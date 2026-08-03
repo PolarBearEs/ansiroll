@@ -375,7 +375,16 @@ def test_play_vars_can_read_baked_controller_config():
     assert by_name(frames, "check config")[0]["status"] == "ok"
 
 
-def test_broken_conditional_config_controls_string_truthiness():
+@pytest.mark.parametrize(
+    ("core_2_20_or_newer", "expected_when_enabled"),
+    [(False, False), (True, True)],
+)
+def test_broken_conditional_config_controls_string_truthiness(
+        monkeypatch, core_2_20_or_newer, expected_when_enabled):
+    monkeypatch.setattr(
+        "ansiroll.runtime._core_at_least",
+        lambda *_version: core_2_20_or_newer,
+    )
     rt = Runtime({}, "", {"inventory_hostname": "h"})
     disabled = rt.ctx({
         "__ansiroll_controller_config": {
@@ -389,7 +398,7 @@ def test_broken_conditional_config_controls_string_truthiness():
     })
 
     assert rt.when(["'broken static'"], disabled) is False
-    assert rt.when(["'broken static'"], enabled) is True
+    assert rt.when(["'broken static'"], enabled) is expected_when_enabled
 
 
 def test_unused_undefined_play_var_does_not_fail_empty_tag_selected_play():
