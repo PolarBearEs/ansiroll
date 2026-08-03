@@ -330,7 +330,19 @@ def _conditions(value):
     try:
         from ansible._internal._datatag._tags import TrustedAsTemplate
     except ImportError:
-        return values
+        # Before data tags, Ansible used AnsibleUnsafeText.__UNSAFE__ for
+        # explicit !unsafe values and treated ordinary parser strings as
+        # trusted template input. Normalize that legacy representation into
+        # the same wire markers used by newer cores.
+        lowered = []
+        for item in values:
+            if isinstance(item, str) and getattr(item, "__UNSAFE__", False):
+                lowered.append({"__ansiroll_untrusted_condition__": str(item)})
+            elif isinstance(item, str) and ("{{" in item or "{%" in item):
+                lowered.append({"__ansiroll_trusted_condition__": str(item)})
+            else:
+                lowered.append(item)
+        return lowered
     lowered = []
     for item in values:
         if isinstance(item, str) and not TrustedAsTemplate.is_tagged_on(item):

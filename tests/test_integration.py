@@ -93,6 +93,31 @@ def test_legacy_assert_action_lowers_that_as_conditions(tmp_path):
     ]
 
 
+def test_unsafe_assert_condition_remains_untrusted(tmp_path):
+    playbook = tmp_path / "unsafe-assert.yml"
+    playbook.write_text(
+        """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: unsafe assertion
+      ansible.builtin.assert:
+        that: !unsafe "{{ dangerous_condition }}"
+"""
+    )
+
+    plays, _actions = parse_playbook(str(playbook))
+    task = next(
+        node
+        for block in plays[0]["tasks"]
+        for node in block.get("block", [])
+        if node.get("name") == "unsafe assertion"
+    )
+
+    assert task["args"]["that"] == [
+        {"__ansiroll_untrusted_condition__": "{{ dangerous_condition }}"}
+    ]
+
+
 def test_embed_and_run_ping():
     emb = ModuleEmbedder()
     meta = emb.embed("ansible.builtin.ping")
