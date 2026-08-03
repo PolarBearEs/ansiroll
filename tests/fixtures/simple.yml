@@ -1,0 +1,38 @@
+---
+- name: Ansiroll smoke test
+  hosts: localhost
+  gather_facts: false
+  vars:
+    greeting: "hello from ansiroll"
+    names:
+      - alice
+      - bob
+  tasks:
+    - name: Print a message
+      debug:
+        msg: "{{ greeting }}"
+
+    - name: Set a fact
+      set_fact:
+        computed: "{{ greeting | upper }}"
+
+    - name: Run a command
+      command: echo "{{ computed }}"
+      register: cmd_out
+
+    - name: Show command stdout
+      debug:
+        var: cmd_out.stdout
+
+    - name: Loop over names
+      command: echo "hi {{ item }}"
+      loop: "{{ names }}"
+
+    - name: Conditional that is skipped
+      debug:
+        msg: "you should not see this"
+      when: false
+
+    - name: Changed-when controlled task
+      command: echo unchanged
+      changed_when: false

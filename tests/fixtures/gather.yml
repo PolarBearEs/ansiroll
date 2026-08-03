@@ -1,0 +1,8 @@
+---
+# No gather_facts key -> implicit gathering (the setup module must be embedded).
+- name: Ansiroll gather test
+  hosts: localhost
+  tasks:
+    - name: Show distribution
+      debug:
+        msg: "distro={{ ansible_distribution | default('UNSET') }}"

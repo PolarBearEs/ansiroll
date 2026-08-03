@@ -1,0 +1,28 @@
+---
+- name: Ansiroll advanced test
+  hosts: localhost
+  gather_facts: false
+  vars:
+    demo_word: "play-override"
+  roles:
+    - demo
+  tasks:
+    - name: Block with rescue
+      block:
+        - name: Failing task in block
+          command: /bin/false
+        - name: Should not run
+          debug:
+            msg: "unreachable after failure"
+      rescue:
+        - name: Rescue task
+          debug:
+            msg: "rescued the failure"
+      always:
+        - name: Always task
+          debug:
+            msg: "always runs"
+
+    - name: Ignored failure
+      command: /bin/false
+      ignore_errors: true

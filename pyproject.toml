@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ansiroll"
+version = "0.1.0"
+description = "Compile an Ansible playbook into a single self-contained Python file, and run it via a normal-reporting strategy plugin."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "PolarBearEs" }]
+license = { file = "LICENSE" }
+# NOTE: ansible-core/ansible-base (>=2.10) is a REQUIRED prerequisite but is
+# intentionally NOT listed here. Ansiroll always runs inside an existing
+# Ansible environment; auto-installing ansible-core can clobber a pinned
+# ansible-base/ansible-core. Install with `--no-deps` into that environment.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/PolarBearEs/ansiroll"
+Issues = "https://github.com/PolarBearEs/ansiroll/issues"
+
+[project.optional-dependencies]
+yaml = ["ruamel.yaml"]
+# Convenience only -- pulls a modern ansible-core into a fresh venv:
+ansible = ["ansible-core>=2.10"]
+test = ["pytest>=7", "pytest-cov>=5", "jinja2", "packaging"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+branch = true
+source = ["ansiroll"]
+
+[tool.coverage.report]
+fail_under = 50
+precision = 1
+show_missing = true
+skip_covered = true
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F401", "F821", "F841"]
+
+[project.scripts]
+ansiroll = "ansiroll.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ansiroll*"]
+
+[tool.setuptools.package-data]
+ansiroll = ["runtime.py", "vendor/*.zip"]

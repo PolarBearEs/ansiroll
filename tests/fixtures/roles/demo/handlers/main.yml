@@ -1,0 +1,4 @@
+---
+- name: demo handler
+  debug:
+    msg: "handler fired"

@@ -1,0 +1,10 @@
+---
+- name: Role task using a default var
+  command: echo "role says {{ demo_word }}"
+  register: role_cmd
+  changed_when: true
+  notify: demo handler
+
+- name: Role debug
+  debug:
+    msg: "role_cmd rc is {{ role_cmd.rc }}"

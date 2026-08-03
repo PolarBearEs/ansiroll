@@ -1,0 +1,7 @@
+---
+# Uses the removed legacy `include:` keyword; Ansiroll rewrites it to import_tasks.
+- name: Legacy include test
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - include: inc.yml

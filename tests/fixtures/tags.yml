@@ -1,0 +1,14 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: run me
+      debug:
+        msg: run
+      tags:
+        - run
+
+    - name: skip me
+      debug:
+        msg: skip
+      tags:
+        - skip

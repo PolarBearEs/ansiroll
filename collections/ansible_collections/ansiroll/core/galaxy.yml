@@ -1,0 +1,13 @@
+namespace: ansiroll
+name: core
+version: 0.1.0
+readme: README.md
+authors:
+  - PolarBearEs
+description: Compile a playbook to one file and run it via a normal-reporting strategy.
+license:
+  - MIT
+tags:
+  - strategy
+  - performance
+repository: https://github.com/PolarBearEs/ansiroll

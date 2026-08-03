@@ -1,0 +1,12 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    sequence_items: []
+  tasks:
+    - set_fact:
+        sequence_items: "{{ sequence_items + [item] }}"
+      with_sequence: start=1 end=3
+
+    - assert:
+        that:
+          - sequence_items == ["1", "2", "3"]

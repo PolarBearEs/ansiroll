@@ -1,0 +1,253 @@
+import os
+import base64
+import io
+import subprocess
+import sys
+import zipfile
+from types import SimpleNamespace
+
+import pytest
+
+from ansiroll.compiler import (
+    _accelerated_only_actions,
+    _build_bundles,
+    _deterministic_zip,
+    _mark_required_accelerators,
+    _render_source,
+    _specialize_accelerators,
+)
+from ansiroll.loader import _classify_accelerator
+from ansiroll.loader import _resolved_play_vars
+
+
+def _module_zip(entries):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, body in entries.items():
+            archive.writestr(name, body)
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
+def test_bundle_union_deduplicates_identical_import_paths():
+    shared = {"ansible/module_utils/shared.py": b"VALUE = 1\n"}
+    modules = {
+        "one": {"module_fqn": "ansible.modules.one", "profile": "legacy",
+                "zip": _module_zip(dict(shared, **{"ansible/modules/one.py": b"pass\n"}))},
+        "alias": {"module_fqn": "ansible.modules.one", "profile": "legacy",
+                  "zip": _module_zip(dict(shared, **{"ansible/modules/one.py": b"pass\n"}))},
+    }
+
+    import_bundle, data_bundle, stats = _build_bundles([], modules)
+    with zipfile.ZipFile(io.BytesIO(import_bundle)) as archive:
+        assert archive.namelist().count("ansible/module_utils/shared.py") == 1
+        assert archive.namelist().count("ansible/modules/one.py") == 1
+    assert stats["unique_module_archives"] == 1
+    assert stats["import_encoded_size"] == len(base64.b64encode(import_bundle))
+    assert stats["data_encoded_size"] == len(base64.b64encode(data_bundle))
+
+
+def test_resolved_play_vars_preserve_ansible_role_magic_lists():
+    play = SimpleNamespace(vars={"ordinary": "play"}, vars_files=[], _loader=None)
+    role_magic = {
+        "role_names": ["app"],
+        "ansible_play_role_names": ["app"],
+        "ansible_role_names": ["app", "dependency"],
+        "ansible_dependent_role_names": ["dependency"],
+    }
+
+    resolved = _resolved_play_vars(
+        play, {"ordinary": "resolved", **role_magic}, "/unused"
+    )
+
+    assert resolved == {"ordinary": "resolved", **role_magic}
+
+
+def test_bundle_union_rejects_conflicting_import_paths():
+    modules = {
+        "one": {"module_fqn": "x.one", "zip": _module_zip({"x/shared.py": b"one"})},
+        "two": {"module_fqn": "x.two", "zip": _module_zip({"x/shared.py": b"two"})},
+    }
+
+    with pytest.raises(RuntimeError, match="conflicting import bundle entry.*x/shared.py"):
+        _build_bundles([], modules)
+
+
+def test_deterministic_zip_has_stable_bytes_and_metadata():
+    entries = {"b": b"two", "a": b"one"}
+    first = _deterministic_zip(entries)
+    second = _deterministic_zip(entries)
+
+    assert first == second
+    with zipfile.ZipFile(io.BytesIO(first)) as archive:
+        assert archive.namelist() == ["a", "b"]
+        assert all(info.date_time == (1980, 1, 1, 0, 0, 0)
+                   for info in archive.infolist())
+
+
+def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
+    agent = tmp_path / "agent.py"
+    agent.write_text(_render_source([], {}, ""))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+    probe = (
+        "import runpy, sys, tempfile; "
+        "tempfile.mkstemp = lambda *a, **k: "
+        "(_ for _ in ()).throw(RuntimeError('temporary files forbidden')); "
+        "ns = runpy.run_path(sys.argv[1]); "
+        "print(ns['jinja2'].__version__); "
+        "print(ns['_Templater']().render_string('hello {{ name }}', {'name': 'world'}))"
+    )
+
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", probe, str(agent)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["2.11.3", "hello world"]
+
+
+def test_accelerator_classification_is_compile_time_when_possible():
+    assert _classify_accelerator(
+        "ansible.builtin.command", {"_raw_params": "printf ok"}, None
+    ) == "always"
+    assert _classify_accelerator(
+        "command", {"_raw_params": "printf {{ value }}"}, None
+    ) == "dynamic"
+    assert _classify_accelerator(
+        "file", {"path": "/tmp/x", "state": "directory", "recurse": True}, None
+    ) == "always"
+    assert _classify_accelerator(
+        "ansible.builtin.systemd",
+        {"name": "cron.service", "state": "started", "enabled": True}, None,
+    ) == "always"
+    assert _classify_accelerator(
+        "systemd", {"name": "cron", "state": "started", "daemon_reload": True},
+        None,
+    ) is None
+    assert _classify_accelerator(
+        "apt",
+        {
+            "pkg": ["mosquitto", "openhab2"],
+            "state": "absent",
+            "purge": True,
+            "autoclean": True,
+            "autoremove": True,
+        },
+        None,
+    ) == "always"
+    assert _classify_accelerator(
+        "apt", {"pkg": ["mosquitto"], "state": "present"}, None
+    ) is None
+    # A literal loop does not change the supported argument shape.
+    assert _classify_accelerator(
+        "command", {"_raw_params": "printf ok"}, [1, 2]
+    ) == "always"
+
+
+def test_legacy_command_warn_classification_tracks_ansible_support(monkeypatch):
+    from ansiroll import loader
+
+    args = {"_raw_params": "apt-get clean", "warn": False}
+    monkeypatch.setattr(loader, "_legacy_command_warn_supported", lambda: True)
+    assert loader._classify_accelerator("command", args, None) == "always"
+
+    monkeypatch.setattr(loader, "_legacy_command_warn_supported", lambda: False)
+    assert loader._classify_accelerator("command", args, None) is None
+
+
+def test_generated_agent_loads_accelerator_from_bundle_under_python_s(tmp_path):
+    destination = tmp_path / "created-by-accelerator"
+    task = {
+        "type": "task", "uuid": "accelerated-1", "name": "accelerated file",
+        "action": "ansible.builtin.file", "special": None,
+        "args": {"path": str(destination), "state": "directory"},
+        "accelerator": "always", "when": [], "loop": None,
+        "loop_var": "item", "vars": {}, "become": False,
+    }
+    stat_task = {
+        "type": "task", "uuid": "accelerated-2", "name": "accelerated stat",
+        "action": "ansible.builtin.stat", "special": None,
+        "args": {"path": str(destination / "missing")},
+        "accelerator": "always", "when": [], "loop": None,
+        "loop_var": "item", "vars": {}, "become": False,
+    }
+    play = {
+        "name": "accelerated", "hosts": "localhost", "vars": {},
+        "tasks": [task, stat_task], "handlers": [], "gather_facts": False,
+    }
+    agent = tmp_path / "accelerated-agent.py"
+    agent.write_text(_render_source([play], {}, ""))
+    env = dict(os.environ)
+    env.update({"PYTHONPATH": "", "ANSIROLL_ACCELERATED_MODULES": "file,stat"})
+
+    proc = subprocess.run(
+        [sys.executable, "-S", str(agent)], capture_output=True, text=True, env=env
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert destination.is_dir()
+
+
+@pytest.mark.parametrize("action", ["ansible.builtin.stat", "shell"])
+def test_total_static_accelerator_replaces_official_module(action):
+    task = {
+        "type": "task",
+        "action": action,
+        "accelerator": "always",
+        "args": {"path": "/tmp/example"},
+        "async_val": 0,
+    }
+    play = {"tasks": [task], "handlers": [], "gather_facts": False}
+
+    actions = _accelerated_only_actions(
+        [play], {action}
+    )
+    _mark_required_accelerators([play], actions)
+
+    assert actions == {action}
+    assert task["accelerator"] == "required"
+
+
+@pytest.mark.parametrize(
+    "task_update",
+    [
+        {"accelerator": "dynamic"},
+        {"async_val": 10},
+        {"fallback": True},
+    ],
+)
+def test_non_total_accelerator_call_keeps_official_module(task_update):
+    task = {
+        "type": "task",
+        "action": "ansible.builtin.stat",
+        "accelerator": "always",
+        "args": {"path": "/tmp/example"},
+        "async_val": 0,
+    }
+    task.update(task_update)
+    play = {"tasks": [task], "handlers": [], "gather_facts": False}
+
+    assert _accelerated_only_actions(
+        [play], {"ansible.builtin.stat"}
+    ) == set()
+
+
+def test_fixed_variables_specialize_dynamic_accelerator_without_rewriting_args():
+    task = {
+        "type": "task",
+        "action": "ansible.builtin.stat",
+        "accelerator": "dynamic",
+        "args": {"path": "{{ root }}/{{ filename }}"},
+    }
+    play = {"tasks": [task], "handlers": []}
+
+    count = _specialize_accelerators(
+        [play], {"root": "/tmp", "filename": "example"}
+    )
+
+    assert count == 1
+    assert task["accelerator"] == "always"
+    assert task["args"] == {"path": "{{ root }}/{{ filename }}"}

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.eggs/
+build/
+dist/
+*.compiled.py
+.idea/
+.coverage
+coverage.xml
+coverage.json
+htmlcov/

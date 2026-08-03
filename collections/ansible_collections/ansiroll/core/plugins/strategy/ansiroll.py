@@ -1,0 +1,1330 @@
+"""
+ansiroll strategy plugin.
+
+Instead of Ansible's per-task round-trips, this strategy compiles the whole play
+into one self-contained Python "agent" (via the ``ansiroll`` package) and runs it
+on each host over a single persistent bidirectional channel:
+
+  * the agent executes the whole play in one long-lived process (module worker stays
+    warm -- module_utils compiled once, decode-once), and
+  * streams one framed result per task back to the controller **as it happens**, so
+    reporting is live and looks exactly like a normal run, and
+  * when it hits a ``delegate_to`` / controller-coupled task it asks the controller
+    inline over the same channel (no re-ship, no segmentation).
+
+Transport reuses Ansible's connection plugin: ``local`` runs python directly;
+``ssh`` reuses the ssh plugin's own argv (keys/args/ControlPersist/sshpass).
+
+Requires the ``ansiroll`` package to be importable on the controller.
+"""
+
+from __future__ import annotations
+
+import collections
+import base64
+import json
+import inspect
+import os
+import shlex
+import struct
+import subprocess
+import sys
+import time
+
+DOCUMENTATION = """
+    name: ansiroll
+    short_description: Compile the play to one file, ship it, run it, report normally
+    description:
+        - Compiles the entire play (with roles/includes inlined and modules embedded)
+          into a single self-contained Python file, transfers it to each host once,
+          executes it, and reconstructs per-task results for normal reporting.
+    version_added: "0.1.0"
+    author: PolarBearEs
+"""
+
+from ansible import context
+from ansible.plugins.strategy import StrategyBase
+from ansible.plugins.loader import connection_loader
+from ansible.utils.display import Display
+
+_UnifiedTaskResult = None
+try:  # 2.18-2.20: callbacks accept the private raw result wrapper
+    from ansible.executor.task_result import _RawTaskResult as _ResultClass
+except Exception:  # 2.21+ uses UnifiedTaskResult; older cores use TaskResult
+    from ansible.executor.task_result import TaskResult as _ResultClass
+    try:
+        from ansible._internal._task import UnifiedTaskResult as _UnifiedTaskResult
+    except Exception:  # pragma: no cover - older ansible-core
+        pass
+
+display = Display()
+
+class StrategyModule(StrategyBase):
+
+    def run(self, iterator, play_context):
+        play = iterator._play
+        self._cur_play = play
+        self._set_hosts_cache(play)
+        self._profile_enabled = _truthy(os.environ.get("ANSIROLL_PROFILE"))
+        self._native_only = _truthy(os.environ.get("ANSIROLL_NATIVE_ONLY"))
+        self._provenance_enabled = _truthy(
+            os.environ.get("ANSIROLL_PROVENANCE")
+        )
+        accelerated_modules = os.environ.get("ANSIROLL_ACCELERATED_MODULES", "")
+        self._profile("accelerated_modules=%s" % (accelerated_modules or "none"))
+        play_vars = self._variable_manager.get_vars(play=play)
+        started = time.monotonic()
+        try:
+            source, modules, task_map = self._compile(play, play_vars)
+        except Exception as ex:
+            display.error("ansiroll: failed to compile play: %s" % ex)
+            return self._tqm.RUN_ERROR
+        self._profile("compile %.3fs, agent %.1f MiB, modules=%d, tasks=%d"
+                      % (time.monotonic() - started, len(source) / 1048576.0,
+                         len(modules), len(task_map)))
+
+        self._delegate_on_target = _truthy(play_vars.get("ansiroll_delegate_on_target"))
+        self._native_only = self._native_only or _truthy(
+            play_vars.get("ansiroll_native_only")
+        )
+        self._provenance_enabled = self._provenance_enabled or _truthy(
+            play_vars.get("ansiroll_provenance")
+        )
+        self._check_mode = bool(
+            context.CLIARGS.get("check") or getattr(play_context, "check_mode", False)
+        )
+        self._diff_mode = bool(context.CLIARGS.get("diff"))
+        self._modules = modules
+        # A tag-filtered or otherwise empty play has no controller work.  In
+        # particular, do not let all([]) route a remote inventory host through
+        # the local channel (and consequently the controller's Python path).
+        self._controller_only_play = bool(task_map) and all(
+            str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+            in {"debug", "set_fact", "fail", "assert", "meta"}
+            for task in task_map.values()
+        )
+        self._requires_linear_fallback = any(
+            (
+                str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+                in {"include_role", "import_role"}
+            )
+            or "{{" in str(getattr(task, "action", "") or "")
+            or "{%" in str(getattr(task, "action", "") or "")
+            for task in task_map.values()
+        )
+        self._local_rt = None
+
+        hosts = list(self.get_hosts_left(iterator))
+        controller_reasons = list(getattr(
+            self, "_compiled_controller_fallbacks", ()
+        ))
+        if self._delegate_on_target:
+            controller_reasons = [
+                item for item in controller_reasons
+                if item.get("kind") != "delegate"
+            ]
+        linear_reason = None
+        if self._requires_linear_fallback:
+            linear_reason = "dynamic role or templated action requires core linear"
+        elif len(hosts) > 1 and self._controller_only_play:
+            linear_reason = (
+                "multi-host controller-only play requires task-lockstep scheduling"
+            )
+        if self._native_only and (linear_reason or controller_reasons):
+            reasons = [linear_reason] if linear_reason else []
+            reasons.extend(
+                item.get("reason") or item.get("kind")
+                for item in controller_reasons
+            )
+            display.error(
+                "ansiroll: native-only mode rejected play %r: %s"
+                % (play.name or play.get_name(), "; ".join(reasons))
+            )
+            return self._tqm.RUN_ERROR
+        if self._requires_linear_fallback or (
+                len(hosts) > 1 and self._controller_only_play):
+            # There is no target work to accelerate, while run_once, rescue,
+            # hostvars and batch membership still require task-lockstep
+            # scheduling. Reuse core linear for this compatibility-only case.
+            display.vvv(
+                "ansiroll: using core linear scheduling for a "
+                "compatibility-only play"
+            )
+            self._emit_provenance({
+                "scope": "play",
+                "play": play.name or play.get_name(),
+                "mode": "linear-fallback",
+                "reason": linear_reason,
+            })
+            from ansible.plugins.strategy.linear import (
+                StrategyModule as LinearStrategy,
+            )
+            # Keep this instance's result thread and queue caches; constructing
+            # a second strategy would make both consumers race on the TQM queue.
+            self.__class__ = LinearStrategy
+            return LinearStrategy.run(self, iterator, play_context)
+        self._emit_provenance({
+            "scope": "play",
+            "play": play.name or play.get_name(),
+            "mode": "native-agent",
+        })
+        if len(hosts) > 1 and _truthy(getattr(play, "any_errors_fatal", False)):
+            display.error(
+                "ansiroll: multi-host any_errors_fatal requires task-lockstep "
+                "execution and is not supported; no hosts were started"
+            )
+            return self._tqm.RUN_ERROR
+        if len(hosts) > 1 and getattr(play, "max_fail_percentage", None) is not None:
+            display.error(
+                "ansiroll: multi-host max_fail_percentage requires task-lockstep "
+                "execution and is not supported; no hosts were started"
+            )
+            return self._tqm.RUN_ERROR
+
+        result = self._tqm.RUN_OK
+        try:
+            self._run_hosts = hosts
+            self._first_host_name = hosts[0].name if hosts else None
+            for host in hosts:
+                if self._run_host(host, source, task_map, play_context):
+                    iterator.mark_host_failed(host)
+                    result = self._tqm.RUN_FAILED_HOSTS
+                self._drain_iterator(host, iterator)
+        finally:
+            self._close_local_runtime()
+        return super(StrategyModule, self).run(iterator, play_context, result)
+
+    # ---- compilation -----------------------------------------------------
+    def _compile(self, play, play_vars=None):
+        from ansiroll.loader import _convert_play
+        from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
+        from ansiroll.compiler import _render_source
+
+        actions = set()
+        only_tags = set(context.CLIARGS.get("tags") or [])
+        skip_tags = set(context.CLIARGS.get("skip_tags") or [])
+        play_node = _convert_play(play, actions, only_tags=only_tags,
+                                  skip_tags=skip_tags, all_vars=play_vars or {})
+
+        embedder = ModuleEmbedder()
+        modules = {}
+        unsupported = set()
+        for action in sorted(actions):
+            if action in SPECIAL_ACTIONS:
+                continue
+            try:
+                meta = embedder.embed(action)
+            except Exception as ex:
+                display.warning("ansiroll: cannot embed module %s (%s); "
+                                "running it on the controller" % (action, ex))
+                unsupported.add(action)
+                continue
+            if meta is not None:
+                modules[action] = meta
+        if unsupported:
+            from ansiroll.compiler import _mark_unsupported
+            _mark_unsupported([play_node], unsupported)
+        self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
+
+        self._ansiballz = embedder.ansiballz_code or ""
+        source = _render_source([play_node], modules, self._ansiballz)
+        task_map = self._build_task_map(play, play_node)
+        return source, modules, task_map
+
+    def _build_task_map(self, play, play_node):
+        from ansible.playbook.block import Block
+        from ansible.playbook.task import Task
+
+        by_key = collections.defaultdict(collections.deque)
+        by_uuid = collections.defaultdict(collections.deque)
+        mapping = {}
+
+        def walk(obj):
+            if isinstance(obj, Block):
+                for section in (obj.block, obj.rescue, obj.always):
+                    for sub in (section or []):
+                        walk(sub)
+            elif isinstance(obj, Task):
+                by_uuid[obj._uuid].append(obj)
+                by_key[(obj._uuid, obj.name or obj.action, obj.action)].append(obj)
+
+        for blk in play.compile():
+            walk(blk)
+        for hblk in (play.handlers or []):
+            walk(hblk)
+        # Tasks materialized by compile-time include_tasks expansion are not in
+        # play.compile(); the loader keeps them in a registry.
+        from ansiroll import loader as _ldr
+        for t in getattr(_ldr, "INCLUDED_TASKS", {}).values():
+            walk(t)
+
+        def walk_node(node):
+            if node.get("type") == "block":
+                for section in ("block", "rescue", "always"):
+                    for sub in node.get(section, []) or []:
+                        walk_node(sub)
+                return
+            if node.get("type") == "include":
+                for sub in node.get("tasks", []) or []:
+                    walk_node(sub)
+            rid = node.get("runtime_id")
+            if not rid:
+                return
+            key = (node.get("uuid"), node.get("name") or node.get("action"),
+                   node.get("action"))
+            queue = by_key.get(key)
+            if queue:
+                mapping[rid] = queue.popleft()
+                return
+            queue = by_uuid.get(node.get("uuid"))
+            if queue:
+                mapping[rid] = queue.popleft()
+
+        for node in play_node.get("tasks", []) or []:
+            walk_node(node)
+        for node in play_node.get("handlers", []) or []:
+            walk_node(node)
+        if play_node.get("gather_facts"):
+            try:
+                gather_task = Task.load(
+                    {"name": "Gathering Facts", "ansible.builtin.setup": {}},
+                    variable_manager=self._variable_manager,
+                    loader=self._loader,
+                )
+                mapping["__gather_facts__"] = gather_task
+            except Exception as ex:
+                display.vvv("ansiroll: could not build Gathering Facts callback task: %s" % ex)
+        return mapping
+
+    # ---- per-host execution over a persistent bidirectional channel ------
+    def _run_host(self, host, source, task_map, play_context):
+        """Ship the agent once, then pump: results stream live, delegated tasks are
+        serviced inline on the controller, all over one persistent channel."""
+        started = time.monotonic()
+        hv = dict(self._variable_manager.get_vars(
+            host=host, play=self._cur_play
+        ))
+        hv.setdefault("ansible_host", host.name)
+        templar = self._mk_templar(hv)
+        become_pass = self._resolve_become_password(hv, templar)
+        agent_source = self._agent_header(host, hv, become_pass) + source
+        self._profile("%s prepared vars/header in %.3fs, payload %.1f MiB"
+                      % (host.name, time.monotonic() - started,
+                         len(agent_source) / 1048576.0))
+        try:
+            open_started = time.monotonic()
+            chan = self._open_channel(host, play_context, hv, templar)
+        except Exception as ex:
+            display.error("ansiroll: cannot open channel to %s: %s" % (host.name, ex))
+            return True
+        self._profile("%s channel open %.3fs" % (host.name, time.monotonic() - open_started))
+        try:
+            send_started = time.monotonic()
+            chan.send_blob(agent_source)  # frame 1: the agent source
+            self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
+            failed = self._pump(
+                host, chan, task_map, hv, templar, become_pass, play_context)
+            self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
+            return failed
+        finally:
+            chan.close()
+
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
+        host_failed = False
+        seen = set()
+        last_frame = time.monotonic()
+        while True:
+            frame = chan.recv()
+            now = time.monotonic()
+            if frame is None:
+                display.error("ansiroll: channel to %s closed unexpectedly:\n%s"
+                              % (host.name, chan.stderr()))
+                return True
+            t = frame.get("t")
+            if t == "result":
+                result_frame = frame.get("frame", {})
+                result_data = result_frame.get("result") or {}
+                target_profile = result_data.pop("_ansiroll_profile", None)
+                detail = ""
+                if target_profile:
+                    detail = (" module=%s load=%.3fs run=%.3fs total=%.3fs cached=%s"
+                              % (target_profile.get("module"),
+                                 target_profile.get("worker_load", 0.0),
+                                 target_profile.get("worker_run", 0.0),
+                                 target_profile.get("worker_total", 0.0),
+                                 target_profile.get("worker_cached")))
+                self._profile("%s result +%.3fs %s%s"
+                              % (host.name, now - last_frame,
+                                 result_frame.get("task") or result_frame.get("action"),
+                                 detail))
+                self._emit_provenance_frame(host, result_frame)
+                self._emit_frame(host, result_frame, task_map, seen, templar)
+            elif t == "task_start":
+                self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "delegate":
+                delegate_started = time.monotonic()
+                chan.send({"t": "delegate_result",
+                           "result": self._run_delegated(
+                               frame, host, hv, templar, become_pass,
+                               task_map, play_context
+                           )})
+                self._profile("%s delegate +%.3fs %s"
+                              % (host.name, time.monotonic() - delegate_started,
+                                 frame.get("name") or frame.get("action")))
+            elif t == "source":
+                chan.send({
+                    "t": "source_result",
+                    "source": self._read_controller_source(frame.get("path")),
+                })
+            elif t == "stats":
+                self._apply_stats(host, frame.get("stats", {}))
+            elif t == "done":
+                host_failed = host_failed or frame.get("failed", False)
+                break
+            last_frame = now
+        return host_failed
+
+    @staticmethod
+    def _read_controller_source(path):
+        """Read a runtime-created controller file for in-memory target transfer."""
+        if not path or not os.path.isfile(path):
+            return {"error": "controller source %r is not a regular file" % path}
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            st = os.stat(path)
+            return {
+                "data": base64.b64encode(data).decode("ascii"),
+                "meta": {
+                    "fullpath": os.path.abspath(path),
+                    "mtime": st.st_mtime,
+                    "uid": st.st_uid,
+                },
+            }
+        except OSError as ex:
+            return {"error": "could not read controller source %r: %s" % (path, ex)}
+
+    def _profile(self, msg):
+        if getattr(self, "_profile_enabled", False):
+            display.display("ansiroll-profile: %s" % msg)
+
+    def _emit_provenance(self, payload):
+        if getattr(self, "_provenance_enabled", False):
+            display.display(
+                "ANSIROLL_PROVENANCE %s"
+                % json.dumps(payload, sort_keys=True, default=str)
+            )
+
+    def _emit_provenance_frame(self, host, frame):
+        provenance = dict(frame.get("provenance") or {"mode": "native-agent"})
+        provenance.update({
+            "scope": "task",
+            "host": host.name,
+            "task": frame.get("task") or frame.get("action"),
+            "action": frame.get("action"),
+        })
+        self._emit_provenance(provenance)
+
+    def _run_delegated(self, frame, host, hv, templar, become_pass,
+                       task_map=None, play_context=None):
+        """Execute a delegated / controller-coupled task on the correct host and
+        return its raw module result (the agent re-emits the framed result)."""
+        action = str(frame.get("action") or "").rsplit(".", 1)[-1]
+        if action in ("add_host", "group_by"):
+            return self._run_inventory_action(action, frame, host, hv)
+        if action == "include_vars":
+            return self._run_include_vars(frame)
+        if action == "set_fact":
+            args = dict(frame.get("args") or {})
+            cacheable = bool(args.pop("cacheable", False))
+            return {
+                "changed": False,
+                "ansible_facts": args,
+                "_ansible_facts_cacheable": cacheable,
+            }
+        if action == "synchronize":
+            return self._run_native_controller_task(
+                frame, host, hv, task_map or {}, play_context)
+        to = frame.get("to")
+        to = self._t(templar, to) if isinstance(to, str) else to
+        local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
+        if action == "template" and local:
+            return self._run_local_template(frame, become_pass)
+        if frame.get("fallback") or not local:
+            reason = ("delegate_to: %s (non-local delegation)" % to if to
+                      else "controller-coupled action %s" % frame.get("action"))
+            return {"failed": True, "changed": False,
+                    "msg": "ansiroll: %s is not supported yet" % reason}
+        rt = self._local_runtime(become_pass)
+        previous_check = rt.check_mode
+        previous_diff = rt.diff_mode
+        previous_become_user = rt.become_user
+        try:
+            rt.check_mode = bool(frame.get("check_mode"))
+            rt.diff_mode = bool(frame.get("diff_mode"))
+            rt.become_user = str(frame.get("become_user") or "root")
+            return rt.run_module(frame.get("action"), frame.get("args") or {},
+                                 become=bool(frame.get("become")))
+        finally:
+            rt.check_mode = previous_check
+            rt.diff_mode = previous_diff
+            rt.become_user = previous_become_user
+
+    def _run_native_controller_task(self, frame, host, hv, task_map, play_context):
+        """Run an action-plugin task with Ansible's official TaskExecutor."""
+        task = task_map.get(frame.get("runtime_id"))
+        if task is None:
+            return {
+                "failed": True,
+                "changed": False,
+                "msg": "ansiroll: original task is unavailable for %s"
+                       % frame.get("action"),
+            }
+        try:
+            concrete = task.copy()
+            concrete.args = _drop_omit_values(dict(frame.get("args") or {}))
+            concrete.when = []
+            concrete.loop = None
+            concrete.loop_with = None
+            concrete.register = None
+            concrete.notify = []
+            job_vars = dict(hv or {})
+            job_vars.update(frame.get("vars") or {})
+
+            class _QuietQueue:
+                @staticmethod
+                def send_callback(*_args, **_kwargs):
+                    pass
+
+            from ansible.executor.task_executor import TaskExecutor
+            from ansible.plugins import loader as plugin_loader
+            executor = TaskExecutor(
+                host, concrete, job_vars, play_context, None, self._loader,
+                plugin_loader, _QuietQueue(), self._variable_manager)
+            return executor.run()
+        except Exception as ex:
+            return {
+                "failed": True,
+                "changed": False,
+                "msg": "ansiroll: controller action %s failed: %s"
+                       % (frame.get("action"), ex),
+            }
+
+    def _run_local_template(self, frame, become_pass):
+        """Render a runtime-created controller file through the in-memory runtime."""
+        args = dict(frame.get("args") or {})
+        src = args.get("src")
+        if not src or not os.path.isfile(src):
+            return {
+                "failed": True,
+                "changed": False,
+                "msg": "template: could not find controller source %r" % src,
+            }
+        try:
+            with open(src, "rb") as fh:
+                raw = fh.read().decode("utf-8", "surrogateescape")
+            st = os.stat(src)
+        except OSError as ex:
+            return {"failed": True, "changed": False, "msg": str(ex)}
+        rt = self._local_runtime(become_pass)
+        previous_become_user = rt.become_user
+        try:
+            rt.become_user = str(frame.get("become_user") or "root")
+            task = {
+                "_baked": {src: raw},
+                "_baked_meta": {
+                    src: {
+                        "fullpath": os.path.abspath(src),
+                        "mtime": st.st_mtime,
+                        "uid": st.st_uid,
+                    },
+                },
+            }
+            return rt._run_file_action(
+                "template", task, args, frame.get("vars") or {},
+                become=bool(frame.get("become")))
+        finally:
+            rt.become_user = previous_become_user
+
+    def _run_include_vars(self, frame):
+        """include_vars reads controller-side files; resolve and parse here."""
+        args = dict(frame.get("args") or {})
+        fname = args.get("_raw_params") or args.get("file")
+        if not fname:
+            return {"failed": True, "changed": False,
+                    "msg": "include_vars: no file specified"}
+        fname = str(fname)
+        path = None
+        if os.path.isabs(fname):
+            path = fname
+        else:
+            candidates = []
+            for d in frame.get("search_dirs") or []:
+                candidates.append(os.path.join(d, "vars", fname))
+                candidates.append(os.path.join(d, fname))
+            for c in candidates:
+                if os.path.exists(c):
+                    path = c
+                    break
+        if not path or not os.path.exists(path):
+            return {"failed": True, "changed": False,
+                    "msg": "Could not find or access '%s'" % fname}
+        try:
+            data = self._loader.load_from_file(path) or {}
+        except Exception as ex:
+            return {"failed": True, "changed": False, "msg": str(ex)}
+        if not isinstance(data, dict):
+            return {"failed": True, "changed": False,
+                    "msg": "%s must be stored as a dictionary/hash" % path}
+        name = args.get("name")
+        facts = {name: data} if name else data
+        return {"changed": False, "ansible_facts": facts,
+                "ansible_included_var_files": [path]}
+
+    def _run_inventory_action(self, action, frame, current_host, hv):
+        """add_host / group_by mutate the controller's in-memory inventory;
+        mirror the core action plugins + strategy result processing."""
+        args = dict(frame.get("args") or {})
+        raw = args.pop("_raw_params", None)
+        if isinstance(raw, dict):
+            args.update(raw)
+        if action == "add_host":
+            name = args.get("name") or args.get("hostname") or args.get("host")
+            if not name:
+                return {"failed": True, "changed": False,
+                        "msg": "name, host or hostname needs to be provided"}
+            groups = args.get("groupname") or args.get("groups") or args.get("group") or []
+            if isinstance(groups, str):
+                groups = [g.strip() for g in groups.split(",") if g.strip()]
+            special = ("name", "hostname", "host", "groupname", "groups", "group")
+            host_vars = {k: v for k, v in args.items() if k not in special}
+            result = {"changed": False,
+                      "add_host": {"host_name": name, "groups": list(groups),
+                                   "host_vars": host_vars}}
+            try:
+                from ansible._internal._task import AddHost
+                host_info = AddHost(
+                    host_name=name,
+                    host_vars=host_vars,
+                    parent_group_names=list(groups),
+                )
+                result["changed"] = self._inventory.add_dynamic_host(host_info)
+            except ImportError:
+                self._inventory.add_dynamic_host(result["add_host"], result)
+            cache = getattr(self, "_hosts_cache_all", None)
+            if result.get("changed") and cache is not None and name not in cache:
+                cache.append(name)
+            return result
+        # group_by
+        key = args.get("key")
+        if not key:
+            return {"failed": True, "changed": False,
+                    "msg": "the 'key' param is required when using group_by"}
+        parents = args.get("parents", ["all"])
+        if isinstance(parents, str):
+            parents = [parents]
+        result = {"changed": False, "add_group": str(key).replace(" ", "-"),
+                  "parent_groups": [str(p).replace(" ", "-") for p in parents]}
+        host = (self._inventory.get_host(hv.get("inventory_hostname"))
+                or current_host)
+        try:
+            # ansible-core 2.21 replaced the executor-side Host/dict API with
+            # an inventory host name and a typed immutable payload.
+            from ansible._internal._task import AddGroup
+            group_info = AddGroup(
+                group_name=result["add_group"],
+                parent_group_names=result["parent_groups"],
+            )
+            result["changed"] = self._inventory.add_dynamic_group(
+                host.name, group_info
+            )
+        except ImportError:
+            self._inventory.add_dynamic_group(host, result)
+        # group_by can make new group_vars and group_names visible immediately
+        # to later tasks in the same play. Refresh only values that changed from
+        # the host snapshot shipped to the agent, preserving agent-side facts.
+        try:
+            updated = self._variable_manager.get_vars(host=host, play=self._cur_play)
+            delta = {}
+            nonpersistent = getattr(
+                self._variable_manager, "_nonpersistent_fact_cache", {}).get(
+                    host.name, {})
+            for name, value in updated.items():
+                if name in ("hostvars", "vars") or name in nonpersistent:
+                    continue
+                try:
+                    changed = name not in hv or hv[name] != value
+                except Exception:
+                    changed = name not in hv
+                if changed:
+                    delta[name] = value
+            if delta:
+                result["_ansiroll_vars"] = delta
+        except Exception:
+            pass
+        return result
+
+    def _local_runtime(self, become_pass):
+        if self._local_rt is None:
+            from ansiroll.runtime import Runtime
+            self._local_rt = Runtime(self._modules, self._ansiballz,
+                                     {"inventory_hostname": "localhost"},
+                                     become_password=become_pass)
+        return self._local_rt
+
+    def _close_local_runtime(self):
+        if getattr(self, "_local_rt", None) is not None:
+            try:
+                self._local_rt.cleanup()
+            except Exception:
+                pass
+            self._local_rt = None
+
+    def _agent_header(self, host, hv, become_pass):
+        return (self._var_header(host, hv, become_pass)
+                + "_INJECTED_DELEGATE_ON_TARGET = %r\n" % bool(self._delegate_on_target)
+                + "_INJECTED_SKIP_RUN_ONCE = %r\n"
+                % (host.name != getattr(self, "_first_host_name", host.name))
+                + "_INJECTED_CHECK_MODE = %r\n" % bool(self._check_mode)
+                + "_INJECTED_DIFF_MODE = %r\n" % bool(self._diff_mode)
+                + "_INJECTED_PROFILE = %r\n" % bool(getattr(self, "_profile_enabled", False))
+                + "_INJECTED_NATIVE_ONLY = %r\n"
+                % bool(getattr(self, "_native_only", False))
+                + "_INJECTED_ACCELERATED_MODULES = %r\n"
+                % os.environ.get("ANSIROLL_ACCELERATED_MODULES", "")
+                + "_INJECTED_FAST_FACTS = %r\n"
+                % _truthy(os.environ.get("ANSIROLL_FAST_FACTS", "")))
+
+    # ---- channel transport ----------------------------------------------
+    def _open_channel(self, host, play_context, hv, templar):
+        from ansiroll.runtime import AGENT_BOOTSTRAP
+        conn_type = self._resolve_connection(host, play_context, hv, templar)
+        # Pure controller-side actions do not need a target connection. This
+        # matches linear's ability to run debug/fail/assert/set_fact against
+        # ad-hoc inventory names that have no resolvable SSH endpoint.
+        if self._controller_only_play:
+            return _Channel([sys.executable, "-c", AGENT_BOOTSTRAP])
+        interp = self._t(templar, hv.get("ansible_python_interpreter"))
+        if not isinstance(interp, str) or not interp.startswith("/"):
+            interp = sys.executable if conn_type == "local" else "/usr/bin/python3"
+        if conn_type == "local":
+            return _Channel([interp, "-c", AGENT_BOOTSTRAP])
+        # ssh: reuse the connection plugin's own argv (keys/args/ControlPersist/sshpass)
+        conn = self._connect(host, play_context, hv, templar)
+        remote = "%s -c %s" % (interp, shlex.quote(AGENT_BOOTSTRAP))
+        argv = _build_ssh_command(conn, remote)
+        argv = [x.decode("utf-8", "surrogateescape") if isinstance(x, bytes) else x for x in argv]
+        pass_fds = ()
+        sshpass = getattr(conn, "sshpass_pipe", None)
+        if sshpass:
+            pw = self._resolve_password(hv, templar) or ""
+            os.write(sshpass[1], (pw + "\n").encode("utf-8"))
+            pass_fds = (sshpass[0],)
+        display.vvv("ansiroll: %s agent via ssh" % host.name)
+        return _Channel(argv, pass_fds=pass_fds)
+
+    def _var_header(self, host, hv, become_pass=None):
+        """Inject this host's vars (extra-vars, inventory, group_vars) plus the
+        resolved become password into the streamed run (stdin only -- never on disk)."""
+        blob = _json_blob(hv)
+        extra_blob = _json_blob(_extra_vars(self._variable_manager))
+        nonpersistent = getattr(
+            self._variable_manager, "_nonpersistent_fact_cache", {}
+        ).get(host.name, {})
+        override_blob = _json_blob(nonpersistent)
+        return (
+            "_INJECTED_HOST = %r\n"
+            "_INJECTED_VARS = __import__('json').loads(%r)\n"
+            "_INJECTED_EXTRA_VARS = __import__('json').loads(%r)\n"
+            "_INJECTED_HOST_VAR_OVERRIDES = __import__('json').loads(%r)\n"
+            "_INJECTED_BECOME_PASS = %r\n"
+            % (host.name, blob, extra_blob, override_blob, become_pass)
+        )
+
+    def _connect(self, host, play_context, hv, templar=None):
+        conn_type = self._resolve_connection(host, play_context, hv, templar)
+        pc = play_context
+        # Best-effort population so ssh/other connections have a valid address/user.
+        # Values may be Jinja templates (e.g. ansible_user: "{{ alfred_assistant_user }}")
+        # and must be templated here; on 2.10 the base play_context also leaves these
+        # as Sentinel (a truthy object), so accept only real, non-empty strings.
+        addr = _first_str(self._t(templar, hv.get("ansible_host")),
+                          self._t(templar, hv.get("ansible_ssh_host")),
+                          getattr(host, "address", None), host.name)
+        user = (_first_str(self._t(templar, hv.get("ansible_user")),
+                           self._t(templar, hv.get("ansible_ssh_user")),
+                           self._t(templar, getattr(pc, "remote_user", None))))
+        for attr, val in (("connection", conn_type), ("remote_addr", addr), ("remote_user", user)):
+            if isinstance(val, str) and val:
+                try:
+                    setattr(pc, attr, val)
+                except Exception:
+                    pass
+        display.vvv("ansiroll: %s via %s as user=%s addr=%s"
+                    % (host.name, conn_type, user or "<ssh default>", addr))
+        conn = connection_loader.get(conn_type, pc, None)
+        self._apply_conn_options(conn, conn_type, hv, templar, user, addr)
+        return conn
+
+    def _apply_conn_options(self, conn, conn_type, hv, templar, user, addr):
+        """Apply per-host connection settings (key file, ssh args, port) like
+        the task executor does, so ssh uses the configured identity rather than
+        falling back to whatever the agent offers."""
+        direct = {"host": addr}
+        if user:
+            direct["remote_user"] = user
+
+        def setopt(opt, *keys):
+            v = _first_str(*[self._t(templar, hv.get(k)) for k in keys])
+            if v is not None:
+                direct[opt] = v
+
+        if conn_type == "ssh":
+            setopt("private_key_file", "ansible_ssh_private_key_file", "ansible_private_key_file")
+            setopt("ssh_common_args", "ansible_ssh_common_args")
+            setopt("ssh_extra_args", "ansible_ssh_extra_args")
+            setopt("ssh_args", "ansible_ssh_args")
+            pw = self._resolve_password(hv, templar)
+            if pw is not None:
+                direct["password"] = pw  # drives sshpass; get_option('password')
+            port = hv.get("ansible_port") or hv.get("ansible_ssh_port")
+            if port is not None:
+                try:
+                    direct["port"] = int(self._t(templar, port) if isinstance(port, str) else port)
+                except Exception:
+                    pass
+        try:
+            # var_options lets the plugin resolve any options we didn't set explicitly;
+            # direct (templated) wins for the connection-critical ones.
+            conn.set_options(var_options=hv, direct=direct)
+        except Exception as ex:
+            try:
+                conn.set_options(direct=direct)
+            except Exception:
+                display.vvv("ansiroll: set_options failed: %s" % ex)
+
+    def _resolve_password(self, hv, templar, become=False):
+        keys = (("ansible_become_password", "ansible_become_pass", "ansible_sudo_pass")
+                if become else
+                ("ansible_password", "ansible_ssh_password", "ansible_ssh_pass"))
+        for k in keys:
+            v = hv.get(k)
+            if v is None:
+                continue
+            try:
+                tv = templar.template(v) if templar is not None else v
+            except Exception:
+                tv = v
+            if isinstance(tv, str) and tv:
+                return tv
+            if tv is not None:
+                try:
+                    s = str(tv)
+                    if s and "AnsibleVault" not in s:
+                        return s
+                except Exception:
+                    pass
+        return None
+
+    def _resolve_become_password(self, hv, templar):
+        # Prefer explicit become creds; many setups reuse the connection password.
+        return (self._resolve_password(hv, templar, become=True)
+                or self._resolve_password(hv, templar, become=False))
+
+    def _mk_templar(self, hv):
+        try:
+            from ansible.template import Templar
+            return Templar(loader=self._loader, variables=hv)
+        except Exception:
+            return None
+
+    def _t(self, templar, value):
+        """Template a single value against the host's vars (controller-side)."""
+        if templar is None or not isinstance(value, str) or "{{" not in value:
+            return value
+        try:
+            return templar.template(value)
+        except Exception:
+            return value
+
+    def _resolve_connection(self, host, play_context, hv, templar=None):
+        conn = self._t(templar, hv.get("ansible_connection"))
+        if not isinstance(conn, str) or not conn:
+            play_conn = self._t(templar, getattr(self._cur_play, "connection", None))
+            conn = play_conn if isinstance(play_conn, str) else None
+        if not conn:
+            pc_conn = getattr(play_context, "connection", None)
+            conn = pc_conn if isinstance(pc_conn, str) else None
+        if not conn or conn == "smart":
+            conn = "ssh"
+        return conn
+
+    # ---- result replay ---------------------------------------------------
+    def _emit_task_start(self, frame, task_map, seen):
+        task_key = frame.get("runtime_id") or frame.get("uuid")
+        task = task_map.get(task_key)
+        if task is None or task_key in seen:
+            if task is None and frame.get("action") != "meta":
+                display.warning(
+                    "ansiroll: no controller task mapping for %s (%s)"
+                    % (frame.get("task") or frame.get("action"), task_key)
+                )
+            return False
+        seen.add(task_key)
+        self._tqm.send_callback("v2_playbook_on_task_start", task, is_conditional=False)
+        return True
+
+    def _emit_frame(self, host, frame, task_map, seen, templar=None):
+        task_key = frame.get("runtime_id") or frame.get("uuid")
+        task = task_map.get(task_key)
+        if task is None:
+            display.warning(
+                "ansiroll: dropping result without controller task mapping for %s (%s)"
+                % (frame.get("task") or frame.get("action"), task_key)
+            )
+            return False
+        if task_key not in seen:
+            self._emit_task_start(frame, task_map, seen)
+
+        status = frame.get("status")
+        result_data = frame.get("result", {})
+        # Mirror registered vars and facts into the variable manager so they
+        # survive into subsequent plays (each play runs a fresh agent).
+        try:
+            registers = _register_names(task)
+            if registers and not frame.get("is_item"):
+                self._variable_manager.set_nonpersistent_facts(
+                    host.name, {reg: dict(result_data) for reg in registers}
+                )
+            facts = result_data.get("ansible_facts")
+            is_set_fact = (
+                str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+                == "set_fact"
+            )
+            cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
+            if isinstance(facts, dict):
+                # Match StrategyBase: cacheable set_fact results populate the
+                # persistent fact cache, while every set_fact result also gets
+                # the higher-precedence nonpersistent host-var copy.
+                if not is_set_fact or cacheable:
+                    self._variable_manager.set_host_facts(
+                        host.name, dict(facts)
+                    )
+                if is_set_fact:
+                    self._variable_manager.set_nonpersistent_facts(
+                        host.name, dict(facts)
+                    )
+
+            # Linear shares a run_once task's registered result and facts with
+            # every host in the current batch.  Hosts are launched in order, so
+            # later agents receive this state in their initial variable snapshot.
+            run_once = getattr(task, "run_once", None)
+            if isinstance(run_once, str) and templar is not None:
+                run_once = self._t(templar, run_once)
+            if _truthy(run_once) and not frame.get("is_item"):
+                for other in getattr(self, "_run_hosts", ()):
+                    if other.name == host.name:
+                        continue
+                    if registers:
+                        self._variable_manager.set_nonpersistent_facts(
+                            other.name,
+                            {reg: dict(result_data) for reg in registers},
+                        )
+                    if isinstance(facts, dict):
+                        if not is_set_fact or cacheable:
+                            self._variable_manager.set_host_facts(
+                                other.name, dict(facts)
+                            )
+                        if is_set_fact:
+                            self._variable_manager.set_nonpersistent_facts(
+                                other.name, dict(facts)
+                            )
+        except Exception:
+            pass
+        tr = self._make_result(host, task, result_data)
+        is_item = frame.get("is_item")
+        ignored = frame.get("ignored")
+
+        method = _callback_for(status, is_item)
+        if status == "failed" and not is_item:
+            self._tqm.send_callback(method, tr, ignore_errors=ignored)
+            return not ignored
+        self._tqm.send_callback(method, tr)
+        return False
+
+    def _make_result(self, host, task, result_data):
+        result_data = dict(result_data)
+        # 2.19+ callbacks expect a structured error summary. Reconstruct one
+        # from the agent's plain result so native-style diagnostics (including
+        # task source context) are retained.
+        if result_data.get("failed") and not _is_structured_error(
+                result_data.get("exception")):
+            summary = _failure_summary(task, result_data.get("msg"))
+            if summary is not None:
+                result_data["exception"] = summary
+            else:
+                result_data.pop("exception", None)
+        elif isinstance(result_data.get("exception"), str):
+            result_data.pop("exception")
+        # Same for deprecations: the agent forwards plain dicts, which the
+        # 2.19+ default callback cannot render; degrade them to warnings.
+        def summary_message(value):
+            if not isinstance(value, dict):
+                return str(value)
+            if value.get("msg"):
+                return str(value["msg"])
+            event = value.get("event")
+            if isinstance(event, dict) and event.get("msg"):
+                return str(event["msg"])
+            return str(value)
+
+        # Serialized module warnings/deprecations are plain dictionaries by
+        # the time they cross the agent channel.  New callbacks expect typed
+        # summary objects and otherwise abort before printing the normal ok
+        # line; older callbacks receive the string fallback below.
+        raw_warnings = result_data.pop("warnings", []) or []
+        raw_deprecations = result_data.pop("deprecations", []) or []
+        try:
+            from ansible.module_utils._internal._messages import (
+                DeprecationSummary, Event, WarningSummary,
+            )
+            if raw_warnings:
+                result_data["warnings"] = [
+                    WarningSummary(event=Event(msg=summary_message(w)))
+                    for w in raw_warnings
+                ]
+            if raw_deprecations:
+                result_data["deprecations"] = [
+                    DeprecationSummary(
+                        event=Event(msg=summary_message(dep)),
+                        date=dep.get("date") if isinstance(dep, dict) else None,
+                        version=dep.get("version") if isinstance(dep, dict) else None,
+                    )
+                    for dep in raw_deprecations
+                ]
+        except Exception:  # older ansible-core uses strings/dicts here
+            warnings = [summary_message(w) for w in raw_warnings]
+            warnings.extend(
+                "[DEPRECATION WARNING]: %s" % summary_message(dep)
+                for dep in raw_deprecations
+            )
+            if warnings:
+                result_data["warnings"] = warnings
+        if _UnifiedTaskResult is not None:
+            unified = _UnifiedTaskResult.from_action_result_dict(dict(result_data))
+            return _ResultClass(host, task, unified)
+        try:
+            return _ResultClass(host, task, dict(result_data), task.dump_attrs())
+        except TypeError:
+            # Older signature: TaskResult(host, task, return_data)
+            return _ResultClass(host, task, dict(result_data))
+
+    def _apply_stats(self, host, stats):
+        # Accumulate: run() is invoked once per play and the recap covers all.
+        # Linear does not add a host to PLAY RECAP when tag filtering leaves a
+        # play with no reportable tasks.  Avoid manufacturing an all-zero row.
+        if not any(stats.get(key, 0) for key in (
+            "ok", "changed", "failures", "skipped", "unreachable",
+            "rescued", "ignored",
+        )):
+            return
+        st = self._tqm._stats
+        name = host.name
+        st.processed[name] = 1
+        st.ok[name] = st.ok.get(name, 0) + stats.get("ok", 0) + stats.get("changed", 0)
+        st.changed[name] = st.changed.get(name, 0) + stats.get("changed", 0)
+        st.failures[name] = st.failures.get(name, 0) + stats.get("failures", 0)
+        st.skipped[name] = st.skipped.get(name, 0) + stats.get("skipped", 0)
+        st.dark[name] = st.dark.get(name, 0) + stats.get("unreachable", 0)
+        if hasattr(st, "rescued"):
+            st.rescued[name] = st.rescued.get(name, 0) + stats.get("rescued", 0)
+        if hasattr(st, "ignored"):
+            st.ignored[name] = st.ignored.get(name, 0) + stats.get("ignored", 0)
+
+    def _drain_iterator(self, host, iterator):
+        # Advance host state to COMPLETE; tasks already ran inside the compiled file.
+        guard = 0
+        while guard < 10000:
+            state, task = iterator.get_next_task_for_host(host)
+            if task is None:
+                break
+            guard += 1
+
+
+def _register_names(task):
+    """Return legacy and 2.21 register-projection variable names."""
+    value = getattr(task, "register", None)
+    if isinstance(value, dict):
+        return [str(name) for name in value]
+    return [str(value)] if value else []
+
+
+def _controller_fallbacks(play_node):
+    found = []
+
+    def walk(nodes):
+        for node in nodes or []:
+            if node.get("type") == "block":
+                walk(node.get("block"))
+                walk(node.get("rescue"))
+                walk(node.get("always"))
+                continue
+            if node.get("type") == "include":
+                walk(node.get("tasks"))
+            if node.get("fallback"):
+                found.append({
+                    "kind": "controller-fallback",
+                    "task": node.get("name") or node.get("action"),
+                    "reason": node.get("fallback_reason")
+                              or "controller fallback",
+                })
+            if node.get("delegate_to"):
+                found.append({
+                    "kind": "delegate",
+                    "task": node.get("name") or node.get("action"),
+                    "reason": "delegate_to %s" % node.get("delegate_to"),
+                })
+
+    walk(play_node.get("tasks"))
+    walk(play_node.get("handlers"))
+    return found
+
+
+def _is_structured_error(value):
+    return value is not None and not isinstance(value, (str, dict))
+
+
+def _failure_summary(task, message):
+    try:
+        from ansible.module_utils._internal._messages import ErrorSummary, Event
+    except Exception:
+        return None
+    message = str(message or "Task failed")
+    if message.startswith("Task failed"):
+        event_message = message
+    else:
+        event_message = "Task failed: Action failed: %s" % message
+    return ErrorSummary(event=Event(
+        msg=event_message,
+        formatted_source_context=_task_source_context(task),
+    ))
+
+
+def _task_source_context(task):
+    try:
+        task_path = str(task.get_path())
+    except Exception:
+        return None
+    match = __import__("re").match(r"^(.*):(\d+)$", task_path)
+    if not match:
+        return None
+    path, line_text = match.groups()
+    line = int(line_text)
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as source:
+            lines = source.read().splitlines()
+    except OSError:
+        return None
+    start = max(1, line - 2)
+    excerpt = "\n".join(
+        "%d %s" % (number, lines[number - 1])
+        for number in range(start, min(line, len(lines)) + 1)
+    )
+    return "Origin: %s:%d\n\n%s" % (path, line, excerpt)
+
+
+def _callback_for(status, is_item):
+    if is_item:
+        return {
+            "ok": "v2_runner_item_on_ok",
+            "changed": "v2_runner_item_on_ok",
+            "failed": "v2_runner_item_on_failed",
+            "skipped": "v2_runner_item_on_skipped",
+        }.get(status, "v2_runner_item_on_ok")
+    return {
+        "ok": "v2_runner_on_ok",
+        "changed": "v2_runner_on_ok",
+        "failed": "v2_runner_on_failed",
+        "skipped": "v2_runner_on_skipped",
+        "unreachable": "v2_runner_on_unreachable",
+    }.get(status, "v2_runner_on_ok")
+
+
+def _first_str(*values):
+    """Return the first value that is a non-empty plain string (ignores Sentinel)."""
+    for v in values:
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def _truthy(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extra_vars(variable_manager):
+    for attr in ("extra_vars", "_extra_vars"):
+        value = getattr(variable_manager, attr, None)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _json_blob(values):
+    # hostvars/vars are live controller objects that stringify uselessly; the
+    # agent synthesizes ``vars``. Materialize hostvars without their recursive
+    # magic members so cross-host templates remain available to delegated
+    # controller actions.
+    if isinstance(values, dict):
+        hostvars = values.get("hostvars")
+        values = {k: v for k, v in values.items() if k not in ("hostvars", "vars")}
+        snapshot = _hostvars_snapshot(hostvars)
+        if snapshot:
+            values["hostvars"] = snapshot
+    try:
+        return json.dumps(values, default=str)
+    except Exception:
+        safe = {}
+        for k, v in (values or {}).items():
+            try:
+                json.dumps(v, default=str)
+                safe[k] = v
+            except Exception:
+                pass
+        return json.dumps(safe, default=str)
+
+
+def _hostvars_snapshot(hostvars):
+    if hostvars is None:
+        return {}
+    out = {}
+    try:
+        names = list(hostvars)
+    except Exception:
+        return out
+    for name in names:
+        try:
+            source = dict(hostvars[name])
+        except Exception:
+            continue
+        safe = {}
+        for key, value in source.items():
+            if key in ("hostvars", "vars"):
+                continue
+            try:
+                json.dumps(value, default=str)
+            except (TypeError, ValueError):
+                continue
+            safe[key] = value
+        out[str(name)] = safe
+    return out
+
+
+def _build_ssh_command(conn, remote):
+    build = conn._build_command
+    host = _conn_option(conn, "host")
+    if not host:
+        host = getattr(getattr(conn, "_play_context", None), "remote_addr", None)
+    if not host:
+        host = getattr(conn, "host", None)
+    ssh_executable = _conn_option(conn, "ssh_executable")
+    if not ssh_executable:
+        ssh_executable = getattr(getattr(conn, "_play_context", None), "ssh_executable", None)
+    if not ssh_executable:
+        ssh_executable = "ssh"
+    try:
+        params = inspect.signature(build).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "subsystem" in params:
+        return build(ssh_executable, "ssh", host, remote)
+    return build("ssh", host, remote)
+
+
+def _conn_option(conn, name):
+    try:
+        return conn.get_option(name)
+    except Exception:
+        return None
+
+
+def _drop_omit_values(value):
+    if isinstance(value, dict):
+        return {
+            key: _drop_omit_values(item)
+            for key, item in value.items()
+            if not (isinstance(item, str)
+                    and item.startswith("__omit_place_holder__"))
+        }
+    if isinstance(value, list):
+        return [_drop_omit_values(item) for item in value]
+    return value
+
+
+class _Channel:
+    """A persistent bidirectional length-prefixed frame channel to an agent process
+    (local python or ssh-to-remote-python). Frame 1 out is the agent source; after
+    that it's JSON frames both ways."""
+
+    def __init__(self, argv, pass_fds=()):
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, bufsize=0, pass_fds=pass_fds)
+
+    def send_blob(self, text):
+        self._write(text.encode("utf-8", "surrogateescape"))
+
+    def send(self, obj):
+        self._write(json.dumps(obj, default=str).encode("utf-8", "surrogateescape"))
+
+    def _write(self, b):
+        self.proc.stdin.write(struct.pack(">I", len(b)))
+        self.proc.stdin.write(b)
+        self.proc.stdin.flush()
+
+    def recv(self):
+        head = _readn(self.proc.stdout, 4)
+        if not head:
+            return None
+        (n,) = struct.unpack(">I", head)
+        body = _readn(self.proc.stdout, n)
+        if body is None:
+            return None
+        try:
+            return json.loads(body.decode("utf-8", "surrogateescape"))
+        except Exception:
+            return None
+
+    def stderr(self):
+        try:
+            return (self.proc.stderr.read() or b"").decode("utf-8", "surrogateescape").strip()
+        except Exception:
+            return ""
+
+    def close(self):
+        for f in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+            try:
+                f.close()
+            except Exception:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+def _readn(stream, n):
+    chunks = []
+    got = 0
+    while got < n:
+        c = stream.read(n - got)
+        if not c:
+            return None
+        chunks.append(c)
+        got += len(c)
+    return b"".join(chunks)
