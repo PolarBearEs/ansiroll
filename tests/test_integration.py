@@ -1685,7 +1685,7 @@ def test_strategy_native_only_rejects_controller_fallback(tmp_path):
 
     assert proc.returncode != 0
     assert "native-only mode rejected play" in proc.stderr
-    assert "delegate_to localhost" in proc.stderr
+    assert "delegate_to localhost" in " ".join(proc.stderr.split())
 
 
 def test_strategy_reports_native_and_ansiballz_provenance(tmp_path):

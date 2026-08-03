@@ -161,6 +161,10 @@ class StrategyModule(StrategyBase):
             )
             # Keep this instance's result thread and queue caches; constructing
             # a second strategy would make both consumers race on the TQM queue.
+            # ansible-core 2.14's linear strategy adds this state in its own
+            # constructor, which this deliberately reused instance never runs.
+            if not hasattr(self, "_in_handlers"):
+                self._in_handlers = False
             self.__class__ = LinearStrategy
             return LinearStrategy.run(self, iterator, play_context)
         self._emit_provenance({
@@ -778,11 +782,16 @@ class StrategyModule(StrategyBase):
             v = _first_str(*[self._t(templar, hv.get(k)) for k in keys])
             if v is not None:
                 direct[opt] = v
+            return v
 
         if conn_type == "ssh":
-            setopt("private_key_file", "ansible_ssh_private_key_file", "ansible_private_key_file")
-            setopt("ssh_common_args", "ansible_ssh_common_args")
-            setopt("ssh_extra_args", "ansible_ssh_extra_args")
+            private_key = setopt(
+                "private_key_file",
+                "ansible_ssh_private_key_file",
+                "ansible_private_key_file",
+            )
+            ssh_common_args = setopt("ssh_common_args", "ansible_ssh_common_args")
+            ssh_extra_args = setopt("ssh_extra_args", "ansible_ssh_extra_args")
             setopt("ssh_args", "ansible_ssh_args")
             pw = self._resolve_password(hv, templar)
             if pw is not None:
@@ -793,6 +802,22 @@ class StrategyModule(StrategyBase):
                     direct["port"] = int(self._t(templar, port) if isinstance(port, str) else port)
                 except Exception:
                     pass
+            # ansible-base 2.10's SSH command builder reads these settings
+            # directly from PlayContext instead of the plugin option store.
+            # Keep both representations populated so its command includes the
+            # configured identity, port, and host-key options.
+            old_context_options = {
+                "private_key_file": private_key,
+                "ssh_common_args": ssh_common_args,
+                "ssh_extra_args": ssh_extra_args,
+                "port": direct.get("port"),
+            }
+            for attr, value in old_context_options.items():
+                if value is not None:
+                    try:
+                        setattr(conn._play_context, attr, value)
+                    except Exception:
+                        pass
         try:
             # var_options lets the plugin resolve any options we didn't set explicitly;
             # direct (templated) wins for the connection-critical ones.
