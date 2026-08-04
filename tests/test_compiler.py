@@ -84,7 +84,7 @@ def test_deterministic_zip_has_stable_bytes_and_metadata():
                    for info in archive.infolist())
 
 
-def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
+def test_generated_agent_bundles_template_runtimes_for_stdlib_only_target(tmp_path):
     agent = tmp_path / "agent.py"
     agent.write_text(_render_source([], {}, ""))
     env = dict(os.environ)
@@ -95,7 +95,10 @@ def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
         "(_ for _ in ()).throw(RuntimeError('temporary files forbidden')); "
         "ns = runpy.run_path(sys.argv[1]); "
         "print(ns['jinja2'].__version__); "
-        "print(ns['_Templater']().render_string('hello {{ name }}', {'name': 'world'}))"
+        "print(ns['_yaml_module']().__version__); "
+        "print(ns['_yaml_module']().__with_libyaml__); "
+        "print(ns['_Templater']().render_string('hello {{ name }}', {'name': 'world'})); "
+        "print(ns['_f_from_yaml']('enabled: true\\nitems:\\n  - one\\n  - two'))"
     )
 
     proc = subprocess.run(
@@ -106,7 +109,13 @@ def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.splitlines() == ["2.11.3", "hello world"]
+    assert proc.stdout.splitlines() == [
+        "2.11.3",
+        "5.3.1",
+        "False",
+        "hello world",
+        "{'enabled': True, 'items': ['one', 'two']}",
+    ]
 
 
 def test_accelerator_classification_is_compile_time_when_possible():

@@ -270,20 +270,34 @@ def _f_flatten(seq, levels=None):
     return out
 
 
-def _f_to_yaml(v, **kwargs):
+def _yaml_module():
+    """Load Ansiroll's private, pure-Python YAML implementation.
+
+    Generated agents get it from the in-memory import bundle.  Importing the
+    source package directly falls back to the shipped ZIP without consulting a
+    target's system PyYAML installation.
+    """
     try:
-        import yaml
-        return yaml.safe_dump(v, default_flow_style=False)
-    except Exception:
-        return json.dumps(v)
+        import ansiroll_yaml
+        return ansiroll_yaml
+    except ImportError:
+        bundle = os.path.join(
+            os.path.dirname(__file__), "vendor", "pyyaml-py35.zip"
+        )
+        if os.path.isfile(bundle) and bundle not in sys.path:
+            sys.path.insert(0, bundle)
+        import ansiroll_yaml
+        return ansiroll_yaml
+
+
+def _f_to_yaml(v, **kwargs):
+    options = dict(kwargs)
+    options.setdefault("default_flow_style", False)
+    return _yaml_module().safe_dump(v, **options)
 
 
 def _f_from_yaml(v):
-    try:
-        import yaml
-        return yaml.safe_load(v)
-    except Exception:
-        return json.loads(v)
+    return _yaml_module().safe_load(v)
 
 
 def _f_union(a, b):

@@ -17,3 +17,18 @@ Upstream artifacts used to build it:
 
 The generated archive's SHA-256 is
 `ece6ccf6bbf11e7a27d10e7d0ad937934212d9bc497db1ab2a0649a463937d40`.
+
+`pyyaml-py35.zip` contains the pure-Python sources from PyYAML 5.3.1,
+stored under the private import name `ansiroll_yaml`. PyYAML 5.3.1 is the last
+release line supporting Python 3.5. The runtime exposes only its safe loader and
+dumper APIs for Ansible's YAML filters. The archive includes the upstream MIT
+license.
+
+Upstream artifact used to build it:
+
+- `PyYAML-5.3.1.tar.gz` (SHA-256
+  `b8eac752c5e14d3eca0e6dd9199cd627518cb5ec06add0de9d32baeee6fe645d`)
+
+Rebuild it with `python3 tools/build_vendor_yaml.py`. The generated archive's
+SHA-256 is
+`bda4e7b81d96fdce9999770570c34fbc07209d5182c1d6cc468d3236898fcc82`.

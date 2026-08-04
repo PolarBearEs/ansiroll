@@ -30,6 +30,9 @@ _WORKER_PATH = os.path.join(os.path.dirname(__file__), "worker.py")
 _JINJA_BUNDLE_PATH = os.path.join(
     os.path.dirname(__file__), "vendor", "jinja2-py35.zip"
 )
+_YAML_BUNDLE_PATH = os.path.join(
+    os.path.dirname(__file__), "vendor", "pyyaml-py35.zip"
+)
 _ACCELERATED_MODULES_PATH = os.path.join(
     os.path.dirname(__file__), "accelerated_modules"
 )
@@ -642,11 +645,16 @@ def _externalize_assets(value, assets):
 
 def _base_import_entries():
     entries = {}
-    with zipfile.ZipFile(_JINJA_BUNDLE_PATH, "r") as archive:
-        for info in archive.infolist():
-            if not info.is_dir():
-                _add_import_entry(entries, info.filename,
-                                  archive.read(info.filename), "Jinja bundle")
+    for path, origin in (
+        (_JINJA_BUNDLE_PATH, "Jinja bundle"),
+        (_YAML_BUNDLE_PATH, "YAML bundle"),
+    ):
+        with zipfile.ZipFile(path, "r") as archive:
+            for info in archive.infolist():
+                if not info.is_dir():
+                    _add_import_entry(
+                        entries, info.filename, archive.read(info.filename), origin
+                    )
     # Generated agents import accelerators lazily from the same shared ZIP.
     # Use a minimal package root: the controller's ansiroll.__init__ imports
     # compiler dependencies which intentionally do not exist on the target.

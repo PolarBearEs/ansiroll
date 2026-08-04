@@ -2,7 +2,7 @@
 
 import pytest
 
-from ansiroll.runtime import _Templater, _UnsafeTemplate
+from ansiroll.runtime import _Templater, _UnsafeTemplate, _yaml_module
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +39,41 @@ def test_filters(t, expr, ctx, expected):
 def test_b64_roundtrip(t):
     enc = render(t, "{{ s | b64encode }}", s="hello world")
     assert render(t, "{{ s | b64decode }}", s=enc) == "hello world"
+
+
+def test_yaml_filters_parse_and_emit_real_yaml(t):
+    assert _yaml_module().__version__ == "5.3.1"
+    assert _yaml_module().__with_libyaml__ is False
+    parsed = render(
+        t,
+        "{{ value | from_yaml }}",
+        value="enabled: true\nitems:\n  - one\n  - two\nempty: null\n",
+    )
+    assert parsed == {"enabled": True, "items": ["one", "two"], "empty": None}
+
+    emitted = render(t, "{{ value | to_yaml }}", value={"items": ["one", "two"]})
+    assert "items:" in emitted
+    assert "- one" in emitted
+    assert render(t, "{{ value | from_yaml }}", value=emitted) == {
+        "items": ["one", "two"]
+    }
+
+    nice = render(t, "{{ value | to_nice_yaml(indent=4) }}", value={
+        "nested": {"enabled": True}
+    })
+    assert "nested:" in nice and "    enabled: true" in nice
+
+
+def test_from_yaml_uses_the_safe_loader(t, tmp_path):
+    marker = tmp_path / "unsafe-yaml-ran"
+    expression = "{{ value | from_yaml }}"
+    value = "!!python/object/apply:pathlib.Path.touch ['%s']" % marker
+
+    result = render(t, expression, value=value)
+
+    import jinja2
+    assert isinstance(result, jinja2.Undefined)
+    assert not marker.exists()
 
 
 def test_to_uuid_stable(t):

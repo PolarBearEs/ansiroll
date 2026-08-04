@@ -19,6 +19,9 @@ playbook into one self-contained artifact and rolls that artifact out to hosts.
    Base64-encoded inside the generated Python source, then decoded and imported
    in memory;
    Ansiroll does not write or extract them to temporary files on the target.
+   The import bundle includes private pure-Python Jinja2 and YAML runtimes, so
+   filters such as `from_yaml`, `to_yaml`, and `to_nice_yaml` do not depend on
+   target packages.
 2. **Run.** A tiny interpreter (`ansiroll/runtime.py`, inlined into the output)
    templates args/conditions, evaluates `when`, expands `loop`, runs the embedded
    modules as subprocesses, tracks `register`/facts, runs handlers, and emits one
@@ -271,8 +274,9 @@ See `PLAN.md` for the full design and rationale.
 ## License and generated artifacts
 
 Ansiroll's original source code is available under the [MIT License](LICENSE).
-The bundled Jinja2 and MarkupSafe sources retain their respective BSD licenses;
-their license texts are included in `ansiroll/vendor/jinja2-py35.zip`.
+The bundled Jinja2 and MarkupSafe sources retain their respective BSD licenses,
+and the bundled PyYAML sources retain their MIT license. Their license texts are
+included in the corresponding archives under `ansiroll/vendor/`.
 
 Compiled agents may contain modules and supporting code sourced from the
 installed Ansible distribution. Those embedded components remain subject to
