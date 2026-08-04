@@ -85,9 +85,8 @@ if __name__ == "__main__":
     _sys.exit(main(PLAYS, MODULES, ANSIBALLZ_CODE, host_vars=_host_vars,
                    become_password=_become_pass, extra_vars=_extra_vars,
                    pretty=_pretty, profile=_profile, native_only=_native_only,
-                   module_bundle=_ANSIROLL_IMPORT_BUNDLE,
+                   module_bundle=_ansiroll_import_bytes,
                    resource_reader=_ansiroll_resource_read,
-                   module_bundle_bytes=_ansiroll_import_bytes,
                    engine_bootstrap=_ANSIROLL_BOOTSTRAP_SECONDS))
 '''
 
@@ -729,8 +728,8 @@ import io as _bundle_io
 import sys as _bundle_sys
 import zipfile as _bundle_zipfile
 
-_ANSIROLL_IMPORT_BUNDLE = %r
-_ansiroll_import_bytes = _bundle_base64.b64decode(_ANSIROLL_IMPORT_BUNDLE)
+_ANSIROLL_IMPORT_BUNDLE_B64 = %r
+_ansiroll_import_bytes = _bundle_base64.b64decode(_ANSIROLL_IMPORT_BUNDLE_B64)
 
 class _AnsirollImportBundle(_bundle_importlib_abc.MetaPathFinder,
                               _bundle_importlib_abc.Loader):

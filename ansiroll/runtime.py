@@ -1132,8 +1132,7 @@ class Runtime:
                  check_mode=False, diff_mode=False, on_result=None, become_password=None, profile=False,
                  extra_vars=None, skip_run_once=False, pretty=False,
                  module_bundle=None, resource_reader=None,
-                 module_bundle_bytes=None, host_var_overrides=None,
-                 native_only=False):
+                 host_var_overrides=None, native_only=False):
         self.modules = modules
         self.vars = dict(host_vars or {})
         self.python = python or sys.executable
@@ -1167,7 +1166,6 @@ class Runtime:
         self.skip_run_once = bool(skip_run_once)
         self.pretty = bool(pretty)
         self.module_bundle = module_bundle
-        self.module_bundle_bytes = module_bundle_bytes
         self.resource_reader = resource_reader
         self.accelerated_modules = _accelerated_module_names()
         self._pretty_last_uuid = None
@@ -2706,7 +2704,7 @@ class Runtime:
         if fqn not in w["loaded"]:
             load_started = time.monotonic()
             req = {"op": "load", "fqn": fqn, "profile": profile}
-            if not (self.module_bundle or self.module_bundle_bytes):
+            if self.module_bundle is None:
                 req["zip"] = meta["zip"]
             self._frame_send(w["proc"], req)
             ack = self._frame_recv(w["proc"])
@@ -2743,7 +2741,7 @@ class Runtime:
         profile = meta.get("profile", "legacy")
         if fqn not in w["loaded"]:
             req = {"op": "load", "fqn": fqn, "profile": profile}
-            if not (self.module_bundle or self.module_bundle_bytes):
+            if self.module_bundle is None:
                 req["zip"] = meta["zip"]
             self._frame_send(w["proc"], req)
             ack = self._frame_recv(w["proc"])
@@ -2821,10 +2819,10 @@ class Runtime:
         identity = "sudo:%s" % self.become_user if become else "current-user"
         w = {"proc": proc, "loaded": set(), "identity": identity}
         bundle_started = time.monotonic()
-        if self.module_bundle_bytes is not None:
-            bundle_bytes = self.module_bundle_bytes
+        if self.module_bundle is not None:
+            bundle_bytes = self.module_bundle
             self._frame_send(proc, {
-                "op": "bundle_bytes", "size": len(bundle_bytes),
+                "op": "bundle", "size": len(bundle_bytes),
             })
             proc.stdin.write(bundle_bytes)
             proc.stdin.flush()
@@ -2835,18 +2833,6 @@ class Runtime:
                 except Exception:
                     pass
                 raise RuntimeError("worker raw bundle load failed: %r" % (ack,))
-        elif self.module_bundle:
-            bundle = self.module_bundle
-            if isinstance(bundle, bytes):
-                bundle = bundle.decode("ascii")
-            self._frame_send(proc, {"op": "bundle", "bundle": bundle})
-            ack = self._frame_recv(proc)
-            if not isinstance(ack, dict) or not ack.get("ok"):
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                raise RuntimeError("worker bundle load failed: %r" % (ack,))
         self.engine_profile["worker_bundle"] += time.monotonic() - bundle_started
         self.engine_profile["workers_started"] += 1
         identities = self.engine_profile.setdefault("worker_identities", {})
@@ -3030,8 +3016,7 @@ def _hostname():
 def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_mode=False,
          become_password=None, defer_handlers=False, initial_notified=None,
          extra_vars=None, pretty=False, profile=False, module_bundle=None,
-         resource_reader=None, module_bundle_bytes=None,
-         engine_bootstrap=None, native_only=False):
+         resource_reader=None, engine_bootstrap=None, native_only=False):
     runtime_started = time.monotonic()
     host_vars = dict(host_vars or {})
     failed = False
@@ -3064,7 +3049,6 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      become_password=become_password, extra_vars=extra_vars,
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
-                     module_bundle_bytes=module_bundle_bytes,
                      native_only=native_only)
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
@@ -3331,9 +3315,8 @@ def agent_main():
                  host_var_overrides=host_var_overrides,
                  native_only=native_only,
                  skip_run_once=skip_run_once,
-                 module_bundle=g.get("_ANSIROLL_IMPORT_BUNDLE"),
-                 resource_reader=g.get("_ansiroll_resource_read"),
-                 module_bundle_bytes=g.get("_ansiroll_import_bytes"))
+                 module_bundle=g.get("_ansiroll_import_bytes"),
+                 resource_reader=g.get("_ansiroll_resource_read"))
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     if not delegate_on_target:

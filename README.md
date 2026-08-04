@@ -16,9 +16,8 @@ playbook into one self-contained artifact and rolls that artifact out to hosts.
    and builds a shared import bundle from every referenced AnsiballZ payload.
    Modules and `module_utils` are stored once by import path; baked files and
    templates are content-addressed in a separate data bundle. Both bundles are
-   Base64-encoded inside the generated Python source. Base64 is slightly larger
-than Base85, but its C-backed decoder materially reduces startup time on
-older target systems. Both ZIP bundles are decoded and imported in memory;
+   Base64-encoded inside the generated Python source, then decoded and imported
+   in memory;
    Ansiroll does not write or extract them to temporary files on the target.
 2. **Run.** A tiny interpreter (`ansiroll/runtime.py`, inlined into the output)
    templates args/conditions, evaluates `when`, expands `loop`, runs the embedded

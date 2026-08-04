@@ -132,17 +132,12 @@ def _send(obj):
     os.write(_RESP, b)
 
 
-def _load_zip(zip_text, encoding="base64"):
-    data = (
-        base64.b85decode(zip_text)
-        if encoding == "base85"
-        else base64.b64decode(zip_text)
-    )
-    _load_zip_bytes(data)
-
-
 def _load_zip_bytes(data):
     sys.meta_path.insert(0, _MemZip(data))
+
+
+def _load_zip_base64(data):
+    _load_zip_bytes(base64.b64decode(data))
 
 
 def _memfd_source(params, data):
@@ -359,17 +354,6 @@ def main():
         op = req.get("op")
         if op == "bundle":
             try:
-                _load_zip(req["bundle"], "base85")
-                _install_legacy_finder_adapters()
-                try:
-                    __import__("ansible.module_utils.basic")
-                except Exception:
-                    pass
-                _send({"ok": True})
-            except Exception as e:
-                _send({"ok": False, "error": repr(e)})
-        elif op == "bundle_bytes":
-            try:
                 bundle_bytes = _readn(req["size"])
                 if bundle_bytes is None:
                     raise EOFError("worker bundle bytes ended early")
@@ -385,7 +369,7 @@ def main():
         elif op == "load":
             try:
                 if req.get("zip"):
-                    _load_zip(req["zip"])
+                    _load_zip_base64(req["zip"])
                 _install_legacy_finder_adapters()
                 try:
                     __import__("ansible.module_utils.basic")  # precompile once

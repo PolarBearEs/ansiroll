@@ -940,7 +940,7 @@ def test_worker_reuses_module_and_writes_nothing():
 def test_worker_loads_accelerator_from_shared_memory_bundle(tmp_path):
     import_bundle, _, _ = _build_bundles([], {})
     rt = Runtime({}, "", {"inventory_hostname": "localhost"},
-                 module_bundle=base64.b85encode(import_bundle))
+                 module_bundle=import_bundle)
     path = tmp_path / "from-worker"
     try:
         res = rt._run_worker_accelerated(
@@ -957,7 +957,7 @@ def test_worker_runs_accelerated_apt_from_shared_memory_bundle():
     import_bundle, _, _ = _build_bundles([], {})
     rt = Runtime(
         {}, "", {"inventory_hostname": "localhost"},
-        module_bundle=base64.b85encode(import_bundle),
+        module_bundle=import_bundle,
     )
     try:
         result = rt._run_worker_accelerated(
@@ -982,8 +982,7 @@ def test_worker_accepts_decoded_import_bundle_bytes():
     import_bundle, _, _ = _build_bundles([], {"command": meta})
     rt = Runtime(
         {"command": meta}, "", {"inventory_hostname": "localhost"},
-        module_bundle=b"invalid-if-raw-transfer-is-not-used",
-        module_bundle_bytes=import_bundle,
+        module_bundle=import_bundle,
     )
     try:
         res = rt.run_module("command", {"_raw_params": "printf raw-bundle"})
