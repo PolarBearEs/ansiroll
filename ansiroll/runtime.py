@@ -2561,6 +2561,15 @@ class Runtime:
         """ansible.builtin.async_status action plugin around its module."""
         options = options or {}
         version = tuple(options.get("version", (2, 21)))
+        unsupported = sorted(set(args) - {"jid", "mode"})
+        if unsupported:
+            if version >= (2, 13):
+                msg = ("Unsupported parameters for (%s) module: %s. "
+                       "Supported parameters include: jid, mode." %
+                       (action, ", ".join(unsupported)))
+            else:
+                msg = "Invalid options for %s: %s" % (action, ",".join(unsupported))
+            return {"failed": True, "changed": False, "msg": msg}
         async_dir = self._async_dir_option(ctx, options, version)
         module_args = dict(args, _async_dir=async_dir)
         if version < (2, 12):

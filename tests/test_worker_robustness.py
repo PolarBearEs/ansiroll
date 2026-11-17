@@ -111,6 +111,23 @@ def test_module_children_read_eof_stdin_like_ansible(tmp_path):
     _run_both(tmp_path, STDIN_PLAY, timeout=60)
 
 
+def test_async_status_rejects_internal_directory_argument(tmp_path):
+    _run_both(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - async_status:
+        jid: test
+        _async_dir: "@JOBS@"
+      ignore_errors: true
+      register: status_result
+    - assert:
+        that:
+          - status_result is failed
+          - "'_async_dir' in status_result.msg"
+""")
+
+
 def _worker_runtime(action):
     meta = ModuleEmbedder().embed(action)
     return Runtime({action: meta}, "", {"inventory_hostname": "localhost"})
