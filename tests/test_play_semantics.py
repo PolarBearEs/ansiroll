@@ -48,12 +48,19 @@ def _summary(text):
     return MSG_RE.findall(text), recap.groups()
 
 
+def _ansible_playbook():
+    # Use the ansible-core that compiles the playbook (same interpreter), not
+    # whichever ansible-playbook happens to be first on PATH.
+    local = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
+    return local if os.path.exists(local) else "ansible-playbook"
+
+
 def _ansible(base, args, strategy=None):
     env = _env()
     if strategy:
         env["ANSIBLE_STRATEGY"] = strategy
     out = subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", "-c", "local", "pb.yml"] + args,
+        [_ansible_playbook(), "-i", "localhost,", "-c", "local", "pb.yml"] + args,
         cwd=str(base), env=env, capture_output=True, text=True,
     )
     return _summary(out.stdout)
@@ -307,3 +314,64 @@ def test_until_and_retries_semantics(tmp_path):
             - debug: msg="T4 changed={{ r4.changed }}"
         """})
     assert '"T4 changed=False"' in msgs
+
+
+def test_role_params_outrank_set_fact(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - set_fact: {b: sf, c: sf}
+            - hosts: localhost
+              gather_facts: false
+              roles:
+                - {role: r, b: roleparam}
+            """,
+        "roles/r/vars/main.yml": """
+            c: rolevar
+            """,
+        "roles/r/tasks/main.yml": """
+            - debug: msg="b={{ b }} c={{ c }}"
+            """,
+    })
+    assert msgs == ['"b=roleparam c=sf"']
+
+
+def test_until_exhausted_registered_result(tmp_path):
+    check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              register: a
+              until: false
+              retries: 1
+              delay: 0
+              ignore_errors: true
+            - debug: msg="A {{ a.attempts }} {{ a.failed }} {{ a.exception is defined }}"
+            - command: /bin/false
+              register: e
+              until: e.rc == 0
+              retries: 1
+              delay: 0
+              failed_when: e.rc == 7
+            - debug: msg="E {{ e.attempts }} {{ e.failed }}"
+        """})
+
+
+def test_failed_task_facts_persist_after_rescue(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - block:
+                - fail: msg=first
+                  name: failing one
+              rescue:
+                - debug: msg="r1 {{ ansible_failed_task.name }} {{ ansible_failed_result.msg }}"
+                - set_fact: {ansible_failed_result: {msg: overridden}}
+                - debug: msg="r2 {{ ansible_failed_result.msg }}"
+            - debug: msg="after {{ ansible_failed_task.name }} {{ ansible_failed_result.msg }}"
+        """})
+    assert msgs[-1] == '"after failing one overridden"'

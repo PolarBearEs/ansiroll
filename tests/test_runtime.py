@@ -842,6 +842,71 @@ def test_gather_facts_failure_fails_host(monkeypatch, setup):
     assert rt.stats["failures"] == 1
 
 
+def test_gather_facts_failure_honors_play_ignore_errors(monkeypatch):
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    monkeypatch.setattr(rt, "run_module", lambda *_a, **_k: {
+        "failed": True, "changed": False, "msg": "setup failed"})
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+    rt.run_play({"tasks": [_task("1", "after", "debug", args={"msg": "x"})],
+                 "handlers": [], "gather_facts": True, "vars": {},
+                 "ignore_errors": True})
+    assert by_name(frames, "after")
+    assert not rt.failed
+    assert rt.stats["failures"] == 0
+    assert rt.stats["ignored"] == 1
+
+
+def _force_handlers_play(force):
+    flush = {"type": "task", "uuid": "f", "name": "Flush handlers",
+             "action": "meta", "special": "meta_flush_handlers"}
+    return {
+        "tasks": [
+            _task("1", "trigger", "debug", args={"msg": "x"},
+                  changed_when=["true"], notify=["h1"]),
+            _task("2", "boom", "fail", args={"msg": "boom"}),
+            flush,
+        ],
+        "handlers": [_task("h", "h1", "debug", args={"msg": "handled"})],
+        "gather_facts": False, "vars": {}, "force_handlers": force,
+    }
+
+
+@pytest.mark.parametrize("version,force,ran", [
+    ("2.13.13", True, True),
+    ("2.13.13", False, False),
+    # 2.14+: play.compile() wraps sections in an `always` flush instead, so
+    # a bare task list without that wrapper flushes nothing after a failure.
+    ("2.14.0", True, False),
+])
+def test_legacy_force_handlers_flushes_after_failure(monkeypatch, version, force, ran):
+    import ansiroll.runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.run_play(_force_handlers_play(force))
+    assert rt.failed
+    assert bool(by_name(frames, "h1")) is ran
+
+
+@pytest.mark.parametrize("version,registered_failed", [
+    ("2.20.1", True), ("2.21.1", False)])
+def test_until_exhausted_failed_when_decides_outcome(monkeypatch, version,
+                                                     registered_failed):
+    import ansiroll.runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.run_play({"tasks": [
+        _task("1", "retry", "debug", args={"msg": "x"}, register="r",
+              until=["false"], retries=1, delay=0, failed_when=["false"]),
+        _task("2", "after", "debug", args={"msg": "{{ r.failed }}"}),
+    ], "handlers": [], "gather_facts": False, "vars": {}})
+    assert not rt.failed
+    assert rt.vars["r"]["failed"] is registered_failed
+    assert "exception" not in rt.vars["r"]
+
+
 def test_core_version_gate_uses_baked_version(monkeypatch):
     # The compiled script bakes the controller's ansible-core version; any
     # ansible installed on the target must not influence version gates.

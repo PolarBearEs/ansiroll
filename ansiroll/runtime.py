@@ -1496,6 +1496,7 @@ class Runtime:
             ctx = dict(node.get("role_defaults") or {})
             ctx.update(self.ctx())
             ctx.update(node.get("role_vars") or {})
+            ctx.update(node.get("role_params") or {})
             env = jinja2.Environment(undefined=jinja2.StrictUndefined)
             return env.from_string(name).render(**ctx) or name
         except Exception:
@@ -1624,6 +1625,7 @@ class Runtime:
                 become=bool(play.get("become")),
                 become_user=play.get("become_user"),
                 fact_schema=play.get("fact_schema"),
+                ignore_errors=play.get("ignore_errors"),
             )
             if not gathered:
                 # A failed setup fails the host; nothing else in the play runs.
@@ -1663,6 +1665,15 @@ class Runtime:
             if not getattr(ex, "counted", False):
                 self._tally("failures")
             self.failed = True
+            # Before 2.14 play.compile() has no force_handlers `always`
+            # flush; StrategyBase.run() runs the remaining handlers for failed
+            # hosts when force_handlers is set (strategy/__init__.py run()).
+            if play.get("force_handlers") and not _core_at_least(2, 14):
+                try:
+                    self.flush_handlers()
+                except TaskFailed as hex_:
+                    if not getattr(hex_, "counted", False):
+                        self._tally("failures")
         self.check_mode = invocation_check_mode
 
     def run_nodes(self, nodes, overlay, become=False):
@@ -1737,10 +1748,15 @@ class Runtime:
                 if not rescue:
                     raise
                 self._tally("rescued")
-                scope = _with_high_vars(scope, {
+                # Saved as nonpersistent facts (set_fact level) that outlive
+                # the rescue (StrategyBase._process_pending_results).
+                failed_facts = {
                     "ansible_failed_task": ex.task,
                     "ansible_failed_result": ex.result,
-                })
+                }
+                self.vars.update(failed_facts)
+                self._runtime_var_overrides.update(failed_facts)
+                self._set_fact_overrides.update(failed_facts)
                 self.run_nodes(rescue, scope, b_become)
         except TaskFailed as ex:
             failed_exc = ex
@@ -1811,16 +1827,17 @@ class Runtime:
             self.emit(task, "skipped", result)
         self._tally("skipped")
 
-    def _layered_ctx(self, ctx, overlay=None):
+    def _layered_ctx(self, ctx, overlay=None, role_params=None):
         """Re-apply the layers that outrank play/role/block/task vars.
 
         VariableManager.get_vars order (low -> high): role defaults < host
         vars/facts < play vars < role vars < block/task vars < include_vars
-        < set_fact/register < include params < extra vars.
+        < set_fact/register < role params < include params < extra vars.
         """
         ctx.pop(_HIGH_VARS_KEY, None)
         ctx.update(self._include_vars_layer)
         ctx.update(self._set_fact_overrides)
+        ctx.update(role_params or {})
         if overlay:
             ctx.update(overlay.get(_HIGH_VARS_KEY) or {})
         ctx.update(self.extra_vars)
@@ -1829,16 +1846,17 @@ class Runtime:
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < host vars/facts/play vars
         # < role vars < block vars < task vars < include_vars < set_fact/
-        # register < include params < extra vars < loop item.
+        # register < role params < include params < extra vars < loop item.
         self._refresh_play_vars()
         ctx = {}
         ctx.update(task.get("role_defaults") or {})
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
-        self._layered_ctx(ctx, overlay)
+        role_params = task.get("role_params")
+        self._layered_ctx(ctx, overlay, role_params)
         ctx.update(self.template_vars(task.get("vars"), ctx))
-        self._layered_ctx(ctx, overlay)
+        self._layered_ctx(ctx, overlay, role_params)
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
         ctx.setdefault("omit", _OMIT)
@@ -2000,7 +2018,7 @@ class Runtime:
         status = _status_of(res)
         self.emit(task, status, res, ignored=ignore)
 
-        if res.get("failed"):
+        if _result_failed(res):
             if ignore:
                 self._tally("changed" if tally_changed else "ok")
                 self._tally("ignored")
@@ -2076,7 +2094,7 @@ class Runtime:
             agg["changed"] = agg["changed"] or res.get("changed", False)
             if tally_changed:
                 agg["_ansiroll_tally_changed"] = True
-            if res.get("failed"):
+            if _result_failed(res):
                 agg["failed"] = True
             self.emit(task, _status_of(res), res, item=it,
                       ignored=ignore_errors, is_item=True)
@@ -2195,8 +2213,6 @@ class Runtime:
             res["failed"] = fw_result
         else:
             res["failed"] = True
-        if res.get("failed") and "exception" not in res:
-            res["exception"] = str(res.get("msg") or "Task failed")
         return res
 
     def _exec_one(self, task, ctx, become=False, attempt=None):
@@ -2813,7 +2829,7 @@ class Runtime:
 
     # ---- facts -----------------------------------------------------------
     def gather_facts(self, environment=None, become=False, become_user=None,
-                     fact_schema=None):
+                     fact_schema=None, ignore_errors=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "runtime_id": "__gather_facts__"}
@@ -2865,6 +2881,15 @@ class Runtime:
                 res = {"failed": True, "changed": False,
                        "msg": "ansiroll: fact gathering returned no result"}
             res.setdefault("changed", False)
+            # The setup task's block belongs to the play, so it inherits the
+            # play's ignore_errors (PlayIterator: Block(play=self._play)).
+            if isinstance(ignore_errors, str):
+                ignore_errors = self.template(ignore_errors, self.ctx())
+            if _to_bool(ignore_errors):
+                self.emit(node, "failed", res, ignored=True)
+                self._tally("ok")
+                self._tally("ignored")
+                return True
             self.emit(node, "failed", res)
             self._tally("failures")
             return False
@@ -3229,10 +3254,18 @@ def _normalize_module_result(result):
     return result
 
 
+def _result_failed(res):
+    # TaskResult.is_failed: an evaluated failed_when decides the outcome even
+    # when the result says failed (e.g. until retries exhausted before 2.21).
+    if "failed_when_result" in res:
+        return bool(res["failed_when_result"])
+    return bool(res.get("failed"))
+
+
 def _status_of(res):
     if res.get("unreachable"):
         return "unreachable"
-    if res.get("failed"):
+    if _result_failed(res):
         return "failed"
     if res.get("skipped"):
         return "skipped"

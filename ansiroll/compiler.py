@@ -204,6 +204,7 @@ def _shadowed_var_names(plays):
         for node in nodes or []:
             names.update((node.get("vars") or {}).keys())
             names.update((node.get("role_vars") or {}).keys())
+            names.update((node.get("role_params") or {}).keys())
             if str(node.get("action") or "").split(".")[-1] == "set_fact":
                 names.update((node.get("args") or {}).keys())
             if node.get("type") == "block":

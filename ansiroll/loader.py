@@ -201,6 +201,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
         "check_mode": getattr(play, "check_mode", None),
         "become": bool(play.become),
         "become_user": getattr(play, "become_user", None),
+        "force_handlers": bool(getattr(play, "force_handlers", False)),
+        "ignore_errors": getattr(play, "ignore_errors", None),
         "vars": _tag_untrusted(_resolved_play_vars(play, all_vars, basedir)),
         "tasks": tasks,
         "handlers": handlers,
@@ -554,6 +556,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": role_defaults,
         "role_vars": role_vars,
+        "role_params": _role_params(task),
         "become": bool(task.become),
         "tasks": tasks,
     }
@@ -567,6 +570,7 @@ def _template_include_filename(task, value, all_vars):
     variables.update(all_vars or {})
     variables.update(role_vars)
     variables.update(dict(task.vars or {}))
+    variables.update(_role_params(task))
     try:
         from ansible.template import Templar
         try:
@@ -641,6 +645,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": role_defaults,
         "role_vars": role_vars,
+        "role_params": _role_params(task),
         "become": bool(task.become),
         "tasks": tasks,
     }
@@ -739,6 +744,7 @@ def _convert_task(task, actions, basedir):
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": role_defaults,  # lowest precedence (below play vars)
         "role_vars": role_vars,          # above play vars, below block/task vars
+        "role_params": _role_params(task),  # above set_fact/register
         "role_magic": _role_magic(task),
         "notify": _as_list(task.notify),
         "special": _special_of(action),
@@ -1085,11 +1091,26 @@ def _role_vars(task):
         # Dependency roles inherit the including role's parameters, while
         # their own vars still take precedence over the parent's role vars.
         for parent in (getattr(role, "_parents", None) or []):
-            rvars.update(parent.get_vars(include_params=True) or {})
-        rvars.update(role.get_vars(include_params=True) or {})
+            rvars.update(parent.get_vars(include_params=False) or {})
+        rvars.update(role.get_vars(include_params=False) or {})
     except Exception:
         pass
     return defaults, rvars
+
+
+def _role_params(task):
+    """Role params ({role: x, var: value}) for a role task.
+
+    VariableManager.get_vars merges them after the set_fact/register cache
+    (ansible/vars/manager.py: "role params"), unlike role vars.
+    """
+    role = getattr(task, "_role", None)
+    if role is None:
+        return {}
+    try:
+        return dict(role.get_role_params(task.get_dep_chain()) or {})
+    except Exception:
+        return {}
 
 
 def _clean_args(args):
