@@ -713,6 +713,14 @@ def _register_included(blocks):
 def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
     if not only_tags and not skip_tags:
         return True
+    from ansible import constants as C
+
+    if task.action in C._ACTION_META:
+        # Core 2.10 keeps all meta tasks; later cores keep implicit ones.
+        # From 2.19.4 generated flushes have "always" and use normal tag rules.
+        if (_core_version() < (2, 11)
+                or (getattr(task, "implicit", False) and "always" not in task.tags)):
+            return True
     try:
         return bool(task.evaluate_tags(only_tags or set(), skip_tags or set(), all_vars or {}))
     except Exception:

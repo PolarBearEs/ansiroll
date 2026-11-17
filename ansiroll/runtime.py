@@ -558,6 +558,10 @@ def _as_result(v):
     return v if isinstance(v, dict) else {}
 
 
+def _test_success(result):
+    return not _as_result(result).get("failed", False)
+
+
 # A subset of Ansible's Jinja2 tests (pure stdlib).
 _ANSIBLE_TESTS = {
     "version": _test_version,
@@ -565,8 +569,9 @@ _ANSIBLE_TESTS = {
     "match": _test_match,
     "search": _test_search,
     "regex": lambda v, pattern, **k: _test_search(v, pattern),
-    "succeeded": lambda r: not _as_result(r).get("failed", False),
-    "success": lambda r: not _as_result(r).get("failed", False),
+    "succeeded": _test_success,
+    "success": _test_success,
+    "successful": _test_success,
     "failed": lambda r: _as_result(r).get("failed", False),
     "failure": lambda r: _as_result(r).get("failed", False),
     "changed": lambda r: _as_result(r).get("changed", False),

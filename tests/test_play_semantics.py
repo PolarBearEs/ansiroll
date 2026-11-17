@@ -13,6 +13,9 @@ import sys
 import textwrap
 
 import pytest
+from packaging.version import Version
+
+from tests.run_official_suite import parse_task_trace
 
 pytest.importorskip("ansible")
 from ansible.release import __version__
@@ -154,6 +157,48 @@ def test_handlers_run_in_definition_order_with_chains_and_listen(tmp_path):
               debug: msg=H3_RAN
         """})
     assert msgs == ['"H1_RAN"', '"H2_RAN"', '"HB_RAN"', '"H3_RAN"', '"H0_RAN"']
+
+
+@pytest.mark.parametrize("skip_always", [False, True])
+def test_tag_selected_role_respects_implicit_flush_tag_rules(tmp_path, skip_always):
+    handler_runs = not skip_always or Version(__version__) < Version("2.19.4")
+    _write(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles:
+                - {role: tagged, tags: selected}
+              post_tasks:
+                - name: verify implicit flush
+                  assert:
+                    that: (role_handler_ran | default(false)) == %s
+                  tags: selected
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - debug: msg="handler ran {{ role_handler_ran | default(false) }}"
+                  tags: selected
+        """ % str(handler_runs).lower(),
+        "roles/tagged/tasks/main.yml": """
+            - command: /bin/true
+              notify: record handler
+        """,
+        "roles/tagged/handlers/main.yml": """
+            - name: record handler
+              set_fact: {role_handler_ran: true}
+        """,
+    })
+    args = ("--tags", "selected")
+    if skip_always:
+        args += ("--skip-tags", "always")
+    expected = _ansible_run(tmp_path, args)
+    assert expected.returncode == 0, expected.stdout + expected.stderr
+    actual = _ansible_run(tmp_path, args, "ansiroll.core.ansiroll")
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    messages, recap = _summary(actual.stdout)
+    assert recap == _summary(expected.stdout)[1]
+    assert parse_task_trace(actual.stdout) == parse_task_trace(expected.stdout)
+    assert messages == ['"handler ran %s"' % handler_runs]
 
 
 def test_handler_chain_notified_backwards_during_final_flush(tmp_path):
@@ -448,6 +493,24 @@ def test_role_params_outrank_set_fact(tmp_path):
             """,
     })
     assert msgs == ['"b=roleparam c=sf"']
+
+
+def test_until_successful_uses_failed_when_for_each_loop_item(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              loop: [first, second]
+              register: outcome
+              failed_when: true
+              until: outcome is successful
+              retries: 2
+              delay: 0
+              ignore_errors: true
+            - debug: msg="attempts {{ outcome.results | map(attribute='attempts') | join(',') }}"
+        """})
+    assert msgs == ['"attempts 2,2"']
 
 
 def test_until_exhausted_registered_result(tmp_path, monkeypatch):
