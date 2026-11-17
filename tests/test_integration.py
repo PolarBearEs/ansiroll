@@ -180,6 +180,53 @@ def test_accelerated_command_matches_official_module_semantics(action):
         assert accelerated.get(key) == official.get(key)
 
 
+def _command_parity_cases(base):
+    os.makedirs(os.path.join(base, "sub"))
+    open(os.path.join(base, "sub", "marker"), "w").close()
+    return [
+        # chdir is applied (and ~-expanded) before creates/removes.
+        ("command", {"_raw_params": "echo ran", "chdir": os.path.join(base, "sub"),
+                     "creates": "marker"}),
+        ("command", {"_raw_params": "pwd", "chdir": "~"}),
+        ("command", {"_raw_params": "true", "chdir": os.path.join(base, "nope")}),
+        ("command", {"_raw_params": "echo x", "creates": "~/"}),
+        # argv gets ~ and $VAR expansion, the reported cmd does not.
+        ("command", {"_raw_params": "echo ~ $HOME '$HOME' ~root/x"}),
+        # Bytes output: no newline translation, surrogateescape decoding.
+        ("shell", {"_raw_params": "printf '\\377ok\\r\\n'", "_uses_shell": True}),
+        ("shell", {"_raw_params": "printf 'a\\r\\nb\\r\\n'", "_uses_shell": True,
+                   "strip_empty_ends": False}),
+        # python -c 'import ...' is run as a real process.
+        ("command", {"_raw_params": "%s -c 'import ansiroll_no_such_mod'" % sys.executable}),
+        ("command", {"_raw_params": "ansiroll_no_such_cmd_xyz --password=x -p y"}),
+        ("command", {"_raw_params": "./ansiroll-relative"}),
+        ("shell", {"_raw_params": "echo $0 x", "_uses_shell": True,
+                   "executable": "/bin/bash"}),
+        ("shell", {"_raw_params": "echo $0 x", "_uses_shell": True,
+                   "executable": "/nonexistent/sh"}),
+    ]
+
+
+def test_accelerated_command_edge_cases_match_official(tmp_path):
+    from ansiroll.loader import _accelerator_options
+
+    cases = _command_parity_cases(str(tmp_path))
+    emb = ModuleEmbedder()
+    rt = Runtime({"command": emb.embed("command"), "shell": emb.embed("shell")},
+                 "", {"inventory_hostname": "localhost"})
+    skip = ("start", "end", "delta", "invocation", "exception")
+    try:
+        for action, args in cases:
+            official = rt.run_module(action, dict(args))
+            accelerated = run_accelerated(
+                action, dict(args), options=_accelerator_options(action))
+            official = {k: v for k, v in official.items() if k not in skip}
+            accelerated = {k: v for k, v in accelerated.items() if k not in skip}
+            assert accelerated == official, (action, args)
+    finally:
+        rt.cleanup()
+
+
 def test_accelerated_command_matches_legacy_warn_semantics():
     import ansible
 

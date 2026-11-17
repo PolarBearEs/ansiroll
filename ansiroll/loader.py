@@ -805,8 +805,9 @@ def _accelerator_options(action):
             options = {}
             if version < (2, 12):
                 options["check_always_skipped"] = True
-            if version >= (2, 16):
-                options["expand_argument_vars"] = True
+            if version < (2, 19):
+                options["chdir_error_detail"] = True
+                options["exec_error_detail"] = True
             if version >= (2, 14):
                 options["check_skip_unchanged"] = True
             if version >= (2, 21):

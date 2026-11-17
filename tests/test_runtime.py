@@ -1027,7 +1027,7 @@ def test_accelerated_command_runs_without_embedded_module(monkeypatch):
     assert rt._workers == {}
 
 
-def test_accelerated_command_expands_argument_vars_when_requested(
+def test_accelerated_command_expands_argument_vars(
         monkeypatch):
     monkeypatch.setenv("ANSIROLL_COMMAND_VALUE", "expanded")
     from ansiroll.accelerated_modules import run as run_accelerated
@@ -1040,13 +1040,12 @@ def test_accelerated_command_expands_argument_vars_when_requested(
                 "$ANSIROLL_COMMAND_VALUE",
             ],
         },
-        options={"expand_argument_vars": True},
     )
 
     assert result["rc"] == 0
 
 
-def test_accelerated_python_import_uses_isolated_fork():
+def test_accelerated_python_import_probe_runs_as_a_process():
     from ansiroll.accelerated_modules import run as run_accelerated
 
     success = run_accelerated(
@@ -1066,7 +1065,7 @@ def test_accelerated_python_import_uses_isolated_fork():
     assert "ModuleNotFoundError" in failure["stderr"]
 
 
-def test_accelerated_shell_python_import_uses_isolated_fork():
+def test_accelerated_shell_python_import_probe_runs_as_a_process():
     from ansiroll.accelerated_modules import run as run_accelerated
 
     result = run_accelerated(
