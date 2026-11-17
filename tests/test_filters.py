@@ -2,7 +2,7 @@
 
 import pytest
 
-from ansiroll.runtime import _Templater, _UnsafeTemplate, _yaml_module
+from ansiroll.runtime import _Templater, _UnsafeTemplate, _f_to_yaml, _yaml_module
 
 
 @pytest.fixture(scope="module")
@@ -200,3 +200,18 @@ def test_to_json_captures_undecryptable_vault(t):
 
 def test_unsafe_filter_result_is_not_templated_again(t):
     assert render(t, "{{ value }}", value=_UnsafeTemplate("{{ 1 }}")) == "{{ 1 }}"
+
+
+def test_to_yaml_keeps_tuple_keys_hashable():
+    assert _f_to_yaml({("a", "b"): 1}) == "? - a\n  - b\n: 1\n"
+
+
+def test_to_yaml_preserves_shared_and_recursive_containers():
+    x = ["leaf"]
+    for _ in range(30):
+        x = [x, x]
+    assert len(_f_to_yaml(x)) < 10000
+
+    loop = []
+    loop.append(loop)
+    assert _f_to_yaml(loop) == "&id001\n- *id001\n"

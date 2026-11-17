@@ -286,16 +286,35 @@ def _yaml_module():
     return ansiroll_yaml
 
 
-def _yaml_plain(v):
+def _yaml_plain(v, memo=None):
     """Materialize runtime wrappers (lazy vars, trusted strings) into the
-    built-in types PyYAML's SafeDumper can represent."""
+    built-in types PyYAML's SafeDumper can represent.
+
+    Shared and self-referencing containers keep their identity (registered
+    before their children are converted), so PyYAML can still emit aliases.
+    """
+    if memo is None:
+        memo = {}
+    if isinstance(v, str):
+        return "".join([v]) if type(v) is not str else v
+    if not isinstance(v, (dict, list, tuple)):
+        return v
+    if id(v) in memo:
+        return memo[id(v)][1]
     if isinstance(v, dict):
-        return {_yaml_plain(k): _yaml_plain(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_yaml_plain(x) for x in v]
-    if isinstance(v, str) and type(v) is not str:
-        return "".join([v])
-    return v
+        out = {}
+        memo[id(v)] = (v, out)
+        for k, x in v.items():
+            out[_yaml_plain(k, memo)] = _yaml_plain(x, memo)
+        return out
+    if isinstance(v, list):
+        out = []
+        memo[id(v)] = (v, out)
+        out.extend(_yaml_plain(x, memo) for x in v)
+        return out
+    out = tuple(_yaml_plain(x, memo) for x in v)
+    memo[id(v)] = (v, out)
+    return out
 
 
 def _f_to_yaml(v, **kwargs):
