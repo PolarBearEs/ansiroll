@@ -32,14 +32,23 @@ STATE_MARKER = "__ANSIROLL_STATE__"
 STATS_MARKER = "__ANSIROLL_STATS__"
 
 
+# ansible-core version of the controller that compiled this artifact. The
+# compiler bakes it into the generated source; target hosts usually have no
+# Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
+_ANSIROLL_CORE_VERSION = None
+
+
 def _core_at_least(major, minor):
-    """Best-effort controller/core feature gate without making Ansible a runtime dependency."""
-    try:
-        from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
-    except Exception:
-        return False
+    """Feature gate on the compiling controller's ansible-core version."""
+    version = _ANSIROLL_CORE_VERSION
+    if not version:
+        # Imported directly on the controller (not compiled): use its Ansible.
+        try:
+            from ansible.release import __version__ as version
+        except Exception:
+            return False
+    match = re.match(r"^(\d+)\.(\d+)", str(version))
+    return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
 
 # Persistent worker: one long-lived process per privilege level. It keeps each
 # module's decoded zip in RAM (decode-once) and forks a child per task -- the fork
@@ -93,6 +102,36 @@ def _trust_set_fact_value(value):
     if isinstance(value, tuple):
         return tuple(_trust_set_fact_value(v) for v in value)
     return value
+
+
+# Overlay key holding variables that outrank set_fact/register: include
+# params, include loop vars and rescue magic vars (VariableManager.get_vars
+# merges include params after the nonpersistent fact cache).
+_HIGH_VARS_KEY = "__ansiroll_high_vars__"
+
+
+def _with_high_vars(overlay, values):
+    out = dict(overlay)
+    out.update(values)
+    high = dict(overlay.get(_HIGH_VARS_KEY) or {})
+    high.update(values)
+    out[_HIGH_VARS_KEY] = high
+    return out
+
+
+def _override_ctx(task, res, ctx):
+    """Variables visible to changed_when/failed_when.
+
+    TaskExecutor exposes the registered result and any facts the action
+    returned, never the bare result keys (``rc``, ``stdout``...).
+    """
+    ectx = dict(ctx)
+    facts = res.get("ansible_facts")
+    if isinstance(facts, dict):
+        ectx.update(facts)
+    if task.get("register"):
+        ectx[task["register"]] = res
+    return ectx
 
 
 def _strip_omit(args):
@@ -1227,6 +1266,8 @@ class Runtime:
         # the flattened host snapshot. Those values (set_fact/register) outrank
         # play vars, a distinction that is otherwise lost after serialization.
         self._set_fact_overrides = dict(host_var_overrides or {})
+        # include_vars results: above task vars, below set_fact/register.
+        self._include_vars_layer = {}
         self._untrusted_runtime_vars = set()
         self.native_only = bool(native_only)
         self._task_provenance = {}
@@ -1247,7 +1288,9 @@ class Runtime:
         self.on_task_start = None
         self.templater = _Templater()
         self.handlers = []
-        self.notified = []  # ordered, de-duplicated handler names
+        self.notified = []  # ordered, de-duplicated pending notifications
+        self._notified_handlers = set()  # indexes into self.handlers
+        self._flushing = False
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
         self.host = self.vars.get("inventory_hostname") or _hostname()
@@ -1283,6 +1326,11 @@ class Runtime:
         if name:
             self.vars[name] = result
             self._untrusted_runtime_vars.add(name)
+            # Registered vars live in the nonpersistent fact cache, like
+            # set_fact: they outrank play/role/block/task vars and must not
+            # be replaced by a lazily re-rendered play var.
+            self._runtime_var_overrides.add(name)
+            self._set_fact_overrides[name] = result
 
     def template(self, value, ctx, _seen=None):
         if isinstance(value, (dict, list)):
@@ -1561,7 +1609,9 @@ class Runtime:
                 plugin["source"] = self._asset_text(plugin.get("source"))
                 plugins.append(plugin)
             self.templater.register_plugins(plugins)
-        self.handlers = play.get("handlers", [])
+        self.handlers = list(play.get("handlers", []))
+        self._notified_handlers = set()
+        self._flushing = False
         self._play_become = play.get("become", False)
         if initial_notified:
             # Carry notifications from earlier segments (see the strategy).
@@ -1569,12 +1619,17 @@ class Runtime:
                 if name not in self.notified:
                     self.notified.append(name)
         if play.get("gather_facts"):
-            self.gather_facts(
+            gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
                 become_user=play.get("become_user"),
                 fact_schema=play.get("fact_schema"),
             )
+            if not gathered:
+                # A failed setup fails the host; nothing else in the play runs.
+                self.failed = True
+                self.check_mode = invocation_check_mode
+                return
         # Play vars (templated after facts are available; containers lazily).
         self.vars["__ansiroll_controller_env"] = play.get("controller_env") or {}
         self.vars["__ansiroll_controller_config"] = (
@@ -1582,6 +1637,7 @@ class Runtime:
         )
         self._runtime_var_overrides = (
             set(self.extra_vars) | set(self._set_fact_overrides)
+            | set(self._include_vars_layer)
         )
         self._play_var_templates = {
             key: value for key, value in (play.get("vars") or {}).items()
@@ -1589,23 +1645,24 @@ class Runtime:
         }
         self.vars.update(self.template_vars(
             play.get("vars"), self.ctx(), dynamic=True))
-        # Host variables created by set_fact have higher precedence than play
-        # vars and retain that precedence for later plays in the same run.
+        # Host variables created by include_vars/set_fact/register have higher
+        # precedence than play vars and keep it for later plays in the run.
+        self.vars.update(self._include_vars_layer)
         self.vars.update(self._set_fact_overrides)
         # Extra-vars have the highest Ansible precedence; play vars must not
         # overwrite values injected via -e.
         self.vars.update(self.extra_vars)
         try:
+            # Handlers run only at the flush points play.compile() lowers into
+            # the task list (after pre_tasks, tasks and post_tasks; wrapped in
+            # `always` sections under force_handlers). A failed host flushes
+            # nothing further unless force_handlers put a flush in `always`.
             self.run_nodes(play.get("tasks", []), {}, play.get("become", False))
         except TaskFailed as ex:
             # An uncaught failure ends the play for this host.
             if not getattr(ex, "counted", False):
                 self._tally("failures")
             self.failed = True
-        # Defer the flush when this is a non-final segment; the final segment runs
-        # handlers with the accumulated notifications.
-        if not defer_handlers:
-            self.flush_handlers()
         self.check_mode = invocation_check_mode
 
     def run_nodes(self, nodes, overlay, become=False):
@@ -1640,27 +1697,31 @@ class Runtime:
                                         "skip_reason": "Conditional result was False"})
             self._tally("skipped")
             return
-        scope = dict(overlay)
-        scope.update(self.template_vars(node.get("vars"), base_ctx))
+        params = self.template_vars(node.get("vars"), base_ctx)
+        scope = _with_high_vars(overlay, params)
         loop = node.get("loop")
         if loop is None:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
             self._tally("ok")
+            self.handlers.extend(node.get("handlers") or [])
             self.run_nodes(node.get("tasks", []), scope, b)
             return
         items = self._resolve_loop(loop, base_ctx)
         for i, it in enumerate(items):
-            item_scope = dict(scope)
-            item_scope.update(self._loop_item_vars(node, items, i, base_ctx))
+            item_scope = _with_high_vars(
+                scope, self._loop_item_vars(node, items, i, base_ctx))
             self.emit(node, "ok", {"changed": False, "include": node.get("file"),
                                    "item": it}, item=it, is_item=True)
             self._tally("ok")
+            self.handlers.extend(node.get("handlers") or [])
             self.run_nodes(node.get("tasks", []), item_scope, b)
 
     def run_block(self, block, overlay, become=False):
         scope = dict(overlay)
-        scope.update(self.template_vars(block.get("vars"), self.ctx(overlay)))
-        if not self.when(block.get("when"), self.ctx(scope)):
+        scope.update(self.template_vars(
+            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay)))
+        if not self.when(block.get("when"),
+                         self._layered_ctx(self.ctx(scope), scope)):
             b_become = bool(block.get("become")) or become
             self._skip_nodes(block.get("block", []), scope, b_become)
             if block.get("always"):
@@ -1676,8 +1737,10 @@ class Runtime:
                 if not rescue:
                     raise
                 self._tally("rescued")
-                scope["ansible_failed_task"] = ex.task
-                scope["ansible_failed_result"] = ex.result
+                scope = _with_high_vars(scope, {
+                    "ansible_failed_task": ex.task,
+                    "ansible_failed_result": ex.result,
+                })
                 self.run_nodes(rescue, scope, b_become)
         except TaskFailed as ex:
             failed_exc = ex
@@ -1748,16 +1811,34 @@ class Runtime:
             self.emit(task, "skipped", result)
         self._tally("skipped")
 
+    def _layered_ctx(self, ctx, overlay=None):
+        """Re-apply the layers that outrank play/role/block/task vars.
+
+        VariableManager.get_vars order (low -> high): role defaults < host
+        vars/facts < play vars < role vars < block/task vars < include_vars
+        < set_fact/register < include params < extra vars.
+        """
+        ctx.pop(_HIGH_VARS_KEY, None)
+        ctx.update(self._include_vars_layer)
+        ctx.update(self._set_fact_overrides)
+        if overlay:
+            ctx.update(overlay.get(_HIGH_VARS_KEY) or {})
+        ctx.update(self.extra_vars)
+        return ctx
+
     def _task_ctx(self, task, overlay):
-        # Precedence (low -> high): role defaults < play/host/facts/registers
-        # < role vars < block/parent overlay < task vars < loop item.
+        # Precedence (low -> high): role defaults < host vars/facts/play vars
+        # < role vars < block vars < task vars < include_vars < set_fact/
+        # register < include params < extra vars < loop item.
         self._refresh_play_vars()
         ctx = {}
         ctx.update(task.get("role_defaults") or {})
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
+        self._layered_ctx(ctx, overlay)
         ctx.update(self.template_vars(task.get("vars"), ctx))
+        self._layered_ctx(ctx, overlay)
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
         ctx.setdefault("omit", _OMIT)
@@ -2062,37 +2143,63 @@ class Runtime:
             out.extend(_sequence_items(str(rendered)))
         return out
 
+    def _attempt_count(self, task, ctx):
+        """Total runs for a task (TaskExecutor._execute's attempt loop)."""
+        until = task.get("until")
+        raw = task.get("retries")
+        retries = None if raw is None else int(self.template(raw, ctx) or 0)
+        if _core_at_least(2, 16):
+            # 2.16+: `retries` alone retries until the task succeeds; unset
+            # retries default to 3 only when `until` is set.
+            if retries is not None:
+                return 1 + max(0, retries)
+            return 4 if until else 1
+        # Older cores only retry with `until`; the Task field defaults to 3.
+        if not until:
+            return 1
+        if retries is None:
+            return 3
+        return 1 if retries <= 0 else retries + 1
+
     def _exec_with_retries(self, task, ctx, become=False):
         until = task.get("until")
-        retries = int(self.template(task.get("retries"), ctx) or 0)
-        if not until:
+        attempts = self._attempt_count(task, ctx)
+        if attempts <= 1 and not (until and not _core_at_least(2, 16)):
             return self._exec_one(task, ctx, become)
 
-        attempts = retries + 1
         delay = float(self.template(task.get("delay"), ctx) or 0)
-        last = None
+        res = None
         eval_ctx = dict(ctx)
         for attempt in range(1, attempts + 1):
-            res = self._exec_one(task, eval_ctx, become)
-            res["attempts"] = attempt
+            res = self._exec_one(task, eval_ctx, become, attempt=attempt)
             if task.get("register"):
                 eval_ctx[task["register"]] = res
-            last = res
-            if self.when(until, eval_ctx):
+            if attempts <= 1:
+                return res
+            # 2.16+: without `until` the default condition is `not failed`.
+            if until:
+                done = self.when(until, eval_ctx)
+            else:
+                done = not res.get("failed")
+            if done:
                 return res
             if attempt < attempts and delay > 0:
                 time.sleep(delay)
-        # `until` never came true: the task fails (like Ansible's retry logic),
-        # but failed_when/changed_when get the last word on the final result
-        # (which now carries `attempts`).
-        if last is None:
-            last = {"changed": False, "attempts": attempts}
-        last["failed"] = True
-        if task.get("failed_when") is not None or task.get("changed_when") is not None:
-            self._apply_overrides(task, last, eval_ctx)
-        return last
+        # Out of attempts: TaskExecutor reports attempts = retries - 1 and
+        # marks the result failed. From 2.21 an evaluated failed_when result
+        # still decides `failed` (UnifiedTaskResult.failed).
+        res["attempts"] = attempts - 1
+        fw_result = res.get("failed_when_result")
+        if (_core_at_least(2, 21) and isinstance(fw_result, bool)
+                and task.get("failed_when") is not None):
+            res["failed"] = fw_result
+        else:
+            res["failed"] = True
+        if res.get("failed") and "exception" not in res:
+            res["exception"] = str(res.get("msg") or "Task failed")
+        return res
 
-    def _exec_one(self, task, ctx, become=False):
+    def _exec_one(self, task, ctx, become=False, attempt=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
         inherited_become_user = self.become_user
@@ -2167,6 +2274,9 @@ class Runtime:
             self._module_env = None
             self.check_mode = inherited_check_mode
             self.become_user = inherited_become_user
+        if attempt is not None:
+            # Available early so changed_when/failed_when can use it.
+            res["attempts"] = attempt
         self._apply_overrides(task, res, ctx)
         if self.profile:
             module_profile = res.get("_ansiroll_profile") or {}
@@ -2239,17 +2349,16 @@ class Runtime:
         fw = task.get("failed_when")
         module_failed = res.get("failed", False)
         module_exception = res.get("exception") or res.get("msg")
+        changed_when_failed = False
         try:
             if cw is not None:
-                ectx = dict(ctx)
-                ectx.update(res)
-                if task.get("register"):
-                    ectx[task["register"]] = res
+                ectx = _override_ctx(task, res, ctx)
                 try:
                     res["changed"] = self.when(cw if isinstance(cw, list) else [cw], ectx, strict=True)
                 except UntrustedConditional:
                     raise
                 except Exception as ex:
+                    changed_when_failed = True
                     original_changed = bool(res.get("changed"))
                     res["failed"] = True
                     res["changed_when_result"] = str(ex)
@@ -2269,11 +2378,10 @@ class Runtime:
                             "failed. Error rendering expression. %s" % ex
                         )
                     res["exception"] = str(ex)
-            if fw is not None:
-                ectx = dict(ctx)
-                ectx.update(res)
-                if task.get("register"):
-                    ectx[task["register"]] = res
+            # TaskExecutor evaluates failed_when only when changed_when
+            # succeeded.
+            if fw is not None and not changed_when_failed:
+                ectx = _override_ctx(task, res, ctx)
                 try:
                     fw_result = self.when(fw if isinstance(fw, list) else [fw], ectx, strict=True)
                 except UntrustedConditional:
@@ -2624,9 +2732,13 @@ class Runtime:
         facts = res.get("ansible_facts")
         if isinstance(facts, dict):
             self.vars.update(facts)
-            if str(task.get("action") or "").rsplit(".", 1)[-1] == "set_fact":
+            short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
+            if short_action == "set_fact":
                 self._runtime_var_overrides.update(facts)
                 self._set_fact_overrides.update(facts)
+            elif short_action == "include_vars":
+                self._runtime_var_overrides.update(facts)
+                self._include_vars_layer.update(facts)
             existing = self.vars.get("ansible_facts")
             if not isinstance(existing, dict):
                 existing = self.vars["ansible_facts"] = {}
@@ -2641,18 +2753,63 @@ class Runtime:
         if not res.get("changed"):
             return
         for name in (task.get("notify") or []):
-            if name not in self.notified:
+            if self._flushing:
+                # A handler notifying handlers marks them right away: later
+                # definitions run in this flush, earlier ones at the next.
+                self._notified_handlers.update(self._handlers_for(name))
+            elif name not in self.notified:
                 self.notified.append(name)
 
     # ---- handlers --------------------------------------------------------
+    def _handlers_for(self, notification):
+        """Indexes of the handlers a notification targets.
+
+        Mirrors StrategyBase.search_handlers_by_notification: the last-defined
+        handler matching by (role-qualified) name, plus every handler listening
+        on the topic (de-duplicated by handler name).
+        """
+        def names(h):
+            if "handler_names" in h:
+                return h.get("handler_names") or []
+            return [h["name"]] if h.get("name") else []
+
+        found = []
+        indexes = range(len(self.handlers) - 1, -1, -1)
+        for idx in indexes:
+            if notification in names(self.handlers[idx]):
+                found.append(idx)
+                break
+        seen = set()
+        for idx in indexes:
+            handler = self.handlers[idx]
+            if notification in (handler.get("listen") or []):
+                own = names(handler)
+                own = own[0] if own else None
+                if own and own in seen:
+                    continue
+                seen.add(own)
+                found.append(idx)
+        return found
+
     def flush_handlers(self):
-        if not self.notified:
+        for name in self.notified:
+            self._notified_handlers.update(self._handlers_for(name))
+        self.notified = []
+        if not self._notified_handlers:
             return
-        pending, self.notified = self.notified, []
-        for name in pending:
-            for h in self.handlers:
-                if h.get("name") == name or name in (h.get("listen") or []):
-                    self.run_task(h, {}, getattr(self, "_play_become", False))
+        # Handlers run in definition order (PlayIterator HANDLERS state); a
+        # failing handler fails the host and ends the flush.
+        self._flushing = True
+        try:
+            idx = 0
+            while idx < len(self.handlers):
+                if idx in self._notified_handlers:
+                    self._notified_handlers.discard(idx)
+                    self.run_task(self.handlers[idx], {},
+                                  getattr(self, "_play_become", False))
+                idx += 1
+        finally:
+            self._flushing = False
 
     # ---- facts -----------------------------------------------------------
     def gather_facts(self, environment=None, become=False, become_user=None,
@@ -2693,16 +2850,28 @@ class Runtime:
             else:
                 provenance = {"mode": "real-ansiballz"}
                 res = self.run_module("ansible.builtin.setup", {}, become=become)
-        except Exception as ex:  # pragma: no cover
-            sys.stderr.write("ansiroll: fact gathering failed: %s\n" % ex)
-            return
+        except Exception as ex:
+            provenance = {"mode": "native-agent"}
+            res = {"failed": True, "changed": False,
+                   "msg": "ansiroll: fact gathering raised %s: %s"
+                          % (type(ex).__name__, ex)}
         finally:
             self._module_env = None
             self.become_user = inherited_become_user
-        self._absorb_facts({"action": "setup"}, res)
         self._task_provenance[id(node)] = provenance
+        if not isinstance(res, dict) or res.get("failed"):
+            # Like Ansible, a failed setup is a fatal task failure for the host.
+            if not isinstance(res, dict):
+                res = {"failed": True, "changed": False,
+                       "msg": "ansiroll: fact gathering returned no result"}
+            res.setdefault("changed", False)
+            self.emit(node, "failed", res)
+            self._tally("failures")
+            return False
+        self._absorb_facts({"action": "setup"}, res)
         self.emit(node, "ok", {"changed": False})
         self._tally("ok")
+        return True
 
     # ---- module execution ------------------------------------------------
     def cleanup(self):
@@ -3106,7 +3275,12 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         "worker_startup": 0.0,
     }
     rt = None
+    host_var_overrides = {}
+    include_vars_layer = {}
     for play in plays:
+        if failed:
+            # A host that failed is removed from the rest of the playbook.
+            break
         if pretty:
             banner = "PLAY [%s] " % (play.get("name") or play.get("hosts") or "")
             sys.stdout.write("\n" + banner + "*" * max(3, 79 - len(banner)) + "\n")
@@ -3116,7 +3290,9 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      become_password=become_password, extra_vars=extra_vars,
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
+                     host_var_overrides=host_var_overrides,
                      native_only=native_only)
+        rt._include_vars_layer = dict(include_vars_layer)
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
@@ -3127,6 +3303,8 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
             rt.cleanup()  # shut the worker down
             engine_profile["worker_cleanup"] += time.monotonic() - cleanup_started
         host_vars = rt.vars  # carry facts/registers across plays for the same host
+        host_var_overrides = rt._set_fact_overrides
+        include_vars_layer = rt._include_vars_layer
         host = rt.host
         failed = failed or rt.failed
         for k in total:
@@ -3431,6 +3609,9 @@ def agent_main():
             for k in total:
                 total[k] += rt.stats.get(k, 0)
             rt.stats = {k: 0 for k in total}
+            if failed:
+                # A host that failed is removed from the rest of the playbook.
+                break
     finally:
         rt.cleanup()
     _chan_send(resp_fd, {"t": "stats", "host": rt.host, "stats": total})

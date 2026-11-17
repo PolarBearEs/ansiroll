@@ -271,6 +271,8 @@ class StrategyModule(StrategyBase):
             if node.get("type") == "include":
                 for sub in node.get("tasks", []) or []:
                     walk_node(sub)
+                for sub in node.get("handlers", []) or []:
+                    walk_node(sub)
             rid = node.get("runtime_id")
             if not rid:
                 return
@@ -1096,6 +1098,7 @@ def _controller_fallbacks(play_node):
                 continue
             if node.get("type") == "include":
                 walk(node.get("tasks"))
+                walk(node.get("handlers"))
             if node.get("fallback"):
                 found.append({
                     "kind": "controller-fallback",

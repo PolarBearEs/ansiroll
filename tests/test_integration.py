@@ -1117,6 +1117,12 @@ def test_compile_embeds_worker_file():
     assert "# __ANSIROLL_WORKER_CODE__" not in src
 
 
+def test_compile_bakes_controller_core_version():
+    from ansible.release import __version__
+    src, _ = compile_playbook(os.path.join(FIXTURES, "simple.yml"))
+    assert "\n_ANSIROLL_CORE_VERSION = %r\n" % str(__version__) in src
+
+
 def test_gather_embeds_setup():
     src, manifest = compile_playbook(os.path.join(FIXTURES, "gather.yml"))
     assert any(m.endswith("setup") for m in manifest["modules"])

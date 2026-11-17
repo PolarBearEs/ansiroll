@@ -814,6 +814,15 @@ _bundle_sys.meta_path.insert(0, _ansiroll_import_finder)
 ''' % base64.b64encode(import_bundle)
 
 
+def _controller_core_version():
+    """ansible-core version doing the compilation (baked into the artifact)."""
+    try:
+        from ansible.release import __version__
+        return str(__version__)
+    except Exception:
+        return None
+
+
 def _render_source(plays, modules, ansiballz_code, group_vars=None):
     return _render_source_with_stats(
         plays, modules, ansiballz_code, group_vars
@@ -850,6 +859,7 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         runtime_src,
         "\n\n# ===== embedded data =====\n",
         '_ANSIROLL_HOST = "localhost"\n',
+        "_ANSIROLL_CORE_VERSION = " + repr(_controller_core_version()) + "\n",
         "ANSIBALLZ_CODE = " + repr(ansiballz_code) + "\n",
         "_ANSIROLL_DATA_BUNDLE = " + repr(base64.b64encode(data_bundle)) + "\n",
         "_ansiroll_data_zip = _bundle_zipfile.ZipFile(_bundle_io.BytesIO("

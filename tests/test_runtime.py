@@ -813,9 +813,42 @@ def test_uncaught_failure_tallies_and_stops():
 def test_handler_notify_and_flush():
     tasks = [_task("1", "trigger", "debug", args={"msg": "x"},
                    changed_when=["true"], notify=["h1"])]
+    flush = {"type": "task", "uuid": "f", "name": "Flush handlers",
+             "action": "meta", "special": "meta_flush_handlers"}
     handlers = [_task("h", "h1", "debug", args={"msg": "handled"})]
-    rt, frames = run(tasks, handlers=handlers)
+    rt, frames = run(tasks + [flush], handlers=handlers)
     assert "h1" in [f["task"] for f in frames]
+
+
+@pytest.mark.parametrize("setup", ["failed", "raises"])
+def test_gather_facts_failure_fails_host(monkeypatch, setup):
+    # Ansible: a failed setup is fatal on "Gathering Facts" and the play's
+    # tasks never run for that host.
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+
+    def fake_setup(*_args, **_kwargs):
+        if setup == "raises":
+            raise OSError("boom")
+        return {"failed": True, "changed": False, "msg": "setup failed"}
+
+    monkeypatch.setattr(rt, "run_module", fake_setup)
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+    rt.run_play({"tasks": [_task("1", "after", "debug", args={"msg": "x"})],
+                 "handlers": [], "gather_facts": True, "vars": {}})
+    assert [f["status"] for f in by_name(frames, "Gathering Facts")] == ["failed"]
+    assert not by_name(frames, "after")
+    assert rt.failed
+    assert rt.stats["failures"] == 1
+
+
+def test_core_version_gate_uses_baked_version(monkeypatch):
+    # The compiled script bakes the controller's ansible-core version; any
+    # ansible installed on the target must not influence version gates.
+    import ansiroll.runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.15.3")
+    assert runtime_mod._core_at_least(2, 15)
+    assert not runtime_mod._core_at_least(2, 16)
 
 
 def test_assert_pass_and_fail():
@@ -967,17 +1000,16 @@ def test_until_retries_until_condition_passes(monkeypatch):
                  "", {"inventory_hostname": "h"})
     attempts = []
 
-    def run_once(_task, _ctx, _become):
-        attempts.append(1)
+    def run_once(_task, _ctx, _become, attempt=None):
+        attempts.append(attempt)
         rc = 1 if len(attempts) == 1 else 0
         return {"changed": True, "failed": rc != 0, "rc": rc}
 
     monkeypatch.setattr(rt, "_exec_one", run_once)
     res = rt._exec_with_retries(task, rt.ctx({}), False)
 
-    assert len(attempts) == 2
+    assert attempts == [1, 2]
     assert res["rc"] == 0
-    assert res["attempts"] == 2
 
 
 def test_accelerated_command_runs_without_embedded_module(monkeypatch):

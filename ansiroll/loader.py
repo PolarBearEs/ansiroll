@@ -166,6 +166,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
+    _apply_force_handlers_default(play)
     tasks = []
     for block in play.compile():
         n = _convert_node(block, actions, basedir, only_tags=only_tags,
@@ -220,6 +221,24 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
         except Exception:
             pass
     return result
+
+
+def _apply_force_handlers_default(play):
+    """Resolve an unset ``force_handlers`` from Ansible's configuration.
+
+    ``Play.force_handlers`` defaults to the ``--force-handlers`` CLI argument,
+    whose own default is ``DEFAULT_FORCE_HANDLERS`` (ANSIBLE_FORCE_HANDLERS /
+    ansible.cfg). ``ansiroll compile`` has no Ansible CLI context, so apply
+    that configured default before ``play.compile()`` wraps each section in a
+    block whose ``always`` flushes handlers.
+    """
+    try:
+        if getattr(play, "force_handlers", None) is not None:
+            return
+        from ansible import constants as C
+        play.force_handlers = bool(C.DEFAULT_FORCE_HANDLERS)
+    except Exception:
+        pass
 
 
 def _controller_env_names(value):
@@ -395,6 +414,7 @@ def _assign_runtime_ids(tasks, handlers):
                 counter[0] += 1
                 if node.get("type") == "include":
                     walk(node.get("tasks", []))
+                    walk(node.get("handlers", []))
 
     walk(tasks)
     walk(handlers)
@@ -589,11 +609,19 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         role = Role.load(ri, play, parent_role=parent_role,
                          from_files=from_files or None, from_include=True)
         blocks = role.compile(play)
+        handler_blocks = list(role.get_handler_blocks(play=play) or [])
     except Exception:
         return None
     finally:
         _INCLUDE_ROLE_STACK.discard(key)
     _register_included(blocks)
+    _register_included(handler_blocks)
+    # Executing include_role appends the role's handlers to the play's
+    # handlers (ansible/playbook/role_include.py IncludeRole.get_block_list).
+    handlers = []
+    for hblock in handler_blocks:
+        _convert_node(hblock, actions, basedir, flatten_handler=True,
+                      sink=handlers, all_vars=all_vars)
     tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                        skip_tags=skip_tags, all_vars=all_vars)
                          for b in blocks) if c]
@@ -603,6 +631,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         "uuid": task._uuid,
         "name": task.name or "include_role",
         "action": "include_role",
+        "handlers": _dedup_by_uuid(handlers),
         "file": name,
         "when": _as_list(task.when),
         "loop": _loop_of(task, basedir),
@@ -689,7 +718,10 @@ def _convert_task(task, actions, basedir):
         "changed_when": _conditions(task.changed_when) or None,
         "failed_when": _conditions(task.failed_when) or None,
         "until": _conditions(getattr(task, "until", None)) or None,
-        "retries": _numeric_or_template(getattr(task, "retries", 0), int),
+        # None = unset: TaskExecutor applies the default (3 retries with
+        # `until`; ansible-core < 2.16 bakes 3 into the field default).
+        "retries": (None if getattr(task, "retries", None) is None
+                    else _numeric_or_template(task.retries, int)),
         "delay": _numeric_or_template(getattr(task, "delay", 0), float),
         "environment": _as_list(getattr(task, "environment", None)) or None,
         "search_dirs": _search_dirs(task, basedir, "files"),
@@ -711,6 +743,8 @@ def _convert_task(task, actions, basedir):
         "notify": _as_list(task.notify),
         "special": _special_of(action),
     }
+    if _is_handler(task):
+        node.update(_handler_match(task))
     accelerator = _classify_accelerator(action, node["args"], node.get("loop"))
     if accelerator:
         node["accelerator"] = accelerator
@@ -738,6 +772,50 @@ def _convert_task(task, actions, basedir):
     elif node["special"] is None:
         actions.add(action)
     return node
+
+
+def _is_handler(task):
+    try:
+        from ansible.playbook.handler import Handler
+    except Exception:
+        return False
+    return isinstance(task, Handler)
+
+
+def _role_names(task):
+    role = getattr(task, "_role", None)
+    if role is None:
+        return []
+    names = []
+    for fqcn in (False, True):
+        try:
+            name = role.get_name(include_role_fqcn=fqcn)
+        except TypeError:
+            name = role.get_name()
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _handler_match(task):
+    """Names and ``listen`` topics a notification can match a handler by.
+
+    Mirrors StrategyBase.search_handlers_by_notification: a handler matches
+    its own name or its role-qualified name; ``listen`` topics also match
+    role-qualified (Handler._validate_listen).
+    """
+    roles = _role_names(task)
+    names = []
+    if task.name:
+        names.append(str(task.name))
+        names.extend("%s : %s" % (role, task.name) for role in roles)
+    listen = []
+    for topic in _as_list(getattr(task, "listen", None)):
+        topic = str(topic)
+        for value in [topic] + ["%s : %s" % (role, topic) for role in roles]:
+            if value not in listen:
+                listen.append(value)
+    return {"handler_names": names, "listen": listen}
 
 
 def _contains_dynamic_value(value):
