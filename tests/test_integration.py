@@ -227,8 +227,9 @@ def test_accelerated_command_edge_cases_match_official(tmp_path):
         rt.cleanup()
 
 
+@pytest.mark.parametrize("search_only", [False, True])
 def test_accelerated_command_guards_use_task_environment_and_literal_chdir(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, search_only):
     from ansiroll.loader import _accelerator_options
 
     work = tmp_path / "literal[1]"
@@ -247,6 +248,13 @@ def test_accelerated_command_guards_use_task_environment_and_literal_chdir(
         ({"removes": "missing"}, False),
         ({"creates": str(tmp_path / "absolute.txt")}, False),
     ]
+    start = tmp_path / "start"
+    start.mkdir()
+    monkeypatch.chdir(start)
+    if search_only:
+        if os.geteuid() == 0:
+            pytest.skip("root can read a search-only working directory")
+        start.chmod(0o111)
     rt = Runtime({"command": ModuleEmbedder().embed("command")},
                  "", {"inventory_hostname": "localhost"})
     rt._module_env = environment
@@ -268,7 +276,53 @@ def test_accelerated_command_guards_use_task_environment_and_literal_chdir(
             assert os.getcwd() == cwd
             assert os.environ["ANSIROLL_GUARD"] == "missing"
     finally:
+        start.chmod(0o700)
         rt.cleanup()
+
+
+def test_compiled_command_loop_restores_search_only_cwd(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root can read a search-only working directory")
+    start = tmp_path / "start"
+    start.mkdir()
+    guarded = tmp_path / "literal[1]"
+    guarded.mkdir()
+    (guarded / "marker").touch()
+    unguarded = tmp_path / "literal[2]"
+    unguarded.mkdir()
+    playbook = tmp_path / "guards.yml"
+    playbook.write_text(
+        """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command:
+        cmd: pwd
+        chdir: "{{ item }}"
+        creates: mark*
+      loop: %s
+    - command: pwd
+""" % json.dumps([str(guarded), str(unguarded)]))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(playbook))[0])
+    start.chmod(0o111)
+    try:
+        proc = subprocess.run([sys.executable, str(script)], cwd=str(start),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=dict(os.environ, ANSIROLL_RAW="1",
+                                       ANSIROLL_ACCELERATED_MODULES="command"),
+                              universal_newlines=True)
+    finally:
+        start.chmod(0o700)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    prefix = "__ANSIROLL_RESULT__ "
+    events = [json.loads(line[len(prefix):]) for line in proc.stdout.splitlines()
+              if line.startswith(prefix)]
+    skipped, executed = [event["result"] for event in events if event["is_item"]]
+    following = [event["result"] for event in events if not event["is_item"]][-1]
+    assert skipped["changed"] is False
+    assert executed["changed"] is True
+    assert executed["stdout"] == str(unguarded)
+    assert following["stdout"] == str(start)
 
 
 def test_accelerated_command_matches_legacy_warn_semantics():
@@ -491,6 +545,7 @@ def test_accelerated_modules_apply_locale_like_ansible_module(tmp_path, task_ove
 @pytest.mark.parametrize("path", [None, ""])
 def test_accelerated_shell_locale_fallback_matches_official(monkeypatch, path):
     import locale
+    from ansiroll.loader import _accelerator_options
 
     monkeypatch.setenv("LC_ALL", "C")
     original_locale = locale.setlocale(locale.LC_ALL)
@@ -507,7 +562,8 @@ def test_accelerated_shell_locale_fallback_matches_official(monkeypatch, path):
     rt._module_env = environment
     try:
         official = rt.run_module("shell", dict(args))
-        accelerated = run_accelerated("shell", args, environment=environment)
+        accelerated = run_accelerated(
+            "shell", args, environment=environment, options=_accelerator_options("shell"))
         following = run_accelerated("shell", args)
     finally:
         rt.cleanup()
@@ -754,6 +810,83 @@ def test_accelerated_file_paths_use_task_environment(tmp_path, monkeypatch):
             assert (base / "stale").is_file()
             assert os.readlink(str(base / "link")) == "stale"
             assert os.environ["ANSIROLL_TARGET"] == str(base / "stale")
+    finally:
+        rt.cleanup()
+
+
+@pytest.mark.parametrize(
+    "state", ["directory", "recursive_directory", "new_directory", "absent", "touch", "link"])
+def test_file_nested_path_expansion_matches_official(tmp_path, state):
+    from ansiroll.loader import _accelerator_options
+
+    args = {"path": "$ANSIROLL_FIRST", "state": state}
+    if state in ("new_directory", "recursive_directory"):
+        args["state"] = "directory"
+    if state in ("directory", "new_directory", "touch"):
+        args["mode"] = "0700"
+    if state == "recursive_directory":
+        args.update(mode="g+w", recurse=True)
+    if state == "touch":
+        args.update(access_time="preserve", modification_time="preserve")
+    if state == "link":
+        args["src"] = "$ANSIROLL_SOURCE"
+    rt = Runtime({"file": ModuleEmbedder().embed("file")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        for side in ("official", "accelerated"):
+            base = tmp_path / side
+            base.mkdir()
+            literal = base / "$ANSIROLL_SECOND"
+            actual = base / "$ANSIROLL_THIRD"
+            actual.mkdir()
+            actual.chmod(0o755)
+            third = base / "third"
+            third.mkdir()
+            third.chmod(0o755)
+            if state in ("directory", "recursive_directory", "absent", "touch"):
+                literal.mkdir()
+                literal.chmod(0o755)
+            if state == "recursive_directory":
+                for directory in (literal, actual):
+                    child = directory / "child"
+                    child.touch()
+                    child.chmod(0o644)
+            (base / "$ANSIROLL_TARGET").touch()
+            environment = {
+                "ANSIROLL_FIRST": str(literal),
+                "ANSIROLL_SECOND": "$ANSIROLL_THIRD",
+                "ANSIROLL_THIRD": "third",
+                "ANSIROLL_SOURCE": "$ANSIROLL_TARGET",
+                "ANSIROLL_TARGET": "missing",
+            }
+            rt._module_env = environment
+            if side == "accelerated":
+                result = run_accelerated("file", args, environment=environment,
+                                         options=_accelerator_options("file"))
+                fallback = state in ("touch", "link")
+                assert bool(result.get("_ansiroll_fallback")) is fallback
+                if fallback:
+                    assert literal.exists() is (state == "touch")
+                    assert actual.stat().st_mode & 0o777 == 0o755
+                    result = rt.run_module("file", dict(args))
+            else:
+                result = rt.run_module("file", dict(args))
+            assert result["changed"] and not result.get("failed"), result
+            if state == "absent":
+                assert not literal.exists()
+            elif state == "link":
+                assert os.readlink(str(literal)) == "$ANSIROLL_TARGET"
+            else:
+                assert literal.stat().st_mode & 0o777 == (
+                    0o700 if state == "new_directory" else 0o755)
+            if state == "recursive_directory":
+                assert actual.stat().st_mode & 0o777 == 0o775
+                assert (actual / "child").stat().st_mode & 0o777 == 0o644
+                assert (literal / "child").stat().st_mode & 0o777 == 0o664
+            else:
+                assert actual.stat().st_mode & 0o777 == (
+                    0o700 if state in ("directory", "touch") else 0o755)
+            assert third.stat().st_mode & 0o777 == 0o755
     finally:
         rt.cleanup()
 

@@ -799,10 +799,13 @@ def _accelerator_options(action):
         from ansible.release import __version__
         match = re.match(r"^(\d+)\.(\d+)", __version__)
         version = tuple(map(int, match.groups())) if match else (0, 0)
+        options = {}
+        # AnsibleModule._check_locale started selecting a UTF-8 fallback in 2.12.
+        if (2, 10) <= version < (2, 12):
+            options["legacy_locale"] = True
         if name == "stat" and version >= (2, 21):
-            return {"disk_usage_bytes": True}
-        if name in ("command", "shell"):
-            options = {}
+            options["disk_usage_bytes"] = True
+        elif name in ("command", "shell"):
             if version < (2, 12):
                 options["check_always_skipped"] = True
             if version < (2, 19):
@@ -812,39 +815,31 @@ def _accelerator_options(action):
                 options["check_skip_unchanged"] = True
             if version >= (2, 21):
                 options["verbose_nonzero"] = True
-            return options or None
-        if name == "find" and version >= (2, 12):
-            options = {
-                "all_paths_examined": True,
-                "structured_skipped_paths": True,
-            }
+        elif name == "find" and version >= (2, 12):
+            options["all_paths_examined"] = True
+            options["structured_skipped_paths"] = True
             if version >= (2, 21):
                 options["disk_usage_bytes"] = True
             if version >= (2, 19):
                 options["typed_warnings"] = True
-            return options
-        if name == "slurp":
+        elif name == "slurp":
             if version < (2, 19):
-                return {"lowercase_not_found": True}
-            return {"typed_exceptions": True}
-        if name == "apt":
-            options = {}
+                options["lowercase_not_found"] = True
+            else:
+                options["typed_exceptions"] = True
+        elif name == "apt":
             if version >= (2, 12):
                 options["parsable_locale"] = True
             if version >= (2, 18):
                 options["language_locale"] = True
-            return options or None
-        if name == "blockinfile" and version >= (2, 20):
-            return {"text_mode": True}
-        if name == "replace":
-            options = {}
+        elif name == "blockinfile" and version >= (2, 20):
+            options["text_mode"] = True
+        elif name == "replace":
             if version < (2, 20):
                 options["binary_io"] = True
             if version < (2, 14):
                 options["omit_result_rc"] = True
-            return options or None
-        if name == "user":
-            options = {}
+        elif name == "user":
             patch = re.match(r"^(\d+)\.(\d+)\.(\d+)", __version__)
             full = tuple(map(int, patch.groups())) if patch else version + (0,)
             if full >= (2, 18, 9):
@@ -852,9 +847,9 @@ def _accelerator_options(action):
             if version >= (2, 21):
                 options["result_memberships"] = True
                 options["placeholder_homes"] = True
-            return options or None
-        if name in ("systemd", "systemd_service") and version >= (2, 14):
-            return {"modern_is_enabled": True}
+        elif name in ("systemd", "systemd_service") and version >= (2, 14):
+            options["modern_is_enabled"] = True
+        return options or None
     except Exception:
         pass
     return None

@@ -61,16 +61,24 @@ def _check_guards(chdir, creates, removes):
         return _matching_guard(creates, removes), None
     # Glob from the actual directory so its name is literal, and restore
     # the agent's working directory before returning.
-    saved = os.open(".", os.O_RDONLY)
+    # Linux permits fchdir on an O_PATH directory descriptor with only
+    # search permission. POSIX O_SEARCH serves the same purpose where present.
+    search_flag = getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
+    saved = os.open(".", search_flag)
+    changed_directory = False
     try:
         try:
             os.chdir(chdir.encode("utf-8", "surrogateescape"))
+            changed_directory = True
         except OSError as error:
             return None, error
         return _matching_guard(creates, removes), None
     finally:
-        os.fchdir(saved)
-        os.close(saved)
+        try:
+            if changed_directory:
+                os.fchdir(saved)
+        finally:
+            os.close(saved)
 
 
 _PASSWD_ARG_RE = re.compile(r'^[-]{0,2}pass[-]?(word|wd)?')

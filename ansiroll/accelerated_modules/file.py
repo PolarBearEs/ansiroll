@@ -268,7 +268,13 @@ def _ensure_directory(path, recurse, attributes, check_mode):
             "failed": True, "path": path,
             "msg": "%s already exists as a %s" % (path, prev_state),
         }
-    targets = [path]
+    # The existing-directory branch uses load_file_common_arguments for
+    # the root, then recurses from the once-expanded path with expand=False.
+    attribute_path = os.path.expanduser(os.path.expandvars(path))
+    if attribute_path != path and (
+            os.path.islink(attribute_path) or not os.path.exists(attribute_path)):
+        raise _Fallback()
+    targets = [attribute_path]
     if recurse:
         for root, directories, files in os.walk(path):
             for name in directories + files:
@@ -329,6 +335,12 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         if state == "directory":
             return _add_path_info(_ensure_directory(
                 path, args.get("recurse", False), attributes, check_mode))
+        # Touch and link perform their initial operation on the validated
+        # path, then load attributes and apply timestamps on a second path.
+        # Let Ansible handle split targets, including touch rollback and
+        # symlink following, before either path has been modified.
+        if os.path.expanduser(os.path.expandvars(path)) != path:
+            return _FALLBACK
         if state == "touch":
             preserve_times = (
                 args.get("modification_time") == "preserve"

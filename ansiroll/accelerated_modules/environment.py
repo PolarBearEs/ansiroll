@@ -46,7 +46,7 @@ def _temporary_environment(overrides):
 
 
 @contextmanager
-def module_environment(environment):
+def module_environment(environment, legacy_locale=False):
     """Apply AnsibleModule._check_locale and restore the agent after the task."""
     overrides = {str(key): str(value) for key, value in (environment or {}).items()}
     previous_locale = locale.setlocale(locale.LC_ALL)
@@ -55,7 +55,7 @@ def module_environment(environment):
             try:
                 locale.setlocale(locale.LC_ALL, "")
             except locale.Error:
-                best = best_parsable_locale()
+                best = "C" if legacy_locale else best_parsable_locale()
                 locale.setlocale(locale.LC_ALL, best)
                 fallback = dict.fromkeys(("LANG", "LC_ALL", "LC_MESSAGES"), best)
                 overrides.update(fallback)
