@@ -225,6 +225,33 @@ def test_to_yaml_detects_recursion_through_lazy_containers():
     assert _f_to_yaml(_LazyTplList(loop, None, {})) == "&id001\n- *id001\n"
 
 
+class _StubRuntime(object):
+    def __init__(self, vars=None):
+        self.vars = vars or {}
+
+    def template(self, value, ctx):
+        return _Templater().render_string(value, ctx)
+
+
+def test_to_yaml_renders_aliased_lazy_list_per_context():
+    from ansiroll.runtime import _LazyTplList
+
+    rt = _StubRuntime()
+    shared = ["{{ name }}"]
+    value = [_LazyTplList(shared, rt, {"name": "play"}),
+             _LazyTplList(shared, rt, {"name": "task"})]
+    assert _f_to_yaml(value) == "- - play\n- - task\n"
+
+
+def test_to_yaml_detects_recursion_through_dynamic_lazy_containers():
+    from ansiroll.runtime import _LazyTplList
+
+    loop = []
+    loop.append(loop)
+    view = _LazyTplList(loop, _StubRuntime({"x": 1}), {}, dynamic=True)
+    assert _f_to_yaml(view) == "&id001\n- *id001\n"
+
+
 def test_yaml_plain_preserves_cycles_through_tuples():
     items = []
     value = (items,)

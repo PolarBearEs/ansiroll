@@ -314,8 +314,12 @@ def _yaml_plain(v, memo=None, key_memo=None):
     if not isinstance(v, (dict, list, tuple)):
         return v
     # Lazy wrappers are rebuilt on every access; key them by the raw
-    # container they wrap so recursion through them is still detected.
-    key = id(getattr(v, "_raw", v))
+    # container they wrap so recursion through them is still detected, plus
+    # the context they were created under (one raw container can render
+    # differently in two contexts).  ``_origin`` stays stable across accesses,
+    # unlike the fresh context dict a dynamic wrapper builds each time.
+    origin = getattr(v, "_origin", None)
+    key = (id(getattr(v, "_raw", v)), id(origin) if origin is not None else None)
     if key in memo:
         return memo[key][1]
     if isinstance(v, dict):
@@ -664,32 +668,34 @@ def _query(name, *args, **kwargs):
     return _lookup_values(name, args, kwargs, ctx)
 
 
-def _lazy_container(value, rt, ctx, dynamic=False):
+def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
     if isinstance(value, dict):
-        return _LazyTplDict(value, rt, ctx, dynamic)
+        return _LazyTplDict(value, rt, ctx, dynamic, origin)
     if isinstance(value, list):
-        return _LazyTplList(value, rt, ctx, dynamic)
+        return _LazyTplList(value, rt, ctx, dynamic, origin)
     return value
 
 
-def _lazy_wrap(value, rt, ctx, dynamic=False):
+def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
     if isinstance(value, str):
         return rt.template(value, ctx)
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_unsafe__"}:
         return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_vault__"}:
         return value
-    return _lazy_container(value, rt, ctx, dynamic)
+    return _lazy_container(value, rt, ctx, dynamic, origin)
 
 
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None):
         dict.__init__(self, raw)
         self._raw = raw
         self._rt = rt
         self._ctx = ctx
+        # The context this view tree was created under; children share it.
+        self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
 
     def _render_ctx(self):
@@ -701,7 +707,8 @@ class _LazyTplDict(dict):
 
     def __getitem__(self, k):
         return _lazy_wrap(
-            dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic)
+            dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic,
+            self._origin)
 
     def get(self, k, default=None):
         try:
@@ -731,11 +738,12 @@ class _LazyTplDict(dict):
 class _LazyTplList(list):
     """A vars list whose items render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None):
         list.__init__(self, raw)
         self._raw = raw
         self._rt = rt
         self._ctx = ctx
+        self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
 
     def _render_ctx(self):
@@ -749,14 +757,17 @@ class _LazyTplList(list):
         v = list.__getitem__(self, i)
         if isinstance(i, slice):
             return [
-                _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic)
+                _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic,
+                           self._origin)
                 for x in v
             ]
-        return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic)
+        return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
+                          self._origin)
 
     def __iter__(self):
         for v in list.__iter__(self):
-            yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic)
+            yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
+                             self._origin)
 
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
