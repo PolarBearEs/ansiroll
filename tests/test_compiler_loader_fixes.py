@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from datetime import datetime
 
 import pytest
 
@@ -447,3 +448,104 @@ def test_register_and_loop_vars_are_not_frozen(tmp_path):
     expected = _ansible(tmp_path / "pb.yml")
     assert expected[0] == ["hi a 0"]
     assert _ansiroll(tmp_path / "pb.yml", tmp_path, "--freeze-playbook-vars") == expected
+
+
+def test_time_and_host_dependent_values_are_not_frozen_or_shaken(tmp_path, monkeypatch):
+    compile_home = tmp_path / "compile-home"
+    runtime_home = tmp_path / "runtime-home"
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "compile-target")
+    monkeypatch.setenv("HOME", str(compile_home))
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    stamp: "{{ now().year }}"
+    home: "{{ '~' | expanduser }}"
+    target: "{{ '%s' | realpath }}"
+    alias: "{{ stamp }}"
+    fixed: "{{ 'a' | upper }}"
+  tasks:
+    - debug: msg="{{ stamp }} {{ home }} {{ target }} {{ alias }} {{ fixed }}"
+    - debug: msg=HOME
+      when: "'~' | expanduser == '%s'"
+    - debug: msg=LINK
+      when: "'%s' | realpath == '%s'"
+""" % (link, compile_home, link, tmp_path / "runtime-target")})
+    playbook = tmp_path / "pb.yml"
+    source, manifest = compile_playbook(str(playbook),
+                                        freeze_playbook_vars=True, tree_shake=True)
+    info = manifest["tree_shake"]
+    assert info["frozen_var_names"] == ["fixed"]
+    assert sorted(info["skipped_playbook_vars"]) == ["alias", "home", "stamp", "target"]
+    assert info["removed_nodes"] == 0
+    assert info["simplified_conditions"] == 0
+
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(source)
+    link.unlink()
+    link.symlink_to(tmp_path / "runtime-target")
+    monkeypatch.setenv("HOME", str(runtime_home))
+    run = subprocess.run([sys.executable, str(compiled)], cwd=tmp_path, env=_env(),
+                         capture_output=True, text=True, check=True)
+    expected = _ansible(playbook)
+    year = datetime.now().year
+    assert expected[0] == ["%s %s %s %s A" % (year, runtime_home, link.resolve(), year),
+                           "LINK"]
+    assert _summary(run.stdout) == expected
+
+
+def test_include_tasks_under_include_role_resolves_like_ansible(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_role: name=r
+""", "roles/r/tasks/main.yml": "- include_tasks: sub/a.yml\n",
+        "roles/r/tasks/sub/a.yml": "- include_tasks: x.yml\n",
+        "roles/r/sub/x.yml": "- debug: msg=ROLE_SUB_X\n"})
+    expected = _ansible(tmp_path / "pb.yml")
+    assert expected[0] == ["ROLE_SUB_X"]
+    assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+
+
+def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path):
+    dest = tmp_path / "dest.txt"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {name: app, flag: false}
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- copy: {src: "{{ name }}.conf", dest: "%s", remote_src: "{{ flag }}"}
+- debug: msg="{{ lookup('file', '%s') }}"
+""" % (dest, dest), "roles/r/files/app.conf": "CONTROLLER\n"})
+    expected = _ansible(tmp_path / "pb.yml")
+    dest.unlink()
+    assert expected[0] == ["CONTROLLER"]
+    assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+
+
+def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {a: 1, b: 2, c: 3}
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: src="{{ item }}" dest=/tmp/never
+  loop: "{{ things | default([]) }}"
+- include_tasks: t.yml
+""", "roles/r/tasks/t.yml": "- debug: msg=x\n",
+        "roles/r/templates/b.j2": "b\n", "roles/r/templates/a.j2": "a\n"})
+    outputs = []
+    for seed, cwd in (("1", ROOT), ("2", str(tmp_path))):
+        out = tmp_path / ("o%s.py" % seed)
+        env = _env()
+        env["PYTHONHASHSEED"] = seed
+        subprocess.check_call(
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(tmp_path / "pb.yml"),
+             "-o", str(out)], cwd=cwd, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        outputs.append(out.read_bytes())
+    assert outputs[0] == outputs[1]

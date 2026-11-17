@@ -179,6 +179,7 @@ def _rewrite_includes(data):
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, all_vars=None):
     INCLUDED_TASKS.clear()
     _INCLUDE_STACK.clear()
+    _INCLUDE_ROLE_PARENTS.clear()
     _INCLUDE_IDS[0] = 0
     if basedir is None:
         try:
@@ -532,6 +533,10 @@ INCLUDED_TASKS = {}
 # Includes currently being expanded, keyed by what makes their expansion
 # identical; the value is the include_id a recursive include refers back to.
 _INCLUDE_STACK = {}
+# id(top-level role block) -> include_role task. IncludeRole.get_block_list
+# parents the role's blocks to the include_role task; ansiroll does not call
+# it, so the link is kept here for include_tasks path resolution only.
+_INCLUDE_ROLE_PARENTS = {}
 _INCLUDE_IDS = [0]
 
 
@@ -631,6 +636,13 @@ def _is_handler(task):
     return isinstance(task, Handler)
 
 
+def _include_parent(obj):
+    parent = getattr(obj, "_parent", None)
+    if parent is None:
+        parent = _INCLUDE_ROLE_PARENTS.get(id(obj))
+    return parent
+
+
 def _include_tasks_path(task, include_target, all_vars):
     """Resolve an include_tasks file like IncludedFile.process_include_results
     (ansible/playbook/included_file.py) does for the controller."""
@@ -643,11 +655,11 @@ def _include_tasks_path(task, include_target, all_vars):
     role = getattr(task, "_role", None)
     dirname = "handlers" if _is_handler(task) else "tasks"
     include_file = None
-    parent_include = getattr(task, "_parent", None)
+    parent_include = _include_parent(task)
     cumulative_path = None
     while parent_include is not None:
         if not isinstance(parent_include, TaskInclude):
-            parent_include = getattr(parent_include, "_parent", None)
+            parent_include = _include_parent(parent_include)
             continue
         if IncludeRole and isinstance(parent_include, IncludeRole):
             parent_include_dir = getattr(parent_include, "_role_path", None) or ""
@@ -676,7 +688,7 @@ def _include_tasks_path(task, include_target, all_vars):
                 loader.get_basedir(), cumulative_path, include_target)
         if os.path.exists(include_file):
             break
-        parent_include = getattr(parent_include, "_parent", None)
+        parent_include = _include_parent(parent_include)
     if include_file is None:
         if role is not None:
             include_file = loader.path_dwim_relative(
@@ -744,6 +756,9 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         except Exception:
             return None
         _register_included(blocks)
+        task._role_path = role._role_path
+        role_roots = [id(block) for block in blocks if getattr(block, "_parent", None) is None]
+        _INCLUDE_ROLE_PARENTS.update(dict.fromkeys(role_roots, task))
         include_id = _new_include_id()
         # Keep the guard while converting the role's tasks: that is where a
         # recursive include_role is reached.
@@ -754,6 +769,8 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
+            for root in role_roots:
+                del _INCLUDE_ROLE_PARENTS[root]
     role_defaults, role_vars = _role_vars(task)
     return _include_node(task, "include_role", name, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
@@ -1006,13 +1023,13 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        elif remote is None:
-            return  # remote_src decided at runtime; nothing safe to bake
         elif _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
             # loop is a runtime var; bake the whole role tree so the runtime can
             # resolve whichever file the rendered src points to.
             return
+        elif remote is None:
+            return  # remote_src decided at runtime; src may be a target path
         else:
             node["fallback"] = True
             node["fallback_reason"] = "dynamic baked src not resolvable at compile time: %s" % src

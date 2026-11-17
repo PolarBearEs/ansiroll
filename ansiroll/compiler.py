@@ -189,6 +189,8 @@ def _contains_undefined(value):
 def _freeze_value(value, context):
     from .runtime import Runtime
     runtime = Runtime({}, "", {})
+    if _runtime_dependent(value, context, runtime.templater.env):
+        return None, False
     try:
         resolved = runtime.template(value, context)
     except Exception:
@@ -385,12 +387,47 @@ def _condition_value(condition, variables, templater):
 
 
 # Filters whose result depends on when/where they run.
-_NONDETERMINISTIC_FILTERS = frozenset(("random", "shuffle", "strftime"))
+_NONDETERMINISTIC_FILTERS = frozenset(
+    ("random", "shuffle", "strftime", "expanduser", "realpath"))
+# Lookups run on the controller, so compile time is the right time for them.
+_CONTROLLER_GLOBALS = frozenset(("lookup", "query", "q"))
+
+
+def _runtime_dependent(value, variables, env, _seen=None):
+    """True when templating ``value`` (or a variable it references) calls a
+    non-lookup global (now(), ...) or a host/time dependent filter, so its
+    result is not known when compiling."""
+    seen = set() if _seen is None else _seen
+    if isinstance(value, dict):
+        if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+            return False
+        return any(_runtime_dependent(item, variables, env, seen)
+                   for pair in value.items() for item in pair)
+    if isinstance(value, (list, tuple)):
+        return any(_runtime_dependent(v, variables, env, seen) for v in value)
+    if not isinstance(value, str) or ("{{" not in value and "{%" not in value):
+        return False
+    from jinja2 import nodes
+    try:
+        parsed = env.parse(value)
+    except Exception:
+        return False
+    for node in parsed.find_all(nodes.Name):
+        if node.ctx != "load":
+            continue
+        if node.name in variables:
+            if node.name not in seen:
+                seen.add(node.name)
+                if _runtime_dependent(variables[node.name], variables, env, seen):
+                    return True
+        elif node.name in env.globals and node.name not in _CONTROLLER_GLOBALS:
+            return True
+    return _uses_nondeterministic_filter(parsed)
 
 
 def _uses_nondeterministic_filter(parsed):
     from jinja2 import nodes
-    return any(node.name in _NONDETERMINISTIC_FILTERS
+    return any(node.name.rsplit(".", 1)[-1] in _NONDETERMINISTIC_FILTERS
                for node in parsed.find_all(nodes.Filter))
 
 
