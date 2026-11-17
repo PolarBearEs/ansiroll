@@ -156,7 +156,10 @@ def _rewrite_includes(data):
     return data
 
 
-def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, all_vars=None):
+def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
+                  all_vars=None, gather_facts=None):
+    from ansible import constants as C
+
     INCLUDED_TASKS.clear()
     if basedir is None:
         try:
@@ -180,15 +183,13 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
                       all_vars=all_vars)
     handlers = _dedup_by_uuid(handlers)
     _assign_runtime_ids(tasks, handlers)
-    # An unset gather_facts follows the configured gathering policy: implicit
-    # and smart gather, explicit does not.
-    gather = play.gather_facts
+    # The strategy supplies the iterator's filtered setup decision. Standalone
+    # uses the play keyword and the controller's default gathering policy.
+    gather = gather_facts
     if gather is None:
-        try:
-            from ansible import constants as C
+        gather = play.gather_facts
+        if gather is None:
             gather = C.DEFAULT_GATHERING != "explicit"
-        except Exception:
-            gather = True
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
     result = {
@@ -196,7 +197,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
         "hosts": hosts,
         "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
-        "fact_schema": _fact_schema(),
+        "error_on_missing_handler": C.ERROR_ON_MISSING_HANDLER,
+        "fact_schema": "%d.%d" % _core_version(),
         "environment": _as_list(getattr(play, "environment", None)) or None,
         "check_mode": getattr(play, "check_mode", None),
         "become": bool(play.become),
@@ -215,7 +217,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
     config_names = _controller_config_names(result)
     if config_names:
         try:
-            from ansible import constants as C
             result["controller_config"] = {
                 name: C.config.get_config_value(name)
                 for name in sorted(config_names)
@@ -273,16 +274,16 @@ def _controller_config_names(value):
     return names
 
 
-def _fact_schema():
-    """Fact shape emitted by the ansible-core version doing the compilation."""
+def _core_version():
+    """Major and minor version of the compiling ansible-core."""
     try:
         from ansible.release import __version__
         match = re.match(r"^(\d+)\.(\d+)", __version__)
         if match:
-            return "%s.%s" % match.groups()
+            return tuple(map(int, match.groups()))
     except Exception:
         pass
-    return "2.10"
+    return (2, 10)
 
 
 def _resolved_play_vars(play, all_vars, basedir):
@@ -612,8 +613,15 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
             variable_manager=task.get_variable_manager(), loader=task._loader)
         role = Role.load(ri, play, parent_role=parent_role,
                          from_files=from_files or None, from_include=True)
-        blocks = role.compile(play)
-        handler_blocks = list(role.get_handler_blocks(play=play) or [])
+        if _core_version() >= (2, 15):
+            dep_chain = role.get_dep_chain()
+            handler_dep_chain = dep_chain
+        else:
+            dep_chain = list(parent_role.get_parents()) + [parent_role] if parent_role else []
+            # Through 2.14, IncludeRole passes the chain to tasks only.
+            handler_dep_chain = None
+        blocks = role.compile(play, dep_chain=dep_chain)
+        handler_blocks = role.get_handler_blocks(play, dep_chain=handler_dep_chain) or []
     except Exception:
         return None
     finally:
@@ -643,6 +651,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         "index_var": _index_var(task),
         **_loop_control(task),
         "vars": _tag_untrusted(dict(task.vars or {})),
+        "include_params": _tag_untrusted(task.get_include_params()),
         "role_defaults": role_defaults,
         "role_vars": role_vars,
         "role_params": _role_params(task),
@@ -807,20 +816,16 @@ def _handler_match(task):
     """Names and ``listen`` topics a notification can match a handler by.
 
     Mirrors StrategyBase.search_handlers_by_notification: a handler matches
-    its own name or its role-qualified name; ``listen`` topics also match
-    role-qualified (Handler._validate_listen).
+    its own name or its role-qualified name. Since 2.17,
+    Handler._validate_listen also adds role-qualified topics.
     """
     roles = _role_names(task)
     names = []
     if task.name:
         names.append(str(task.name))
         names.extend("%s : %s" % (role, task.name) for role in roles)
-    listen = []
-    for topic in _as_list(getattr(task, "listen", None)):
-        topic = str(topic)
-        for value in [topic] + ["%s : %s" % (role, topic) for role in roles]:
-            if value not in listen:
-                listen.append(value)
+    # ansible-core 2.17+ includes role-qualified aliases in task.listen.
+    listen = list(dict.fromkeys(map(str, _as_list(getattr(task, "listen", None)))))
     return {"handler_names": names, "listen": listen}
 
 

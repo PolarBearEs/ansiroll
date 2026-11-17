@@ -108,6 +108,7 @@ def _trust_set_fact_value(value):
 # params, include loop vars and rescue magic vars (VariableManager.get_vars
 # merges include params after the nonpersistent fact cache).
 _HIGH_VARS_KEY = "__ansiroll_high_vars__"
+_INCLUDE_PARAMS_KEY = "__ansiroll_include_params__"
 
 
 def _with_high_vars(overlay, values):
@@ -183,6 +184,10 @@ class TaskFailed(Exception):
         super(TaskFailed, self).__init__(name)
         self.task = task or {"name": name}
         self.result = result or {"failed": True, "msg": str(name)}
+
+
+class MissingHandler(Exception):
+    """A changed task requested a handler that has not been loaded."""
 
 
 class UntrustedConditional(Exception):
@@ -1286,6 +1291,7 @@ class Runtime:
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
+        self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
         self.templater = _Templater()
         self.handlers = []
         self.notified = []  # ordered, de-duplicated pending notifications
@@ -1610,7 +1616,8 @@ class Runtime:
                 plugin["source"] = self._asset_text(plugin.get("source"))
                 plugins.append(plugin)
             self.templater.register_plugins(plugins)
-        self.handlers = list(play.get("handlers", []))
+        self.handlers = [(handler, {}, False) for handler in play.get("handlers", [])]
+        self._error_on_missing_handler = play.get("error_on_missing_handler", True)
         self._notified_handlers = set()
         self._flushing = False
         self._play_become = play.get("become", False)
@@ -1619,24 +1626,25 @@ class Runtime:
             for name in initial_notified:
                 if name not in self.notified:
                     self.notified.append(name)
+        self.vars["__ansiroll_controller_env"] = play.get("controller_env") or {}
+        self.vars["__ansiroll_controller_config"] = (
+            play.get("controller_config") or {}
+        )
         if play.get("gather_facts"):
+            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
                 become_user=play.get("become_user"),
                 fact_schema=play.get("fact_schema"),
                 ignore_errors=play.get("ignore_errors"),
+                ctx=setup_ctx,
             )
             if not gathered:
-                # A failed setup fails the host; nothing else in the play runs.
                 self.failed = True
                 self.check_mode = invocation_check_mode
                 return
         # Play vars (templated after facts are available; containers lazily).
-        self.vars["__ansiroll_controller_env"] = play.get("controller_env") or {}
-        self.vars["__ansiroll_controller_config"] = (
-            play.get("controller_config") or {}
-        )
         self._runtime_var_overrides = (
             set(self.extra_vars) | set(self._set_fact_overrides)
             | set(self._include_vars_layer)
@@ -1655,25 +1663,22 @@ class Runtime:
         # overwrite values injected via -e.
         self.vars.update(self.extra_vars)
         try:
-            # Handlers run only at the flush points play.compile() lowers into
-            # the task list (after pre_tasks, tasks and post_tasks; wrapped in
-            # `always` sections under force_handlers). A failed host flushes
-            # nothing further unless force_handlers put a flush in `always`.
-            self.run_nodes(play.get("tasks", []), {}, play.get("become", False))
+            # Play.compile() provides the implicit flush points and wraps them
+            # in always sections when force_handlers is supported there.
+            self.run_nodes(play.get("tasks", []), {}, self._play_become)
         except TaskFailed as ex:
-            # An uncaught failure ends the play for this host.
             if not getattr(ex, "counted", False):
                 self._tally("failures")
             self.failed = True
-            # Before 2.14 play.compile() has no force_handlers `always`
-            # flush; StrategyBase.run() runs the remaining handlers for failed
-            # hosts when force_handlers is set (strategy/__init__.py run()).
-            if play.get("force_handlers") and not _core_at_least(2, 14):
-                try:
-                    self.flush_handlers()
-                except TaskFailed as hex_:
-                    if not getattr(hex_, "counted", False):
-                        self._tally("failures")
+        # Through 2.13, StrategyBase.run() makes one final pass, with failed
+        # hosts eligible only under force_handlers.
+        if not _core_at_least(2, 14) and (not self.failed or play.get("force_handlers")):
+            try:
+                self.flush_handlers()
+            except TaskFailed as ex:
+                if not getattr(ex, "counted", False):
+                    self._tally("failures")
+                self.failed = True
         self.check_mode = invocation_check_mode
 
     def run_nodes(self, nodes, overlay, become=False):
@@ -1689,8 +1694,7 @@ class Runtime:
             self.run_task(node, overlay, become)
 
     def run_include(self, node, overlay, become=False):
-        """A compile-time-expanded include_tasks: run the inner tasks (per loop
-        item when looped). The include itself reports but is not tallied."""
+        """Run a compile-time-expanded include once per invocation or loop item."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
@@ -1708,24 +1712,32 @@ class Runtime:
                                         "skip_reason": "Conditional result was False"})
             self._tally("skipped")
             return
-        params = self.template_vars(node.get("vars"), base_ctx)
-        scope = _with_high_vars(overlay, params)
         loop = node.get("loop")
-        if loop is None:
-            self.emit(node, "ok", {"changed": False, "include": node.get("file")})
-            self._tally("ok")
-            self.handlers.extend(node.get("handlers") or [])
+        tally = node.get("action") != "include_role" or _core_at_least(2, 17)
+        items = self._resolve_loop(loop, base_ctx) if loop is not None else [None]
+        invocation_params = node.get("include_params", node.get("vars")) or {}
+        for i, item in enumerate(items):
+            result = {"changed": False, "include": node.get("file")}
+            loop_vars = {}
+            if loop is not None:
+                loop_vars = self._loop_item_vars(node, items, i, base_ctx)
+                result["item"] = item
+            ctx = dict(base_ctx)
+            ctx.update(loop_vars)
+            params = self.template_vars(invocation_params, ctx)
+            params.update(loop_vars)
+            scope = _with_high_vars(overlay, params)
+            # Handlers execute later, so retain the expressions as well as
+            # the loop values from this invocation.
+            include_params = dict(overlay.get(_INCLUDE_PARAMS_KEY) or {})
+            include_params.update(invocation_params)
+            include_params.update(loop_vars)
+            scope[_INCLUDE_PARAMS_KEY] = include_params
+            self.emit(node, "ok", result, item=item, is_item=loop is not None)
+            if tally:
+                self._tally("ok")
+            self.handlers.extend((handler, scope, b) for handler in node.get("handlers", []))
             self.run_nodes(node.get("tasks", []), scope, b)
-            return
-        items = self._resolve_loop(loop, base_ctx)
-        for i, it in enumerate(items):
-            item_scope = _with_high_vars(
-                scope, self._loop_item_vars(node, items, i, base_ctx))
-            self.emit(node, "ok", {"changed": False, "include": node.get("file"),
-                                   "item": it}, item=it, is_item=True)
-            self._tally("ok")
-            self.handlers.extend(node.get("handlers") or [])
-            self.run_nodes(node.get("tasks", []), item_scope, b)
 
     def run_block(self, block, overlay, become=False):
         scope = dict(overlay)
@@ -1744,6 +1756,8 @@ class Runtime:
             try:
                 self.run_nodes(block.get("block", []), scope, b_become)
             except TaskFailed as ex:
+                if getattr(ex, "ends_play", False):
+                    raise
                 rescue = block.get("rescue") or []
                 if not rescue:
                     raise
@@ -1759,6 +1773,8 @@ class Runtime:
                 self._set_fact_overrides.update(failed_facts)
                 self.run_nodes(rescue, scope, b_become)
         except TaskFailed as ex:
+            if getattr(ex, "ends_play", False):
+                raise
             failed_exc = ex
         if block.get("always"):
             try:
@@ -1835,6 +1851,7 @@ class Runtime:
         < set_fact/register < role params < include params < extra vars.
         """
         ctx.pop(_HIGH_VARS_KEY, None)
+        ctx.pop(_INCLUDE_PARAMS_KEY, None)
         ctx.update(self._include_vars_layer)
         ctx.update(self._set_fact_overrides)
         ctx.update(role_params or {})
@@ -1955,6 +1972,7 @@ class Runtime:
         else:
             ignore = _to_bool(ignore)
         loop = task.get("loop", None)
+        notifications = []
         if loop is not None:
             # A literal-false task conditional short-circuits loop templating.
             # An undefined loop expression must not fabricate an undefined item
@@ -1976,7 +1994,8 @@ class Runtime:
                 self._tally("skipped")
                 return
             try:
-                res = self._run_loop(task, base_ctx, effective_become, ignore)
+                res = self._run_loop(
+                    task, base_ctx, effective_become, ignore, notifications)
             except TaskFailed:
                 raise
             except Exception as ex:
@@ -2008,6 +2027,8 @@ class Runtime:
                 return
             if run_it:
                 res = self._exec_with_retries(task, base_ctx, effective_become)
+                if res.get("changed") and not _result_failed(res):
+                    notifications = self._notification_names(task, base_ctx)
             if task.get("register"):
                 res.setdefault("failed", False)
                 res.setdefault("changed", False)
@@ -2015,6 +2036,8 @@ class Runtime:
             self._absorb_facts(task, res)
 
         tally_changed = res.pop("_ansiroll_tally_changed", res.get("changed", False))
+        if res.get("changed") and not _result_failed(res):
+            self._queue_notify(notifications)
         status = _status_of(res)
         self.emit(task, status, res, ignored=ignore)
 
@@ -2028,7 +2051,6 @@ class Runtime:
             self._tally("skipped")
         else:
             self._tally("changed" if res.get("changed") else "ok")
-            self._queue_notify(task, res)
 
     def _loop_item_vars(self, task, items, i, ctx=None):
         """Per-item loop variables: loop_var, index_var and ansible_loop."""
@@ -2056,7 +2078,8 @@ class Runtime:
             out["ansible_loop"] = loop_info
         return out
 
-    def _run_loop(self, task, base_ctx, become=False, ignore_errors=False):
+    def _run_loop(self, task, base_ctx, become=False, ignore_errors=False,
+                  notifications=None):
         items = self._resolve_loop(task.get("loop"), base_ctx)
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         any_ran = False
@@ -2071,6 +2094,8 @@ class Runtime:
             else:
                 any_ran = True
                 res = self._exec_with_retries(task, ctx, become)
+                if notifications is not None and not _result_failed(res):
+                    notifications.extend(self._notification_names(task, ctx))
                 self._absorb_facts(task, res)
                 if isinstance(res.get("ansible_facts"), dict):
                     base_ctx.update(res["ansible_facts"])
@@ -2196,7 +2221,11 @@ class Runtime:
                 return res
             # 2.16+: without `until` the default condition is `not failed`.
             if until:
-                done = self.when(until, eval_ctx)
+                try:
+                    done = self.when(until, eval_ctx, strict=True)
+                except Exception as ex:
+                    return {"failed": True, "changed": False,
+                            "msg": "An 'until' expression failed. %s" % ex}
             else:
                 done = not res.get("failed")
             if done:
@@ -2765,18 +2794,40 @@ class Runtime:
                 key = k[8:] if isinstance(k, str) and k.startswith("ansible_") else k
                 existing[key] = v
 
-    def _queue_notify(self, task, res):
-        if not res.get("changed"):
-            return
-        for name in (task.get("notify") or []):
-            if self._flushing:
-                # A handler notifying handlers marks them right away: later
-                # definitions run in this flush, earlier ones at the next.
-                self._notified_handlers.update(self._handlers_for(name))
+    def _notification_names(self, task, ctx):
+        names = []
+        for value in task.get("notify") or []:
+            rendered = self.template(value, ctx)
+            names.extend(rendered if isinstance(rendered, list) else [rendered])
+        return names
+
+    def _queue_notify(self, names):
+        for name in names:
+            matches = self._handlers_for(name)
+            if not matches:
+                message = (
+                    "The requested handler '%s' was not found in either the main "
+                    "handlers list nor in the listening handlers list" % _as_text(name)
+                )
+                if self._error_on_missing_handler:
+                    raise MissingHandler(message)
+                self.on_warning(message)
+            elif self._flushing or not _core_at_least(2, 15):
+                # Older cores bind when notified. Newer cores also bind
+                # immediately during a flush so forward notifications can
+                # run in the same pass.
+                self._notified_handlers.update(matches)
             elif name not in self.notified:
                 self.notified.append(name)
 
     # ---- handlers --------------------------------------------------------
+    def _handler_scope(self, handler, scope):
+        params = scope.get(_INCLUDE_PARAMS_KEY)
+        if not params:
+            return scope
+        ctx = self._layered_ctx(self.ctx(scope), role_params=handler.get("role_params"))
+        return _with_high_vars(scope, self.template_vars(params, ctx))
+
     def _handlers_for(self, notification):
         """Indexes of the handlers a notification targets.
 
@@ -2784,24 +2835,31 @@ class Runtime:
         handler matching by (role-qualified) name, plus every handler listening
         on the topic (de-duplicated by handler name).
         """
-        def names(h):
-            if "handler_names" in h:
-                return h.get("handler_names") or []
-            return [h["name"]] if h.get("name") else []
+        def names(handler, scope):
+            values = handler.get("handler_names")
+            if values is None:
+                values = [handler["name"]] if handler.get("name") else []
+            if any("{{" in value or "{%" in value for value in values):
+                ctx = self._task_ctx(handler, self._handler_scope(handler, scope))
+                values = [self.template(value, ctx) for value in values]
+                values = [value for value in values if not _is_undef(value)]
+            return values
 
         found = []
         indexes = range(len(self.handlers) - 1, -1, -1)
         for idx in indexes:
-            if notification in names(self.handlers[idx]):
+            handler, scope, _ = self.handlers[idx]
+            if notification in names(handler, scope):
                 found.append(idx)
                 break
         seen = set()
+        modern = _core_at_least(2, 15)
         for idx in indexes:
-            handler = self.handlers[idx]
+            handler, scope, _ = self.handlers[idx]
             if notification in (handler.get("listen") or []):
-                own = names(handler)
+                own = names(handler, scope)
                 own = own[0] if own else None
-                if own and own in seen:
+                if modern and own and own in seen:
                     continue
                 seen.add(own)
                 found.append(idx)
@@ -2821,25 +2879,34 @@ class Runtime:
             while idx < len(self.handlers):
                 if idx in self._notified_handlers:
                     self._notified_handlers.discard(idx)
-                    self.run_task(self.handlers[idx], {},
-                                  getattr(self, "_play_become", False))
+                    handler, scope, become = self.handlers[idx]
+                    self.run_task(handler, self._handler_scope(handler, scope),
+                                  become or self._play_become)
                 idx += 1
+        except TaskFailed as ex:
+            # In 2.14 a failed HANDLERS state goes straight to COMPLETE.
+            # 2.15+ returns to the block containing the flush first.
+            if _core_at_least(2, 14) and not _core_at_least(2, 15):
+                ex.ends_play = True
+            raise
         finally:
             self._flushing = False
 
     # ---- facts -----------------------------------------------------------
     def gather_facts(self, environment=None, become=False, become_user=None,
-                     fact_schema=None, ignore_errors=None):
+                     fact_schema=None, ignore_errors=None, ctx=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
-                "runtime_id": "__gather_facts__"}
+                "uuid": "__gather_facts__", "runtime_id": "__gather_facts__"}
+        if ctx is None:
+            ctx = self.ctx()
         self.emit_start(node)
         inherited_become_user = self.become_user
         try:
             if become_user:
-                self.become_user = _as_text(become_user)
+                self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
-                {"environment": environment}, self.ctx())
+                {"environment": environment}, ctx)
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
@@ -2884,7 +2951,7 @@ class Runtime:
             # The setup task's block belongs to the play, so it inherits the
             # play's ignore_errors (PlayIterator: Block(play=self._play)).
             if isinstance(ignore_errors, str):
-                ignore_errors = self.template(ignore_errors, self.ctx())
+                ignore_errors = self.template(ignore_errors, ctx)
             if _to_bool(ignore_errors):
                 self.emit(node, "failed", res, ignored=True)
                 self._tally("ok")
@@ -2893,8 +2960,10 @@ class Runtime:
             self.emit(node, "failed", res)
             self._tally("failures")
             return False
+        if isinstance(res.get("ansible_facts"), dict):
+            res["ansible_facts"]["_ansible_facts_gathered"] = True
         self._absorb_facts({"action": "setup"}, res)
-        self.emit(node, "ok", {"changed": False})
+        self.emit(node, "ok", res if self.on_result else {"changed": False})
         self._tally("ok")
         return True
 
@@ -3330,6 +3399,9 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         try:
             play_started = time.monotonic()
             rt.run_play(play, defer_handlers=defer_handlers, initial_notified=initial_notified)
+        except MissingHandler as ex:
+            sys.stderr.write("ERROR: %s\n" % ex)
+            return 1
         finally:
             engine_profile["play_execution"] += time.monotonic() - play_started
             cleanup_started = time.monotonic()
@@ -3597,6 +3669,7 @@ def agent_main():
                  resource_reader=g.get("_ansiroll_resource_read"))
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
+    rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
             _chan_send(resp_fd, {"t": "delegate", "uuid": task.get("uuid"),
@@ -3637,6 +3710,8 @@ def agent_main():
              "unreachable": 0, "rescued": 0, "ignored": 0}
     try:
         for play in plays:
+            if not g.get("_INJECTED_GATHER_FACTS", True):
+                play = dict(play, gather_facts=False)
             rt.run_play(play)
             failed = failed or rt.failed
             for k in total:
@@ -3645,6 +3720,9 @@ def agent_main():
             if failed:
                 # A host that failed is removed from the rest of the playbook.
                 break
+    except MissingHandler as ex:
+        _chan_send(resp_fd, {"t": "error", "message": str(ex)})
+        return
     finally:
         rt.cleanup()
     _chan_send(resp_fd, {"t": "stats", "host": rt.host, "stats": total})

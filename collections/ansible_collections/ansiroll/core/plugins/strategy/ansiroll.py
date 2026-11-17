@@ -43,6 +43,7 @@ DOCUMENTATION = """
 """
 
 from ansible import context
+from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
@@ -74,8 +75,19 @@ class StrategyModule(StrategyBase):
         self._profile("accelerated_modules=%s" % (accelerated_modules or "none"))
         play_vars = self._variable_manager.get_vars(play=play)
         started = time.monotonic()
+        hosts = list(self.get_hosts_left(iterator))
+        gather_task = next(
+            (task for task in iterator._blocks[0].block
+             if task.action == "gather_facts"), None)
+        gather_hosts = set()
+        if gather_task is not None:
+            for host in hosts:
+                _, next_task = iterator.get_next_task_for_host(host, peek=True)
+                if next_task is gather_task:
+                    gather_hosts.add(host.name)
         try:
-            source, modules, task_map = self._compile(play, play_vars)
+            source, modules, task_map = self._compile(
+                play, play_vars, gather_task if gather_hosts else None)
         except Exception as ex:
             display.error("ansiroll: failed to compile play: %s" % ex)
             return self._tqm.RUN_ERROR
@@ -114,7 +126,6 @@ class StrategyModule(StrategyBase):
         )
         self._local_rt = None
 
-        hosts = list(self.get_hosts_left(iterator))
         controller_reasons = list(getattr(
             self, "_compiled_controller_fallbacks", ()
         ))
@@ -190,7 +201,8 @@ class StrategyModule(StrategyBase):
             self._run_hosts = hosts
             self._first_host_name = hosts[0].name if hosts else None
             for host in hosts:
-                if self._run_host(host, source, task_map, play_context):
+                if self._run_host(host, source, task_map, play_context,
+                                  host.name in gather_hosts):
                     iterator.mark_host_failed(host)
                     result = self._tqm.RUN_FAILED_HOSTS
                 self._drain_iterator(host, iterator)
@@ -199,7 +211,7 @@ class StrategyModule(StrategyBase):
         return super(StrategyModule, self).run(iterator, play_context, result)
 
     # ---- compilation -----------------------------------------------------
-    def _compile(self, play, play_vars=None):
+    def _compile(self, play, play_vars, gather_task):
         from ansiroll.loader import _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
@@ -208,7 +220,8 @@ class StrategyModule(StrategyBase):
         only_tags = set(context.CLIARGS.get("tags") or [])
         skip_tags = set(context.CLIARGS.get("skip_tags") or [])
         play_node = _convert_play(play, actions, only_tags=only_tags,
-                                  skip_tags=skip_tags, all_vars=play_vars or {})
+                                  skip_tags=skip_tags, all_vars=play_vars,
+                                  gather_facts=gather_task is not None)
 
         embedder = ModuleEmbedder()
         modules = {}
@@ -233,6 +246,8 @@ class StrategyModule(StrategyBase):
         self._ansiballz = embedder.ansiballz_code or ""
         source = _render_source([play_node], modules, self._ansiballz)
         task_map = self._build_task_map(play, play_node)
+        if gather_task is not None:
+            task_map["__gather_facts__"] = gather_task
         return source, modules, task_map
 
     def _build_task_map(self, play, play_node):
@@ -290,20 +305,10 @@ class StrategyModule(StrategyBase):
             walk_node(node)
         for node in play_node.get("handlers", []) or []:
             walk_node(node)
-        if play_node.get("gather_facts"):
-            try:
-                gather_task = Task.load(
-                    {"name": "Gathering Facts", "ansible.builtin.setup": {}},
-                    variable_manager=self._variable_manager,
-                    loader=self._loader,
-                )
-                mapping["__gather_facts__"] = gather_task
-            except Exception as ex:
-                display.vvv("ansiroll: could not build Gathering Facts callback task: %s" % ex)
         return mapping
 
     # ---- per-host execution over a persistent bidirectional channel ------
-    def _run_host(self, host, source, task_map, play_context):
+    def _run_host(self, host, source, task_map, play_context, gather_facts):
         """Ship the agent once, then pump: results stream live, delegated tasks are
         serviced inline on the controller, all over one persistent channel."""
         started = time.monotonic()
@@ -313,7 +318,11 @@ class StrategyModule(StrategyBase):
         hv.setdefault("ansible_host", host.name)
         templar = self._mk_templar(hv)
         become_pass = self._resolve_become_password(hv, templar)
-        agent_source = self._agent_header(host, hv, become_pass) + source
+        agent_source = (
+            self._agent_header(host, hv, become_pass)
+            + "_INJECTED_GATHER_FACTS = %r\n" % gather_facts
+            + source
+        )
         self._profile("%s prepared vars/header in %.3fs, payload %.1f MiB"
                       % (host.name, time.monotonic() - started,
                          len(agent_source) / 1048576.0))
@@ -382,6 +391,10 @@ class StrategyModule(StrategyBase):
                     "t": "source_result",
                     "source": self._read_controller_source(frame.get("path")),
                 })
+            elif t == "warning":
+                display.warning(frame["message"])
+            elif t == "error":
+                raise AnsibleError(frame["message"])
             elif t == "stats":
                 self._apply_stats(host, frame.get("stats", {}))
             elif t == "done":
