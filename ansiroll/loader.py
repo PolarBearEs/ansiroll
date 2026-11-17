@@ -835,8 +835,11 @@ def _accelerator_options(action):
                 options["parsable_locale"] = True
             if version >= (2, 18):
                 options["language_locale"] = True
-        elif name == "blockinfile" and version >= (2, 20):
-            options["text_mode"] = True
+        elif name == "blockinfile":
+            if version < (2, 17):
+                options["chmod_before_chown"] = True
+            if version >= (2, 20):
+                options["text_mode"] = True
         # Older file modules returned only dest for a touch in check mode.
         elif name == "file" and (
                 full_version < (2, 13, 8) or (2, 14, 0) <= full_version < (2, 14, 2)):

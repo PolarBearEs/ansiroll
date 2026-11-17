@@ -7,10 +7,9 @@ import errno
 import io
 import os
 import re
-import shutil
-import stat
 import tempfile
-import time
+
+from ._atomic import copy_replacement_attributes
 
 
 _PATH_KEYS = ("path", "dest", "destfile", "name")
@@ -96,21 +95,7 @@ def _atomic_write(path, contents, encoding, original, chmod_before_chown):
                 closefd=True) as output:
             output.write(contents)
         try:
-            if chmod_before_chown:
-                os.chmod(temporary, stat.S_IMODE(original.st_mode))
-            os.chown(temporary, original.st_uid, original.st_gid)
-            if chmod_before_chown:
-                if hasattr(os, "chflags") and hasattr(original, "st_flags"):
-                    try:
-                        os.chflags(temporary, original.st_flags)
-                    except OSError as error:
-                        if error.errno not in (getattr(errno, "ENOTSUP", None),
-                                               getattr(errno, "EOPNOTSUPP", None)):
-                            raise
-            else:
-                shutil.copystat(path, temporary)
-                now = time.time()
-                os.utime(temporary, (now, now))
+            copy_replacement_attributes(path, temporary, original, chmod_before_chown)
         except OSError as error:
             if error.errno != errno.EPERM:
                 raise

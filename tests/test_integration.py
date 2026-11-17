@@ -669,12 +669,15 @@ def test_accelerated_replace_matches_official_module_semantics(
     assert accelerated_path.read_bytes() == official_path.read_bytes()
 
 
-def test_accelerated_replace_writes_like_official_when_chown_is_denied(
-        tmp_path, monkeypatch):
+@pytest.mark.parametrize("action,args", [
+    ("replace", {"regexp": "^old=.*$", "replace": "new=2"}),
+    ("blockinfile", {"insertafter": "EOF", "block": "new=2"}),
+])
+def test_accelerated_atomic_write_matches_official_when_chown_is_denied(
+        tmp_path, monkeypatch, action, args):
     """Non-root replacing a file it may not chown back (another owner, or a
     group it is not in): atomic_move ignores EPERM and still writes."""
     import errno as errno_module
-    from ansiroll.accelerated_modules import replace as replace_module
     from ansiroll.loader import _accelerator_options
 
     hooks = tmp_path / "hooks"
@@ -690,12 +693,11 @@ def test_accelerated_replace_writes_like_official_when_chown_is_denied(
     for path in (official_path, accelerated_path):
         path.write_text("old=1\n")
         os.chmod(str(path), 0o644)
-    args = {"regexp": "^old=.*$", "replace": "new=2"}
     monkeypatch.setenv("PYTHONPATH", str(hooks))
-    meta = ModuleEmbedder().embed("replace")
-    rt = Runtime({"replace": meta}, "", {"inventory_hostname": "localhost"})
+    meta = ModuleEmbedder().embed(action)
+    rt = Runtime({action: meta}, "", {"inventory_hostname": "localhost"})
     try:
-        official = rt.run_module("replace", dict(args, path=str(official_path)))
+        official = rt.run_module(action, dict(args, path=str(official_path)))
     finally:
         rt.cleanup()
     monkeypatch.delenv("PYTHONPATH")
@@ -703,15 +705,19 @@ def test_accelerated_replace_writes_like_official_when_chown_is_denied(
     def denied(*args, **kwargs):
         raise OSError(errno_module.EPERM, "Operation not permitted")
 
-    monkeypatch.setattr(replace_module.os, "chown", denied)
+    monkeypatch.setattr(os, "chown", denied)
     accelerated = run_accelerated(
-        "replace", dict(args, path=str(accelerated_path)),
-        options=_accelerator_options("replace"))
+        action, dict(args, path=str(accelerated_path)),
+        options=_accelerator_options(action))
 
     official.pop("invocation", None)
     assert official["changed"] is True
+    for result, path in ((official, official_path), (accelerated, accelerated_path)):
+        if "diff" in result:
+            result["diff"] = json.loads(json.dumps(result["diff"]).replace(str(path), "<path>"))
     assert accelerated == official
-    assert accelerated_path.read_bytes() == official_path.read_bytes() == b"new=2\n"
+    assert accelerated_path.read_bytes() == official_path.read_bytes()
+    assert b"new=2" in accelerated_path.read_bytes()
     assert (oct(os.stat(str(accelerated_path)).st_mode & 0o7777)
             == oct(os.stat(str(official_path)).st_mode & 0o7777))
 

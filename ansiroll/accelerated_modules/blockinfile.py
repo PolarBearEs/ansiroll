@@ -6,10 +6,10 @@ import errno
 import io
 import os
 import re
-import shutil
 import stat
 import tempfile
-import time
+
+from ._atomic import copy_replacement_attributes
 
 
 _PATH_KEYS = ("path", "dest", "name")
@@ -72,7 +72,7 @@ def _current_umask():
     return umask
 
 
-def _atomic_write(path, contents, text_mode):
+def _atomic_write(path, contents, text_mode, chmod_before_chown):
     """blockinfile.write_changes() + AnsibleModule.atomic_move()."""
     directory = os.path.dirname(path) or "."
     descriptor, temporary = tempfile.mkstemp(
@@ -88,11 +88,7 @@ def _atomic_write(path, contents, text_mode):
         creating = not os.path.exists(path)
         if not creating:
             try:
-                dest_stat = os.stat(path)
-                os.chown(temporary, dest_stat.st_uid, dest_stat.st_gid)
-                shutil.copystat(path, temporary)
-                now = time.time()
-                os.utime(temporary, (now, now))
+                copy_replacement_attributes(path, temporary, os.stat(path), chmod_before_chown)
             except OSError as error:
                 if error.errno != errno.EPERM:
                     raise
@@ -256,7 +252,8 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
 
     if changed and not check_mode:
         try:
-            _atomic_write(os.path.realpath(path), result, text_mode)
+            _atomic_write(os.path.realpath(path), result, text_mode,
+                          bool(options.get("chmod_before_chown")))
         except (IOError, OSError) as error:
             return {"failed": True, "msg": str(error)}
     if check_mode and not exists:
