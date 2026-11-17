@@ -27,6 +27,7 @@ import hashlib
 import re
 import shlex
 from contextlib import contextmanager
+from itertools import groupby
 
 RESULT_MARKER = "__ANSIROLL_RESULT__"
 STATE_MARKER = "__ANSIROLL_STATE__"
@@ -839,6 +840,17 @@ class _PlayVarScope(dict):
     def get(self, key, default=None):
         return self[key] if key in self else default
 
+    def items(self):
+        for key in self:
+            # Values from the variable mapping have already been interpreted.
+            # Keep delimiter-shaped data literal in the enclosing expression.
+            self.accesses += 1
+            yield key, self[key]
+
+    def values(self):
+        for _, value in self.items():
+            yield value
+
 
 class _TemplateContext(jinja2.runtime.Context):
     def resolve_or_missing(self, key):
@@ -1407,6 +1419,7 @@ class Runtime:
         self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
         self.templater = _Templater()
         self.handlers = []
+        self._handler_blocks = []
         self.notified = []  # ordered, de-duplicated pending notifications
         self._notified_handlers = set()  # indexes into self.handlers
         self._flushing = False
@@ -1757,7 +1770,9 @@ class Runtime:
                 plugin["source"] = self._asset_text(plugin.get("source"))
                 plugins.append(plugin)
             self.templater.register_plugins(plugins)
-        self.handlers = [(handler, {}, False) for handler in play.get("handlers", [])]
+        self.handlers = []
+        self._handler_blocks = []
+        self._add_handlers(play.get("handlers", []), {}, False)
         self._error_on_missing_handler = play.get("error_on_missing_handler", True)
         self._allow_broken_conditionals = play.get("allow_broken_conditionals")
         self._notified_handlers = set()
@@ -1870,7 +1885,7 @@ class Runtime:
             self.emit(node, "ok", result, item=item, is_item=loop is not None)
             if tally:
                 self._tally("ok")
-            self.handlers.extend((handler, scope, b) for handler in node.get("handlers", []))
+            self._add_handlers(node.get("handlers", []), scope, b)
             self.run_nodes(node.get("tasks", []), scope, b)
 
     def run_block(self, block, overlay, become=False):
@@ -2955,6 +2970,12 @@ class Runtime:
                 self.notified.append(name)
 
     # ---- handlers --------------------------------------------------------
+    def _add_handlers(self, handlers, scope, become):
+        for _, block in groupby(handlers, key=lambda handler: handler.get("handler_block")):
+            start = len(self.handlers)
+            self.handlers.extend((handler, scope, become) for handler in block)
+            self._handler_blocks.append(range(start, len(self.handlers)))
+
     def _handler_scope(self, handler, scope):
         params = scope.get(_INCLUDE_PARAMS_KEY)
         if not params:
@@ -2972,9 +2993,8 @@ class Runtime:
     def _handlers_for(self, notification):
         """Indexes of the handlers a notification targets.
 
-        Mirrors StrategyBase.search_handlers_by_notification: the last-defined
-        handler matching by (role-qualified) name, plus every handler listening
-        on the topic (de-duplicated by handler name).
+        Search the newest blocks first, in declaration order within each block.
+        Also match listeners, deduplicated by handler name on modern cores.
         """
         def names(handler, scope):
             values = handler.get("handler_names")
@@ -2999,7 +3019,7 @@ class Runtime:
             return values
 
         found = []
-        indexes = range(len(self.handlers) - 1, -1, -1)
+        indexes = [idx for block in reversed(self._handler_blocks) for idx in block]
         for idx in indexes:
             handler, scope, _ = self.handlers[idx]
             if notification in names(handler, scope):
@@ -3007,7 +3027,8 @@ class Runtime:
                 break
         seen = set()
         modern = _core_at_least(2, 15)
-        for idx in indexes:
+        listener_indexes = indexes if modern else range(len(self.handlers))
+        for idx in listener_indexes:
             handler, scope, _ = self.handlers[idx]
             if notification in (handler.get("listen") or []):
                 if modern:

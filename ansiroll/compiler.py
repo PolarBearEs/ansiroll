@@ -198,21 +198,32 @@ def _freeze_value(value, context):
     return resolved, True
 
 
-def _shadowed_var_names(plays):
-    names = set()
+def _walk_play_nodes(plays):
     def walk(nodes):
         for node in nodes or []:
-            names.update((node.get("vars") or {}).keys())
-            names.update((node.get("role_vars") or {}).keys())
-            names.update((node.get("role_params") or {}).keys())
-            if str(node.get("action") or "").split(".")[-1] == "set_fact":
-                names.update((node.get("args") or {}).keys())
+            if node.get("tree_shaken_handler"):
+                continue
+            yield node
             if node.get("type") == "block":
-                walk(node.get("block")); walk(node.get("rescue")); walk(node.get("always"))
+                for section in ("block", "rescue", "always"):
+                    yield from walk(node.get(section))
             elif node.get("type") == "include":
-                walk(node.get("tasks"))
+                yield from walk(node.get("tasks"))
+                yield from walk(node.get("handlers"))
+
     for play in plays:
-        walk(play.get("tasks")); walk(play.get("handlers"))
+        yield from walk(play.get("tasks"))
+        yield from walk(play.get("handlers"))
+
+
+def _shadowed_var_names(plays):
+    names = set()
+    for node in _walk_play_nodes(plays):
+        names.update((node.get("vars") or {}).keys())
+        names.update((node.get("role_vars") or {}).keys())
+        names.update((node.get("role_params") or {}).keys())
+        if str(node.get("action") or "").split(".")[-1] == "set_fact":
+            names.update((node.get("args") or {}).keys())
     return names
 
 
@@ -380,7 +391,7 @@ def _simplify_when(conditions, variables, templater, stats, cache):
     return True, remaining
 
 
-def _tree_shake_nodes(nodes, variables, templater, stats, cache):
+def _tree_shake_nodes(nodes, variables, templater, stats, cache, handlers=False):
     kept = []
     for node in nodes or []:
         possible, remaining = _simplify_when(
@@ -388,6 +399,12 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache):
         )
         if not possible:
             stats["removed_nodes"] += 1
+            if handlers:
+                # Notification matching ignores conditions. Keep the entry so
+                # it can still match and report a skipped handler at flush time.
+                node["when"] = [False]
+                node["tree_shaken_handler"] = True
+                kept.append(node)
             continue
         node["when"] = remaining
         kind = node.get("type")
@@ -410,6 +427,10 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache):
             node["tasks"] = _tree_shake_nodes(
                 node.get("tasks"), variables, templater, stats, cache
             )
+            if "handlers" in node:
+                node["handlers"] = _tree_shake_nodes(
+                    node["handlers"], variables, templater, stats, cache, handlers=True
+                )
         kept.append(node)
     return kept
 
@@ -424,30 +445,17 @@ def _tree_shake_plays(plays, variables, stats):
             play.get("tasks"), variables, templater, stats, cache
         )
         play["handlers"] = _tree_shake_nodes(
-            play.get("handlers"), variables, templater, stats, cache
+            play.get("handlers"), variables, templater, stats, cache, handlers=True
         )
 
 
 def _actions_in_plays(plays):
-    actions = set()
-
-    def walk(nodes):
-        for node in nodes or []:
-            if node.get("type") == "block":
-                walk(node.get("block"))
-                walk(node.get("rescue"))
-                walk(node.get("always"))
-            elif node.get("type") == "include":
-                walk(node.get("tasks"))
-            else:
-                action = node.get("action")
-                if action:
-                    actions.add(action)
-    for play in plays:
-        walk(play.get("tasks"))
-        walk(play.get("handlers"))
-        if play.get("gather_facts"):
-            actions.add("ansible.builtin.setup")
+    actions = {
+        node["action"] for node in _walk_play_nodes(plays)
+        if node.get("action") and node.get("type") != "include"
+    }
+    if any(play.get("gather_facts") for play in plays):
+        actions.add("ansible.builtin.setup")
     return actions
 
 
@@ -456,36 +464,22 @@ def _specialize_accelerators(plays, variables):
 
     runtime = Runtime({}, "", {})
     count = 0
-
-    def walk(nodes):
-        nonlocal count
-        for node in nodes or []:
-            if node.get("type") == "block":
-                walk(node.get("block"))
-                walk(node.get("rescue"))
-                walk(node.get("always"))
-            elif node.get("type") == "include":
-                walk(node.get("tasks"))
-            elif node.get("accelerator") == "dynamic":
-                try:
-                    resolved = runtime.template(
-                        node.get("args") or {}, dict(variables)
-                    )
-                except Exception:
-                    continue
-                if (
-                        not _contains_undefined(resolved)
-                        and can_accelerate(
-                            str(node.get("action") or "").split(".")[-1],
-                            resolved,
-                            check_mode=False,
-                        )):
-                    node["accelerator"] = "always"
-                    count += 1
-
-    for play in plays:
-        walk(play.get("tasks"))
-        walk(play.get("handlers"))
+    for node in _walk_play_nodes(plays):
+        if node.get("accelerator") != "dynamic":
+            continue
+        try:
+            resolved = runtime.template(node.get("args") or {}, dict(variables))
+        except Exception:
+            continue
+        if (
+                not _contains_undefined(resolved)
+                and can_accelerate(
+                    str(node.get("action") or "").split(".")[-1],
+                    resolved,
+                    check_mode=False,
+                )):
+            node["accelerator"] = "always"
+            count += 1
     return count
 
 
@@ -495,78 +489,38 @@ def _accelerated_only_actions(plays, actions):
         if str(action).split(".")[-1] in TOTAL_NAMES
     }
     seen = set()
-
-    def walk(nodes):
-        for node in nodes or []:
-            if node.get("type") == "block":
-                walk(node.get("block"))
-                walk(node.get("rescue"))
-                walk(node.get("always"))
-            elif node.get("type") == "include":
-                walk(node.get("tasks"))
-            else:
-                action = node.get("action")
-                if action not in eligible:
-                    continue
-                seen.add(action)
-                if (
-                        node.get("accelerator") != "always"
-                        or node.get("fallback")
-                        or int(node.get("async_val") or 0)):
-                    eligible.discard(action)
-
-    for play in plays:
-        walk(play.get("tasks"))
-        walk(play.get("handlers"))
+    for node in _walk_play_nodes(plays):
+        action = node.get("action")
+        if action not in eligible:
+            continue
+        seen.add(action)
+        if (
+                node.get("accelerator") != "always"
+                or node.get("fallback")
+                or int(node.get("async_val") or 0)):
+            eligible.discard(action)
     return eligible & seen
 
 
 def _mark_required_accelerators(plays, actions):
-    def walk(nodes):
-        for node in nodes or []:
-            if node.get("type") == "block":
-                walk(node.get("block"))
-                walk(node.get("rescue"))
-                walk(node.get("always"))
-            elif node.get("type") == "include":
-                walk(node.get("tasks"))
-            elif node.get("action") in actions:
-                node["accelerator"] = "required"
-
-    for play in plays:
-        walk(play.get("tasks"))
-        walk(play.get("handlers"))
+    for node in _walk_play_nodes(plays):
+        if node.get("action") in actions:
+            node["accelerator"] = "required"
 
 
 def _mark_unsupported(plays, unsupported_actions):
-    def walk(nodes):
-        for n in nodes:
-            if n.get("type") == "block":
-                walk(n.get("block", []))
-                walk(n.get("rescue", []))
-                walk(n.get("always", []))
-            elif n.get("action") in unsupported_actions and not n.get("fallback"):
-                n["fallback"] = True
-                n["fallback_reason"] = "module %s could not be embedded" % n.get("action")
-    for p in plays:
-        walk(p["tasks"])
+    for node in _walk_play_nodes(plays):
+        if node.get("action") in unsupported_actions and not node.get("fallback"):
+            node["fallback"] = True
+            node["fallback_reason"] = "module %s could not be embedded" % node["action"]
 
 
 def _collect_fallbacks(plays):
-    found = []
-
-    def walk(nodes):
-        for n in nodes:
-            if n.get("type") == "block":
-                walk(n.get("block", []))
-                walk(n.get("rescue", []))
-                walk(n.get("always", []))
-            elif n.get("fallback"):
-                found.append({"uuid": n.get("uuid"), "name": n.get("name"),
-                              "reason": n.get("fallback_reason")})
-    for p in plays:
-        walk(p["tasks"])
-    return found
+    return [
+        {"uuid": node.get("uuid"), "name": node.get("name"),
+         "reason": node.get("fallback_reason")}
+        for node in _walk_play_nodes(plays) if node.get("fallback")
+    ]
 
 
 def _json_default(o):

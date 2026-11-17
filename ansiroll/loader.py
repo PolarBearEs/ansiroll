@@ -176,12 +176,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                           skip_tags=skip_tags, all_vars=all_vars)
         if n:
             tasks.append(n)
-    handlers = []
-    for hblock in _handler_blocks(play):
-        # No tag filtering: a notified handler runs regardless of --tags.
-        _convert_node(hblock, actions, basedir, flatten_handler=True, sink=handlers,
-                      all_vars=all_vars)
-    handlers = _dedup_by_uuid(handlers)
+    handlers = _convert_handlers(_handler_blocks(play), actions, basedir, all_vars)
     _assign_runtime_ids(tasks, handlers)
     # The strategy supplies the iterator's filtered setup decision. Standalone
     # uses the play keyword and the controller's default gathering policy.
@@ -437,16 +432,18 @@ def _assign_runtime_ids(tasks, handlers):
     walk(handlers)
 
 
-def _dedup_by_uuid(nodes):
+def _convert_handlers(blocks, actions, basedir, all_vars):
     seen = set()
-    out = []
-    for n in nodes:
-        uid = n.get("uuid")
-        if uid in seen:
-            continue
-        seen.add(uid)
-        out.append(n)
-    return out
+    handlers = []
+    for block_index, block in enumerate(blocks):
+        for handler in block.block or []:
+            # Ignore tag selection for handlers, which run when notified.
+            node = _convert_node(handler, actions, basedir, all_vars=all_vars)
+            if node and node.get("uuid") not in seen:
+                seen.add(node.get("uuid"))
+                node["handler_block"] = block_index
+                handlers.append(node)
+    return handlers
 
 
 def _handler_blocks(play):
@@ -460,20 +457,12 @@ def _handler_blocks(play):
     return blocks
 
 
-def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
+def _convert_node(node, actions, basedir,
                   only_tags=None, skip_tags=None, all_vars=None):
     from ansible.playbook.block import Block
     from ansible.playbook.task import Task
 
     if isinstance(node, Block):
-        if flatten_handler and sink is not None:
-            # Handlers are flat; emit each contained task into the sink.
-            for sub in (node.block or []):
-                conv = _convert_node(sub, actions, basedir, only_tags=only_tags,
-                                     skip_tags=skip_tags, all_vars=all_vars)
-                if conv:
-                    sink.append(conv)
-            return None
         block_node = {
             "type": "block",
             "when": _conditions(node.when),
@@ -644,10 +633,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
     _register_included(handler_blocks)
     # Executing include_role appends the role's handlers to the play's
     # handlers (ansible/playbook/role_include.py IncludeRole.get_block_list).
-    handlers = []
-    for hblock in handler_blocks:
-        _convert_node(hblock, actions, basedir, flatten_handler=True,
-                      sink=handlers, all_vars=all_vars)
+    handlers = _convert_handlers(handler_blocks, actions, basedir, all_vars)
     if handlers and handler_dep_chain is None:
         # Through 2.14 the child handler has no dependency chain. It still
         # sees defaults from roles declared on the play via VariableManager.
@@ -667,7 +653,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         "uuid": task._uuid,
         "name": task.name or "include_role",
         "action": "include_role",
-        "handlers": _dedup_by_uuid(handlers),
+        "handlers": handlers,
         "file": name,
         "when": _as_list(task.when),
         "loop": _loop_of(task, basedir),

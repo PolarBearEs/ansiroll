@@ -44,6 +44,29 @@ def test_debug_and_set_fact_register():
     assert rt.stats["ok"] == 2
 
 
+def test_play_var_mapping_iteration_only_resolves_consumed_values():
+    rt = Runtime({}, "", {})
+    called = []
+
+    def measure(value):
+        called.append(value)
+        return value
+
+    rt.templater.env.globals["measure"] = measure
+    values = {
+        "first": "{{ measure('first') }}",
+        "second": "{{ measure('second') }}",
+    }
+    prepared = rt.template_vars(values, {}, dynamic=True)
+
+    assert rt.template("{{ vars.items() | first }}", prepared) == ("first", "first")
+    assert called == ["first"]
+    assert rt.template("{{ vars.values() | first }}", prepared) == "first"
+    assert called == ["first", "first"]
+    assert rt.template("{{ (vars | dict2items | first).value }}", prepared) == "first"
+    assert called == ["first", "first", "first", "second"]
+
+
 def test_debug_result_is_always_visible_to_ansible_callbacks():
     _rt, frames = run([
         _task("1", "show", "debug", args={"msg": "Tagged_task"}),
