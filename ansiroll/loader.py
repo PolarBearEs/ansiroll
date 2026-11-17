@@ -113,11 +113,21 @@ def parse_playbook(path, vault_password_file=None):
     vm = VariableManager(loader=loader, inventory=inventory)
     pb = Playbook.load(path, variable_manager=vm, loader=loader)
 
-    basedir = os.path.dirname(os.path.abspath(path))
+    pb_dir = os.path.abspath(getattr(pb, "_basedir", None)
+                             or os.path.dirname(os.path.abspath(path)))
     plays = []
     actions = set()
     for play in pb.get_plays():
+        # Like ansible-playbook (cli/playbook.py, executor/playbook_executor.py):
+        # run each play with the loader's basedir set to the directory of the
+        # playbook file that defined it, so role, include and src lookups are
+        # independent of the compiler's working directory.
+        basedir = os.path.abspath(getattr(play, "_included_path", None) or pb_dir)
+        loader.set_basedir(basedir)
         node = _convert_play(play, actions, basedir)
+        # The standalone file never maps back to ansible-core Task objects
+        # (unlike the strategy plugin), so make its identifiers reproducible.
+        _assign_stable_uuids(node["tasks"], node["handlers"])
         plays.append(node)
     return plays, actions
 
@@ -158,6 +168,8 @@ def _rewrite_includes(data):
 
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, all_vars=None):
     INCLUDED_TASKS.clear()
+    _INCLUDE_STACK.clear()
+    _INCLUDE_IDS[0] = 0
     if basedir is None:
         try:
             basedir = play._loader.get_basedir()
@@ -400,6 +412,36 @@ def _assign_runtime_ids(tasks, handlers):
     walk(handlers)
 
 
+def _assign_stable_uuids(tasks, handlers):
+    """Replace ansible-core's random task/role UUIDs with deterministic ones.
+
+    Only equality between the identifiers matters at runtime (output grouping,
+    handler de-duplication already happened), so the first-seen order keeps
+    every relation while making repeated compiles byte-identical."""
+    mapping = {}
+
+    def stable(value):
+        if value is None:
+            return None
+        if value not in mapping:
+            mapping[value] = "00000000-0000-4000-8000-%012x" % len(mapping)
+        return mapping[value]
+
+    def walk(nodes):
+        for node in nodes:
+            if "uuid" in node:
+                node["uuid"] = stable(node["uuid"])
+            magic = node.get("role_magic")
+            if isinstance(magic, dict) and "role_uuid" in magic:
+                magic["role_uuid"] = stable(magic["role_uuid"])
+            for key in ("block", "rescue", "always", "tasks"):
+                if node.get(key):
+                    walk(node[key])
+
+    walk(tasks)
+    walk(handlers)
+
+
 def _dedup_by_uuid(nodes):
     seen = set()
     out = []
@@ -476,7 +518,20 @@ def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
 # Task objects created while expanding include_tasks, keyed by uuid; the
 # strategy needs them to map result frames back to displayable tasks.
 INCLUDED_TASKS = {}
-_INCLUDE_ROLE_STACK = set()
+# Includes currently being expanded, keyed by what makes their expansion
+# identical; the value is the include_id a recursive include refers back to.
+_INCLUDE_STACK = {}
+_INCLUDE_IDS = [0]
+
+
+def _include_ref(key):
+    """Return the include_id of an in-progress expansion of the same content."""
+    return _INCLUDE_STACK.get(key)
+
+
+def _new_include_id():
+    _INCLUDE_IDS[0] += 1
+    return "include-%d" % _INCLUDE_IDS[0]
 
 
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_vars):
@@ -493,38 +548,49 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         fname = _template_include_filename(task, fname, all_vars)
         if not isinstance(fname, str) or "{{" in fname or "{%" in fname:
             return None
-    path = None
-    if os.path.isabs(fname):
-        path = fname if os.path.exists(fname) else None
-    else:
-        for d in _search_dirs(task, basedir, "tasks"):
-            cand = os.path.join(d, fname)
-            if os.path.exists(cand):
-                path = cand
-                break
-    if path is None:
+    path = _include_tasks_path(task, fname, all_vars)
+    if path is None or not os.path.exists(path):
         return None
-    try:
-        from ansible.playbook.helpers import load_list_of_blocks
+    role = getattr(task, "_role", None)
+    key = ("tasks", os.path.realpath(path), id(role) if role is not None else None,
+           _is_handler(task))
+    ref = _include_ref(key)
+    include_id = None
+    tasks = []
+    if ref is None:
         try:
-            data = task._loader.load_from_file(path, trusted_as_template=True)
-        except TypeError:  # older ansible-core without the trust kwarg
-            data = task._loader.load_from_file(path)
-        blocks = load_list_of_blocks(
-            data, play=_play_of(task), task_include=task, role=task._role,
-            variable_manager=task.get_variable_manager(), loader=task._loader)
-    except Exception:
-        return None
-    _register_included(blocks)
-    tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
-                                       skip_tags=skip_tags, all_vars=all_vars)
-                         for b in blocks) if c]
+            from ansible.playbook.helpers import load_list_of_blocks
+            try:
+                data = task._loader.load_from_file(path, trusted_as_template=True)
+            except TypeError:  # older ansible-core without the trust kwarg
+                data = task._loader.load_from_file(path)
+            blocks = load_list_of_blocks(
+                data, play=_play_of(task), task_include=task, role=task._role,
+                variable_manager=task.get_variable_manager(), loader=task._loader)
+        except Exception:
+            return None
+        _register_included(blocks)
+        include_id = _new_include_id()
+        _INCLUDE_STACK[key] = include_id
+        try:
+            tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
+                                               skip_tags=skip_tags, all_vars=all_vars)
+                                 for b in blocks) if c]
+        finally:
+            _INCLUDE_STACK.pop(key, None)
     role_defaults, role_vars = _role_vars(task)
-    return {
+    node = _include_node(task, "include_tasks", fname, basedir,
+                         role_defaults, role_vars, tasks, include_id, ref)
+    return node
+
+
+def _include_node(task, action, fname, basedir, role_defaults, role_vars,
+                  tasks, include_id, ref):
+    node = {
         "type": "include",
         "uuid": task._uuid,
-        "name": task.name or "include_tasks",
-        "action": "include_tasks",
+        "name": task.name or action,
+        "action": action,
         "file": fname,
         "when": _as_list(task.when),
         "loop": _loop_of(task, basedir),
@@ -537,6 +603,76 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         "become": bool(task.become),
         "tasks": tasks,
     }
+    if include_id is not None:
+        node["include_id"] = include_id
+    if ref is not None:
+        # A recursive include (terminated at runtime, e.g. by `when`): reuse
+        # the expansion of the enclosing include instead of unrolling forever.
+        node["tasks_ref"] = ref
+    return node
+
+
+def _is_handler(task):
+    try:
+        from ansible.playbook.handler import Handler
+    except ImportError:
+        return False
+    return isinstance(task, Handler)
+
+
+def _include_tasks_path(task, include_target, all_vars):
+    """Resolve an include_tasks file like IncludedFile.process_include_results
+    (ansible/playbook/included_file.py) does for the controller."""
+    loader = task._loader
+    from ansible.playbook.task_include import TaskInclude
+    try:
+        from ansible.playbook.role_include import IncludeRole
+    except ImportError:
+        IncludeRole = ()
+    role = getattr(task, "_role", None)
+    dirname = "handlers" if _is_handler(task) else "tasks"
+    include_file = None
+    parent_include = getattr(task, "_parent", None)
+    cumulative_path = None
+    while parent_include is not None:
+        if not isinstance(parent_include, TaskInclude):
+            parent_include = getattr(parent_include, "_parent", None)
+            continue
+        if IncludeRole and isinstance(parent_include, IncludeRole):
+            parent_include_dir = getattr(parent_include, "_role_path", None) or ""
+        else:
+            raw = (parent_include.args or {}).get("_raw_params")
+            if isinstance(raw, str) and ("{{" in raw or "{%" in raw):
+                raw = _template_include_filename(parent_include, raw, all_vars)
+            parent_include_dir = os.path.dirname(raw) if isinstance(raw, str) else ""
+        if cumulative_path is not None and not os.path.isabs(cumulative_path):
+            cumulative_path = os.path.join(parent_include_dir, cumulative_path)
+        else:
+            cumulative_path = parent_include_dir
+        if role is not None:
+            new_basedir = os.path.join(role._role_path, dirname, cumulative_path)
+            candidates = [
+                loader.path_dwim_relative(role._role_path, dirname, include_target,
+                                          is_role=True),
+                loader.path_dwim_relative(new_basedir, dirname, include_target,
+                                          is_role=True),
+            ]
+            for include_file in candidates:
+                if os.path.exists(include_file):
+                    break
+        else:
+            include_file = loader.path_dwim_relative(
+                loader.get_basedir(), cumulative_path, include_target)
+        if os.path.exists(include_file):
+            break
+        parent_include = getattr(parent_include, "_parent", None)
+    if include_file is None:
+        if role is not None:
+            include_file = loader.path_dwim_relative(
+                role._role_path, dirname, include_target, is_role=True)
+        else:
+            include_file = loader.path_dwim(include_target)
+    return include_file
 
 
 def _template_include_filename(task, value, all_vars):
@@ -570,51 +706,46 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         v = args.get(opt + "_from")
         if v:
             from_files[opt] = v
-    # Guard against include cycles (a role including itself); Ansible resolves
-    # these at runtime, we bail out to the unsupported-fallback path instead.
-    key = (name, from_files.get("tasks"))
-    if key in _INCLUDE_ROLE_STACK:
-        return None
-    _INCLUDE_ROLE_STACK.add(key)
     try:
         from ansible.playbook.role.include import RoleInclude
         from ansible.playbook.role import Role
         play = _play_of(task)
         parent_role = getattr(task, "_role", None)
+        # Resolve the role exactly like IncludeRole.get_block_list
+        # (ansible/playbook/role_include.py): no current_role_path, so the
+        # search is collections, <playbook dir>/roles, roles_path, playbook dir.
         ri = RoleInclude.load(
-            {"role": name}, play=play,
-            current_role_path=getattr(parent_role, "_role_path", None),
-            parent_role=parent_role,
-            variable_manager=task.get_variable_manager(), loader=task._loader)
-        role = Role.load(ri, play, parent_role=parent_role,
-                         from_files=from_files or None, from_include=True)
-        blocks = role.compile(play)
+            name, play=play,
+            variable_manager=task.get_variable_manager(), loader=task._loader,
+            collection_list=getattr(task, "collections", None))
     except Exception:
         return None
-    finally:
-        _INCLUDE_ROLE_STACK.discard(key)
-    _register_included(blocks)
-    tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
-                                       skip_tags=skip_tags, all_vars=all_vars)
-                         for b in blocks) if c]
+    key = ("role", getattr(ri, "_role_path", None) or name,
+           tuple(sorted(from_files.items())), _is_handler(task))
+    ref = _include_ref(key)
+    include_id = None
+    tasks = []
+    if ref is None:
+        try:
+            role = Role.load(ri, play, parent_role=parent_role,
+                             from_files=from_files or None, from_include=True)
+            blocks = role.compile(play)
+        except Exception:
+            return None
+        _register_included(blocks)
+        include_id = _new_include_id()
+        # Keep the guard while converting the role's tasks: that is where a
+        # recursive include_role is reached.
+        _INCLUDE_STACK[key] = include_id
+        try:
+            tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
+                                               skip_tags=skip_tags, all_vars=all_vars)
+                                 for b in blocks) if c]
+        finally:
+            _INCLUDE_STACK.pop(key, None)
     role_defaults, role_vars = _role_vars(task)
-    return {
-        "type": "include",
-        "uuid": task._uuid,
-        "name": task.name or "include_role",
-        "action": "include_role",
-        "file": name,
-        "when": _as_list(task.when),
-        "loop": _loop_of(task, basedir),
-        "loop_var": _loop_var(task),
-        "index_var": _index_var(task),
-        **_loop_control(task),
-        "vars": _tag_untrusted(dict(task.vars or {})),
-        "role_defaults": role_defaults,
-        "role_vars": role_vars,
-        "become": bool(task.become),
-        "tasks": tasks,
-    }
+    return _include_node(task, "include_role", name, basedir,
+                         role_defaults, role_vars, tasks, include_id, ref)
 
 
 def _play_of(task):
@@ -732,6 +863,10 @@ def _convert_task(task, actions, basedir):
         _bake_sources(node, task, basedir)
         if node["special"] is None:
             actions.add(action)
+        elif node["special"] == "copy" and _remote_src(node["args"]) is not False:
+            # remote_src copies run the copy module on the target, like the
+            # copy action plugin's remote_src path.
+            actions.add(action)
     elif action in CONTROLLER_COUPLED:
         node["fallback"] = True
         node["fallback_reason"] = "controller-coupled action %s" % action
@@ -847,12 +982,12 @@ def _bake_sources(node, task, basedir):
     src = args.get("src")
     if not src:
         return  # copy with `content:` -- nothing to bake, templated at runtime
-    if (node.get("action", "").split(".")[-1] == "unarchive"
-            and args.get("remote_src") is True):
-        return
+    name = node.get("action", "").split(".")[-1]
+    remote = _remote_src(args) if name in ("copy", "unarchive") else False
+    if remote is True:
+        return  # src lives on the target; the module reads it there
 
-    subdir = "templates" if node.get("action", "").split(".")[-1] == "template" else "files"
-    search_dirs = _search_dirs(task, basedir, subdir)
+    subdir = "templates" if name == "template" else "files"
 
     candidates = []
     if _JINJA_RE.search(src):
@@ -860,6 +995,8 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
+        elif remote is None:
+            return  # remote_src decided at runtime; nothing safe to bake
         elif _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
             # loop is a runtime var; bake the whole role tree so the runtime can
@@ -875,13 +1012,20 @@ def _bake_sources(node, task, basedir):
     baked = {}
     meta = {}
     for rel in candidates:
-        path = _resolve_src(rel, search_dirs)
+        path = _find_needle(task, subdir, rel)
         if path is None:
+            if remote is None:
+                return  # may be a target path if remote_src renders true
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
         with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
             baked[rel] = fh.read()
+        if name != "template":
+            continue
+        # Only template exposes source metadata (template_fullpath,
+        # template_mtime, template_uid); copy/unarchive never read it, so it
+        # is not embedded for them.
         try:
             st = os.stat(path)
             meta[rel] = {"fullpath": os.path.abspath(path),
@@ -889,7 +1033,32 @@ def _bake_sources(node, task, basedir):
         except OSError:
             pass
     node["_baked"] = baked
-    node["_baked_meta"] = meta
+    if meta:
+        node["_baked_meta"] = meta
+
+
+def _remote_src(args):
+    """remote_src with Ansible's boolean(strict=False) conversion (as the copy
+    and unarchive action plugins do); None when only known at runtime."""
+    value = args.get("remote_src", False)
+    if _contains_dynamic_value(value):
+        return None
+    try:
+        from ansible.module_utils.parsing.convert_bool import boolean
+        return boolean(value, strict=False)
+    except Exception:
+        return None
+
+
+def _find_needle(task, subdir, rel):
+    """ActionBase._find_needle: the controller-side file a copy/template src
+    names, or None when it is missing or not a regular file."""
+    try:
+        path = task._loader.path_dwim_relative_stack(
+            task.get_search_path(), subdir, rel)
+    except Exception:
+        return None
+    return path if os.path.isfile(path) else None
 
 
 def _bake_role_tree(node, task, subdir):
@@ -904,8 +1073,9 @@ def _bake_role_tree(node, task, subdir):
     if not os.path.isdir(tree_dir):
         return False
     baked = {}
-    for root, _dirs, files in os.walk(tree_dir):
-        for fn in files:
+    for root, dirs, files in os.walk(tree_dir):
+        dirs.sort()
+        for fn in sorted(files):
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, tree_dir)
             try:
@@ -930,27 +1100,40 @@ def _raw_search_path(task, basedir):
 
 
 def _search_dirs(task, basedir, subdir):
-    """Build the ordered list of directories to look for a src file in."""
-    dirs = []
+    """Directories DataLoader.path_dwim_relative_stack searches, in order, for
+    a file under ``subdir`` (ansible/parsing/dataloader.py): each task search
+    path (role-aware), then the loader basedir as a last resort."""
+    loader = getattr(task, "_loader", None)
     try:
         stack = list(task.get_search_path() or [])
     except Exception:
         stack = []
-    for base in stack + [basedir]:
-        dirs.append(os.path.join(base, subdir))
-        dirs.append(os.path.join(base, "files" if subdir == "templates" else "templates"))
-        dirs.append(base)
+    try:
+        from ansible.utils.path import unfrackpath
+    except ImportError:
+        def unfrackpath(path, follow=False):
+            return os.path.normpath(os.path.abspath(path))
+    dirs = []
+    for path in stack:
+        upath = unfrackpath(path, follow=False)
+        pb_base_dir = os.path.dirname(upath)
+        is_role = False
+        try:
+            is_role = bool(loader._is_role(path))
+        except Exception:
+            pass
+        if is_role and pb_base_dir.endswith("/tasks"):
+            dirs.append(os.path.join(os.path.dirname(pb_base_dir), subdir))
+            dirs.append(pb_base_dir)
+        dirs.append(os.path.join(upath, subdir))
+        dirs.append(upath)
+    try:
+        base = loader.get_basedir()
+    except Exception:
+        base = basedir
+    dirs.append(os.path.join(base, subdir))
+    dirs.append(base)
     return dirs
-
-
-def _resolve_src(rel, search_dirs):
-    if os.path.isabs(rel) and os.path.isfile(rel):
-        return rel
-    for base in search_dirs:
-        path = os.path.join(base, rel)
-        if os.path.isfile(path):
-            return path
-    return None
 
 
 def _only_item(src):

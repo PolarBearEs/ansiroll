@@ -154,6 +154,21 @@ class _UnsupportedLookup(Exception):
     """No built-in implementation for this lookup plugin name."""
 
 
+def _ansible_boolean(value):
+    """ansible.module_utils.parsing.convert_bool.boolean(value, strict=False)."""
+    if isinstance(value, bool):
+        return value
+    normalized = value
+    if isinstance(value, bytes):
+        normalized = value.decode("utf-8", "surrogateescape")
+    if isinstance(normalized, str):
+        normalized = normalized.lower().strip()
+    try:
+        return normalized in ("y", "yes", "on", "1", "true", "t", 1, 1.0)
+    except TypeError:
+        return False
+
+
 def _to_bool(value):
     if isinstance(value, bool):
         return value
@@ -1626,6 +1641,13 @@ class Runtime:
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
+        targets = self.__dict__.setdefault("_include_targets", {})
+        if node.get("include_id"):
+            targets[node["include_id"]] = node.get("tasks", [])
+        tasks = node.get("tasks", [])
+        if node.get("tasks_ref"):
+            # Recursive include: run the enclosing include's expansion again.
+            tasks = targets.get(node["tasks_ref"], tasks)
         try:
             run_it = self.when(node.get("when"), base_ctx)
         except UntrustedConditional as ex:
@@ -1646,7 +1668,7 @@ class Runtime:
         if loop is None:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
             self._tally("ok")
-            self.run_nodes(node.get("tasks", []), scope, b)
+            self.run_nodes(tasks, scope, b)
             return
         items = self._resolve_loop(loop, base_ctx)
         for i, it in enumerate(items):
@@ -1655,7 +1677,7 @@ class Runtime:
             self.emit(node, "ok", {"changed": False, "include": node.get("file"),
                                    "item": it}, item=it, is_item=True)
             self._tally("ok")
-            self.run_nodes(node.get("tasks", []), item_scope, b)
+            self.run_nodes(tasks, item_scope, b)
 
     def run_block(self, block, overlay, become=False):
         scope = dict(overlay)
@@ -2358,6 +2380,12 @@ class Runtime:
             }
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
+        if name == "copy" and _ansible_boolean(
+                args.get("remote_src", False) if isinstance(args, dict) else False):
+            # The copy action plugin hands remote_src copies straight to the
+            # copy module, which reads src on the target.
+            return self.run_module(
+                task["action"], _fail_on_undef(_strip_omit(args)), become=become)
         if name in ("template", "copy"):
             return self._run_file_action(name, task, args, ctx, become)
         if name == "assert":
