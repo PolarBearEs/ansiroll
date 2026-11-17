@@ -574,7 +574,10 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
     role = getattr(task, "_role", None)
     physical_path = os.path.realpath(path)
     scope = _include_scope_key(task)
-    stable_template = raw_fname if getattr(task, "_ansiroll_stable_include", False) else None
+    stable_template = None
+    if raw_fname != fname and (getattr(task, "_ansiroll_stable_include", False)
+                              or _is_literal_include_template(raw_fname)):
+        stable_template = raw_fname
     key = ("tasks", physical_path, _include_path_spelling(path),
            id(role) if role is not None else None, _is_handler(task),
            _include_search_context(task, stable_template, fname), scope)
@@ -805,6 +808,8 @@ def _include_tasks_path(task, include_target, all_vars):
 
 def _template_include_filename(task, value, all_vars):
     """Resolve an include filename using Ansible's own templar and precedence."""
+    from ansible.utils.vars import combine_vars
+
     role_defaults, role_vars = _role_vars(task)
     variables = {}
     variables.update(role_defaults)
@@ -815,7 +820,7 @@ def _template_include_filename(task, value, all_vars):
     variables.update(role_vars)
     for scope in _include_scope(task):
         variables.update(scope)
-    variables.update(task.get_variable_manager().extra_vars)
+    variables = combine_vars(variables, task.get_variable_manager().extra_vars)
     try:
         from ansible.template import Templar
         try:
@@ -826,6 +831,18 @@ def _template_include_filename(task, value, all_vars):
         return templar.template(value, fail_on_undefined=True)
     except Exception:
         return None
+
+
+def _is_literal_include_template(value):
+    from jinja2 import Environment, nodes, TemplateSyntaxError
+
+    try:
+        body = Environment().parse(value).body
+    except TemplateSyntaxError:
+        return False
+    return all(isinstance(output, nodes.Output) and all(
+        isinstance(part, (nodes.TemplateData, nodes.Const)) for part in output.nodes
+    ) for output in body)
 
 
 def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars):
@@ -1221,9 +1238,16 @@ def _bake_role_tree(node, task, subdir):
         return False
     baked = {}
     directories = []
+    aliases = {}
+    real_tree_dir = os.path.realpath(tree_dir)
     for root, dirs, files in os.walk(tree_dir):
         dirs.sort()
         directories.append(os.path.relpath(root, tree_dir))
+        for dirname in dirs:
+            full = os.path.join(root, dirname)
+            if os.path.islink(full):
+                aliases[os.path.relpath(full, tree_dir)] = os.path.relpath(
+                    os.path.realpath(full), real_tree_dir)
         for fn in sorted(files):
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, tree_dir)
@@ -1237,6 +1261,11 @@ def _bake_role_tree(node, task, subdir):
     node["_baked"] = baked
     node["_baked_tree"] = subdir
     node["_baked_tree_dirs"] = directories
+    # Capture links to directories already in the tree without walking them.
+    directory_set = set(directories)
+    aliases = {path: target for path, target in aliases.items() if target in directory_set}
+    if aliases:
+        node["_baked_tree_aliases"] = aliases
     return True
 
 

@@ -202,6 +202,51 @@ def test_recursive_include_reuses_stable_search_context(tmp_path, include):
     assert _ansible(playbook, strategy="ansiroll.core.ansiroll") == expected
 
 
+def test_constant_recursive_include_with_sibling(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {depth: 0}
+  tasks:
+    - include_tasks: "{{ 'rec.yml' }}"
+""", "rec.yml": """
+- include_tasks: leaf.yml
+- set_fact: depth="{{ depth | int + 1 }}"
+- include_tasks: "{{ 'rec.yml' }}"
+  when: depth | int < 34
+""", "leaf.yml": '- debug: msg="depth {{ depth }}"\n'})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook)
+    assert expected[0] == ["depth %d" % depth for depth in range(34)]
+    assert compile_playbook(str(playbook))[1]["fallback_tasks"] == []
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll") == expected
+
+
+def test_recursive_include_preserves_ancestry_for_rebound_sibling(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {depth: 0, selected_file: rec.yml}
+  tasks:
+    - include_tasks: "{{ selected_file }}"
+""", "rec.yml": """
+- set_fact: depth="{{ depth | int + 1 }}"
+- include_tasks: "{{ selected_file }}"
+  when: depth | int < 3
+- include_tasks: leaf.yml
+  vars: {selected_file: sub/rec.yml}
+  when: depth | int == 3
+""", "sub/sub/leaf.yml": "- debug: msg=REBOUND\n"})
+    # Retain the compiler's search ancestry when a child rebinds a template.
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    nodes = list(_task_nodes(_bundle_json(source)[0]["tasks"]))
+    recursively_included = [node for node in nodes if node.get("file") == "rec.yml"]
+    assert len(recursively_included) >= 3
+    assert all(not node.get("tasks_ref") for node in recursively_included[:3])
+    assert any(node.get("args", {}).get("msg") == "REBOUND" for node in nodes)
+
+
 def test_recursive_include_keeps_symlink_alias_directory(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -664,7 +709,31 @@ def test_nested_include_filename_uses_role_invocation_vars(tmp_path):
     assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
 
 
-@pytest.mark.parametrize("prefix", ["", "./", "existing/../", "missing/../"])
+def test_nested_include_filename_merges_extra_vars(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_role: name=r
+      vars: {selection: {part: left}}
+""", "roles/r/tasks/main.yml": "- include_tasks: sub/entry.yml\n",
+        "roles/r/tasks/sub/entry.yml": '- include_tasks: "{{ selection.part }}.yml"\n',
+        "roles/r/tasks/sub/left.yml": "- debug: msg=MERGED\n"})
+    playbook = tmp_path / "pb.yml"
+    extra = {"selection": {"other": "extra"}}
+    args = ("-e", json.dumps(extra))
+    expected = _ansible(playbook, *args)
+    assert expected[0] == ["MERGED"]
+    assert compile_playbook(str(playbook), extra_vars=extra)[1]["fallback_tasks"] == []
+    assert _ansiroll(playbook, tmp_path, *args) == expected
+    assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
+
+
+@pytest.mark.parametrize("prefix", ["", "./", "existing/../", "alias/../", "missing/../", "loop/../"])
 def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, prefix):
     dest = tmp_path / "dest.txt"
     _write(tmp_path, {"pb.yml": """
@@ -676,9 +745,14 @@ def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, pr
 - copy: {src: "%s{{ name }}.conf", dest: "%s", remote_src: "{{ flag }}"}
 - debug: msg="{{ lookup('file', '%s') }}"
 """ % (prefix, dest, dest), "roles/r/files/app.conf": "CONTROLLER\n"})
-    (tmp_path / "roles/r/files/existing").mkdir()
-    expected = _ansible(tmp_path / "pb.yml")
-    if prefix == "missing/../":
+    files = tmp_path / "roles/r/files"
+    (files / "existing").mkdir()
+    (files / "alias").symlink_to("existing", target_is_directory=True)
+    (files / "loop").symlink_to("loop", target_is_directory=True)
+    (files / "tree").symlink_to(".", target_is_directory=True)
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook)
+    if prefix in ("missing/../", "loop/../"):
         assert expected[1][3] == 1
         assert not dest.exists()
         result = _ansiroll(tmp_path / "pb.yml", tmp_path)
@@ -688,8 +762,15 @@ def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, pr
         assert expected[0] == ["CONTROLLER"]
         assert dest.read_text() == "CONTROLLER\n"
         dest.unlink()
-        assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+        assert _ansiroll(playbook, tmp_path) == expected
         assert dest.read_text() == "CONTROLLER\n"
+        if prefix == "alias/../":
+            source, _manifest = compile_playbook(str(playbook))
+            copy = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                        if node.get("action") == "copy")
+            assert list(copy["_baked"]) == ["app.conf"]
+            dest.unlink()
+            assert _ansible(playbook, strategy="ansiroll.core.ansiroll") == expected
 
 
 def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):

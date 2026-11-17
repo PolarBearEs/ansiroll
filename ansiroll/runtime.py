@@ -2230,6 +2230,7 @@ class Runtime:
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
             directories = set(task.get("_baked_tree_dirs") or ())
+            aliases = task.get("_baked_tree_aliases") or {}
             prefix = []
             for part in parts[:-1]:
                 if part in ("", "."):
@@ -2240,8 +2241,15 @@ class Runtime:
                     prefix.pop()
                 else:
                     prefix.append(part)
-                    if "/".join(prefix) not in directories:
+                    directory = "/".join(prefix)
+                    if directory in aliases:
+                        target = aliases[directory]
+                        prefix = [] if target == "." else target.split("/")
+                    elif directory not in directories:
                         return src
+            if "/".join(prefix + [parts[-1]]) not in (task.get("_baked") or {}):
+                return src
+        # Ansible checks the original relative path, then normalizes it when reading.
         return os.path.normpath(src)
 
     def _baked_module_source(self, task, args):
