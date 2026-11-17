@@ -611,6 +611,88 @@ def test_accelerated_blockinfile_matches_official_idempotence(tmp_path):
     assert accelerated_path.read_bytes() == official_path.read_bytes()
 
 
+def test_accelerated_blockinfile_create_mode_and_line_splitting_match_official(
+        tmp_path):
+    import stat as stat_module
+    from ansiroll.loader import _accelerator_options
+
+    files = {
+        # \x0c, \x1c and U+0085 split str lines but not bytes lines.
+        "ff": b"a\x0cb\nc\xc2\x85d\x1ce\n",
+        "crlf": b"one\r\ntwo\r\n",
+    }
+    cases = [
+        {"path": "new", "create": True, "block": "x"},
+        {"path": "sub/dir/new", "create": True, "block": "x"},
+        {"path": "ff", "block": "x", "insertbefore": "b"},
+        {"path": "ff", "block": "y"},
+        {"path": "crlf", "block": "z", "insertafter": "one"},
+    ]
+    for side in ("official", "accelerated"):
+        (tmp_path / side).mkdir()
+        for name, data in files.items():
+            (tmp_path / side / name).write_bytes(data)
+    rt = Runtime({"blockinfile": ModuleEmbedder().embed("blockinfile")},
+                 "", {"inventory_hostname": "localhost"})
+    options = _accelerator_options("blockinfile")
+
+    def outcome(result, side, rel):
+        base = str(tmp_path / side)
+        result = json.loads(json.dumps(
+            {k: v for k, v in result.items() if k != "invocation"}
+        ).replace(base, "<D>"))
+        path = os.path.join(base, rel)
+        mode = stat_module.S_IMODE(os.stat(path).st_mode)
+        with open(path, "rb") as handle:
+            return result, oct(mode), handle.read()
+
+    try:
+        for case in cases:
+            official = rt.run_module("blockinfile", dict(
+                case, path=str(tmp_path / "official" / case["path"])))
+            accelerated = run_accelerated("blockinfile", dict(
+                case, path=str(tmp_path / "accelerated" / case["path"])),
+                options=options)
+            assert (outcome(accelerated, "accelerated", case["path"])
+                    == outcome(official, "official", case["path"])), case
+    finally:
+        rt.cleanup()
+
+
+def test_accelerated_blockinfile_non_utf8_file_matches_official(tmp_path):
+    from ansiroll.loader import _accelerator_options
+
+    options = _accelerator_options("blockinfile") or {}
+    official_path = tmp_path / "official"
+    accelerated_path = tmp_path / "accelerated"
+    for path in (official_path, accelerated_path):
+        path.write_bytes(b"caf\xe9\nend\n")
+    args = {"block": "x", "insertafter": "caf"}
+    accelerated = run_accelerated(
+        "blockinfile", dict(args, path=str(accelerated_path)), options=options)
+    if options.get("text_mode"):
+        # ansible-core >= 2.20 decodes utf-8 and the module dies; ansible-playbook
+        # registers this failure (the runtime's crash wrapping differs).
+        assert accelerated == {
+            "failed": True, "changed": False,
+            "msg": "Task failed: Module failed: 'utf-8' codec can't decode "
+                   "byte 0xe9 in position 3: invalid continuation byte",
+        }
+        assert accelerated_path.read_bytes() == b"caf\xe9\nend\n"
+        return
+    rt = Runtime({"blockinfile": ModuleEmbedder().embed("blockinfile")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        official = rt.run_module("blockinfile", dict(args, path=str(official_path)))
+    finally:
+        rt.cleanup()
+    official.pop("invocation", None)
+    for result, path in ((official, official_path), (accelerated, accelerated_path)):
+        result["diff"] = json.loads(json.dumps(result["diff"]).replace(str(path), "<p>"))
+    assert accelerated == official
+    assert accelerated_path.read_bytes() == official_path.read_bytes()
+
+
 def test_accelerated_user_and_group_noops_match_official():
     import grp
     import pwd

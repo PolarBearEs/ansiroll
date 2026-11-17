@@ -827,6 +827,8 @@ def _accelerator_options(action):
             if version < (2, 19):
                 return {"lowercase_not_found": True}
             return {"typed_exceptions": True}
+        if name == "blockinfile" and version >= (2, 20):
+            return {"text_mode": True}
         if name == "replace":
             options = {}
             if version < (2, 20):

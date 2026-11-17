@@ -2,11 +2,14 @@
 
 from __future__ import absolute_import
 
+import errno
 import io
 import os
 import re
+import shutil
 import stat
 import tempfile
+import time
 
 
 _PATH_KEYS = ("path", "dest", "name")
@@ -14,6 +17,12 @@ _ALLOWED = frozenset(_PATH_KEYS + (
     "block", "content", "marker", "marker_begin", "marker_end",
     "insertafter", "insertbefore", "create", "state", "backup", "validate",
 ))
+
+
+def _text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "surrogateescape")
+    return value
 
 
 def _single(args, keys, default=None):
@@ -49,18 +58,54 @@ def can_accelerate(args, check_mode=False, shell=False):
     return isinstance(args.get("create", False), bool)
 
 
-def _atomic_write(path, content, original):
+def _current_umask():
+    # Read it without the os.umask(0) round trip where the kernel exposes it.
+    try:
+        with io.open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (IOError, OSError, ValueError):
+        pass
+    umask = os.umask(0)
+    os.umask(umask)
+    return umask
+
+
+def _atomic_write(path, contents, text_mode):
+    """blockinfile.write_changes() + AnsibleModule.atomic_move()."""
     directory = os.path.dirname(path) or "."
     descriptor, temporary = tempfile.mkstemp(
         prefix=".ansiroll-blockinfile-", dir=directory)
     try:
-        with io.open(descriptor, "w", encoding="utf-8", closefd=True) as output:
-            output.write(content)
-        if original is not None:
-            os.chmod(temporary, stat.S_IMODE(original.st_mode))
-            if os.geteuid() == 0:
-                os.chown(temporary, original.st_uid, original.st_gid)
-        os.replace(temporary, path)
+        if text_mode:
+            # ansible-core >= 2.20: text file, newline=None.
+            output = io.open(descriptor, "w", encoding="utf-8", closefd=True)
+        else:
+            output = io.open(descriptor, "wb", closefd=True)
+        with output:
+            output.write(contents)
+        creating = not os.path.exists(path)
+        if not creating:
+            try:
+                dest_stat = os.stat(path)
+                os.chown(temporary, dest_stat.st_uid, dest_stat.st_gid)
+                shutil.copystat(path, temporary)
+                now = time.time()
+                os.utime(temporary, (now, now))
+            except OSError as error:
+                if error.errno != errno.EPERM:
+                    raise
+        os.rename(temporary, path)
+        if creating:
+            os.chmod(path, 0o666 & ~_current_umask())
+            dir_stat = os.stat(directory)
+            try:
+                os.chown(path, os.geteuid(),
+                         dir_stat.st_gid if dir_stat.st_mode & stat.S_ISGID
+                         else os.getegid())
+            except OSError:
+                pass
     finally:
         try:
             os.unlink(temporary)
@@ -69,8 +114,15 @@ def _atomic_write(path, content, original):
 
 
 def run(args, check_mode=False, shell=False, environment=None, options=None):
+    options = options or {}
     path = _single(args, _PATH_KEYS)
-    diff_mode = bool((options or {}).get("diff_mode"))
+    diff_mode = bool(options.get("diff_mode"))
+    # ansible-core < 2.20 worked on bytes; 2.20 added encoding (utf-8).
+    text_mode = bool(options.get("text_mode"))
+    if text_mode:
+        conv = lambda value: value  # noqa: E731
+    else:
+        conv = lambda value: value.encode("utf-8", "surrogateescape")  # noqa: E731
     if os.path.isdir(path):
         return {
             "failed": True,
@@ -84,26 +136,36 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
             "msg": "Path %s does not exist !" % path,
             "rc": 257,
         }
-    try:
-        original = os.stat(path) if exists else None
-        if exists:
-            # ``newline=""`` is significant: blockinfile preserves existing
-            # newline sequences rather than normalizing them while reading.
-            with io.open(path, "r", encoding="utf-8", newline="") as source:
-                content = source.read()
-            lines = content.splitlines(True)
-        else:
-            content = None
-            lines = []
-    except FileNotFoundError:
+    if not exists:
+        parent = os.path.dirname(path)
+        if parent and not os.path.exists(parent) and not check_mode:
+            try:
+                os.makedirs(parent)
+            except OSError as error:
+                return {"failed": True, "msg": (
+                    "Error creating %s Error code: %s Error description: %s"
+                    % (parent, error.errno, error.strerror))}
         content = None
         lines = []
-        original = None
-    except (IOError, OSError) as error:
-        return {"failed": True, "msg": str(error)}
+    else:
+        try:
+            if text_mode:
+                # newline="" preserves the file's newline sequences.
+                with io.open(path, "r", encoding="utf-8", newline="") as source:
+                    content = source.read()
+            else:
+                with io.open(path, "rb") as source:
+                    content = source.read()
+        except UnicodeDecodeError as error:
+            # The official module dies with this exception.
+            return {"failed": True, "changed": False,
+                    "msg": "Task failed: Module failed: %s" % error}
+        except (IOError, OSError) as error:
+            return {"failed": True, "msg": str(error)}
+        lines = content.splitlines(True)
 
     diff = {
-        "before": content if diff_mode and content else "",
+        "before": _text(content) if diff_mode and content else "",
         "after": "",
         "before_header": "%s (content)" % path,
         "after_header": "%s (content)" % path,
@@ -117,17 +179,19 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
     if insertbefore is None and insertafter is None:
         insertafter = "EOF"
     if insertafter not in (None, "EOF"):
-        insertre = re.compile(insertafter)
+        insertre = re.compile(conv(insertafter))
     elif insertbefore not in (None, "BOF"):
-        insertre = re.compile(insertbefore)
+        insertre = re.compile(conv(insertbefore))
     else:
         insertre = None
 
-    marker = args.get("marker", "# {mark} ANSIBLE MANAGED BLOCK")
-    line_separator = os.linesep
-    begin = re.sub(r"{mark}", args.get("marker_begin", "BEGIN"), marker) + line_separator
-    end = re.sub(r"{mark}", args.get("marker_end", "END"), marker) + line_separator
-    block = _single(args, ("block", "content"), "")
+    marker = conv(args.get("marker", "# {mark} ANSIBLE MANAGED BLOCK"))
+    line_separator = conv(os.linesep)
+    begin = re.sub(conv(r"{mark}"), conv(args.get("marker_begin", "BEGIN")),
+                   marker) + line_separator
+    end = re.sub(conv(r"{mark}"), conv(args.get("marker_end", "END")),
+                 marker) + line_separator
+    block = conv(_single(args, ("block", "content"), ""))
     if state == "present" and block:
         if not block.endswith(line_separator):
             block += line_separator
@@ -146,12 +210,12 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         n0 = None
         if insertre is not None:
             if insertre.flags & re.MULTILINE:
-                match = insertre.search(content or "")
+                match = insertre.search(content or conv(""))
                 if match:
                     if insertafter:
-                        n0 = (content or "").count("\n", 0, match.end())
+                        n0 = (content or conv("")).count(conv("\n"), 0, match.end())
                     elif insertbefore:
-                        n0 = (content or "").count("\n", 0, match.start())
+                        n0 = (content or conv("")).count(conv("\n"), 0, match.start())
             else:
                 for index, line in enumerate(lines):
                     if insertre.search(line):
@@ -173,9 +237,9 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
     if n0 > 0 and not lines[n0 - 1].endswith(line_separator):
         lines[n0 - 1] += line_separator
     lines[n0:n0] = blocklines
-    result = "".join(lines)
+    result = conv("").join(lines)
     if diff_mode:
-        diff["after"] = result
+        diff["after"] = _text(result)
 
     if content == result:
         message = ""
@@ -192,10 +256,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
 
     if changed and not check_mode:
         try:
-            parent = os.path.dirname(path)
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent)
-            _atomic_write(os.path.realpath(path), result, original)
+            _atomic_write(os.path.realpath(path), result, text_mode)
         except (IOError, OSError) as error:
             return {"failed": True, "msg": str(error)}
     if check_mode and not exists:
