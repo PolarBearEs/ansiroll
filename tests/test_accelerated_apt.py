@@ -42,7 +42,7 @@ def test_absent_packages_return_without_running_apt_get(monkeypatch):
     _executables(monkeypatch)
     calls = []
 
-    def command(argv, environment=None, force_c_locale=False):
+    def command(argv, environment=None, force_c_locale=False, overrides=None):
         calls.append((argv, force_c_locale))
         assert argv[0] == "/usr/bin/dpkg-query"
         return (
@@ -70,7 +70,7 @@ def test_config_files_are_purged_and_installed_packages_removed(monkeypatch):
     _executables(monkeypatch)
     calls = []
 
-    def command(argv, environment=None, force_c_locale=False):
+    def command(argv, environment=None, force_c_locale=False, overrides=None):
         calls.append(argv)
         if argv[0].endswith("dpkg-query"):
             return 0, "mosquitto\tii \nopenhab2\trc \n", ""
@@ -118,7 +118,7 @@ def test_check_mode_simulates_a_required_removal(monkeypatch):
     _executables(monkeypatch)
     calls = []
 
-    def command(argv, environment=None, force_c_locale=False):
+    def command(argv, environment=None, force_c_locale=False, overrides=None):
         calls.append(argv)
         if argv[0].endswith("dpkg-query"):
             return 0, "mosquitto\tii \n", ""
@@ -138,7 +138,7 @@ def test_unusual_dpkg_state_falls_back_before_mutation(monkeypatch):
     _executables(monkeypatch)
     calls = []
 
-    def command(argv, environment=None, force_c_locale=False):
+    def command(argv, environment=None, force_c_locale=False, overrides=None):
         calls.append(argv)
         return 0, "mosquitto\tiU \n", ""
 
@@ -154,7 +154,7 @@ def test_unusual_dpkg_state_falls_back_before_mutation(monkeypatch):
 def test_failed_removal_does_not_report_changed(monkeypatch):
     _executables(monkeypatch)
 
-    def command(argv, environment=None, force_c_locale=False):
+    def command(argv, environment=None, force_c_locale=False, overrides=None):
         if argv[0].endswith("dpkg-query"):
             return 0, "mosquitto\tii \n", ""
         return 100, "", "dpkg is locked"
