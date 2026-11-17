@@ -192,13 +192,18 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
+    core_version = _core_version()
     result = {
         "name": play.name or "",
         "hosts": hosts,
         "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
         "error_on_missing_handler": C.ERROR_ON_MISSING_HANDLER,
-        "fact_schema": "%d.%d" % _core_version(),
+        "allow_broken_conditionals": (
+            core_version >= (2, 19)
+            and C.config.get_config_value("ALLOW_BROKEN_CONDITIONALS")
+        ),
+        "fact_schema": "%d.%d" % core_version,
         "environment": _as_list(getattr(play, "environment", None)) or None,
         "check_mode": getattr(play, "check_mode", None),
         "become": bool(play.become),
@@ -634,6 +639,16 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
     for hblock in handler_blocks:
         _convert_node(hblock, actions, basedir, flatten_handler=True,
                       sink=handlers, all_vars=all_vars)
+    if handlers and handler_dep_chain is None:
+        # Through 2.14 the child handler has no dependency chain. It still
+        # sees defaults from roles declared on the play via VariableManager.
+        from ansible.utils.vars import combine_vars
+
+        play_defaults = {}
+        for play_role in play.get_roles():
+            play_defaults = combine_vars(play_defaults, play_role.get_default_vars())
+        for handler in handlers:
+            handler["role_defaults"] = combine_vars(play_defaults, handler.get("role_defaults") or {})
     tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                        skip_tags=skip_tags, all_vars=all_vars)
                          for b in blocks) if c]
@@ -826,7 +841,14 @@ def _handler_match(task):
         names.extend("%s : %s" % (role, task.name) for role in roles)
     # ansible-core 2.17+ includes role-qualified aliases in task.listen.
     listen = list(dict.fromkeys(map(str, _as_list(getattr(task, "listen", None)))))
-    return {"handler_names": names, "listen": listen}
+    match = {"handler_names": names, "listen": listen}
+    if names and ("{{" in names[0] or "{%" in names[0]):
+        # StrategyBase resolves handler names with play/task vars and no host.
+        variables = task.get_variable_manager().get_vars(
+            play=_play_of(task), task=task, include_hostvars=False)
+        variables.pop("vars", None)  # rebuilt after applying invocation vars
+        match["handler_name_vars"] = _tag_untrusted(variables)
+    return match
 
 
 def _contains_dynamic_value(value):
@@ -1089,7 +1111,7 @@ def _role_vars(task):
         return {}, {}
     defaults, rvars = {}, {}
     try:
-        defaults = dict(role.get_default_vars() or {})
+        defaults = dict(role.get_default_vars(dep_chain=task.get_dep_chain()) or {})
     except Exception:
         pass
     try:

@@ -360,8 +360,9 @@ def test_role_params_outrank_set_fact(tmp_path):
     assert msgs == ['"b=roleparam c=sf"']
 
 
-def test_until_exhausted_registered_result(tmp_path):
-    check(tmp_path, {"pb.yml": """
+def test_until_exhausted_registered_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_DISPLAY_TRACEBACK", "never")
+    msgs, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
           tasks:
@@ -371,7 +372,8 @@ def test_until_exhausted_registered_result(tmp_path):
               retries: 1
               delay: 0
               ignore_errors: true
-            - debug: msg="A {{ a.attempts }} {{ a.failed }} {{ a.exception is defined }}"
+            - debug:
+                msg: "A {{ a.attempts }} {{ a.failed }} {{ a.exception | default('none') }}"
             - command: /bin/false
               register: e
               until: e.rc == 0
@@ -380,6 +382,8 @@ def test_until_exhausted_registered_result(tmp_path):
               failed_when: e.rc == 7
             - debug: msg="E {{ e.attempts }} {{ e.failed }}"
         """})
+    exception = "(traceback unavailable)" if (2, 19) <= CORE_VERSION < (2, 21) else "none"
+    assert msgs[0] == '"A 1 True %s"' % exception
 
 
 def test_failed_task_facts_persist_after_rescue(tmp_path):
@@ -399,27 +403,90 @@ def test_failed_task_facts_persist_after_rescue(tmp_path):
     assert msgs[-1] == '"after failing one overridden"'
 
 
+def _run_mode(tmp_path, mode):
+    if mode == "standalone":
+        return _standalone_run(tmp_path, ())
+    return _ansible_run(tmp_path, (), "ansiroll.core.ansiroll" if mode == "strategy" else None)
+
+
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
-def test_invalid_until_does_not_repeat_side_effects(tmp_path, mode):
+@pytest.mark.parametrize("condition", ["missing_condition", "'false'", "1 - 1", "1 + 0"])
+def test_invalid_until_does_not_repeat_side_effects(tmp_path, monkeypatch, mode, condition):
+    if condition != "missing_condition" and CORE_VERSION < (2, 19):
+        pytest.skip("boolean results are required from ansible-core 2.19")
+    monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "False")
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
           tasks:
             - shell: echo attempt >> attempts
-              until: missing_condition
+              until: "%s"
               delay: 0
             - debug: msg=AFTER_UNTIL
-        """})
-    if mode == "standalone":
-        out = _standalone_run(tmp_path, ())
-    else:
-        strategy = "ansiroll.core.ansiroll" if mode == "strategy" else None
-        out = _ansible_run(tmp_path, (), strategy)
+        """ % condition})
+    out = _run_mode(tmp_path, mode)
     output = out.stdout + out.stderr
     assert out.returncode != 0
     assert _summary(output)[1][3] == "1"
     assert "AFTER_UNTIL" not in output
     assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"]
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="added in ansible-core 2.19")
+@pytest.mark.parametrize("source", ["env", "config"])
+def test_until_allows_broken_conditionals_without_config_lookup(tmp_path, monkeypatch, source):
+    files = {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - shell: echo attempt >> attempts
+              until: "'false'"
+              delay: 0
+            - shell: echo attempt >> attempts
+              until: 1 + 0
+              delay: 0
+            - shell: echo attempt >> attempts
+              until: 1 - 1
+              retries: 1
+              delay: 0
+              register: exhausted
+              ignore_errors: true
+            - debug: msg="EXHAUSTED {{ exhausted.attempts }} {{ exhausted.failed }}"
+        """}
+    monkeypatch.delenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", raising=False)
+    if source == "env":
+        monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "True")
+    else:
+        files["ansible.cfg"] = "[defaults]\nallow_broken_conditionals = True\n"
+        monkeypatch.setenv("ANSIBLE_CONFIG", str(tmp_path / "ansible.cfg"))
+    msgs, _ = check(tmp_path, files)
+    assert msgs == ['"EXHAUSTED 1 True"']
+    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"] * 12
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+@pytest.mark.parametrize("loop", ["", "loop: [first, second]"])
+def test_invalid_notify_fails_before_dispatch(tmp_path, mode, loop):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - shell: echo attempt >> attempts
+              notify: "{{ missing_notification }}"
+              when: false
+            - shell: echo attempt >> attempts
+              notify: "run {{ missing_notification }}"
+              %s
+              changed_when: false
+              ignore_errors: true
+            - debug: msg=AFTER_NOTIFY
+        """ % loop})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode == 0, output
+    assert "missing_notification" in output
+    assert not (tmp_path / "attempts").exists()
+    assert _summary(output) == (['"AFTER_NOTIFY"'], ("2", "0", "0", "0", "1", "0", "1"))
 
 
 def _reject_setup_become(tmp_path, monkeypatch):
@@ -496,6 +563,62 @@ def test_nested_dynamic_role_inherits_parent_params_in_tasks_and_handlers(tmp_pa
             """,
     })
     assert msgs == ['"task parent_param"', '"handler parent_param"']
+
+
+def test_nested_dynamic_role_handler_resolves_invocation_with_parent_default(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles: [parent]
+            """,
+        "roles/parent/defaults/main.yml": "fallback_value: owner_default",
+        "roles/parent/vars/main.yml": "outer_value: outer",
+        "roles/parent/tasks/main.yml": """
+            - include_role: {name: child}
+              vars: {value: "{{ fallback_value }}:{{ outer_value }}"}
+            """,
+        "roles/child/tasks/main.yml": """
+            - debug: msg="task {{ value }}"
+              changed_when: true
+              notify: run child
+            """,
+        "roles/child/handlers/main.yml": """
+            - name: run {{ role_name }}
+              debug: msg="handler {{ value }}"
+            """,
+    })
+    assert msgs == ['"task owner_default:outer"', '"handler owner_default:outer"']
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+def test_handler_name_uses_play_vars_without_host_facts(tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("ANSIBLE_ERROR_ON_MISSING_HANDLER", "False")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars: {suffix: play}
+          tasks:
+            - set_fact: {suffix: fact, host_only: target}
+            - debug: msg=trigger
+              changed_when: true
+              notify: [run play, run target]
+          handlers:
+            - name: run {{ suffix }}
+              debug: msg="play handler sees {{ suffix }}"
+            - name: run {{ host_only }}
+              debug: msg=HOST_HANDLER_RAN
+        """})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    if CORE_VERSION < (2, 12):
+        assert out.returncode != 0, output
+        assert "'host_only' is undefined" in output
+        assert "HOST_HANDLER_RAN" not in output
+        return
+    assert out.returncode == 0, output
+    assert "The requested handler 'run target' was not found" in output
+    assert _summary(output)[0] == ['"trigger"', '"play handler sees fact"']
 
 
 @pytest.mark.parametrize("looped", [False, True])

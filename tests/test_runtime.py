@@ -889,10 +889,10 @@ def test_legacy_force_handlers_flushes_after_failure(monkeypatch, version, force
     assert bool(by_name(frames, "h1")) is ran
 
 
-@pytest.mark.parametrize("version,registered_failed", [
-    ("2.20.1", True), ("2.21.1", False)])
-def test_until_exhausted_failed_when_decides_outcome(monkeypatch, version,
-                                                     registered_failed):
+@pytest.mark.parametrize("version,registered_failed,registered_exception", [
+    ("2.20.1", True, "(traceback unavailable)"), ("2.21.1", False, None)])
+def test_until_exhausted_failed_when_decides_outcome(
+        monkeypatch, version, registered_failed, registered_exception):
     import ansiroll.runtime as runtime_mod
     monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
     frames = []
@@ -904,7 +904,7 @@ def test_until_exhausted_failed_when_decides_outcome(monkeypatch, version,
     ], "handlers": [], "gather_facts": False, "vars": {}})
     assert not rt.failed
     assert rt.vars["r"]["failed"] is registered_failed
-    assert "exception" not in rt.vars["r"]
+    assert rt.vars["r"].get("exception") == registered_exception
 
 
 def test_core_version_gate_uses_baked_version(monkeypatch):

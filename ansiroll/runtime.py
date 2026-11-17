@@ -870,6 +870,12 @@ class _AnsirollUndefined(jinja2.ChainableUndefined):
         self._fail_with_undefined_error()
 
 
+class _StrictAnsirollUndefined(jinja2.StrictUndefined):
+    # Keep nested default filters working while rejecting undefined output.
+    __getattr__ = _AnsirollUndefined.__getattr__
+    __getitem__ = _AnsirollUndefined.__getitem__
+
+
 class _PluginDict(dict):
     """env.filters/env.tests replacement that reports plugins which exist but
     failed to load, with Ansible's error message."""
@@ -945,6 +951,7 @@ class _Templater:
         self.env.globals.setdefault("q", self._g_query)
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
+        self._strict_env = self.env.overlay(undefined=_StrictAnsirollUndefined)
 
     def _g_lookup(self, name, *a, **k):
         try:
@@ -1044,12 +1051,14 @@ class _Templater:
             return _captured("lookup plugin '%s' failed to load: %s" % (name, e))
         return self._plugin_lookup(name, args, kwargs)
 
-    def render_string(self, text, ctx, _depth=0):
+    def render_string(self, text, ctx, _depth=0, strict=False):
         if not isinstance(text, str):
             return text
         if "{{" not in text and "{%" not in text:
             return text
         self._current_ctx = ctx
+        env = self._strict_env if strict else self.env
+        template_key = (text, strict)
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
@@ -1057,11 +1066,12 @@ class _Templater:
                 and (stripped.count("{{") == 1 or lookup_expr)
                 and "{%" not in stripped):
             expr = stripped[2:-2].strip()
+            expr_key = (expr, True) if strict else expr
             try:
-                compiled = self._expr_cache.get(expr)
+                compiled = self._expr_cache.get(expr_key)
                 if compiled is None:
-                    compiled = self.env.compile_expression(expr, undefined_to_none=False)
-                    self._expr_cache[expr] = compiled
+                    compiled = env.compile_expression(expr, undefined_to_none=False)
+                    self._expr_cache[expr_key] = compiled
                 result = compiled(**ctx)
             except jinja2.TemplateSyntaxError as e:
                 # Captured, not raised: surfaces when the value is used (or is
@@ -1069,10 +1079,10 @@ class _Templater:
                 return _captured_jinja_error(e, syntax=True)
             except Exception:
                 try:
-                    tmpl = self._template_cache.get(text)
+                    tmpl = self._template_cache.get(template_key)
                     if tmpl is None:
-                        tmpl = self.env.from_string(text)
-                        self._template_cache[text] = tmpl
+                        tmpl = env.from_string(text)
+                        self._template_cache[template_key] = tmpl
                     result = tmpl.render(**ctx)
                 except jinja2.TemplateError as e:
                     return _captured_jinja_error(
@@ -1080,10 +1090,10 @@ class _Templater:
                     )
         else:
             try:
-                tmpl = self._template_cache.get(text)
+                tmpl = self._template_cache.get(template_key)
                 if tmpl is None:
-                    tmpl = self.env.from_string(text)
-                    self._template_cache[text] = tmpl
+                    tmpl = env.from_string(text)
+                    self._template_cache[template_key] = tmpl
             except jinja2.TemplateSyntaxError as e:
                 return _captured_jinja_error(e, syntax=True)
             try:
@@ -1109,7 +1119,7 @@ class _Templater:
                 and not self._has_embedded_template_constant(text)):
             if result == text or _depth >= 10:
                 return _captured("Recursive loop detected in template: %s" % text)
-            return self.render_string(result, ctx, _depth + 1)
+            return self.render_string(result, ctx, _depth + 1, strict=strict)
         return result
 
     def _has_embedded_template_constant(self, text):
@@ -1297,6 +1307,7 @@ class Runtime:
         self.notified = []  # ordered, de-duplicated pending notifications
         self._notified_handlers = set()  # indexes into self.handlers
         self._flushing = False
+        self._allow_broken_conditionals = None
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
         self.host = self.vars.get("inventory_hostname") or _hostname()
@@ -1338,7 +1349,7 @@ class Runtime:
             self._runtime_var_overrides.add(name)
             self._set_fact_overrides[name] = result
 
-    def template(self, value, ctx, _seen=None):
+    def template(self, value, ctx, _seen=None, strict=False):
         if isinstance(value, (dict, list)):
             if _seen is None:
                 _seen = set()
@@ -1352,16 +1363,16 @@ class Runtime:
                 )  # `!unsafe`: never templated
             if set(value.keys()) == {"__ansiroll_vault__"}:
                 return value
-            return {self.template(k, ctx, _seen) if isinstance(k, str) and "{{" in k else k:
-                    self.template(v, ctx, _seen) for k, v in value.items()}
+            return {self.template(k, ctx, _seen, strict=strict) if isinstance(k, str) and "{{" in k else k:
+                    self.template(v, ctx, _seen, strict=strict) for k, v in value.items()}
         if isinstance(value, list):
-            return [self.template(v, ctx, _seen) for v in value]
+            return [self.template(v, ctx, _seen, strict=strict) for v in value]
         if isinstance(value, str):
-            out = self.templater.render_string(value, ctx)
+            out = self.templater.render_string(value, ctx, strict=strict)
             if isinstance(out, (dict, list)) and out is not value:
                 # A bare expression returned a container that may hold raw
                 # (lazily deferred) templates -- resolve them now that it is used.
-                out = self.template(out, ctx, _seen)
+                out = self.template(out, ctx, _seen, strict=strict)
             return out
         return value
 
@@ -1393,7 +1404,7 @@ class Runtime:
                 out[k] = _lazy_container(v, self, base, dynamic)
         return out
 
-    def when(self, conds, ctx, strict=False):
+    def when(self, conds, ctx, strict=False, until=False):
         for cond in (conds or []):
             if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
                 raise UntrustedConditional(
@@ -1438,7 +1449,7 @@ class Runtime:
                 # example `that: "{{ expression_list }}"`). Evaluate the
                 # resolved members as conditions rather than treating the
                 # non-empty list itself as truthy.
-                if isinstance(result, (list, tuple)):
+                if not until and isinstance(result, (list, tuple)):
                     if not self.when(list(result), ctx, strict=strict):
                         return False
                     continue
@@ -1456,7 +1467,7 @@ class Runtime:
                 if strict and _is_undef(result):
                     raise RuntimeError(
                         "The conditional check %r failed: the expression is undefined" % cond)
-                if not self._condition_truth(result, ctx):
+                if not self._condition_truth(result, ctx, until=until):
                     return False
                 continue
             try:
@@ -1464,7 +1475,7 @@ class Runtime:
                 if strict and _is_undef(result):
                     raise RuntimeError(
                         "The conditional check %r failed: the expression is undefined" % cond)
-                if not self._condition_truth(result, ctx):
+                if not self._condition_truth(result, ctx, until=until):
                     return False
             except UntrustedConditional:
                 raise
@@ -1474,15 +1485,20 @@ class Runtime:
                 return False
         return True
 
-    def _condition_truth(self, result, ctx):
+    def _condition_truth(self, result, ctx, until=False):
         if isinstance(result, bool):
             return result
-        if isinstance(result, str) and result.strip().lower() in (
+        if until and not _core_at_least(2, 19):
+            return bool(result)
+        if not until and isinstance(result, str) and result.strip().lower() in (
                 "true", "false"):
             return _to_bool(result)
-        if _core_at_least(2, 20) and not _is_undef(result):
-            config = ctx.get("__ansiroll_controller_config") or {}
-            if _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False)):
+        if _core_at_least(2, 19 if until else 20) and not _is_undef(result):
+            allow_broken = self._allow_broken_conditionals
+            if allow_broken is None:
+                config = ctx.get("__ansiroll_controller_config") or {}
+                allow_broken = _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False))
+            if allow_broken:
                 return bool(result)
             raise RuntimeError(
                 "Conditional result was derived from value of type '%s'. "
@@ -1618,6 +1634,7 @@ class Runtime:
             self.templater.register_plugins(plugins)
         self.handlers = [(handler, {}, False) for handler in play.get("handlers", [])]
         self._error_on_missing_handler = play.get("error_on_missing_handler", True)
+        self._allow_broken_conditionals = play.get("allow_broken_conditionals")
         self._notified_handlers = set()
         self._flushing = False
         self._play_become = play.get("become", False)
@@ -2026,9 +2043,7 @@ class Runtime:
                 self._tally("skipped")
                 return
             if run_it:
-                res = self._exec_with_retries(task, base_ctx, effective_become)
-                if res.get("changed") and not _result_failed(res):
-                    notifications = self._notification_names(task, base_ctx)
+                res = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
             if task.get("register"):
                 res.setdefault("failed", False)
                 res.setdefault("changed", False)
@@ -2093,9 +2108,7 @@ class Runtime:
                        "skip_reason": "Conditional result was False"}
             else:
                 any_ran = True
-                res = self._exec_with_retries(task, ctx, become)
-                if notifications is not None and not _result_failed(res):
-                    notifications.extend(self._notification_names(task, ctx))
+                res = self._exec_notifying_task(task, ctx, become, notifications)
                 self._absorb_facts(task, res)
                 if isinstance(res.get("ansible_facts"), dict):
                     base_ctx.update(res["ansible_facts"])
@@ -2204,6 +2217,19 @@ class Runtime:
             return 3
         return 1 if retries <= 0 else retries + 1
 
+    def _exec_notifying_task(self, task, ctx, become, notifications):
+        # Like TaskExecutor.post_validate, resolve notify after when and
+        # before dispatch, including on unchanged tasks and per loop item.
+        try:
+            names = self._notification_names(task, ctx)
+        except Exception as ex:
+            return {"failed": True, "changed": False,
+                    "msg": "Failed to template notify: %s" % ex}
+        res = self._exec_with_retries(task, ctx, become)
+        if notifications is not None and not _result_failed(res):
+            notifications.extend(names)
+        return res
+
     def _exec_with_retries(self, task, ctx, become=False):
         until = task.get("until")
         attempts = self._attempt_count(task, ctx)
@@ -2222,7 +2248,7 @@ class Runtime:
             # 2.16+: without `until` the default condition is `not failed`.
             if until:
                 try:
-                    done = self.when(until, eval_ctx, strict=True)
+                    done = self.when(until, eval_ctx, strict=True, until=True)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "An 'until' expression failed. %s" % ex}
@@ -2242,6 +2268,10 @@ class Runtime:
             res["failed"] = fw_result
         else:
             res["failed"] = True
+            if _core_at_least(2, 19) and not _core_at_least(2, 21):
+                # Those releases normalize a failed result with no exception
+                # to an action failure, exposed as a traceback string.
+                res.setdefault("exception", "(traceback unavailable)")
         return res
 
     def _exec_one(self, task, ctx, become=False, attempt=None):
@@ -2797,8 +2827,9 @@ class Runtime:
     def _notification_names(self, task, ctx):
         names = []
         for value in task.get("notify") or []:
-            rendered = self.template(value, ctx)
-            names.extend(rendered if isinstance(rendered, list) else [rendered])
+            rendered = _fail_on_undef(self.template(value, ctx, strict=True))
+            values = rendered if isinstance(rendered, list) else [rendered]
+            names.extend(value for value in values if value != _OMIT)
         return names
 
     def _queue_notify(self, names):
@@ -2825,7 +2856,14 @@ class Runtime:
         params = scope.get(_INCLUDE_PARAMS_KEY)
         if not params:
             return scope
-        ctx = self._layered_ctx(self.ctx(scope), role_params=handler.get("role_params"))
+        ctx = dict(handler.get("role_defaults") or {})
+        ctx.update(self.vars)
+        ctx.update(handler.get("role_vars") or {})
+        ctx.update(scope)
+        self._layered_ctx(ctx, role_params=handler.get("role_params"))
+        ctx.setdefault("omit", _OMIT)
+        ctx.setdefault("hostvars", {self.host: ctx})
+        ctx.setdefault("vars", ctx)
         return _with_high_vars(scope, self.template_vars(params, ctx))
 
     def _handlers_for(self, notification):
@@ -2840,8 +2878,22 @@ class Runtime:
             if values is None:
                 values = [handler["name"]] if handler.get("name") else []
             if any("{{" in value or "{%" in value for value in values):
-                ctx = self._task_ctx(handler, self._handler_scope(handler, scope))
-                values = [self.template(value, ctx) for value in values]
+                ctx = dict(handler.get("handler_name_vars") or {})
+                ctx.update(scope.get(_INCLUDE_PARAMS_KEY) or {})
+                ctx.update(self.extra_vars)
+                for key, value in ctx.items():
+                    if not isinstance(value, str):
+                        ctx[key] = _lazy_wrap(value, self, ctx)
+                ctx["vars"] = dict(ctx)
+                for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
+                    ctx[key] = self.vars.get(key) or {}
+                values = [self.template(value, ctx, strict=True) for value in values]
+                # Through 2.11 an undefined name aborts notification lookup.
+                if _core_at_least(2, 10) and not _core_at_least(2, 12):
+                    try:
+                        _fail_on_undef(values)
+                    except jinja2.UndefinedError as ex:
+                        raise MissingHandler(str(ex))
                 values = [value for value in values if not _is_undef(value)]
             return values
 
@@ -2857,11 +2909,12 @@ class Runtime:
         for idx in indexes:
             handler, scope, _ = self.handlers[idx]
             if notification in (handler.get("listen") or []):
-                own = names(handler, scope)
-                own = own[0] if own else None
-                if modern and own and own in seen:
-                    continue
-                seen.add(own)
+                if modern:
+                    own = names(handler, scope)
+                    own = own[0] if own else None
+                    if own and own in seen:
+                        continue
+                    seen.add(own)
                 found.append(idx)
         return found
 
