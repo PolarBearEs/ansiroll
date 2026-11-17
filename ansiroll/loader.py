@@ -827,6 +827,13 @@ def _accelerator_options(action):
             if version < (2, 19):
                 return {"lowercase_not_found": True}
             return {"typed_exceptions": True}
+        if name == "apt":
+            options = {}
+            if version >= (2, 12):
+                options["parsable_locale"] = True
+            if version >= (2, 18):
+                options["language_locale"] = True
+            return options or None
         if name == "blockinfile" and version >= (2, 20):
             return {"text_mode": True}
         if name == "replace":

@@ -277,6 +277,59 @@ def test_accelerated_apt_absent_matches_official_module_semantics():
     assert accelerated["changed"] == official["changed"] is False
 
 
+def test_accelerated_apt_remove_uses_official_apt_environment(tmp_path):
+    """apt-get runs with the official module's APT_ENV_VARS; fake dpkg-query and
+    apt-get on the task PATH record it, so no package state is touched."""
+    import ansible
+    from ansible.module_utils.common.locale import get_best_parsable_locale
+    from ansiroll.loader import _accelerator_options
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    record = tmp_path / "env.json"
+    (bin_dir / "dpkg-query").write_text(
+        "#!/bin/sh\nprintf 'ansiroll-fake\\tii \\n'\n")
+    (bin_dir / "apt-get").write_text(
+        "#!%s\nimport json, os, sys\n"
+        "json.dump({'argv': sys.argv[1:], 'env': dict(os.environ)}, open(%r, 'w'))\n"
+        % (sys.executable, str(record)))
+    for name in ("dpkg-query", "apt-get"):
+        os.chmod(str(bin_dir / name), 0o755)
+    environment = {
+        "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "LANG": "es_ES.UTF-8", "LC_ALL": "es_ES.UTF-8", "LANGUAGE": "es",
+        "DEBIAN_FRONTEND": "dialog",
+    }
+    result = run_accelerated(
+        "apt", {"name": "ansiroll-fake", "state": "absent"},
+        environment=environment, options=_accelerator_options("apt"))
+    assert result.get("changed") is True, result
+
+    class _Module(object):
+        def get_bin_path(self, name):
+            return shutil.which(name, path=environment["PATH"])
+
+        def run_command(self, args):
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  env=dict(os.environ, **environment))
+            return proc.returncode, proc.stdout, proc.stderr
+
+        def debug(self, msg):
+            pass
+
+    source = open(os.path.join(
+        os.path.dirname(ansible.__file__), "modules", "apt.py")).read()
+    block = re.search(r"APT_ENV_VARS = dict\((.*?)\)", source, re.S).group(1)
+    locale = get_best_parsable_locale(_Module())
+    expected = {}
+    for key, value in re.findall(r"(\w+)=([^,\n]+)", block):
+        expected[key] = locale if value.strip() == "locale" else value.strip("'\" ")
+    assert "LANG" in expected and "DEBIAN_FRONTEND" in expected
+    recorded = json.load(open(str(record)))
+    assert {key: recorded["env"].get(key) for key in expected} == expected
+    assert recorded["argv"][-2:] == ["remove", "ansiroll-fake"]
+
+
 def test_accelerated_slurp_matches_official_module_semantics(tmp_path):
     source = tmp_path / "binary"
     source.write_bytes(b"\x00quotes'\"slashes\\\xff")

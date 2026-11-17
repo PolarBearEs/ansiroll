@@ -60,23 +60,25 @@ def can_accelerate(args, check_mode=False, shell=False):
     return True
 
 
-def _environment(environment, force_c_locale=False):
+def _environment(environment, force_c_locale=False, overrides=None):
     result = os.environ.copy()
     if environment:
         result.update({str(key): str(value) for key, value in environment.items()})
     if force_c_locale:
         result["LC_ALL"] = "C"
         result["LANG"] = "C"
+    if overrides:
+        result.update(overrides)
     return result
 
 
-def _command(argv, environment=None, force_c_locale=False):
+def _command(argv, environment=None, force_c_locale=False, overrides=None):
     try:
         process = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_environment(environment, force_c_locale),
+            env=_environment(environment, force_c_locale, overrides),
         )
         stdout, stderr = process.communicate()
         return (
@@ -86,6 +88,41 @@ def _command(argv, environment=None, force_c_locale=False):
         )
     except Exception as error:
         return None, "", str(error)
+
+
+def _best_parsable_locale(environment):
+    """module_utils.common.locale.get_best_parsable_locale()."""
+    found = "C"
+    search_path = (environment or {}).get("PATH")
+    executable = shutil.which("locale", path=search_path)
+    if not executable:
+        return found
+    returncode, stdout, _stderr = _command([executable, "-a"], environment)
+    if returncode != 0 or not stdout:
+        return found
+    available = stdout.strip().splitlines()
+    for preferred in ("C.utf8", "C.UTF-8", "en_US.utf8", "en_US.UTF-8", "C", "POSIX"):
+        if preferred in available:
+            return preferred
+    return found
+
+
+def _apt_environment(environment, options):
+    """APT_ENV_VARS, the run_command_environ_update of the official module."""
+    # ansible-core < 2.12 hard-coded C; 2.18 added LANGUAGE.
+    locale = (_best_parsable_locale(environment)
+              if options.get("parsable_locale") else "C")
+    variables = {
+        "DEBIAN_FRONTEND": "noninteractive",
+        "DEBIAN_PRIORITY": "critical",
+        "LANG": locale,
+        "LC_ALL": locale,
+        "LC_MESSAGES": locale,
+        "LC_CTYPE": locale,
+    }
+    if options.get("language_locale"):
+        variables["LANGUAGE"] = locale
+    return variables
 
 
 def _requested_name(binary_name, requested):
@@ -177,7 +214,9 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         return {"changed": False}
 
     command = _apt_remove_command(apt_get, remove, args, check_mode)
-    returncode, stdout, stderr = _command(command, environment)
+    returncode, stdout, stderr = _command(
+        command, environment,
+        overrides=_apt_environment(environment, options or {}))
     if returncode is None:
         # The process may have started before communication failed. Never
         # fall back after a potentially mutating command: that could apply a
