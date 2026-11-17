@@ -67,7 +67,7 @@ def test_yaml_filters_parse_and_emit_real_yaml(t):
 def test_from_yaml_uses_the_safe_loader(t, tmp_path):
     marker = tmp_path / "unsafe-yaml-ran"
     expression = "{{ value | from_yaml }}"
-    value = "!!python/object/apply:pathlib.Path.touch ['%s']" % marker
+    value = "!!python/object/apply:os.mkdir ['%s']" % marker
 
     result = render(t, expression, value=value)
 

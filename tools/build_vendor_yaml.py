@@ -35,7 +35,7 @@ def _zip_info(name: str) -> zipfile.ZipInfo:
 
 
 def build(output: str) -> str:
-    with urllib.request.urlopen(SOURCE_URL) as response:
+    with urllib.request.urlopen(SOURCE_URL, timeout=60) as response:
         source = response.read()
     actual = hashlib.sha256(source).hexdigest()
     if actual != SOURCE_SHA256:

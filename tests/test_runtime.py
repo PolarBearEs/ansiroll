@@ -1560,3 +1560,24 @@ def test_accelerated_command_handles_check_mode_without_worker(monkeypatch):
     assert result["rc"] == 0
     assert result["skipped"] is True
     assert result["msg"] == "Command would have run if not in check mode"
+
+
+def test_to_yaml_filters_accept_lazy_vars_and_set_fact_values():
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    play = {
+        "tasks": [
+            _task("1", "sf", "set_fact", args={"greeting": "hi", "items": ["a", "b"]}),
+            _task("2", "cfg", "debug", args={"msg": "{{ config | to_yaml }}"}),
+            _task("3", "nice", "debug", args={"msg": "{{ greeting | to_nice_yaml }}"}),
+            _task("4", "lst", "debug", args={"msg": "{{ items | to_yaml }}"}),
+        ],
+        "handlers": [],
+        "gather_facts": False,
+        "vars": {"config": {"enabled": True, "nested": ["{{ 1 + 1 }}"]}},
+    }
+    rt.run_play(play)
+    assert [f["status"] for f in frames] == ["ok"] * 4
+    assert by_name(frames, "cfg")[0]["result"]["msg"] == "enabled: true\nnested:\n- 2\n"
+    assert by_name(frames, "nice")[0]["result"]["msg"] == "hi\n...\n"
+    assert by_name(frames, "lst")[0]["result"]["msg"] == "- a\n- b\n"

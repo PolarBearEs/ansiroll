@@ -277,23 +277,29 @@ def _yaml_module():
     source package directly falls back to the shipped ZIP without consulting a
     target's system PyYAML installation.
     """
-    try:
-        import ansiroll_yaml
-        return ansiroll_yaml
-    except ImportError:
-        bundle = os.path.join(
-            os.path.dirname(__file__), "vendor", "pyyaml-py35.zip"
-        )
-        if os.path.isfile(bundle) and bundle not in sys.path:
-            sys.path.insert(0, bundle)
-        import ansiroll_yaml
-        return ansiroll_yaml
+    bundle = os.path.join(os.path.dirname(__file__), "vendor", "pyyaml-py35.zip")
+    if os.path.isfile(bundle) and bundle not in sys.path:
+        sys.path.insert(0, bundle)
+    import ansiroll_yaml
+    return ansiroll_yaml
+
+
+def _yaml_plain(v):
+    """Materialize runtime wrappers (lazy vars, trusted strings) into the
+    built-in types PyYAML's SafeDumper can represent."""
+    if isinstance(v, dict):
+        return {_yaml_plain(k): _yaml_plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_yaml_plain(x) for x in v]
+    if isinstance(v, str) and type(v) is not str:
+        return "".join([v])
+    return v
 
 
 def _f_to_yaml(v, **kwargs):
     options = dict(kwargs)
     options.setdefault("default_flow_style", False)
-    return _yaml_module().safe_dump(v, **options)
+    return _yaml_module().safe_dump(_yaml_plain(v), **options)
 
 
 def _f_from_yaml(v):
