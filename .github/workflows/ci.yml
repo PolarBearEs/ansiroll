@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install project and test dependencies
-        run: pip install -e ".[ansible,test]"
+        run: pip install -e ".[test]" "ansible-core==2.21.*"
       - name: Run branch coverage
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}/collections
@@ -52,7 +52,8 @@ jobs:
   # Full suite across ansible-core versions. Embedding + compilation + the
   # strategy parity tests run against each ansible release.
   matrix:
-    runs-on: ubuntu-latest
+    # Python 3.9 is not published for Ubuntu 26.04 runners.
+    runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
