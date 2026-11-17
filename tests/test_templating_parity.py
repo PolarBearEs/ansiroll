@@ -138,6 +138,44 @@ def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     })
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Templar parity")
+def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
+    nested_vars_check = (
+        "all_vars.msg.vars.label == 'sample' and 'vars' not in all_vars.msg.vars"
+        if Version(__version__) >= Version("2.20") else "'vars' not in all_vars.msg"
+    )
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    label: sample
+    nested: {leaf: '{{ label }}'}
+  tasks:
+    - no_log: true
+      block:
+        - debug: {msg: '{{ hostvars }}'}
+          register: all_hosts
+        - debug: {msg: '{{ hostvars.localhost }}'}
+          register: one_host
+        - debug: {msg: '{{ vars }}'}
+          register: all_vars
+    - assert:
+        that:
+          - all_hosts.msg | type_debug == 'dict'
+          - all_hosts.msg.localhost.inventory_hostname == 'localhost'
+          - one_host.msg | type_debug == 'dict'
+          - one_host.msg.inventory_hostname == 'localhost'
+          - all_vars.msg | type_debug == 'dict'
+          - all_vars.msg.hostvars is defined
+          - "%s"
+          - all_vars.msg.nested.leaf == 'sample'
+          - all_vars.msg.one_host.msg.inventory_hostname == 'localhost'
+""" % nested_vars_check)
+    _, linear_recap = _ansible(path, tmp_path)
+    _, ansiroll_recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert ansiroll_recap == linear_recap == ("4", "0", "0", "0", "0", "0", "0")
+
+
 def test_template_and_copy_content_fail_on_undefined_variables(tmp_path):
     out = tmp_path / "out"
     out.mkdir()

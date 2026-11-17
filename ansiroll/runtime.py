@@ -61,6 +61,16 @@ def _legacy_non_native(ctx):
     return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
 
 
+def _vars_snapshot(ctx):
+    # Ansible exposes a shallow copy of the task context under the magic
+    # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
+    snapshot = {key: value for key, value in ctx.items()
+                if key != "vars" and not str(key).startswith("__ansiroll")}
+    if _core_at_least(2, 20):
+        snapshot["vars"] = dict(snapshot)
+    return snapshot
+
+
 # Persistent worker: one long-lived process per privilege level. It keeps each
 # module's decoded zip in RAM (decode-once) and forks a child per task -- the fork
 # inherits the already-decoded zips and compiled module_utils copy-on-write, so the
@@ -1613,8 +1623,10 @@ class Runtime:
             if o:
                 d.update(o)
         d.setdefault("omit", _OMIT)
-        d.setdefault("hostvars", {self.host: d})
-        d.setdefault("vars", d)
+        if "hostvars" not in d:
+            d["hostvars"] = {self.host: dict(d)}
+        if "vars" not in d:
+            d["vars"] = _vars_snapshot(d)
         return d
 
     def _store_register(self, task, result):
@@ -2094,21 +2106,19 @@ class Runtime:
         if task.get("search_path"):
             ctx.setdefault("ansible_search_path", task["search_path"])
         hostvars = ctx.get("hostvars")
-        if isinstance(hostvars, dict):
-            # The controller snapshot predates include_vars/set_fact/register
-            # changes made by this long-lived agent. Refresh this host's entry
-            # for every task while preserving other hosts from the snapshot.
-            hostvars = dict(hostvars)
-            current = dict(hostvars.get(self.host) or {})
-            current.update({
-                key: value for key, value in ctx.items()
-                if key not in ("hostvars", "vars")
-            })
-            hostvars[self.host] = current
-            ctx["hostvars"] = hostvars
-        else:
-            ctx["hostvars"] = {self.host: ctx}
-        ctx.setdefault("vars", ctx)
+        # The controller snapshot predates include_vars/set_fact/register
+        # changes made by this long-lived agent. Refresh this host's entry
+        # for every task while preserving other hosts from the snapshot.
+        hostvars = dict(hostvars) if isinstance(hostvars, dict) else {}
+        current = dict(hostvars.get(self.host) or {})
+        current.update({
+            key: value for key, value in ctx.items()
+            if key not in ("hostvars", "vars")
+        })
+        hostvars[self.host] = current
+        ctx["hostvars"] = hostvars
+        if "vars" not in ctx:
+            ctx["vars"] = _vars_snapshot(ctx)
         return ctx
 
     def _refresh_play_vars(self):
