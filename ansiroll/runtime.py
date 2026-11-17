@@ -1624,18 +1624,41 @@ class Runtime:
         self.check_mode = invocation_check_mode
 
     def run_nodes(self, nodes, overlay, become=False):
+        # Each suspended generator resumes after its child sequence. Advancing
+        # one at a time keeps dynamic include and block depth off the call stack.
+        stack = [self._node_steps(nodes, overlay, become)]
+        failure = None
+        while stack:
+            frame = stack[-1]
+            try:
+                if failure is None:
+                    child = next(frame)
+                else:
+                    # Resume at the yield so enclosing blocks can handle failure.
+                    child = frame.throw(failure)
+            except StopIteration:
+                stack.pop()
+                failure = None
+            except TaskFailed as ex:
+                stack.pop()
+                failure = ex
+            else:
+                stack.append(child)
+                failure = None
+        if failure is not None:
+            raise failure
+
+    def _node_steps(self, nodes, overlay, become):
         for node in nodes:
-            self.run_node(node, overlay, become)
+            kind = node.get("type")
+            if kind == "block":
+                yield from self._block_steps(node, overlay, become)
+            elif kind == "include":
+                yield from self._include_steps(node, overlay, become)
+            else:
+                self.run_task(node, overlay, become)
 
-    def run_node(self, node, overlay, become=False):
-        if node.get("type") == "block":
-            self.run_block(node, overlay, become)
-        elif node.get("type") == "include":
-            self.run_include(node, overlay, become)
-        else:
-            self.run_task(node, overlay, become)
-
-    def run_include(self, node, overlay, become=False):
+    def _include_steps(self, node, overlay, become):
         """Run a compile-time-expanded include, once per loop item if looped."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
@@ -1668,7 +1691,7 @@ class Runtime:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
             if node.get("tally_include_ok", True):
                 self._tally("ok")
-            self.run_nodes(tasks, scope, b)
+            yield self._node_steps(tasks, scope, b)
             return
         items = self._resolve_loop(loop, base_ctx)
         for i, it in enumerate(items):
@@ -1678,22 +1701,22 @@ class Runtime:
                                    "item": it}, item=it, is_item=True)
             if node.get("tally_include_ok", True):
                 self._tally("ok")
-            self.run_nodes(tasks, item_scope, b)
+            yield self._node_steps(tasks, item_scope, b)
 
-    def run_block(self, block, overlay, become=False):
+    def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
         scope.update(self.template_vars(block.get("vars"), self.ctx(overlay)))
         if not self.when(block.get("when"), self.ctx(scope)):
             b_become = bool(block.get("become")) or become
-            self._skip_nodes(block.get("block", []), scope, b_become)
+            yield self._skip_steps(block.get("block", []), scope, b_become)
             if block.get("always"):
-                self._skip_nodes(block["always"], scope, b_become)
+                yield self._skip_steps(block["always"], scope, b_become)
             return
         b_become = bool(block.get("become")) or become
         failed_exc = None
         try:
             try:
-                self.run_nodes(block.get("block", []), scope, b_become)
+                yield self._node_steps(block.get("block", []), scope, b_become)
             except TaskFailed as ex:
                 rescue = block.get("rescue") or []
                 if not rescue:
@@ -1701,12 +1724,12 @@ class Runtime:
                 self._tally("rescued")
                 scope["ansible_failed_task"] = ex.task
                 scope["ansible_failed_result"] = ex.result
-                self.run_nodes(rescue, scope, b_become)
+                yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
             failed_exc = ex
         if block.get("always"):
             try:
-                self.run_nodes(block["always"], scope, b_become)
+                yield self._node_steps(block["always"], scope, b_become)
             except TaskFailed:
                 # If always replaces a pending block/rescue failure, preserve
                 # the original count before propagating the new failure.
@@ -1728,20 +1751,17 @@ class Runtime:
             else:
                 raise failed_exc
 
-    def _skip_nodes(self, nodes, overlay, become=False):
+    def _skip_steps(self, nodes, overlay, become):
         for node in nodes:
             if node.get("type") == "block":
                 scope = dict(overlay)
                 scope.update(self.template_vars(node.get("vars"), self.ctx(overlay)))
                 b_become = bool(node.get("become")) or become
-                self._skip_nodes(node.get("block", []), scope, b_become)
+                yield self._skip_steps(node.get("block", []), scope, b_become)
                 if node.get("always"):
-                    self._skip_nodes(node["always"], scope, b_become)
-            elif node.get("type") == "include":
-                # A skipped dynamic include reports one skipped task; its inner
-                # tasks were never loaded in Ansible, so they don't appear.
-                self._skip_task(node, overlay)
+                    yield self._skip_steps(node["always"], scope, b_become)
             else:
+                # Skipped dynamic includes report a skip without loading children.
                 self._skip_task(node, overlay)
 
     def _skip_task(self, task, overlay):

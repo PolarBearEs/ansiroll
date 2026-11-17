@@ -182,6 +182,57 @@ def test_recursive_include_tasks_and_include_role(tmp_path):
     assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
 
 
+def test_generated_agent_finishes_deep_recursive_include(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {iterations: 0}
+  tasks:
+    - include_tasks: count.yml
+    - debug: msg="Completed {{ iterations }} iterations"
+""", "count.yml": """
+- set_fact: {iterations: "{{ iterations | int + 1 }}"}
+- include_tasks: count.yml
+  when: iterations | int < 425
+"""})
+    messages, recap = _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
+    assert messages == ["Completed 425 iterations"]
+    assert recap == (851, 0, 0, 0, 1, 0, 0)
+
+
+def test_recursive_include_failure_unwinds_nested_blocks(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {iterations: 0}
+  tasks:
+    - block:
+        - block:
+            - include_tasks: count.yml
+          rescue:
+            - debug: msg="inner rescue"
+          always:
+            - debug: msg="inner always"
+      always:
+        - debug: msg="outer always"
+    - debug: msg="Completed {{ iterations }} iterations"
+""", "count.yml": """
+- set_fact: {iterations: "{{ iterations | int + 1 }}"}
+- include_tasks: count.yml
+  when: iterations | int < 12
+- name: stop
+  fail: msg="at iteration {{ iterations }}"
+"""})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    assert expected[0] == [
+        "inner rescue", "inner always", "outer always",
+        "Completed 12 iterations",
+    ]
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=0) == expected
+
+
 @pytest.mark.parametrize("include", [
     "- include_tasks: ./rec.yml\n",
     '- include_tasks: "{{ selected_file }}"\n  vars: {selected_file: rec.yml}\n',
