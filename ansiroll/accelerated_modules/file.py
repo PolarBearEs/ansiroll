@@ -237,26 +237,25 @@ def _ensure_directory(path, recurse, attributes, check_mode):
         if check_mode:
             return {"path": path, "changed": True}
         # mkdir -p, applying the attributes to every directory it creates.
-        components = []
+        changed = False
         curpath = ""
         for dirname in path.strip("/").split("/"):
             curpath = "/".join([curpath, dirname])
             if not os.path.isabs(path):
                 curpath = curpath.lstrip("/")
-            components.append(curpath)
-        missing = [item for item in components if not os.path.exists(item)]
-        if not missing:
-            raise _Fallback()
-        attributes.preflight(missing[0])
-        changed = False
-        for curpath in missing:
+            # Creating an earlier component can make an existing path like
+            # new/.. reachable. Apply attributes only after this live check.
+            if os.path.exists(curpath):
+                continue
+            if not changed:
+                attributes.preflight(curpath)
             try:
                 os.mkdir(curpath)
                 changed = True
             except OSError as error:
-                if curpath == missing[0]:
-                    raise _Fallback()
                 if not (error.errno == errno.EEXIST and os.path.isdir(curpath)):
+                    if not changed:
+                        raise _Fallback()
                     return {
                         "failed": True, "path": path,
                         "msg": "There was an issue creating %s as requested: %s"
@@ -347,7 +346,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
 
 
 def _ensure_link(args, path, check_mode):
-    source = args["src"]
+    source = os.path.expanduser(os.path.expandvars(args["src"]))
     exists = os.path.lexists(path)
     force = args.get("force", False)
     source_base = (

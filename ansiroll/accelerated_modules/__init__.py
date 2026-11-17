@@ -2,12 +2,11 @@
 
 from __future__ import absolute_import
 
-import locale
-
 from . import (
     apt, blockinfile, command, file, find, group, replace, service, slurp,
     stat, systemd, user,
 )
+from .environment import module_environment
 
 _IMPLEMENTATIONS = {
     "apt": apt,
@@ -53,30 +52,11 @@ def can_accelerate(name, args, check_mode=False):
     ))
 
 
-_LOCALE_CHECKED = []
-
-
-def check_locale():
-    """AnsibleModule._check_locale(): official modules (and the ansible CLI)
-    call setlocale(LC_ALL, ''), so strerror() texts and strftime() names
-    follow the user's locale. Accelerated modules run in-process, so apply it
-    once here."""
-    if _LOCALE_CHECKED:
-        return
-    _LOCALE_CHECKED.append(True)
-    try:
-        locale.setlocale(locale.LC_ALL, "")
-    except locale.Error:
-        # The official fallback is the best parsable locale (C.utf8, C, ...),
-        # which renders the same English messages as the untouched C locale.
-        pass
-
-
 def run(name, args, check_mode=False, environment=None, options=None):
-    check_locale()
     short_name = str(name).split(".")[-1]
     implementation = _IMPLEMENTATIONS[short_name]
-    return implementation.run(
-        args or {}, check_mode=bool(check_mode), shell=short_name == "shell",
-        environment=environment, options=options or {},
-    )
+    with module_environment(environment) as module_env:
+        return implementation.run(
+            args or {}, check_mode=bool(check_mode), shell=short_name == "shell",
+            environment=module_env, options=options or {},
+        )

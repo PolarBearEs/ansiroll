@@ -259,7 +259,8 @@ def _copy_cleanup(args):
 def _copy_read(args):
     """Read a destination for the copy action's diff (the slurp module)."""
     try:
-        with open(args.get("path") or "", "rb") as fh:
+        path = os.path.expanduser(os.path.expandvars(args.get("path") or ""))
+        with open(path, "rb") as fh:
             return {"content": base64.b64encode(fh.read()).decode("ascii")}
     except OSError as e:
         return {"failed": True, "msg": str(e)}
@@ -442,7 +443,15 @@ def main():
                     os.close(source_fd)
         elif op in _COPY_OPS:
             try:
-                _send(_COPY_OPS[op](req.get("args") or {}))
+                args = req.get("args") or {}
+                if op in ("copy_stat", "copy_read"):
+                    from ansiroll.accelerated_modules.environment import module_environment
+
+                    with module_environment(req.get("env")):
+                        result = _COPY_OPS[op](args)
+                else:
+                    result = _COPY_OPS[op](args)
+                _send(result)
             except Exception as e:
                 _send({"failed": True, "msg": str(e)})
         elif op == "accelerated":

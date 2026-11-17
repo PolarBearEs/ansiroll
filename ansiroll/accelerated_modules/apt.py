@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 
+from .environment import best_parsable_locale
+
 
 _PACKAGE_KEYS = ("name", "package", "pkg")
 _ALLOWED = frozenset(_PACKAGE_KEYS + (
@@ -90,27 +92,10 @@ def _command(argv, environment=None, force_c_locale=False, overrides=None):
         return None, "", str(error)
 
 
-def _best_parsable_locale(environment):
-    """module_utils.common.locale.get_best_parsable_locale()."""
-    found = "C"
-    search_path = (environment or {}).get("PATH")
-    executable = shutil.which("locale", path=search_path)
-    if not executable:
-        return found
-    returncode, stdout, _stderr = _command([executable, "-a"], environment)
-    if returncode != 0 or not stdout:
-        return found
-    available = stdout.strip().splitlines()
-    for preferred in ("C.utf8", "C.UTF-8", "en_US.utf8", "en_US.UTF-8", "C", "POSIX"):
-        if preferred in available:
-            return preferred
-    return found
-
-
 def _apt_environment(environment, options):
     """APT_ENV_VARS, the run_command_environ_update of the official module."""
     # ansible-core < 2.12 hard-coded C; 2.18 added LANGUAGE.
-    locale = (_best_parsable_locale(environment)
+    locale = (best_parsable_locale(environment)
               if options.get("parsable_locale") else "C")
     variables = {
         "DEBIAN_FRONTEND": "noninteractive",

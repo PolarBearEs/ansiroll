@@ -225,7 +225,42 @@ def test_template_and_copy_src_match_official(tmp_path):
 """, files=files))
 
 
-def test_copy_diff_mode_matches_official(tmp_path):
+def test_copy_inline_content_preserve_and_remote_src_match_official(tmp_path):
+    previous = os.umask(0o002)
+    try:
+        outcomes = _run_both(tmp_path, """
+    - copy: {content: inline, dest: "{{ d }}/remote", remote_src: yes, mode: preserve}
+      register: r1
+    - copy: {content: inline, dest: "{{ d }}/attrs", mode: preserve}
+      register: r2
+    - copy: {content: inline, dest: "{{ d }}/attrs", mode: "0664"}
+      register: r3
+    - copy: {content: inline, dest: "{{ d }}/attrs", mode: preserve}
+      register: r4
+    - copy: {src: "{{ d }}/remote", dest: "{{ d }}/from_remote", remote_src: yes}
+      register: r5
+""")
+    finally:
+        os.umask(previous)
+    _assert_same(outcomes)
+    for name in ("remote", "attrs"):
+        assert outcomes["compiled"][1][name] == ("file", "0o600", b"inline")
+
+
+def test_copy_force_false_stats_destination_in_task_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_COPY_DEST", "work/stale")
+    outcomes = _run_both(tmp_path, """
+    - copy: {content: wanted, dest: "$ANSIROLL_COPY_DEST", force: no}
+      environment: {ANSIROLL_COPY_DEST: "{{ d }}/actual"}
+      register: r1
+""", files={"work/stale": (b"stale", 0o644)})
+    _assert_same(outcomes)
+    assert outcomes["compiled"][1]["actual"][2] == b"wanted"
+    assert outcomes["compiled"][1]["stale"][2] == b"stale"
+
+
+@pytest.mark.parametrize("task_environment", [False, True])
+def test_copy_diff_mode_matches_official(tmp_path, monkeypatch, task_environment):
     pytest.importorskip("ansible")
     from ansiroll.embed import ModuleEmbedder
     from ansiroll.loader import COPY_ACTION_MODULES
@@ -235,11 +270,21 @@ def test_copy_diff_mode_matches_official(tmp_path):
     official_dir.mkdir()
     (official_dir / "f").write_text("old\n")
     play = tmp_path / "play.yml"
+    task_env = ""
+    dest = str(official_dir / "f")
+    if task_environment:
+        stale = tmp_path / "stale"
+        stale.write_text("stale\n")
+        monkeypatch.setenv("ANSIROLL_COPY_DIFF_DEST", str(stale))
+        dest = "$ANSIROLL_COPY_DIFF_DEST"
+        task_env = "      environment: {ANSIROLL_COPY_DIFF_DEST: %s}\n" % (
+            json.dumps(str(official_dir / "f")))
     play.write_text(
         "- hosts: localhost\n  gather_facts: false\n  tasks:\n"
         "    - copy: {content: \"new\\n\", dest: %s}\n      register: r\n"
+        "%s"
         "    - debug: {msg: \"{{ [r] | to_json }}\"}\n"
-        % json.dumps(str(official_dir / "f")))
+        % (json.dumps(dest), task_env))
     proc = subprocess.run(
         [_ansible_playbook(), "-i", "localhost,", "-c", "local", "--diff", str(play)],
         env=_env(), capture_output=True, text=True)
@@ -251,9 +296,13 @@ def test_copy_diff_mode_matches_official(tmp_path):
     embedder = ModuleEmbedder()
     modules = {name: embedder.embed(name) for name in COPY_ACTION_MODULES}
     rt = Runtime(modules, "", {"inventory_hostname": "localhost"}, diff_mode=True)
+    compiled_dest = str(compiled_dir / "f")
+    if task_environment:
+        rt._module_env = {"ANSIROLL_COPY_DIFF_DEST": compiled_dest}
     try:
         result = rt._run_file_action(
-            "copy", {}, {"content": "new\n", "dest": str(compiled_dir / "f")}, {})
+            "copy", {}, {"content": "new\n",
+                         "dest": dest if task_environment else compiled_dest}, {})
     finally:
         rt.cleanup()
     assert _normalize(result, str(compiled_dir)) == official

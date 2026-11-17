@@ -2476,6 +2476,7 @@ class Runtime:
             w = self._get_worker(bool(become))
             self._frame_send(w["proc"], {
                 "op": op, "args": args, "check_mode": self.check_mode,
+                "env": self._module_env,
             })
             response = self._frame_recv(w["proc"])
             if response is None:
@@ -2525,6 +2526,10 @@ class Runtime:
             return {"failed": True, "changed": False,
                     "msg": "%s: arguments must be a dictionary" % name}
         args = dict(args)
+        for internal in ("_original_basename", "_diff_peek"):
+            if args.get(internal) is not None:
+                return {"failed": True, "changed": False,
+                        "msg": 'Invalid parameter specified: "%s"' % internal}
         baked = task.get("_baked") or {}
         src = args.get("src")
         meta = {}
@@ -2549,9 +2554,6 @@ class Runtime:
             if newline_sequence not in ("\n", "\r", "\r\n"):
                 return {"failed": True, "changed": False,
                         "msg": "newline_sequence needs to be one of: \n, \r or \r\n"}
-        elif _ansible_bool(args.get("remote_src", False)):
-            # The copy action hands remote_src copies straight to the module.
-            return self.run_module(_COPY_MODULE, args, become=become)
         dest = args.get("dest")
         if name == "copy":
             content = args.get("content")
@@ -2566,6 +2568,8 @@ class Runtime:
                 failure = "can not use content with a dir as dest"
             if failure:
                 return {"failed": True, "changed": False, "msg": failure}
+            if content is None and _ansible_bool(args.get("remote_src", False)):
+                return self.run_module(_COPY_MODULE, args, become=become)
         else:
             content = None
 
@@ -2575,6 +2579,13 @@ class Runtime:
             data = _as_text(content).encode("utf-8", "surrogateescape")
             source_rel = ".%s" % _random_suffix()
             source_display = os.path.join(_tempfile_dir(), source_rel)
+            if args.get("mode") == "preserve":
+                # The copy action preserves the mode of its mkstemp source.
+                import stat
+                import tempfile
+
+                with tempfile.TemporaryFile() as source:
+                    lmode = "0%03o" % stat.S_IMODE(os.fstat(source.fileno()).st_mode)
         else:
             raw = baked.get(src)
             meta = (task.get("_baked_meta") or {}).get(src) or {}
@@ -2647,10 +2658,6 @@ class Runtime:
                     args.pop(key, None)
             else:
                 data = raw.encode("utf-8", "surrogateescape")
-        for internal in ("_original_basename", "_diff_peek"):
-            if args.get(internal) is not None:
-                return {"failed": True, "changed": False,
-                        "msg": 'Invalid parameter specified: "%s"' % internal}
         try:
             return self._copy_single_file(
                 task, args, data, source_rel, source_display,
@@ -2888,10 +2895,11 @@ class Runtime:
                 {"environment": environment}, self.ctx())
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if fast_facts in ("1", "true", "yes", "on"):
-                from ansiroll.accelerated_modules import check_locale, facts
-                check_locale()
+                from ansiroll.accelerated_modules import facts
+                from ansiroll.accelerated_modules.environment import module_environment
                 started = time.monotonic()
-                res = facts.run(fact_schema=fact_schema)
+                with module_environment(self._module_env):
+                    res = facts.run(fact_schema=fact_schema)
                 provenance = {
                     "mode": "native-agent",
                     "reason": "accelerated facts",

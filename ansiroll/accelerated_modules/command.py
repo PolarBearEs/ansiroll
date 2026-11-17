@@ -39,13 +39,6 @@ def can_accelerate(args, check_mode=False, shell=False):
     return True
 
 
-def _exists(pattern, chdir=None):
-    # The official module globs after os.chdir(chdir).
-    if chdir:
-        pattern = os.path.join(chdir, pattern)
-    return bool(glob.glob(pattern))
-
-
 def _stamp(value):
     return value.strftime("%Y-%m-%d %H:%M:%S.%f")
 
@@ -55,18 +48,29 @@ def _expand_path(value):
     return os.path.expanduser(os.path.expandvars(str(value)))
 
 
-def _check_chdir(chdir):
-    """Reproduce the official module's os.chdir(chdir) outcome without moving
-    the long-lived worker: return the OSError it would raise, or None."""
+def _matching_guard(creates, removes):
+    if creates and glob.glob(creates):
+        return "creates"
+    if removes and not glob.glob(removes):
+        return "removes"
+    return None
+
+
+def _check_guards(chdir, creates, removes):
+    if not chdir:
+        return _matching_guard(creates, removes), None
+    # Glob from the actual directory so its name is literal, and restore
+    # the agent's working directory before returning.
     saved = os.open(".", os.O_RDONLY)
     try:
-        os.chdir(chdir.encode("utf-8", "surrogateescape"))
-    except OSError as error:
-        return error
+        try:
+            os.chdir(chdir.encode("utf-8", "surrogateescape"))
+        except OSError as error:
+            return None, error
+        return _matching_guard(creates, removes), None
     finally:
         os.fchdir(saved)
         os.close(saved)
-    return None
 
 
 _PASSWD_ARG_RE = re.compile(r'^[-]{0,2}pass[-]?(word|wd)?')
@@ -112,28 +116,23 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         "delta": None,
         "msg": "",
     }
-    chdir = args.get("chdir")
-    if chdir:
-        chdir = _expand_path(chdir)
-        error = _check_chdir(chdir)
-        if error is not None:
-            # ansible-core < 2.19 appended the error text.
-            result["msg"] = (
-                "Unable to change directory before execution: %s" % error
-                if options.get("chdir_error_detail")
-                else "Unable to change directory before execution."
-            )
-            result["failed"] = True
-            result["stdout_lines"] = []
-            result["stderr_lines"] = []
-            return result
-    creates = args.get("creates")
-    removes = args.get("removes")
-    if creates is not None:
-        creates = _expand_path(creates)
-    if removes is not None:
-        removes = _expand_path(removes)
-    if creates and _exists(creates, chdir):
+    chdir, creates, removes = (
+        _expand_path(args[key]) if args.get(key) is not None else None
+        for key in ("chdir", "creates", "removes")
+    )
+    guard, error = _check_guards(chdir, creates, removes)
+    if error is not None:
+        # ansible-core < 2.19 appended the error text.
+        result["msg"] = (
+            "Unable to change directory before execution: %s" % error
+            if options.get("chdir_error_detail")
+            else "Unable to change directory before execution."
+        )
+        result["failed"] = True
+        result["stdout_lines"] = []
+        result["stderr_lines"] = []
+        return result
+    if guard == "creates":
         result.update({
             "rc": 0,
             "stdout": "skipped, since %s exists" % creates,
@@ -143,7 +142,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         result["stdout_lines"] = result["stdout"].splitlines()
         result["stderr_lines"] = []
         return result
-    if removes and not _exists(removes, chdir):
+    if guard == "removes":
         result.update({
             "rc": 0,
             "stdout": "skipped, since %s does not exist" % removes,

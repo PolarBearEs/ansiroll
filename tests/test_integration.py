@@ -227,6 +227,50 @@ def test_accelerated_command_edge_cases_match_official(tmp_path):
         rt.cleanup()
 
 
+def test_accelerated_command_guards_use_task_environment_and_literal_chdir(
+        tmp_path, monkeypatch):
+    from ansiroll.loader import _accelerator_options
+
+    work = tmp_path / "literal[1]"
+    work.mkdir()
+    (work / "guard.txt").touch()
+    (tmp_path / "absolute.txt").touch()
+    monkeypatch.setenv("ANSIROLL_GUARD", "missing")
+    monkeypatch.setenv("ANSIROLL_COMMAND_PATH", str(tmp_path))
+    environment = {
+        "ANSIROLL_GUARD": "guard.*",
+        "ANSIROLL_COMMAND_PATH": str(work),
+    }
+    cases = [
+        ({"creates": "$ANSIROLL_GUARD"}, False),
+        ({"removes": "$ANSIROLL_GUARD"}, True),
+        ({"removes": "missing"}, False),
+        ({"creates": str(tmp_path / "absolute.txt")}, False),
+    ]
+    rt = Runtime({"command": ModuleEmbedder().embed("command")},
+                 "", {"inventory_hostname": "localhost"})
+    rt._module_env = environment
+    cwd = os.getcwd()
+    try:
+        for guard, changed in cases:
+            args = dict(guard, chdir="$ANSIROLL_COMMAND_PATH",
+                        _raw_params="printf %s $ANSIROLL_GUARD")
+            official = rt.run_module("command", dict(args))
+            accelerated = run_accelerated(
+                "command", args, environment=environment,
+                options=_accelerator_options("command"))
+            ignored = ("start", "end", "delta", "invocation")
+            assert ({k: v for k, v in accelerated.items() if k not in ignored}
+                    == {k: v for k, v in official.items() if k not in ignored})
+            assert accelerated["changed"] is changed
+            if changed:
+                assert accelerated["stdout"] == "guard.*"
+            assert os.getcwd() == cwd
+            assert os.environ["ANSIROLL_GUARD"] == "missing"
+    finally:
+        rt.cleanup()
+
+
 def test_accelerated_command_matches_legacy_warn_semantics():
     import ansible
 
@@ -402,7 +446,8 @@ def _translated_locale():
     return None
 
 
-def test_accelerated_modules_apply_locale_like_ansible_module(tmp_path):
+@pytest.mark.parametrize("task_override", [False, True])
+def test_accelerated_modules_apply_locale_like_ansible_module(tmp_path, task_override):
     # AnsibleModule._check_locale() (module_utils/basic.py) runs
     # setlocale(LC_ALL, ''), so official error texts follow the user's locale.
     name = _translated_locale()
@@ -417,26 +462,62 @@ def test_accelerated_modules_apply_locale_like_ansible_module(tmp_path):
         "rt = Runtime({'slurp': ModuleEmbedder().embed('slurp')}, '',\n"
         "             {'inventory_hostname': 'localhost'})\n"
         "try:\n"
+        "    task_env = {'LC_ALL': sys.argv[2], 'LANGUAGE': ''} if sys.argv[2] else None\n"
+        "    rt._module_env = task_env\n"
         "    official = rt.run_module('slurp', args)\n"
         "finally:\n"
         "    rt.cleanup()\n"
         "official.pop('invocation', None)\n"
         "from ansible.release import __version__ as v\n"
         "new = tuple(map(int, v.split('.')[:2])) >= (2, 19)\n"
-        "accelerated = run('slurp', args, options={\n"
+        "accelerated = run('slurp', args, environment=task_env, options={\n"
         "    'lowercase_not_found': not new, 'typed_exceptions': new})\n"
         "print(json.dumps([official, accelerated]))\n"
     )
-    env = dict(os.environ, LANG=name, LC_ALL=name, LANGUAGE="")
+    inherited = "C" if task_override else name
+    env = dict(os.environ, LANG=inherited, LC_ALL=inherited, LANGUAGE="")
     env["PYTHONPATH"] = os.pathsep.join(
         [os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
          env.get("PYTHONPATH", "")])
     proc = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path / "missing")],
+        [sys.executable, "-c", script, str(tmp_path / "missing"),
+         name if task_override else ""],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         universal_newlines=True, check=True)
     official, accelerated = json.loads(proc.stdout.splitlines()[-1])
     assert accelerated == official
+
+
+@pytest.mark.parametrize("path", [None, ""])
+def test_accelerated_shell_locale_fallback_matches_official(monkeypatch, path):
+    import locale
+
+    monkeypatch.setenv("LC_ALL", "C")
+    original_locale = locale.setlocale(locale.LC_ALL)
+    original_env = dict(os.environ)
+    args = {
+        "_raw_params": 'printf "%s\n" "$LANG" "$LC_ALL" "$LC_MESSAGES"',
+        "_uses_shell": True,
+    }
+    environment = {"LC_ALL": "ansiroll_invalid_locale"}
+    if path is not None:
+        environment["PATH"] = path
+    rt = Runtime({"shell": ModuleEmbedder().embed("shell")},
+                 "", {"inventory_hostname": "localhost"})
+    rt._module_env = environment
+    try:
+        official = rt.run_module("shell", dict(args))
+        accelerated = run_accelerated("shell", args, environment=environment)
+        following = run_accelerated("shell", args)
+    finally:
+        rt.cleanup()
+    assert accelerated["stdout_lines"] == official["stdout_lines"]
+    fallback = official["stdout_lines"][0]
+    assert fallback and fallback != environment["LC_ALL"]
+    assert accelerated["stdout_lines"] == [fallback] * 3
+    assert following["stdout_lines"][1] == "C"
+    assert locale.setlocale(locale.LC_ALL) == original_locale
+    assert dict(os.environ) == original_env
 
 
 @pytest.mark.parametrize("initial,args", [
@@ -564,6 +645,7 @@ def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
         # mode applies to every directory mkdir -p creates.
         ({"path": "a/b/c", "state": "directory", "mode": "0750"}, False),
         ({"path": "a/b/c", "state": "directory", "mode": "0750"}, False),
+        ({"path": "existing/new/../target", "state": "directory", "mode": "0700"}, False),
         ({"path": "q/r", "state": "directory", "mode": "g+w"}, False),
         # mode/owner/size/... are reported even when not requested.
         ({"path": "m/n", "state": "directory"}, False),
@@ -595,6 +677,8 @@ def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
     for side in ("official", "accelerated"):
         base = tmp_path / side
         (base / "exist").mkdir(parents=True)
+        (base / "existing").mkdir()
+        os.chmod(str(base / "existing"), 0o775)
         (base / "regular").write_text("")
         os.chmod(str(base / "regular"), 0o644)
         os.symlink("regular", str(base / "lnk"))
@@ -631,6 +715,45 @@ def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
             assert (normalized(accelerated, accelerated_base)
                     == normalized(official, official_base)), (args, check)
             assert tree(accelerated_base) == tree(official_base), (args, check)
+    finally:
+        rt.cleanup()
+
+
+def test_accelerated_file_paths_use_task_environment(tmp_path, monkeypatch):
+    from ansiroll.loader import _accelerator_options
+
+    args = {"path": "$ANSIROLL_TARGET", "state": "absent"}
+    link = {"path": "~/link", "src": "$ANSIROLL_SOURCE", "state": "link"}
+    rt = Runtime({"file": ModuleEmbedder().embed("file")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        for side in ("official", "accelerated"):
+            base = tmp_path / side
+            base.mkdir()
+            (base / "stale").touch()
+            (base / "wanted").touch()
+            monkeypatch.setenv("ANSIROLL_TARGET", str(base / "stale"))
+            environment = {
+                "HOME": str(base),
+                "ANSIROLL_TARGET": str(base / "wanted"),
+                "ANSIROLL_SOURCE": "stale",
+            }
+            rt._module_env = environment
+            if side == "official":
+                absent = rt.run_module("file", dict(args))
+                linked = rt.run_module("file", dict(link))
+            else:
+                options = _accelerator_options("file")
+                absent = run_accelerated(
+                    "file", args, environment=environment, options=options)
+                linked = run_accelerated(
+                    "file", link, environment=environment, options=options)
+            assert absent["changed"] is True
+            assert linked["changed"] is True
+            assert not (base / "wanted").exists()
+            assert (base / "stale").is_file()
+            assert os.readlink(str(base / "link")) == "stale"
+            assert os.environ["ANSIROLL_TARGET"] == str(base / "stale")
     finally:
         rt.cleanup()
 
@@ -1132,6 +1255,31 @@ def test_accelerated_user_expands_home_like_official_path_type():
         pytest.skip("HOME does not match the passwd home")
     assert accelerated == official
     assert official["changed"] is False
+
+
+def test_accelerated_user_home_uses_task_environment(tmp_path, monkeypatch):
+    import pwd as pwd_module
+    from ansiroll.loader import _accelerator_options
+
+    me = pwd_module.getpwuid(os.getuid())
+    monkeypatch.setenv("ANSIROLL_USER_HOME", str(tmp_path / "stale"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    args = {"name": me.pw_name, "home": "$ANSIROLL_USER_HOME", "create_home": False}
+    environment = {"ANSIROLL_USER_HOME": "~", "HOME": me.pw_dir}
+    rt = Runtime({"user": ModuleEmbedder().embed("user")},
+                 "", {"inventory_hostname": "localhost"}, check_mode=True)
+    rt._module_env = environment
+    try:
+        official = rt.run_module("user", dict(args))
+    finally:
+        rt.cleanup()
+    official.pop("invocation", None)
+    accelerated = run_accelerated(
+        "user", args, check_mode=True, environment=environment,
+        options=_accelerator_options("user"))
+    assert accelerated == official
+    assert official["changed"] is False
+    assert os.environ["HOME"] == str(tmp_path)
 
 
 def test_accelerated_user_compares_int_fields_as_strings(monkeypatch):
