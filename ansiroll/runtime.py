@@ -20,6 +20,7 @@ import base64
 import json
 import os
 import struct
+import selectors
 import subprocess
 import sys
 import time
@@ -58,6 +59,51 @@ def _worker_source():
         with open(os.path.join(os.path.dirname(__file__), "worker.py"), "r") as worker_file:
             _WORKER_CODE = worker_file.read()
     return _WORKER_CODE
+
+class _WorkerStderr:
+    """Drain diagnostics alongside request writes and response reads."""
+
+    def __init__(self, proc):
+        self.stream = proc.stderr
+        self.tail = b""
+        os.set_blocking(proc.stdin.fileno(), False)
+        os.set_blocking(self.stream.fileno(), False)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.stream, selectors.EVENT_READ)
+
+    def _drain(self):
+        try:
+            data = os.read(self.stream.fileno(), 65536)
+        except BlockingIOError:
+            return
+        if data:
+            self.tail = (self.tail + data)[-65536:]
+        elif self.selector.get_map().get(self.stream.fileno()) is not None:
+            self.selector.unregister(self.stream)
+
+    def wait(self, stream, event):
+        self.selector.register(stream, event)
+        try:
+            while True:
+                ready = False
+                for key, _ in self.selector.select():
+                    if key.fileobj is self.stream:
+                        self._drain()
+                    else:
+                        ready = True
+                if ready:
+                    return
+        finally:
+            self.selector.unregister(stream)
+
+    def read(self):
+        self._drain()
+        return self.tail.decode("utf-8", "surrogateescape").strip()
+
+    def close(self):
+        self.selector.close()
+        self.stream.close()
+
 
 # __ANSIROLL_JINJA_BUNDLE__
 import jinja2  # type: ignore
@@ -2146,9 +2192,12 @@ class Runtime:
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
                     res = self._run_async_module(
                         task["action"], args, become=become,
-                        async_val=int(task.get("async_val") or 0), ctx=ctx)
-                elif str(task.get("action") or "").split(".")[-1] == "async_status":
-                    res = self._run_async_status(task["action"], args, become, ctx)
+                        async_val=int(task.get("async_val") or 0), ctx=ctx,
+                        options=task.get("async_options"))
+                elif task.get("action") in ("async_status", "ansible.builtin.async_status",
+                                            "ansible.legacy.async_status"):
+                    res = self._run_async_status(task["action"], args, become, ctx,
+                                                 task.get("async_options"))
                 elif task.get("accelerator") and (
                         self.accelerated_modules
                         or task.get("accelerator") == "required"):
@@ -2489,11 +2538,14 @@ class Runtime:
             self._close_workers()
             return None
 
-    def _async_dir_option(self, ctx):
-        """The shell plugin's async_dir option (var ansible_async_dir)."""
+    def _async_dir_option(self, ctx, options, version):
+        """Resolve the configured shell option and its task overrides."""
+        env = self._module_env or {}
+        if version < (2, 12) and "ANSIBLE_ASYNC_DIR" in env:
+            return env["ANSIBLE_ASYNC_DIR"]
         value = (ctx or {}).get("ansible_async_dir")
         if value is None or _is_undef(value):
-            return "~/.ansible_async"
+            value = options.get("dir", "~/.ansible_async")
         return _as_text(self.template(value, ctx))
 
     def _remote_expand_user(self, path, become):
@@ -2505,45 +2557,67 @@ class Runtime:
             head = "~%s" % self.become_user
         return os.path.expanduser(head) + sep + rest
 
-    def _run_async_status(self, action, args, become, ctx):
+    def _run_async_status(self, action, args, become, ctx, options=None):
         """ansible.builtin.async_status action plugin around its module."""
-        if not args.get("jid") or args.get("mode", "status") not in ("status", "cleanup"):
-            return None  # let the module report the argument error
-        jid = _as_text(args["jid"])
-        mode = args.get("mode", "status")
+        options = options or {}
+        version = tuple(options.get("version", (2, 21)))
+        async_dir = self._async_dir_option(ctx, options, version)
+        module_args = dict(args, _async_dir=async_dir)
+        if version < (2, 12):
+            if "jid" not in args:
+                return {"failed": True, "msg": "jid is required"}
+            return self.run_module(action, module_args, become=become)
+
+        module_args["_async_dir"] = self._remote_expand_user(async_dir, become)
+        modern_flags = version >= (2, 19)
+        stopped = False if modern_flags else 0
         results = {
-            "started": False, "finished": False, "stdout": "", "stderr": "",
-            "stdout_lines": [], "stderr_lines": [], "ansible_job_id": jid,
+            "started": stopped, "finished": stopped, "stdout": "", "stderr": "",
+            "stdout_lines": [], "stderr_lines": [],
         }
-        async_dir = self._remote_expand_user(self._async_dir_option(ctx), become)
-        log_path = os.path.join(async_dir, jid)
+        if "jid" not in args:
+            if version == (2, 12):
+                results.update(failed=True, msg="jid is required")
+                return results
+            return {"failed": True, "changed": False, "msg": "missing required arguments: jid"}
+        mode = args.get("mode", "status")
+        if version >= (2, 13) and mode not in ("status", "cleanup"):
+            message = "value of mode must be one of: status, cleanup, got: %s" % _as_text(mode)
+            return {"failed": True, "changed": False, "msg": message.rstrip()}
+
+        jid = _as_text(args["jid"])
+        results["ansible_job_id"] = jid
+        log_path = os.path.join(module_args["_async_dir"], jid)
         if mode == "cleanup":
             results["erased"] = log_path
         else:
             results["results_file"] = log_path
-            results["started"] = True
-        module_args = dict(args, jid=jid, mode=mode, _async_dir=async_dir)
+            results["started"] = True if modern_flags else 1
         results = _f_combine(results, self.run_module(action, module_args, become=become),
                              recursive=True)
-        for convert in ("started", "finished"):
-            results[convert] = bool(results.get(convert))
+        if modern_flags:
+            for convert in ("started", "finished"):
+                results[convert] = bool(results[convert])
         return results
 
-    def _run_async_module(self, action, args, become=False, async_val=0, ctx=None):
+    def _run_async_module(self, action, args, become=False, async_val=0, ctx=None,
+                          options=None):
         meta = self.modules.get(action)
         if meta is None:
             return None
-        params = json.dumps({"ANSIBLE_MODULE_ARGS": args})
-        # ActionBase._execute_module appends ANSIBLE_ASYNC_DIR (the raw
-        # async_dir option) to the task environment for wrap_async.
-        raw_async_dir = self._async_dir_option(ctx)
+        options = options or {}
+        version = tuple(options.get("version", (2, 21)))
+        if self.check_mode and version < (2, 17):
+            return {"failed": True, "changed": False,
+                    "msg": "check mode and async cannot be used on same task."}
+        params = self._module_params(args)
+        # The wrapper and its module receive the same task environment.
         env = dict(self._module_env or {})
-        env["ANSIBLE_ASYNC_DIR"] = raw_async_dir
+        env["ANSIBLE_ASYNC_DIR"] = self._async_dir_option(ctx, options, version)
         try:
             ack = self._run_async_via_worker(
                 meta, params, become, env=env,
-                async_dir=self._remote_expand_user(raw_async_dir, become),
-                time_limit=async_val)
+                time_limit=async_val, version=version)
         except Exception as ex:
             detail = self._worker_stderr(bool(become))
             self._close_workers()
@@ -2554,16 +2628,9 @@ class Runtime:
                        % (meta["module_fqn"], ex, (": " + detail) if detail else ""),
                 "module_stderr": detail,
             }
-        if ack.get("failed"):
-            return ack
-        return {
-            "failed": False,
-            "started": True,
-            "finished": False,
-            "ansible_job_id": ack.get("ansible_job_id"),
-            "results_file": ack.get("results_file"),
-            "changed": True,
-        }
+        if not ack.get("failed"):
+            ack["changed"] = True
+        return ack
 
     def _run_file_action(self, name, task, args, ctx, become=False):
         """Handle template/copy using src content baked at compile time.
@@ -2786,15 +2853,18 @@ class Runtime:
             return marker
         return self._asset_bytes(marker).decode("utf-8", "surrogateescape")
 
+    def _module_params(self, args):
+        module_args = dict(args)
+        module_args["_ansible_check_mode"] = bool(self.check_mode)
+        module_args["_ansible_diff"] = bool(self.diff_mode)
+        return json.dumps({"ANSIBLE_MODULE_ARGS": module_args})
+
     def run_module(self, action, args, become=False):
         meta = self.modules.get(action)
         if meta is None:
             return {"failed": True, "changed": False,
                     "msg": "ansiroll: module %r was not embedded" % action}
-        module_args = dict(args)
-        module_args["_ansible_check_mode"] = bool(self.check_mode)
-        module_args["_ansible_diff"] = bool(self.diff_mode)
-        params = json.dumps({"ANSIBLE_MODULE_ARGS": module_args})
+        params = self._module_params(args)
         # Modules run in the persistent forking worker (in-memory, decode-once).
         # If the worker DIES (OOM / bug / sudo failure), the task's outcome is
         # unknown -- so we fail loudly rather than silently retrying (which could
@@ -2856,8 +2926,7 @@ class Runtime:
             result["_ansiroll_profile"] = profile_data
         return result
 
-    def _run_async_via_worker(self, meta, params, become, env=None,
-                              async_dir=None, time_limit=0):
+    def _run_async_via_worker(self, meta, params, become, env, time_limit, version):
         w = self._get_worker(bool(become))
         fqn = meta["module_fqn"]
         profile = meta.get("profile", "legacy")
@@ -2872,7 +2941,7 @@ class Runtime:
             w["loaded"].add(fqn)
         request = {"op": "async_run", "fqn": fqn,
                    "params": params, "profile": profile, "env": env,
-                   "async_dir": async_dir, "time_limit": time_limit}
+                   "time_limit": time_limit, "version": version}
         self._send_worker_request(w["proc"], request, self._module_source_bytes)
         ack = self._frame_recv(w["proc"])
         if not isinstance(ack, dict) or ack.get("error"):
@@ -2906,8 +2975,10 @@ class Runtime:
         become = self._needs_become(become)
         key = (True, self.become_user) if become else False
         w = self._workers.get(key)
-        if w and w["proc"].poll() is None:
-            return w
+        if w:
+            if w["proc"].poll() is None:
+                return w
+            self._stop_worker(self._workers.pop(key))
         startup_started = time.monotonic()
         worker_code = _worker_source()
         cmd = [self.python, "-c", worker_code]
@@ -2941,6 +3012,12 @@ class Runtime:
         self.engine_profile["worker_spawn"] += time.monotonic() - spawn_started
         identity = "sudo:%s" % self.become_user if become else "current-user"
         w = {"proc": proc, "loaded": set(), "identity": identity}
+        try:
+            proc._ansiroll_stderr = _WorkerStderr(proc)
+        except BaseException:
+            self._stop_worker(w)
+            raise
+        self._workers[key] = w
         bundle_started = time.monotonic()
         if self.module_bundle is not None:
             bundle_bytes = self.module_bundle
@@ -2950,51 +3027,24 @@ class Runtime:
             self._write_all(proc, bundle_bytes)
             ack = self._frame_recv(proc)
             if not isinstance(ack, dict) or not ack.get("ok"):
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
                 raise RuntimeError("worker raw bundle load failed: %r" % (ack,))
         self.engine_profile["worker_bundle"] += time.monotonic() - bundle_started
         self.engine_profile["workers_started"] += 1
         identities = self.engine_profile.setdefault("worker_identities", {})
         identities[identity] = identities.get(identity, 0) + 1
         self.engine_profile["worker_startup"] += time.monotonic() - startup_started
-        self._workers[key] = w
         return w
 
     def _worker_stderr(self, become):
-        """Best-effort read of a worker's stderr (why it died).
-
-        Never blocks on a live worker: it may have answered with an error
-        frame and still be waiting for the next request."""
+        """Return up to the last 64 KiB of worker diagnostics."""
         become = self._needs_become(become)
         key = (True, self.become_user) if become else False
         w = self._workers.get(key)
-        if not w or not w["proc"].stderr:
+        if not w:
             return ""
-        proc = w["proc"]
         try:
-            import selectors
-            fd = proc.stderr.fileno()
-            # A dead worker's pipe reaches EOF promptly; bound the wait in
-            # case a descendant still holds it open.
-            deadline = time.monotonic() + (1.0 if proc.poll() is not None else 0.0)
-            chunks = []
-            sel = selectors.DefaultSelector()
-            sel.register(fd, selectors.EVENT_READ)
-            try:
-                while True:
-                    if not sel.select(max(0.0, deadline - time.monotonic())):
-                        break
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-            finally:
-                sel.close()
-            return b"".join(chunks).decode("utf-8", "surrogateescape").strip()
-        except Exception:
+            return w["proc"]._ansiroll_stderr.read()
+        except OSError:
             return ""
 
     def _frame_send(self, proc, obj):
@@ -3005,10 +3055,13 @@ class Runtime:
     def _write_all(proc, data):
         # The worker pipes are unbuffered (bufsize=0): write() may be short.
         view = memoryview(data)
+        diagnostics = getattr(proc, "_ansiroll_stderr", None)
         while view:
+            if diagnostics is not None:
+                diagnostics.wait(proc.stdin, selectors.EVENT_WRITE)
             written = proc.stdin.write(view)
-            if written is None:
-                written = 0
+            if not written:
+                raise OSError("worker request write made no progress")
             view = view[written:]
         proc.stdin.flush()
 
@@ -3022,20 +3075,23 @@ class Runtime:
         self._write_all(proc, source)
 
     def _frame_recv(self, proc):
-        head = self._readn(proc.stdout, 4)
+        diagnostics = getattr(proc, "_ansiroll_stderr", None)
+        head = self._readn(proc.stdout, 4, diagnostics)
         if not head:
             return None
         (n,) = struct.unpack(">I", head)
-        body = self._readn(proc.stdout, n)
+        body = self._readn(proc.stdout, n, diagnostics)
         if body is None:
             return None
         return json.loads(body.decode("utf-8"))
 
     @staticmethod
-    def _readn(stream, n):
+    def _readn(stream, n, diagnostics=None):
         chunks = []
         got = 0
         while got < n:
+            if diagnostics is not None:
+                diagnostics.wait(stream, selectors.EVENT_READ)
             c = stream.read(n - got)
             if not c:
                 return None
@@ -3043,24 +3099,30 @@ class Runtime:
             got += len(c)
         return b"".join(chunks)
 
+    def _stop_worker(self, worker):
+        proc = worker["proc"]
+        # EOF ends the worker's request loop. Closing avoids waiting for a
+        # worker whose request pipe is full.
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        finally:
+            proc.stdout.close()
+            capture = getattr(proc, "_ansiroll_stderr", None)
+            if capture is not None:
+                capture.close()
+            else:
+                proc.stderr.close()
+
     def _close_workers(self):
-        for w in self._workers.values():
-            proc = w["proc"]
-            try:
-                self._frame_send(proc, {"op": "quit"})
-            except Exception:
-                pass
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        for worker in self._workers.values():
+            self._stop_worker(worker)
         self._workers = {}
 
 
@@ -3395,7 +3457,10 @@ def _chan_send(out_fd, obj):
     b = json.dumps(obj, default=str).encode("utf-8", "surrogateescape")
     view = memoryview(struct.pack(">I", len(b)) + b)
     while view:
-        view = view[os.write(out_fd, view):]
+        written = os.write(out_fd, view)
+        if not written:
+            raise OSError("agent channel write made no progress")
+        view = view[written:]
 
 
 def _delegate_vars(ctx):

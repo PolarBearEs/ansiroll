@@ -711,6 +711,14 @@ def _convert_task(task, actions, basedir):
         "notify": _as_list(task.notify),
         "special": _special_of(action),
     }
+    if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
+                                       "ansible.legacy.async_status"):
+        from ansible.plugins.loader import shell_loader
+
+        node["async_options"] = {
+            "version": _core_version(),
+            "dir": shell_loader.get("sh").get_option("async_dir"),
+        }
     accelerator = _classify_accelerator(action, node["args"], node.get("loop"))
     if accelerator:
         node["accelerator"] = accelerator
@@ -779,12 +787,17 @@ def _legacy_command_warn_supported():
         return False
 
 
+def _core_version():
+    from ansible.release import __version__
+
+    match = re.match(r"^(\d+)\.(\d+)", __version__)
+    return tuple(map(int, match.groups())) if match else (0, 0)
+
+
 def _accelerator_options(action):
     name = str(action or "").split(".")[-1]
     try:
-        from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        version = tuple(map(int, match.groups())) if match else (0, 0)
+        version = _core_version()
         if name == "stat" and version >= (2, 21):
             return {"disk_usage_bytes": True}
         if name in ("command", "shell"):

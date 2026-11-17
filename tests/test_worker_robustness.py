@@ -18,6 +18,7 @@ pytest.importorskip("ansible")
 
 from ansiroll import runtime as runtime_module  # noqa: E402
 from ansiroll.embed import ModuleEmbedder  # noqa: E402
+from ansiroll.loader import _core_version  # noqa: E402
 from ansiroll.runtime import Runtime  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,26 +34,38 @@ def _env():
     return env
 
 
-def _run_both(tmp_path, playbook_text, timeout=120):
+def _run_both(tmp_path, playbook_text, timeout=120, controller_env=None, diff=False):
+    env = dict(_env(), **(controller_env or {}))
     play = tmp_path / "play.yml"
     play.write_text(playbook_text.replace("@JOBS@", str(tmp_path / "async-jobs")))
     compiled = tmp_path / "play_compiled.py"
     subprocess.run(
         [sys.executable, "-m", "ansiroll.cli", "compile", str(play), "-o", str(compiled)],
-        cwd=str(tmp_path), env=_env(), stdin=subprocess.DEVNULL,
+        cwd=str(tmp_path), env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, timeout=timeout,
     )
-    runs = {
-        "ansible": ["ansible-playbook", "-i", "localhost,", "-c", "local", str(play)],
-        "ansiroll": [sys.executable, str(compiled)],
-    }
+    official = ["ansible-playbook", "-i", "localhost,", "-c", "local",
+                "-e", "ansible_python_interpreter=" + sys.executable, str(play)]
+    agent = [sys.executable, str(compiled)]
+    if diff:
+        official.append("--diff")
+        agent = [sys.executable, "-c", """
+import runpy, sys
+g = runpy.run_path(sys.argv[1])
+sys.exit(g["main"](g["PLAYS"], g["MODULES"], g["ANSIBALLZ_CODE"],
+                   host_vars={"inventory_hostname": "localhost"},
+                   diff_mode=True, pretty=True, module_bundle=g["_ansiroll_import_bytes"],
+                   resource_reader=g["_ansiroll_resource_read"]))
+""", str(compiled)]
+    runs = {"ansible": official, "ansiroll": agent}
     for name, cmd in runs.items():
         log = tmp_path / ("%s.log" % name)
         with open(str(log), "w") as out:
             # Keep our end of stdin open for the whole run: modules must not
             # see (or block on) the caller's stdin.
             proc = subprocess.Popen(
-                cmd, cwd=str(tmp_path), env=_env(), stdin=subprocess.PIPE,
+                cmd, cwd=str(tmp_path), env=env if name == "ansible" else _env(),
+                stdin=subprocess.PIPE,
                 stdout=out, stderr=subprocess.STDOUT,
             )
             try:
@@ -164,31 +177,34 @@ ASYNC_PLAY = """
     - command: sh -c 'echo $FOO; echo $ANSIBLE_ASYNC_DIR >&2'
       environment:
         FOO: bar
+        ANSIBLE_ASYNC_DIR: "@JOBS@-task"
       async: 30
       poll: 0
       register: job
     - async_status:
         jid: "{{ job.ansible_job_id }}"
+      environment:
+        ANSIBLE_ASYNC_DIR: "@JOBS@-task"
       register: status
       until: status.finished
       retries: 20
       delay: 1
     - assert:
         that:
-          - job.started is sameas true
-          - job.finished is sameas false
+          - "@LAUNCH_FLAGS@"
           - job.changed
-          - job.ansible_job_id is match("^j[0-9]+[.][0-9]+$")
-          - job.results_file == "@JOBS@/" ~ job.ansible_job_id
-          - status.started is sameas true
-          - status.finished is sameas true
+          - job.ansible_job_id is match("^@JID_PREFIX@[0-9]+[.][0-9]+$")
+          - job.results_file == "@JOBDIR@/" ~ job.ansible_job_id
+          - "@STATUS_FLAGS@"
           - status.stdout == "bar"
-          - status.stderr == "@JOBS@"
-          - status.results_file == job.results_file
+          - status.stderr == "@JOBDIR@"
+          - "@STATUS_PATH@"
           - status.ansible_job_id == job.ansible_job_id
     - async_status:
         jid: "{{ job.ansible_job_id }}"
         mode: cleanup
+      environment:
+        ANSIBLE_ASYNC_DIR: "@JOBS@-task"
       register: cleanup
     - stat:
         path: "{{ job.results_file }}"
@@ -200,8 +216,107 @@ ASYNC_PLAY = """
 """
 
 
-def test_async_job_results_env_and_status_match_ansible(tmp_path):
-    _run_both(tmp_path, ASYNC_PLAY)
+@pytest.mark.parametrize("directory_source", ["variable", "environment", "configuration"])
+def test_async_job_results_env_and_status_match_ansible(tmp_path, directory_source):
+    version = _core_version()
+    play = ASYNC_PLAY.replace("@JID_PREFIX@", "j" if version >= (2, 15) else "")
+    play = play.replace("@JOBDIR@", "@JOBS@-task" if version < (2, 12) else "@JOBS@")
+    if directory_source != "variable":
+        play = play.replace('  vars:\n    ansible_async_dir: "@JOBS@"\n', "")
+        # A separate task verifies the baked option even when old Ansible
+        # gives the task environment precedence over shell options.
+        play += """
+    - command: echo configured
+      async: 30
+      poll: 0
+      register: configured
+    - assert:
+        that:
+          - configured.results_file == "@JOBS@/" ~ configured.ansible_job_id
+    """
+    controller_env = {"ANSIBLE_ASYNC_DIR": str(tmp_path / "async-jobs")}
+    if directory_source == "configuration":
+        config = tmp_path / "ansible.cfg"
+        config.write_text("[defaults]\nasync_dir = %s\n" % (tmp_path / "async-jobs"))
+        controller_env = {"ANSIBLE_CONFIG": str(config)}
+    elif directory_source == "variable":
+        controller_env["ANSIBLE_ASYNC_DIR"] += "-controller"
+    if version >= (2, 19):
+        play = play.replace("@LAUNCH_FLAGS@", "job.started is sameas true and job.finished is sameas false")
+        play = play.replace("@STATUS_FLAGS@", "status.started is sameas true and status.finished is sameas true")
+    else:
+        play = play.replace("@LAUNCH_FLAGS@", "job.started is sameas 1 and job.finished is sameas 0")
+        status_started = "status.started is sameas 1" if version >= (2, 12) else "status.started is undefined"
+        play = play.replace("@STATUS_FLAGS@", "status.finished is sameas 1 and " + status_started)
+    status_path = ("status.results_file == job.results_file" if version >= (2, 12)
+                   else "status.results_file is undefined")
+    _run_both(tmp_path, play.replace("@STATUS_PATH@", status_path), controller_env=controller_env)
+
+
+def test_async_check_mode_diff_and_status_validation(tmp_path):
+    play = """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_async_dir: "@JOBS@"
+  tasks:
+    - file:
+        path: "@JOBS@/must-not-exist"
+        state: directory
+      check_mode: true
+      async: 30
+      poll: 0
+      register: job
+    - async_status:
+        jid: "{{ job.ansible_job_id }}"
+      register: status
+      until: status.finished
+      retries: 20
+      delay: 1
+    - stat:
+        path: "@JOBS@/must-not-exist"
+      register: touched
+    - async_status:
+        mode: status
+      register: missing
+      ignore_errors: true
+    - async_status:
+        jid: absent
+        mode: bogus
+      register: bad_mode
+      ignore_errors: true
+    - assert:
+        that:
+          - not touched.stat.exists
+          - status.changed
+          - status.diff.before.state == "absent"
+          - status.diff.after.state == "directory"
+          - missing.msg is search("jid is required|missing required arguments. jid")
+          - 'bad_mode.msg == "value of mode must be one of: @MODE_CHOICES@, got: bogus"'
+    - file:
+        path: "@JOBS@/must-not-exist"
+        state: absent
+"""
+    if _core_version() < (2, 17):
+        play = play.replace("      check_mode: true\n", "")
+        play = play.replace("    - file:\n", """
+    - file:
+        path: "@JOBS@/check-mode"
+        state: directory
+      check_mode: true
+      async: 30
+      poll: 0
+      register: rejected
+      ignore_errors: true
+    - assert:
+        that:
+          - rejected.failed
+          - rejected.msg == "check mode and async cannot be used on same task."
+    - file:
+""", 1)
+        play = play.replace("          - not touched.stat.exists", "          - touched.stat.isdir")
+    choices = "status, cleanup" if _core_version() >= (2, 13) else "cleanup, status"
+    _run_both(tmp_path, play.replace("@MODE_CHOICES@", choices), diff=True)
 
 
 ASYNC_TIMEOUT_PLAY = """
@@ -230,6 +345,8 @@ ASYNC_TIMEOUT_PLAY = """
 
 
 def test_async_job_is_killed_at_its_time_limit(tmp_path):
+    if _core_version() < (2, 12):
+        pytest.skip("Ansible before 2.12 does not publish a timeout result")
     _run_both(tmp_path, ASYNC_TIMEOUT_PLAY)
 
 
@@ -288,6 +405,28 @@ def test_worker_stderr_does_not_block_on_a_live_worker():
     assert elapsed < 10
     assert res["failed"] is True
     assert "worker load failed" in res["msg"]
+
+
+def test_worker_startup_stderr_can_exceed_pipe_capacity(monkeypatch):
+    def noisy_worker():
+        return (
+            "import sys\n"
+            "sys.stderr.write('x' * (2 * 1024 * 1024) + '\\nworker startup failure\\n')\n"
+            "sys.stderr.flush()\n"
+        )
+
+    monkeypatch.setattr(runtime_module, "_worker_source", noisy_worker)
+    rt = _worker_runtime("ping")
+    rt.module_bundle = b"x" * (2 * 1024 * 1024)
+    previous = _with_alarm(30)
+    try:
+        res = rt.run_module("ping", {})
+    finally:
+        _clear_alarm(previous)
+        rt.cleanup()
+    assert res["failed"] is True
+    assert res["module_stderr"].endswith("worker startup failure")
+    assert "worker startup failure" in res["msg"]
 
 
 def test_worker_send_loops_over_short_writes():
