@@ -1312,7 +1312,6 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
 """ % destination)
 
     src, manifest = compile_playbook(str(play))
-    assert "tempfile" not in src
     assert "ansiroll-unarchive-" not in src
     assert "memfd_create" in src
     generated = tmp_path / "compiled.py"

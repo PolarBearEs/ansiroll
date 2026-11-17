@@ -15,6 +15,7 @@ import shutil
 import signal
 import struct
 import sys
+import tempfile
 import time
 import traceback
 import zipfile
@@ -410,7 +411,7 @@ def _jwrite(job_path, info):
     os.rename(jobfile, job_path)
 
 
-def _async_module(jid, job_path, fqn, params, profile, env, source_fd, notify,
+def _async_module(jid, job_path, fqn, params, profile, source_fd, notify,
                   version):
     """Run one async job and leave its result where async_status reads it.
 
@@ -435,7 +436,7 @@ def _async_module(jid, job_path, fqn, params, profile, env, source_fd, notify,
                 source_fd,
             )
             params = json.dumps(payload)
-        response = _run(fqn, params, profile, env)
+        response = _run(fqn, params, profile)
         outdata = response["out"]
         stderr = response["err"]
         filtered_outdata, json_warnings = _filter_non_json_lines(outdata)
@@ -469,8 +470,27 @@ def _async_module(jid, job_path, fqn, params, profile, env, source_fd, notify,
         })
 
 
+def _async_timed_out(pid, time_limit, poll_before_timeout):
+    step = 5
+    remaining = int(time_limit)
+    if poll_before_timeout and 0 < remaining <= step:
+        step = remaining / 2
+    time.sleep(step)
+    while os.waitpid(pid, os.WNOHANG) == (0, 0):
+        if not poll_before_timeout:
+            # The original watchdog charges this interval even if the job
+            # exits during it. It checks for exit on the next iteration.
+            time.sleep(step)
+        remaining -= step
+        if remaining <= 0:
+            return True
+        if poll_before_timeout:
+            time.sleep(step)
+    return False
+
+
 def _async_supervise(jid, job_path, time_limit, fqn, params, profile, env,
-                     source_fd, notify, version):
+                     source_fd, notify, version, poll_before_timeout):
     # async_wrapper's daemonized supervisor: detach from the worker's pipes,
     # run the module in its own process group and kill it at the time limit.
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -478,43 +498,52 @@ def _async_supervise(jid, job_path, time_limit, fqn, params, profile, env,
         os.dup2(devnull, fd)
     os.close(devnull)
     os.close(_RESP)
-    sub_pid = os.fork()
-    if sub_pid == 0:
+    # Re-evaluate the temp location in the task environment. Only remove
+    # this private directory, even if multiple jobs share the temp parent.
+    os.environ.update({str(k): str(v) for k, v in env.items()})
+    tempfile.tempdir = None
+    with tempfile.TemporaryDirectory(prefix="ansiroll-async-") as tmpdir:
+        payload = json.loads(params)
+        payload["ANSIBLE_MODULE_ARGS"]["_ansible_tmpdir"] = tmpdir
+        params = json.dumps(payload)
+        sub_pid = os.fork()
+        if sub_pid == 0:
+            try:
+                os.setpgid(0, 0)
+            except OSError:
+                pass
+            try:
+                _async_module(jid, job_path, fqn, params, profile, source_fd, notify,
+                              version)
+            finally:
+                os._exit(0)
+        os.close(notify)
+        if source_fd is not None:
+            os.close(source_fd)
         try:
-            os.setpgid(0, 0)
+            os.setpgid(sub_pid, sub_pid)
         except OSError:
             pass
-        try:
-            _async_module(jid, job_path, fqn, params, profile, env, source_fd,
-                          notify, version)
-        finally:
-            os._exit(0)
-    os.close(notify)
-    if source_fd is not None:
-        os.close(source_fd)
-    try:
-        os.setpgid(sub_pid, sub_pid)
-    except OSError:
-        pass
-    step = 5
-    remaining = int(time_limit)
-    time.sleep(step)
-    while os.waitpid(sub_pid, os.WNOHANG) == (0, 0):
-        if remaining <= 0:
+        timed_out = _async_timed_out(sub_pid, time_limit, poll_before_timeout)
+        if timed_out:
             # Reap the writer before replacing its result. Otherwise a
             # concurrent write can overwrite the timeout or its temp file.
-            os.killpg(sub_pid, signal.SIGKILL)
+            try:
+                os.killpg(sub_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             os.waitpid(sub_pid, 0)
-            if version >= (2, 12):
-                _jwrite(job_path, {
-                    "msg": "Timeout exceeded", "failed": True, "child_pid": sub_pid,
-                })
-            return
-        time.sleep(step)
-        remaining -= step
+    if timed_out and version >= (2, 12):
+        if poll_before_timeout:
+            # This watchdog publishes the timeout one second after killing.
+            time.sleep(1)
+        _jwrite(job_path, {
+            "msg": "Timeout exceeded", "failed": True, "child_pid": sub_pid,
+        })
 
 
-def _async_run(fqn, params, profile, env, time_limit, source_fd, version):
+def _async_run(fqn, params, profile, env, time_limit, source_fd, version,
+               poll_before_timeout):
     async_dir = env.get("ANSIBLE_ASYNC_DIR", "~/.ansible_async")
     if "HOME" in env and (async_dir == "~" or async_dir.startswith("~/")):
         jobdir = env["HOME"].rstrip("/") + async_dir[1:]
@@ -557,7 +586,8 @@ def _async_run(fqn, params, profile, env, time_limit, source_fd, version):
             if os.fork() == 0:
                 try:
                     _async_supervise(jid, job_path, time_limit, fqn, params,
-                                     profile, env, source_fd, w, version)
+                                     profile, env, source_fd, w, version,
+                                     poll_before_timeout)
                 finally:
                     os._exit(0)
         finally:
@@ -652,6 +682,7 @@ def main():
                     req.get("time_limit") or 0,
                     source_fd,
                     tuple(req.get("version", (2, 21))),
+                    req.get("poll_before_timeout", False),
                 )
                 _send(response)
             except Exception as e:

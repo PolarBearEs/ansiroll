@@ -2626,7 +2626,8 @@ class Runtime:
         try:
             ack = self._run_async_via_worker(
                 meta, params, become, env=env,
-                time_limit=async_val, version=version)
+                time_limit=async_val, version=version,
+                poll_before_timeout=options.get("poll_before_timeout", False))
         except Exception as ex:
             detail = self._worker_stderr(bool(become))
             self._close_workers()
@@ -2935,7 +2936,8 @@ class Runtime:
             result["_ansiroll_profile"] = profile_data
         return result
 
-    def _run_async_via_worker(self, meta, params, become, env, time_limit, version):
+    def _run_async_via_worker(self, meta, params, become, env, time_limit, version,
+                              poll_before_timeout):
         w = self._get_worker(bool(become))
         fqn = meta["module_fqn"]
         profile = meta.get("profile", "legacy")
@@ -2950,7 +2952,8 @@ class Runtime:
             w["loaded"].add(fqn)
         request = {"op": "async_run", "fqn": fqn,
                    "params": params, "profile": profile, "env": env,
-                   "time_limit": time_limit, "version": version}
+                   "time_limit": time_limit, "version": version,
+                   "poll_before_timeout": poll_before_timeout}
         self._send_worker_request(w["proc"], request, self._module_source_bytes)
         ack = self._frame_recv(w["proc"])
         if not isinstance(ack, dict) or ack.get("error"):

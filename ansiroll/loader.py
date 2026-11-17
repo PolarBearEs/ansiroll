@@ -9,7 +9,9 @@ inlined runtime can interpret. This module runs only at compile time.
 from __future__ import annotations
 
 import os
+import pkgutil
 import re
+from functools import lru_cache
 
 from .compat import init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
@@ -719,6 +721,8 @@ def _convert_task(task, actions, basedir):
             "version": _core_version(),
             "dir": shell_loader.get("sh").get_option("async_dir"),
         }
+        if node["async_val"] and node["poll"] == 0:
+            node["async_options"]["poll_before_timeout"] = _async_poll_before_timeout()
     accelerator = _classify_accelerator(action, node["args"], node.get("loop"))
     if accelerator:
         node["accelerator"] = accelerator
@@ -792,6 +796,14 @@ def _core_version():
 
     match = re.match(r"^(\d+)\.(\d+)", __version__)
     return tuple(map(int, match.groups())) if match else (0, 0)
+
+
+@lru_cache(maxsize=1)
+def _async_poll_before_timeout():
+    # The watchdog loop differs across patch releases (e.g. 2.20.0 and
+    # 2.20.11). Bake the installed wrapper's behavior into the agent.
+    source = pkgutil.get_data("ansible", "modules/async_wrapper.py")
+    return b"step = remaining / 2" in (source or b"")
 
 
 def _accelerator_options(action):

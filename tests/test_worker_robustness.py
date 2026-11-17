@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("ansible")
 
 from ansiroll import runtime as runtime_module  # noqa: E402
+from ansiroll import worker as worker_module  # noqa: E402
 from ansiroll.embed import ModuleEmbedder  # noqa: E402
 from ansiroll.loader import _core_version  # noqa: E402
 from ansiroll.runtime import Runtime  # noqa: E402
@@ -342,8 +343,12 @@ ASYNC_TIMEOUT_PLAY = """
   vars:
     ansible_async_dir: "@JOBS@"
   tasks:
-    - command: sleep 30
-      async: 1
+    - record_async_tmp:
+        marker: "@JOBS@/tmp-path"
+        unrelated: "@JOBS@-tmp/ansible-moduletmp-unrelated"
+      environment:
+        TMPDIR: "@JOBS@-tmp"
+      async: 4
       poll: 0
       register: job
     - async_status:
@@ -358,13 +363,88 @@ ASYNC_TIMEOUT_PLAY = """
           - status.finished
           - status.msg == "Timeout exceeded"
           - status.child_pid is defined
+    - slurp:
+        src: "@JOBS@/tmp-path"
+      register: tmp_path
+    - stat:
+        path: "{{ tmp_path.content | b64decode }}"
+      register: module_tmp
+      until: not module_tmp.stat.exists
+      retries: 5
+      delay: 1
 """
 
 
-def test_async_job_is_killed_at_its_time_limit(tmp_path):
+def test_async_timeout_cleans_only_the_jobs_temp_directory(tmp_path):
     if _core_version() < (2, 12):
         pytest.skip("Ansible before 2.12 does not publish a timeout result")
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "record_async_tmp.py").write_text("""
+import os
+import time
+
+from ansible.module_utils.basic import AnsibleModule
+
+
+def main():
+    module = AnsibleModule(argument_spec={
+        "marker": {"type": "path", "required": True},
+        "unrelated": {"type": "path", "required": True},
+    })
+    with open(os.path.join(module.tmpdir, "payload"), "w") as fh:
+        fh.write("job data")
+    os.symlink(module.params["unrelated"], os.path.join(module.tmpdir, "unrelated"))
+    with open(module.params["marker"], "w") as fh:
+        fh.write(module.tmpdir)
+    time.sleep(30)
+    module.exit_json(changed=False)
+
+
+if __name__ == "__main__":
+    main()
+""")
+    shared_tmp = tmp_path / "async-jobs-tmp"
+    shared_tmp.mkdir()
+    unrelated = shared_tmp / "ansible-moduletmp-unrelated"
+    unrelated.mkdir()
+    sentinel = unrelated / "payload"
+    sentinel.write_text("keep")
     _run_both(tmp_path, ASYNC_TIMEOUT_PLAY)
+    assert sentinel.read_text() == "keep"
+    assert not list(shared_tmp.glob("ansiroll-async-*"))
+
+
+@pytest.mark.parametrize("poll_before_timeout, time_limit, exit_at, timed_out, checks", [
+    (False, 1, 4.9, False, [5]),
+    (False, 1, 9.9, True, [5]),
+    (False, 6, 9.9, False, [5, 10]),
+    (False, 6, 14.9, True, [5, 10]),
+    (True, 1, 0.9, False, [0.5, 1]),
+    (True, 1, 1.1, True, [0.5, 1]),
+    (True, 5, 5.1, True, [2.5, 5]),
+    (True, 6, 9.9, False, [5, 10]),
+    (True, 6, 10.1, True, [5, 10]),
+])
+def test_async_timeout_respects_watchdog_poll_order(
+        monkeypatch, poll_before_timeout, time_limit, exit_at, timed_out, checks):
+    now = [0]
+    polls = []
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    def waitpid(pid, flags):
+        assert flags == os.WNOHANG
+        polls.append(now[0])
+        return (pid, 0) if now[0] >= exit_at else (0, 0)
+
+    monkeypatch.setattr(worker_module.time, "sleep", sleep)
+    monkeypatch.setattr(worker_module.os, "waitpid", waitpid)
+    assert worker_module._async_timed_out(1, time_limit, poll_before_timeout) is timed_out
+    assert polls == checks
+    if timed_out:
+        assert now[0] == (checks[-1] if poll_before_timeout else checks[-1] + 5)
 
 
 def _children(pid):
