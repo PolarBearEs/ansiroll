@@ -471,7 +471,7 @@ def test_deferred_play_vars_resolve_in_mapping_iteration(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
-def test_combine_resolves_deferred_play_vars_on_modern_core(tmp_path, mode):
+def test_mapping_copies_resolve_deferred_play_vars_on_modern_core(tmp_path, mode):
     if CORE_VERSION < (2, 19):
         pytest.skip("legacy Ansible exposes raw values in vars mapping copies")
     _write(tmp_path, {"pb.yml": """
@@ -486,10 +486,14 @@ def test_combine_resolves_deferred_play_vars_on_modern_core(tmp_path, mode):
                   {{ (vars | combine({})).alias == 5 }}
                   {{ (vars | combine({'alias': 6})).alias == 6 }}
                   {{ ({'known': true} | combine(vars)).alias == 5 }}
+                  {{ vars.copy().alias == 5 }}
+                  {{ dict(vars).alias == 5 }}
+                  {{ dict(vars, alias=6).alias == 6 }}
+                  {{ dict(plain=7).plain == 7 }}
         """})
     result = _run_mode(tmp_path, mode)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _summary(result.stdout)[0] == [json.dumps("True True True")]
+    assert _summary(result.stdout)[0] == [json.dumps("True True True True True True True")]
 
 
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])

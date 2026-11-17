@@ -208,23 +208,24 @@ def _to_bool(value):
     return bool(value)
 
 
+def _jinja_dict(*args, **kwargs):
+    if len(args) == 1 and isinstance(args[0], _PlayVarScope):
+        return dict(args[0].items(), **kwargs)
+    return dict(*args, **kwargs)
+
+
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
 
-    def copy(mapping):
-        if isinstance(mapping, _PlayVarScope):
-            return dict(mapping.items())
-        return dict(mapping)
-
     def merge(a, b):
-        out = copy(a)
+        out = _jinja_dict(a)
         for k, v in b.items():
             if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
         return out
-    result = copy(d or {})
+    result = _jinja_dict(d or {})
     for o in others:
         result = merge(result, o or {})
     return result
@@ -857,6 +858,9 @@ class _PlayVarScope(dict):
         for _, value in self.items():
             yield value
 
+    def copy(self):
+        return _jinja_dict(self)
+
 
 class _TemplateContext(jinja2.runtime.Context):
     def resolve_or_missing(self, key):
@@ -1042,6 +1046,7 @@ class _Templater:
         self.env.globals.setdefault("q", self._g_query)
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
+        self.env.globals["dict"] = _jinja_dict
         self._strict_env = self.env.overlay(undefined=_StrictAnsirollUndefined)
 
     def _g_lookup(self, name, *a, **k):
