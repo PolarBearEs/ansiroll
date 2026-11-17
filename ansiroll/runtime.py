@@ -128,12 +128,28 @@ class _UnsafeText(str):
 _NO_TEMPLATE = (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue)
 
 
+class _IncludedVars(dict):
+    """Controller-loaded include_vars definitions carried in a task result."""
+
+
+def _decode_included_var(value):
+    if isinstance(value, dict):
+        if set(value) == {"__ansiroll_unsafe__"}:
+            return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
+        return {key: _decode_included_var(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_included_var(item) for item in value]
+    return value
+
+
 def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _mark_unsafe(value, _seen=None):
+def _mark_unsafe(value, _seen=None, preserve_included_vars=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
+    if preserve_included_vars and isinstance(value, _IncludedVars):
+        return value
     if isinstance(value, str):
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             return _UnsafeText(value)
@@ -152,16 +168,17 @@ def _mark_unsafe(value, _seen=None):
             getter = (value.__getitem__ if isinstance(value, _LazyTplDict)
                       else lambda key: dict.__getitem__(value, key))
             for k in list(dict.keys(value)):
-                out[_mark_unsafe(k, _seen)] = _mark_unsafe(getter(k), _seen)
+                out[_mark_unsafe(k, _seen)] = _mark_unsafe(
+                    getter(k), _seen, preserve_included_vars)
             return out
         if isinstance(value, list):
             out = []
             _seen[id(value)] = (value, out)
             items = (iter(value) if isinstance(value, _LazyTplList)
                      else list.__iter__(value))
-            out.extend(_mark_unsafe(v, _seen) for v in items)
+            out.extend(_mark_unsafe(v, _seen, preserve_included_vars) for v in items)
             return out
-        return tuple(_mark_unsafe(v, _seen) for v in value)
+        return tuple(_mark_unsafe(v, _seen, preserve_included_vars) for v in value)
     return value
 
 
@@ -1633,7 +1650,8 @@ class Runtime:
     def _store_register(self, task, result):
         name = task.get("register")
         if name:
-            self.vars[name] = _mark_unsafe(result)
+            include_vars = task.get("action", "").rsplit(".", 1)[-1] == "include_vars"
+            self.vars[name] = _mark_unsafe(result, preserve_included_vars=include_vars)
             self._untrusted_runtime_vars.add(name)
 
     def template(self, value, ctx, _seen=None):
@@ -2341,8 +2359,11 @@ class Runtime:
             if res is None:
                 res = self._exec_with_retries(task, ctx, become)
                 self._absorb_facts(task, res)
-                if isinstance(res.get("ansible_facts"), dict):
-                    base_ctx.update(res["ansible_facts"])
+                facts = res.get("ansible_facts")
+                if isinstance(facts, _IncludedVars):
+                    base_ctx.update({key: self.vars[key] for key in facts})
+                elif isinstance(facts, dict):
+                    base_ctx.update(facts)
             res["item"] = it
             if task.get("loop_label") is not None:
                 label_ctx = dict(ctx)
@@ -2497,6 +2518,7 @@ class Runtime:
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
+        included_vars = None
         try:
             check_override = task.get("check_mode")
             if check_override is not None:
@@ -2539,9 +2561,14 @@ class Runtime:
                         self.template(task.get("args") or {}, ctx)
                     ))
                     res = self.delegate_fn(task, args, become, ctx)
-                    if task["action"].rsplit(".", 1)[-1] == "group_by":
+                    action = task["action"].rsplit(".", 1)[-1]
+                    if action == "group_by":
                         # Preserve trust only for controller inventory metadata.
                         refreshed_vars = res.pop("_ansiroll_vars", None)
+                    elif action == "include_vars":
+                        payload = res.pop("_ansiroll_included_vars", None)
+                        if payload is not None:
+                            included_vars = json.loads(payload)
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(self.template(task.get("args") or {}, ctx)))
@@ -2572,6 +2599,12 @@ class Runtime:
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
+        if isinstance(included_vars, dict):
+            # Only the include_vars controller reply carries authored definitions.
+            res["ansible_facts"] = _IncludedVars(
+                (key, _decode_included_var(value))
+                for key, value in included_vars.items()
+            )
         self._apply_overrides(task, res, ctx)
         if refreshed_vars is not None:
             res["_ansiroll_vars"] = refreshed_vars
@@ -3052,7 +3085,13 @@ class Runtime:
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
         facts = res.get("ansible_facts")
-        if isinstance(facts, dict):
+        if isinstance(facts, _IncludedVars):
+            for key, value in facts.items():
+                if (key not in self.extra_vars and key not in self._set_fact_overrides
+                        and key not in self._untrusted_runtime_vars):
+                    self.vars[key] = value
+                    self._runtime_var_overrides.add(key)
+        elif isinstance(facts, dict):
             # Facts are module output: never templated (Ansible marks them unsafe).
             facts = _mark_unsafe(facts)
             self.vars.update(facts)

@@ -437,7 +437,26 @@ class StrategyModule(StrategyBase):
         if action in ("add_host", "group_by"):
             return self._run_inventory_action(action, frame, host, hv)
         if action == "include_vars":
-            return self._run_include_vars(frame)
+            result = self._run_include_vars(frame)
+            facts = result.pop("ansible_facts", None)
+            if facts is not None:
+                from ansiroll.loader import _tag_untrusted
+
+                # Scalar values stringified for JSON have no template provenance.
+                result["_ansiroll_included_vars"] = json.dumps(
+                    _tag_untrusted(facts),
+                    default=lambda value: {"__ansiroll_unsafe__": str(value)},
+                )
+                # Match Ansible's include_vars layer for later plays and hosts.
+                task = (task_map or {}).get(frame.get("runtime_id") or frame.get("uuid"))
+                run_once = getattr(task, "run_once", None)
+                if isinstance(run_once, str):
+                    run_once = self._t(templar, run_once)
+                hosts = self._run_hosts if _truthy(run_once) else (host,)
+                for target in hosts:
+                    for key, value in facts.items():
+                        self._variable_manager.set_host_variable(target.name, key, value)
+            return result
         if action == "set_fact":
             args = dict(frame.get("args") or {})
             cacheable = bool(args.pop("cacheable", False))
@@ -574,9 +593,14 @@ class StrategyModule(StrategyBase):
             return {"failed": True, "changed": False,
                     "msg": "Could not find or access '%s'" % fname}
         try:
-            data = self._loader.load_from_file(path) or {}
+            try:
+                data = self._loader.load_from_file(path, cache="none", trusted_as_template=True)
+            except TypeError:  # Older Ansible uses AnsibleUnsafeText for !unsafe.
+                data = self._loader.load_from_file(path)
         except Exception as ex:
             return {"failed": True, "changed": False, "msg": str(ex)}
+        if data is None:
+            data = {}
         if not isinstance(data, dict):
             return {"failed": True, "changed": False,
                     "msg": "%s must be stored as a dictionary/hash" % path}
@@ -931,10 +955,11 @@ class StrategyModule(StrategyBase):
                     host.name, {reg: dict(result_data) for reg in registers}
                 )
             facts = result_data.get("ansible_facts")
-            is_set_fact = (
-                str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
-                == "set_fact"
-            )
+            action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+            if action == "include_vars":
+                # The controller has already stored the original tagged values.
+                facts = None
+            is_set_fact = action == "set_fact"
             cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
             if isinstance(facts, dict):
                 # Match StrategyBase: cacheable set_fact results populate the

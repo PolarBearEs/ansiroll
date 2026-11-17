@@ -138,6 +138,73 @@ def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     })
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_controller_authored_vars_preserve_template_provenance(tmp_path, use_strategy):
+    vars_files = "" if use_strategy else "  vars_files: [sample.yml, literals.yml]\n"
+    register = "\n      register: inclusion" if MODERN_TEMPLATING else ""
+    include = """
+    - ansible.builtin.include_vars: {file: sample.yml, name: included}%s
+    - ansible.builtin.include_vars: literals.yml
+""" % register if use_strategy else ""
+    prefix = "included." if use_strategy else ""
+    playbook = r"""
+- hosts: localhost
+  gather_facts: false
+  vars:
+    label: sample
+%(vars_files)s  tasks:%(include)s
+    - command:
+        argv: [printf, '%%s', '{{ "{{" }} label }}-module']
+      delegate_to: localhost
+      register: output
+      changed_when: false
+    - debug:
+        msg: >-
+          {{ %(prefix)sauthored }} / {{ %(prefix)snested[0].value }} /
+          {{ literal }} / {{ output.stdout }}
+""" % {"vars_files": vars_files, "include": include, "prefix": prefix}
+    if use_strategy:
+        playbook += r"""
+    - debug:
+        msg: >-
+          {{ authored is defined | lower }} / {{ ansible_facts.included is defined | lower }}
+"""
+        if register:
+            playbook += r"""
+    - debug:
+        msg: "{{ inclusion.ansible_facts.included.authored }}"
+"""
+        playbook += r"""
+    - ansible.builtin.include_vars: sample.yml
+    - debug:
+        msg: "{{ authored }} / {{ literal }}"
+- hosts: localhost
+  gather_facts: false
+  vars:
+    label: later
+  tasks:
+    - debug:
+        msg: "{{ included.authored }} / {{ authored }} / {{ literal }}"
+"""
+    messages, recap = _assert_parity(tmp_path, playbook, {
+        "sample.yml": "authored: '{{ label }}-authored'\nnested: [{value: '{{ label }}-nested'}]\n",
+        "literals.yml": "literal: !unsafe '{{ label }}-literal'\n",
+    }, use_strategy=use_strategy)
+
+    assert recap[3] == "0"
+    assert messages[0] == (
+        "sample-authored / sample-nested / {{ label }}-literal / {{ label }}-module"
+    )
+    if use_strategy:
+        assert messages[1] == "false / false"
+        if register:
+            assert messages[2] == "sample-authored"
+        assert messages[-2:] == [
+            "sample-authored / {{ label }}-literal",
+            "later-authored / later-authored / {{ label }}-literal",
+        ]
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Templar parity")
 def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
     nested_vars_check = (
