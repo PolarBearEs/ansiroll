@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 
 from .compat import init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
@@ -34,6 +35,9 @@ BAKED_ACTIONS = {
     "copy", "ansible.builtin.copy",
     "unarchive", "ansible.builtin.unarchive",
 }
+
+# Official modules the copy/template action plugins execute on the target.
+COPY_ACTION_MODULES = ("ansible.builtin.copy", "ansible.builtin.file")
 
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
@@ -729,9 +733,19 @@ def _convert_task(task, actions, basedir):
     node["delegate_to"] = str(delegate) if delegate else None
 
     if action in BAKED_ACTIONS:
-        _bake_sources(node, task, basedir)
+        if (node["special"] == "copy"
+                and _boolean_literal(node["args"].get("remote_src")) is True):
+            # remote_src copies never read a controller-side src.
+            pass
+        else:
+            _bake_sources(node, task, basedir)
         if node["special"] is None:
             actions.add(action)
+        else:
+            # The runtime runs these like the copy action plugin: through the
+            # official copy and file modules.
+            actions.update(COPY_ACTION_MODULES)
+            node.update(_copy_action_settings())
     elif action in CONTROLLER_COUPLED:
         node["fallback"] = True
         node["fallback_reason"] = "controller-coupled action %s" % action
@@ -828,6 +842,34 @@ def _accelerator_options(action):
     return None
 
 
+def _boolean_literal(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and not _contains_dynamic_value(value):
+        lowered = value.strip().lower()
+        if lowered in ("y", "yes", "on", "1", "true", "t"):
+            return True
+        if lowered in ("n", "no", "off", "0", "false", "f", ""):
+            return False
+    return None
+
+
+def _copy_action_settings():
+    """Controller-side copy action settings from the compiling ansible-core."""
+    settings = {}
+    try:
+        from ansible.plugins.action.copy import REAL_FILE_ARGS
+        settings["_copy_file_args"] = sorted(REAL_FILE_ARGS)
+    except Exception:
+        pass
+    try:
+        from ansible import constants as C
+        settings["_max_diff_size"] = int(C.MAX_FILE_SIZE_FOR_DIFF)
+    except Exception:
+        pass
+    return settings
+
+
 def _special_of(action):
     name = action.split(".")[-1]
     if name in ("debug", "set_fact", "fail", "assert", "template", "copy"):
@@ -885,7 +927,8 @@ def _bake_sources(node, task, basedir):
         try:
             st = os.stat(path)
             meta[rel] = {"fullpath": os.path.abspath(path),
-                         "mtime": st.st_mtime, "uid": st.st_uid}
+                         "mtime": st.st_mtime, "uid": st.st_uid,
+                         "mode": stat.S_IMODE(st.st_mode)}
         except OSError:
             pass
     node["_baked"] = baked
@@ -904,6 +947,7 @@ def _bake_role_tree(node, task, subdir):
     if not os.path.isdir(tree_dir):
         return False
     baked = {}
+    meta = {}
     for root, _dirs, files in os.walk(tree_dir):
         for fn in files:
             full = os.path.join(root, fn)
@@ -911,11 +955,16 @@ def _bake_role_tree(node, task, subdir):
             try:
                 with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
                     baked[rel] = fh.read()
+                st = os.stat(full)
             except OSError:
                 continue
+            meta[rel] = {"fullpath": os.path.abspath(full),
+                         "mtime": st.st_mtime, "uid": st.st_uid,
+                         "mode": stat.S_IMODE(st.st_mode)}
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     return True
 

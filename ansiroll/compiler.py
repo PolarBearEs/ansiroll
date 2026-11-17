@@ -22,7 +22,7 @@ import os
 import zipfile
 
 from .embed import ModuleEmbedder
-from .loader import load_adjacent_group_vars, parse_playbook
+from .loader import COPY_ACTION_MODULES, load_adjacent_group_vars, parse_playbook
 from .accelerated_modules import TOTAL_NAMES, can_accelerate
 
 _RUNTIME_PATH = os.path.join(os.path.dirname(__file__), "runtime.py")
@@ -442,6 +442,8 @@ def _actions_in_plays(plays):
                 action = node.get("action")
                 if action:
                     actions.add(action)
+                if node.get("special") in ("template", "copy"):
+                    actions.update(COPY_ACTION_MODULES)
     for play in plays:
         walk(play.get("tasks"))
         walk(play.get("handlers"))
