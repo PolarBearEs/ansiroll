@@ -21,7 +21,6 @@ Repository = "https://github.com/PolarBearEs/ansiroll"
 Issues = "https://github.com/PolarBearEs/ansiroll/issues"
 
 [project.optional-dependencies]
-yaml = ["ruamel.yaml"]
 # Convenience only -- pulls a modern ansible-core into a fresh venv:
 ansible = ["ansible-core>=2.10"]
 test = ["pytest>=7", "pytest-cov>=5", "jinja2", "packaging"]

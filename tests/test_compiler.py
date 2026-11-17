@@ -84,7 +84,7 @@ def test_deterministic_zip_has_stable_bytes_and_metadata():
                    for info in archive.infolist())
 
 
-def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
+def test_generated_agent_bundles_template_runtimes_for_stdlib_only_target(tmp_path):
     agent = tmp_path / "agent.py"
     agent.write_text(_render_source([], {}, ""))
     env = dict(os.environ)
@@ -95,7 +95,10 @@ def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
         "(_ for _ in ()).throw(RuntimeError('temporary files forbidden')); "
         "ns = runpy.run_path(sys.argv[1]); "
         "print(ns['jinja2'].__version__); "
-        "print(ns['_Templater']().render_string('hello {{ name }}', {'name': 'world'}))"
+        "print(ns['_yaml_module']().__version__); "
+        "print(ns['_yaml_module']().__with_libyaml__); "
+        "print(ns['_Templater']().render_string('hello {{ name }}', {'name': 'world'})); "
+        "print(ns['_f_from_yaml']('enabled: true\\nitems:\\n  - one\\n  - two'))"
     )
 
     proc = subprocess.run(
@@ -106,7 +109,13 @@ def test_generated_agent_bundles_jinja_for_stdlib_only_target(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.splitlines() == ["2.11.3", "hello world"]
+    assert proc.stdout.splitlines() == [
+        "2.11.3",
+        "5.3.1",
+        "False",
+        "hello world",
+        "{'enabled': True, 'items': ['one', 'two']}",
+    ]
 
 
 def test_accelerator_classification_is_compile_time_when_possible():
@@ -251,3 +260,28 @@ def test_fixed_variables_specialize_dynamic_accelerator_without_rewriting_args()
     assert count == 1
     assert task["accelerator"] == "always"
     assert task["args"] == {"path": "{{ root }}/{{ filename }}"}
+
+
+def test_generated_agent_yaml_filters_work_under_agent_bootstrap():
+    # Drive the real AGENT_BOOTSTRAP: it reads a length-prefixed source frame
+    # from stdin, execs it without __file__, then calls agent_main().
+    import struct
+    from ansiroll.runtime import AGENT_BOOTSTRAP
+
+    source = _render_source([], {}, "") + (
+        "\n\ndef agent_main():\n"
+        "    print(_f_from_yaml('a: 1'))\n"
+        "    print(_f_to_yaml({'a': 1}), end='')\n"
+    )
+    payload = source.encode("utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", AGENT_BOOTSTRAP],
+        input=struct.pack(">I", len(payload)) + payload,
+        capture_output=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout.decode().splitlines() == ["{'a': 1}", "a: 1"]

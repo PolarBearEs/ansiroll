@@ -270,20 +270,78 @@ def _f_flatten(seq, levels=None):
     return out
 
 
+def _yaml_module():
+    """Load Ansiroll's private, pure-Python YAML implementation.
+
+    Generated agents get it from the in-memory import bundle (and are exec'd
+    without ``__file__``).  Importing the source package directly puts the
+    shipped ZIP first on sys.path so no other ``ansiroll_yaml`` can shadow it.
+    """
+    here = globals().get("__file__")
+    if here:
+        bundle = os.path.join(os.path.dirname(here), "vendor", "pyyaml-py35.zip")
+        if os.path.isfile(bundle) and bundle not in sys.path:
+            sys.path.insert(0, bundle)
+    import ansiroll_yaml
+    return ansiroll_yaml
+
+
+def _yaml_plain_key(k, memo):
+    """Convert a mapping key.  Keys are hashable, so a key tuple holds no
+    mutable container and cannot be part of a cycle; keep it a tuple."""
+    if isinstance(k, str):
+        return "".join([k]) if type(k) is not str else k
+    if not isinstance(k, tuple):
+        return k
+    if id(k) not in memo:
+        memo[id(k)] = (k, tuple(_yaml_plain_key(x, memo) for x in k))
+    return memo[id(k)][1]
+
+
+def _yaml_plain(v, memo=None, key_memo=None):
+    """Materialize runtime wrappers (lazy vars, trusted strings) into the
+    built-in types PyYAML's SafeDumper can represent.
+
+    Shared and self-referencing containers keep their identity: each output
+    container is registered before its children are converted, so PyYAML can
+    still emit aliases.  Tuple values become lists (SafeDumper writes both as
+    sequences) so they can be registered up front too.
+    """
+    if memo is None:
+        memo, key_memo = {}, {}
+    if isinstance(v, str):
+        return "".join([v]) if type(v) is not str else v
+    if not isinstance(v, (dict, list, tuple)):
+        return v
+    # Lazy wrappers are rebuilt on every access; key them by the raw
+    # container they wrap so recursion through them is still detected, plus
+    # the context they were created under (one raw container can render
+    # differently in two contexts).  ``_origin`` stays stable across accesses,
+    # unlike the fresh context dict a dynamic wrapper builds each time.
+    origin = getattr(v, "_origin", None)
+    key = (id(getattr(v, "_raw", v)), id(origin) if origin is not None else None)
+    if key in memo:
+        return memo[key][1]
+    if isinstance(v, dict):
+        out = {}
+        memo[key] = (v, out)
+        for k, x in v.items():
+            out[_yaml_plain_key(k, key_memo)] = _yaml_plain(x, memo, key_memo)
+        return out
+    out = []
+    memo[key] = (v, out)
+    out.extend(_yaml_plain(x, memo, key_memo) for x in v)
+    return out
+
+
 def _f_to_yaml(v, **kwargs):
-    try:
-        import yaml
-        return yaml.safe_dump(v, default_flow_style=False)
-    except Exception:
-        return json.dumps(v)
+    options = dict(kwargs)
+    options.setdefault("default_flow_style", False)
+    return _yaml_module().safe_dump(_yaml_plain(v), **options)
 
 
 def _f_from_yaml(v):
-    try:
-        import yaml
-        return yaml.safe_load(v)
-    except Exception:
-        return json.loads(v)
+    return _yaml_module().safe_load(v)
 
 
 def _f_union(a, b):
@@ -610,31 +668,34 @@ def _query(name, *args, **kwargs):
     return _lookup_values(name, args, kwargs, ctx)
 
 
-def _lazy_container(value, rt, ctx, dynamic=False):
+def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
     if isinstance(value, dict):
-        return _LazyTplDict(value, rt, ctx, dynamic)
+        return _LazyTplDict(value, rt, ctx, dynamic, origin)
     if isinstance(value, list):
-        return _LazyTplList(value, rt, ctx, dynamic)
+        return _LazyTplList(value, rt, ctx, dynamic, origin)
     return value
 
 
-def _lazy_wrap(value, rt, ctx, dynamic=False):
+def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
     if isinstance(value, str):
         return rt.template(value, ctx)
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_unsafe__"}:
         return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_vault__"}:
         return value
-    return _lazy_container(value, rt, ctx, dynamic)
+    return _lazy_container(value, rt, ctx, dynamic, origin)
 
 
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None):
         dict.__init__(self, raw)
+        self._raw = raw
         self._rt = rt
         self._ctx = ctx
+        # The context this view tree was created under; children share it.
+        self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
 
     def _render_ctx(self):
@@ -646,7 +707,8 @@ class _LazyTplDict(dict):
 
     def __getitem__(self, k):
         return _lazy_wrap(
-            dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic)
+            dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic,
+            self._origin)
 
     def get(self, k, default=None):
         try:
@@ -676,10 +738,12 @@ class _LazyTplDict(dict):
 class _LazyTplList(list):
     """A vars list whose items render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None):
         list.__init__(self, raw)
+        self._raw = raw
         self._rt = rt
         self._ctx = ctx
+        self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
 
     def _render_ctx(self):
@@ -693,14 +757,17 @@ class _LazyTplList(list):
         v = list.__getitem__(self, i)
         if isinstance(i, slice):
             return [
-                _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic)
+                _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic,
+                           self._origin)
                 for x in v
             ]
-        return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic)
+        return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
+                          self._origin)
 
     def __iter__(self):
         for v in list.__iter__(self):
-            yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic)
+            yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
+                             self._origin)
 
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)

@@ -2,7 +2,7 @@
 
 import pytest
 
-from ansiroll.runtime import _Templater, _UnsafeTemplate
+from ansiroll.runtime import _Templater, _UnsafeTemplate, _f_to_yaml, _yaml_module, _yaml_plain
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +39,41 @@ def test_filters(t, expr, ctx, expected):
 def test_b64_roundtrip(t):
     enc = render(t, "{{ s | b64encode }}", s="hello world")
     assert render(t, "{{ s | b64decode }}", s=enc) == "hello world"
+
+
+def test_yaml_filters_parse_and_emit_real_yaml(t):
+    assert _yaml_module().__version__ == "5.3.1"
+    assert _yaml_module().__with_libyaml__ is False
+    parsed = render(
+        t,
+        "{{ value | from_yaml }}",
+        value="enabled: true\nitems:\n  - one\n  - two\nempty: null\n",
+    )
+    assert parsed == {"enabled": True, "items": ["one", "two"], "empty": None}
+
+    emitted = render(t, "{{ value | to_yaml }}", value={"items": ["one", "two"]})
+    assert "items:" in emitted
+    assert "- one" in emitted
+    assert render(t, "{{ value | from_yaml }}", value=emitted) == {
+        "items": ["one", "two"]
+    }
+
+    nice = render(t, "{{ value | to_nice_yaml(indent=4) }}", value={
+        "nested": {"enabled": True}
+    })
+    assert "nested:" in nice and "    enabled: true" in nice
+
+
+def test_from_yaml_uses_the_safe_loader(t, tmp_path):
+    marker = tmp_path / "unsafe-yaml-ran"
+    expression = "{{ value | from_yaml }}"
+    value = "!!python/object/apply:os.mkdir ['%s']" % marker
+
+    result = render(t, expression, value=value)
+
+    import jinja2
+    assert isinstance(result, jinja2.Undefined)
+    assert not marker.exists()
 
 
 def test_to_uuid_stable(t):
@@ -165,3 +200,64 @@ def test_to_json_captures_undecryptable_vault(t):
 
 def test_unsafe_filter_result_is_not_templated_again(t):
     assert render(t, "{{ value }}", value=_UnsafeTemplate("{{ 1 }}")) == "{{ 1 }}"
+
+
+def test_to_yaml_keeps_tuple_keys_hashable():
+    assert _f_to_yaml({("a", "b"): 1}) == "? - a\n  - b\n: 1\n"
+
+
+def test_to_yaml_preserves_shared_and_recursive_containers():
+    x = ["leaf"]
+    for _ in range(30):
+        x = [x, x]
+    assert len(_f_to_yaml(x)) < 10000
+
+    loop = []
+    loop.append(loop)
+    assert _f_to_yaml(loop) == "&id001\n- *id001\n"
+
+
+def test_to_yaml_detects_recursion_through_lazy_containers():
+    from ansiroll.runtime import _LazyTplList
+
+    loop = []
+    loop.append(loop)
+    assert _f_to_yaml(_LazyTplList(loop, None, {})) == "&id001\n- *id001\n"
+
+
+class _StubRuntime(object):
+    def __init__(self, vars=None):
+        self.vars = vars or {}
+
+    def template(self, value, ctx):
+        return _Templater().render_string(value, ctx)
+
+
+def test_to_yaml_renders_aliased_lazy_list_per_context():
+    from ansiroll.runtime import _LazyTplList
+
+    rt = _StubRuntime()
+    shared = ["{{ name }}"]
+    value = [_LazyTplList(shared, rt, {"name": "play"}),
+             _LazyTplList(shared, rt, {"name": "task"})]
+    assert _f_to_yaml(value) == "- - play\n- - task\n"
+
+
+def test_to_yaml_detects_recursion_through_dynamic_lazy_containers():
+    from ansiroll.runtime import _LazyTplList
+
+    loop = []
+    loop.append(loop)
+    view = _LazyTplList(loop, _StubRuntime({"x": 1}), {}, dynamic=True)
+    assert _f_to_yaml(view) == "&id001\n- *id001\n"
+
+
+def test_yaml_plain_preserves_cycles_through_tuples():
+    items = []
+    value = (items,)
+    items.append(value)
+
+    plain = _yaml_plain(value)
+
+    assert plain[0][0] is plain
+    assert _f_to_yaml(value) == "&id001\n- - *id001\n"

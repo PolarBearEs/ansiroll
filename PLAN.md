@@ -50,7 +50,8 @@ Ansiroll/
 │   ├── worker.py               # persistent module worker embedded as source
 │   ├── accelerated_modules/    # optional stdlib module implementations
 │   └── vendor/
-│       └── jinja2-py35.zip     # target-side Jinja2/MarkupSafe bundle
+│       ├── jinja2-py35.zip     # target-side Jinja2/MarkupSafe bundle
+│       └── pyyaml-py35.zip     # target-side private pure-Python YAML bundle
 ├── collections/ansible_collections/ansiroll/core/
 │   ├── galaxy.yml
 │   └── plugins/strategy/ansiroll.py
@@ -109,7 +110,7 @@ module archive and import name, then deduplicates shared modules and
 The compiler creates two deterministic ZIP bundles:
 
 1. An import bundle containing module code, shared `module_utils`, the vendored
-   Jinja2 runtime, and the accelerator implementations.
+   Jinja2 and private YAML runtimes, and the accelerator implementations.
 2. A data bundle containing the lowered plays, module metadata, baked group
    variables, specialization data, and content-addressed task assets.
 
