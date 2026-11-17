@@ -239,7 +239,9 @@ ASYNC_PLAY = """
 @pytest.mark.parametrize("directory_source", ["variable", "environment", "configuration"])
 def test_async_job_results_env_and_status_match_ansible(tmp_path, directory_source):
     version = _core_version()
-    play = ASYNC_PLAY.replace("@JID_PREFIX@", "j" if version >= (2, 15) else "")
+    # Core 2.14.5 backported the prefix used by newer minor releases.
+    prefix = "j" if _core_version(include_patch=True) >= (2, 14, 5) else ""
+    play = ASYNC_PLAY.replace("@JID_PREFIX@", prefix)
     play = play.replace("@JOBDIR@", "@JOBS@-task" if version < (2, 12) else "@JOBS@")
     if directory_source != "variable":
         play = play.replace('  vars:\n    ansible_async_dir: "@JOBS@"\n', "")

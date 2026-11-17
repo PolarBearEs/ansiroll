@@ -568,7 +568,7 @@ def _async_run(fqn, params, profile, env, time_limit, source_fd, version,
         random_id = random.SystemRandom().randrange(999999999999)
     else:
         random_id = random.randint(0, 999999999999)
-    prefix = ("j" if version >= (2, 15) else "") + str(random_id)
+    prefix = ("j" if version >= (2, 14, 5) else "") + str(random_id)
     r, w = os.pipe()
     try:
         pid = os.fork()

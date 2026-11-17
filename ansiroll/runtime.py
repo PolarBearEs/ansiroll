@@ -2585,7 +2585,7 @@ class Runtime:
             "stdout_lines": [], "stderr_lines": [],
         }
         if "jid" not in args:
-            if version == (2, 12):
+            if version[:2] == (2, 12):
                 results.update(failed=True, msg="jid is required")
                 return results
             return {"failed": True, "changed": False, "msg": "missing required arguments: jid"}

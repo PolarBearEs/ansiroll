@@ -718,7 +718,7 @@ def _convert_task(task, actions, basedir):
         from ansible.plugins.loader import shell_loader
 
         node["async_options"] = {
-            "version": _core_version(),
+            "version": _core_version(include_patch=True),
             "dir": shell_loader.get("sh").get_option("async_dir"),
         }
         if node["async_val"] and node["poll"] == 0:
@@ -791,11 +791,12 @@ def _legacy_command_warn_supported():
         return False
 
 
-def _core_version():
+def _core_version(include_patch=False):
     from ansible.release import __version__
 
-    match = re.match(r"^(\d+)\.(\d+)", __version__)
-    return tuple(map(int, match.groups())) if match else (0, 0)
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", __version__)
+    version = tuple(int(part or "0") for part in match.groups()) if match else (0, 0, 0)
+    return version if include_patch else version[:2]
 
 
 @lru_cache(maxsize=1)
