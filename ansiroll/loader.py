@@ -843,8 +843,16 @@ def _accelerator_options(action):
             if version < (2, 14):
                 options["omit_result_rc"] = True
             return options or None
-        if name == "user" and version >= (2, 21):
-            return {"result_memberships": True}
+        if name == "user":
+            options = {}
+            patch = re.match(r"^(\d+)\.(\d+)\.(\d+)", __version__)
+            full = tuple(map(int, patch.groups())) if patch else version + (0,)
+            if full >= (2, 18, 9):
+                options["home_mode"] = True
+            if version >= (2, 21):
+                options["result_memberships"] = True
+                options["placeholder_homes"] = True
+            return options or None
         if name in ("systemd", "systemd_service") and version >= (2, 14):
             return {"modern_is_enabled": True}
     except Exception:

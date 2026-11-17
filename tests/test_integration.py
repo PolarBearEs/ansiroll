@@ -993,6 +993,145 @@ def test_accelerated_find_splits_comma_separated_lists_like_official(tmp_path):
         rt.cleanup()
 
 
+@pytest.mark.parametrize("login_defs", [
+    "UMASK 027\nHOME_MODE 0750\n",
+    "HOME_MODE 0700\nUMASK 022\n",
+    "UMASK 077\nUMASK 002\n",
+    "# no mode\n",
+    None,
+])
+def test_accelerated_user_home_creation_matches_official_create_homedir(
+        tmp_path, monkeypatch, login_defs):
+    import stat as stat_module
+    from ansible.modules import user as official_user
+    from ansiroll.accelerated_modules import user as accelerated_user
+    from ansiroll.loader import _accelerator_options
+
+    skel = tmp_path / "skel"
+    (skel / "sub").mkdir(parents=True)
+    (skel / ".profile").write_text("profile")
+    (skel / "sub" / "f").write_text("f")
+    os.chmod(str(skel / ".profile"), 0o640)
+    os.symlink(".profile", str(skel / "link"))
+    defs = tmp_path / "login.defs"
+    if login_defs is not None:
+        defs.write_text(login_defs)
+
+    class _Module(object):
+        def exit_json(self, **kwargs):
+            raise AssertionError(kwargs)
+
+    official = official_user.User.__new__(official_user.User)
+    official.module = _Module()
+    official.skeleton = str(skel)
+    official.LOGIN_DEFS = str(defs)
+    official.create_homedir(str(tmp_path / "official" / "home"))
+    official.chown_homedir(os.getuid(), os.getgid(), str(tmp_path / "official" / "home"))
+
+    monkeypatch.setattr(accelerated_user, "_SKELETON", str(skel))
+    monkeypatch.setattr(accelerated_user, "_LOGIN_DEFS", str(defs))
+    options = _accelerator_options("user") or {}
+    accelerated_user._create_homedir(
+        str(tmp_path / "accelerated" / "home"), options.get("home_mode"))
+    accelerated_user._chown_homedir(
+        os.getuid(), os.getgid(), str(tmp_path / "accelerated" / "home"))
+
+    def tree(base):
+        out = {}
+        for root, dirs, files in os.walk(base):
+            for name in dirs + files + ["."]:
+                full = os.path.normpath(os.path.join(root, name))
+                st = os.lstat(full)
+                out[os.path.relpath(full, base)] = (
+                    oct(stat_module.S_IMODE(st.st_mode)),
+                    os.readlink(full) if os.path.islink(full) else None)
+        return out
+
+    assert (tree(str(tmp_path / "accelerated" / "home"))
+            == tree(str(tmp_path / "official" / "home")))
+
+
+def test_accelerated_user_expands_home_like_official_path_type():
+    import pwd as pwd_module
+    from ansiroll.loader import _accelerator_options
+
+    me = pwd_module.getpwuid(os.getuid())
+    args = {"name": me.pw_name, "home": "~", "shell": me.pw_shell}
+    meta = ModuleEmbedder().embed("user")
+    rt = Runtime({"user": meta}, "", {"inventory_hostname": "localhost"})
+    rt.check_mode = True
+    try:
+        official = rt.run_module("user", dict(args))
+    finally:
+        rt.cleanup()
+    official.pop("invocation", None)
+    accelerated = run_accelerated(
+        "user", dict(args), check_mode=True,
+        options=_accelerator_options("user"))
+    if me.pw_dir != os.path.expanduser("~"):
+        pytest.skip("HOME does not match the passwd home")
+    assert accelerated == official
+    assert official["changed"] is False
+
+
+def test_accelerated_user_compares_int_fields_as_strings(monkeypatch):
+    """comment/shell are type='str' in the official argument_spec, so an int
+    that matches the passwd field is not a change."""
+    import pwd as pwd_module
+    from ansiroll.accelerated_modules import user as accelerated_user
+
+    entry = pwd_module.struct_passwd(
+        ("ansiroll-fake", "x", 4242, 4242, "123", "/", "7"))
+    monkeypatch.setattr(accelerated_user.pwd, "getpwnam", lambda name: entry)
+    monkeypatch.setattr(accelerated_user.grp, "getgrall", lambda: [])
+
+    def no_execute(*_args, **_kwargs):
+        raise AssertionError("usermod must not run")
+
+    monkeypatch.setattr(accelerated_user, "_execute", no_execute)
+    result = accelerated_user.run(
+        {"name": "ansiroll-fake", "comment": 123, "shell": 7})
+    assert result["changed"] is False
+    assert result["comment"] == "123"
+
+
+def test_accelerated_user_creates_missing_home_parents_before_useradd(
+        tmp_path, monkeypatch):
+    import pwd as pwd_module
+    from ansiroll.accelerated_modules import user as accelerated_user
+
+    skel = tmp_path / "skel"
+    skel.mkdir()
+    (skel / ".bashrc").write_text("rc")
+    defs = tmp_path / "login.defs"
+    defs.write_text("UMASK 077\n")
+    home = tmp_path / "missing" / "parent" / "home"
+    monkeypatch.setattr(accelerated_user, "_SKELETON", str(skel))
+    monkeypatch.setattr(accelerated_user, "_LOGIN_DEFS", str(defs))
+    created = []
+    entry = pwd_module.struct_passwd(
+        ("ansiroll-fake", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh"))
+
+    def getpwnam(name):
+        if not created:
+            raise KeyError(name)
+        return entry
+
+    def execute(command, environment):
+        # The official module creates the home (and its parents) first.
+        assert (home / ".bashrc").read_text() == "rc"
+        created.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(accelerated_user.pwd, "getpwnam", getpwnam)
+    monkeypatch.setattr(accelerated_user.grp, "getgrall", lambda: [])
+    monkeypatch.setattr(accelerated_user, "_execute", execute)
+    result = accelerated_user.run({"name": "ansiroll-fake", "home": str(home)})
+    assert result["changed"] is True
+    assert created and created[0][0] == "useradd" and "-m" in created[0]
+    assert oct(os.stat(str(home)).st_mode & 0o777) == oct(0o700)
+
+
 def test_compile_omits_total_static_official_module_and_forces_accelerator(
         tmp_path):
     destination = tmp_path / "accelerated-only-file"
