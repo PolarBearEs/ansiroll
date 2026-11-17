@@ -80,7 +80,68 @@ class _TrustedAsTemplateValue(str):
     """A string produced by set_fact and trusted for later templating."""
 
 
+class _UnsafeText(str):
+    """Text that must never be templated again.
+
+    Mirrors Ansible: module results, facts, lookup output and the output of a
+    render are data, not templates (AnsibleUnsafeText before 2.19, a missing
+    TrustedAsTemplate tag since).  Only strings that look like templates are
+    wrapped, so ordinary values keep their plain ``str`` type."""
+
+
+# Strings the templater returns verbatim.
+_NO_TEMPLATE = (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue)
+
+
+def _looks_templated(value):
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _mark_unsafe(value, _seen=None):
+    """Deep-copy `value`, marking template-looking strings as never-templated."""
+    if isinstance(value, str):
+        if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+            return _UnsafeText(value)
+        return value
+    if isinstance(value, (dict, list, tuple)):
+        if _seen is None:
+            _seen = {}
+        if id(value) in _seen:
+            return _seen[id(value)]
+        if isinstance(value, dict):
+            out = {}
+            _seen[id(value)] = out
+            # Lazy views render on access; plain containers are read raw.
+            getter = (value.__getitem__ if isinstance(value, _LazyTplDict)
+                      else lambda key: dict.__getitem__(value, key))
+            for k in list(dict.keys(value)):
+                out[_mark_unsafe(k, _seen)] = _mark_unsafe(getter(k), _seen)
+            return out
+        if isinstance(value, list):
+            out = []
+            _seen[id(value)] = out
+            items = (iter(value) if isinstance(value, _LazyTplList)
+                     else list.__iter__(value))
+            out.extend(_mark_unsafe(v, _seen) for v in items)
+            return out
+        return tuple(_mark_unsafe(v, _seen) for v in value)
+    return value
+
+
+def _decode_wire_data(value):
+    """Decode compile-time rendered values (`{"__ansiroll_data__": text}`)."""
+    if isinstance(value, dict):
+        if set(value.keys()) == {"__ansiroll_data__"}:
+            return _UnsafeText(value["__ansiroll_data__"])
+        return {k: _decode_wire_data(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_wire_data(v) for v in value]
+    return value
+
+
 def _trust_set_fact_value(value):
+    if isinstance(value, _NO_TEMPLATE):
+        return value
     if isinstance(value, str):
         return _TrustedAsTemplateValue(value)
     if isinstance(value, dict):
@@ -150,6 +211,29 @@ class UntrustedConditional(Exception):
     """A conditional contained an embedded template and was refused."""
 
 
+class ConditionalError(Exception):
+    """Evaluating a `when` conditional failed (undefined variable, error)."""
+
+
+class _BrokenConditional(RuntimeError):
+    """A conditional produced a non-boolean result (ansible-core 2.20+)."""
+
+
+def _conditional_error_message(cond, error):
+    """Ansible's message for a `when` that raised while being evaluated."""
+    if isinstance(cond, dict) and len(cond) == 1:
+        cond = list(cond.values())[0]
+    if isinstance(error, _BrokenConditional):
+        return "Task failed: A 'when' expression failed: %s" % error
+    if _core_at_least(2, 19):
+        kind = ("Error while evaluating conditional"
+                if isinstance(error, jinja2.UndefinedError)
+                else "Error rendering expression")
+        return "Task failed: A 'when' expression failed: %s: %s" % (kind, error)
+    return ("The conditional check '%s' failed. The error was: error while "
+            "evaluating conditional (%s): %s" % (cond, cond, error))
+
+
 class _UnsupportedLookup(Exception):
     """No built-in implementation for this lookup plugin name."""
 
@@ -160,6 +244,24 @@ def _to_bool(value):
     if isinstance(value, str):
         return value.strip().lower() in ("true", "yes", "on", "1")
     return bool(value)
+
+
+_BOOLEANS_TRUE = frozenset(("y", "yes", "on", "1", "true", "t", 1, 1.0, True))
+
+
+def _boolean(value):
+    """Keyword/action-arg coercion: ansible.module_utils.parsing.convert_bool
+    .boolean, which (unlike the `bool` filter) also accepts y/t and n/f."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (str, bytes)):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        value = value.lower().strip()
+    try:
+        return value in _BOOLEANS_TRUE
+    except TypeError:
+        return False
 
 
 def _f_combine(d, *others, **kwargs):
@@ -187,9 +289,21 @@ def _f_items2dict(lst, key_name="key", value_name="value"):
     return {i[key_name]: i[value_name] for i in (lst or [])}
 
 
-def _f_regex_replace(s, pattern, repl="", count=0):
+def _f_regex_replace(s="", pattern="", repl="", ignorecase=False,
+                     multiline=False, count=0, mandatory_count=0):
+    # Mirrors ansible.plugins.filter.core.regex_replace.
     import re
-    return re.sub(pattern, repl, str(s), count=count)
+    flags = 0
+    if ignorecase:
+        flags |= re.I
+    if multiline:
+        flags |= re.M
+    text = s if isinstance(s, str) else str(s)
+    output, subs = re.compile(pattern, flags).subn(repl, text, count=count)
+    if mandatory_count and mandatory_count != subs:
+        raise ValueError("'%s' should match %d times, but matches %d times "
+                         "in '%s'" % (pattern, mandatory_count, count, s))
+    return output
 
 
 def _f_regex_search(s, pattern, *args, **kwargs):
@@ -236,7 +350,8 @@ def _to_text_str(v):
 def _f_ternary(condition, true_val, false_val=None, none_val=None):
     if condition is None and none_val is not None:
         return none_val
-    return true_val if _to_bool(condition) else false_val
+    # Ansible uses plain Python truthiness here, not boolean coercion.
+    return true_val if condition else false_val
 
 
 def _f_hash(v, hashtype="sha1"):
@@ -725,6 +840,12 @@ class _LazyTplDict(dict):
     def copy(self):
         return {k: self[k] for k in dict.keys(self)}
 
+    def __repr__(self):
+        # str()/repr() inside a template shows the rendered values.
+        return repr(self.copy())
+
+    __str__ = __repr__
+
     def __eq__(self, other):
         mine = {k: self[k] for k in dict.keys(self)}
         return mine == (other.copy() if isinstance(other, _LazyTplDict) else other)
@@ -771,6 +892,11 @@ class _LazyTplList(list):
 
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
+
+    def __repr__(self):
+        return repr(list(iter(self)))
+
+    __str__ = __repr__
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -819,11 +945,39 @@ def _wrap_filter(fn):
 
 
 class _AnsirollUndefined(jinja2.ChainableUndefined):
-    """ChainableUndefined, except `x in undefined` raises (jinja 3.1 silently
-    returns False, Ansible errors)."""
+    """Ansible's undefined: attribute/item access chains (keeping the first
+    failure), but using the value -- str(), iteration, truth, comparison,
+    `x in undefined` -- raises, like StrictUndefined (AnsibleUndefined)."""
+
+    __str__ = __iter__ = __len__ = __eq__ = __ne__ = __bool__ = __hash__ = \
+        jinja2.Undefined._fail_with_undefined_error
+    __nonzero__ = __bool__
+
+    def __html__(self):
+        self._fail_with_undefined_error()
 
     def __contains__(self, item):
         self._fail_with_undefined_error()
+
+
+class _AnsirollContext(jinja2.runtime.Context):
+    """Template variables are templated lazily when a template looks them up.
+
+    Like Ansible's AnsibleJ2Vars (<= 2.18) and lazy templating (2.19+), a
+    trusted variable value that is itself a template renders on access; data
+    marked as never-templated (results, facts, rendered output) is returned
+    verbatim.  Names bound inside the template itself are never touched."""
+
+    def resolve_or_missing(self, key):
+        if key in self.vars:
+            return self.vars[key]
+        if key not in self.parent:
+            return jinja2.runtime.missing
+        value = self.parent[key]
+        templater = getattr(self.environment, "_ansiroll_templater", None)
+        if templater is None or str(key).startswith("__ansiroll"):
+            return value
+        return templater.resolve_variable(key, value, self.parent)
 
 
 class _PluginDict(dict):
@@ -872,7 +1026,6 @@ class _Templater:
     def __init__(self):
         self._expr_cache = {}
         self._template_cache = {}
-        self._embedded_constant_cache = {}
         self._current_ctx = {}
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
@@ -883,6 +1036,10 @@ class _Templater:
             keep_trailing_newline=True,
             finalize=_concretize,
         )
+        self.env.context_class = _AnsirollContext
+        self.env._ansiroll_templater = self
+        self._resolving = []        # variable templates being rendered (cycles)
+        self._runtime = None        # bound by Runtime for lazy containers
         filters = _PluginDict("filter", self._plugin_errors["filter"])
         filters.update(self.env.filters)
         self.env.filters = filters
@@ -902,15 +1059,30 @@ class _Templater:
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
 
+    def _lookup_ctx(self, name, terms):
+        """The vars lookup templates trusted values like a variable reference."""
+        ctx = self._current_ctx
+        if str(name).rsplit(".", 1)[-1] != "vars" or not isinstance(ctx, dict):
+            return ctx
+        view = dict(ctx)
+        for term in terms:
+            key = str(term)
+            if key in ctx and not key.startswith("__ansiroll"):
+                view[key] = self.resolve_variable(key, ctx[key], ctx)
+        return view
+
     def _g_lookup(self, name, *a, **k):
         try:
             a = tuple(self._template_lookup_arg(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
-            return _lookup(name, *a, _ansiroll_ctx=self._current_ctx, **k)
+            # Lookup output is data and is never templated again.
+            return _mark_unsafe(
+                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
                 return vals
+            vals = _mark_unsafe(vals)
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
@@ -921,9 +1093,11 @@ class _Templater:
         try:
             a = tuple(self._template_lookup_arg(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
-            return _query(name, *a, _ansiroll_ctx=self._current_ctx, **k)
+            return _mark_unsafe(
+                _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
-            return self._plugin_lookup(name, a, k)
+            vals = self._plugin_lookup(name, a, k)
+            return vals if _is_undef(vals) else _mark_unsafe(vals)
         except Exception as e:
             return _captured(str(e))
 
@@ -1000,12 +1174,45 @@ class _Templater:
             return _captured("lookup plugin '%s' failed to load: %s" % (name, e))
         return self._plugin_lookup(name, args, kwargs)
 
+    def resolve_variable(self, key, value, ctx):
+        """Template a variable's trusted value when a template references it."""
+        if type(value) is str and ("{{" in value or "{%" in value):
+            marker = (key, value)
+            if marker in self._resolving:
+                return _captured("Recursive loop detected in template: %s" % value)
+            self._resolving.append(marker)
+            try:
+                return self.render_string(value, ctx)
+            finally:
+                self._resolving.pop()
+        if self._runtime is not None and type(value) in (dict, list):
+            return _lazy_container(value, self._runtime, ctx)
+        return value
+
     def render_string(self, text, ctx, _depth=0):
-        if not isinstance(text, str):
+        if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if "{{" not in text and "{%" not in text:
             return text
+        previous = self._current_ctx
         self._current_ctx = ctx
+        try:
+            result = self._render_string(text, ctx)
+        finally:
+            # A nested render (a lazily templated variable, a lookup term)
+            # must not leave its context behind for the outer template.
+            self._current_ctx = previous
+        if isinstance(result, _UntrustedConditionValue):
+            return result
+        if isinstance(result, str):
+            # Rendered output is data: like Ansible, it is never templated
+            # again (trusted variable values are templated when looked up).
+            return (_UnsafeText(result) if _looks_templated(result)
+                    else str(result) if isinstance(result, _UnsafeTemplate)
+                    else result)
+        return result
+
+    def _render_string(self, text, ctx):
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
@@ -1054,34 +1261,6 @@ class _Templater:
             return _captured_jinja_error(
                 e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
             )
-        if isinstance(result, _UnsafeTemplate):
-            return str(result)
-        # Resolve nested templates (a var whose value is itself a template), like
-        # Ansible -- re-render until stable; a self-referencing template is a
-        # recursion error (captured, so it fails where it is used).
-        if (isinstance(result, str)
-                and "{% raw" not in text and "{% endraw" not in text
-                and ("{{" in result or "{%" in result)
-                and not self._has_embedded_template_constant(text)):
-            if result == text or _depth >= 10:
-                return _captured("Recursive loop detected in template: %s" % text)
-            return self.render_string(result, ctx, _depth + 1)
-        return result
-
-    def _has_embedded_template_constant(self, text):
-        """Whether Jinja source contains a literal string that looks templated."""
-        cached = self._embedded_constant_cache.get(text)
-        if cached is not None:
-            return cached
-        try:
-            parsed = self.env.parse(text)
-        except jinja2.TemplateSyntaxError:
-            result = False
-        else:
-            result = any(isinstance(node.value, str)
-                         and ("{{" in node.value or "{%" in node.value)
-                         for node in parsed.find_all(jinja2.nodes.Const))
-        self._embedded_constant_cache[text] = result
         return result
 
     def evaluate(self, expr, ctx):
@@ -1089,12 +1268,16 @@ class _Templater:
         if isinstance(expr, bool):
             return expr
         expr = str(expr)
+        previous = self._current_ctx
         self._current_ctx = ctx
-        compiled = self._expr_cache.get(expr)
-        if compiled is None:
-            compiled = self.env.compile_expression(expr, undefined_to_none=False)
-            self._expr_cache[expr] = compiled
-        return compiled(**ctx)
+        try:
+            compiled = self._expr_cache.get(expr)
+            if compiled is None:
+                compiled = self.env.compile_expression(expr, undefined_to_none=False)
+                self._expr_cache[expr] = compiled
+            return compiled(**ctx)
+        finally:
+            self._current_ctx = previous
 
 
 def _is_undef(v):
@@ -1105,7 +1288,10 @@ def _as_text(v):
     """Coerce a rendered value to text for writing to a file."""
     if isinstance(v, str):
         return v
-    if _is_undef(v) or v is None:
+    if _is_undef(v):
+        # A captured render error or undefined value fails, never writes "".
+        v._fail_with_undefined_error()
+    if v is None:
         return ""
     if isinstance(v, (dict, list)):
         return json.dumps(v)
@@ -1246,6 +1432,7 @@ class Runtime:
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
         self.templater = _Templater()
+        self.templater._runtime = self
         self.handlers = []
         self.notified = []  # ordered, de-duplicated handler names
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
@@ -1281,7 +1468,7 @@ class Runtime:
     def _store_register(self, task, result):
         name = task.get("register")
         if name:
-            self.vars[name] = result
+            self.vars[name] = _mark_unsafe(result)
             self._untrusted_runtime_vars.add(name)
 
     def template(self, value, ctx, _seen=None):
@@ -1305,9 +1492,10 @@ class Runtime:
         if isinstance(value, str):
             out = self.templater.render_string(value, ctx)
             if isinstance(out, (dict, list)) and out is not value:
-                # A bare expression returned a container that may hold raw
-                # (lazily deferred) templates -- resolve them now that it is used.
-                out = self.template(out, ctx, _seen)
+                # A bare expression returned a container that may hold lazy
+                # variable views -- resolve them now that it is used.  The
+                # result is data and is never templated again.
+                out = _mark_unsafe(out)
             return out
         return value
 
@@ -1340,85 +1528,87 @@ class Runtime:
         return out
 
     def when(self, conds, ctx, strict=False):
+        """All conditions true?  An evaluation error raises: the raw error in
+        strict mode (changed_when/failed_when), else ConditionalError, which
+        fails the task like Ansible instead of silently skipping it."""
         for cond in (conds or []):
-            if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
-                raise UntrustedConditional(
-                    "Encountered untrusted template or expression."
-                )
-            if (
-                    isinstance(cond, dict)
-                    and set(cond) == {"__ansiroll_untrusted_condition__"}):
-                raise UntrustedConditional(
-                    "Encountered untrusted template or expression."
-                )
-            trusted_template = (isinstance(cond, dict)
-                                and set(cond) == {"__ansiroll_trusted_condition__"})
-            if trusted_template:
-                cond = cond["__ansiroll_trusted_condition__"]
-            # Like Ansible, refuse conditionals with embedded templates: the
-            # expression may come from untrusted data (template injection).
-            if isinstance(cond, str) and ("{{" in cond or "{%" in cond):
-                if not trusted_template:
-                    raise UntrustedConditional(
-                        "Conditional %r is an untrusted template or expression and "
-                        "cannot be evaluated." % cond)
-                try:
-                    from jinja2 import meta as jinja_meta
-                    referenced = jinja_meta.find_undeclared_variables(
-                        self.templater.env.parse(cond)
-                    )
-                except Exception:
-                    referenced = ()
-                if any(
-                        name in ctx
-                        and (
-                            name in self._untrusted_runtime_vars
-                            or _contains_untrusted_condition_value(ctx[name])
-                        )
-                        for name in referenced):
-                    raise UntrustedConditional(
-                        "Encountered untrusted template or expression."
-                    )
-                result = self.templater.render_string(cond, ctx)
-                # Assert accepts an indirected list of expressions (for
-                # example `that: "{{ expression_list }}"`). Evaluate the
-                # resolved members as conditions rather than treating the
-                # non-empty list itself as truthy.
-                if isinstance(result, (list, tuple)):
-                    if not self.when(list(result), ctx, strict=strict):
-                        return False
-                    continue
-                if isinstance(result, (_UnsafeTemplate, _UntrustedConditionValue)):
-                    raise UntrustedConditional(
-                        "Encountered untrusted template or expression."
-                    )
-                if isinstance(result, str) and result.strip().lower() not in (
-                        "true", "false"):
-                    if re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S):
-                        raise UntrustedConditional(
-                            "Encountered untrusted template or expression."
-                        )
-                    result = self.templater.evaluate(result, ctx)
-                if strict and _is_undef(result):
-                    raise RuntimeError(
-                        "The conditional check %r failed: the expression is undefined" % cond)
-                if not self._condition_truth(result, ctx):
-                    return False
-                continue
             try:
-                result = self.templater.evaluate(cond, ctx)
-                if strict and _is_undef(result):
-                    raise RuntimeError(
-                        "The conditional check %r failed: the expression is undefined" % cond)
-                if not self._condition_truth(result, ctx):
+                if not self._condition(cond, ctx, strict):
                     return False
-            except UntrustedConditional:
+            except (UntrustedConditional, ConditionalError):
                 raise
-            except Exception:
+            except Exception as ex:
                 if strict:
                     raise
-                return False
+                raise ConditionalError(_conditional_error_message(cond, ex))
         return True
+
+    def _condition(self, cond, ctx, strict=False):
+        if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
+            raise UntrustedConditional(
+                "Encountered untrusted template or expression."
+            )
+        if (
+                isinstance(cond, dict)
+                and set(cond) == {"__ansiroll_untrusted_condition__"}):
+            raise UntrustedConditional(
+                "Encountered untrusted template or expression."
+            )
+        trusted_template = (isinstance(cond, dict)
+                            and set(cond) == {"__ansiroll_trusted_condition__"})
+        if trusted_template:
+            cond = cond["__ansiroll_trusted_condition__"]
+        # Like Ansible, refuse conditionals with embedded templates: the
+        # expression may come from untrusted data (template injection).
+        if isinstance(cond, str) and ("{{" in cond or "{%" in cond):
+            if not trusted_template:
+                raise UntrustedConditional(
+                    "Conditional %r is an untrusted template or expression and "
+                    "cannot be evaluated." % cond)
+            try:
+                from jinja2 import meta as jinja_meta
+                referenced = jinja_meta.find_undeclared_variables(
+                    self.templater.env.parse(cond)
+                )
+            except Exception:
+                referenced = ()
+            if any(
+                    name in ctx
+                    and (
+                        name in self._untrusted_runtime_vars
+                        or _contains_untrusted_condition_value(ctx[name])
+                    )
+                    for name in referenced):
+                raise UntrustedConditional(
+                    "Encountered untrusted template or expression."
+                )
+            result = self.templater.render_string(cond, ctx)
+            # Assert accepts an indirected list of expressions (for
+            # example `that: "{{ expression_list }}"`). Evaluate the
+            # resolved members as conditions rather than treating the
+            # non-empty list itself as truthy.
+            if isinstance(result, (list, tuple)):
+                return self.when(list(result), ctx, strict=strict)
+            if isinstance(result, (_UnsafeTemplate, _UntrustedConditionValue)):
+                raise UntrustedConditional(
+                    "Encountered untrusted template or expression."
+                )
+            if isinstance(result, str) and result.strip().lower() not in (
+                    "true", "false"):
+                if re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S):
+                    raise UntrustedConditional(
+                        "Encountered untrusted template or expression."
+                    )
+                result = self.templater.evaluate(result, ctx)
+            if strict and _is_undef(result):
+                raise RuntimeError(
+                    "The conditional check %r failed: the expression is undefined" % cond)
+            return self._condition_truth(result, ctx)
+        result = self.templater.evaluate(cond, ctx)
+        if strict and _is_undef(result):
+            raise RuntimeError(
+                "The conditional check %r failed: the expression is undefined" % cond)
+        return self._condition_truth(result, ctx)
 
     def _condition_truth(self, result, ctx):
         if isinstance(result, bool):
@@ -1430,10 +1620,10 @@ class Runtime:
             config = ctx.get("__ansiroll_controller_config") or {}
             if _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False)):
                 return bool(result)
-            raise RuntimeError(
-                "Conditional result was derived from value of type '%s'. "
+            raise _BrokenConditional(
+                "Conditional result (%s) was derived from value of type '%s'. "
                 "Conditionals must have a boolean result."
-                % type(result).__name__
+                % (bool(result), type(result).__name__)
             )
         return _to_bool(result)
 
@@ -1553,7 +1743,7 @@ class Runtime:
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):
                 play_check_mode = self.template(play_check_mode, self.ctx())
-            self.check_mode = _to_bool(play_check_mode)
+            self.check_mode = _boolean(play_check_mode)
         if play.get("jinja_plugins"):
             plugins = []
             for plugin in play["jinja_plugins"]:
@@ -1628,7 +1818,7 @@ class Runtime:
         b = bool(node.get("become")) or become
         try:
             run_it = self.when(node.get("when"), base_ctx)
-        except UntrustedConditional as ex:
+        except (UntrustedConditional, ConditionalError) as ex:
             self.emit(node, "failed", {"failed": True, "changed": False, "msg": str(ex)})
             self._tally("failures")
             result = {"failed": True, "changed": False, "msg": str(ex)}
@@ -1660,7 +1850,12 @@ class Runtime:
     def run_block(self, block, overlay, become=False):
         scope = dict(overlay)
         scope.update(self.template_vars(block.get("vars"), self.ctx(overlay)))
-        if not self.when(block.get("when"), self.ctx(scope)):
+        try:
+            run_it = self.when(block.get("when"), self.ctx(scope))
+        except ConditionalError as ex:
+            self._fail_block_condition(block, scope, ex)
+            return
+        if not run_it:
             b_become = bool(block.get("become")) or become
             self._skip_nodes(block.get("block", []), scope, b_become)
             if block.get("always"):
@@ -1704,6 +1899,21 @@ class Runtime:
                     failed_exc.counted = True
             else:
                 raise failed_exc
+
+    def _fail_block_condition(self, block, overlay, error):
+        """A block's `when` is inherited by its tasks: Ansible reports the
+        evaluation error as a failure of the first task it reaches."""
+        nodes = list(block.get("block") or [])
+        while nodes and nodes[0].get("type") == "block":
+            nodes = list(nodes[0].get("block") or []) + nodes[1:]
+        task = nodes[0] if nodes else {"name": block.get("name")}
+        result = {"failed": True, "changed": False, "msg": str(error)}
+        self.emit_start(task)
+        self.emit(task, "failed", result)
+        self._tally("failures")
+        exc = TaskFailed(task.get("name"), task, result)
+        exc.counted = True
+        raise exc
 
     def _skip_nodes(self, nodes, overlay, become=False):
         for node in nodes:
@@ -1841,7 +2051,7 @@ class Runtime:
             try:
                 if isinstance(run_once, str):
                     run_once = self.template(run_once, base_ctx)
-                if _to_bool(run_once):
+                if _boolean(run_once):
                     # Ansible emits no skipped event for hosts which do not
                     # execute a run_once task.
                     return
@@ -1852,9 +2062,9 @@ class Runtime:
 
         ignore = task.get("ignore_errors", False)
         if isinstance(ignore, str):
-            ignore = _to_bool(self.template(ignore, base_ctx))
+            ignore = _boolean(self.template(ignore, base_ctx))
         else:
-            ignore = _to_bool(ignore)
+            ignore = _boolean(ignore)
         loop = task.get("loop", None)
         if loop is not None:
             # A literal-false task conditional short-circuits loop templating.
@@ -1897,7 +2107,7 @@ class Runtime:
         else:
             try:
                 run_it = self.when(task.get("when"), base_ctx)
-            except UntrustedConditional as ex:
+            except (UntrustedConditional, ConditionalError) as ex:
                 run_it = None
                 res = {"failed": True, "changed": False, "msg": str(ex)}
             if run_it is False:
@@ -1966,10 +2176,16 @@ class Runtime:
             ctx.update(self._loop_item_vars(task, items, i, base_ctx))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
-            if not self.when(task.get("when"), ctx):
+            try:
+                run_it = self.when(task.get("when"), ctx)
+            except ConditionalError as ex:
+                # Ansible evaluates `when` per item; an error fails the item.
+                run_it = None
+                res = {"failed": True, "changed": False, "msg": str(ex)}
+            if run_it is False:
                 res = {"skipped": True, "changed": False,
                        "skip_reason": "Conditional result was False"}
-            else:
+            elif run_it:
                 any_ran = True
                 res = self._exec_with_retries(task, ctx, become)
                 self._absorb_facts(task, res)
@@ -2004,7 +2220,13 @@ class Runtime:
                 bctx = dict(ctx)
                 if task.get("register"):
                     bctx[task["register"]] = res
-                if self.when(bw, bctx):
+                try:
+                    stop = self.when(bw, bctx)
+                except ConditionalError as ex:
+                    agg["failed"] = True
+                    agg["msg"] = str(ex)
+                    stop = True
+                if stop:
                     break
         if not items:
             # Ansible reports a loop that resolves to no items as skipped.
@@ -2027,6 +2249,10 @@ class Runtime:
             return None
 
     def _resolve_loop(self, loop, ctx):
+        # Loop items are data; Ansible never templates an item's value again.
+        return _mark_unsafe(self._resolve_loop_items(loop, ctx))
+
+    def _resolve_loop_items(self, loop, ctx):
         if isinstance(loop, dict) and "__ansiroll_lookup" in loop:
             name = loop["__ansiroll_lookup"]
             if name == "sequence":
@@ -2078,7 +2304,13 @@ class Runtime:
             if task.get("register"):
                 eval_ctx[task["register"]] = res
             last = res
-            if self.when(until, eval_ctx):
+            try:
+                done = self.when(until, eval_ctx)
+            except ConditionalError as ex:
+                res["failed"] = True
+                res["msg"] = str(ex)
+                return res
+            if done:
                 return res
             if attempt < attempts and delay > 0:
                 time.sleep(delay)
@@ -2102,7 +2334,7 @@ class Runtime:
             if check_override is not None:
                 if isinstance(check_override, str):
                     check_override = self.template(check_override, ctx)
-                self.check_mode = _to_bool(check_override)
+                self.check_mode = _boolean(check_override)
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -2167,6 +2399,8 @@ class Runtime:
             self._module_env = None
             self.check_mode = inherited_check_mode
             self.become_user = inherited_become_user
+        # Module output is data, never a template (Ansible marks it unsafe).
+        res = _mark_unsafe(res)
         self._apply_overrides(task, res, ctx)
         if self.profile:
             module_profile = res.get("_ansiroll_profile") or {}
@@ -2198,7 +2432,7 @@ class Runtime:
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
         name = str(task.get("action") or "").split(".")[-1]
-        if name != "unarchive" or _to_bool(args.get("remote_src", False)):
+        if name != "unarchive" or _boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         marker = (task.get("_baked") or {}).get(src)
@@ -2340,7 +2574,7 @@ class Runtime:
                 _trust_set_fact_value(k): _trust_set_fact_value(v)
                 for k, v in args.items() if k not in ("cacheable",)
             }
-            cacheable = _to_bool(args.get("cacheable", False))
+            cacheable = _boolean(args.get("cacheable", False))
             reserved = ("true", "false", "yes", "no", "on", "off", "none", "null")
             for k in facts:
                 if not isinstance(k, str):
@@ -2366,7 +2600,10 @@ class Runtime:
             tests = (task.get("args") or {}).get("that", args.get("that", []))
             if isinstance(tests, str):
                 tests = [tests]
-            ok = self.when(tests, ctx)
+            try:
+                ok = self.when(tests, ctx)
+            except ConditionalError as ex:
+                return {"failed": True, "changed": False, "msg": str(ex)}
             if ok:
                 return {"changed": False, "msg": args.get("success_msg", "All assertions passed")}
             return {"failed": True, "changed": False,
@@ -2623,6 +2860,8 @@ class Runtime:
             self.vars.update(refreshed_vars)
         facts = res.get("ansible_facts")
         if isinstance(facts, dict):
+            # Facts are module output: never templated (Ansible marks them unsafe).
+            facts = _mark_unsafe(facts)
             self.vars.update(facts)
             if str(task.get("action") or "").rsplit(".", 1)[-1] == "set_fact":
                 self._runtime_var_overrides.update(facts)
@@ -3343,7 +3582,7 @@ def agent_main():
         host_vars.update(g["_INJECTED_VARS"])
     extra_vars = g.get("_INJECTED_EXTRA_VARS") or {}
     host_var_overrides = g.get("_INJECTED_HOST_VAR_OVERRIDES") or {}
-    specialized_vars = g.get("_SPECIALIZED_VARS") or {}
+    specialized_vars = _decode_wire_data(g.get("_SPECIALIZED_VARS") or {})
     conflicts = sorted(k for k, value in specialized_vars.items()
                        if k in extra_vars and extra_vars[k] != value)
     if conflicts:

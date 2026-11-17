@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from ansiroll.runtime import Runtime, UntrustedConditional, _parse_output
+from ansiroll.runtime import (
+    ConditionalError, Runtime, UntrustedConditional, _parse_output,
+)
 
 
 def _task(uuid, name, special, **kw):
@@ -397,7 +399,12 @@ def test_broken_conditional_config_controls_string_truthiness(
         }
     })
 
-    assert rt.when(["'broken static'"], disabled) is False
+    if core_2_20_or_newer:
+        # ansible-core 2.20+ fails the task on a non-boolean conditional.
+        with pytest.raises(ConditionalError, match="must have a boolean"):
+            rt.when(["'broken static'"], disabled)
+    else:
+        assert rt.when(["'broken static'"], disabled) is False
     assert rt.when(["'broken static'"], enabled) is expected_when_enabled
 
 

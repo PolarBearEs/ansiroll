@@ -76,6 +76,7 @@ if __name__ == "__main__":
     _pretty = os.environ.get("ANSIROLL_RAW", "").lower() not in ("1", "true", "yes")
     _profile = os.environ.get("ANSIROLL_PROFILE", "").lower() in ("1", "true", "yes", "on")
     _native_only = os.environ.get("ANSIROLL_NATIVE_ONLY", "").lower() in ("1", "true", "yes", "on")
+    _SPECIALIZED_VARS = _decode_wire_data(_SPECIALIZED_VARS)
     _conflicts = sorted(k for k, v in _SPECIALIZED_VARS.items()
                         if k in _extra_vars and _extra_vars[k] != v)
     if _conflicts:
@@ -139,9 +140,14 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
         _mark_unsupported(plays, unsupported_actions)
 
     fallbacks = _collect_fallbacks(plays)
+    # Frozen values were already rendered here; ship them as data so the
+    # runtime does not template them a second time.
+    shipped_vars = {name: _encode_rendered(value)
+                    for name, value in frozen_vars.items()}
+    shipped_vars.update(extra_vars or {})
     source, bundle_stats = _render_source_with_stats(
         plays, modules, embedder.ansiballz_code or "", group_vars,
-        specialized_vars=specialized_vars,
+        specialized_vars=shipped_vars,
     )
     manifest = {
         "version": 2,
@@ -184,6 +190,19 @@ def _contains_undefined(value):
     if isinstance(value, (list, tuple)):
         return any(_contains_undefined(v) for v in value)
     return False
+
+
+def _encode_rendered(value):
+    """Wire form of a rendered value: template-looking text is data."""
+    if isinstance(value, str):
+        if "{{" in value or "{%" in value:
+            return {"__ansiroll_data__": str(value)}
+        return value
+    if isinstance(value, dict):
+        return {k: _encode_rendered(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_rendered(v) for v in value]
+    return value
 
 
 def _freeze_value(value, context):
