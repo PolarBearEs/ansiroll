@@ -51,7 +51,8 @@ def _ansible(playbook, *args, strategy="linear"):
     env = dict(_env(), ANSIBLE_STRATEGY=strategy)
     proc = subprocess.run(
         [os.path.join(os.path.dirname(sys.executable), "ansible-playbook"),
-         "-i", "localhost,", "-c", "local", str(playbook)] + list(args),
+         "-i", "localhost,", "-c", "local",
+         "-e", "ansible_python_interpreter=" + sys.executable, str(playbook)] + list(args),
         cwd=str(playbook.parent), env=env, capture_output=True, text=True,
     )
     return _summary(proc.stdout)
