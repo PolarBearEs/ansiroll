@@ -1793,14 +1793,15 @@ class Runtime:
                 )
             if isinstance(result, str):
                 whole_template = re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S)
-                if whole_template or result.strip().lower() not in ("true", "false"):
-                    if whole_template:
-                        raise UntrustedConditional(
-                            "Encountered untrusted template or expression."
-                        )
-                    result = self.templater.evaluate(result, ctx)
-                else:
+                boolean_text = result.strip().lower() in ("true", "false")
+                if whole_template and (modern or not boolean_text):
+                    raise UntrustedConditional(
+                        "Encountered untrusted template or expression."
+                    )
+                if boolean_text:
                     result = _to_bool(result)
+                else:
+                    result = self.templater.evaluate(result, ctx)
             if strict and _is_undef(result):
                 raise RuntimeError(
                     "The conditional check %r failed: the expression is undefined" % cond)

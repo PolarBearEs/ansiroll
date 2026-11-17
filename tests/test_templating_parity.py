@@ -445,6 +445,22 @@ def test_ternary_regex_replace_and_keyword_booleans(tmp_path):
     assert msgs[:4] == ["T,T,F,F", "False,False,True", "X\nX", "X X"]
 
 
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy boolean-string conditionals")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_legacy_boolean_strings_in_inline_conditions(tmp_path, use_strategy):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: accepted}
+      when: "{{ 'true' }}"
+    - debug: {msg: skipped}
+      when: "{{ 'false' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["accepted"]
+    assert recap == ("1", "0", "0", "0", "1", "0", "0")
+
+
 def test_lazy_container_operations_resolve_nested_values_once(tmp_path):
     msgs, _ = _assert_parity(tmp_path, """
 - hosts: localhost
