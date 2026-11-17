@@ -36,18 +36,36 @@ def _env():
 def _run_both(tmp_path, playbook_text, timeout=120):
     play = tmp_path / "play.yml"
     play.write_text(playbook_text.replace("@JOBS@", str(tmp_path / "async-jobs")))
+    compiled = tmp_path / "play_compiled.py"
+    subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(play), "-o", str(compiled)],
+        cwd=str(tmp_path), env=_env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, timeout=timeout,
+    )
     runs = {
         "ansible": ["ansible-playbook", "-i", "localhost,", "-c", "local", str(play)],
-        "ansiroll": [sys.executable, "-m", "ansiroll.cli", "run", str(play)],
+        "ansiroll": [sys.executable, str(compiled)],
     }
     for name, cmd in runs.items():
-        proc = subprocess.run(
-            cmd, cwd=str(tmp_path), env=_env(), stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, timeout=timeout,
-        )
-        assert proc.returncode == 0 and "failed=0" in proc.stdout, (
-            "%s run failed:\n%s" % (name, proc.stdout))
+        log = tmp_path / ("%s.log" % name)
+        with open(str(log), "w") as out:
+            # Keep our end of stdin open for the whole run: modules must not
+            # see (or block on) the caller's stdin.
+            proc = subprocess.Popen(
+                cmd, cwd=str(tmp_path), env=_env(), stdin=subprocess.PIPE,
+                stdout=out, stderr=subprocess.STDOUT,
+            )
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                returncode = "timeout"
+            finally:
+                proc.stdin.close()
+        output = log.read_text()
+        assert returncode == 0 and "failed=0" in output, (
+            "%s run failed (%s):\n%s" % (name, returncode, output))
 
 
 STDIN_PLAY = """
@@ -75,9 +93,9 @@ STDIN_PLAY = """
 
 
 def test_module_children_read_eof_stdin_like_ansible(tmp_path):
-    # Runs under a terminal-less, already-EOF stdin of its own; the agent
-    # must still give module children an EOF pipe, never its own stdin.
-    _run_both(tmp_path, STDIN_PLAY)
+    # The agent's own stdin stays open; module children must still get an
+    # already-closed pipe, never the agent's stdin.
+    _run_both(tmp_path, STDIN_PLAY, timeout=60)
 
 
 def _worker_runtime(action):
@@ -259,12 +277,15 @@ def test_worker_stderr_does_not_block_on_a_live_worker():
     meta = dict(ModuleEmbedder().embed("ping"))
     meta["zip"] = "!!not-base64!!"
     rt = Runtime({"ping": meta}, "", {"inventory_hostname": "localhost"})
-    previous = _with_alarm(20)
+    previous = _with_alarm(30)
+    started = time.monotonic()
     try:
         res = rt.run_module("ping", {})
     finally:
+        elapsed = time.monotonic() - started
         _clear_alarm(previous)
         rt.cleanup()
+    assert elapsed < 10
     assert res["failed"] is True
     assert "worker load failed" in res["msg"]
 
