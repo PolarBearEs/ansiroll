@@ -799,12 +799,51 @@ class _HandlerNameVars(_LazyTplDict):
             self._resolving.remove(key)
 
 
-class _StrictTemplateContext(jinja2.runtime.Context):
+class _PlayVarTemplate(str):
+    """Source of a top-level play variable, resolved in the consuming context."""
+
+
+class _PlayVarScope(dict):
+    """Cache referenced play templates for a single Jinja evaluation."""
+
+    def __init__(self, ctx, templater, strict):
+        super().__init__(ctx)
+        self["vars"] = self
+        self.templater = templater
+        self.strict = strict
+        self.resolving = set()
+        self.resolved = {}
+        self.accesses = 0
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if not isinstance(value, _PlayVarTemplate):
+            return value
+        self.accesses += 1
+        if key in self.resolving:
+            return _captured("Recursive loop detected in play variable: %s" % key)
+        if key not in self.resolved:
+            self.resolving.add(key)
+            try:
+                self.resolved[key] = self.templater.render_string(
+                    value, self, strict=self.strict)
+            finally:
+                self.resolving.remove(key)
+        return self.resolved[key]
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+
+class _TemplateContext(jinja2.runtime.Context):
     def resolve_or_missing(self, key):
+        value = super().resolve_or_missing(key)
         scope = self.parent.get("vars")
         if key not in self.vars and isinstance(scope, _HandlerNameVars) and key in scope:
             return scope[key]
-        return jinja2.runtime.Context.resolve_or_missing(self, key)
+        if isinstance(value, _PlayVarTemplate) and isinstance(scope, _PlayVarScope):
+            return scope[key]
+        return value
 
 
 class _LazyTplList(list):
@@ -961,6 +1000,7 @@ class _Templater:
             keep_trailing_newline=True,
             finalize=_concretize,
         )
+        self.env.context_class = _TemplateContext
         filters = _PluginDict("filter", self._plugin_errors["filter"])
         filters.update(self.env.filters)
         self.env.filters = filters
@@ -980,7 +1020,6 @@ class _Templater:
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
         self._strict_env = self.env.overlay(undefined=_StrictAnsirollUndefined)
-        self._strict_env.context_class = _StrictTemplateContext
 
     def _g_lookup(self, name, *a, **k):
         try:
@@ -1080,13 +1119,31 @@ class _Templater:
             return _captured("lookup plugin '%s' failed to load: %s" % (name, e))
         return self._plugin_lookup(name, args, kwargs)
 
+    def _play_var_scope(self, ctx, strict):
+        if isinstance(ctx, _PlayVarScope):
+            return ctx
+        if any(isinstance(value, _PlayVarTemplate) for value in ctx.values()):
+            return _PlayVarScope(ctx, self, strict)
+        return ctx
+
     def render_string(self, text, ctx, _depth=0, strict=False):
         if not isinstance(text, str):
             return text
         if "{{" not in text and "{%" not in text:
             return text
+        ctx = self._play_var_scope(ctx, strict)
+        previous = self._current_ctx
         scope = ctx.get("vars")
         self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
+        try:
+            return self._render_string(text, ctx, _depth, strict)
+        finally:
+            self._current_ctx = previous
+
+    def _render_string(self, text, ctx, _depth, strict):
+        scope = ctx.get("vars")
+        play_scope = ctx if isinstance(ctx, _PlayVarScope) else None
+        accesses = play_scope.accesses if play_scope is not None else 0
         env = self._strict_env if strict else self.env
         template_key = (text, strict)
         stripped = text.strip()
@@ -1107,7 +1164,9 @@ class _Templater:
                 # Captured, not raised: surfaces when the value is used (or is
                 # inspected via dump_object), like Ansible 2.19.
                 return _captured_jinja_error(e, syntax=True)
-            except Exception:
+            except Exception as e:
+                if strict and isinstance(e, jinja2.UndefinedError):
+                    return _captured_jinja_error(e)
                 try:
                     tmpl = self._template_cache.get(template_key)
                     if tmpl is None:
@@ -1142,11 +1201,12 @@ class _Templater:
             return str(result)
         if strict and isinstance(result, _UntrustedConditionValue):
             return result
-        # Handler name variables resolve before interpolation. Their rendered
-        # output can contain template-looking text from untrusted data.
-        # Other callers still use recursive rendering for indirect variables.
+        # Play and handler template sources resolve on access. Output from
+        # those evaluations can contain delimiters from ordinary data.
         if (isinstance(result, str)
                 and not isinstance(scope, _HandlerNameVars)
+                and (play_scope is None or (
+                    not play_scope.resolving and play_scope.accesses == accesses))
                 and "{% raw" not in text and "{% endraw" not in text
                 and ("{{" in result or "{%" in result)
                 and not self._has_embedded_template_constant(text)):
@@ -1176,14 +1236,19 @@ class _Templater:
         if isinstance(expr, bool):
             return expr
         expr = str(expr)
-        self._current_ctx = ctx
+        ctx = self._play_var_scope(ctx, strict)
         expr_key = (expr, True) if strict else expr
         compiled = self._expr_cache.get(expr_key)
         if compiled is None:
             env = self._strict_env if strict else self.env
             compiled = env.compile_expression(expr, undefined_to_none=False)
             self._expr_cache[expr_key] = compiled
-        return compiled(**ctx)
+        previous = self._current_ctx
+        self._current_ctx = ctx
+        try:
+            return compiled(**ctx)
+        finally:
+            self._current_ctx = previous
 
 
 def _is_undef(v):
@@ -1310,8 +1375,6 @@ class Runtime:
             "worker_startup": 0.0,
         }
         self.extra_vars = dict(extra_vars or {})
-        self._play_var_templates = {}
-        self._runtime_var_overrides = set(self.extra_vars)
         # The controller passes its nonpersistent fact cache separately from
         # the flattened host snapshot. Those values (set_fact/register) outrank
         # play vars, a distinction that is otherwise lost after serialization.
@@ -1380,12 +1443,10 @@ class Runtime:
             self.vars[name] = result
             self._untrusted_runtime_vars.add(name)
             # Registered vars live in the nonpersistent fact cache, like
-            # set_fact: they outrank play/role/block/task vars and must not
-            # be replaced by a lazily re-rendered play var.
-            self._runtime_var_overrides.add(name)
+            # set_fact: they outrank play/role/block/task vars.
             self._set_fact_overrides[name] = result
 
-    def template(self, value, ctx, _seen=None, strict=False):
+    def template(self, value, ctx, _seen=None, strict=False, _rendered=False):
         if isinstance(value, (dict, list)):
             if _seen is None:
                 _seen = set()
@@ -1393,6 +1454,9 @@ class Runtime:
                 return value
             _seen.add(id(value))
         if isinstance(value, dict):
+            if _rendered:
+                return {k: self.template(v, ctx, _seen, strict, _rendered=True)
+                        for k, v in value.items()}
             if set(value.keys()) == {"__ansiroll_unsafe__"}:
                 return _UntrustedConditionValue(
                     value["__ansiroll_unsafe__"]
@@ -1402,38 +1466,31 @@ class Runtime:
             return {self.template(k, ctx, _seen, strict=strict) if isinstance(k, str) and "{{" in k else k:
                     self.template(v, ctx, _seen, strict=strict) for k, v in value.items()}
         if isinstance(value, list):
-            return [self.template(v, ctx, _seen, strict=strict) for v in value]
-        if isinstance(value, str):
+            return [self.template(v, ctx, _seen, strict, _rendered) for v in value]
+        if isinstance(value, str) and not _rendered and ("{{" in value or "{%" in value):
+            ctx = self.templater._play_var_scope(ctx, strict)
+            accesses = ctx.accesses if isinstance(ctx, _PlayVarScope) else 0
             out = self.templater.render_string(value, ctx, strict=strict)
             if isinstance(out, (dict, list)) and out is not value:
-                # A bare expression returned a container that may hold raw
-                # (lazily deferred) templates -- resolve them now that it is used.
-                out = self.template(out, ctx, _seen, strict=strict)
+                # Access can resolve trusted lazy members. Ordinary strings
+                # inside an evaluated alias result are already data.
+                rendered = isinstance(ctx, _PlayVarScope) and ctx.accesses != accesses
+                out = self.template(out, ctx, _seen, strict, _rendered=rendered)
             return out
         return value
 
     def template_vars(self, d, ctx, dynamic=False):
-        """Template a vars mapping lazily: top-level strings render now (with
-        sibling vars visible), but containers become lazy wrappers that render
-        values only on access (side-effect laziness, like Ansible 2.19).
-
-        Dynamic play vars may legitimately refer to variables that are only
-        available to a later, tag-selected task.  Preserve those expressions
-        until the task context refreshes them instead of failing while merely
-        entering a play with no executable tasks.
-        """
+        """Prepare variables with lazy containers and deferred play templates."""
         d = d or {}
         base = dict(ctx)
         base.update(d)
         out = {}
         for k, v in d.items():
             if isinstance(v, str):
-                try:
+                if dynamic and ("{{" in v or "{%" in v):
+                    out[k] = _PlayVarTemplate(v)
+                else:
                     out[k] = self.templater.render_string(v, base)
-                except Exception:
-                    if not dynamic:
-                        raise
-                    out[k] = v
             elif isinstance(v, dict) and set(v.keys()) == {"__ansiroll_unsafe__"}:
                 out[k] = _UntrustedConditionValue(v["__ansiroll_unsafe__"])
             else:
@@ -1523,6 +1580,8 @@ class Runtime:
             try:
                 result = self.templater.evaluate(cond, ctx, strict=modern_until)
                 if strict and _is_undef(result):
+                    if modern_until:
+                        result._fail_with_undefined_error()
                     raise RuntimeError(
                         "The conditional check %r failed: the expression is undefined" % cond)
                 if not self._condition_truth(result, ctx, until=until):
@@ -1579,6 +1638,8 @@ class Runtime:
             ctx.update(node.get("role_vars") or {})
             ctx.update(node.get("role_params") or {})
             env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+            env.context_class = _TemplateContext
+            ctx = self.templater._play_var_scope(ctx, strict=True)
             return env.from_string(name).render(**ctx) or name
         except Exception:
             return name
@@ -1720,15 +1781,7 @@ class Runtime:
                 self.failed = True
                 self.check_mode = invocation_check_mode
                 return
-        # Play vars (templated after facts are available; containers lazily).
-        self._runtime_var_overrides = (
-            set(self.extra_vars) | set(self._set_fact_overrides)
-            | set(self._include_vars_layer)
-        )
-        self._play_var_templates = {
-            key: value for key, value in (play.get("vars") or {}).items()
-            if isinstance(value, str) and ("{{" in value or "{%" in value)
-        }
+        # Play templates resolve when consumed, after task precedence is applied.
         self.vars.update(self.template_vars(
             play.get("vars"), self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -1845,7 +1898,6 @@ class Runtime:
                     "ansible_failed_result": ex.result,
                 }
                 self.vars.update(failed_facts)
-                self._runtime_var_overrides.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
                 self.run_nodes(rescue, scope, b_become)
         except TaskFailed as ex:
@@ -1940,7 +1992,6 @@ class Runtime:
         # Precedence (low -> high): role defaults < host vars/facts/play vars
         # < role vars < block vars < task vars < include_vars < set_fact/
         # register < role params < include params < extra vars < loop item.
-        self._refresh_play_vars()
         ctx = {}
         ctx.update(task.get("role_defaults") or {})
         ctx.update(self.vars)
@@ -1974,28 +2025,6 @@ class Runtime:
             ctx["hostvars"] = {self.host: ctx}
         ctx.setdefault("vars", ctx)
         return ctx
-
-    def _refresh_play_vars(self):
-        """Re-evaluate lazy play vars against facts produced by earlier tasks."""
-        if not self._play_var_templates:
-            return
-        for _ in range(3):
-            ctx = dict(self.vars)
-            changed = False
-            for key, raw in self._play_var_templates.items():
-                if key in self._runtime_var_overrides:
-                    continue
-                rendered = self.templater.render_string(raw, ctx)
-                try:
-                    differs = key not in self.vars or self.vars[key] != rendered
-                except Exception:
-                    differs = True
-                if differs:
-                    self.vars[key] = rendered
-                    changed = True
-                ctx[key] = rendered
-            if not changed:
-                break
 
     def run_task(self, task, overlay, become=False):
         if not self.profile:
@@ -2879,10 +2908,8 @@ class Runtime:
             self.vars.update(facts)
             short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
             if short_action == "set_fact":
-                self._runtime_var_overrides.update(facts)
                 self._set_fact_overrides.update(facts)
             elif short_action == "include_vars":
-                self._runtime_var_overrides.update(facts)
                 self._include_vars_layer.update(facts)
             existing = self.vars.get("ansible_facts")
             if not isinstance(existing, dict):

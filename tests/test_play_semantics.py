@@ -306,6 +306,96 @@ def test_register_not_clobbered_by_templated_play_var(tmp_path):
         """})
 
 
+def test_play_alias_uses_task_scope(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars:
+                notification: "handle {{ source }}"
+                source: "{{ missing_source }}"
+                fact_notification: "{{ missing_fact }}"
+                registered: "{{ missing_registered }}"
+                extra_notification: "{{ missing_extra }}"
+                done: "{{ current.stdout == 'ready' }}"
+              handlers:
+                - name: handle marker
+                  debug: msg=HANDLED
+              tasks:
+                - debug: msg=task
+                  vars: {source: marker}
+                  changed_when: true
+                  notify: "{{ notification }}"
+                - block:
+                    - debug: msg=block
+                      changed_when: true
+                      notify: "{{ notification }}"
+                  vars: {source: marker}
+                - include_role: {name: scoped}
+                - set_fact: {fact_notification: handle marker}
+                - command: echo handle marker
+                  register: registered
+                - debug: msg=facts
+                  changed_when: true
+                  notify: ["{{ fact_notification }}", "{{ registered.stdout }}",
+                           "{{ extra_notification }}"]
+                - command: echo from loop
+                  loop: [marker]
+                  loop_control: {loop_var: source}
+                  notify: "{{ notification }}"
+                - command: echo ready
+                  register: current
+                  until: done
+                  delay: 0
+        """,
+        "roles/scoped/vars/main.yml": "source: marker",
+        "roles/scoped/tasks/main.yml": """
+            - debug: msg=role
+              changed_when: true
+              notify: "{{ notification }}"
+        """,
+    }, args=["-e", "extra_notification='handle marker'"])
+    assert msgs == ['"task"', '"block"', '"role"', '"facts"', '"HANDLED"']
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+def test_unused_play_template_does_not_run_lookup(tmp_path, mode):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            unused: "{{ lookup('pipe', 'echo looked_up >> lookup_marker') }}"
+          tasks:
+            - debug: msg=UNRELATED
+        """})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode == 0, output
+    assert "UNRELATED" in output
+    assert not (tmp_path / "lookup_marker").exists()
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+def test_play_alias_keeps_registered_list_data_literal(tmp_path, mode):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            marker_value: interpolated
+            marker_lines: "{{ marker.stdout_lines }}"
+          tasks:
+            - command: cat marker.txt
+              register: marker
+            - debug:
+                msg: "{{ marker_lines }}"
+        """, "marker.txt": "{{ marker_value }}\n"})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode == 0, output
+    assert '"{{ marker_value }}"' in output
+    assert '"interpolated"' not in output
+
+
 def test_until_and_retries_semantics(tmp_path):
     msgs, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
@@ -454,17 +544,21 @@ def test_invalid_until_does_not_repeat_side_effects(tmp_path, monkeypatch, mode,
 
 @pytest.mark.skipif(CORE_VERSION < (2, 19), reason="boolean results are required from Core 2.19")
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
-def test_until_rejects_undefined_operand_with_broken_conditionals(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("condition", ["missing_condition ~ 'suffix'", "condition_alias"])
+def test_until_rejects_undefined_operand_with_broken_conditionals(
+        tmp_path, monkeypatch, mode, condition):
     monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "True")
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
+          vars:
+            condition_alias: "{{ missing_condition ~ 'suffix' }}"
           tasks:
             - shell: echo attempt >> attempts
-              until: missing_condition ~ 'suffix'
+              until: %s
               delay: 0
             - debug: msg=AFTER_UNTIL
-        """})
+        """ % condition})
     out = _run_mode(tmp_path, mode)
     output = out.stdout + out.stderr
     assert out.returncode != 0
@@ -510,13 +604,18 @@ def test_until_allows_broken_conditionals_without_config_lookup(tmp_path, monkey
 
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
 @pytest.mark.parametrize("loop", ["", "loop: [first, second]"])
-@pytest.mark.parametrize("notify", ["run {{ missing_notification }}", "{{ config.handler }}"])
+@pytest.mark.parametrize("notify", [
+    "run {{ missing_notification }}", "{{ config.handler }}",
+    "{{ notification_value }}", "{{ notification_alias }}",
+])
 def test_invalid_notify_fails_before_dispatch(tmp_path, mode, loop, notify):
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
           vars:
             config: {handler: "run {{ missing_notification }}"}
+            notification_alias: "{{ notification_value }}"
+            notification_value: "run {{ missing_notification }}"
           tasks:
             - shell: echo attempt >> attempts
               notify: "{{ missing_notification }}"
