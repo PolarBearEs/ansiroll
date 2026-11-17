@@ -387,6 +387,58 @@ def test_accelerated_slurp_missing_file_matches_official_failure(tmp_path):
     assert accelerated == expected
 
 
+def _translated_locale():
+    """A non-English UTF-8 locale whose strerror() differs from English."""
+    try:
+        names = subprocess.run(
+            ["locale", "-a"], stdout=subprocess.PIPE,
+            universal_newlines=True).stdout.split()
+    except OSError:
+        return None
+    for name in names:
+        if name.lower().endswith((".utf8", ".utf-8")) and \
+                not name.startswith(("C.", "en_", "POSIX")):
+            return name
+    return None
+
+
+def test_accelerated_modules_apply_locale_like_ansible_module(tmp_path):
+    # AnsibleModule._check_locale() (module_utils/basic.py) runs
+    # setlocale(LC_ALL, ''), so official error texts follow the user's locale.
+    name = _translated_locale()
+    if name is None:
+        pytest.skip("no translated UTF-8 locale installed")
+    script = (
+        "import json, sys\n"
+        "from ansiroll.embed import ModuleEmbedder\n"
+        "from ansiroll.runtime import Runtime\n"
+        "from ansiroll.accelerated_modules import run\n"
+        "args = {'src': sys.argv[1]}\n"
+        "rt = Runtime({'slurp': ModuleEmbedder().embed('slurp')}, '',\n"
+        "             {'inventory_hostname': 'localhost'})\n"
+        "try:\n"
+        "    official = rt.run_module('slurp', args)\n"
+        "finally:\n"
+        "    rt.cleanup()\n"
+        "official.pop('invocation', None)\n"
+        "from ansible.release import __version__ as v\n"
+        "new = tuple(map(int, v.split('.')[:2])) >= (2, 19)\n"
+        "accelerated = run('slurp', args, options={\n"
+        "    'lowercase_not_found': not new, 'typed_exceptions': new})\n"
+        "print(json.dumps([official, accelerated]))\n"
+    )
+    env = dict(os.environ, LANG=name, LC_ALL=name, LANGUAGE="")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+         env.get("PYTHONPATH", "")])
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "missing")],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, check=True)
+    official, accelerated = json.loads(proc.stdout.splitlines()[-1])
+    assert accelerated == official
+
+
 @pytest.mark.parametrize("initial,args", [
     (
         "before\nold=one\nold=two\nafter\n",
@@ -532,6 +584,14 @@ def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
         ({"path": "regular", "state": "absent"}, False),
         ({"path": "missing", "state": "absent"}, False),
     ]
+    from ansible.release import __version__ as ansible_version
+    if tuple(map(int, ansible_version.split(".")[:2])) < (2, 19):
+        # Before 2.19 the official module raises AnsibleModuleError for a
+        # directory over a regular file and relies on its sys.excepthook to
+        # emit fail_json, which Runtime's embedded execution does not install;
+        # ansible-playbook reports the fail_json the accelerated module returns.
+        cases = [case for case in cases
+                 if case[0] != {"path": "regular", "state": "directory"}]
     for side in ("official", "accelerated"):
         base = tmp_path / side
         (base / "exist").mkdir(parents=True)

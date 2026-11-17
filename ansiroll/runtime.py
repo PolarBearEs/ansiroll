@@ -2888,7 +2888,8 @@ class Runtime:
                 {"environment": environment}, self.ctx())
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if fast_facts in ("1", "true", "yes", "on"):
-                from ansiroll.accelerated_modules import facts
+                from ansiroll.accelerated_modules import check_locale, facts
+                check_locale()
                 started = time.monotonic()
                 res = facts.run(fact_schema=fact_schema)
                 provenance = {
