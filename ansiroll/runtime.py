@@ -2221,9 +2221,28 @@ class Runtime:
     @staticmethod
     def _baked_source_key(task, src):
         # Role trees are baked under paths relative to files/ or templates/.
-        if task.get("_baked_tree") and isinstance(src, str):
-            return os.path.normpath(src)
-        return src
+        if not task.get("_baked_tree") or not isinstance(src, str) or os.path.isabs(src):
+            return src
+        parts = src.split("/")
+        if parts[-1] in ("", ".", ".."):
+            return src
+        if ".." in parts:
+            # Relative Ansible source paths traverse the controller's actual
+            # directories. A missing or unbaked component can't be canceled.
+            directories = set(task.get("_baked_tree_dirs") or ())
+            prefix = []
+            for part in parts[:-1]:
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    if not prefix:
+                        return src
+                    prefix.pop()
+                else:
+                    prefix.append(part)
+                    if "/".join(prefix) not in directories:
+                        return src
+        return os.path.normpath(src)
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""

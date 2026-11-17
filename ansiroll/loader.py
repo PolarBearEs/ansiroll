@@ -97,11 +97,12 @@ def load_adjacent_group_vars(playbook_path, vault_password_file=None):
     return merged
 
 
-def parse_playbook(path, vault_password_file=None):
+def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
     """Return (plays, actions) where actions is the set of module names to embed."""
     init_loader()
     from ansible.parsing.dataloader import DataLoader
     from ansible.inventory.manager import InventoryManager
+    from ansible.utils.vars import combine_vars
     from ansible.vars.manager import VariableManager
     from ansible.playbook import Playbook
 
@@ -111,6 +112,9 @@ def parse_playbook(path, vault_password_file=None):
         loader.set_vault_secrets(secrets)
     inventory = InventoryManager(loader=loader, sources=[])
     vm = VariableManager(loader=loader, inventory=inventory)
+    if extra_vars:
+        # Ansible can share its cached CLI extra vars across variable managers.
+        vm._extra_vars = combine_vars(vm.extra_vars, extra_vars)
     pb = Playbook.load(path, variable_manager=vm, loader=loader)
 
     pb_dir = os.path.abspath(getattr(pb, "_basedir", None)
@@ -557,7 +561,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
     result) remain on the controller-coupled path.
     """
     args = task.args or {}
-    fname = args.get("_raw_params") or args.get("file")
+    raw_fname = fname = args.get("_raw_params") or args.get("file")
     if not isinstance(fname, str):
         return None
     if "{{" in fname or "{%" in fname:
@@ -569,8 +573,9 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         return None
     role = getattr(task, "_role", None)
     physical_path = os.path.realpath(path)
-    key = ("tasks", physical_path, path, id(role) if role is not None else None,
-           _is_handler(task), _include_search_context(task), _include_scope_key(task))
+    key = ("tasks", physical_path, _include_path_spelling(path),
+           id(role) if role is not None else None, _is_handler(task),
+           _include_search_context(task, raw_fname, fname), _include_scope_key(task))
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
@@ -672,24 +677,36 @@ def _next_include_dir(parent_dir, cumulative_path):
     return parent_dir
 
 
-def _include_search_context(task):
+def _include_path_spelling(path):
+    # Keep aliases and parent traversals, both of which can affect resolution.
+    root = "//" if path.startswith("//") and not path.startswith("///") else ""
+    if not root and os.path.isabs(path):
+        root = "/"
+    return root + "/".join(part for part in path.split("/") if part not in ("", "."))
+
+
+def _include_search_context(task, raw_fname=None, fname=None):
     # Descendants search using this include's argument followed by its ancestors'
     # arguments. Preserve both the relative prefix (which a child can extend)
     # and the ordered paths after the first absolute reset.
-    paths = list(_parent_include_paths(task))
+    paths = [(path if dynamic else _include_path_spelling(path), dynamic)
+             for path, dynamic in _parent_include_paths(task)]
     if any(dynamic for _, dynamic in paths):
         # A descendant can override variables in an ancestor's filename.
-        # Preserve those templates and their positions in the search.
+        # Keep the templates distinct, and coalesce repeated directories that
+        # add no search candidate under the current compile-time bindings.
         context = []
-        for path, dynamic in paths:
-            entry = (path, dynamic)
-            if not dynamic:
-                if not path and context[-1:] == [entry]:
-                    continue
-                # An absolute parent resets the cumulative path. The first
-                # occurrence can still consume a preceding relative suffix.
-                if os.path.isabs(path) and context[-2:] == [entry, entry]:
-                    continue
+        for entry in paths:
+            path, dynamic = entry
+            directory = path
+            if dynamic:
+                directory = _include_path_spelling(os.path.dirname(fname)) if path == raw_fname else None
+            if directory == "" and context[-1:] == [entry]:
+                continue
+            # An absolute parent resets the cumulative path. The first
+            # occurrence can still consume a preceding relative suffix.
+            if directory and os.path.isabs(directory) and context[-2:] == [entry, entry]:
+                continue
             context.append(entry)
         return tuple(context)
 
@@ -698,7 +715,7 @@ def _include_search_context(task):
     candidates = relative
     for path, _ in paths:
         cumulative_path = _next_include_dir(path, cumulative_path)
-        candidates[cumulative_path] = None
+        candidates[_include_path_spelling(cumulative_path)] = None
         if os.path.isabs(path):
             candidates = remaining
     return tuple(relative), tuple(remaining)
@@ -786,6 +803,7 @@ def _template_include_filename(task, value, all_vars):
     variables.update(role_vars)
     for scope in _include_scope(task):
         variables.update(scope)
+    variables.update(task.get_variable_manager().extra_vars)
     try:
         from ansible.template import Templar
         try:
@@ -1184,8 +1202,10 @@ def _bake_role_tree(node, task, subdir):
     if not os.path.isdir(tree_dir):
         return False
     baked = {}
+    directories = []
     for root, dirs, files in os.walk(tree_dir):
         dirs.sort()
+        directories.append(os.path.relpath(root, tree_dir))
         for fn in sorted(files):
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, tree_dir)
@@ -1198,6 +1218,7 @@ def _bake_role_tree(node, task, subdir):
         return False
     node["_baked"] = baked
     node["_baked_tree"] = subdir
+    node["_baked_tree_dirs"] = directories
     return True
 
 

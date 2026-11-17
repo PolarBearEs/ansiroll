@@ -99,7 +99,8 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
                      tree_shake=False, freeze_playbook_vars=False,
                      freeze_vars=None):
     """Parse, embed modules, and return (source_text, manifest_dict)."""
-    plays, actions = parse_playbook(playbook_path, vault_password_file=vault_password_file)
+    plays, actions = parse_playbook(playbook_path, vault_password_file=vault_password_file,
+                                   extra_vars=extra_vars)
     group_vars = load_adjacent_group_vars(playbook_path,
                                           vault_password_file=vault_password_file)
     frozen_vars, freeze_info = _resolve_frozen_vars(

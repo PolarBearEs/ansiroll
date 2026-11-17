@@ -47,11 +47,12 @@ def _summary(text):
     return MSG_RE.findall(text), tuple(int(x) for x in match.groups())
 
 
-def _ansible(playbook, *args):
+def _ansible(playbook, *args, strategy="linear"):
+    env = dict(_env(), ANSIBLE_STRATEGY=strategy)
     proc = subprocess.run(
         [os.path.join(os.path.dirname(sys.executable), "ansible-playbook"),
          "-i", "localhost,", "-c", "local", str(playbook)] + list(args),
-        cwd=str(playbook.parent), env=_env(), capture_output=True, text=True,
+        cwd=str(playbook.parent), env=env, capture_output=True, text=True,
     )
     return _summary(proc.stdout)
 
@@ -174,6 +175,31 @@ def test_recursive_include_tasks_and_include_role(tmp_path):
     expected = _ansible(tmp_path / "pb.yml")
     assert expected[0] == ["depth 0", "depth 1", "depth 2", "role depth 0", "role depth 1"]
     assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+
+
+@pytest.mark.parametrize("include", [
+    "- include_tasks: ./rec.yml\n",
+    '- include_tasks: "{{ selected_file }}"\n  vars: {selected_file: rec.yml}\n',
+])
+def test_recursive_include_reuses_stable_search_context(tmp_path, include):
+    playbook = tmp_path / "pb.yml"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {depth: 0}
+  tasks:
+""" + "".join("    " + line for line in include.splitlines(keepends=True)),
+        "rec.yml": """
+- debug: msg="depth {{ depth }}"
+- set_fact: depth="{{ depth | int + 1 }}"
+""" + include + "  when: depth | int < 34\n"})
+    expected = _ansible(playbook)
+    assert expected[0] == ["depth %d" % depth for depth in range(34)]
+    source, manifest = compile_playbook(str(playbook))
+    assert manifest["fallback_tasks"] == []
+    assert any(node.get("tasks_ref") for node in _task_nodes(_bundle_json(source)[0]["tasks"]))
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll") == expected
 
 
 def test_recursive_include_keeps_symlink_alias_directory(tmp_path):
@@ -625,14 +651,20 @@ def test_nested_include_filename_uses_role_invocation_vars(tmp_path):
 """, "roles/r/tasks/main.yml": "- include_tasks: sub/entry.yml\n",
         "roles/r/tasks/sub/entry.yml": '- include_tasks: "{{ part }}.yml"\n',
         "roles/r/tasks/sub/leaf.yml": "- debug: msg=SCOPED\n",
+        "roles/r/tasks/sub/extra.yml": "- debug: msg=EXTRA\n",
         "roles/r/defaults/main.yml": "part: decoy\n"})
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook)
     assert expected[0] == ["SCOPED"]
     assert _ansiroll(playbook, tmp_path) == expected
+    args = ("-e", "part=extra")
+    expected = _ansible(playbook, *args)
+    assert expected[0] == ["EXTRA"]
+    assert _ansiroll(playbook, tmp_path, *args) == expected
+    assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
 
 
-@pytest.mark.parametrize("prefix", ["", "./"])
+@pytest.mark.parametrize("prefix", ["", "./", "existing/../", "missing/../"])
 def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, prefix):
     dest = tmp_path / "dest.txt"
     _write(tmp_path, {"pb.yml": """
@@ -644,10 +676,20 @@ def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, pr
 - copy: {src: "%s{{ name }}.conf", dest: "%s", remote_src: "{{ flag }}"}
 - debug: msg="{{ lookup('file', '%s') }}"
 """ % (prefix, dest, dest), "roles/r/files/app.conf": "CONTROLLER\n"})
+    (tmp_path / "roles/r/files/existing").mkdir()
     expected = _ansible(tmp_path / "pb.yml")
-    dest.unlink()
-    assert expected[0] == ["CONTROLLER"]
-    assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+    if prefix == "missing/../":
+        assert expected[1][3] == 1
+        assert not dest.exists()
+        result = _ansiroll(tmp_path / "pb.yml", tmp_path)
+        assert result[1] == expected[1]
+        assert not dest.exists()
+    else:
+        assert expected[0] == ["CONTROLLER"]
+        assert dest.read_text() == "CONTROLLER\n"
+        dest.unlink()
+        assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+        assert dest.read_text() == "CONTROLLER\n"
 
 
 def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):
