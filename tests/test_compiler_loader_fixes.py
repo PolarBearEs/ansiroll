@@ -81,10 +81,10 @@ def _task_nodes(nodes):
                 yield child
 
 
-def _plays_json(source):
+def _bundle_json(source, entry="plays.json"):
     data = re.search(r"_ANSIROLL_DATA_BUNDLE = b'([^']*)'", source).group(1)
     archive = zipfile.ZipFile(io.BytesIO(base64.b64decode(data)))
-    return json.loads(archive.read("plays.json").decode("utf-8"))
+    return json.loads(archive.read(entry).decode("utf-8"))
 
 
 def test_user_dicts_shaped_like_plugins_are_not_externalized(tmp_path):
@@ -174,6 +174,56 @@ def test_recursive_include_tasks_and_include_role(tmp_path):
     expected = _ansible(tmp_path / "pb.yml")
     assert expected[0] == ["depth 0", "depth 1", "depth 2", "role depth 0", "role depth 1"]
     assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+
+
+def test_recursive_include_keeps_symlink_alias_directory(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {depth: 0}
+  tasks:
+    - include_tasks: left/shared.yml
+""", "shared.yml": """
+- include_tasks: leaf.yml
+- set_fact: depth="{{ depth | int + 1 }}"
+- include_tasks: "%s"
+  when: depth | int < 2
+""" % (tmp_path / "right" / "shared.yml"),
+        "left/leaf.yml": "- debug: msg=LEFT\n",
+        "right/leaf.yml": "- debug: msg=RIGHT\n"})
+    for side in ("left", "right"):
+        (tmp_path / side / "shared.yml").symlink_to("../shared.yml")
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook)
+    assert expected[0] == ["LEFT", "RIGHT"]
+    assert _ansiroll(playbook, tmp_path) == expected
+
+
+def test_recursive_include_keeps_inherited_search_directories(tmp_path):
+    right = tmp_path / "roles/r/tasks/right/prefix.yml"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {depth: 0}
+  roles: [r]
+""", "roles/r/tasks/main.yml": "- include_tasks: left/prefix.yml\n",
+        "roles/r/tasks/left/prefix.yml": "- include_tasks: shared.yml\n",
+        "roles/r/tasks/right/prefix.yml": "- include_tasks: shared.yml\n",
+        "roles/r/tasks/left/leaf.yml": "- debug: msg=LEFT\n",
+        "roles/r/tasks/right/leaf.yml": "- debug: msg=RIGHT\n",
+        "roles/r/tasks/shared.yml": """
+- include_tasks: leaf.yml
+- set_fact: depth="{{ depth | int + 1 }}"
+- include_tasks: "%s"
+  when: depth | int < 3
+""" % right})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook)
+    assert expected[0] == ["LEFT", "RIGHT", "RIGHT"]
+    source, manifest = compile_playbook(str(playbook))
+    assert manifest["fallback_tasks"] == []
+    assert any(node.get("tasks_ref") for node in _task_nodes(_bundle_json(source)[0]["tasks"]))
+    assert _ansiroll(playbook, tmp_path) == expected
 
 
 def test_include_role_resolves_from_playbook_dir_not_cwd(tmp_path):
@@ -289,7 +339,7 @@ def test_unsupported_module_inside_include_and_handler_is_marked(tmp_path):
     _source, manifest = compile_playbook(str(tmp_path / "pb.yml"))
     assert [u["action"] for u in manifest["unsupported_modules"]] == ["bad"]
     assert len(manifest["fallback_tasks"]) == 2
-    play = _plays_json(_source)[0]
+    play = _bundle_json(_source)[0]
     bad = [n for n in _task_nodes(play["tasks"]) if n.get("action") == "bad"]
     assert len(bad) == 1 and bad[0]["fallback"] is True
     handlers = list(_task_nodes(play["handlers"]))
@@ -312,7 +362,7 @@ def test_two_compiles_are_byte_identical(tmp_path):
     first = compile_playbook(str(tmp_path / "pb.yml"))[0]
     second = compile_playbook(str(tmp_path / "pb.yml"))[0]
     assert first == second
-    nodes = list(_task_nodes(_plays_json(first)[0]["tasks"]))
+    nodes = list(_task_nodes(_bundle_json(first)[0]["tasks"]))
     copy_task = [n for n in nodes if n.get("action") == "copy"][0]
     assert copy_task["_baked"] and "_baked_meta" not in copy_task
     tree = [n for n in nodes if n.get("_baked_tree")][0]
@@ -495,6 +545,61 @@ def test_time_and_host_dependent_values_are_not_frozen_or_shaken(tmp_path, monke
     assert _summary(run.stdout) == expected
 
 
+def test_explicit_freeze_allows_deterministic_jinja_globals(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    ports: "{{ range(8000, 8003) | list }}"
+  tasks:
+    - debug: msg="{{ ports | join(',') }}"
+"""})
+    playbook = tmp_path / "pb.yml"
+    source, manifest = compile_playbook(str(playbook), freeze_vars=["ports"])
+    assert manifest["tree_shake"]["frozen_var_names"] == ["ports"]
+    assert _bundle_json(source, "specialized_vars.json")["ports"] == [8000, 8001, 8002]
+    expected = _ansible(playbook)
+    assert expected[0] == ["8000,8001,8002"]
+    assert _ansiroll(playbook, tmp_path, "--freeze-var", "ports") == expected
+
+
+def test_runtime_filters_passed_to_map_stay_dynamic(tmp_path, monkeypatch):
+    compile_home = tmp_path / "compile-home"
+    runtime_home = tmp_path / "runtime-home"
+    monkeypatch.setenv("HOME", str(compile_home))
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    filter_name: expanduser
+    home: "{{ ['~'] | map('expanduser') | first }}"
+    indirect_home: "{{ ['~'] | map(filter_name) | first }}"
+    fixed: "{{ ['a'] | map('upper') | first }}"
+  tasks:
+    - debug: msg="{{ home }} {{ indirect_home }} {{ fixed }}"
+    - debug: msg=RUNTIME
+      when: "(['~'] | map('expanduser') | first) == '%s'"
+""" % runtime_home})
+    playbook = tmp_path / "pb.yml"
+    source, manifest = compile_playbook(str(playbook), freeze_playbook_vars=True,
+                                        tree_shake=True)
+    info = manifest["tree_shake"]
+    assert info["frozen_var_names"] == ["filter_name", "fixed"]
+    assert sorted(info["skipped_playbook_vars"]) == ["home", "indirect_home"]
+    assert info["removed_nodes"] == 0
+    with pytest.raises(ValueError, match="'home' is unresolved"):
+        compile_playbook(str(playbook), freeze_vars=["home"])
+
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(source)
+    monkeypatch.setenv("HOME", str(runtime_home))
+    run = subprocess.run([sys.executable, str(compiled)], cwd=tmp_path, env=_env(),
+                         capture_output=True, text=True, check=True)
+    expected = _ansible(playbook)
+    assert expected[0] == ["%s %s A" % (runtime_home, runtime_home), "RUNTIME"]
+    assert _summary(run.stdout) == expected
+
+
 def test_include_tasks_under_include_role_resolves_like_ansible(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -509,7 +614,26 @@ def test_include_tasks_under_include_role_resolves_like_ansible(tmp_path):
     assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
 
 
-def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path):
+def test_nested_include_filename_uses_role_invocation_vars(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {selection: leaf}
+  tasks:
+    - include_role: name=r
+      vars: {part: "{{ selection }}"}
+""", "roles/r/tasks/main.yml": "- include_tasks: sub/entry.yml\n",
+        "roles/r/tasks/sub/entry.yml": '- include_tasks: "{{ part }}.yml"\n',
+        "roles/r/tasks/sub/leaf.yml": "- debug: msg=SCOPED\n",
+        "roles/r/defaults/main.yml": "part: decoy\n"})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook)
+    assert expected[0] == ["SCOPED"]
+    assert _ansiroll(playbook, tmp_path) == expected
+
+
+@pytest.mark.parametrize("prefix", ["", "./"])
+def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, prefix):
     dest = tmp_path / "dest.txt"
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -517,9 +641,9 @@ def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path):
   vars: {name: app, flag: false}
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- copy: {src: "{{ name }}.conf", dest: "%s", remote_src: "{{ flag }}"}
+- copy: {src: "%s{{ name }}.conf", dest: "%s", remote_src: "{{ flag }}"}
 - debug: msg="{{ lookup('file', '%s') }}"
-""" % (dest, dest), "roles/r/files/app.conf": "CONTROLLER\n"})
+""" % (prefix, dest, dest), "roles/r/files/app.conf": "CONTROLLER\n"})
     expected = _ansible(tmp_path / "pb.yml")
     dest.unlink()
     assert expected[0] == ["CONTROLLER"]

@@ -534,8 +534,8 @@ INCLUDED_TASKS = {}
 # identical; the value is the include_id a recursive include refers back to.
 _INCLUDE_STACK = {}
 # id(top-level role block) -> include_role task. IncludeRole.get_block_list
-# parents the role's blocks to the include_role task; ansiroll does not call
-# it, so the link is kept here for include_tasks path resolution only.
+# parents the role's blocks to the include_role task. Keep the equivalent
+# link for compile-time include paths and variables.
 _INCLUDE_ROLE_PARENTS = {}
 _INCLUDE_IDS = [0]
 
@@ -568,9 +568,12 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
     if path is None or not os.path.exists(path):
         return None
     role = getattr(task, "_role", None)
-    key = ("tasks", os.path.realpath(path), id(role) if role is not None else None,
-           _is_handler(task))
+    physical_path = os.path.realpath(path)
+    key = ("tasks", physical_path, path, id(role) if role is not None else None,
+           _is_handler(task), _include_search_context(task), _include_scope_key(task))
     ref = _include_ref(key)
+    if ref is None and _too_many_include_contexts(key):
+        return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
     if ref is None:
@@ -619,6 +622,9 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "become": bool(task.become),
         "tasks": tasks,
     }
+    if action == "include_role" and tuple(map(int, _fact_schema().split("."))) < (2, 17):
+        # Older linear strategies do not count successful role includes in ok.
+        node["tally_include_ok"] = False
     if include_id is not None:
         node["include_id"] = include_id
     if ref is not None:
@@ -643,35 +649,106 @@ def _include_parent(obj):
     return parent
 
 
+def _parent_include_paths(obj):
+    """Yield enclosing include directories, or raw filenames to template."""
+    from ansible.playbook.role_include import IncludeRole
+    from ansible.playbook.task_include import TaskInclude
+
+    while obj is not None:
+        if isinstance(obj, IncludeRole):
+            yield getattr(obj, "_role_path", None) or "", False
+        elif isinstance(obj, TaskInclude):
+            raw = (obj.args or {}).get("_raw_params") or (obj.args or {}).get("file")
+            if isinstance(raw, str) and ("{{" in raw or "{%" in raw):
+                yield raw, True
+            else:
+                yield os.path.dirname(raw) if isinstance(raw, str) else "", False
+        obj = _include_parent(obj)
+
+
+def _next_include_dir(parent_dir, cumulative_path):
+    if cumulative_path is not None and not os.path.isabs(cumulative_path):
+        return os.path.join(parent_dir, cumulative_path)
+    return parent_dir
+
+
+def _include_search_context(task):
+    # Descendants search using this include's argument followed by its ancestors'
+    # arguments. Preserve both the relative prefix (which a child can extend)
+    # and the ordered paths after the first absolute reset.
+    paths = list(_parent_include_paths(task))
+    if any(dynamic for _, dynamic in paths):
+        # A descendant can override variables in an ancestor's filename.
+        # Preserve those templates and their positions in the search.
+        context = []
+        for path, dynamic in paths:
+            entry = (path, dynamic)
+            if not dynamic:
+                if not path and context[-1:] == [entry]:
+                    continue
+                # An absolute parent resets the cumulative path. The first
+                # occurrence can still consume a preceding relative suffix.
+                if os.path.isabs(path) and context[-2:] == [entry, entry]:
+                    continue
+            context.append(entry)
+        return tuple(context)
+
+    relative, remaining = {}, {}
+    cumulative_path = None
+    candidates = relative
+    for path, _ in paths:
+        cumulative_path = _next_include_dir(path, cumulative_path)
+        candidates[cumulative_path] = None
+        if os.path.isabs(path):
+            candidates = remaining
+    return tuple(relative), tuple(remaining)
+
+
+def _include_scope(task):
+    from ansible.playbook.task_include import TaskInclude
+
+    parents = []
+    while task is not None:
+        parents.append(task)
+        task = _include_parent(task)
+    scope, params = {}, {}
+    for parent in reversed(parents):
+        variables = parent.vars or {}
+        scope.update(variables)
+        if isinstance(parent, TaskInclude):
+            params.update(variables)
+    return scope, params
+
+
+def _include_scope_key(task):
+    return tuple(repr(sorted(scope.items())) for scope in _include_scope(task))
+
+
+def _too_many_include_contexts(key):
+    # Relative ancestry can grow on every recursive call. If it never repeats,
+    # stop expansion without substituting a task graph from a different context.
+    return sum(active[:2] == key[:2] for active in _INCLUDE_STACK) >= 32
+
+
+def _unresolved_recursive_include(task, actions, basedir):
+    node = _convert_task(task, actions, basedir)
+    node["fallback_reason"] = "recursive include search context did not stabilize"
+    return node
+
+
 def _include_tasks_path(task, include_target, all_vars):
     """Resolve an include_tasks file like IncludedFile.process_include_results
     (ansible/playbook/included_file.py) does for the controller."""
     loader = task._loader
-    from ansible.playbook.task_include import TaskInclude
-    try:
-        from ansible.playbook.role_include import IncludeRole
-    except ImportError:
-        IncludeRole = ()
     role = getattr(task, "_role", None)
     dirname = "handlers" if _is_handler(task) else "tasks"
     include_file = None
-    parent_include = _include_parent(task)
     cumulative_path = None
-    while parent_include is not None:
-        if not isinstance(parent_include, TaskInclude):
-            parent_include = _include_parent(parent_include)
-            continue
-        if IncludeRole and isinstance(parent_include, IncludeRole):
-            parent_include_dir = getattr(parent_include, "_role_path", None) or ""
-        else:
-            raw = (parent_include.args or {}).get("_raw_params")
-            if isinstance(raw, str) and ("{{" in raw or "{%" in raw):
-                raw = _template_include_filename(parent_include, raw, all_vars)
-            parent_include_dir = os.path.dirname(raw) if isinstance(raw, str) else ""
-        if cumulative_path is not None and not os.path.isabs(cumulative_path):
-            cumulative_path = os.path.join(parent_include_dir, cumulative_path)
-        else:
-            cumulative_path = parent_include_dir
+    for parent_path, dynamic in _parent_include_paths(_include_parent(task)):
+        if dynamic:
+            rendered = _template_include_filename(task, parent_path, all_vars)
+            parent_path = os.path.dirname(rendered) if isinstance(rendered, str) else ""
+        cumulative_path = _next_include_dir(parent_path, cumulative_path)
         if role is not None:
             new_basedir = os.path.join(role._role_path, dirname, cumulative_path)
             candidates = [
@@ -688,7 +765,6 @@ def _include_tasks_path(task, include_target, all_vars):
                 loader.get_basedir(), cumulative_path, include_target)
         if os.path.exists(include_file):
             break
-        parent_include = _include_parent(parent_include)
     if include_file is None:
         if role is not None:
             include_file = loader.path_dwim_relative(
@@ -703,9 +779,13 @@ def _template_include_filename(task, value, all_vars):
     role_defaults, role_vars = _role_vars(task)
     variables = {}
     variables.update(role_defaults)
+    play = _play_of(task)
+    if play is not None:
+        variables.update(play.vars or {})
     variables.update(all_vars or {})
     variables.update(role_vars)
-    variables.update(dict(task.vars or {}))
+    for scope in _include_scope(task):
+        variables.update(scope)
     try:
         from ansible.template import Templar
         try:
@@ -743,9 +823,12 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
             collection_list=getattr(task, "collections", None))
     except Exception:
         return None
-    key = ("role", getattr(ri, "_role_path", None) or name,
-           tuple(sorted(from_files.items())), _is_handler(task))
+    task._role_path = getattr(ri, "_role_path", None)
+    key = ("role", task._role_path or name, tuple(sorted(from_files.items())),
+           _is_handler(task), _include_search_context(task), _include_scope_key(task))
     ref = _include_ref(key)
+    if ref is None and _too_many_include_contexts(key):
+        return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
     if ref is None:

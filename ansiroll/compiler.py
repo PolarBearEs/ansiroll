@@ -329,12 +329,13 @@ def _condition_value(condition, variables, templater):
         referenced = jinja_meta.find_undeclared_variables(parsed)
     except Exception:
         return None
-    # Templater globals (now(), lookup(), query(), ...) are evaluated when the
-    # task runs; a condition that calls one is not statically known.
+    # Time-dependent globals and controller lookups in conditions run when
+    # the task runs.
     # find_undeclared_variables omits environment globals, so look at the
     # names the expression actually loads.
     from jinja2 import nodes as jinja_nodes
     if any(node.name not in variables and node.name in templater.env.globals
+           and node.name not in _DETERMINISTIC_GLOBALS
            for node in parsed.find_all(jinja_nodes.Name)):
         return None
     if _uses_nondeterministic_filter(parsed):
@@ -391,11 +392,12 @@ _NONDETERMINISTIC_FILTERS = frozenset(
     ("random", "shuffle", "strftime", "expanduser", "realpath"))
 # Lookups run on the controller, so compile time is the right time for them.
 _CONTROLLER_GLOBALS = frozenset(("lookup", "query", "q"))
+_DETERMINISTIC_GLOBALS = frozenset(("range", "dict", "cycler", "joiner", "namespace"))
 
 
 def _runtime_dependent(value, variables, env, _seen=None):
     """True when templating ``value`` (or a variable it references) calls a
-    non-lookup global (now(), ...) or a host/time dependent filter, so its
+    runtime-dependent global (now(), ...) or a host/time dependent filter, so its
     result is not known when compiling."""
     seen = set() if _seen is None else _seen
     if isinstance(value, dict):
@@ -420,15 +422,31 @@ def _runtime_dependent(value, variables, env, _seen=None):
                 seen.add(node.name)
                 if _runtime_dependent(variables[node.name], variables, env, seen):
                     return True
-        elif node.name in env.globals and node.name not in _CONTROLLER_GLOBALS:
+        elif (node.name in env.globals and node.name not in _CONTROLLER_GLOBALS
+              and node.name not in _DETERMINISTIC_GLOBALS):
             return True
     return _uses_nondeterministic_filter(parsed)
 
 
 def _uses_nondeterministic_filter(parsed):
     from jinja2 import nodes
-    return any(node.name.rsplit(".", 1)[-1] in _NONDETERMINISTIC_FILTERS
-               for node in parsed.find_all(nodes.Filter))
+    for node in parsed.find_all(nodes.Filter):
+        name = node.name.rsplit(".", 1)[-1]
+        args = iter(node.args)
+        while name == "map":
+            # map(attribute=...) does not call a filter. For positional map,
+            # each mapped filter consumes its name before forwarding arguments.
+            arg = next(args, None)
+            if arg is None:
+                if node.dyn_args is not None:
+                    return True
+                break
+            if not isinstance(arg, nodes.Const) or not isinstance(arg.value, str):
+                return True
+            name = arg.value.rsplit(".", 1)[-1]
+        if name in _NONDETERMINISTIC_FILTERS:
+            return True
+    return False
 
 
 def _loop_shadowed_names(node):

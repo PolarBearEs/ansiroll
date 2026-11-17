@@ -1636,8 +1636,7 @@ class Runtime:
             self.run_task(node, overlay, become)
 
     def run_include(self, node, overlay, become=False):
-        """A compile-time-expanded include_tasks: run the inner tasks (per loop
-        item when looped). The include itself reports but is not tallied."""
+        """Run a compile-time-expanded include, once per loop item if looped."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
@@ -1667,7 +1666,8 @@ class Runtime:
         loop = node.get("loop")
         if loop is None:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
-            self._tally("ok")
+            if node.get("tally_include_ok", True):
+                self._tally("ok")
             self.run_nodes(tasks, scope, b)
             return
         items = self._resolve_loop(loop, base_ctx)
@@ -1676,7 +1676,8 @@ class Runtime:
             item_scope.update(self._loop_item_vars(node, items, i, base_ctx))
             self.emit(node, "ok", {"changed": False, "include": node.get("file"),
                                    "item": it}, item=it, is_item=True)
-            self._tally("ok")
+            if node.get("tally_include_ok", True):
+                self._tally("ok")
             self.run_nodes(tasks, item_scope, b)
 
     def run_block(self, block, overlay, become=False):
@@ -2217,13 +2218,21 @@ class Runtime:
                 identities[identity] = identities.get(identity, 0) + 1
         return res
 
+    @staticmethod
+    def _baked_source_key(task, src):
+        # Role trees are baked under paths relative to files/ or templates/.
+        if task.get("_baked_tree") and isinstance(src, str):
+            return os.path.normpath(src)
+        return src
+
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
         name = str(task.get("action") or "").split(".")[-1]
         if name != "unarchive" or _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
-        marker = (task.get("_baked") or {}).get(src)
+        key = self._baked_source_key(task, src)
+        marker = (task.get("_baked") or {}).get(key)
         if marker is None:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
         return self._asset_bytes(marker)
@@ -2559,8 +2568,9 @@ class Runtime:
         else:
             if src is None:
                 return {"failed": True, "changed": False, "msg": "%s: src is required" % name}
-            raw = baked.get(src)
-            meta = (task.get("_baked_meta") or {}).get(src) or {}
+            key = self._baked_source_key(task, src)
+            raw = baked.get(key)
+            meta = (task.get("_baked_meta") or {}).get(key) or {}
             if raw is None and self.controller_source_fn:
                 try:
                     fetched = self.controller_source_fn(src)
