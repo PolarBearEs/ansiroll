@@ -273,13 +273,15 @@ def _f_flatten(seq, levels=None):
 def _yaml_module():
     """Load Ansiroll's private, pure-Python YAML implementation.
 
-    Generated agents get it from the in-memory import bundle.  Importing the
-    source package directly falls back to the shipped ZIP without consulting a
-    target's system PyYAML installation.
+    Generated agents get it from the in-memory import bundle (and are exec'd
+    without ``__file__``).  Importing the source package directly puts the
+    shipped ZIP first on sys.path so no other ``ansiroll_yaml`` can shadow it.
     """
-    bundle = os.path.join(os.path.dirname(__file__), "vendor", "pyyaml-py35.zip")
-    if os.path.isfile(bundle) and bundle not in sys.path:
-        sys.path.insert(0, bundle)
+    here = globals().get("__file__")
+    if here:
+        bundle = os.path.join(os.path.dirname(here), "vendor", "pyyaml-py35.zip")
+        if os.path.isfile(bundle) and bundle not in sys.path:
+            sys.path.insert(0, bundle)
     import ansiroll_yaml
     return ansiroll_yaml
 

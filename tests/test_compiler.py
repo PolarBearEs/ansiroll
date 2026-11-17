@@ -260,3 +260,28 @@ def test_fixed_variables_specialize_dynamic_accelerator_without_rewriting_args()
     assert count == 1
     assert task["accelerator"] == "always"
     assert task["args"] == {"path": "{{ root }}/{{ filename }}"}
+
+
+def test_generated_agent_yaml_filters_work_without_dunder_file(tmp_path):
+    # AGENT_BOOTSTRAP execs the source with only __name__ in its globals.
+    agent = tmp_path / "agent.py"
+    agent.write_text(_render_source([], {}, ""))
+    probe = (
+        "import sys; "
+        "src = open(sys.argv[1]).read(); "
+        "g = {'__name__': '__ansiroll_agent__'}; "
+        "exec(compile(src, '<ansiroll-agent>', 'exec'), g); "
+        "print(g['_f_from_yaml']('a: 1')); "
+        "print(g['_f_to_yaml']({'a': 1}), end='')"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+    proc = subprocess.run(
+        [sys.executable, "-S", "-c", probe, str(agent)],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["{'a': 1}", "a: 1"]
