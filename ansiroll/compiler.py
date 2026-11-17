@@ -217,66 +217,86 @@ def _shadowed_var_names(plays):
 
 def _resolve_frozen_vars(plays, group_vars, extra_vars,
                          freeze_playbook_vars, requested):
-    """Resolve immutable values and return (values, non-secret manifest metadata)."""
-    candidates = {}
+    """Resolve immutable values and return (values, non-secret manifest metadata).
+
+    A frozen value is injected for the whole run (with extra-var precedence),
+    so a name is only frozen when it resolves to the same value in every play:
+    a play that does not define it must still see it undefined, as in Ansible.
+    """
+    group_vars = group_vars or {}
+    extra_vars = extra_vars or {}
     sources = {}
     skipped = {}
+    frozen = {}
     shadowed = _shadowed_var_names(plays)
 
-    for index, play in enumerate(plays):
-        play_vars = play.get("vars") or {}
-        context = dict(group_vars or {})
-        context.update(play_vars)
-        context.update(extra_vars or {})
-        names = set(play_vars) if freeze_playbook_vars else (set(play_vars) & requested)
-        for name in sorted(names):
-            if name in extra_vars:
-                continue
-            if name in shadowed:
-                if name in requested:
-                    raise ValueError(
-                        "ansiroll: cannot freeze %r because a task, block, role, "
-                        "or set_fact shadows it" % name
-                    )
-                skipped[name] = "shadowed by task/block/role vars or set_fact"
-                continue
-            value, known = _freeze_value(play_vars[name], context)
-            if not known:
-                if name in requested:
-                    raise ValueError("ansiroll: explicitly frozen variable %r is unresolved" % name)
-                skipped[name] = "value is not resolvable at compile time"
-                continue
-            candidates.setdefault(name, []).append(value)
-            sources.setdefault(name, []).append("play[%d].vars" % index)
+    names = set(requested)
+    if freeze_playbook_vars:
+        for play in plays:
+            names.update((play.get("vars") or {}).keys())
 
-    for name in sorted(requested):
-        if name in extra_vars or name in candidates:
+    for name in sorted(names):
+        explicit = name in requested
+        if name in extra_vars:
             continue
         if name in shadowed:
-            raise ValueError(
-                "ansiroll: cannot freeze %r because a task, block, role, "
-                "or set_fact shadows it" % name
-            )
-        if name not in (group_vars or {}):
-            raise ValueError("ansiroll: explicitly frozen variable %r is undefined" % name)
-        context = dict(group_vars or {})
-        context.update(extra_vars or {})
-        value, known = _freeze_value(group_vars[name], context)
-        if not known:
-            raise ValueError("ansiroll: explicitly frozen variable %r is unresolved" % name)
-        candidates[name] = [value]
-        sources[name] = ["group_vars"]
-
-    frozen = {}
-    for name, values in candidates.items():
-        first = values[0]
-        if any(value != first for value in values[1:]):
-            raise ValueError(
-                "ansiroll: frozen variable %r has conflicting values across plays" % name
-            )
-        frozen[name] = first
+            if explicit:
+                raise ValueError(
+                    "ansiroll: cannot freeze %r because a task, block, role, "
+                    "or set_fact shadows it" % name
+                )
+            skipped[name] = "shadowed by task/block/role vars or set_fact"
+            continue
+        values = []
+        origins = []
+        reason = None
+        for index, play in enumerate(plays):
+            play_vars = play.get("vars") or {}
+            if name in play_vars:
+                raw, origin = play_vars[name], "play[%d].vars" % index
+            elif name in group_vars:
+                raw, origin = group_vars[name], "group_vars"
+            else:
+                reason = "undefined"
+                break
+            context = dict(group_vars)
+            context.update(play_vars)
+            context.update(extra_vars)
+            value, known = _freeze_value(raw, context)
+            if not known:
+                reason = "unresolved"
+                break
+            values.append(value)
+            origins.append(origin)
+        if reason is None and any(v != values[0] for v in values[1:]):
+            reason = "conflicting"
+        if reason is None and not values:
+            reason = "undefined"
+        if reason is not None:
+            if explicit:
+                if reason == "conflicting":
+                    raise ValueError(
+                        "ansiroll: frozen variable %r has conflicting values "
+                        "across plays" % name)
+                if reason == "unresolved":
+                    raise ValueError(
+                        "ansiroll: explicitly frozen variable %r is unresolved" % name)
+                if not any(name in (p.get("vars") or {}) for p in plays):
+                    raise ValueError(
+                        "ansiroll: explicitly frozen variable %r is undefined" % name)
+                raise ValueError(
+                    "ansiroll: cannot freeze %r because it is not defined in "
+                    "every play" % name)
+            skipped[name] = {
+                "undefined": "not defined in every play",
+                "unresolved": "value is not resolvable at compile time",
+                "conflicting": "plays define different values",
+            }[reason]
+            continue
+        frozen[name] = values[0]
+        sources[name] = sorted(set(origins))
     return frozen, {
-        "sources": {name: sorted(set(value)) for name, value in sorted(sources.items())},
+        "sources": {name: sources[name] for name in sorted(sources)},
         "skipped": {name: skipped[name] for name in sorted(skipped)},
     }
 
@@ -299,6 +319,13 @@ def _condition_value(condition, variables, templater):
         parsed = templater.env.parse(source)
         referenced = jinja_meta.find_undeclared_variables(parsed)
     except Exception:
+        return None
+    # Templater globals (now(), lookup(), query(), ...) are evaluated when the
+    # task runs; a condition that calls one is not statically known.
+    if any(name not in variables and name in templater.env.globals
+           for name in referenced):
+        return None
+    if _uses_nondeterministic_filter(parsed):
         return None
     if not referenced.issubset(variables):
         # A tracking StrictUndefined distinguishes an unknown value that Jinja
@@ -347,6 +374,28 @@ def _condition_value(condition, variables, templater):
         return None
 
 
+_NONDETERMINISTIC_FILTERS = frozenset(("random", "shuffle"))
+
+
+def _uses_nondeterministic_filter(parsed):
+    from jinja2 import nodes
+    return any(node.name in _NONDETERMINISTIC_FILTERS
+               for node in parsed.find_all(nodes.Filter))
+
+
+def _loop_shadowed_names(node):
+    """Names a looped task binds per item. They take precedence over extra
+    vars (Ansible evaluates the task's ``when`` per item with them set)."""
+    if node.get("loop") is None:
+        return frozenset()
+    names = {node.get("loop_var") or "item", "ansible_loop_var"}
+    if node.get("index_var"):
+        names.update((node["index_var"], "ansible_index_var"))
+    if node.get("loop_extended"):
+        names.add("ansible_loop")
+    return frozenset(names)
+
+
 def _condition_cache_key(condition):
     if isinstance(condition, (str, bool, int, float, type(None))):
         return type(condition).__name__, condition
@@ -360,10 +409,14 @@ def _condition_cache_key(condition):
     return None
 
 
-def _simplify_when(conditions, variables, templater, stats, cache):
+def _simplify_when(conditions, variables, templater, stats, cache, shadowed=frozenset()):
+    if shadowed:
+        variables = {k: v for k, v in variables.items() if k not in shadowed}
     remaining = []
     for condition in conditions or []:
         key = _condition_cache_key(condition)
+        if key is not None:
+            key = (key, tuple(sorted(shadowed)))
         if key is not None and key in cache:
             value = cache[key]
         else:
@@ -383,7 +436,8 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache):
     kept = []
     for node in nodes or []:
         possible, remaining = _simplify_when(
-            node.get("when"), variables, templater, stats, cache
+            node.get("when"), variables, templater, stats, cache,
+            _loop_shadowed_names(node),
         )
         if not possible:
             stats["removed_nodes"] += 1
@@ -539,32 +593,38 @@ def _mark_required_accelerators(plays, actions):
 
 def _mark_unsupported(plays, unsupported_actions):
     def walk(nodes):
-        for n in nodes:
+        for n in nodes or []:
             if n.get("type") == "block":
                 walk(n.get("block", []))
                 walk(n.get("rescue", []))
                 walk(n.get("always", []))
+            elif n.get("type") == "include":
+                walk(n.get("tasks", []))
             elif n.get("action") in unsupported_actions and not n.get("fallback"):
                 n["fallback"] = True
                 n["fallback_reason"] = "module %s could not be embedded" % n.get("action")
     for p in plays:
-        walk(p["tasks"])
+        walk(p.get("tasks"))
+        walk(p.get("handlers"))
 
 
 def _collect_fallbacks(plays):
     found = []
 
     def walk(nodes):
-        for n in nodes:
+        for n in nodes or []:
             if n.get("type") == "block":
                 walk(n.get("block", []))
                 walk(n.get("rescue", []))
                 walk(n.get("always", []))
+            elif n.get("type") == "include":
+                walk(n.get("tasks", []))
             elif n.get("fallback"):
                 found.append({"uuid": n.get("uuid"), "name": n.get("name"),
                               "reason": n.get("fallback_reason")})
     for p in plays:
-        walk(p["tasks"])
+        walk(p.get("tasks"))
+        walk(p.get("handlers"))
     return found
 
 
@@ -618,29 +678,38 @@ def _asset_marker(data, assets):
     return {"__ansiroll_asset__": digest}
 
 
-def _externalize_assets(value, assets):
-    """Move baked file and plugin bodies out of the JSON task graph."""
-    if isinstance(value, list):
-        return [_externalize_assets(v, assets) for v in value]
-    if not isinstance(value, dict):
-        return value
-    out = {}
-    for key, item in value.items():
-        if key == "_baked" and isinstance(item, dict):
-            baked = {}
-            for name, body in item.items():
-                if isinstance(body, str):
-                    raw = body.encode("utf-8", "surrogateescape")
-                    baked[name] = _asset_marker(raw, assets)
-                else:
-                    baked[name] = item
-            out[key] = baked
-        elif key == "source" and isinstance(item, str) and {
-                "kind", "name", "source"}.issubset(value):
-            out[key] = _asset_marker(item.encode("utf-8", "surrogateescape"), assets)
-        else:
-            out[key] = _externalize_assets(item, assets)
-    return out
+def _externalize_baked(node, assets):
+    baked = node.get("_baked")
+    if isinstance(baked, dict):
+        out = {}
+        for name, body in baked.items():
+            if isinstance(body, str):
+                out[name] = _asset_marker(body.encode("utf-8", "surrogateescape"), assets)
+            else:
+                out[name] = body
+        node["_baked"] = out
+    for key in ("block", "rescue", "always", "tasks"):
+        for child in node.get(key) or []:
+            if isinstance(child, dict):
+                _externalize_baked(child, assets)
+
+
+def _externalize_assets(plays, assets):
+    """Move baked file and plugin bodies out of the JSON task graph.
+
+    Only the loader's own fields are touched: task ``_baked`` bodies and the
+    play's ``jinja_plugins`` sources. User data (vars, args, messages) that
+    happens to use the same key names is left alone."""
+    for play in plays:
+        for plugin in play.get("jinja_plugins") or []:
+            source = plugin.get("source")
+            if isinstance(source, str):
+                plugin["source"] = _asset_marker(
+                    source.encode("utf-8", "surrogateescape"), assets)
+        for key in ("tasks", "handlers"):
+            for node in play.get(key) or []:
+                _externalize_baked(node, assets)
+    return plays
 
 
 def _base_import_entries():
