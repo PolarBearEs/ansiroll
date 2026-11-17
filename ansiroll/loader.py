@@ -213,16 +213,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
         }
+    from ansible import constants as C
+
     config_names = _controller_config_names(result)
-    if config_names:
+    config_names.add("ALLOW_BROKEN_CONDITIONALS")
+    controller_config = {}
+    for name in sorted(config_names):
         try:
-            from ansible import constants as C
-            result["controller_config"] = {
-                name: C.config.get_config_value(name)
-                for name in sorted(config_names)
-            }
+            controller_config[name] = C.config.get_config_value(name)
         except Exception:
+            # Config keys differ across core releases.
             pass
+    if controller_config:
+        result["controller_config"] = controller_config
     return result
 
 
@@ -328,6 +331,8 @@ def _tag_untrusted(value, template_syntax_only=False):
             return {k: walk(x) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(walk(x) for x in v)
         return v
 
     return walk(value)
@@ -534,7 +539,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         "uuid": task._uuid,
         "name": task.name or "include_tasks",
         "action": "include_tasks",
-        "ignore_errors": _boolean_or_template(task.ignore_errors),
+        **_ignore_errors_keywords(task),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -613,7 +618,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         "uuid": task._uuid,
         "name": task.name or "include_role",
         "action": "include_role",
-        "ignore_errors": _boolean_or_template(task.ignore_errors),
+        **_ignore_errors_keywords(task),
         "file": name,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -707,7 +712,7 @@ def _convert_task(task, actions, basedir):
         "environment": _as_list(getattr(task, "environment", None)) or None,
         "search_dirs": _search_dirs(task, basedir, "files"),
         "search_path": _raw_search_path(task, basedir),
-        "ignore_errors": _boolean_or_template(task.ignore_errors),
+        **_ignore_errors_keywords(task),
         "no_log": bool(getattr(task, "no_log", False)),
         "async_val": int(getattr(task, "async_val", 0) or 0),
         "poll": int(getattr(task, "poll", 0) or 0),
@@ -1131,6 +1136,21 @@ def _numeric_or_template(value, cast):
         return cast(value)
     except (TypeError, ValueError):
         return value  # templated value; the runtime resolves it per-host
+
+
+def _ignore_errors_keywords(task):
+    value = _boolean_or_template(task.ignore_errors)
+    result = {"ignore_errors": value}
+    if isinstance(value, str):
+        try:
+            from ansible.playbook.base import Sentinel
+
+            inherited = task._get_parent_attribute("ignore_errors", omit=True)
+        except (ImportError, TypeError):  # Older cores use the keyword default.
+            return result
+        if inherited is not Sentinel and inherited is not None:
+            result["ignore_errors_on_omit"] = _boolean_or_template(inherited)
+    return result
 
 
 def _boolean_or_template(value):

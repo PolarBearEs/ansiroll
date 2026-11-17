@@ -141,14 +141,20 @@ def _mark_unsafe(value, _seen=None):
     return value
 
 
-def _decode_wire_data(value):
-    """Decode compile-time rendered values (`{"__ansiroll_data__": text}`)."""
+def _decode_frozen_value(value):
+    """Decode a value from the compiler's frozen-vars section."""
     if isinstance(value, dict):
-        if set(value.keys()) == {"__ansiroll_data__"}:
-            return _UnsafeText(value["__ansiroll_data__"])
-        return {k: _decode_wire_data(v) for k, v in value.items()}
+        if "mapping" in value:
+            return {_decode_frozen_value(k): _decode_frozen_value(v)
+                    for k, v in value["mapping"]}
+        if "tuple" in value:
+            return tuple(_decode_frozen_value(v) for v in value["tuple"])
+        if "text" in value:
+            return _UnsafeText(value["text"])
+        if "untrusted" in value:
+            return _UntrustedConditionValue(value["untrusted"])
     if isinstance(value, list):
-        return [_decode_wire_data(v) for v in value]
+        return [_decode_frozen_value(v) for v in value]
     return value
 
 
@@ -176,16 +182,43 @@ def _strip_omit(args):
 
 
 def _fail_on_undef(value):
-    """Raise the captured error of any Undefined nested in module args."""
+    """Raise the captured error of any Undefined nested in a value."""
     if isinstance(value, dict):
-        for v in value.values():
+        for k, v in value.items():
+            _fail_on_undef(k)
             _fail_on_undef(v)
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         for v in value:
             _fail_on_undef(v)
     elif _is_undef(value):
         value._fail_with_undefined_error()
     return value
+
+
+def _debug_var_value(value):
+    if not _core_at_least(2, 19):
+        try:
+            return _fail_on_undef(value)
+        except jinja2.UndefinedError:
+            return "VARIABLE IS NOT DEFINED!"
+
+    error_count = 0
+
+    def replace(v):
+        nonlocal error_count
+        if _is_undef(v):
+            try:
+                v._fail_with_undefined_error()
+            except jinja2.UndefinedError as ex:
+                error_count += 1
+                return "<< error %d - %s >>" % (error_count, ex)
+        if isinstance(v, dict):
+            return {k: replace(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [replace(x) for x in v]
+        return v
+
+    return replace(value)
 
 
 def _contains_untrusted_condition_value(value):
@@ -199,16 +232,6 @@ def _contains_untrusted_condition_value(value):
     if isinstance(value, (list, tuple)):
         return any(_contains_untrusted_condition_value(item) for item in value)
     return False
-
-
-def _fail_on_direct_undef(value):
-    """Raise direct/list errors without forcing every value in a mapping."""
-    if isinstance(value, (list, tuple)):
-        for v in value:
-            _fail_on_direct_undef(v)
-    elif _is_undef(value):
-        value._fail_with_undefined_error()
-    return value
 
 
 class TaskFailed(Exception):
@@ -819,7 +842,7 @@ def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
 
 
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
-    if isinstance(value, str):
+    if isinstance(value, (str, tuple)):
         return rt.template(value, ctx)
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_unsafe__"}:
         return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
@@ -1569,7 +1592,7 @@ class Runtime:
             self._untrusted_runtime_vars.add(name)
 
     def template(self, value, ctx, _seen=None):
-        if isinstance(value, (dict, list)):
+        if isinstance(value, (dict, list, tuple)):
             if _seen is None:
                 _seen = set()
             if id(value) in _seen:  # cycles (e.g. hostvars references the ctx)
@@ -1582,13 +1605,16 @@ class Runtime:
                 )  # `!unsafe`: never templated
             if set(value.keys()) == {"__ansiroll_vault__"}:
                 return value
-            return {self.template(k, ctx, _seen) if isinstance(k, str) and "{{" in k else k:
-                    self.template(v, ctx, _seen) for k, v in value.items()}
+            # Ansible leaves mapping keys literal.
+            return {_mark_unsafe(k): self.template(v, ctx, _seen)
+                    for k, v in value.items()}
         if isinstance(value, list):
             return [self.template(v, ctx, _seen) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self.template(v, ctx, _seen) for v in value)
         if isinstance(value, str):
             out = self.templater.render_string(value, ctx)
-            if isinstance(out, (dict, list)) and out is not value:
+            if isinstance(out, (dict, list, tuple)) and out is not value:
                 # A bare expression returned a container that may hold lazy
                 # variable views -- resolve them now that it is used.  The
                 # result is data and is never templated again.
@@ -1641,6 +1667,10 @@ class Runtime:
         return True
 
     def _condition(self, cond, ctx, strict=False, keyword="when"):
+        modern = _core_at_least(2, 19)
+        config = ctx.get("__ansiroll_controller_config") or {}
+        allow_broken = modern and _to_bool(
+            config.get("ALLOW_BROKEN_CONDITIONALS", False))
         if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
             raise UntrustedConditional(
                 "Encountered untrusted template or expression."
@@ -1684,9 +1714,14 @@ class Runtime:
             # example `that: "{{ expression_list }}"`). Evaluate the
             # resolved members as conditions rather than treating the
             # non-empty list itself as truthy.
-            if isinstance(result, (list, tuple)):
+            if (keyword is None or not modern) and isinstance(result, (list, tuple)):
                 return self.when(list(result), ctx, strict=strict,
                                  keyword=keyword)
+            if modern and (result is None or
+                           isinstance(result, str) and not result.strip()):
+                if allow_broken:
+                    return True
+                raise _BrokenConditional("Empty conditional expressions are not allowed.")
             if isinstance(result, (_UnsafeTemplate, _UntrustedConditionValue)):
                 raise UntrustedConditional(
                     "Encountered untrusted template or expression."
@@ -1695,8 +1730,6 @@ class Runtime:
                 whole_template = re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S)
                 if whole_template or result.strip().lower() not in ("true", "false"):
                     if whole_template:
-                        if _core_at_least(2, 19) and not result.strip():
-                            raise _BrokenConditional("Empty conditional expressions are not allowed.")
                         raise UntrustedConditional(
                             "Encountered untrusted template or expression."
                         )
@@ -1706,25 +1739,26 @@ class Runtime:
             if strict and _is_undef(result):
                 raise RuntimeError(
                     "The conditional check %r failed: the expression is undefined" % cond)
-            return self._condition_truth(result, ctx)
+            return self._condition_truth(result, modern, allow_broken)
         if cond is None or (isinstance(cond, str) and not cond.strip()):
-            if cond is not None and _core_at_least(2, 19):
+            if cond is not None and modern and not allow_broken:
                 raise _BrokenConditional("Empty conditional expressions are not allowed.")
             return True
-        if not isinstance(cond, (bool, str)) and _core_at_least(2, 19):
-            raise _BrokenConditional("Conditional expressions must be strings.")
+        if not isinstance(cond, (bool, str)) and modern:
+            if not allow_broken:
+                raise _BrokenConditional("Conditional expressions must be strings.")
+            return bool(_fail_on_undef(self.template(cond, ctx)))
         result = self.templater.evaluate(cond, ctx)
         if strict and _is_undef(result):
             raise RuntimeError(
                 "The conditional check %r failed: the expression is undefined" % cond)
-        return self._condition_truth(result, ctx)
+        return self._condition_truth(result, modern, allow_broken)
 
-    def _condition_truth(self, result, ctx):
+    def _condition_truth(self, result, modern, allow_broken):
         if isinstance(result, bool):
             return result
-        if _core_at_least(2, 19) and not _is_undef(result):
-            config = ctx.get("__ansiroll_controller_config") or {}
-            if _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False)):
+        if modern and not _is_undef(result):
+            if allow_broken:
                 return bool(result)
             raise _BrokenConditional(
                 "Conditional result (%s) was derived from value of type '%s'. "
@@ -2200,6 +2234,11 @@ class Runtime:
             return None, bool(ignore)
         try:
             value = _fail_on_undef(self.template(ignore, ctx))
+            if isinstance(value, _Omit):
+                value = task.get("ignore_errors_on_omit", False)
+                if not _core_at_least(2, 19):
+                    # These executors restore context and skip boolean validation.
+                    return None, bool(value)
         except jinja2.UndefinedError as ex:
             detail = str(ex)
         except Exception as ex:
@@ -2394,6 +2433,7 @@ class Runtime:
         inherited_check_mode = self.check_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
+        refreshed_vars = None
         try:
             check_override = task.get("check_mode")
             if check_override is not None:
@@ -2436,6 +2476,9 @@ class Runtime:
                         self.template(task.get("args") or {}, ctx)
                     ))
                     res = self.delegate_fn(task, args, become, ctx)
+                    if task["action"].rsplit(".", 1)[-1] == "group_by":
+                        # Preserve trust only for controller inventory metadata.
+                        refreshed_vars = res.pop("_ansiroll_vars", None)
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(self.template(task.get("args") or {}, ctx)))
@@ -2467,6 +2510,8 @@ class Runtime:
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
         self._apply_overrides(task, res, ctx)
+        if refreshed_vars is not None:
+            res["_ansiroll_vars"] = refreshed_vars
         if self.profile:
             module_profile = res.get("_ansiroll_profile") or {}
             elapsed = time.monotonic() - task_started
@@ -2617,26 +2662,35 @@ class Runtime:
                 and isinstance(args["_raw_params"], dict)):
             args = dict(args["_raw_params"])
         if name == "debug":
-            for value in args.values():
-                _fail_on_direct_undef(value)
-        else:
-            args = _fail_on_undef(args)
-        if name == "debug":
+            for key, value in args.items():
+                try:
+                    _fail_on_undef(value)
+                except jinja2.UndefinedError as ex:
+                    if _core_at_least(2, 19):
+                        return {
+                            "changed": False, "failed": True,
+                            "msg": ("Task failed: Finalization of task args for "
+                                    "'ansible.builtin.debug' failed: Error while "
+                                    "resolving value for %r: %s" % (key, ex)),
+                        }
+                    raise
             if "var" in args:
                 key = args["var"]
                 # `var:` takes an expression (often dotted), evaluated against vars.
                 try:
                     val = self.templater.evaluate(key, ctx)
+                except jinja2.UndefinedError as ex:
+                    val = _captured(str(ex))
                 except Exception:
                     val = ctx.get(key, self.vars.get(key))
-                if _is_undef(val):
-                    val = "VARIABLE IS NOT DEFINED!"
-                return {"changed": False, key: val, "_ansible_verbose_always": True}
+                return {"changed": False, key: _debug_var_value(val),
+                        "_ansible_verbose_always": True}
             return {
                 "changed": False,
                 "msg": args.get("msg", "Hello world!"),
                 "_ansible_verbose_always": True,
             }
+        args = _fail_on_undef(args)
         if name == "set_fact":
             import keyword
             facts = {
@@ -3392,6 +3446,11 @@ def _hostname():
         return "localhost"
 
 
+def _state_json_default(value):
+    # The final state can include lazy play vars which were never resolved.
+    return None if _is_undef(value) else str(value)
+
+
 def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_mode=False,
          become_password=None, defer_handlers=False, initial_notified=None,
          extra_vars=None, pretty=False, profile=False, module_bundle=None,
@@ -3492,7 +3551,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         # can carry them into the next segment (segment-driven delegation).
         sys.stdout.write("%s %s\n" % (STATE_MARKER, json.dumps(
             {"vars": (rt.vars if rt else host_vars), "notified": (rt.notified if rt else [])},
-            default=str)))
+            default=_state_json_default)))
         # Authoritative recap line for controllers (the strategy parses this).
         sys.stdout.write("%s %s\n" % (STATS_MARKER, json.dumps({"host": host, "stats": total})))
         sys.stdout.flush()
@@ -3653,9 +3712,10 @@ def agent_main():
     host_vars.update(g.get("_BAKED_GROUP_VARS") or {})
     if "_INJECTED_VARS" in g:
         host_vars.update(g["_INJECTED_VARS"])
-    extra_vars = g.get("_INJECTED_EXTRA_VARS") or {}
+    extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
     host_var_overrides = g.get("_INJECTED_HOST_VAR_OVERRIDES") or {}
-    specialized_vars = _decode_wire_data(g.get("_SPECIALIZED_VARS") or {})
+    specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
+    specialized_vars.update(g.get("_FROZEN_VARS") or {})
     conflicts = sorted(k for k, value in specialized_vars.items()
                        if k in extra_vars and extra_vars[k] != value)
     if conflicts:

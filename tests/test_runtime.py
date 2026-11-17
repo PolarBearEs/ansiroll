@@ -615,13 +615,25 @@ def test_debug_fails_when_rendered_argument_contains_captured_undefined():
     assert "missing" in frames[0]["result"]["msg"]
 
 
-def test_debug_does_not_force_nested_undefined_in_mapping():
-    task = _task("1", "lazy debug", "debug", args={"msg": "{{ nested }}"})
-    _rt, frames = run([task], host_vars={
+@pytest.mark.parametrize("modern", [False, True])
+def test_debug_finalizes_nested_undefined_before_reporting(monkeypatch, modern):
+    monkeypatch.setattr("ansiroll.runtime._core_at_least", lambda *_: modern)
+    tasks = [
+        _task("1", "message", "debug", args={"msg": "{{ nested }}"},
+              ignore_errors=True),
+        _task("2", "diagnostic", "debug", args={"var": "nested"}),
+    ]
+    _rt, frames = run(tasks, host_vars={
         "inventory_hostname": "h",
-        "nested": {"unused": "{{ missing }}"},
+        "nested": {"values": ("{{ missing }}", "{{ also_missing }}")},
     })
-    assert frames[0]["status"] == "ok"
+    assert frames[0]["status"] == "failed"
+    assert "'missing' is undefined" in frames[0]["result"]["msg"]
+    assert frames[1]["status"] == "ok"
+    assert frames[1]["result"]["nested"] == ({
+        "values": ["<< error 1 - 'missing' is undefined >>",
+                   "<< error 2 - 'also_missing' is undefined >>"]
+    } if modern else "VARIABLE IS NOT DEFINED!")
 
 
 def test_delegated_debug_remains_a_runtime_special_action():

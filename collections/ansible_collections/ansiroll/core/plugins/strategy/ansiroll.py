@@ -643,7 +643,10 @@ class StrategyModule(StrategyBase):
                 host.name, group_info
             )
         except ImportError:
-            self._inventory.add_dynamic_group(host, result)
+            if hasattr(self._inventory, "add_dynamic_group"):
+                self._inventory.add_dynamic_group(host, result)
+            else:
+                self._add_group(host, result)
         # group_by can make new group_vars and group_names visible immediately
         # to later tasks in the same play. Refresh only values that changed from
         # the host snapshot shipped to the agent, preserving agent-side facts.
@@ -663,7 +666,7 @@ class StrategyModule(StrategyBase):
                 if changed:
                     delta[name] = value
             if delta:
-                result["_ansiroll_vars"] = delta
+                result["_ansiroll_vars"] = json.loads(_json_blob(delta))
         except Exception:
             pass
         return result

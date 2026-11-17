@@ -507,3 +507,185 @@ runpy.run_path(sys.argv[1], run_name='__main__')
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert ("Conditionals must have a boolean result." in proc.stdout) == strict
     assert _summary(proc.stdout) == _ansible(playbook, tmp_path)
+
+
+def test_debug_nested_undefined_survives_generated_result_reporting(tmp_path):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    details: {items: ["{{ missing_first }}", {other: "{{ missing_second }}"}]}
+  tasks:
+    - block:
+        - debug: {msg: "{{ details }}"}
+          register: outcome
+      rescue:
+        - debug: {msg: rescued}
+      always:
+        - debug: {msg: always}
+    - debug: {var: details}
+    - debug: {msg: "continued: {{ outcome.failed }}"}
+""")
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(path))[0])
+    ansible = ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)]
+    modern = Version(__version__) >= Version("2.19")
+    runs = [(ansible, _env()), ([sys.executable, str(script)], _env())]
+    if modern:
+        runs.append((ansible, dict(_env(), ANSIBLE_STRATEGY="ansiroll.core.ansiroll")))
+    for command, env in runs:
+        proc = subprocess.run(command, cwd=tmp_path, env=env,
+                              capture_output=True, text=True, check=True)
+        msgs, recap = _summary(proc.stdout)
+        assert msgs == ["rescued", "always", "continued: True"]
+        assert recap == ("4", "0", "0", "0", "0", "1", "0")
+        assert "'missing_first' is undefined" in proc.stdout
+        if modern:
+            assert "<< error 1 - 'missing_first' is undefined >>" in proc.stdout
+            assert "<< error 2 - 'missing_second' is undefined >>" in proc.stdout
+        else:
+            assert "VARIABLE IS NOT DEFINED!" in proc.stdout
+
+    raw = subprocess.run([sys.executable, str(script)], cwd=tmp_path,
+                         env=dict(_env(), ANSIROLL_RAW="1"),
+                         capture_output=True, text=True, check=True)
+    state = next(line for line in raw.stdout.splitlines()
+                 if line.startswith("__ANSIROLL_STATE__ "))
+    assert json.loads(state.split(" ", 1)[1])["vars"]["outcome"]["failed"]
+
+
+def test_group_by_refresh_preserves_trusted_templates(tmp_path):
+    msgs, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {label: rendered}
+  tasks:
+    - group_by: {key: added}
+    - debug: {msg: "{{ group_text }} / {{ group_literal }}"}
+""", {"group_vars/added.yml": """
+group_text: 'value={{ label }}'
+group_literal: !unsafe 'value={{ label }}'
+"""}, use_strategy=True)
+    assert msgs == ["value=rendered / value={{ label }}"]
+
+
+def test_omit_ignore_errors_uses_core_keyword_default(tmp_path):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    msgs, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: first}
+          ignore_errors: "{{ omit }}"
+      rescue:
+        - debug: {msg: rescued first}
+    - block:
+        - fail: {msg: second}
+          ignore_errors: "{{ omit }}"
+        - debug: {msg: after second}
+      ignore_errors: true
+      rescue:
+        - debug: {msg: rescued second}
+""")
+    if Version(__version__) >= Version("2.14"):
+        assert msgs == ["rescued first", "after second"]
+        assert recap[-2:] == ("1", "1")
+    else:
+        assert msgs == ["rescued first", "rescued second"]
+        assert recap[-2:] == ("2", "0")
+
+
+def test_frozen_values_and_extra_vars_preserve_literal_mappings(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    label: rendered
+    fixed:
+      __ansiroll_data__: {'{{ label }}': literal}
+  tasks:
+    - debug:
+        msg: "{{ fixed['__ansiroll_data__'].keys() | first }}/{{ ordinary['__ansiroll_data__'] }}"
+""")
+    src, _ = compile_playbook(
+        str(path), freeze_vars=["fixed"],
+        extra_vars={"ordinary": {"__ansiroll_data__": "ordinary"}},
+    )
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run([sys.executable, str(script)], cwd=tmp_path,
+                          env=_env(), capture_output=True, text=True, check=True)
+    assert _summary(proc.stdout)[0] == ["{{ label }}/ordinary"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_broken_conditional_policy_is_baked(tmp_path, enabled):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    if Version(__version__) < Version("2.19"):
+        pytest.skip("ALLOW_BROKEN_CONDITIONALS was introduced in 2.19")
+
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: truthy expression}
+      when: "'false'"
+      ignore_errors: true
+    - debug: {msg: literal number}
+      when: 1
+      ignore_errors: true
+    - debug: {msg: whitespace}
+      when: '  '
+      ignore_errors: true
+    - debug: {msg: rendered empty}
+      when: "{{ '' }}"
+      ignore_errors: true
+    - debug: {msg: skipped}
+      when: "[]"
+      ignore_errors: true
+""")
+    env = dict(_env(), ANSIBLE_ALLOW_BROKEN_CONDITIONALS=str(enabled))
+    expected = subprocess.run(
+        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
+    )
+    script = tmp_path / "compiled.py"
+    subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(path), "-o",
+         str(script), "--tree-shake"], cwd=tmp_path, env=env,
+        capture_output=True, text=True, check=True,
+    )
+    env["ANSIBLE_ALLOW_BROKEN_CONDITIONALS"] = str(not enabled)
+    compiled = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, env=env,
+        capture_output=True, text=True, check=True,
+    )
+    assert _summary(compiled.stdout) == _summary(expected.stdout)
+    assert _summary(expected.stdout)[0] == (
+        ["truthy expression", "literal number", "whitespace", "rendered empty"]
+        if enabled else []
+    )
+
+
+def test_mapping_keys_stay_literal(tmp_path):
+    msgs, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {label: rendered}
+  tasks:
+    - set_fact:
+        mapping:
+          '{{ label }}': trusted
+          !unsafe '{{ label }}-literal': untrusted
+    - debug:
+        msg: "{{ mapping.keys() | list | sort | join(',') }}"
+""")
+    assert msgs == ["{{ label }},{{ label }}-literal"]
