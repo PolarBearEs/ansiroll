@@ -471,6 +471,28 @@ def test_deferred_play_vars_resolve_in_mapping_iteration(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+def test_combine_resolves_deferred_play_vars_on_modern_core(tmp_path, mode):
+    if CORE_VERSION < (2, 19):
+        pytest.skip("legacy Ansible exposes raw values in vars mapping copies")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            source: 5
+            alias: "{{ source }}"
+          tasks:
+            - debug:
+                msg: >-
+                  {{ (vars | combine({})).alias == 5 }}
+                  {{ (vars | combine({'alias': 6})).alias == 6 }}
+                  {{ ({'known': true} | combine(vars)).alias == 5 }}
+        """})
+    result = _run_mode(tmp_path, mode)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _summary(result.stdout)[0] == [json.dumps("True True True")]
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
 def test_deferred_play_vars_keep_literal_mapping_values(tmp_path, mode):
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost

@@ -211,15 +211,20 @@ def _to_bool(value):
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
 
+    def copy(mapping):
+        if isinstance(mapping, _PlayVarScope):
+            return dict(mapping.items())
+        return dict(mapping)
+
     def merge(a, b):
-        out = dict(a)
+        out = copy(a)
         for k, v in b.items():
             if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
         return out
-    result = dict(d or {})
+    result = copy(d or {})
     for o in others:
         result = merge(result, o or {})
     return result
