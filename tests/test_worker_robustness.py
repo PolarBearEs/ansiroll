@@ -3,6 +3,7 @@
 Playbook checks run under both real ``ansible-playbook`` and the standalone
 ansiroll agent; each asserts Ansible's observable behavior in-play.
 """
+import errno
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import struct
 import subprocess
 import sys
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -445,6 +447,41 @@ def test_async_timeout_respects_watchdog_poll_order(
     assert polls == checks
     if timed_out:
         assert now[0] == (checks[-1] if poll_before_timeout else checks[-1] + 5)
+
+
+def test_cleanup_io_error_does_not_suppress_timeout(tmp_path, monkeypatch):
+    job = tmp_path / "job"
+    job_tmp = tmp_path / "job-tmp"
+    job_tmp.mkdir()
+    (job_tmp / "payload").touch()
+    unlink = os.unlink
+
+    def fail_payload_unlink(path, *args, **kwargs):
+        if os.path.basename(path) == "payload":
+            raise OSError(errno.EIO, "injected cleanup failure")
+        return unlink(path, *args, **kwargs)
+
+    worker_os = Mock(wraps=os)
+    worker_os.fork.return_value = 42
+    for name in ("open", "dup2", "close", "setpgid", "killpg", "waitpid"):
+        getattr(worker_os, name).return_value = None
+    with monkeypatch.context() as patch:
+        patch.setattr(worker_module, "os", worker_os)
+        patch.setattr(worker_module, "_async_timed_out", lambda *args: True)
+        patch.setattr(worker_module.tempfile, "tempdir", None)
+        patch.setattr(worker_module.tempfile, "mkdtemp", lambda **kwargs: str(job_tmp))
+        patch.setattr(os, "unlink", fail_payload_unlink)
+        worker_module._async_supervise(
+            "job", str(job), 1, "command", '{"ANSIBLE_MODULE_ARGS": {}}',
+            None, {}, None, 99, (2, 21), False,
+        )
+
+    worker_os.killpg.assert_called_once_with(42, signal.SIGKILL)
+    worker_os.waitpid.assert_called_once_with(42, 0)
+    assert (job_tmp / "payload").exists()
+    assert json.loads(job.read_text()) == {
+        "msg": "Timeout exceeded", "failed": True, "child_pid": 42,
+    }
 
 
 def _children(pid):

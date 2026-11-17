@@ -502,7 +502,8 @@ def _async_supervise(jid, job_path, time_limit, fqn, params, profile, env,
     # this private directory, even if multiple jobs share the temp parent.
     os.environ.update({str(k): str(v) for k, v in env.items()})
     tempfile.tempdir = None
-    with tempfile.TemporaryDirectory(prefix="ansiroll-async-") as tmpdir:
+    tmpdir = tempfile.mkdtemp(prefix="ansiroll-async-")
+    try:
         payload = json.loads(params)
         payload["ANSIBLE_MODULE_ARGS"]["_ansible_tmpdir"] = tmpdir
         params = json.dumps(payload)
@@ -533,13 +534,15 @@ def _async_supervise(jid, job_path, time_limit, fqn, params, profile, env,
             except ProcessLookupError:
                 pass
             os.waitpid(sub_pid, 0)
-    if timed_out and version >= (2, 12):
-        if poll_before_timeout:
-            # This watchdog publishes the timeout one second after killing.
-            time.sleep(1)
-        _jwrite(job_path, {
-            "msg": "Timeout exceeded", "failed": True, "child_pid": sub_pid,
-        })
+        if timed_out and version >= (2, 12):
+            if poll_before_timeout:
+                # This watchdog publishes the timeout one second after killing.
+                time.sleep(1)
+            _jwrite(job_path, {
+                "msg": "Timeout exceeded", "failed": True, "child_pid": sub_pid,
+            })
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _async_run(fqn, params, profile, env, time_limit, source_fd, version,
