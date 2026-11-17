@@ -573,9 +573,11 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         return None
     role = getattr(task, "_role", None)
     physical_path = os.path.realpath(path)
+    scope = _include_scope_key(task)
+    stable_template = raw_fname if getattr(task, "_ansiroll_stable_include", False) else None
     key = ("tasks", physical_path, _include_path_spelling(path),
            id(role) if role is not None else None, _is_handler(task),
-           _include_search_context(task, raw_fname, fname), _include_scope_key(task))
+           _include_search_context(task, stable_template, fname), scope)
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
@@ -593,7 +595,17 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
                 variable_manager=task.get_variable_manager(), loader=task._loader)
         except Exception:
             return None
-        _register_included(blocks)
+        nested_includes = _register_included(blocks)
+        if raw_fname != fname and all(
+            ((nested.args or {}).get("_raw_params") or (nested.args or {}).get("file")) == raw_fname
+            and _include_scope_key(nested) == scope
+            for nested in nested_includes
+        ):
+            # This expansion searches for the same template in the same scope
+            # at every include site. A different child could rebind that
+            # template and make even repeated ancestor paths significant.
+            for nested in nested_includes:
+                nested._ansiroll_stable_include = True
         include_id = _new_include_id()
         _INCLUDE_STACK[key] = include_id
         try:
@@ -685,7 +697,7 @@ def _include_path_spelling(path):
     return root + "/".join(part for part in path.split("/") if part not in ("", "."))
 
 
-def _include_search_context(task, raw_fname=None, fname=None):
+def _include_search_context(task, stable_template=None, fname=None):
     # Descendants search using this include's argument followed by its ancestors'
     # arguments. Preserve both the relative prefix (which a child can extend)
     # and the ordered paths after the first absolute reset.
@@ -693,14 +705,14 @@ def _include_search_context(task, raw_fname=None, fname=None):
              for path, dynamic in _parent_include_paths(task)]
     if any(dynamic for _, dynamic in paths):
         # A descendant can override variables in an ancestor's filename.
-        # Keep the templates distinct, and coalesce repeated directories that
-        # add no search candidate under the current compile-time bindings.
+        # Keep the templates distinct unless the recursive expansion can
+        # establish that the filename binding stays the same.
         context = []
         for entry in paths:
             path, dynamic = entry
             directory = path
             if dynamic:
-                directory = _include_path_spelling(os.path.dirname(fname)) if path == raw_fname else None
+                directory = _include_path_spelling(os.path.dirname(fname)) if path == stable_template else None
             if directory == "" and context[-1:] == [entry]:
                 continue
             # An absolute parent resets the cumulative path. The first
@@ -890,6 +902,9 @@ def _play_of(task):
 def _register_included(blocks):
     from ansible.playbook.block import Block
     from ansible.playbook.task import Task
+    from ansible.playbook.task_include import TaskInclude
+
+    includes = []
 
     def walk(obj):
         if isinstance(obj, Block):
@@ -898,9 +913,12 @@ def _register_included(blocks):
                     walk(sub)
         elif isinstance(obj, Task):
             INCLUDED_TASKS[obj._uuid] = obj
+            if isinstance(obj, TaskInclude):
+                includes.append(obj)
 
     for b in blocks:
         walk(b)
+    return includes
 
 
 def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
