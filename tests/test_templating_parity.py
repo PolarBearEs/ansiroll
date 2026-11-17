@@ -186,8 +186,25 @@ def test_controller_authored_vars_preserve_template_provenance(tmp_path, use_str
     - debug:
         msg: "{{ included.authored }} / {{ authored }} / {{ literal }}"
 """
+        if register:
+            playbook += r"""
+    - debug:
+        msg: >-
+          {{ inclusion.ansible_facts.included.nested[0].value }} /
+          {{ inclusion.ansible_facts.included.nested[0].literal }} /
+          {{ inclusion.ansible_facts.included.nested[0].count }} /
+          {{ inclusion.ansible_facts.included.nested[0].word }} /
+          {{ output.stdout }}
+"""
     messages, recap = _assert_parity(tmp_path, playbook, {
-        "sample.yml": "authored: '{{ label }}-authored'\nnested: [{value: '{{ label }}-nested'}]\n",
+        "sample.yml": (
+            "authored: '{{ label }}-authored'\n"
+            "nested:\n"
+            "  - value: '{{ label }}-nested'\n"
+            "    literal: !unsafe '{{ label }}-included-literal'\n"
+            "    count: 7\n"
+            "    word: plain\n"
+        ),
         "literals.yml": "literal: !unsafe '{{ label }}-literal'\n",
     }, use_strategy=use_strategy)
 
@@ -197,12 +214,45 @@ def test_controller_authored_vars_preserve_template_provenance(tmp_path, use_str
     )
     if use_strategy:
         assert messages[1] == "false / false"
-        if register:
-            assert messages[2] == "sample-authored"
-        assert messages[-2:] == [
+        expected = [
             "sample-authored / {{ label }}-literal",
             "later-authored / later-authored / {{ label }}-literal",
         ]
+        if register:
+            expected.insert(0, "sample-authored")
+            expected.append(
+                "later-nested / {{ label }}-included-literal / 7 / plain / {{ label }}-module"
+            )
+        assert messages[2:] == expected
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern include_vars register provenance")
+def test_looped_include_vars_keeps_each_registered_definition_across_plays(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    label: first
+  tasks:
+    - include_vars: {file: "{{ item }}.yml", name: data}
+      loop: [authored, skipped, literal]
+      when: item != 'skipped'
+      register: inclusion
+- hosts: localhost
+  gather_facts: false
+  vars:
+    label: second
+  tasks:
+    - debug:
+        msg: >-
+          {{ inclusion.results[0].ansible_facts.data.value }} /
+          {{ inclusion.results[1] is skipped | lower }} /
+          {{ inclusion.results[2].ansible_facts.data.value }}
+""", {
+        "authored.yml": "value: '{{ label }}'\n",
+        "literal.yml": "value: !unsafe '{{ label }}'\n",
+    }, use_strategy=True)
+    assert messages == ["second / true / {{ label }}"]
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Templar parity")
@@ -504,6 +554,51 @@ def test_inherited_conditions_are_evaluated_at_each_task(tmp_path):
     })
     assert msgs == ["uses_task_vars"]
     assert recap == ("6", "0", "0", "2", "1", "1", "5")
+
+
+@pytest.mark.parametrize("action", [
+    "include_tasks: included.yml", "include_role: {name: r}",
+], ids=["tasks", "role"])
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_dynamic_include_loop_resolution_reports_task_results(tmp_path, action, use_strategy):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: undefined loop skipped
+      ACTION
+      loop: "{{ missing_loop }}"
+      when: false
+      register: skipped_loop
+    - assert: {that: skipped_loop is skipped, quiet: true}
+    - name: malformed loop fails despite the condition
+      ACTION
+      loop: "{{ 'scalar' }}"
+      when: false
+      ignore_errors: true
+      register: malformed_loop
+    - assert: {that: malformed_loop is failed, quiet: true}
+    - name: undefined lookup loop ignored
+      ACTION
+      with_list: "{{ missing_loop }}"
+      ignore_errors: true
+    - block:
+        - name: undefined loop rescued
+          ACTION
+          loop: "{{ missing_loop }}"
+      rescue:
+        - assert: {that: ansible_failed_result is failed, quiet: true}
+      always:
+        - debug: {msg: always ran}
+    - name: empty loop skipped
+      ACTION
+      loop: []
+""".replace("ACTION", action), {
+        "included.yml": "- debug: {msg: unexpected included task}\n",
+        "roles/r/tasks/main.yml": "- debug: {msg: unexpected included role}\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["always ran"]
+    assert recap == ("6", "0", "0", "0", "2", "1", "2")
 
 
 def test_undefined_and_false_loop_conditions(tmp_path):

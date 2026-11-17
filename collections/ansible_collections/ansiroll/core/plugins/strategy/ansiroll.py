@@ -336,6 +336,7 @@ class StrategyModule(StrategyBase):
     def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
         host_failed = False
         seen = set()
+        included_vars_by_task = {}
         last_frame = time.monotonic()
         while True:
             frame = chan.recv()
@@ -362,7 +363,11 @@ class StrategyModule(StrategyBase):
                                  result_frame.get("task") or result_frame.get("action"),
                                  detail))
                 self._emit_provenance_frame(host, result_frame)
-                self._emit_frame(host, result_frame, task_map, seen, templar)
+                task_key = result_frame.get("runtime_id") or result_frame.get("uuid")
+                definitions = None
+                if not result_frame.get("is_item"):
+                    definitions = included_vars_by_task.pop(task_key, None)
+                self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
             elif t == "delegate":
@@ -370,7 +375,7 @@ class StrategyModule(StrategyBase):
                 chan.send({"t": "delegate_result",
                            "result": self._run_delegated(
                                frame, host, hv, templar, become_pass,
-                               task_map, play_context
+                               task_map, play_context, included_vars_by_task
                            )})
                 self._profile("%s delegate +%.3fs %s"
                               % (host.name, time.monotonic() - delegate_started,
@@ -430,7 +435,7 @@ class StrategyModule(StrategyBase):
         self._emit_provenance(provenance)
 
     def _run_delegated(self, frame, host, hv, templar, become_pass,
-                       task_map=None, play_context=None):
+                       task_map=None, play_context=None, included_vars_by_task=None):
         """Execute a delegated / controller-coupled task on the correct host and
         return its raw module result (the agent re-emits the framed result)."""
         action = str(frame.get("action") or "").rsplit(".", 1)[-1]
@@ -447,8 +452,16 @@ class StrategyModule(StrategyBase):
                     _tag_untrusted(facts),
                     default=lambda value: {"__ansiroll_unsafe__": str(value)},
                 )
+                # Keep the loader's tagged values until the register is replayed.
+                task_key = frame.get("runtime_id") or frame.get("uuid")
+                task = (task_map or {}).get(task_key)
+                task_action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+                if (included_vars_by_task is not None and task_action == "include_vars"
+                        and _register_names(task)):
+                    definitions = included_vars_by_task.setdefault(task_key, [])
+                    result["_ansiroll_included_vars_reference"] = len(definitions)
+                    definitions.append(facts)
                 # Match Ansible's include_vars layer for later plays and hosts.
-                task = (task_map or {}).get(frame.get("runtime_id") or frame.get("uuid"))
                 run_once = getattr(task, "run_once", None)
                 if isinstance(run_once, str):
                     run_once = self._t(templar, run_once)
@@ -932,7 +945,8 @@ class StrategyModule(StrategyBase):
         self._tqm.send_callback("v2_playbook_on_task_start", task, is_conditional=False)
         return True
 
-    def _emit_frame(self, host, frame, task_map, seen, templar=None):
+    def _emit_frame(self, host, frame, task_map, seen, templar=None,
+                    included_vars=None):
         task_key = frame.get("runtime_id") or frame.get("uuid")
         task = task_map.get(task_key)
         if task is None:
@@ -950,12 +964,17 @@ class StrategyModule(StrategyBase):
         # survive into subsequent plays (each play runs a fresh agent).
         try:
             registers = _register_names(task)
+            action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+            registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action == "include_vars" and included_vars:
+                    registered_result = _restore_included_vars(
+                        result_data, included_vars, frame.get("included_vars_references"),
+                    )
                 self._variable_manager.set_nonpersistent_facts(
-                    host.name, {reg: dict(result_data) for reg in registers}
+                    host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = result_data.get("ansible_facts")
-            action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             if action == "include_vars":
                 # The controller has already stored the original tagged values.
                 facts = None
@@ -987,7 +1006,7 @@ class StrategyModule(StrategyBase):
                     if registers:
                         self._variable_manager.set_nonpersistent_facts(
                             other.name,
-                            {reg: dict(result_data) for reg in registers},
+                            {reg: dict(registered_result) for reg in registers},
                         )
                     if isinstance(facts, dict):
                         if not is_set_fact or cacheable:
@@ -1108,6 +1127,24 @@ class StrategyModule(StrategyBase):
             if task is None:
                 break
             guard += 1
+
+
+def _restore_included_vars(result, definitions, references):
+    """Restore controller-loaded facts only in the registered copy of a result."""
+    if not isinstance(references, dict):
+        return result
+    looped = isinstance(result.get("results"), list)
+    entries = result["results"] if looped else [result]
+    restored = []
+    for index, entry in enumerate(entries):
+        reference = references.get(str(index))
+        if (type(reference) is int and 0 <= reference < len(definitions)
+                and isinstance(entry, dict) and "ansible_facts" in entry):
+            entry = dict(entry, ansible_facts=definitions[reference])
+        restored.append(entry)
+    if looped:
+        return dict(result, results=restored)
+    return restored[0]
 
 
 def _register_names(task):

@@ -1893,6 +1893,17 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if (not is_item and not node.get("no_log") and node.get("register")
+                    and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
+                entries = result["results"] if "results" in result else [result]
+                references = {}
+                for index, entry in enumerate(entries):
+                    facts = entry.get("ansible_facts")
+                    reference = getattr(facts, "controller_reference", None)
+                    if isinstance(facts, _IncludedVars) and reference is not None:
+                        references[str(index)] = reference
+                if references:
+                    frame["included_vars_references"] = references
             self.on_result(frame)
         elif self.pretty:
             self._emit_pretty(frame)
@@ -2024,13 +2035,18 @@ class Runtime:
         return self._inherited_when + list(own)
 
     def run_include(self, node, overlay, become=False):
-        """A compile-time-expanded include_tasks: run the inner tasks (per loop
-        item when looped). The include itself reports but is not tallied."""
+        """Run a compile-time-expanded include_tasks or include_role."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
-        result, ignore = self._task_gate(node, base_ctx)
+        items, result, ignore = self._resolve_task_loop(node, base_ctx)
+        if items is not None and not items:
+            result = {"changed": False, "skipped": True, "results": [],
+                      "msg": "No items in the list"}
+        if result is None:
+            result, ignore = self._task_gate(node, base_ctx)
         if result is not None:
+            self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore)
             if result.get("skipped"):
                 self._tally("skipped")
@@ -2043,12 +2059,11 @@ class Runtime:
         scope = dict(overlay)
         scope.update(self.template_vars(node.get("vars"), base_ctx))
         loop = node.get("loop")
-        if loop is None:
+        if items is None:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
             self._tally("ok")
             self.run_nodes(node.get("tasks", []), scope, b)
             return
-        items = self._resolve_loop(loop, base_ctx)
         for i, it in enumerate(items):
             item_scope = dict(scope)
             item_scope.update(self._loop_item_vars(node, items, i, base_ctx))
@@ -2224,25 +2239,8 @@ class Runtime:
         self.emit_start(task)
 
         if task.get("loop") is not None:
-            try:
-                items = self._resolve_loop(task["loop"], base_ctx)
-            except jinja2.UndefinedError as ex:
-                # Only undefined loop values are deferred until the task's
-                # condition has had a chance to skip it.
-                try:
-                    skipped = not self.when(self._when_of(task), base_ctx)
-                except ConditionalError:
-                    skipped = False
-                if skipped:
-                    res = self._conditional_skip()
-                else:
-                    message = "Task failed: %s" % ex if _core_at_least(2, 19) else str(ex)
-                    res = {"failed": True, "changed": False, "msg": message}
-                ignore = self._ignore_before_validation(task)
-            except Exception as ex:
-                res = {"failed": True, "changed": False, "msg": str(ex)}
-                ignore = self._ignore_before_validation(task)
-            else:
+            items, res, ignore = self._resolve_task_loop(task, base_ctx)
+            if res is None:
                 try:
                     res, ignore = self._run_loop(task, items, base_ctx, effective_become)
                 except TaskFailed:
@@ -2419,6 +2417,28 @@ class Runtime:
             agg["msg"] = "One or more items failed"
         return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
+    def _resolve_task_loop(self, task, ctx):
+        loop = task.get("loop")
+        if loop is None:
+            return None, None, False
+        try:
+            return self._resolve_loop(loop, ctx), None, False
+        except jinja2.UndefinedError as ex:
+            # Only undefined loop values are deferred until the task's
+            # condition has had a chance to skip it.
+            try:
+                skipped = not self.when(self._when_of(task), ctx)
+            except ConditionalError:
+                skipped = False
+            if skipped:
+                result = self._conditional_skip()
+            else:
+                message = "Task failed: %s" % ex if _core_at_least(2, 19) else str(ex)
+                result = {"failed": True, "changed": False, "msg": message}
+        except Exception as ex:
+            result = {"failed": True, "changed": False, "msg": str(ex)}
+        return None, result, self._ignore_before_validation(task)
+
     def _resolve_loop(self, loop, ctx):
         items = _mark_unsafe(self._resolve_loop_items(loop, ctx))
         if not isinstance(loop, list) or not _legacy_templating():
@@ -2519,6 +2539,7 @@ class Runtime:
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
         included_vars = None
+        included_vars_reference = None
         try:
             check_override = task.get("check_mode")
             if check_override is not None:
@@ -2567,6 +2588,7 @@ class Runtime:
                         refreshed_vars = res.pop("_ansiroll_vars", None)
                     elif action == "include_vars":
                         payload = res.pop("_ansiroll_included_vars", None)
+                        included_vars_reference = res.pop("_ansiroll_included_vars_reference", None)
                         if payload is not None:
                             included_vars = json.loads(payload)
             else:
@@ -2605,6 +2627,7 @@ class Runtime:
                 (key, _decode_included_var(value))
                 for key, value in included_vars.items()
             )
+            res["ansible_facts"].controller_reference = included_vars_reference
         self._apply_overrides(task, res, ctx)
         if refreshed_vars is not None:
             res["_ansiroll_vars"] = refreshed_vars
