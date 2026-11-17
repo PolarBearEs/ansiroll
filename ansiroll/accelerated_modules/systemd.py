@@ -6,6 +6,8 @@ import os
 import shutil
 import subprocess
 
+from . import _stdin
+
 
 _NAME_KEYS = ("name", "service", "unit")
 _RELOAD_KEYS = ("daemon_reload", "daemon-reload")
@@ -61,7 +63,7 @@ def _command(argv, environment):
         process_env.update({str(key): str(value) for key, value in environment.items()})
     process_env.setdefault("XDG_RUNTIME_DIR", "/run/user/%s" % os.geteuid())
     try:
-        process = subprocess.Popen(
+        process = _stdin.popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=process_env
         )
         stdout, stderr = process.communicate()
