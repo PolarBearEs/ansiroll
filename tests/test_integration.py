@@ -503,6 +503,78 @@ def test_accelerated_file_directory_matches_official_idempotence(tmp_path):
     assert (accelerated_path.stat().st_mode & 0o7777) == 0o750
 
 
+def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
+    import stat as stat_module
+    from ansiroll.accelerated_modules import can_accelerate
+    from ansiroll.loader import _accelerator_options
+
+    cases = [
+        # mode applies to every directory mkdir -p creates.
+        ({"path": "a/b/c", "state": "directory", "mode": "0750"}, False),
+        ({"path": "a/b/c", "state": "directory", "mode": "0750"}, False),
+        ({"path": "q/r", "state": "directory", "mode": "g+w"}, False),
+        # mode/owner/size/... are reported even when not requested.
+        ({"path": "m/n", "state": "directory"}, False),
+        ({"path": "exist", "state": "directory", "mode": "0700"}, False),
+        ({"path": "exist", "state": "directory", "owner": str(os.getuid())}, False),
+        # A regular file is not a directory, in check mode too.
+        ({"path": "regular", "state": "directory"}, True),
+        ({"path": "regular", "state": "directory"}, False),
+        ({"path": "newdir", "state": "directory"}, True),
+        ({"path": "t1", "state": "touch"}, False),
+        ({"path": "t1", "state": "touch", "mode": "0600"}, False),
+        ({"path": "t1", "state": "touch", "mode": "0644"}, True),
+        ({"path": "t3", "state": "touch", "modification_time": "preserve",
+          "access_time": "preserve"}, False),
+        ({"path": "lnk", "state": "absent"}, True),
+        ({"path": "l2", "src": "exist", "state": "link"}, False),
+        ({"path": "l2", "src": "exist", "state": "link"}, False),
+        ({"path": "regular", "state": "absent"}, False),
+        ({"path": "missing", "state": "absent"}, False),
+    ]
+    for side in ("official", "accelerated"):
+        base = tmp_path / side
+        (base / "exist").mkdir(parents=True)
+        (base / "regular").write_text("")
+        os.chmod(str(base / "regular"), 0o644)
+        os.symlink("regular", str(base / "lnk"))
+
+    def tree(base):
+        out = {}
+        for root, dirs, files in os.walk(base):
+            for name in dirs + files:
+                full = os.path.join(root, name)
+                out[os.path.relpath(full, base)] = oct(
+                    stat_module.S_IMODE(os.lstat(full).st_mode))
+        return out
+
+    def normalized(result, base):
+        result = {k: v for k, v in result.items() if k not in ("invocation", "diff")}
+        return json.loads(json.dumps(result).replace(base, "<D>"))
+
+    rt = Runtime({"file": ModuleEmbedder().embed("file")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        for args, check in cases:
+            official_base = str(tmp_path / "official")
+            accelerated_base = str(tmp_path / "accelerated")
+            official_args = dict(args, path=os.path.join(official_base, args["path"]))
+            accelerated_args = dict(
+                args, path=os.path.join(accelerated_base, args["path"]))
+            assert can_accelerate("file", dict(accelerated_args), check_mode=check)
+            rt.check_mode = check
+            official = rt.run_module("file", official_args)
+            accelerated = run_accelerated(
+                "file", accelerated_args, check_mode=check,
+                options=_accelerator_options("file"))
+            assert not accelerated.get("_ansiroll_fallback"), args
+            assert (normalized(accelerated, accelerated_base)
+                    == normalized(official, official_base)), (args, check)
+            assert tree(accelerated_base) == tree(official_base), (args, check)
+    finally:
+        rt.cleanup()
+
+
 def test_accelerated_file_attribute_free_recurse_matches_official(tmp_path):
     official_path = tmp_path / "official"
     accelerated_path = tmp_path / "accelerated"
