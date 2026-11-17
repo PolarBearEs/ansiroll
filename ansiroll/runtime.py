@@ -3819,10 +3819,11 @@ def _delegate_vars(ctx):
         if key == "vars":
             continue
         try:
-            json.dumps(value, default=str)
-        except (TypeError, ValueError):
+            # Materialize lazy values once so sending the frame cannot
+            # resolve the same context a second time.
+            safe[key] = json.loads(json.dumps(value, default=str))
+        except (TypeError, ValueError, jinja2.UndefinedError):
             continue
-        safe[key] = value
     return safe
 
 

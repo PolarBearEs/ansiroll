@@ -665,6 +665,26 @@ def test_lookup_loop_undefined_is_deferred_until_when(tmp_path, use_strategy):
     assert recap == ("3", "0", "0", "0", "1", "0", "2")
 
 
+def test_delegated_task_ignores_unrelated_undefined_context_values(tmp_path):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    unused: "{{ missing_scalar }}"
+    unused_mapping: {nested: "{{ missing_mapping_value }}"}
+    unused_list: ["{{ missing_list_value }}"]
+    used: fixture
+  tasks:
+    - command: {argv: [printf, '%s', "{{ used }}"]}
+      delegate_to: localhost
+      changed_when: false
+      register: delegated
+    - debug: {msg: "{{ delegated.stdout }}"}
+""", use_strategy=True)
+    assert messages == ["fixture"]
+    assert recap == ("2", "0", "0", "0", "0", "0", "0")
+
+
 def test_until_and_assert_errors_and_invalid_ignore_errors(tmp_path):
     from ansible.release import __version__
     from packaging.version import Version
