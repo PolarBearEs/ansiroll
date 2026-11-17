@@ -2144,18 +2144,22 @@ class Runtime:
                 args = _fail_on_undef(_strip_omit(self.template(task.get("args") or {}, ctx)))
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
-                    res = self._run_async_module(task["action"], args, become=become)
+                    res = self._run_async_module(
+                        task["action"], args, become=become,
+                        async_val=int(task.get("async_val") or 0), ctx=ctx)
+                elif str(task.get("action") or "").split(".")[-1] == "async_status":
+                    res = self._run_async_status(task["action"], args, become, ctx)
                 elif task.get("accelerator") and (
                         self.accelerated_modules
                         or task.get("accelerator") == "required"):
                     res = self._run_accelerated_action(task, args, become)
+                    if res is not None:
+                        provenance = {
+                            "mode": "native-agent",
+                            "reason": "accelerated action",
+                        }
                 else:
                     res = None
-                if res is not None:
-                    provenance = {
-                        "mode": "native-agent",
-                        "reason": "accelerated action",
-                    }
                 if res is None:
                     res = self.run_module(task["action"], args, become=become)
         except Exception as ex:
@@ -2485,13 +2489,61 @@ class Runtime:
             self._close_workers()
             return None
 
-    def _run_async_module(self, action, args, become=False):
+    def _async_dir_option(self, ctx):
+        """The shell plugin's async_dir option (var ansible_async_dir)."""
+        value = (ctx or {}).get("ansible_async_dir")
+        if value is None or _is_undef(value):
+            return "~/.ansible_async"
+        return _as_text(self.template(value, ctx))
+
+    def _remote_expand_user(self, path, become):
+        """ActionBase._remote_expand_user: a bare ~ means the become user's home."""
+        if not path.startswith("~"):
+            return path
+        head, sep, rest = path.partition(os.path.sep)
+        if head == "~" and become and self.become_user:
+            head = "~%s" % self.become_user
+        return os.path.expanduser(head) + sep + rest
+
+    def _run_async_status(self, action, args, become, ctx):
+        """ansible.builtin.async_status action plugin around its module."""
+        if not args.get("jid") or args.get("mode", "status") not in ("status", "cleanup"):
+            return None  # let the module report the argument error
+        jid = _as_text(args["jid"])
+        mode = args.get("mode", "status")
+        results = {
+            "started": False, "finished": False, "stdout": "", "stderr": "",
+            "stdout_lines": [], "stderr_lines": [], "ansible_job_id": jid,
+        }
+        async_dir = self._remote_expand_user(self._async_dir_option(ctx), become)
+        log_path = os.path.join(async_dir, jid)
+        if mode == "cleanup":
+            results["erased"] = log_path
+        else:
+            results["results_file"] = log_path
+            results["started"] = True
+        module_args = dict(args, jid=jid, mode=mode, _async_dir=async_dir)
+        results = _f_combine(results, self.run_module(action, module_args, become=become),
+                             recursive=True)
+        for convert in ("started", "finished"):
+            results[convert] = bool(results.get(convert))
+        return results
+
+    def _run_async_module(self, action, args, become=False, async_val=0, ctx=None):
         meta = self.modules.get(action)
         if meta is None:
             return None
         params = json.dumps({"ANSIBLE_MODULE_ARGS": args})
+        # ActionBase._execute_module appends ANSIBLE_ASYNC_DIR (the raw
+        # async_dir option) to the task environment for wrap_async.
+        raw_async_dir = self._async_dir_option(ctx)
+        env = dict(self._module_env or {})
+        env["ANSIBLE_ASYNC_DIR"] = raw_async_dir
         try:
-            ack = self._run_async_via_worker(meta, params, become)
+            ack = self._run_async_via_worker(
+                meta, params, become, env=env,
+                async_dir=self._remote_expand_user(raw_async_dir, become),
+                time_limit=async_val)
         except Exception as ex:
             detail = self._worker_stderr(bool(become))
             self._close_workers()
@@ -2502,13 +2554,15 @@ class Runtime:
                        % (meta["module_fqn"], ex, (": " + detail) if detail else ""),
                 "module_stderr": detail,
             }
-        jid = ack.get("jid") or str(ack.get("pid"))
+        if ack.get("failed"):
+            return ack
         return {
+            "failed": False,
+            "started": True,
+            "finished": False,
+            "ansible_job_id": ack.get("ansible_job_id"),
+            "results_file": ack.get("results_file"),
             "changed": True,
-            "ansible_job_id": jid,
-            "started": 1,
-            "finished": 0,
-            "results_file": "",
         }
 
     def _run_file_action(self, name, task, args, ctx, become=False):
@@ -2802,7 +2856,8 @@ class Runtime:
             result["_ansiroll_profile"] = profile_data
         return result
 
-    def _run_async_via_worker(self, meta, params, become):
+    def _run_async_via_worker(self, meta, params, become, env=None,
+                              async_dir=None, time_limit=0):
         w = self._get_worker(bool(become))
         fqn = meta["module_fqn"]
         profile = meta.get("profile", "legacy")
@@ -2816,7 +2871,8 @@ class Runtime:
                 raise RuntimeError("worker load failed: %r" % (ack,))
             w["loaded"].add(fqn)
         request = {"op": "async_run", "fqn": fqn,
-                   "params": params, "profile": profile}
+                   "params": params, "profile": profile, "env": env,
+                   "async_dir": async_dir, "time_limit": time_limit}
         self._send_worker_request(w["proc"], request, self._module_source_bytes)
         ack = self._frame_recv(w["proc"])
         if not isinstance(ack, dict) or ack.get("error"):
@@ -2891,8 +2947,7 @@ class Runtime:
             self._frame_send(proc, {
                 "op": "bundle", "size": len(bundle_bytes),
             })
-            proc.stdin.write(bundle_bytes)
-            proc.stdin.flush()
+            self._write_all(proc, bundle_bytes)
             ack = self._frame_recv(proc)
             if not isinstance(ack, dict) or not ack.get("ok"):
                 try:
@@ -2909,21 +2964,52 @@ class Runtime:
         return w
 
     def _worker_stderr(self, become):
-        """Best-effort read of a dead worker's stderr (why it died)."""
+        """Best-effort read of a worker's stderr (why it died).
+
+        Never blocks on a live worker: it may have answered with an error
+        frame and still be waiting for the next request."""
         become = self._needs_become(become)
         key = (True, self.become_user) if become else False
         w = self._workers.get(key)
         if not w or not w["proc"].stderr:
             return ""
+        proc = w["proc"]
         try:
-            return w["proc"].stderr.read().decode("utf-8", "surrogateescape").strip()
+            import selectors
+            fd = proc.stderr.fileno()
+            # A dead worker's pipe reaches EOF promptly; bound the wait in
+            # case a descendant still holds it open.
+            deadline = time.monotonic() + (1.0 if proc.poll() is not None else 0.0)
+            chunks = []
+            sel = selectors.DefaultSelector()
+            sel.register(fd, selectors.EVENT_READ)
+            try:
+                while True:
+                    if not sel.select(max(0.0, deadline - time.monotonic())):
+                        break
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                sel.close()
+            return b"".join(chunks).decode("utf-8", "surrogateescape").strip()
         except Exception:
             return ""
 
     def _frame_send(self, proc, obj):
         b = json.dumps(obj).encode("utf-8")
-        proc.stdin.write(struct.pack(">I", len(b)))
-        proc.stdin.write(b)
+        self._write_all(proc, struct.pack(">I", len(b)) + b)
+
+    @staticmethod
+    def _write_all(proc, data):
+        # The worker pipes are unbuffered (bufsize=0): write() may be short.
+        view = memoryview(data)
+        while view:
+            written = proc.stdin.write(view)
+            if written is None:
+                written = 0
+            view = view[written:]
         proc.stdin.flush()
 
     def _send_worker_request(self, proc, request, source=None):
@@ -2933,8 +3019,7 @@ class Runtime:
         request = dict(request)
         request["source_size"] = len(source)
         self._frame_send(proc, request)
-        proc.stdin.write(source)
-        proc.stdin.flush()
+        self._write_all(proc, source)
 
     def _frame_recv(self, proc):
         head = self._readn(proc.stdout, 4)
@@ -3308,8 +3393,9 @@ def _chan_recv():
 
 def _chan_send(out_fd, obj):
     b = json.dumps(obj, default=str).encode("utf-8", "surrogateescape")
-    os.write(out_fd, struct.pack(">I", len(b)))
-    os.write(out_fd, b)
+    view = memoryview(struct.pack(">I", len(b)) + b)
+    while view:
+        view = view[os.write(out_fd, view):]
 
 
 def _delegate_vars(ctx):

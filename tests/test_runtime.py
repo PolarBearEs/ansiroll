@@ -931,7 +931,8 @@ def test_async_poll_zero_starts_without_sync_run(monkeypatch):
     task["special"] = None
     rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
 
-    def async_run(action, args, become=False):
+    def async_run(action, args, become=False, async_val=0, ctx=None):
+        assert async_val == 2000
         return {
             "changed": True,
             "ansible_job_id": "123.456",
