@@ -755,6 +755,14 @@ def _convert_task(task, actions, basedir):
         node["fallback_reason"] = "controller-coupled action %s" % action
     elif node["special"] is None:
         actions.add(action)
+    if node["special"] == "set_fact":
+        # Only top-level fact names from the authored argument mapping may
+        # be templates. Preserve their trust before serialization strips tags.
+        keys = [k for k in node["args"] if isinstance(k, str)
+                and ("{{" in k or "{%" in k)]
+        trusted_keys = [k for k in _tag_untrusted(keys) if isinstance(k, str)]
+        if trusted_keys:
+            node["set_fact_key_templates"] = trusted_keys
     if action.split(".")[-1] == "assert":
         node["args"] = {k: v if k == "that" else _tag_untrusted(v)
                         for k, v in node["args"].items()}

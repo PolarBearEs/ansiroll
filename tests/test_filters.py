@@ -90,6 +90,7 @@ def test_to_uuid_stable(t):
     ("{{ 'buster' is search('ste') }}", {}, True),
     ("{{ r is changed }}", {"r": {"changed": True}}, True),
     ("{{ r is succeeded }}", {"r": {"failed": False}}, True),
+    ("{{ r is successful }}", {"r": {"failed": True}}, False),
     ("{{ r is failed }}", {"r": {"failed": True}}, True),
     ("{{ r is skipped }}", {"r": {"skipped": True}}, True),
 ])

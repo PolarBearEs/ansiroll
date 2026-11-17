@@ -52,7 +52,8 @@ def _ansible(playbook, cwd, strategy=None):
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(playbook)],
+        ["ansible-playbook", "-i", "localhost,", "-c", "local",
+         "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True,
     )
     return _summary(proc.stdout)
@@ -420,6 +421,31 @@ def test_undefined_and_false_loop_conditions(tmp_path):
 """)
 
 
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_lookup_loop_undefined_is_deferred_until_when(tmp_path, use_strategy):
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg=unreachable
+      delegate_to: localhost
+      with_list: "{{ missing_loop }}"
+      when: false
+      register: skipped_loop
+    - assert:
+        quiet: true
+        that: skipped_loop is skipped
+    - debug: msg=unreachable
+      with_list: "{{ missing_loop }}"
+      ignore_errors: true
+    - debug: msg=unreachable
+      with_dict: ["ordinary"]
+      when: false
+      ignore_errors: true
+""", use_strategy=use_strategy)
+    assert recap == ("3", "0", "0", "0", "1", "0", "2")
+
+
 def test_until_and_assert_errors_and_invalid_ignore_errors(tmp_path):
     from ansible.release import __version__
     from packaging.version import Version
@@ -740,6 +766,58 @@ def test_broken_conditional_policy_is_baked(tmp_path, enabled):
         ["truthy expression", "literal number", "whitespace", "rendered empty"]
         if enabled else []
     )
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_templates_authored_fact_names(tmp_path, use_strategy):
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_key: greeting
+    fact_value: hello
+  tasks:
+    - set_fact:
+        "{{ fact_key }}": "{{ fact_value }}"
+      register: result
+    - ansible.builtin.set_fact:
+        "fruit_{{ idx }}": "{{ item }}"
+      loop: [apple, pear]
+      loop_control:
+        index_var: idx
+    - set_fact:
+        !unsafe "{{ fact_key }}": goodbye
+      ignore_errors: true
+    - assert:
+        quiet: true
+        that:
+          - greeting == 'hello'
+          - result.ansible_facts.greeting == 'hello'
+          - fruit_0 == 'apple'
+          - fruit_1 == 'pear'
+""", use_strategy=use_strategy)
+    assert recap == ("4", "0", "0", "0", "0", "0", "1")
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_loop_preserves_distinct_registered_results(tmp_path, use_strategy):
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fruit_names: [apple, pear, orange, plum]
+  tasks:
+    - shell: printf '%s' "{{ item }}"
+      loop: "{{ fruit_names }}"
+      register: fruit
+    - assert:
+        quiet: true
+        that: item.stdout == fruit_names[idx]
+      loop: "{{ fruit.results }}"
+      loop_control:
+        index_var: idx
+""", use_strategy=use_strategy)
+    assert recap == ("2", "1", "0", "0", "0", "0", "0")
 
 
 def test_mapping_keys_stay_literal(tmp_path):

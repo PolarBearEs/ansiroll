@@ -130,11 +130,13 @@ def _mark_unsafe(value, _seen=None):
     if isinstance(value, (dict, list, tuple)):
         if _seen is None:
             _seen = {}
+        # Keep source containers alive because lazy views create temporary
+        # wrappers whose object IDs could be reused during this traversal.
         if id(value) in _seen:
-            return _seen[id(value)]
+            return _seen[id(value)][1]
         if isinstance(value, dict):
             out = {}
-            _seen[id(value)] = out
+            _seen[id(value)] = (value, out)
             # Lazy views render on access; plain containers are read raw.
             getter = (value.__getitem__ if isinstance(value, _LazyTplDict)
                       else lambda key: dict.__getitem__(value, key))
@@ -143,7 +145,7 @@ def _mark_unsafe(value, _seen=None):
             return out
         if isinstance(value, list):
             out = []
-            _seen[id(value)] = out
+            _seen[id(value)] = (value, out)
             items = (iter(value) if isinstance(value, _LazyTplList)
                      else list.__iter__(value))
             out.extend(_mark_unsafe(v, _seen) for v in items)
@@ -689,6 +691,10 @@ def _as_result(v):
     return v if isinstance(v, dict) else {}
 
 
+def _test_succeeded(result):
+    return not _as_result(result).get("failed", False)
+
+
 # A subset of Ansible's Jinja2 tests (pure stdlib).
 _ANSIBLE_TESTS = {
     "version": _test_version,
@@ -696,8 +702,9 @@ _ANSIBLE_TESTS = {
     "match": _test_match,
     "search": _test_search,
     "regex": lambda v, pattern, **k: _test_search(v, pattern),
-    "succeeded": lambda r: not _as_result(r).get("failed", False),
-    "success": lambda r: not _as_result(r).get("failed", False),
+    "succeeded": _test_succeeded,
+    "success": _test_succeeded,
+    "successful": _test_succeeded,
     "failed": lambda r: _as_result(r).get("failed", False),
     "failure": lambda r: _as_result(r).get("failed", False),
     "changed": lambda r: _as_result(r).get("changed", False),
@@ -2403,7 +2410,9 @@ class Runtime:
             name = loop["__ansiroll_lookup"]
             if name == "sequence":
                 return self._resolve_sequence_loop(loop.get("terms"), ctx)
-            terms = self.template(loop.get("terms"), ctx)
+            # Defer undefined lookup terms to the task condition, before a
+            # lookup can turn them into loop items or different errors.
+            terms = _fail_on_undef(self.template(loop.get("terms"), ctx))
             if not isinstance(terms, list):
                 terms = [terms]
             try:
@@ -2736,13 +2745,15 @@ class Runtime:
         args = _fail_on_undef(args)
         if name == "set_fact":
             import keyword
-            facts = {
-                _trust_set_fact_value(k): _trust_set_fact_value(v)
-                for k, v in args.items() if k not in ("cacheable",)
-            }
+            facts = {}
+            key_templates = set(task.get("set_fact_key_templates", ()))
             cacheable = _boolean(args.get("cacheable", False))
             reserved = ("true", "false", "yes", "no", "on", "off", "none", "null")
-            for k in facts:
+            for k, value in args.items():
+                if k == "cacheable":
+                    continue
+                if k in key_templates:
+                    k = _fail_on_undef(self.template(str(k), ctx))
                 if not isinstance(k, str):
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s' of type '%s'"
@@ -2750,6 +2761,7 @@ class Runtime:
                 if not k.isidentifier() or keyword.iskeyword(k) or k.lower() in reserved:
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s'" % k}
+                facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
             self.vars.update(facts)
             return {
                 "changed": False,
