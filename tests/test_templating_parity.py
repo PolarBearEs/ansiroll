@@ -14,10 +14,12 @@ import pytest
 
 pytest.importorskip("ansible")
 
+from ansible import constants as C  # noqa: E402
 from ansible.release import __version__  # noqa: E402
 from packaging.version import Version
 
 from ansiroll.compiler import compile_playbook  # noqa: E402
+from ansiroll.loader import parse_playbook  # noqa: E402
 
 MODERN_TEMPLATING = Version(__version__) >= Version("2.19")
 
@@ -208,6 +210,34 @@ def test_nested_render_restores_loop_context(tmp_path):
     assert msgs == ["B-xa", "B-xb"]
 
 
+def test_fileglob_paths_are_baked_and_delivered_as_data(tmp_path):
+    source = tmp_path / "files" / "item.txt"
+    dest = tmp_path / "copied.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        src: "{{ item }}"
+        dest: %s
+      with_fileglob: ["*.txt"]
+    - debug:
+        msg: "{{ item | basename }}"
+      with_fileglob: ["*.txt"]
+""" % json.dumps(str(dest)), {"files/item.txt": "fixture"})
+
+    plays, _ = parse_playbook(str(playbook))
+    copy_task = next(task for block in plays[0]["tasks"] for task in block.get("block", [])
+                     if task.get("action", "").split(".")[-1] == "copy")
+    assert copy_task["loop"] == [{"__ansiroll_unsafe__": str(source)}]
+    assert copy_task["_baked"] == {str(source): "fixture"}
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "fixture"
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == "fixture"
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
@@ -283,9 +313,10 @@ def test_lazy_container_operations_resolve_nested_values_once(tmp_path):
         msg: "{{ [mapping | type_debug, items_ | type_debug] | join(',') }}"
 """)
     assert msgs[-1] == "dict,list"
-    encoded = '2' if MODERN_TEMPLATING else '"2"'
+    native = MODERN_TEMPLATING or C.DEFAULT_JINJA2_NATIVE
+    encoded = '2' if native else '"2"'
     assert msgs[0] == '{"k": %s, "z": 1} / 2 / 2' % encoded
-    assert msgs[1].endswith("/ " + str(MODERN_TEMPLATING))
+    assert msgs[1].endswith("/ " + str(native))
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])

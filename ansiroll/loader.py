@@ -1046,7 +1046,9 @@ def _clean_args(args):
 
 def _tag_loop_values(task, loop):
     if getattr(task, "loop_with", None) == "fileglob" and isinstance(loop, list):
-        return loop
+        # The compiler uses raw paths for baking, but lookup results must
+        # reach the runtime as data, just like results of runtime lookups.
+        return [{"__ansiroll_unsafe__": path} for path in loop]
     if isinstance(loop, dict) and "__ansiroll_lookup" in loop:
         return dict(loop, terms=_tag_untrusted(loop["terms"]))
     return _tag_untrusted(loop)
