@@ -464,7 +464,7 @@ def test_deferred_play_vars_resolve_in_mapping_iteration(tmp_path, mode):
     result = _run_mode(tmp_path, mode)
     assert result.returncode == 0, result.stdout + result.stderr
     expected = "True\nresolved-task-value\nresolved-task-value"
-    if mode == "linear" and CORE_VERSION < (2, 19):
+    if CORE_VERSION < (2, 19):
         # Legacy Ansible exposes the raw values in the vars mapping.
         expected = "False\nresolved-{{ source }}\nmissing"
     assert _summary(result.stdout)[0] == [json.dumps(expected)]
@@ -491,7 +491,7 @@ def test_deferred_play_vars_keep_literal_mapping_values(tmp_path, mode):
     result = _run_mode(tmp_path, mode)
     assert result.returncode == 0, result.stdout + result.stderr
     expected = "{{ marker_value }}"
-    if mode == "linear" and CORE_VERSION < (2, 19):
+    if CORE_VERSION < (2, 19):
         expected = "{{ marker.stdout }}"
     assert _summary(result.stdout)[0] == [json.dumps(expected)] * 2
 

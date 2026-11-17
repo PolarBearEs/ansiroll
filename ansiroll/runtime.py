@@ -841,11 +841,12 @@ class _PlayVarScope(dict):
         return self[key] if key in self else default
 
     def items(self):
+        resolve = _core_at_least(2, 19)
         for key in self:
-            # Values from the variable mapping have already been interpreted.
-            # Keep delimiter-shaped data literal in the enclosing expression.
+            # A value read from vars must retain its provenance even when
+            # legacy Ansible exposes the unresolved string on iteration.
             self.accesses += 1
-            yield key, self[key]
+            yield key, self[key] if resolve else dict.__getitem__(self, key)
 
     def values(self):
         for _, value in self.items():
