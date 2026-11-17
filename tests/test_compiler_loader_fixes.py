@@ -813,6 +813,9 @@ def test_nested_include_filename_uses_role_invocation_vars(tmp_path):
 
 @pytest.mark.parametrize("writer, filename", [
     ("set_fact: {selected: second.yml}", "{{ selected }}"),
+    ("set_fact: {selected: second.yml}", "{{ lookup('vars', 'selected') }}"),
+    ("set_fact: {selected: second.yml}", "{{ query('ansible.builtin.vars', 'selected')[0] }}"),
+    ("set_fact: {selected: second.yml}", "{{ q('ansible.legacy.vars', 'selected')[0] }}"),
     ("command: printf second.yml\n  register: selected", "{{ alias }}"),
 ])
 def test_runtime_include_filename_is_left_as_fallback(tmp_path, writer, filename):
@@ -847,10 +850,36 @@ def test_runtime_include_filename_is_left_as_fallback(tmp_path, writer, filename
     args = ("-e", "selected=extra.yml")
     expected = _ansible(playbook, *args)
     assert expected[0] == ["EXTRA"]
+    from ansible.release import __version__
+
+    if __version__.startswith("2.10.") and "ansible.builtin.vars" in filename:
+        # The 2.10 standalone Templar cannot load this qualified lookup.
+        return
     assert compile_playbook(str(playbook), extra_vars={"selected": "extra.yml"})[1][
         "fallback_tasks"] == []
     assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
     assert _ansiroll(playbook, tmp_path, *args) == expected
+
+
+@pytest.mark.parametrize("lookup", ["lookup('vars', selector)", "lookup(plugin, 'selected')"])
+def test_dynamic_vars_lookup_include_filename_is_left_as_fallback(tmp_path, lookup):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selector: selected
+    plugin: vars
+    selected: first.yml
+  tasks:
+    - set_fact: {selected: second.yml}
+    - name: Select task file
+      include_tasks: "{{ %s }}"
+""" % lookup, "first.yml": "- debug: msg=STALE\n", "second.yml": "- debug: msg=RUNTIME\n"})
+    playbook = tmp_path / "pb.yml"
+    assert _ansible(playbook)[0] == ["RUNTIME"]
+    source, manifest = compile_playbook(str(playbook))
+    assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
+    assert "STALE" not in json.dumps(_bundle_json(source))
 
 
 @pytest.mark.parametrize("entry", ["config.yml", "[absent.yml, config.yml]"])

@@ -629,14 +629,29 @@ def _depends_on_vars(value, variables, matches):
             parsed = env.parse(value)
         except TemplateSyntaxError:
             return False
-        for node in parsed.find_all(nodes.Name):
-            if node.ctx != "load" or node.name in seen:
+        for call in parsed.find_all(nodes.Call):
+            if (not isinstance(call.node, nodes.Name)
+                    or call.node.name not in ("lookup", "query", "q")):
                 continue
-            name = node.name
-            seen.add(name)
-            if matches(name) or (name in variables and walk(variables[name])):
+            if not call.args or not isinstance(call.args[0], nodes.Const):
                 return True
-        return False
+            if call.args[0].value not in ("vars", "ansible.builtin.vars", "ansible.legacy.vars"):
+                continue
+            if call.dyn_args is not None:
+                return True
+            for arg in call.args[1:]:
+                if not isinstance(arg, nodes.Const) or not isinstance(arg.value, str):
+                    return True
+                if depends_on_name(arg.value):
+                    return True
+        return any(depends_on_name(node.name) for node in parsed.find_all(nodes.Name)
+                   if node.ctx == "load")
+
+    def depends_on_name(name):
+        if name in seen:
+            return False
+        seen.add(name)
+        return matches(name) or (name in variables and walk(variables[name]))
 
     return walk(value)
 
