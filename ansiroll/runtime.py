@@ -286,15 +286,29 @@ def _yaml_module():
     return ansiroll_yaml
 
 
-def _yaml_plain(v, memo=None):
+def _yaml_plain_key(k, memo):
+    """Convert a mapping key.  Keys are hashable, so a key tuple holds no
+    mutable container and cannot be part of a cycle; keep it a tuple."""
+    if isinstance(k, str):
+        return "".join([k]) if type(k) is not str else k
+    if not isinstance(k, tuple):
+        return k
+    if id(k) not in memo:
+        memo[id(k)] = (k, tuple(_yaml_plain_key(x, memo) for x in k))
+    return memo[id(k)][1]
+
+
+def _yaml_plain(v, memo=None, key_memo=None):
     """Materialize runtime wrappers (lazy vars, trusted strings) into the
     built-in types PyYAML's SafeDumper can represent.
 
-    Shared and self-referencing containers keep their identity (registered
-    before their children are converted), so PyYAML can still emit aliases.
+    Shared and self-referencing containers keep their identity: each output
+    container is registered before its children are converted, so PyYAML can
+    still emit aliases.  Tuple values become lists (SafeDumper writes both as
+    sequences) so they can be registered up front too.
     """
     if memo is None:
-        memo = {}
+        memo, key_memo = {}, {}
     if isinstance(v, str):
         return "".join([v]) if type(v) is not str else v
     if not isinstance(v, (dict, list, tuple)):
@@ -308,15 +322,11 @@ def _yaml_plain(v, memo=None):
         out = {}
         memo[key] = (v, out)
         for k, x in v.items():
-            out[_yaml_plain(k, memo)] = _yaml_plain(x, memo)
+            out[_yaml_plain_key(k, key_memo)] = _yaml_plain(x, memo, key_memo)
         return out
-    if isinstance(v, list):
-        out = []
-        memo[key] = (v, out)
-        out.extend(_yaml_plain(x, memo) for x in v)
-        return out
-    out = tuple(_yaml_plain(x, memo) for x in v)
+    out = []
     memo[key] = (v, out)
+    out.extend(_yaml_plain(x, memo, key_memo) for x in v)
     return out
 
 

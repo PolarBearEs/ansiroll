@@ -2,7 +2,7 @@
 
 import pytest
 
-from ansiroll.runtime import _Templater, _UnsafeTemplate, _f_to_yaml, _yaml_module
+from ansiroll.runtime import _Templater, _UnsafeTemplate, _f_to_yaml, _yaml_module, _yaml_plain
 
 
 @pytest.fixture(scope="module")
@@ -223,3 +223,14 @@ def test_to_yaml_detects_recursion_through_lazy_containers():
     loop = []
     loop.append(loop)
     assert _f_to_yaml(_LazyTplList(loop, None, {})) == "&id001\n- *id001\n"
+
+
+def test_yaml_plain_preserves_cycles_through_tuples():
+    items = []
+    value = (items,)
+    items.append(value)
+
+    plain = _yaml_plain(value)
+
+    assert plain[0][0] is plain
+    assert _f_to_yaml(value) == "&id001\n- - *id001\n"
