@@ -1198,6 +1198,8 @@ def _extra_vars(variable_manager):
 
 
 def _json_blob(values):
+    from ansiroll.loader import _tag_untrusted
+
     # hostvars/vars are live controller objects that stringify uselessly; the
     # agent synthesizes ``vars``. Materialize hostvars without their recursive
     # magic members so cross-host templates remain available to delegated
@@ -1208,12 +1210,15 @@ def _json_blob(values):
         snapshot = _hostvars_snapshot(hostvars)
         if snapshot:
             values["hostvars"] = snapshot
+    # Keep literal template-looking data tagged across the JSON boundary.
+    # Other host values also serve as connection metadata and identifiers.
     try:
-        return json.dumps(values, default=str)
+        return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
     except Exception:
         safe = {}
         for k, v in (values or {}).items():
             try:
+                v = _tag_untrusted(v, template_syntax_only=True)
                 json.dumps(v, default=str)
                 safe[k] = v
             except Exception:

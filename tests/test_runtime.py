@@ -377,15 +377,12 @@ def test_play_vars_can_read_baked_controller_config():
     assert by_name(frames, "check config")[0]["status"] == "ok"
 
 
-@pytest.mark.parametrize(
-    ("core_2_20_or_newer", "expected_when_enabled"),
-    [(False, False), (True, True)],
-)
+@pytest.mark.parametrize("core_2_19_or_newer", [False, True])
 def test_broken_conditional_config_controls_string_truthiness(
-        monkeypatch, core_2_20_or_newer, expected_when_enabled):
+        monkeypatch, core_2_19_or_newer):
     monkeypatch.setattr(
         "ansiroll.runtime._core_at_least",
-        lambda *_version: core_2_20_or_newer,
+        lambda *_version: core_2_19_or_newer,
     )
     rt = Runtime({}, "", {"inventory_hostname": "h"})
     disabled = rt.ctx({
@@ -399,13 +396,13 @@ def test_broken_conditional_config_controls_string_truthiness(
         }
     })
 
-    if core_2_20_or_newer:
-        # ansible-core 2.20+ fails the task on a non-boolean conditional.
+    if core_2_19_or_newer:
+        # ansible-core 2.19+ fails the task on a non-boolean conditional.
         with pytest.raises(ConditionalError, match="must have a boolean"):
             rt.when(["'broken static'"], disabled)
     else:
-        assert rt.when(["'broken static'"], disabled) is False
-    assert rt.when(["'broken static'"], enabled) is expected_when_enabled
+        assert rt.when(["'broken static'"], disabled) is True
+    assert rt.when(["'broken static'"], enabled) is True
 
 
 def test_unused_undefined_play_var_does_not_fail_empty_tag_selected_play():

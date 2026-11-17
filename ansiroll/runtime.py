@@ -32,14 +32,23 @@ STATE_MARKER = "__ANSIROLL_STATE__"
 STATS_MARKER = "__ANSIROLL_STATS__"
 
 
+# ansible-core version of the controller that compiled this artifact. The
+# compiler bakes it into the generated source; target hosts usually have no
+# Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
+_ANSIROLL_CORE_VERSION = None
+
+
 def _core_at_least(major, minor):
-    """Best-effort controller/core feature gate without making Ansible a runtime dependency."""
-    try:
-        from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
-    except Exception:
-        return False
+    """Feature gate on the compiling controller's ansible-core version."""
+    version = _ANSIROLL_CORE_VERSION
+    if not version:
+        # Imported directly on the controller (not compiled): use its Ansible.
+        try:
+            from ansible.release import __version__ as version
+        except Exception:
+            return False
+    match = re.match(r"^(\d+)\.(\d+)", str(version))
+    return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
 
 # Persistent worker: one long-lived process per privilege level. It keeps each
 # module's decoded zip in RAM (decode-once) and forks a child per task -- the fork
@@ -65,7 +74,11 @@ import jinja2  # type: ignore
 
 # Sentinel for the `omit` magic variable; args/env entries equal to it are
 # dropped before the module runs (mirrors Ansible's omit placeholder).
-_OMIT = "__omit_place_holder__ansiroll"
+class _Omit(str):
+    pass
+
+
+_OMIT = _Omit("__omit_place_holder__ansiroll")
 
 
 class _UnsafeTemplate(str):
@@ -207,29 +220,36 @@ class TaskFailed(Exception):
         self.result = result or {"failed": True, "msg": str(name)}
 
 
-class UntrustedConditional(Exception):
-    """A conditional contained an embedded template and was refused."""
-
-
 class ConditionalError(Exception):
     """Evaluating a `when` conditional failed (undefined variable, error)."""
 
 
+class UntrustedConditional(ConditionalError):
+    """A conditional contained an embedded template and was refused."""
+
+
 class _BrokenConditional(RuntimeError):
-    """A conditional produced a non-boolean result (ansible-core 2.20+)."""
+    """A conditional violated ansible-core's expression or result requirements."""
 
 
-def _conditional_error_message(cond, error):
-    """Ansible's message for a `when` that raised while being evaluated."""
+def _conditional_error_message(cond, error, keyword="when"):
+    """Ansible's message for a conditional that raised while being evaluated.
+    `keyword` names the failing expression (`when`, `until`); None for
+    assert, whose message carries no expression prefix."""
     if isinstance(cond, dict) and len(cond) == 1:
         cond = list(cond.values())[0]
+    if keyword is None or not _core_at_least(2, 21):
+        prefix = "Task failed: "
+    else:
+        prefix = "Task failed: %s '%s' expression failed: " % (
+            "An" if keyword[0] in "aeiou" else "A", keyword)
     if isinstance(error, _BrokenConditional):
-        return "Task failed: A 'when' expression failed: %s" % error
+        return prefix + str(error)
     if _core_at_least(2, 19):
         kind = ("Error while evaluating conditional"
                 if isinstance(error, jinja2.UndefinedError)
                 else "Error rendering expression")
-        return "Task failed: A 'when' expression failed: %s: %s" % (kind, error)
+        return "%s%s: %s" % (prefix, kind, error)
     return ("The conditional check '%s' failed. The error was: error while "
             "evaluating conditional (%s): %s" % (cond, cond, error))
 
@@ -246,10 +266,11 @@ def _to_bool(value):
     return bool(value)
 
 
-_BOOLEANS_TRUE = frozenset(("y", "yes", "on", "1", "true", "t", 1, 1.0, True))
+_BOOLEANS_TRUE = frozenset(("y", "yes", "on", "1", "true", "t", 1))
+_BOOLEANS_FALSE = frozenset(("n", "no", "off", "0", "false", "f", 0))
 
 
-def _boolean(value):
+def _boolean(value, strict=False):
     """Keyword/action-arg coercion: ansible.module_utils.parsing.convert_bool
     .boolean, which (unlike the `bool` filter) also accepts y/t and n/f."""
     if isinstance(value, bool):
@@ -259,23 +280,29 @@ def _boolean(value):
             value = value.decode("utf-8", "replace")
         value = value.lower().strip()
     try:
-        return value in _BOOLEANS_TRUE
+        if value in _BOOLEANS_TRUE:
+            return True
+        if not strict or value in _BOOLEANS_FALSE:
+            return False
     except TypeError:
-        return False
+        if not strict:
+            return False
+    raise TypeError("Invalid boolean value")
 
 
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
 
+    # Copy through items(): dict(lazy_view) bypasses rendering on Python 3.5.
     def merge(a, b):
-        out = dict(a)
+        out = dict(a.items())
         for k, v in b.items():
             if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
         return out
-    result = dict(d or {})
+    result = dict((d or {}).items())
     for o in others:
         result = merge(result, o or {})
     return result
@@ -580,7 +607,7 @@ _ANSIBLE_FILTERS = {
     "symmetric_difference": _f_symmetric_difference,
     "flatten": _f_flatten,
     "quote": _f_quote,
-    "type_debug": lambda v: type(v).__name__,
+    "type_debug": lambda v: _type_name(v),
     "basename": lambda v: os.path.basename(str(v)),
     "dirname": lambda v: os.path.dirname(str(v)),
     "expanduser": lambda v: os.path.expanduser(str(v)),
@@ -840,6 +867,12 @@ class _LazyTplDict(dict):
     def copy(self):
         return {k: self[k] for k in dict.keys(self)}
 
+    def __iter__(self):
+        # Overriding __iter__ makes dict(view) and {**view} read through
+        # __getitem__ instead of the raw storage on Python 3.6+ (Ansible's
+        # _AnsibleLazyTemplateDict does the same).
+        return dict.__iter__(self)
+
     def __repr__(self):
         # str()/repr() inside a template shows the rendered values.
         return repr(self.copy())
@@ -893,6 +926,35 @@ class _LazyTplList(list):
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
 
+    # list's C-level operations read the raw storage; render first, like
+    # Ansible's _AnsibleLazyTemplateList.
+    def __contains__(self, item):
+        return item in list(iter(self))
+
+    def __reversed__(self):
+        return reversed(list(iter(self)))
+
+    def __add__(self, other):
+        if isinstance(other, _LazyTplList):
+            other = list(iter(other))
+        return list.__add__(list(iter(self)), other)
+
+    def __radd__(self, other):
+        if not isinstance(other, list):
+            return NotImplemented
+        return list(other) + list(iter(self))
+
+    def __mul__(self, other):
+        return list.__mul__(list(iter(self)), other)
+
+    __rmul__ = __mul__
+
+    def index(self, *args):
+        return list(iter(self)).index(*args)
+
+    def count(self, item):
+        return list(iter(self)).count(item)
+
     def __repr__(self):
         return repr(list(iter(self)))
 
@@ -902,6 +964,24 @@ class _LazyTplList(list):
         return not self.__eq__(other)
 
     __hash__ = None
+
+
+def _jinja_dict(*args, **kwargs):
+    # Python 3.5's dict(view) may copy a dict subclass's raw storage.
+    if args and isinstance(args[0], _LazyTplDict):
+        args = (args[0].items(),) + args[1:]
+    return dict(*args, **kwargs)
+
+
+def _type_name(value):
+    """type_debug: internal wrappers report the builtin type they stand for."""
+    for internal, name in ((_LazyTplDict, "dict"), (_LazyTplList, "list")):
+        if isinstance(value, internal):
+            return name
+    if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
+                       _TrustedAsTemplateValue):
+        return "str"
+    return type(value).__name__
 
 
 def _concretize(value):
@@ -952,6 +1032,19 @@ class _AnsirollUndefined(jinja2.ChainableUndefined):
     __str__ = __iter__ = __len__ = __eq__ = __ne__ = __bool__ = __hash__ = \
         jinja2.Undefined._fail_with_undefined_error
     __nonzero__ = __bool__
+
+    def __init__(self, hint=None, obj=jinja2.utils.missing, name=None,
+                 exc=jinja2.exceptions.UndefinedError):
+        if hint is None and obj is not jinja2.utils.missing:
+            # Name the builtin type, never an internal wrapper class.
+            type_name = _type_name(obj)
+            if _core_at_least(2, 19):
+                hint = "object of type %r has no attribute %r" % (type_name, name)
+            elif isinstance(name, str):
+                hint = "'%s object' has no attribute %r" % (type_name, name)
+            else:
+                hint = "%s object has no element %r" % (type_name, name)
+        jinja2.ChainableUndefined.__init__(self, hint, obj, name, exc)
 
     def __html__(self):
         self._fail_with_undefined_error()
@@ -1058,6 +1151,7 @@ class _Templater:
         self.env.globals.setdefault("q", self._g_query)
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
+        self.env.globals["dict"] = _jinja_dict
 
     def _lookup_ctx(self, name, terms):
         """The vars lookup templates trusted values like a variable reference."""
@@ -1186,7 +1280,7 @@ class _Templater:
             finally:
                 self._resolving.pop()
         if self._runtime is not None and type(value) in (dict, list):
-            return _lazy_container(value, self._runtime, ctx)
+            return _lazy_wrap(value, self._runtime, ctx)
         return value
 
     def render_string(self, text, ctx, _depth=0):
@@ -1434,6 +1528,9 @@ class Runtime:
         self.templater = _Templater()
         self.templater._runtime = self
         self.handlers = []
+        # Hand-built runtime nodes can supply block conditions independently;
+        # parsed tasks already carry the accumulated conditions from Ansible.
+        self._inherited_when = []
         self.notified = []  # ordered, de-duplicated handler names
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
@@ -1527,23 +1624,23 @@ class Runtime:
                 out[k] = _lazy_container(v, self, base, dynamic)
         return out
 
-    def when(self, conds, ctx, strict=False):
+    def when(self, conds, ctx, strict=False, keyword="when"):
         """All conditions true?  An evaluation error raises: the raw error in
         strict mode (changed_when/failed_when), else ConditionalError, which
         fails the task like Ansible instead of silently skipping it."""
         for cond in (conds or []):
             try:
-                if not self._condition(cond, ctx, strict):
+                if not self._condition(cond, ctx, strict, keyword):
                     return False
-            except (UntrustedConditional, ConditionalError):
+            except ConditionalError:
                 raise
             except Exception as ex:
                 if strict:
                     raise
-                raise ConditionalError(_conditional_error_message(cond, ex))
+                raise ConditionalError(_conditional_error_message(cond, ex, keyword))
         return True
 
-    def _condition(self, cond, ctx, strict=False):
+    def _condition(self, cond, ctx, strict=False, keyword="when"):
         if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
             raise UntrustedConditional(
                 "Encountered untrusted template or expression."
@@ -1588,22 +1685,34 @@ class Runtime:
             # resolved members as conditions rather than treating the
             # non-empty list itself as truthy.
             if isinstance(result, (list, tuple)):
-                return self.when(list(result), ctx, strict=strict)
+                return self.when(list(result), ctx, strict=strict,
+                                 keyword=keyword)
             if isinstance(result, (_UnsafeTemplate, _UntrustedConditionValue)):
                 raise UntrustedConditional(
                     "Encountered untrusted template or expression."
                 )
-            if isinstance(result, str) and result.strip().lower() not in (
-                    "true", "false"):
-                if re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S):
-                    raise UntrustedConditional(
-                        "Encountered untrusted template or expression."
-                    )
-                result = self.templater.evaluate(result, ctx)
+            if isinstance(result, str):
+                whole_template = re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S)
+                if whole_template or result.strip().lower() not in ("true", "false"):
+                    if whole_template:
+                        if _core_at_least(2, 19) and not result.strip():
+                            raise _BrokenConditional("Empty conditional expressions are not allowed.")
+                        raise UntrustedConditional(
+                            "Encountered untrusted template or expression."
+                        )
+                    result = self.templater.evaluate(result, ctx)
+                else:
+                    result = _to_bool(result)
             if strict and _is_undef(result):
                 raise RuntimeError(
                     "The conditional check %r failed: the expression is undefined" % cond)
             return self._condition_truth(result, ctx)
+        if cond is None or (isinstance(cond, str) and not cond.strip()):
+            if cond is not None and _core_at_least(2, 19):
+                raise _BrokenConditional("Empty conditional expressions are not allowed.")
+            return True
+        if not isinstance(cond, (bool, str)) and _core_at_least(2, 19):
+            raise _BrokenConditional("Conditional expressions must be strings.")
         result = self.templater.evaluate(cond, ctx)
         if strict and _is_undef(result):
             raise RuntimeError(
@@ -1613,19 +1722,16 @@ class Runtime:
     def _condition_truth(self, result, ctx):
         if isinstance(result, bool):
             return result
-        if isinstance(result, str) and result.strip().lower() in (
-                "true", "false"):
-            return _to_bool(result)
-        if _core_at_least(2, 20) and not _is_undef(result):
+        if _core_at_least(2, 19) and not _is_undef(result):
             config = ctx.get("__ansiroll_controller_config") or {}
             if _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False)):
                 return bool(result)
             raise _BrokenConditional(
                 "Conditional result (%s) was derived from value of type '%s'. "
                 "Conditionals must have a boolean result."
-                % (bool(result), type(result).__name__)
+                % (bool(result), _type_name(result))
             )
-        return _to_bool(result)
+        return bool(result)
 
     # ---- result emission -------------------------------------------------
     def _node_name(self, node):
@@ -1810,25 +1916,28 @@ class Runtime:
         else:
             self.run_task(node, overlay, become)
 
+    def _when_of(self, node):
+        own = node.get("when") or []
+        if own[:len(self._inherited_when)] == self._inherited_when:
+            return own
+        return self._inherited_when + list(own)
+
     def run_include(self, node, overlay, become=False):
         """A compile-time-expanded include_tasks: run the inner tasks (per loop
         item when looped). The include itself reports but is not tallied."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
-        try:
-            run_it = self.when(node.get("when"), base_ctx)
-        except (UntrustedConditional, ConditionalError) as ex:
-            self.emit(node, "failed", {"failed": True, "changed": False, "msg": str(ex)})
-            self._tally("failures")
-            result = {"failed": True, "changed": False, "msg": str(ex)}
-            exc = TaskFailed(node.get("name"), node, result)
-            exc.counted = True
-            raise exc
-        if not run_it:
-            self.emit(node, "skipped", {"changed": False, "skipped": True,
-                                        "skip_reason": "Conditional result was False"})
-            self._tally("skipped")
+        result, ignore = self._task_gate(node, base_ctx)
+        if result is not None:
+            self.emit(node, _status_of(result), result, ignored=ignore)
+            if result.get("skipped"):
+                self._tally("skipped")
+            elif ignore:
+                self._tally("ok")
+                self._tally("ignored")
+            else:
+                raise TaskFailed(node.get("name"), node, result)
             return
         scope = dict(overlay)
         scope.update(self.template_vars(node.get("vars"), base_ctx))
@@ -1850,17 +1959,14 @@ class Runtime:
     def run_block(self, block, overlay, become=False):
         scope = dict(overlay)
         scope.update(self.template_vars(block.get("vars"), self.ctx(overlay)))
+        inherited = self._inherited_when
+        self._inherited_when = self._when_of(block)
         try:
-            run_it = self.when(block.get("when"), self.ctx(scope))
-        except ConditionalError as ex:
-            self._fail_block_condition(block, scope, ex)
-            return
-        if not run_it:
-            b_become = bool(block.get("become")) or become
-            self._skip_nodes(block.get("block", []), scope, b_become)
-            if block.get("always"):
-                self._skip_nodes(block["always"], scope, b_become)
-            return
+            self._run_block_body(block, scope, become)
+        finally:
+            self._inherited_when = inherited
+
+    def _run_block_body(self, block, scope, become):
         b_become = bool(block.get("become")) or become
         failed_exc = None
         try:
@@ -1899,64 +2005,6 @@ class Runtime:
                     failed_exc.counted = True
             else:
                 raise failed_exc
-
-    def _fail_block_condition(self, block, overlay, error):
-        """A block's `when` is inherited by its tasks: Ansible reports the
-        evaluation error as a failure of the first task it reaches."""
-        nodes = list(block.get("block") or [])
-        while nodes and nodes[0].get("type") == "block":
-            nodes = list(nodes[0].get("block") or []) + nodes[1:]
-        task = nodes[0] if nodes else {"name": block.get("name")}
-        result = {"failed": True, "changed": False, "msg": str(error)}
-        self.emit_start(task)
-        self.emit(task, "failed", result)
-        self._tally("failures")
-        exc = TaskFailed(task.get("name"), task, result)
-        exc.counted = True
-        raise exc
-
-    def _skip_nodes(self, nodes, overlay, become=False):
-        for node in nodes:
-            if node.get("type") == "block":
-                scope = dict(overlay)
-                scope.update(self.template_vars(node.get("vars"), self.ctx(overlay)))
-                b_become = bool(node.get("become")) or become
-                self._skip_nodes(node.get("block", []), scope, b_become)
-                if node.get("always"):
-                    self._skip_nodes(node["always"], scope, b_become)
-            elif node.get("type") == "include":
-                # A skipped dynamic include reports one skipped task; its inner
-                # tasks were never loaded in Ansible, so they don't appear.
-                self._skip_task(node, overlay)
-            else:
-                self._skip_task(node, overlay)
-
-    def _skip_task(self, task, overlay):
-        self.emit_start(task)
-        ctx = self._task_ctx(task, overlay)
-        result = {"skipped": True, "changed": False, "skip_reason": "Conditional result was False"}
-        loop = task.get("loop", None)
-        if loop is not None:
-            items = self._resolve_loop(loop, ctx)
-            agg = {"results": [], "changed": False, "skipped": True, "msg": "All items skipped"}
-            for it in items:
-                item_ctx = dict(ctx)
-                item_ctx[task.get("loop_var") or "item"] = it
-                item_res = dict(result)
-                item_res["item"] = it
-                label = self._loop_label(task, item_ctx)
-                if label is not None:
-                    item_res["_ansible_item_label"] = label
-                agg["results"].append(item_res)
-                self.emit(task, "skipped", item_res, item=it, is_item=True)
-            if task.get("register"):
-                self._store_register(task, agg)
-            self.emit(task, "skipped", agg)
-        else:
-            if task.get("register"):
-                self._store_register(task, result)
-            self.emit(task, "skipped", result)
-        self._tally("skipped")
 
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < play/host/facts/registers
@@ -2037,12 +2085,28 @@ class Runtime:
             total["max"] = max(total["max"], elapsed)
 
     def _run_task(self, task, overlay, become=False):
-        if task.get("special") == "meta_flush_handlers":
-            self.emit_start(task)
-            self.flush_handlers()
-            return
-        if task.get("special") == "meta_clear_host_errors":
-            self._errors_cleared = True
+        special = task.get("special")
+        if special in ("meta_flush_handlers", "meta_clear_host_errors"):
+            conditions = self._when_of(task)
+            if conditions:
+                try:
+                    if not self.when(conditions, self._task_ctx(task, overlay)):
+                        return
+                except ConditionalError as ex:
+                    result = {"failed": True, "changed": False, "msg": str(ex)}
+                    self.emit_start(task)
+                    self.emit(task, "failed", result)
+                    raise TaskFailed(task.get("name"), task, result)
+            if special == "meta_flush_handlers":
+                self.emit_start(task)
+                inherited = self._inherited_when
+                self._inherited_when = []
+                try:
+                    self.flush_handlers()
+                finally:
+                    self._inherited_when = inherited
+            else:
+                self._errors_cleared = True
             return
         effective_become = bool(task.get("become")) or become
         base_ctx = self._task_ctx(task, overlay)
@@ -2060,70 +2124,42 @@ class Runtime:
                 pass
         self.emit_start(task)
 
-        ignore = task.get("ignore_errors", False)
-        if isinstance(ignore, str):
-            ignore = _boolean(self.template(ignore, base_ctx))
-        else:
-            ignore = _boolean(ignore)
-        loop = task.get("loop", None)
-        if loop is not None:
-            # A literal-false task conditional short-circuits loop templating.
-            # An undefined loop expression must not fabricate an undefined item
-            # or emit both an item-level and aggregate skipped result.
-            conditions = task.get("when") or []
-            literal_false = any(
-                cond is False or (
-                    isinstance(cond, str)
-                    and cond.strip().lower() in ("false", "no", "off", "0")
-                )
-                for cond in conditions
-            )
-            if literal_false:
-                res = {"changed": False, "skipped": True,
-                       "skip_reason": "Conditional result was False"}
-                if task.get("register"):
-                    self._store_register(task, res)
-                self.emit(task, "skipped", res)
-                self._tally("skipped")
-                return
+        if task.get("loop") is not None:
             try:
-                res = self._run_loop(task, base_ctx, effective_become, ignore)
-            except TaskFailed:
-                raise
-            except Exception as ex:
-                # A loop that fails to resolve fails the task -- unless a false
-                # `when` short-circuits it to skipped (ansible/ansible#45189).
+                items = self._resolve_loop(task["loop"], base_ctx)
+            except jinja2.UndefinedError as ex:
+                # Only undefined loop values are deferred until the task's
+                # condition has had a chance to skip it.
                 try:
-                    skipped = not self.when(task.get("when"), base_ctx)
-                except Exception:
+                    skipped = not self.when(self._when_of(task), base_ctx)
+                except ConditionalError:
                     skipped = False
                 if skipped:
-                    res = {"changed": False, "skipped": True,
-                           "skip_reason": "Conditional result was False"}
+                    res = self._conditional_skip()
                 else:
-                    res = {"failed": True, "changed": False, "msg": str(ex)}
-                if task.get("register"):
-                    self._store_register(task, res)
-        else:
-            try:
-                run_it = self.when(task.get("when"), base_ctx)
-            except (UntrustedConditional, ConditionalError) as ex:
-                run_it = None
+                    message = "Task failed: %s" % ex if _core_at_least(2, 19) else str(ex)
+                    res = {"failed": True, "changed": False, "msg": message}
+                ignore = self._ignore_before_validation(task)
+            except Exception as ex:
                 res = {"failed": True, "changed": False, "msg": str(ex)}
-            if run_it is False:
-                skip_res = {"changed": False, "skipped": True, "skip_reason": "Conditional result was False"}
-                if task.get("register"):
-                    self._store_register(task, skip_res)
-                self.emit(task, "skipped", skip_res)
-                self._tally("skipped")
-                return
-            if run_it:
+                ignore = self._ignore_before_validation(task)
+            else:
+                try:
+                    res, ignore = self._run_loop(task, items, base_ctx, effective_become)
+                except TaskFailed:
+                    raise
+                except Exception as ex:
+                    res = {"failed": True, "changed": False, "msg": str(ex)}
+                    ignore = self._ignore_before_validation(task)
+        else:
+            res, ignore = self._task_gate(task, base_ctx)
+            if res is None:
                 res = self._exec_with_retries(task, base_ctx, effective_become)
-            if task.get("register"):
-                res.setdefault("failed", False)
-                res.setdefault("changed", False)
-                self._store_register(task, res)
-            self._absorb_facts(task, res)
+                self._absorb_facts(task, res)
+        if task.get("register"):
+            res.setdefault("failed", False)
+            res.setdefault("changed", False)
+            self._store_register(task, res)
 
         tally_changed = res.pop("_ansiroll_tally_changed", res.get("changed", False))
         status = _status_of(res)
@@ -2140,6 +2176,45 @@ class Runtime:
         else:
             self._tally("changed" if res.get("changed") else "ok")
             self._queue_notify(task, res)
+
+    def _conditional_skip(self):
+        return {"changed": False, "skipped": True,
+                "skip_reason": "Conditional result was False"}
+
+    def _ignore_before_validation(self, task):
+        ignore = task.get("ignore_errors")
+        # Older executors pass through the inherited keyword on a validation
+        # error. In 2.21+ only a literal bool can take effect this early.
+        return ignore is True if _core_at_least(2, 21) else bool(ignore)
+
+    def _task_gate(self, task, ctx):
+        """Evaluate the task condition, then resolve its ignore_errors keyword."""
+        ignore = task.get("ignore_errors")
+        try:
+            if not self.when(self._when_of(task), ctx):
+                return self._conditional_skip(), self._ignore_before_validation(task)
+        except ConditionalError as ex:
+            result = {"failed": True, "changed": False, "msg": str(ex)}
+            return result, self._ignore_before_validation(task)
+        if ignore is None or isinstance(ignore, bool):
+            return None, bool(ignore)
+        try:
+            value = _fail_on_undef(self.template(ignore, ctx))
+        except jinja2.UndefinedError as ex:
+            detail = str(ex)
+        except Exception as ex:
+            detail = "Error rendering template: %s" % ex
+        else:
+            try:
+                return None, _boolean(value, strict=True)
+            except TypeError:
+                detail = "The value %r could not be converted to 'bool'." % value
+        if _core_at_least(2, 19):
+            message = "Task failed: Error processing keyword 'ignore_errors': " + detail
+        else:
+            message = "The field 'ignore_errors' has an invalid value: " + detail
+        result = {"failed": True, "changed": False, "msg": message}
+        return result, self._ignore_before_validation(task)
 
     def _loop_item_vars(self, task, items, i, ctx=None):
         """Per-item loop variables: loop_var, index_var and ansible_loop."""
@@ -2167,26 +2242,17 @@ class Runtime:
             out["ansible_loop"] = loop_info
         return out
 
-    def _run_loop(self, task, base_ctx, become=False, ignore_errors=False):
-        items = self._resolve_loop(task.get("loop"), base_ctx)
+    def _run_loop(self, task, items, base_ctx, become=False):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
-        any_ran = False
+        ignore_loop = False
+        failed_items_ignored = True
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
             ctx.update(self._loop_item_vars(task, items, i, base_ctx))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
-            try:
-                run_it = self.when(task.get("when"), ctx)
-            except ConditionalError as ex:
-                # Ansible evaluates `when` per item; an error fails the item.
-                run_it = None
-                res = {"failed": True, "changed": False, "msg": str(ex)}
-            if run_it is False:
-                res = {"skipped": True, "changed": False,
-                       "skip_reason": "Conditional result was False"}
-            elif run_it:
-                any_ran = True
+            res, ignore = self._task_gate(task, ctx)
+            if res is None:
                 res = self._exec_with_retries(task, ctx, become)
                 self._absorb_facts(task, res)
                 if isinstance(res.get("ansible_facts"), dict):
@@ -2204,6 +2270,24 @@ class Runtime:
                 except Exception as ex:
                     res = {"failed": True, "changed": False, "item": it,
                            "msg": "Failed to template loop_control.label: %s" % ex}
+            stop = False
+            bw = task.get("loop_break_when")
+            if bw:
+                bctx = dict(ctx)
+                if task.get("register"):
+                    bctx[task["register"]] = res
+                try:
+                    stop = self.when(bw, bctx, keyword="break_when")
+                except ConditionalError as ex:
+                    if not _core_at_least(2, 21):
+                        # Older executors emitted the item before evaluating
+                        # break_when, then returned the task-level error.
+                        self.emit(task, _status_of(res), res, item=it,
+                                  ignored=ignore, is_item=True)
+                        return {"failed": True, "changed": False, "msg": str(ex)}, ignore
+                    res["failed"] = True
+                    res["break_when_result"] = str(ex)
+                    stop = True
             tally_changed = res.pop(
                 "_ansiroll_tally_changed", res.get("changed", False)
             )
@@ -2213,40 +2297,20 @@ class Runtime:
                 agg["_ansiroll_tally_changed"] = True
             if res.get("failed"):
                 agg["failed"] = True
-            self.emit(task, _status_of(res), res, item=it,
-                      ignored=ignore_errors, is_item=True)
-            bw = task.get("loop_break_when")
-            if bw:
-                bctx = dict(ctx)
-                if task.get("register"):
-                    bctx[task["register"]] = res
-                try:
-                    stop = self.when(bw, bctx)
-                except ConditionalError as ex:
-                    agg["failed"] = True
-                    agg["msg"] = str(ex)
-                    stop = True
-                if stop:
-                    break
+                failed_items_ignored = failed_items_ignored and ignore
+            ignore_loop = ignore_loop or ignore
+            self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
+            if stop:
+                break
         if not items:
-            # Ansible reports a loop that resolves to no items as skipped.
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
-        elif not any_ran:
+        elif all(res.get("skipped") for res in agg["results"]):
             agg["skipped"] = True
             agg["msg"] = "All items skipped"
-        if task.get("register"):
-            self._store_register(task, agg)
-        return agg
-
-    def _loop_label(self, task, ctx):
-        label = task.get("loop_label")
-        if label is None:
-            return None
-        try:
-            return self.template(label, ctx)
-        except Exception:
-            return None
+        elif agg["failed"]:
+            agg["msg"] = "One or more items failed"
+        return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
     def _resolve_loop(self, loop, ctx):
         # Loop items are data; Ansible never templates an item's value again.
@@ -2267,11 +2331,13 @@ class Runtime:
                 if _is_undef(vals):
                     vals._fail_with_undefined_error()
                 return vals
-        items = self.template(loop, ctx)
-        if items is None:
-            return []
+        items = _fail_on_undef(self.template(loop, ctx))
         if not isinstance(items, list):
-            items = [items]
+            if _core_at_least(2, 19):
+                message = "The `loop` value must resolve to a 'list', not %r." % _type_name(items)
+            else:
+                message = "Invalid data passed to 'loop', it requires a list, got this instead: %s" % items
+            raise ValueError(message)
         return items
 
     def _resolve_sequence_loop(self, terms, ctx):
@@ -2284,7 +2350,7 @@ class Runtime:
 
         out = []
         for term in terms:
-            rendered = self.template(term, ctx) if isinstance(term, str) else term
+            rendered = self.template(term, ctx)
             out.extend(_sequence_items(str(rendered)))
         return out
 
@@ -2305,11 +2371,10 @@ class Runtime:
                 eval_ctx[task["register"]] = res
             last = res
             try:
-                done = self.when(until, eval_ctx)
+                done = self.when(until, eval_ctx, keyword="until")
             except ConditionalError as ex:
-                res["failed"] = True
-                res["msg"] = str(ex)
-                return res
+                # Ansible replaces the module result with the error.
+                return {"failed": True, "changed": False, "msg": str(ex)}
             if done:
                 return res
             if attempt < attempts and delay > 0:
@@ -2539,7 +2604,11 @@ class Runtime:
 
     def _run_special(self, special, task, ctx, become=False):
         name = special.split(".")[-1]
-        args = self.template(task.get("args") or {}, ctx)
+        raw_args = task.get("args") or {}
+        if name == "assert":
+            # Its condition expressions are interpreted only by when().
+            raw_args = {k: v for k, v in raw_args.items() if k != "that"}
+        args = self.template(raw_args, ctx)
         # Ansible accepts the complete module argument dictionary through a
         # single template, representing it internally as `_raw_params`.
         if (
@@ -2601,7 +2670,7 @@ class Runtime:
             if isinstance(tests, str):
                 tests = [tests]
             try:
-                ok = self.when(tests, ctx)
+                ok = self.when(tests, ctx, keyword=None)
             except ConditionalError as ex:
                 return {"failed": True, "changed": False, "msg": str(ex)}
             if ok:
@@ -2810,7 +2879,11 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    new_content = _as_text(self.templater.render_string(raw, tctx))
+                    rendered = self.templater.render_string(raw, tctx)
+                    if _core_at_least(2, 19) and isinstance(rendered, _Omit):
+                        return {"failed": True, "changed": False,
+                                "msg": "Task failed: A template was resolved to an Omit scalar."}
+                    new_content = _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
