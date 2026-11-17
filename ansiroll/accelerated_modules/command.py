@@ -64,7 +64,12 @@ def _check_guards(chdir, creates, removes):
     # Linux permits fchdir on an O_PATH directory descriptor with only
     # search permission. POSIX O_SEARCH serves the same purpose where present.
     search_flag = getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
-    saved = os.open(".", search_flag)
+    if not os.access(".", os.X_OK):
+        return "fallback", None
+    try:
+        saved = os.open(".", search_flag)
+    except PermissionError:
+        return "fallback", None
     changed_directory = False
     try:
         try:
@@ -129,6 +134,8 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         for key in ("chdir", "creates", "removes")
     )
     guard, error = _check_guards(chdir, creates, removes)
+    if guard == "fallback":
+        return {"_ansiroll_fallback": True}
     if error is not None:
         # ansible-core < 2.19 appended the error text.
         result["msg"] = (

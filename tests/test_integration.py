@@ -325,6 +325,48 @@ def test_compiled_command_loop_restores_search_only_cwd(tmp_path):
     assert following["stdout"] == str(start)
 
 
+def test_compiled_command_falls_back_when_cwd_loses_search_permission(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root can search a directory without permissions")
+    start = tmp_path / "start"
+    start.mkdir()
+    target = tmp_path / "literal[1]"
+    target.mkdir()
+    (target / "marker").touch()
+    playbook = tmp_path / "guard.yml"
+    playbook.write_text(
+        """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: %s
+        state: directory
+        mode: "0000"
+    - command:
+        cmd: pwd
+        chdir: %s
+        creates: marker
+""" % (json.dumps(str(start)), json.dumps(str(target))))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(playbook))[0])
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)], cwd=str(start),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_ACCELERATED_MODULES="command"),
+            universal_newlines=True,
+        )
+    finally:
+        start.chmod(0o700)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    prefix = "__ANSIROLL_RESULT__ "
+    result = [json.loads(line[len(prefix):])["result"] for line in proc.stdout.splitlines()
+              if line.startswith(prefix)][-1]
+    assert result["changed"] is False
+    assert result["rc"] == 0
+    assert "since marker exists" in result["stdout"]
+
+
 def test_accelerated_command_matches_legacy_warn_semantics():
     import ansible
 
