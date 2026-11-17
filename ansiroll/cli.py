@@ -58,12 +58,19 @@ def _cmd_compile(args):
     except Exception as ex:
         sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
         return 2
-    source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
-                                        vault_password_file=args.vault_password_file,
-                                        extra_vars=extra_vars,
-                                        tree_shake=args.tree_shake,
-                                        freeze_playbook_vars=args.freeze_playbook_vars,
-                                        freeze_vars=args.freeze_var)
+    try:
+        source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
+                                            vault_password_file=args.vault_password_file,
+                                            extra_vars=extra_vars,
+                                            tree_shake=args.tree_shake,
+                                            freeze_playbook_vars=args.freeze_playbook_vars,
+                                            freeze_vars=args.freeze_var)
+    except ValueError as ex:
+        message = str(ex)
+        if not message.startswith("ansiroll: "):
+            message = "ansiroll: " + message
+        sys.stderr.write(message + "\n")
+        return 2
     with open(args.output, "w") as fh:
         fh.write(source)
     os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
@@ -79,10 +86,12 @@ def _cmd_compile(args):
 
 
 def _load_extra_vars(specs, vault_password_file=None):
+    """Parse -e values exactly like ansible.utils.vars.load_extra_vars."""
     if not specs:
         return {}
     from ansible.parsing.dataloader import DataLoader
     from ansible.parsing.splitter import parse_kv
+    from ansible.utils.vars import combine_vars
     from .loader import _vault_secrets
 
     loader = DataLoader()
@@ -91,18 +100,24 @@ def _load_extra_vars(specs, vault_password_file=None):
         loader.set_vault_secrets(secrets)
     merged = {}
     for spec in specs:
+        if not spec:
+            continue
         if spec.startswith("@"):
-            value = loader.load_from_file(os.path.abspath(spec[1:]))
-        else:
+            # Argument is a YAML file (JSON is a subset of YAML)
             try:
-                value = loader.load(spec)
-            except Exception:
-                value = None
-            if not isinstance(value, dict) and "=" in spec:
-                value = parse_kv(spec)
+                value = loader.load_from_file(spec[1:], trusted_as_template=True)
+            except TypeError:  # older ansible-core without the trust kwarg
+                value = loader.load_from_file(spec[1:])
+        elif spec[0] in ("/", "."):
+            raise ValueError("Please prepend extra_vars filename '%s' with '@'" % spec)
+        elif spec[0] in ("[", "{"):
+            value = loader.load(spec)
+        else:
+            value = parse_kv(spec)
         if not isinstance(value, dict):
-            raise ValueError("%r did not produce a variable mapping" % spec)
-        merged.update(value)
+            raise ValueError("Invalid extra vars data supplied. '%s' could not be "
+                             "made into a dictionary" % spec)
+        merged = combine_vars(merged, value)
     return merged
 
 
