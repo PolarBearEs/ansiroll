@@ -838,14 +838,15 @@ def _accelerator_options(action):
         elif name == "blockinfile" and version >= (2, 20):
             options["text_mode"] = True
         # Older file modules returned only dest for a touch in check mode.
-        elif name == "file" and full_version < (2, 13, 8):
+        elif name == "file" and (
+                full_version < (2, 13, 8) or (2, 14, 0) <= full_version < (2, 14, 2)):
             options["omit_touch_check_changed"] = True
         elif name == "replace":
             if version < (2, 17):
                 options["chmod_before_chown"] = True
             if version < (2, 20):
                 options["binary_io"] = True
-            if version < (2, 14):
+            if version < (2, 13):
                 options["omit_result_rc"] = True
         elif name == "user":
             if full_version >= (2, 18, 9):
