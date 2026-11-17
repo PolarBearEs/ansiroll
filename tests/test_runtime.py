@@ -44,7 +44,11 @@ def test_debug_and_set_fact_register():
     assert rt.stats["ok"] == 2
 
 
-def test_play_var_mapping_iteration_only_resolves_consumed_values():
+@pytest.mark.parametrize("version,resolve", [("2.18.20", False), ("2.19.15", True)])
+def test_play_var_mapping_iteration_only_resolves_consumed_values(monkeypatch, version, resolve):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
     rt = Runtime({}, "", {})
     called = []
 
@@ -59,12 +63,13 @@ def test_play_var_mapping_iteration_only_resolves_consumed_values():
     }
     prepared = rt.template_vars(values, {}, dynamic=True)
 
-    assert rt.template("{{ vars.items() | first }}", prepared) == ("first", "first")
-    assert called == ["first"]
-    assert rt.template("{{ vars.values() | first }}", prepared) == "first"
-    assert called == ["first", "first"]
-    assert rt.template("{{ (vars | dict2items | first).value }}", prepared) == "first"
-    assert called == ["first", "first", "first", "second"]
+    expected = "first" if resolve else values["first"]
+    assert rt.template("{{ vars.items() | first }}", prepared) == ("first", expected)
+    assert called == (["first"] if resolve else [])
+    assert rt.template("{{ vars.values() | first }}", prepared) == expected
+    assert called == (["first", "first"] if resolve else [])
+    assert rt.template("{{ (vars | dict2items | first).value }}", prepared) == expected
+    assert called == (["first", "first", "first", "second"] if resolve else [])
 
 
 def test_debug_result_is_always_visible_to_ansible_callbacks():
