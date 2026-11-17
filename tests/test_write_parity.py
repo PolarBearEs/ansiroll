@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -62,7 +63,7 @@ def _normalize(result, workdir):
             if key in ("src", "backup_file"):
                 # Temp/backup names embed random parts, pids and timestamps.
                 name = os.path.basename(value)
-                if name.startswith(".") and not name.startswith(".source"):
+                if re.fullmatch(r"(?:\.|tmp)[a-z0-9_]{8}", name):
                     name = "<random temp name>"
                 elif "~" in name:
                     name = re.sub(r"\.\d+\.[\d-]+@[\d:]+~$", ".<backup>", name)
@@ -154,9 +155,9 @@ def test_copy_attributes_force_backup_and_symbolic_modes_match_official(tmp_path
       register: r4
     - copy: {content: "y\\n", dest: "{{ d }}/a", backup: yes}
       register: r5
-    - copy: {content: "y\\n", dest: "{{ d }}/b", mode: "u=rw,g=r"}
+    - copy: {content: "y\\n", dest: "{{ d }}/b.conf", mode: "u=rw,g=r"}
       register: r6
-    - copy: {content: "y\\n", dest: "{{ d }}/b", mode: "u=rwx,g=,o="}
+    - copy: {content: "y\\n", dest: "{{ d }}/b.conf", mode: "u=rwx,g=,o="}
       register: r7
     - copy: {content: {"k": [1, 2]}, dest: "{{ d }}/json"}
       register: r8
@@ -263,13 +264,14 @@ def test_copy_force_false_stats_destination_in_task_environment(tmp_path, monkey
 def test_copy_diff_mode_matches_official(tmp_path, monkeypatch, task_environment):
     pytest.importorskip("ansible")
     from ansiroll.embed import ModuleEmbedder
-    from ansiroll.loader import COPY_ACTION_MODULES
+    from ansiroll.loader import COPY_ACTION_MODULES, _copy_action_settings
     from ansiroll.runtime import Runtime
 
     official_dir = tmp_path / "official"
     official_dir.mkdir()
     (official_dir / "f").write_text("old\n")
     play = tmp_path / "play.yml"
+    controller_tmp = tmp_path / "controller-tmp"
     task_env = ""
     dest = str(official_dir / "f")
     if task_environment:
@@ -287,7 +289,8 @@ def test_copy_diff_mode_matches_official(tmp_path, monkeypatch, task_environment
         % (json.dumps(dest), task_env))
     proc = subprocess.run(
         [_ansible_playbook(), "-i", "localhost,", "-c", "local", "--diff", str(play)],
-        env=_env(), capture_output=True, text=True)
+        env=dict(_env(), ANSIBLE_LOCAL_TEMP=str(controller_tmp)),
+        capture_output=True, text=True)
     official = _normalize(_results(proc.stdout)[0], str(official_dir))
 
     compiled_dir = tmp_path / "compiled"
@@ -296,14 +299,24 @@ def test_copy_diff_mode_matches_official(tmp_path, monkeypatch, task_environment
     embedder = ModuleEmbedder()
     modules = {name: embedder.embed(name) for name in COPY_ACTION_MODULES}
     rt = Runtime(modules, "", {"inventory_hostname": "localhost"}, diff_mode=True)
+    settings = _copy_action_settings()
     compiled_dest = str(compiled_dir / "f")
     if task_environment:
         rt._module_env = {"ANSIROLL_COPY_DIFF_DEST": compiled_dest}
     try:
         result = rt._run_file_action(
-            "copy", {}, {"content": "new\n",
-                         "dest": dest if task_environment else compiled_dest}, {})
+            "copy", settings, {"content": "new\n",
+                               "dest": dest if task_environment else compiled_dest}, {})
     finally:
         rt.cleanup()
-    assert _normalize(result, str(compiled_dir)) == official
+    compiled = _normalize(result, str(compiled_dir))
+    if settings.get("_copy_inline_diff_source"):
+        for side, directory in ((official, str(controller_tmp)),
+                                (compiled, tempfile.gettempdir())):
+            diff = side["diff"][0]
+            header = diff["after_header"]
+            assert os.path.commonpath([header, directory]) == directory
+            assert re.fullmatch(r"tmp[a-z0-9_]{8}", os.path.basename(header))
+            diff["after_header"] = "<controller temporary source>"
+    assert compiled == official
     assert official["diff"][0]["before"] == "old\n"

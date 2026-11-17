@@ -797,8 +797,9 @@ def _accelerator_options(action):
     name = str(action or "").split(".")[-1]
     try:
         from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        version = tuple(map(int, match.groups())) if match else (0, 0)
+        match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", __version__)
+        full_version = tuple(int(part or 0) for part in match.groups()) if match else (0, 0, 0)
+        version = full_version[:2]
         options = {}
         # AnsibleModule._check_locale started selecting a UTF-8 fallback in 2.12.
         if (2, 10) <= version < (2, 12):
@@ -808,6 +809,8 @@ def _accelerator_options(action):
         elif name in ("command", "shell"):
             if version < (2, 12):
                 options["check_always_skipped"] = True
+            if version < (2, 11):
+                options["omit_exec_error_output"] = True
             if version < (2, 19):
                 options["chdir_error_detail"] = True
                 options["exec_error_detail"] = True
@@ -834,15 +837,18 @@ def _accelerator_options(action):
                 options["language_locale"] = True
         elif name == "blockinfile" and version >= (2, 20):
             options["text_mode"] = True
+        # Older file modules returned only dest for a touch in check mode.
+        elif name == "file" and full_version < (2, 13, 8):
+            options["omit_touch_check_changed"] = True
         elif name == "replace":
+            if version < (2, 17):
+                options["chmod_before_chown"] = True
             if version < (2, 20):
                 options["binary_io"] = True
             if version < (2, 14):
                 options["omit_result_rc"] = True
         elif name == "user":
-            patch = re.match(r"^(\d+)\.(\d+)\.(\d+)", __version__)
-            full = tuple(map(int, patch.groups())) if patch else version + (0,)
-            if full >= (2, 18, 9):
+            if full_version >= (2, 18, 9):
                 options["home_mode"] = True
             if version >= (2, 21):
                 options["result_memberships"] = True
@@ -869,7 +875,16 @@ def _boolean_literal(value):
 
 def _copy_action_settings():
     """Controller-side copy action settings from the compiling ansible-core."""
+    from ansible.release import __version__
+
     settings = {}
+    version = tuple(map(int, __version__.split(".")[:2]))
+    # 2.17 switched to hidden temporary names and kept the suffix for validate.
+    if version < (2, 17):
+        settings["_copy_legacy_stage"] = True
+    # 2.16 started using the destination as the diff header for inline content.
+    if version < (2, 16):
+        settings["_copy_inline_diff_source"] = True
     try:
         from ansible.plugins.action.copy import REAL_FILE_ARGS
         settings["_copy_file_args"] = sorted(REAL_FILE_ARGS)

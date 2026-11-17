@@ -290,11 +290,13 @@ def _ensure_directory(path, recurse, attributes, check_mode):
     return {"path": path, "changed": changed}
 
 
-def _execute_touch(path, preserve_times, attributes, check_mode):
+def _execute_touch(path, preserve_times, attributes, check_mode, options):
     prev_state = _get_state(path)
     if prev_state == "link":
         raise _Fallback()
     result = {"dest": path}
+    if check_mode and options.get("omit_touch_check_changed"):
+        return result
     if prev_state == "absent":
         if check_mode:
             result["changed"] = True
@@ -319,7 +321,8 @@ def _execute_touch(path, preserve_times, attributes, check_mode):
 
 
 def run(args, check_mode=False, shell=False, environment=None, options=None):
-    if (options or {}).get("diff_mode") or _selinux_enabled():
+    options = options or {}
+    if options.get("diff_mode") or _selinux_enabled():
         return _FALLBACK
     path = args.get("path") or args.get("dest") or args.get("name")
     path = os.path.expanduser(os.path.expandvars(path))
@@ -347,7 +350,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
                 and args.get("access_time") == "preserve"
             )
             return _add_path_info(_execute_touch(
-                path, preserve_times, attributes, check_mode))
+                path, preserve_times, attributes, check_mode, options))
         return _ensure_link(args, path, check_mode)
     except _Fallback:
         return _FALLBACK

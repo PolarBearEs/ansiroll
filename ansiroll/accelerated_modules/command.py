@@ -229,18 +229,19 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
             stdin.encode("utf-8", "surrogateescape") if stdin is not None else None)
         rc = proc.returncode
     except Exception as ex:
-        # module_utils.basic run_command(): fail_json(rc=errno (257 for
-        # non-OSError), stdout='', stderr='', cmd=_clean_args(args)).
-        return {
+        # run_command uses errno (257 for non-OSError) and a sanitized command.
+        # It started including empty output fields in ansible-core 2.11.
+        result = {
             "failed": True,
             "rc": ex.errno if isinstance(ex, OSError) else 257,
-            "stdout": "", "stderr": "",
-            "stdout_lines": [], "stderr_lines": [],
             "cmd": _clean_args(argv if argv is not None else raw),
             # ansible-core < 2.19 reported to_native(e) instead.
             "msg": (str(ex) if options.get("exec_error_detail")
                     else "Error executing command."),
         }
+        if not options.get("omit_exec_error_output"):
+            result.update(stdout="", stderr="", stdout_lines=[], stderr_lines=[])
+        return result
     ended = datetime.datetime.now()
     # The module runs with encoding=None and converts bytes with to_text.
     stdout = (stdout or b"").decode("utf-8", "surrogateescape")

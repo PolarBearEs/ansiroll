@@ -428,7 +428,6 @@ def test_accelerated_apt_remove_uses_official_apt_environment(tmp_path):
     """apt-get runs with the official module's APT_ENV_VARS; fake dpkg-query and
     apt-get on the task PATH record it, so no package state is touched."""
     import ansible
-    from ansible.module_utils.common.locale import get_best_parsable_locale
     from ansiroll.loader import _accelerator_options
 
     bin_dir = tmp_path / "bin"
@@ -467,13 +466,17 @@ def test_accelerated_apt_remove_uses_official_apt_environment(tmp_path):
     source = open(os.path.join(
         os.path.dirname(ansible.__file__), "modules", "apt.py")).read()
     block = re.search(r"APT_ENV_VARS = dict\((.*?)\)", source, re.S).group(1)
-    locale = get_best_parsable_locale(_Module())
+    locale = None
+    if re.search(r"=\s*locale\b", block):
+        from ansible.module_utils.common.locale import get_best_parsable_locale
+        locale = get_best_parsable_locale(_Module())
     expected = {}
     for key, value in re.findall(r"(\w+)=([^,\n]+)", block):
         expected[key] = locale if value.strip() == "locale" else value.strip("'\" ")
     assert "LANG" in expected and "DEBIAN_FRONTEND" in expected
     recorded = json.load(open(str(record)))
     assert {key: recorded["env"].get(key) for key in expected} == expected
+    assert recorded["env"]["LANGUAGE"] == expected.get("LANGUAGE", "es")
     assert recorded["argv"][-2:] == ["remove", "ansiroll-fake"]
 
 
@@ -640,6 +643,8 @@ def test_accelerated_shell_locale_fallback_matches_official(monkeypatch, path):
 ])
 def test_accelerated_replace_matches_official_module_semantics(
         tmp_path, initial, args):
+    from ansiroll.loader import _accelerator_options
+
     official_path = tmp_path / "official"
     accelerated_path = tmp_path / "accelerated"
     official_path.write_text(initial)
@@ -652,15 +657,10 @@ def test_accelerated_replace_matches_official_module_semantics(
             "replace", dict(args, path=str(official_path)))
     finally:
         rt.cleanup()
-    from ansible.release import __version__ as ansible_version
-    version = tuple(map(int, ansible_version.split(".")[:2]))
     accelerated = run_accelerated(
         "replace",
         dict(args, path=str(accelerated_path)),
-        options={
-            "binary_io": version < (2, 20),
-            "omit_result_rc": version < (2, 14),
-        },
+        options=_accelerator_options("replace"),
     )
 
     official.pop("invocation", None)
@@ -674,6 +674,7 @@ def test_accelerated_replace_writes_like_official_when_chown_is_denied(
     group it is not in): atomic_move ignores EPERM and still writes."""
     import errno as errno_module
     from ansiroll.accelerated_modules import replace as replace_module
+    from ansiroll.loader import _accelerator_options
 
     hooks = tmp_path / "hooks"
     hooks.mkdir()
@@ -702,7 +703,9 @@ def test_accelerated_replace_writes_like_official_when_chown_is_denied(
         raise OSError(errno_module.EPERM, "Operation not permitted")
 
     monkeypatch.setattr(replace_module.os, "chown", denied)
-    accelerated = run_accelerated("replace", dict(args, path=str(accelerated_path)))
+    accelerated = run_accelerated(
+        "replace", dict(args, path=str(accelerated_path)),
+        options=_accelerator_options("replace"))
 
     official.pop("invocation", None)
     assert official["changed"] is True
@@ -763,6 +766,7 @@ def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
         ({"path": "t1", "state": "touch"}, False),
         ({"path": "t1", "state": "touch", "mode": "0600"}, False),
         ({"path": "t1", "state": "touch", "mode": "0644"}, True),
+        ({"path": "missing-touch", "state": "touch"}, True),
         ({"path": "t3", "state": "touch", "modification_time": "preserve",
           "access_time": "preserve"}, False),
         ({"path": "lnk", "state": "absent"}, True),

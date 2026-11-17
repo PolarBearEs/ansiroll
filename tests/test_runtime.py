@@ -1379,7 +1379,7 @@ def test_worker_copy_stat_and_stage_ops(tmp_path):
             "copy_stat", {"path": str(dest), "follow": False, "checksum": True})
         assert stat["checksum"] == hashlib.sha1(b"hello").hexdigest()
         staged = rt._run_worker_operation("copy_stage", {
-            "data": base64.b64encode(b"data").decode("ascii"), "suffix": ".conf"})
+            "data": base64.b64encode(b"data").decode("ascii"), "filename": ".source.conf"})
         assert staged["path"].endswith("/.source.conf")
         with open(staged["path"], "rb") as fh:
             assert fh.read() == b"data"

@@ -2577,7 +2577,8 @@ class Runtime:
             if isinstance(content, (dict, list)):
                 content = json.dumps(content)
             data = _as_text(content).encode("utf-8", "surrogateescape")
-            source_rel = ".%s" % _random_suffix()
+            prefix = "tmp" if task.get("_copy_legacy_stage") else "."
+            source_rel = prefix + _random_suffix()
             source_display = os.path.join(_tempfile_dir(), source_rel)
             if args.get("mode") == "preserve":
                 # The copy action preserves the mode of its mkstemp source.
@@ -2739,10 +2740,12 @@ class Runtime:
                     raise _CopyActionError(
                         "failed to transfer file to %s: %s" % (dest_file, put.get("msg")))
                 return {"changed": False, "dest": dest, "src": source_display}
-            tmp_src = ".source" + os.path.splitext(dest_file)[1]
+            tmp_src = "source"
+            if not task.get("_copy_legacy_stage"):
+                tmp_src = ".source" + os.path.splitext(dest_file)[1]
             staged = self._copy_op("copy_stage", {
                 "data": base64.b64encode(data).decode("ascii"),
-                "suffix": os.path.splitext(dest_file)[1],
+                "filename": tmp_src,
             }, become)
             if staged.get("failed"):
                 raise _CopyActionError(
@@ -2833,7 +2836,8 @@ class Runtime:
             elif b"\x00" in data:
                 diff["src_binary"] = 1
             else:
-                diff["after_header"] = destination if from_content else source_display
+                inline_header = from_content and not task.get("_copy_inline_diff_source")
+                diff["after_header"] = destination if inline_header else source_display
                 diff["after"] = data.decode("utf-8", "surrogateescape")
         if task.get("no_log"):
             if "before" in diff:

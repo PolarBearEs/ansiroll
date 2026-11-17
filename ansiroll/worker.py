@@ -242,7 +242,7 @@ def _copy_stage(args):
             fh.write(data)
         return {"path": args["path"]}
     tmpdir = tempfile.mkdtemp(prefix="ansible-tmp-")
-    path = os.path.join(tmpdir, ".source" + (args.get("suffix") or ""))
+    path = os.path.join(tmpdir, args["filename"])
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
