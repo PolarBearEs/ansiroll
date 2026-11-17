@@ -2220,7 +2220,7 @@ class Runtime:
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
         name = str(task.get("action") or "").split(".")[-1]
-        if name != "unarchive" or _to_bool(args.get("remote_src", False)):
+        if name != "unarchive" or _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         marker = (task.get("_baked") or {}).get(src)
@@ -2380,10 +2380,13 @@ class Runtime:
             }
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
-        if name == "copy" and _ansible_boolean(
-                args.get("remote_src", False) if isinstance(args, dict) else False):
-            # The copy action plugin hands remote_src copies straight to the
-            # copy module, which reads src on the target.
+        if (name == "copy" and isinstance(args, dict)
+                and args.get("src") is not None and args.get("content") is None
+                and args.get("dest")
+                and _ansible_boolean(args.get("remote_src", False))):
+            # The copy action plugin (after its argument checks and the
+            # content branch) hands remote_src copies straight to the copy
+            # module, which reads src on the target.
             return self.run_module(
                 task["action"], _fail_on_undef(_strip_omit(args)), become=become)
         if name in ("template", "copy"):

@@ -65,7 +65,9 @@ def _cmd_compile(args):
                                             tree_shake=args.tree_shake,
                                             freeze_playbook_vars=args.freeze_playbook_vars,
                                             freeze_vars=args.freeze_var)
-    except ValueError as ex:
+    except Exception as ex:
+        if not isinstance(ex, (ValueError,) + _ansible_errors()):
+            raise
         message = str(ex)
         if not message.startswith("ansiroll: "):
             message = "ansiroll: " + message
@@ -83,6 +85,14 @@ def _cmd_compile(args):
            len(manifest["fallback_tasks"]))
     )
     return 0
+
+
+def _ansible_errors():
+    try:
+        from ansible.errors import AnsibleError
+    except ImportError:
+        return ()
+    return (AnsibleError,)
 
 
 def _load_extra_vars(specs, vault_password_file=None):

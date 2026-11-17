@@ -344,3 +344,106 @@ def test_cli_reports_freeze_errors_cleanly(tmp_path, capsys):
     assert rc == 2
     assert "Traceback" not in err
     assert "ansiroll: cannot freeze 'x'" in err
+
+
+def test_tree_shake_keeps_conditions_on_jinja_globals(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg=NEVER
+      when: now().year == 1999
+    - debug: msg=STAMP
+      when: "'%Y' | strftime == '1999'"
+"""})
+    _source, manifest = compile_playbook(str(tmp_path / "pb.yml"), tree_shake=True)
+    assert manifest["tree_shake"]["removed_nodes"] == 0
+
+
+def test_unarchive_remote_src_y_reads_target_at_runtime(tmp_path):
+    archive = tmp_path / "a.tgz"
+    out = tmp_path / "out"
+    out.mkdir()
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - unarchive: src=%s dest=%s remote_src=y
+    - debug: msg="{{ lookup('file', '%s/f.txt') }}"
+""" % (archive, out, out)})
+    compiled = tmp_path / "compiled.py"
+    proc = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(tmp_path / "pb.yml"),
+         "-o", str(compiled)], cwd=ROOT, env=_env(), capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    (payload / "f.txt").write_text("ON_TARGET\n")
+    subprocess.check_call(["tar", "czf", str(archive), "-C", str(payload), "f.txt"])
+    run = subprocess.run([sys.executable, str(compiled)], env=_env(),
+                         capture_output=True, text=True)
+    got = _summary(run.stdout + run.stderr)
+    (out / "f.txt").unlink()
+    assert got == _ansible(tmp_path / "pb.yml")
+    assert got[0] == ["ON_TARGET"]
+
+
+def test_copy_content_wins_over_remote_src(tmp_path):
+    dest = tmp_path / "dest.txt"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy: content=INLINE dest=%s remote_src=yes
+    - debug: msg="{{ lookup('file', '%s') }}"
+""" % (dest, dest)})
+    expected = _ansible(tmp_path / "pb.yml")
+    dest.unlink()
+    assert expected[0] == ["INLINE"]
+    assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
+
+
+def test_included_file_lookups_do_not_depend_on_cwd(tmp_path):
+    dest = tmp_path / "pb" / "dest.txt"
+    _write(tmp_path / "pb", {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - import_tasks: inc/t.yml
+    - include_tasks: inc/t.yml
+""", "inc/t.yml": """
+- debug: msg="{{ lookup('file', 'data.txt') }}"
+- copy: src=data.txt dest=%s
+- debug: msg="{{ lookup('file', '%s') }}"
+""" % (dest, dest), "inc/files/data.txt": "INC_FILES\n",
+        "files/data.txt": "PB_FILES\n"})
+    _write(tmp_path / "decoy", {"files/data.txt": "DECOY\n", "data.txt": "DECOY\n"})
+    playbook = tmp_path / "pb" / "pb.yml"
+    expected = _ansible(playbook)
+    dest.unlink()
+    assert expected[0] == ["INC_FILES"] * 4
+    assert _ansiroll(playbook, tmp_path, cwd=str(tmp_path / "decoy")) == expected
+
+
+def test_register_and_loop_vars_are_not_frozen(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {res: play, it: play, idx: play}
+  tasks:
+    - command: echo hi
+      register: res
+    - include_tasks: inc.yml
+      loop: [a]
+      loop_control: {loop_var: it, index_var: idx}
+""", "inc.yml": '- debug: msg="{{ res.stdout }} {{ it }} {{ idx }}"\n'})
+    _source, manifest = compile_playbook(str(tmp_path / "pb.yml"),
+                                         freeze_playbook_vars=True)
+    assert manifest["tree_shake"]["frozen_var_names"] == []
+    assert sorted(manifest["tree_shake"]["skipped_playbook_vars"]) == ["idx", "it", "res"]
+    for name in ("res", "it", "idx"):
+        with pytest.raises(ValueError):
+            compile_playbook(str(tmp_path / "pb.yml"), freeze_vars=[name])
+    expected = _ansible(tmp_path / "pb.yml")
+    assert expected[0] == ["hi a 0"]
+    assert _ansiroll(tmp_path / "pb.yml", tmp_path, "--freeze-playbook-vars") == expected

@@ -117,6 +117,7 @@ def parse_playbook(path, vault_password_file=None):
                              or os.path.dirname(os.path.abspath(path)))
     plays = []
     actions = set()
+    uuids = {}
     for play in pb.get_plays():
         # Like ansible-playbook (cli/playbook.py, executor/playbook_executor.py):
         # run each play with the loader's basedir set to the directory of the
@@ -127,7 +128,7 @@ def parse_playbook(path, vault_password_file=None):
         node = _convert_play(play, actions, basedir)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
-        _assign_stable_uuids(node["tasks"], node["handlers"])
+        _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
         plays.append(node)
     return plays, actions
 
@@ -149,20 +150,29 @@ def _make_rewriting_loader(DataLoader):
 
 
 def _rewrite_includes(data):
+    # Rewrite in place: ansible-core's parsed containers carry origin tags
+    # (task.get_path(), hence the file search path, comes from them), so they
+    # must not be replaced by plain copies.
     if isinstance(data, list):
-        return [_rewrite_includes(x) for x in data]
+        for index, item in enumerate(data):
+            data[index] = _rewrite_includes(item)
+        return data
     if isinstance(data, dict):
-        if "include" in data and isinstance(data.get("include"), str):
+        rename = "include" in data and isinstance(data.get("include"), str)
+        if rename:
             dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            rewritten = {}
-            for k, v in data.items():
+            items = list(data.items())
+            data.clear()
+            for k, v in items:
                 if k == "include":
-                    rewritten[new_key] = v
+                    data[new_key] = v
                 else:
-                    rewritten[k] = _rewrite_includes(v)
-            return rewritten
-        return {k: _rewrite_includes(v) for k, v in data.items()}
+                    data[k] = _rewrite_includes(v)
+        else:
+            for k in list(data):
+                data[k] = _rewrite_includes(data[k])
+        return data
     return data
 
 
@@ -412,13 +422,14 @@ def _assign_runtime_ids(tasks, handlers):
     walk(handlers)
 
 
-def _assign_stable_uuids(tasks, handlers):
+def _assign_stable_uuids(tasks, handlers, mapping=None):
     """Replace ansible-core's random task/role UUIDs with deterministic ones.
 
     Only equality between the identifiers matters at runtime (output grouping,
     handler de-duplication already happened), so the first-seen order keeps
     every relation while making repeated compiles byte-identical."""
-    mapping = {}
+    if mapping is None:
+        mapping = {}
 
     def stable(value):
         if value is None:
@@ -1101,8 +1112,8 @@ def _raw_search_path(task, basedir):
 
 def _search_dirs(task, basedir, subdir):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
-    a file under ``subdir`` (ansible/parsing/dataloader.py): each task search
-    path (role-aware), then the loader basedir as a last resort."""
+    a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
+    call it: each task search path (role-aware), then the loader basedir."""
     loader = getattr(task, "_loader", None)
     try:
         stack = list(task.get_search_path() or [])
@@ -1117,11 +1128,14 @@ def _search_dirs(task, basedir, subdir):
     for path in stack:
         upath = unfrackpath(path, follow=False)
         pb_base_dir = os.path.dirname(upath)
-        is_role = False
-        try:
-            is_role = bool(loader._is_role(path))
-        except Exception:
-            pass
+        # LookupBase.find_file_in_search_path passes is_role='role_path' in
+        # the task vars, i.e. any role task; otherwise dwim detects roles.
+        is_role = getattr(task, "_role", None) is not None
+        if not is_role:
+            try:
+                is_role = bool(loader._is_role(path))
+            except Exception:
+                pass
         if is_role and pb_base_dir.endswith("/tasks"):
             dirs.append(os.path.join(os.path.dirname(pb_base_dir), subdir))
             dirs.append(pb_base_dir)

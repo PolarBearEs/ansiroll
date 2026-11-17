@@ -206,6 +206,13 @@ def _shadowed_var_names(plays):
             names.update((node.get("role_vars") or {}).keys())
             if str(node.get("action") or "").split(".")[-1] == "set_fact":
                 names.update((node.get("args") or {}).keys())
+            if node.get("register"):
+                names.add(node["register"])
+            if node.get("loop") is not None:
+                # Loop variables beat extra vars, inside included files too.
+                names.add(node.get("loop_var") or "item")
+                if node.get("index_var"):
+                    names.add(node["index_var"])
             if node.get("type") == "block":
                 walk(node.get("block")); walk(node.get("rescue")); walk(node.get("always"))
             elif node.get("type") == "include":
@@ -243,9 +250,9 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
             if explicit:
                 raise ValueError(
                     "ansiroll: cannot freeze %r because a task, block, role, "
-                    "or set_fact shadows it" % name
+                    "set_fact, register or loop variable shadows it" % name
                 )
-            skipped[name] = "shadowed by task/block/role vars or set_fact"
+            skipped[name] = "shadowed by task/block/role vars, set_fact, register or loop var"
             continue
         values = []
         origins = []
@@ -322,8 +329,11 @@ def _condition_value(condition, variables, templater):
         return None
     # Templater globals (now(), lookup(), query(), ...) are evaluated when the
     # task runs; a condition that calls one is not statically known.
-    if any(name not in variables and name in templater.env.globals
-           for name in referenced):
+    # find_undeclared_variables omits environment globals, so look at the
+    # names the expression actually loads.
+    from jinja2 import nodes as jinja_nodes
+    if any(node.name not in variables and node.name in templater.env.globals
+           for node in parsed.find_all(jinja_nodes.Name)):
         return None
     if _uses_nondeterministic_filter(parsed):
         return None
@@ -374,7 +384,8 @@ def _condition_value(condition, variables, templater):
         return None
 
 
-_NONDETERMINISTIC_FILTERS = frozenset(("random", "shuffle"))
+# Filters whose result depends on when/where they run.
+_NONDETERMINISTIC_FILTERS = frozenset(("random", "shuffle", "strftime"))
 
 
 def _uses_nondeterministic_filter(parsed):
