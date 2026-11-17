@@ -34,15 +34,22 @@ def _strings(value):
     raise ValueError("expected a string or list of strings")
 
 
+def _string_list(value):
+    """type='list' parameters: a string is split on commas (check_type_list)."""
+    if isinstance(value, str):
+        return value.split(",")
+    return _strings(value)
+
+
 def can_accelerate(args, check_mode=False, shell=False):
     if not isinstance(args, dict) or not set(args).issubset(_ALLOWED):
         return False
     try:
-        paths = _strings(_single(args, _PATH_KEYS))
-        _strings(_single(args, ("patterns", "pattern"), ["*"]))
+        paths = _string_list(_single(args, _PATH_KEYS))
+        _string_list(_single(args, ("patterns", "pattern"), ["*"]))
         excludes = _single(args, ("excludes", "exclude"))
         if excludes is not None:
-            _strings(excludes)
+            _string_list(excludes)
     except (TypeError, ValueError):
         return False
     if not paths or any(not path or "\0" in path for path in paths):
@@ -140,10 +147,10 @@ def _warning(message, error=None, typed=False):
 
 
 def run(args, check_mode=False, shell=False, environment=None, options=None):
-    paths = _strings(_single(args, _PATH_KEYS))
-    patterns = _strings(_single(args, ("patterns", "pattern"), ["*"])) or ["*"]
+    paths = _string_list(_single(args, _PATH_KEYS))
+    patterns = _string_list(_single(args, ("patterns", "pattern"), ["*"])) or ["*"]
     raw_excludes = _single(args, ("excludes", "exclude"))
-    excludes = _strings(raw_excludes) if raw_excludes is not None else []
+    excludes = _string_list(raw_excludes) if raw_excludes is not None else []
     wanted_type = args.get("file_type", "file")
     recurse = args.get("recurse", False)
     hidden = args.get("hidden", False)
@@ -248,7 +255,8 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         "matched": len(files),
         "examined": examined,
     }
-    if skipped_paths:
+    # ansible-core >= 2.12 always returns skipped_paths.
+    if skipped_paths or structured_skips:
         result["skipped_paths"] = skipped_paths
     if warnings:
         result["warnings"] = warnings

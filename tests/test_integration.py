@@ -836,6 +836,38 @@ def test_accelerated_find_missing_path_matches_official_result(tmp_path):
     assert accelerated == expected
 
 
+def test_accelerated_find_splits_comma_separated_lists_like_official(tmp_path):
+    from ansiroll.loader import _accelerator_options
+
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        for name in ("x.txt", "y.log", "z.cfg"):
+            (tmp_path / sub / name).write_text(name)
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    cases = [
+        {"paths": "%s,%s" % (a, b), "patterns": "*.txt,*.log"},
+        {"paths": a, "patterns": "*.txt,*.log", "excludes": "x*,nomatch"},
+        {"path": a, "pattern": "*.cfg"},
+    ]
+    rt = Runtime({"find": ModuleEmbedder().embed("find")},
+                 "", {"inventory_hostname": "localhost"})
+
+    def normalized(result):
+        result = {k: v for k, v in result.items() if k != "invocation"}
+        result["files"] = sorted(result["files"], key=lambda item: item["path"])
+        return result
+
+    try:
+        for case in cases:
+            official = rt.run_module("find", dict(case))
+            accelerated = run_accelerated(
+                "find", dict(case), options=_accelerator_options("find"))
+            assert normalized(accelerated) == normalized(official), case
+            assert official["matched"] > 0
+    finally:
+        rt.cleanup()
+
+
 def test_compile_omits_total_static_official_module_and_forces_accelerator(
         tmp_path):
     destination = tmp_path / "accelerated-only-file"
