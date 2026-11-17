@@ -122,6 +122,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
     plays = []
     actions = set()
     uuids = {}
+    runtime_writes = set()
     for play in pb.get_plays():
         # Like ansible-playbook (cli/playbook.py, executor/playbook_executor.py):
         # run each play with the loader's basedir set to the directory of the
@@ -129,7 +130,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
         # independent of the compiler's working directory.
         basedir = os.path.abspath(getattr(play, "_included_path", None) or pb_dir)
         loader.set_basedir(basedir)
-        node = _convert_play(play, actions, basedir)
+        node = _convert_play(play, actions, basedir, runtime_writes=runtime_writes)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -180,30 +181,55 @@ def _rewrite_includes(data):
     return data
 
 
-def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, all_vars=None):
-    INCLUDED_TASKS.clear()
-    _INCLUDE_STACK.clear()
-    _INCLUDE_ROLE_PARENTS.clear()
-    _INCLUDE_IDS[0] = 0
+def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
+                  all_vars=None, runtime_writes=None):
     if basedir is None:
         try:
             basedir = play._loader.get_basedir()
         except Exception:
             basedir = os.getcwd()
+    play_vars = _resolved_play_vars(play, all_vars, basedir)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
-    tasks = []
-    for block in play.compile():
-        n = _convert_node(block, actions, basedir, only_tags=only_tags,
-                          skip_tags=skip_tags, all_vars=all_vars)
-        if n:
-            tasks.append(n)
-    handlers = []
-    for hblock in _handler_blocks(play):
-        # No tag filtering: a notified handler runs regardless of --tags.
-        _convert_node(hblock, actions, basedir, flatten_handler=True, sink=handlers,
-                      all_vars=all_vars)
+    blocks = play.compile()
+    handler_blocks = _handler_blocks(play)
+    known_writes = set(runtime_writes or ())
+    manager = play.get_variable_manager()
+    # Strategy compilation has no host context. Values left by earlier plays
+    # can still override these compile-time play vars on individual hosts.
+    for cache_name in ("_vars_cache", "_nonpersistent_fact_cache"):
+        for host_vars in getattr(manager, cache_name, {}).values():
+            known_writes.update(host_vars)
+    includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.record_writes(blocks + handler_blocks)
+    while True:
+        INCLUDED_TASKS.clear()
+        _INCLUDE_STACK.clear()
+        _INCLUDE_ROLE_PARENTS.clear()
+        _INCLUDE_IDS[0] = 0
+        initial_writes = includes.runtime_writes.copy()
+        includes.resolved_template = False
+        play_actions = set()
+        tasks = []
+        for block in blocks:
+            node = _convert_node(block, play_actions, basedir, only_tags=only_tags,
+                                 skip_tags=skip_tags, includes=includes)
+            if node:
+                tasks.append(node)
+        handlers = []
+        for hblock in handler_blocks:
+            # A notified handler runs regardless of --tags.
+            _convert_node(hblock, play_actions, basedir, flatten_handler=True,
+                          sink=handlers, includes=includes)
+        # Includes can expose additional writes, including writes that precede
+        # another include on a later loop iteration. Revisit provisional paths
+        # when the set grows, keeping only the final graph and task IDs.
+        if not includes.resolved_template or initial_writes == includes.runtime_writes:
+            break
+    actions.update(play_actions)
+    if runtime_writes is not None:
+        runtime_writes.update(includes.runtime_writes)
     handlers = _dedup_by_uuid(handlers)
     _assign_runtime_ids(tasks, handlers)
     # An unset gather_facts follows the configured gathering policy: implicit
@@ -227,7 +253,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
         "check_mode": getattr(play, "check_mode", None),
         "become": bool(play.become),
         "become_user": getattr(play, "become_user", None),
-        "vars": _tag_untrusted(_resolved_play_vars(play, all_vars, basedir)),
+        "vars": _tag_untrusted(play_vars),
         "tasks": tasks,
         "handlers": handlers,
     }
@@ -293,24 +319,33 @@ def _fact_schema():
 
 def _resolved_play_vars(play, all_vars, basedir):
     """Merge static vars_files at their play-var precedence."""
+    from ansible.utils.vars import combine_vars
+
     out = dict(play.vars or {})
-    for entry in (_as_list(getattr(play, "vars_files", None)) or []):
-        if not isinstance(entry, str):
-            continue
-        entry = re.sub(
-            r"{{\s*playbook_dir\s*}}", basedir, entry
-        )
-        if "{{" in entry or "{%" in entry:
-            continue
-        path = entry if os.path.isabs(entry) else os.path.join(basedir, entry)
-        try:
-            loaded = play._loader.load_from_file(path, trusted_as_template=True) or {}
-        except TypeError:
-            loaded = play._loader.load_from_file(path) or {}
-        except Exception:
-            continue
-        if isinstance(loaded, dict):
-            out.update(loaded)
+    use_search_stack = tuple(map(int, _fact_schema().split("."))) >= (2, 12)
+    for entry in _as_list(getattr(play, "vars_files", None)):
+        for filename in _as_list(entry):
+            if not isinstance(filename, str):
+                continue
+            filename = re.sub(r"{{\s*playbook_dir\s*}}", basedir, filename)
+            if _is_templated(filename):
+                break
+            try:
+                # 2.10 and 2.11 load relative to the playbook directory.
+                path = filename
+                if use_search_stack:
+                    path = play._loader.path_dwim_relative_stack(
+                        play.get_search_path(), "vars", filename)
+                try:
+                    loaded = play._loader.load_from_file(path, trusted_as_template=True)
+                except TypeError:
+                    loaded = play._loader.load_from_file(path)
+            except Exception:
+                continue
+            for item in _as_list(loaded) or []:
+                if isinstance(item, dict):
+                    out = combine_vars(out, item)
+            break
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
     # and unrelated inventory state are not baked into every play.
@@ -482,7 +517,7 @@ def _handler_blocks(play):
 
 
 def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
-                  only_tags=None, skip_tags=None, all_vars=None):
+                  only_tags=None, skip_tags=None, includes=None):
     from ansible.playbook.block import Block
     from ansible.playbook.task import Task
 
@@ -491,7 +526,7 @@ def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
             # Handlers are flat; emit each contained task into the sink.
             for sub in (node.block or []):
                 conv = _convert_node(sub, actions, basedir, only_tags=only_tags,
-                                     skip_tags=skip_tags, all_vars=all_vars)
+                                     skip_tags=skip_tags, includes=includes)
                 if conv:
                     sink.append(conv)
             return None
@@ -501,13 +536,13 @@ def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
             "become": bool(node.become),
             "vars": _tag_untrusted(dict(node.vars or {})),
             "block": [c for c in (_convert_node(s, actions, basedir, only_tags=only_tags,
-                                                skip_tags=skip_tags, all_vars=all_vars)
+                                                skip_tags=skip_tags, includes=includes)
                                     for s in (node.block or [])) if c],
             "rescue": [c for c in (_convert_node(s, actions, basedir, only_tags=only_tags,
-                                                 skip_tags=skip_tags, all_vars=all_vars)
+                                                 skip_tags=skip_tags, includes=includes)
                                      for s in (node.rescue or [])) if c],
             "always": [c for c in (_convert_node(s, actions, basedir, only_tags=only_tags,
-                                                 skip_tags=skip_tags, all_vars=all_vars)
+                                                 skip_tags=skip_tags, includes=includes)
                                      for s in (node.always or [])) if c],
         }
         if not block_node["block"] and not block_node["rescue"] and not block_node["always"]:
@@ -515,16 +550,16 @@ def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
         return block_node
 
     if isinstance(node, Task):
-        if not _matches_tags(node, only_tags, skip_tags, all_vars):
+        if not _matches_tags(node, only_tags, skip_tags, includes.all_vars):
             return None
         if node.action in ("include_tasks", "ansible.builtin.include_tasks"):
             inc = _convert_include_tasks(node, actions, basedir, only_tags,
-                                         skip_tags, all_vars)
+                                         skip_tags, includes)
             if inc is not None:
                 return inc
         if node.action in ("include_role", "ansible.builtin.include_role"):
             inc = _convert_include_role(node, actions, basedir, only_tags,
-                                        skip_tags, all_vars)
+                                        skip_tags, includes)
             if inc is not None:
                 return inc
         return _convert_task(node, actions, basedir)
@@ -544,6 +579,90 @@ _INCLUDE_ROLE_PARENTS = {}
 _INCLUDE_IDS = [0]
 
 
+def _is_templated(value):
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _loop_binding_names(loop_var, index_var, extended):
+    names = {loop_var or "item", "ansible_loop_var"}
+    if index_var:
+        names.update((index_var, "ansible_index_var"))
+    if extended:
+        names.add("ansible_loop")
+    return names
+
+
+def _runtime_write_names(action, args, register):
+    """Return variable writes, using None for a write with unknown names."""
+    names = set(register if isinstance(register, dict) else [register]) if register else set()
+    action = str(action or "").rsplit(".", 1)[-1]
+    if action == "set_fact":
+        names.update(None if _is_templated(key) else key
+                     for key in args if key != "cacheable")
+    elif action == "include_vars":
+        name = args.get("name")
+        names.add(name if isinstance(name, str) and name and not _is_templated(name) else None)
+    return names
+
+
+def _can_write_var(writes, name):
+    return name in writes or None in writes
+
+
+def _depends_on_vars(value, variables, matches):
+    """Follow Jinja variable references through known values."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    env = Environment()
+    seen = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                return False
+            return any(walk(item) for pair in value.items() for item in pair)
+        if isinstance(value, (list, tuple)):
+            return any(walk(item) for item in value)
+        if not _is_templated(value):
+            return False
+        try:
+            parsed = env.parse(value)
+        except TemplateSyntaxError:
+            return False
+        for node in parsed.find_all(nodes.Name):
+            if node.ctx != "load" or node.name in seen:
+                continue
+            name = node.name
+            seen.add(name)
+            if matches(name) or (name in variables and walk(variables[name])):
+                return True
+        return False
+
+    return walk(value)
+
+
+class _IncludeVariables:
+    def __init__(self, play_vars, all_vars, runtime_writes):
+        self.play_vars = play_vars
+        self.all_vars = all_vars
+        self.runtime_writes = runtime_writes
+        self.resolved_template = False
+
+    def record_writes(self, blocks):
+        from ansible.playbook.block import Block
+        from ansible.playbook.task import Task
+
+        for node in blocks or ():
+            if isinstance(node, Block):
+                self.record_writes(node.block)
+                self.record_writes(node.rescue)
+                self.record_writes(node.always)
+            elif isinstance(node, Task):
+                self.runtime_writes.update(
+                    _runtime_write_names(node.action, node.args or {}, node.register)
+                )
+
+
 def _include_ref(key):
     """Return the include_id of an in-progress expansion of the same content."""
     return _INCLUDE_STACK.get(key)
@@ -554,7 +673,7 @@ def _new_include_id():
     return "include-%d" % _INCLUDE_IDS[0]
 
 
-def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_vars):
+def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand a compile-time-resolvable include_tasks.
 
     Filenames depending on runtime values (such as a loop item or a registered
@@ -565,10 +684,10 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
     if not isinstance(fname, str):
         return None
     if "{{" in fname or "{%" in fname:
-        fname = _template_include_filename(task, fname, all_vars)
+        fname = _template_include_filename(task, fname, includes)
         if not isinstance(fname, str) or "{{" in fname or "{%" in fname:
             return None
-    path = _include_tasks_path(task, fname, all_vars)
+    path = _include_tasks_path(task, fname, includes)
     if path is None or not os.path.exists(path):
         return None
     role = getattr(task, "_role", None)
@@ -598,6 +717,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
                 variable_manager=task.get_variable_manager(), loader=task._loader)
         except Exception:
             return None
+        includes.record_writes(blocks)
         nested_includes = _register_included(blocks)
         if raw_fname != fname and all(
             ((nested.args or {}).get("_raw_params") or (nested.args or {}).get("file")) == raw_fname
@@ -613,7 +733,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, all_var
         _INCLUDE_STACK[key] = include_id
         try:
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
-                                               skip_tags=skip_tags, all_vars=all_vars)
+                                               skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
@@ -768,7 +888,7 @@ def _unresolved_recursive_include(task, actions, basedir):
     return node
 
 
-def _include_tasks_path(task, include_target, all_vars):
+def _include_tasks_path(task, include_target, includes):
     """Resolve an include_tasks file like IncludedFile.process_include_results
     (ansible/playbook/included_file.py) does for the controller."""
     loader = task._loader
@@ -778,7 +898,7 @@ def _include_tasks_path(task, include_target, all_vars):
     cumulative_path = None
     for parent_path, dynamic in _parent_include_paths(_include_parent(task)):
         if dynamic:
-            rendered = _template_include_filename(task, parent_path, all_vars)
+            rendered = _template_include_filename(task, parent_path, includes)
             parent_path = os.path.dirname(rendered) if isinstance(rendered, str) else ""
         cumulative_path = _next_include_dir(parent_path, cumulative_path)
         if role is not None:
@@ -806,21 +926,45 @@ def _include_tasks_path(task, include_target, all_vars):
     return include_file
 
 
-def _template_include_filename(task, value, all_vars):
+def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
+    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
     role_defaults, role_vars = _role_vars(task)
     variables = {}
     variables.update(role_defaults)
-    play = _play_of(task)
-    if play is not None:
-        variables.update(play.vars or {})
-    variables.update(all_vars or {})
+    variables.update(includes.play_vars)
+    variables.update(includes.all_vars or {})
     variables.update(role_vars)
     for scope in _include_scope(task):
         variables.update(scope)
-    variables = combine_vars(variables, task.get_variable_manager().extra_vars)
+    extra_vars = task.get_variable_manager().extra_vars
+    variables = combine_vars(variables, extra_vars)
+
+    loop_names = set()
+    parent = task
+    while parent is not None:
+        if getattr(parent, "loop", None) is not None:
+            loop_names.update(_loop_binding_names(
+                _loop_var(parent), _index_var(parent),
+                getattr(getattr(parent, "loop_control", None), "extended", False),
+            ))
+        parent = _include_parent(parent)
+
+    def is_runtime(name):
+        if name in loop_names:
+            return True
+        if not _can_write_var(includes.runtime_writes, name):
+            return False
+        # A scalar extra var replaces any runtime value. A mapping under
+        # hash_behaviour=merge can still inherit keys from a runtime write.
+        return name not in extra_vars or (
+            DEFAULT_HASH_BEHAVIOUR == "merge" and isinstance(extra_vars[name], dict)
+        )
+
+    if _depends_on_vars(value, variables, is_runtime):
+        return None
     try:
         from ansible.template import Templar
         try:
@@ -828,9 +972,12 @@ def _template_include_filename(task, value, all_vars):
         except TypeError:
             templar = Templar(loader=task._loader)
             templar.available_variables = variables
-        return templar.template(value, fail_on_undefined=True)
+        resolved = templar.template(value, fail_on_undefined=True)
     except Exception:
         return None
+    if isinstance(resolved, str) and not _is_templated(resolved):
+        includes.resolved_template = True
+    return resolved
 
 
 def _is_literal_include_template(value):
@@ -845,7 +992,7 @@ def _is_literal_include_template(value):
     ) for output in body)
 
 
-def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars):
+def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand a static-name include_role at compile time."""
     args = task.args or {}
     name = args.get("name") or args.get("_raw_params")
@@ -885,6 +1032,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
             blocks = role.compile(play)
         except Exception:
             return None
+        includes.record_writes(blocks)
         _register_included(blocks)
         task._role_path = role._role_path
         role_roots = [id(block) for block in blocks if getattr(block, "_parent", None) is None]
@@ -895,7 +1043,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, all_vars
         _INCLUDE_STACK[key] = include_id
         try:
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
-                                               skip_tags=skip_tags, all_vars=all_vars)
+                                               skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)

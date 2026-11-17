@@ -22,7 +22,14 @@ import os
 import zipfile
 
 from .embed import ModuleEmbedder
-from .loader import load_adjacent_group_vars, parse_playbook
+from .loader import (
+    _can_write_var,
+    _depends_on_vars,
+    _loop_binding_names,
+    _runtime_write_names,
+    load_adjacent_group_vars,
+    parse_playbook,
+)
 from .accelerated_modules import TOTAL_NAMES, can_accelerate
 
 _RUNTIME_PATH = os.path.join(os.path.dirname(__file__), "runtime.py")
@@ -203,25 +210,25 @@ def _freeze_value(value, context):
 
 def _shadowed_var_names(plays):
     names = set()
+
     def walk(nodes):
         for node in nodes or []:
-            names.update((node.get("vars") or {}).keys())
-            names.update((node.get("role_vars") or {}).keys())
-            if str(node.get("action") or "").split(".")[-1] == "set_fact":
-                names.update((node.get("args") or {}).keys())
-            if node.get("register"):
-                names.add(node["register"])
-            if node.get("loop") is not None:
-                # Loop variables beat extra vars, inside included files too.
-                names.add(node.get("loop_var") or "item")
-                if node.get("index_var"):
-                    names.add(node["index_var"])
+            names.update(node.get("vars") or {})
+            names.update(node.get("role_vars") or {})
+            names.update(_runtime_write_names(
+                node.get("action"), node.get("args") or {}, node.get("register"),
+            ))
+            names.update(_loop_shadowed_names(node))
             if node.get("type") == "block":
-                walk(node.get("block")); walk(node.get("rescue")); walk(node.get("always"))
+                walk(node.get("block"))
+                walk(node.get("rescue"))
+                walk(node.get("always"))
             elif node.get("type") == "include":
                 walk(node.get("tasks"))
+
     for play in plays:
-        walk(play.get("tasks")); walk(play.get("handlers"))
+        walk(play.get("tasks"))
+        walk(play.get("handlers"))
     return names
 
 
@@ -240,6 +247,9 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
     frozen = {}
     shadowed = _shadowed_var_names(plays)
 
+    def is_shadowed(name):
+        return _can_write_var(shadowed, name)
+
     names = set(requested)
     if freeze_playbook_vars:
         for play in plays:
@@ -249,13 +259,15 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
         explicit = name in requested
         if name in extra_vars:
             continue
-        if name in shadowed:
+        if is_shadowed(name):
             if explicit:
                 raise ValueError(
                     "ansiroll: cannot freeze %r because a task, block, role, "
-                    "set_fact, register or loop variable shadows it" % name
+                    "set_fact, include_vars, register or loop variable shadows it" % name
                 )
-            skipped[name] = "shadowed by task/block/role vars, set_fact, register or loop var"
+            skipped[name] = (
+                "shadowed by task/block/role vars, set_fact, include_vars, register or loop var"
+            )
             continue
         values = []
         origins = []
@@ -272,6 +284,9 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
             context = dict(group_vars)
             context.update(play_vars)
             context.update(extra_vars)
+            if _depends_on_vars(raw, context, is_shadowed):
+                reason = "shadowed dependency"
+                break
             value, known = _freeze_value(raw, context)
             if not known:
                 reason = "unresolved"
@@ -288,6 +303,9 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
                     raise ValueError(
                         "ansiroll: frozen variable %r has conflicting values "
                         "across plays" % name)
+                if reason == "shadowed dependency":
+                    raise ValueError(
+                        "ansiroll: frozen variable %r depends on a runtime variable" % name)
                 if reason == "unresolved":
                     raise ValueError(
                         "ansiroll: explicitly frozen variable %r is unresolved" % name)
@@ -301,6 +319,7 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
                 "undefined": "not defined in every play",
                 "unresolved": "value is not resolvable at compile time",
                 "conflicting": "plays define different values",
+                "shadowed dependency": "depends on a runtime variable",
             }[reason]
             continue
         frozen[name] = values[0]
@@ -455,12 +474,9 @@ def _loop_shadowed_names(node):
     vars (Ansible evaluates the task's ``when`` per item with them set)."""
     if node.get("loop") is None:
         return frozenset()
-    names = {node.get("loop_var") or "item", "ansible_loop_var"}
-    if node.get("index_var"):
-        names.update((node["index_var"], "ansible_index_var"))
-    if node.get("loop_extended"):
-        names.add("ansible_loop")
-    return frozenset(names)
+    return frozenset(_loop_binding_names(
+        node.get("loop_var"), node.get("index_var"), node.get("loop_extended"),
+    ))
 
 
 def _condition_cache_key(condition):
@@ -499,12 +515,44 @@ def _simplify_when(conditions, variables, templater, stats, cache, shadowed=froz
     return True, remaining
 
 
-def _tree_shake_nodes(nodes, variables, templater, stats, cache):
+def _recursive_include_loops(nodes):
+    """Collect loop bindings that reach an include body on recursive entry."""
+    bodies = {}
+    pending = []
+    inherited = {}
+
+    def walk(nodes, enclosing_loops):
+        for node in nodes or []:
+            kind = node.get("type")
+            if kind == "block":
+                for key in ("block", "rescue", "always"):
+                    walk(node.get(key), enclosing_loops)
+            elif kind == "include":
+                loop_names = enclosing_loops | _loop_shadowed_names(node)
+                if node.get("include_id"):
+                    bodies[node["include_id"]] = node.get("tasks")
+                if node.get("tasks_ref") and loop_names:
+                    pending.append((node["tasks_ref"], loop_names))
+                walk(node.get("tasks"), loop_names)
+
+    walk(nodes, frozenset())
+    while pending:
+        target, loop_names = pending.pop()
+        previous = inherited.get(target, frozenset())
+        if not loop_names.issubset(previous):
+            inherited[target] = previous | loop_names
+            walk(bodies.get(target), inherited[target])
+    return inherited
+
+
+def _tree_shake_nodes(nodes, variables, templater, stats, cache, recursive_loops,
+                      enclosing_loops=frozenset()):
     kept = []
     for node in nodes or []:
+        loop_names = enclosing_loops | _loop_shadowed_names(node)
         possible, remaining = _simplify_when(
             node.get("when"), variables, templater, stats, cache,
-            _loop_shadowed_names(node),
+            loop_names,
         )
         if not possible:
             stats["removed_nodes"] += 1
@@ -513,13 +561,13 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache):
         kind = node.get("type")
         if kind == "block":
             node["block"] = _tree_shake_nodes(
-                node.get("block"), variables, templater, stats, cache
+                node.get("block"), variables, templater, stats, cache, recursive_loops, loop_names
             )
             node["rescue"] = _tree_shake_nodes(
-                node.get("rescue"), variables, templater, stats, cache
+                node.get("rescue"), variables, templater, stats, cache, recursive_loops, loop_names
             )
             node["always"] = _tree_shake_nodes(
-                node.get("always"), variables, templater, stats, cache
+                node.get("always"), variables, templater, stats, cache, recursive_loops, loop_names
             )
             if not node["block"]:
                 node["rescue"] = []
@@ -527,8 +575,9 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache):
                 stats["removed_nodes"] += 1
                 continue
         elif kind == "include":
+            loop_names |= recursive_loops.get(node.get("include_id"), frozenset())
             node["tasks"] = _tree_shake_nodes(
-                node.get("tasks"), variables, templater, stats, cache
+                node.get("tasks"), variables, templater, stats, cache, recursive_loops, loop_names
             )
         kept.append(node)
     return kept
@@ -540,12 +589,11 @@ def _tree_shake_plays(plays, variables, stats):
     templater = _Templater()
     cache = {}
     for play in plays:
-        play["tasks"] = _tree_shake_nodes(
-            play.get("tasks"), variables, templater, stats, cache
-        )
-        play["handlers"] = _tree_shake_nodes(
-            play.get("handlers"), variables, templater, stats, cache
-        )
+        for section in ("tasks", "handlers"):
+            nodes = play.get(section)
+            play[section] = _tree_shake_nodes(
+                nodes, variables, templater, stats, cache, _recursive_include_loops(nodes)
+            )
 
 
 def _actions_in_plays(plays):

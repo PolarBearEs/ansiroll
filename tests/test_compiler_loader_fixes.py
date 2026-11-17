@@ -47,7 +47,7 @@ def _summary(text):
     return MSG_RE.findall(text), tuple(int(x) for x in match.groups())
 
 
-def _ansible(playbook, *args, strategy="linear"):
+def _ansible(playbook, *args, strategy="linear", returncode=None):
     env = dict(_env(), ANSIBLE_STRATEGY=strategy)
     proc = subprocess.run(
         [os.path.join(os.path.dirname(sys.executable), "ansible-playbook"),
@@ -55,10 +55,12 @@ def _ansible(playbook, *args, strategy="linear"):
          "-e", "ansible_python_interpreter=" + sys.executable, str(playbook)] + list(args),
         cwd=str(playbook.parent), env=env, capture_output=True, text=True,
     )
+    if returncode is not None:
+        assert proc.returncode == returncode, proc.stdout + proc.stderr
     return _summary(proc.stdout)
 
 
-def _ansiroll(playbook, tmp_path, *compile_args, cwd=None):
+def _ansiroll(playbook, tmp_path, *compile_args, cwd=None, returncode=None):
     out = tmp_path / "compiled.py"
     proc = subprocess.run(
         [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
@@ -68,6 +70,8 @@ def _ansiroll(playbook, tmp_path, *compile_args, cwd=None):
     assert proc.returncode == 0, proc.stderr
     run = subprocess.run([sys.executable, str(out)], cwd=str(playbook.parent),
                          env=_env(), capture_output=True, text=True)
+    if returncode is not None:
+        assert run.returncode == returncode, run.stdout + run.stderr
     return _summary(run.stdout + run.stderr)
 
 
@@ -370,6 +374,103 @@ def test_tree_shake_keeps_loop_shadowed_and_runtime_conditions(tmp_path):
     # Messages match; the recap differs only by the removed (skipped) task.
     got = _ansiroll(tmp_path / "pb.yml", tmp_path, "--tree-shake", "-e", "env=prod")
     assert got[0] == expected[0]
+
+
+def test_tree_shake_keeps_enclosing_include_loop_bindings(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: outer.yml
+      loop: [dev]
+      loop_control: {loop_var: env, index_var: position}
+    - debug: msg=OUTSIDE
+      when: env == 'dev'
+""", "outer.yml": """
+- block:
+    - include_tasks: inner.yml
+""", "inner.yml": """
+- debug: msg=INHERITED_LOOP
+  when:
+    - env == 'dev'
+    - position == 0
+- debug: msg=LINEAR_EXTRA_VARS
+  when: env == 'prod'
+"""})
+    playbook = tmp_path / "pb.yml"
+    args = ("-e", "env=prod position=3")
+    extra = {"env": "prod", "position": "3"}
+    # Linear applies extra vars after the include parameters attached to the
+    # child. Ansiroll's runner carries the loop values as a runtime overlay.
+    assert _ansible(playbook, *args)[0] == ["LINEAR_EXTRA_VARS"]
+    expected = _ansible(playbook, *args, strategy="ansiroll.core.ansiroll")
+    assert expected[0] == ["INHERITED_LOOP"]
+    assert _ansiroll(playbook, tmp_path, *args) == expected
+    source, manifest = compile_playbook(str(playbook), extra_vars=extra, tree_shake=True)
+    assert manifest["tree_shake"]["removed_nodes"] == 1
+    assert manifest["tree_shake"]["simplified_conditions"] == 0
+    assert "OUTSIDE" not in json.dumps(_bundle_json(source))
+    assert _ansiroll(playbook, tmp_path, "--tree-shake", *args)[0] == expected[0]
+
+
+def test_tree_shake_keeps_recursive_include_loop_bindings(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {depth: 0}
+  tasks:
+    - include_tasks: recursive.yml
+""", "recursive.yml": """
+- debug: msg=RECURSIVE_LOOP
+  when: env == 'dev'
+- set_fact: {depth: "{{ depth | int + 1 }}"}
+- include_tasks: recursive.yml
+  loop: [dev]
+  loop_control: {loop_var: env}
+  when: depth | int < 2
+"""})
+    playbook = tmp_path / "pb.yml"
+    args = ("-e", "env=prod")
+    source, manifest = compile_playbook(
+        str(playbook), extra_vars={"env": "prod"}, tree_shake=True,
+    )
+    nodes = _task_nodes(_bundle_json(source)[0]["tasks"])
+    assert any(node.get("tasks_ref") for node in nodes)
+    assert manifest["tree_shake"]["removed_nodes"] == 0
+    assert _ansiroll(playbook, tmp_path, "--tree-shake", *args)[0] == ["RECURSIVE_LOOP"]
+
+
+def test_freeze_playbook_vars_follows_runtime_dependencies(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selected: initial
+    intermediate: "{{ selected }}"
+    rendered: "{{ intermediate }}"
+    collection: ["{{ rendered }}"]
+    scoped: outer
+    scoped_alias: "{{ scoped }}"
+    stable: constant
+  tasks:
+    - set_fact: {selected: updated}
+    - debug:
+        msg: "{{ collection[0] }} {{ stable }}"
+    - debug: msg=SCOPED
+      vars: {scoped: inner}
+"""})
+    playbook = tmp_path / "pb.yml"
+    _source, manifest = compile_playbook(str(playbook), freeze_playbook_vars=True)
+    info = manifest["tree_shake"]
+    assert info["frozen_var_names"] == ["stable"]
+    for name in ("intermediate", "rendered", "collection", "scoped_alias"):
+        assert info["skipped_playbook_vars"][name] == "depends on a runtime variable"
+        with pytest.raises(ValueError, match="depends on a runtime variable"):
+            compile_playbook(str(playbook), freeze_vars=[name])
+    expected = _ansible(playbook)
+    assert expected[0] == ["updated constant", "SCOPED"]
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll") == expected
+    assert _ansiroll(playbook, tmp_path, "--freeze-playbook-vars") == expected
 
 
 def test_frozen_vars_do_not_leak_or_conflict_across_plays(tmp_path):
@@ -708,6 +809,96 @@ def test_nested_include_filename_uses_role_invocation_vars(tmp_path):
     assert expected[0] == ["EXTRA"]
     assert _ansiroll(playbook, tmp_path, *args) == expected
     assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
+
+
+@pytest.mark.parametrize("writer, filename", [
+    ("set_fact: {selected: second.yml}", "{{ selected }}"),
+    ("command: printf second.yml\n  register: selected", "{{ alias }}"),
+])
+def test_runtime_include_filename_is_left_as_fallback(tmp_path, writer, filename):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selected: first.yml
+    intermediate: "{{ selected.stdout | default(selected) }}"
+    alias: "{{ intermediate }}"
+  tasks:
+    - include_tasks: writer.yml
+    - name: Select task file
+      include_tasks: "%s"
+""" % filename,
+        "writer.yml": "- " + writer + "\n",
+        "first.yml": "- debug: msg=STALE\n",
+        "second.yml": "- debug: msg=RUNTIME\n",
+        "extra.yml": "- debug: msg=EXTRA\n"})
+    playbook = tmp_path / "pb.yml"
+    assert _ansible(playbook)[0] == ["RUNTIME"]
+    source, manifest = compile_playbook(str(playbook))
+    assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
+    assert "STALE" not in json.dumps(_bundle_json(source))
+    # Dynamic include_tasks currently fail through the controller path. The
+    # compiled artifact must fail too, with neither execution choosing STALE.
+    strategy = _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=2)
+    standalone = _ansiroll(playbook, tmp_path, returncode=1)
+    assert "STALE" not in strategy[0] + standalone[0]
+    assert strategy[1][3] == standalone[1][3] == 1
+
+    args = ("-e", "selected=extra.yml")
+    expected = _ansible(playbook, *args)
+    assert expected[0] == ["EXTRA"]
+    assert compile_playbook(str(playbook), extra_vars={"selected": "extra.yml"})[1][
+        "fallback_tasks"] == []
+    assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
+    assert _ansiroll(playbook, tmp_path, *args) == expected
+
+
+@pytest.mark.parametrize("entry", ["config.yml", "[absent.yml, config.yml]"])
+def test_include_filename_uses_vars_files_before_play_vars(tmp_path, entry):
+    from ansible.release import __version__
+
+    major_minor = tuple(int(part) for part in __version__.split(".")[:2])
+    # Ansible started searching the vars/ subdirectory in 2.12.
+    config = "vars/config.yml" if major_minor >= (2, 12) else "config.yml"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selected: first.yml
+    alias: "{{ selected }}"
+  vars_files:
+    - %s
+  tasks:
+    - include_tasks: "{{ alias }}"
+""" % entry,
+        config: "selected: second.yml\n",
+        "first.yml": "- debug: msg=PLAY\n",
+        "second.yml": "- debug: msg=VARS_FILE\n",
+        "extra.yml": "- debug: msg=EXTRA\n"})
+    playbook = tmp_path / "pb.yml"
+    for args, marker in [((), "VARS_FILE"), (("-e", "selected=extra.yml"), "EXTRA")]:
+        expected = _ansible(playbook, *args)
+        assert expected[0] == [marker]
+        assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
+        assert _ansiroll(playbook, tmp_path, *args) == expected
+
+
+def test_include_filename_is_rechecked_after_discovering_nested_writes(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selected: first.yml
+  tasks:
+    - name: Select task file
+      include_tasks: "{{ selected }}"
+      when: false
+    - include_tasks: writer.yml
+""", "first.yml": "- debug: msg=STALE\n",
+        "writer.yml": "- set_fact: {selected: second.yml}\n"})
+    source, manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
+    assert "STALE" not in json.dumps(_bundle_json(source))
 
 
 def test_nested_include_filename_merges_extra_vars(tmp_path, monkeypatch):
