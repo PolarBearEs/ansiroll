@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -2406,6 +2407,31 @@ def test_strategy_reads_runtime_created_controller_source_losslessly(tmp_path):
 
     assert base64.b64decode(result["data"]) == source.read_bytes()
     assert result["meta"]["fullpath"] == str(source)
+
+
+@pytest.mark.parametrize("action", ["copy", "template"])
+def test_strategy_preserves_runtime_created_source_mode(tmp_path, action):
+    delegation = "      delegate_to: localhost" if action == "template" else ""
+    source = tmp_path / "runtime.txt"
+    destination = tmp_path / "result.txt"
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - copy:
+        content: fixture
+        dest: %s
+        mode: '0641'
+    - %s:
+        src: %s
+        dest: %s
+        mode: preserve
+%s
+""" % (source, action, source, destination, delegation)
+    result = _run_strategy_play(tmp_path, playbook)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert destination.read_text() == "fixture"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o641
 
 
 def test_strategy_does_not_create_an_empty_recap_row():
