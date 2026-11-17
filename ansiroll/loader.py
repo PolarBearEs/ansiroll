@@ -220,6 +220,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             name: os.environ[name] for name in sorted(names) if name in os.environ
         }
     config_names = _controller_config_names(result)
+    if core_version >= (2, 19):
+        config_names.add("DISPLAY_TRACEBACK")
     if config_names:
         try:
             result["controller_config"] = {
@@ -332,15 +334,22 @@ def _resolved_play_vars(play, all_vars, basedir):
     return out
 
 
-def _tag_untrusted(value):
+def _tag_untrusted(value, legacy=False):
     """Mark strings that are explicitly not trusted (for example `!unsafe`)."""
     try:
         from ansible._internal._datatag._tags import TrustedAsTemplate
     except ImportError:
-        return value
+        if not legacy:
+            return value
+
+        def untrusted(v):
+            return getattr(v, "__UNSAFE__", False)
+    else:
+        def untrusted(v):
+            return not TrustedAsTemplate.is_tagged_on(v)
 
     def walk(v):
-        if isinstance(v, str) and not TrustedAsTemplate.is_tagged_on(v):
+        if isinstance(v, str) and untrusted(v):
             return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
             return {k: walk(x) for k, x in v.items()}
@@ -847,7 +856,7 @@ def _handler_match(task):
         variables = task.get_variable_manager().get_vars(
             play=_play_of(task), task=task, include_hostvars=False)
         variables.pop("vars", None)  # rebuilt after applying invocation vars
-        match["handler_name_vars"] = _tag_untrusted(variables)
+        match["handler_name_vars"] = _tag_untrusted(variables, legacy=True)
     return match
 
 

@@ -386,6 +386,26 @@ def test_until_exhausted_registered_result(tmp_path, monkeypatch):
     assert msgs[0] == '"A 1 True %s"' % exception
 
 
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="captured task errors start in Core 2.19")
+@pytest.mark.parametrize("until", ["", "until: false"])
+def test_failed_command_exception_after_retry_exhaustion(tmp_path, monkeypatch, until):
+    monkeypatch.setenv("ANSIBLE_DISPLAY_TRACEBACK", "never")
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/false
+              %s
+              retries: 1
+              delay: 0
+              register: outcome
+              ignore_errors: true
+            - debug:
+                msg: "{{ outcome.attempts }} {{ outcome.failed }} {{ outcome.exception }}"
+        """ % until})
+    assert msgs == ['"1 True (traceback unavailable)"']
+
+
 def test_failed_task_facts_persist_after_rescue(tmp_path):
     msgs, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
@@ -432,6 +452,27 @@ def test_invalid_until_does_not_repeat_side_effects(tmp_path, monkeypatch, mode,
     assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"]
 
 
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="boolean results are required from Core 2.19")
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+def test_until_rejects_undefined_operand_with_broken_conditionals(tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "True")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - shell: echo attempt >> attempts
+              until: missing_condition ~ 'suffix'
+              delay: 0
+            - debug: msg=AFTER_UNTIL
+        """})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode != 0
+    assert "missing_condition" in output
+    assert "AFTER_UNTIL" not in output
+    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"]
+
+
 @pytest.mark.skipif(CORE_VERSION < (2, 19), reason="added in ansible-core 2.19")
 @pytest.mark.parametrize("source", ["env", "config"])
 def test_until_allows_broken_conditionals_without_config_lookup(tmp_path, monkeypatch, source):
@@ -451,6 +492,9 @@ def test_until_allows_broken_conditionals_without_config_lookup(tmp_path, monkey
               delay: 0
               register: exhausted
               ignore_errors: true
+            - shell: echo attempt >> attempts
+              until: ["", null, "   ", true]
+              delay: 0
             - debug: msg="EXHAUSTED {{ exhausted.attempts }} {{ exhausted.failed }}"
         """}
     monkeypatch.delenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", raising=False)
@@ -461,26 +505,29 @@ def test_until_allows_broken_conditionals_without_config_lookup(tmp_path, monkey
         monkeypatch.setenv("ANSIBLE_CONFIG", str(tmp_path / "ansible.cfg"))
     msgs, _ = check(tmp_path, files)
     assert msgs == ['"EXHAUSTED 1 True"']
-    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"] * 12
+    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"] * 15
 
 
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
 @pytest.mark.parametrize("loop", ["", "loop: [first, second]"])
-def test_invalid_notify_fails_before_dispatch(tmp_path, mode, loop):
+@pytest.mark.parametrize("notify", ["run {{ missing_notification }}", "{{ config.handler }}"])
+def test_invalid_notify_fails_before_dispatch(tmp_path, mode, loop, notify):
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
+          vars:
+            config: {handler: "run {{ missing_notification }}"}
           tasks:
             - shell: echo attempt >> attempts
               notify: "{{ missing_notification }}"
               when: false
             - shell: echo attempt >> attempts
-              notify: "run {{ missing_notification }}"
+              notify: "%s"
               %s
               changed_when: false
               ignore_errors: true
             - debug: msg=AFTER_NOTIFY
-        """ % loop})
+        """ % (notify, loop)})
     out = _run_mode(tmp_path, mode)
     output = out.stdout + out.stderr
     assert out.returncode == 0, output
@@ -597,16 +644,18 @@ def test_handler_name_uses_play_vars_without_host_facts(tmp_path, monkeypatch, m
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
-          vars: {suffix: play}
+          vars:
+            suffix: "{{ alias }}"
+            alias: play
           tasks:
             - set_fact: {suffix: fact, host_only: target}
             - debug: msg=trigger
               changed_when: true
-              notify: [run play, run target]
+              notify: [run PLAY, run TARGET]
           handlers:
-            - name: run {{ suffix }}
+            - name: run {{ suffix | upper }}
               debug: msg="play handler sees {{ suffix }}"
-            - name: run {{ host_only }}
+            - name: run {{ host_only | upper }}
               debug: msg=HOST_HANDLER_RAN
         """})
     out = _run_mode(tmp_path, mode)
@@ -617,7 +666,7 @@ def test_handler_name_uses_play_vars_without_host_facts(tmp_path, monkeypatch, m
         assert "HOST_HANDLER_RAN" not in output
         return
     assert out.returncode == 0, output
-    assert "The requested handler 'run target' was not found" in output
+    assert "The requested handler 'run TARGET' was not found" in output
     assert _summary(output)[0] == ['"trigger"', '"play handler sees fact"']
 
 

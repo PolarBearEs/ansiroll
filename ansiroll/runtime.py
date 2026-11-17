@@ -26,6 +26,7 @@ import time
 import hashlib
 import re
 import shlex
+from contextlib import contextmanager
 
 RESULT_MARKER = "__ANSIROLL_RESULT__"
 STATE_MARKER = "__ANSIROLL_STATE__"
@@ -722,6 +723,8 @@ def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
 
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
     if isinstance(value, str):
+        if getattr(rt, "_strict_var_resolution", False):
+            return rt.template(value, ctx, strict=True)
         return rt.template(value, ctx)
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_unsafe__"}:
         return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
@@ -777,6 +780,31 @@ class _LazyTplDict(dict):
         return not self.__eq__(other)
 
     __hash__ = None
+
+
+class _HandlerNameVars(_LazyTplDict):
+    """The host-independent vars available while matching a handler name."""
+
+    def __init__(self, raw, rt, ctx):
+        _LazyTplDict.__init__(self, raw, rt, ctx)
+        self._resolving = set()
+
+    def __getitem__(self, key):
+        if key in self._resolving:
+            return _captured("Recursive loop detected in handler name variable: %s" % key)
+        self._resolving.add(key)
+        try:
+            return _LazyTplDict.__getitem__(self, key)
+        finally:
+            self._resolving.remove(key)
+
+
+class _StrictTemplateContext(jinja2.runtime.Context):
+    def resolve_or_missing(self, key):
+        scope = self.parent.get("vars")
+        if key not in self.vars and isinstance(scope, _HandlerNameVars) and key in scope:
+            return scope[key]
+        return jinja2.runtime.Context.resolve_or_missing(self, key)
 
 
 class _LazyTplList(list):
@@ -952,6 +980,7 @@ class _Templater:
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
         self._strict_env = self.env.overlay(undefined=_StrictAnsirollUndefined)
+        self._strict_env.context_class = _StrictTemplateContext
 
     def _g_lookup(self, name, *a, **k):
         try:
@@ -1056,7 +1085,8 @@ class _Templater:
             return text
         if "{{" not in text and "{%" not in text:
             return text
-        self._current_ctx = ctx
+        scope = ctx.get("vars")
+        self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
         env = self._strict_env if strict else self.env
         template_key = (text, strict)
         stripped = text.strip()
@@ -1110,10 +1140,13 @@ class _Templater:
             )
         if isinstance(result, _UnsafeTemplate):
             return str(result)
-        # Resolve nested templates (a var whose value is itself a template), like
-        # Ansible -- re-render until stable; a self-referencing template is a
-        # recursion error (captured, so it fails where it is used).
+        if strict and isinstance(result, _UntrustedConditionValue):
+            return result
+        # Handler name variables resolve before interpolation. Their rendered
+        # output can contain template-looking text from untrusted data.
+        # Other callers still use recursive rendering for indirect variables.
         if (isinstance(result, str)
+                and not isinstance(scope, _HandlerNameVars)
                 and "{% raw" not in text and "{% endraw" not in text
                 and ("{{" in result or "{%" in result)
                 and not self._has_embedded_template_constant(text)):
@@ -1138,16 +1171,18 @@ class _Templater:
         self._embedded_constant_cache[text] = result
         return result
 
-    def evaluate(self, expr, ctx):
+    def evaluate(self, expr, ctx, strict=False):
         """Evaluate a single boolean-ish expression (used for when/changed_when)."""
         if isinstance(expr, bool):
             return expr
         expr = str(expr)
         self._current_ctx = ctx
-        compiled = self._expr_cache.get(expr)
+        expr_key = (expr, True) if strict else expr
+        compiled = self._expr_cache.get(expr_key)
         if compiled is None:
-            compiled = self.env.compile_expression(expr, undefined_to_none=False)
-            self._expr_cache[expr] = compiled
+            env = self._strict_env if strict else self.env
+            compiled = env.compile_expression(expr, undefined_to_none=False)
+            self._expr_cache[expr_key] = compiled
         return compiled(**ctx)
 
 
@@ -1308,6 +1343,7 @@ class Runtime:
         self._notified_handlers = set()  # indexes into self.handlers
         self._flushing = False
         self._allow_broken_conditionals = None
+        self._strict_var_resolution = False
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
         self.host = self.vars.get("inventory_hostname") or _hostname()
@@ -1404,8 +1440,20 @@ class Runtime:
                 out[k] = _lazy_container(v, self, base, dynamic)
         return out
 
+    @contextmanager
+    def _strict_vars(self):
+        previous = self._strict_var_resolution
+        self._strict_var_resolution = True
+        try:
+            yield
+        finally:
+            self._strict_var_resolution = previous
+
     def when(self, conds, ctx, strict=False, until=False):
+        modern_until = until and _core_at_least(2, 19)
         for cond in (conds or []):
+            if modern_until and self._empty_until(cond, ctx):
+                continue
             if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
                 raise UntrustedConditional(
                     "Encountered untrusted template or expression."
@@ -1444,7 +1492,9 @@ class Runtime:
                     raise UntrustedConditional(
                         "Encountered untrusted template or expression."
                     )
-                result = self.templater.render_string(cond, ctx)
+                result = self.templater.render_string(cond, ctx, strict=modern_until)
+                if modern_until and self._empty_until(result, ctx):
+                    continue
                 # Assert accepts an indirected list of expressions (for
                 # example `that: "{{ expression_list }}"`). Evaluate the
                 # resolved members as conditions rather than treating the
@@ -1463,7 +1513,7 @@ class Runtime:
                         raise UntrustedConditional(
                             "Encountered untrusted template or expression."
                         )
-                    result = self.templater.evaluate(result, ctx)
+                    result = self.templater.evaluate(result, ctx, strict=modern_until)
                 if strict and _is_undef(result):
                     raise RuntimeError(
                         "The conditional check %r failed: the expression is undefined" % cond)
@@ -1471,7 +1521,7 @@ class Runtime:
                     return False
                 continue
             try:
-                result = self.templater.evaluate(cond, ctx)
+                result = self.templater.evaluate(cond, ctx, strict=modern_until)
                 if strict and _is_undef(result):
                     raise RuntimeError(
                         "The conditional check %r failed: the expression is undefined" % cond)
@@ -1485,6 +1535,19 @@ class Runtime:
                 return False
         return True
 
+    def _broken_conditionals_allowed(self, ctx):
+        if self._allow_broken_conditionals is not None:
+            return self._allow_broken_conditionals
+        config = ctx.get("__ansiroll_controller_config") or {}
+        return _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False))
+
+    def _empty_until(self, value, ctx):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            if self._broken_conditionals_allowed(ctx):
+                return True
+            raise RuntimeError("Empty conditional expressions are not allowed.")
+        return False
+
     def _condition_truth(self, result, ctx, until=False):
         if isinstance(result, bool):
             return result
@@ -1494,11 +1557,7 @@ class Runtime:
                 "true", "false"):
             return _to_bool(result)
         if _core_at_least(2, 19 if until else 20) and not _is_undef(result):
-            allow_broken = self._allow_broken_conditionals
-            if allow_broken is None:
-                config = ctx.get("__ansiroll_controller_config") or {}
-                allow_broken = _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False))
-            if allow_broken:
+            if self._broken_conditionals_allowed(ctx):
                 return bool(result)
             raise RuntimeError(
                 "Conditional result was derived from value of type '%s'. "
@@ -2248,7 +2307,11 @@ class Runtime:
             # 2.16+: without `until` the default condition is `not failed`.
             if until:
                 try:
-                    done = self.when(until, eval_ctx, strict=True, until=True)
+                    if _core_at_least(2, 19):
+                        with self._strict_vars():
+                            done = self.when(until, eval_ctx, strict=True, until=True)
+                    else:
+                        done = self.when(until, eval_ctx, strict=True, until=True)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "An 'until' expression failed. %s" % ex}
@@ -2263,15 +2326,22 @@ class Runtime:
         # still decides `failed` (UnifiedTaskResult.failed).
         res["attempts"] = attempts - 1
         fw_result = res.get("failed_when_result")
-        if (_core_at_least(2, 21) and isinstance(fw_result, bool)
+        modern_result = _core_at_least(2, 21)
+        action_failed = res.get("failed")
+        if (modern_result and isinstance(fw_result, bool)
                 and task.get("failed_when") is not None):
             res["failed"] = fw_result
         else:
             res["failed"] = True
-            if _core_at_least(2, 19) and not _core_at_least(2, 21):
-                # Those releases normalize a failed result with no exception
-                # to an action failure, exposed as a traceback string.
+        if _core_at_least(2, 19) and (not modern_result or action_failed):
+            # Core projects the captured task error as a traceback string.
+            # From 2.21 exhaustion alone no longer creates a captured error.
+            config = ctx.get("__ansiroll_controller_config") or {}
+            modes = config.get("DISPLAY_TRACEBACK") or ()
+            if "always" in modes or ("error" in modes and "never" not in modes):
                 res.setdefault("exception", "(traceback unavailable)")
+            else:
+                res["exception"] = "(traceback unavailable)"
         return res
 
     def _exec_one(self, task, ctx, become=False, attempt=None):
@@ -2827,7 +2897,8 @@ class Runtime:
     def _notification_names(self, task, ctx):
         names = []
         for value in task.get("notify") or []:
-            rendered = _fail_on_undef(self.template(value, ctx, strict=True))
+            with self._strict_vars():
+                rendered = _fail_on_undef(self.template(value, ctx, strict=True))
             values = rendered if isinstance(rendered, list) else [rendered]
             names.extend(value for value in values if value != _OMIT)
         return names
@@ -2881,13 +2952,11 @@ class Runtime:
                 ctx = dict(handler.get("handler_name_vars") or {})
                 ctx.update(scope.get(_INCLUDE_PARAMS_KEY) or {})
                 ctx.update(self.extra_vars)
-                for key, value in ctx.items():
-                    if not isinstance(value, str):
-                        ctx[key] = _lazy_wrap(value, self, ctx)
-                ctx["vars"] = dict(ctx)
                 for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
                     ctx[key] = self.vars.get(key) or {}
-                values = [self.template(value, ctx, strict=True) for value in values]
+                ctx["vars"] = _HandlerNameVars(ctx, self, ctx)
+                with self._strict_vars():
+                    values = [self.template(value, ctx, strict=True) for value in values]
                 # Through 2.11 an undefined name aborts notification lookup.
                 if _core_at_least(2, 10) and not _core_at_least(2, 12):
                     try:
