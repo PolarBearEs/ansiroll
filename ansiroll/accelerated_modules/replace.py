@@ -3,11 +3,13 @@
 from __future__ import absolute_import
 
 import codecs
+import errno
 import io
 import os
 import re
-import stat
+import shutil
 import tempfile
+import time
 
 
 _PATH_KEYS = ("path", "dest", "destfile", "name")
@@ -83,6 +85,9 @@ def _section(contents, after, before):
 
 
 def _atomic_write(path, contents, encoding, original):
+    """Write like replace.write_changes + AnsibleModule.atomic_move: the
+    temporary file takes dest's owner and stat attributes when the caller may
+    set them (EPERM is ignored, as in atomic_move) and is renamed over dest."""
     directory = os.path.dirname(path) or "."
     descriptor, temporary = tempfile.mkstemp(prefix=".ansiroll-replace-", dir=directory)
     try:
@@ -91,14 +96,15 @@ def _atomic_write(path, contents, encoding, original):
                 descriptor, mode, encoding=None if mode == "wb" else encoding,
                 closefd=True) as output:
             output.write(contents)
-        os.chmod(temporary, stat.S_IMODE(original.st_mode))
-        if os.geteuid() == 0:
+        try:
             os.chown(temporary, original.st_uid, original.st_gid)
-        elif original.st_uid != os.geteuid():
-            os.unlink(temporary)
-            return False
-        os.replace(temporary, path)
-        return True
+            shutil.copystat(path, temporary)
+            now = time.time()
+            os.utime(temporary, (now, now))
+        except OSError as error:
+            if error.errno != errno.EPERM:
+                raise
+        os.rename(temporary, path)
     finally:
         try:
             os.unlink(temporary)

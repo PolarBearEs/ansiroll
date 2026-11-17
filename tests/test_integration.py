@@ -330,6 +330,50 @@ def test_accelerated_replace_matches_official_module_semantics(
     assert accelerated_path.read_bytes() == official_path.read_bytes()
 
 
+def test_accelerated_replace_writes_like_official_when_chown_is_denied(
+        tmp_path, monkeypatch):
+    """Non-root replacing a file it may not chown back (another owner, or a
+    group it is not in): atomic_move ignores EPERM and still writes."""
+    import errno as errno_module
+    from ansiroll.accelerated_modules import replace as replace_module
+
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "def _denied(*args, **kwargs):\n"
+        "    raise OSError(errno.EPERM, 'Operation not permitted')\n"
+        "os.chown = _denied\n"
+    )
+    official_path = tmp_path / "official"
+    accelerated_path = tmp_path / "accelerated"
+    for path in (official_path, accelerated_path):
+        path.write_text("old=1\n")
+        os.chmod(str(path), 0o644)
+    args = {"regexp": "^old=.*$", "replace": "new=2"}
+    monkeypatch.setenv("PYTHONPATH", str(hooks))
+    meta = ModuleEmbedder().embed("replace")
+    rt = Runtime({"replace": meta}, "", {"inventory_hostname": "localhost"})
+    try:
+        official = rt.run_module("replace", dict(args, path=str(official_path)))
+    finally:
+        rt.cleanup()
+    monkeypatch.delenv("PYTHONPATH")
+
+    def denied(*args, **kwargs):
+        raise OSError(errno_module.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(replace_module.os, "chown", denied)
+    accelerated = run_accelerated("replace", dict(args, path=str(accelerated_path)))
+
+    official.pop("invocation", None)
+    assert official["changed"] is True
+    assert accelerated == official
+    assert accelerated_path.read_bytes() == official_path.read_bytes() == b"new=2\n"
+    assert (oct(os.stat(str(accelerated_path)).st_mode & 0o7777)
+            == oct(os.stat(str(official_path)).st_mode & 0o7777))
+
+
 def test_accelerated_file_directory_matches_official_idempotence(tmp_path):
     official_path = tmp_path / "official"
     accelerated_path = tmp_path / "accelerated"
