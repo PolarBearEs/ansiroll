@@ -149,6 +149,7 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
   gather_facts: false
   vars:
     label: sample
+    __ansiroll_label: user-provided
     nested: {leaf: '{{ label }}'}
   tasks:
     - no_log: true
@@ -167,6 +168,8 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
           - one_host.msg.inventory_hostname == 'localhost'
           - all_vars.msg | type_debug == 'dict'
           - all_vars.msg.hostvars is defined
+          - all_vars.msg['__ansiroll_label'] == 'user-provided'
+          - "'__ansiroll_controller_config' not in all_vars.msg"
           - "%s"
           - all_vars.msg.nested.leaf == 'sample'
           - all_vars.msg.one_host.msg.inventory_hostname == 'localhost'

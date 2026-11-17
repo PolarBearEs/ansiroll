@@ -64,8 +64,9 @@ def _legacy_non_native(ctx):
 def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
-    snapshot = {key: value for key, value in ctx.items()
-                if key != "vars" and not str(key).startswith("__ansiroll")}
+    excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
+                "__ansiroll_search_dirs"}
+    snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
     return snapshot
