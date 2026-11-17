@@ -215,3 +215,11 @@ def test_to_yaml_preserves_shared_and_recursive_containers():
     loop = []
     loop.append(loop)
     assert _f_to_yaml(loop) == "&id001\n- *id001\n"
+
+
+def test_to_yaml_detects_recursion_through_lazy_containers():
+    from ansiroll.runtime import _LazyTplList
+
+    loop = []
+    loop.append(loop)
+    assert _f_to_yaml(_LazyTplList(loop, None, {})) == "&id001\n- *id001\n"

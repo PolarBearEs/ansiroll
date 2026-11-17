@@ -299,21 +299,24 @@ def _yaml_plain(v, memo=None):
         return "".join([v]) if type(v) is not str else v
     if not isinstance(v, (dict, list, tuple)):
         return v
-    if id(v) in memo:
-        return memo[id(v)][1]
+    # Lazy wrappers are rebuilt on every access; key them by the raw
+    # container they wrap so recursion through them is still detected.
+    key = id(getattr(v, "_raw", v))
+    if key in memo:
+        return memo[key][1]
     if isinstance(v, dict):
         out = {}
-        memo[id(v)] = (v, out)
+        memo[key] = (v, out)
         for k, x in v.items():
             out[_yaml_plain(k, memo)] = _yaml_plain(x, memo)
         return out
     if isinstance(v, list):
         out = []
-        memo[id(v)] = (v, out)
+        memo[key] = (v, out)
         out.extend(_yaml_plain(x, memo) for x in v)
         return out
     out = tuple(_yaml_plain(x, memo) for x in v)
-    memo[id(v)] = (v, out)
+    memo[key] = (v, out)
     return out
 
 
@@ -674,6 +677,7 @@ class _LazyTplDict(dict):
 
     def __init__(self, raw, rt, ctx, dynamic=False):
         dict.__init__(self, raw)
+        self._raw = raw
         self._rt = rt
         self._ctx = ctx
         self._dynamic = dynamic
@@ -719,6 +723,7 @@ class _LazyTplList(list):
 
     def __init__(self, raw, rt, ctx, dynamic=False):
         list.__init__(self, raw)
+        self._raw = raw
         self._rt = rt
         self._ctx = ctx
         self._dynamic = dynamic

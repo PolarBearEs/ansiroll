@@ -262,26 +262,26 @@ def test_fixed_variables_specialize_dynamic_accelerator_without_rewriting_args()
     assert task["args"] == {"path": "{{ root }}/{{ filename }}"}
 
 
-def test_generated_agent_yaml_filters_work_without_dunder_file(tmp_path):
-    # AGENT_BOOTSTRAP execs the source with only __name__ in its globals.
-    agent = tmp_path / "agent.py"
-    agent.write_text(_render_source([], {}, ""))
-    probe = (
-        "import sys; "
-        "src = open(sys.argv[1]).read(); "
-        "g = {'__name__': '__ansiroll_agent__'}; "
-        "exec(compile(src, '<ansiroll-agent>', 'exec'), g); "
-        "print(g['_f_from_yaml']('a: 1')); "
-        "print(g['_f_to_yaml']({'a': 1}), end='')"
+def test_generated_agent_yaml_filters_work_under_agent_bootstrap():
+    # Drive the real AGENT_BOOTSTRAP: it reads a length-prefixed source frame
+    # from stdin, execs it without __file__, then calls agent_main().
+    import struct
+    from ansiroll.runtime import AGENT_BOOTSTRAP
+
+    source = _render_source([], {}, "") + (
+        "\n\ndef agent_main():\n"
+        "    print(_f_from_yaml('a: 1'))\n"
+        "    print(_f_to_yaml({'a': 1}), end='')\n"
     )
+    payload = source.encode("utf-8")
     env = dict(os.environ)
     env["PYTHONPATH"] = ""
     proc = subprocess.run(
-        [sys.executable, "-S", "-c", probe, str(agent)],
+        [sys.executable, "-S", "-c", AGENT_BOOTSTRAP],
+        input=struct.pack(">I", len(payload)) + payload,
         capture_output=True,
-        text=True,
         env=env,
     )
 
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.splitlines() == ["{'a': 1}", "a: 1"]
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout.decode().splitlines() == ["{'a': 1}", "a: 1"]
