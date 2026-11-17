@@ -216,7 +216,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
     from ansible import constants as C
 
     config_names = _controller_config_names(result)
-    config_names.add("ALLOW_BROKEN_CONDITIONALS")
+    config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE"))
     controller_config = {}
     for name in sorted(config_names):
         try:

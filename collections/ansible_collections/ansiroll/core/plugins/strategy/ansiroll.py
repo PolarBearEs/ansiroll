@@ -648,9 +648,11 @@ class StrategyModule(StrategyBase):
             else:
                 self._add_group(host, result)
         # group_by can make new group_vars and group_names visible immediately
-        # to later tasks in the same play. Refresh only values that changed from
-        # the host snapshot shipped to the agent, preserving agent-side facts.
+        # to later tasks in the same play. Compare against the last snapshot
+        # sent to the agent, including trust that survives serialization.
         try:
+            from ansiroll.loader import _tag_untrusted
+
             updated = self._variable_manager.get_vars(host=host, play=self._cur_play)
             delta = {}
             nonpersistent = getattr(
@@ -660,13 +662,17 @@ class StrategyModule(StrategyBase):
                 if name in ("hostvars", "vars") or name in nonpersistent:
                     continue
                 try:
-                    changed = name not in hv or hv[name] != value
+                    changed = (name not in hv or hv[name] != value
+                               or _tag_untrusted(hv[name], template_syntax_only=True)
+                               != _tag_untrusted(value, template_syntax_only=True))
                 except Exception:
                     changed = name not in hv
                 if changed:
                     delta[name] = value
             if delta:
-                result["_ansiroll_vars"] = json.loads(_json_blob(delta))
+                refreshed = json.loads(_json_blob(delta))
+                result["_ansiroll_vars"] = refreshed
+                hv.update({name: delta[name] for name in refreshed})
         except Exception:
             pass
         return result

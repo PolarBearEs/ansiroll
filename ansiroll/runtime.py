@@ -26,6 +26,7 @@ import time
 import hashlib
 import re
 import shlex
+from numbers import Number
 
 RESULT_MARKER = "__ANSIROLL_RESULT__"
 STATE_MARKER = "__ANSIROLL_STATE__"
@@ -49,6 +50,16 @@ def _core_at_least(major, minor):
             return False
     match = re.match(r"^(\d+)\.(\d+)", str(version))
     return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
+
+
+def _legacy_templating():
+    return _core_at_least(2, 10) and not _core_at_least(2, 19)
+
+
+def _legacy_non_native(ctx):
+    config = ctx.get("__ansiroll_controller_config") or {}
+    return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
+
 
 # Persistent worker: one long-lived process per privilege level. It keeps each
 # module's decoded zip in RAM (decode-once) and forks a child per task -- the fork
@@ -630,7 +641,7 @@ _ANSIBLE_FILTERS = {
     "symmetric_difference": _f_symmetric_difference,
     "flatten": _f_flatten,
     "quote": _f_quote,
-    "type_debug": lambda v: _type_name(v),
+    "type_debug": lambda v: _type_debug(v),
     "basename": lambda v: os.path.basename(str(v)),
     "dirname": lambda v: os.path.dirname(str(v)),
     "expanduser": lambda v: os.path.expanduser(str(v)),
@@ -1007,6 +1018,13 @@ def _type_name(value):
     return type(value).__name__
 
 
+def _type_debug(value):
+    if (isinstance(value, (_UnsafeTemplate, _UntrustedConditionValue))
+            and _legacy_templating()):
+        return "AnsibleUnsafeText"
+    return _type_name(value)
+
+
 def _concretize(value):
     """Consume lazy iterators (selectattr/map/... results) so errors surface at
     template time, like Ansible's templar does."""
@@ -1319,6 +1337,13 @@ class _Templater:
             # A nested render (a lazily templated variable, a lookup term)
             # must not leave its context behind for the outer template.
             self._current_ctx = previous
+        if (isinstance(result, Number) and not isinstance(result, bool)
+                and _legacy_non_native(ctx)):
+            # Legacy non-native concatenation stringifies numbers unless the
+            # whole template names a variable whose raw value is a number.
+            single = re.match(r"^\{\{\s*(\w+)\s*\}\}$", text)
+            if single is None or not isinstance(ctx.get(single.group(1)), Number):
+                return str(result)
         if isinstance(result, _UntrustedConditionValue):
             return result
         if isinstance(result, str):
@@ -1625,7 +1650,8 @@ class Runtime:
     def template_vars(self, d, ctx, dynamic=False):
         """Template a vars mapping lazily: top-level strings render now (with
         sibling vars visible), but containers become lazy wrappers that render
-        values only on access (side-effect laziness, like Ansible 2.19).
+        values only on access. Legacy non-native templating also keeps scalar
+        sources so its raw single-variable type check sees the original value.
 
         Dynamic play vars may legitimately refer to variables that are only
         available to a later, tag-selected task.  Preserve those expressions
@@ -1636,8 +1662,9 @@ class Runtime:
         base = dict(ctx)
         base.update(d)
         out = {}
+        legacy = _legacy_non_native(base)
         for k, v in d.items():
-            if isinstance(v, str):
+            if isinstance(v, str) and not legacy:
                 try:
                     out[k] = self.templater.render_string(v, base)
                 except Exception:
@@ -1913,10 +1940,12 @@ class Runtime:
         self._runtime_var_overrides = (
             set(self.extra_vars) | set(self._set_fact_overrides)
         )
-        self._play_var_templates = {
-            key: value for key, value in (play.get("vars") or {}).items()
-            if isinstance(value, str) and ("{{" in value or "{%" in value)
-        }
+        self._play_var_templates = {}
+        if not _legacy_non_native(self.vars):
+            self._play_var_templates = {
+                key: value for key, value in (play.get("vars") or {}).items()
+                if _looks_templated(value)
+            }
         self.vars.update(self.template_vars(
             play.get("vars"), self.ctx(), dynamic=True))
         # Host variables created by set_fact have higher precedence than play
@@ -2352,8 +2381,22 @@ class Runtime:
         return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
     def _resolve_loop(self, loop, ctx):
-        # Loop items are data; Ansible never templates an item's value again.
-        return _mark_unsafe(self._resolve_loop_items(loop, ctx))
+        items = _mark_unsafe(self._resolve_loop_items(loop, ctx))
+        if not isinstance(loop, list) or not _legacy_templating():
+            return items
+        # Legacy core can template an inline item again when the task reads it.
+        # Limit this to output authored entirely as literals in the playbook,
+        # so values flowing from vars, lookups or filters stay data.
+        for i, source in enumerate(loop):
+            if type(source) is not str or type(items[i]) is not _UnsafeText:
+                continue
+            parsed = self.templater.env.parse(source)
+            if all(isinstance(node, jinja2.nodes.Output) and
+                   all(isinstance(part, (jinja2.nodes.Const, jinja2.nodes.TemplateData))
+                       for part in node.nodes)
+                   for node in parsed.body):
+                items[i] = str(items[i])
+        return items
 
     def _resolve_loop_items(self, loop, ctx):
         if isinstance(loop, dict) and "__ansiroll_lookup" in loop:

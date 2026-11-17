@@ -14,7 +14,12 @@ import pytest
 
 pytest.importorskip("ansible")
 
+from ansible.release import __version__  # noqa: E402
+from packaging.version import Version
+
 from ansiroll.compiler import compile_playbook  # noqa: E402
+
+MODERN_TEMPLATING = Version(__version__) >= Version("2.19")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RECAP_RE = re.compile(
@@ -108,7 +113,8 @@ def test_untrusted_data_is_not_templated_again(tmp_path):
     - debug: msg="{{ chain1 }}"
     - debug: msg="{{ nested_list | join(',') }}"
 """, {"data.txt": "{{ base }}"})
-    assert msgs[0] == "{{ base }}"
+    assert msgs[:5] == ["{{ base }}"] * 5
+    assert msgs[5] == ("{{ base }}" if MODERN_TEMPLATING else "BASE")
     assert msgs[-1] == "BASE,BASE-2"
 
 
@@ -277,7 +283,9 @@ def test_lazy_container_operations_resolve_nested_values_once(tmp_path):
         msg: "{{ [mapping | type_debug, items_ | type_debug] | join(',') }}"
 """)
     assert msgs[-1] == "dict,list"
-    assert msgs[0].endswith("/ 2 / 2")
+    encoded = '2' if MODERN_TEMPLATING else '"2"'
+    assert msgs[0] == '{"k": %s, "z": 1} / 2 / 2' % encoded
+    assert msgs[1].endswith("/ " + str(MODERN_TEMPLATING))
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
@@ -313,7 +321,7 @@ group_mapping: {k: !unsafe "{{ sentinel }}"}
         "{{ sentinel }}/{{ sentinel }}",
         "{{ sentinel }}",
         "{{ sentinel }}",
-        "{{ sentinel }}/str",
+        "{{ sentinel }}/" + ("str" if MODERN_TEMPLATING else "AnsibleUnsafeText"),
     ]
 
 
@@ -570,6 +578,34 @@ group_text: 'value={{ label }}'
 group_literal: !unsafe 'value={{ label }}'
 """}, use_strategy=True)
     assert msgs == ["value=rendered / value={{ label }}"]
+
+
+def test_group_by_refresh_detects_trust_changes_without_text_changes(tmp_path):
+    msgs, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {label: rendered}
+  tasks:
+    - debug: {msg: "{{ direct }} / {{ nested.values_[0] }}"}
+    - group_by: {key: added}
+    - debug: {msg: "{{ direct }} / {{ nested.values_[0] }}"}
+    - group_by: {key: restored}
+    - debug: {msg: "{{ direct }} / {{ nested.values_[0] }}"}
+""", {
+        "group_vars/all.yml": """
+direct: !unsafe '{{ label }}'
+nested: {values_: ['{{ label }}']}
+""",
+        "group_vars/added.yml": """
+direct: '{{ label }}'
+nested: {values_: [!unsafe '{{ label }}']}
+""",
+        "group_vars/restored.yml": """
+direct: !unsafe '{{ label }}'
+nested: {values_: ['{{ label }}']}
+""",
+    }, use_strategy=True)
+    assert msgs == ["{{ label }} / rendered", "rendered / {{ label }}", "{{ label }} / rendered"]
 
 
 def test_omit_ignore_errors_uses_core_keyword_default(tmp_path):
