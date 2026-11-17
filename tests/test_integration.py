@@ -325,7 +325,8 @@ def test_compiled_command_loop_restores_search_only_cwd(tmp_path):
     assert following["stdout"] == str(start)
 
 
-def test_compiled_command_falls_back_when_cwd_loses_search_permission(tmp_path):
+@pytest.mark.parametrize("action,chdir", [("command", None), ("command", 0), ("shell", False)])
+def test_compiled_command_falls_back_when_cwd_loses_search_permission(tmp_path, action, chdir):
     if os.geteuid() == 0:
         pytest.skip("root can search a directory without permissions")
     start = tmp_path / "start"
@@ -342,18 +343,20 @@ def test_compiled_command_falls_back_when_cwd_loses_search_permission(tmp_path):
         path: %s
         state: directory
         mode: "0000"
-    - command:
+    - %s:
         cmd: pwd
         chdir: %s
         creates: marker
-""" % (json.dumps(str(start)), json.dumps(str(target))))
+      ignore_errors: true
+""" % (json.dumps(str(start)), action,
+       json.dumps(str(target) if chdir is None else chdir)))
     script = tmp_path / "compiled.py"
     script.write_text(compile_playbook(str(playbook))[0])
     try:
         proc = subprocess.run(
             [sys.executable, str(script)], cwd=str(start),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_ACCELERATED_MODULES="command"),
+            env=dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_ACCELERATED_MODULES=action),
             universal_newlines=True,
         )
     finally:
@@ -363,8 +366,12 @@ def test_compiled_command_falls_back_when_cwd_loses_search_permission(tmp_path):
     result = [json.loads(line[len(prefix):])["result"] for line in proc.stdout.splitlines()
               if line.startswith(prefix)][-1]
     assert result["changed"] is False
-    assert result["rc"] == 0
-    assert "since marker exists" in result["stdout"]
+    if chdir is None:
+        assert result["rc"] == 0
+        assert "since marker exists" in result["stdout"]
+    else:
+        assert result["failed"] is True
+        assert result["msg"].startswith("Unable to change directory before execution")
 
 
 def test_accelerated_command_matches_legacy_warn_semantics():

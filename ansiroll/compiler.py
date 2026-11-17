@@ -515,7 +515,7 @@ def _accelerated_only_actions(plays, actions):
                         or node.get("fallback")
                         # The command guard cannot always restore the agent's cwd.
                         or (str(action).split(".")[-1] in ("command", "shell")
-                            and (node.get("args") or {}).get("chdir"))
+                            and (node.get("args") or {}).get("chdir") is not None)
                         or int(node.get("async_val") or 0)):
                     eligible.discard(action)
 
