@@ -150,21 +150,25 @@ def _make_rewriting_loader(DataLoader):
     return RewritingDataLoader()
 
 
+_TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+
+
 def _rewrite_includes(data):
     # In place: rebuilding the containers would drop the origin Ansible tags them with, which is what puts a task's
-    # own directory on its search path.
-    if isinstance(data, list):
-        for i, x in enumerate(data):
-            data[i] = _rewrite_includes(x)
-    elif isinstance(data, dict):
-        for k, v in list(data.items()):
-            data[k] = _rewrite_includes(v)
-        if "include" in data and isinstance(data.get("include"), str):
-            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
+    # own directory on its search path. Only task lists are touched, since vars files go through this loader too.
+    if not isinstance(data, list):
+        return data
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for k in _TASK_LIST_KEYS:
+            _rewrite_includes(item.get(k))
+        if "include" in item and isinstance(item.get("include"), str):
+            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            items = [(new_key if k == "include" else k, v) for k, v in data.items()]
-            data.clear()
-            data.update(items)
+            items = [(new_key if k == "include" else k, v) for k, v in item.items()]
+            item.clear()
+            item.update(items)
     return data
 
 
@@ -983,6 +987,7 @@ def _bake_search_tree(node, task, search_dirs, src):
     if ".." in prefix.split("/"):
         return False
     baked = {}
+    meta = {}
     skipped = []
     for i, base in enumerate(search_dirs):
         # Without a literal subdir to narrow it down, walking a whole role, task or playbook dir would bake the entire
@@ -1000,11 +1005,14 @@ def _bake_search_tree(node, task, search_dirs, src):
                 try:
                     with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
                         baked[rel] = fh.read()
+                    st = os.stat(full)
                 except OSError:
                     continue
+                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid}
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_meta"] = meta
     return True
 
 
