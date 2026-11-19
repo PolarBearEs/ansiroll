@@ -40,6 +40,7 @@ BAKED_ACTIONS = {
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
+_ROLE_PATH_RE = re.compile(r"{{\s*role_path\s*}}")
 _USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*\bplaybook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
@@ -150,20 +151,20 @@ def _make_rewriting_loader(DataLoader):
 
 
 def _rewrite_includes(data):
+    # In place: rebuilding the containers would drop the origin Ansible tags them with, which is what puts a task's
+    # own directory on its search path.
     if isinstance(data, list):
-        return [_rewrite_includes(x) for x in data]
-    if isinstance(data, dict):
+        for i, x in enumerate(data):
+            data[i] = _rewrite_includes(x)
+    elif isinstance(data, dict):
+        for k, v in list(data.items()):
+            data[k] = _rewrite_includes(v)
         if "include" in data and isinstance(data.get("include"), str):
             dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            rewritten = {}
-            for k, v in data.items():
-                if k == "include":
-                    rewritten[new_key] = v
-                else:
-                    rewritten[k] = _rewrite_includes(v)
-            return rewritten
-        return {k: _rewrite_includes(v) for k, v in data.items()}
+            items = [(new_key if k == "include" else k, v) for k, v in data.items()]
+            data.clear()
+            data.update(items)
     return data
 
 
@@ -920,6 +921,9 @@ def _bake_sources(node, task, basedir):
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
     src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
+    role_path = getattr(getattr(task, "_role", None), "_role_path", None)
+    if role_path:
+        src = _ROLE_PATH_RE.sub(lambda _m: role_path, src)
 
     candidates = []
     if _JINJA_RE.search(src):
@@ -927,11 +931,12 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        # A role tree is keyed relative to the role, so it can never match a src that renders to an absolute path.
-        elif not (os.path.isabs(src) or _USES_PLAYBOOK_DIR_RE.search(src)) and _bake_role_tree(node, task, subdir):
+        # Baked keys are relative to a search dir, so they can never match a src that renders to an absolute path,
+        # which a leading Jinja dir (e.g. "{{ some_dir }}/x") may well do.
+        elif (not (os.path.isabs(src) or _USES_PLAYBOOK_DIR_RE.search(src) or _starts_with_jinja_dir(src))
+              and _bake_search_tree(node, task, search_dirs, src)):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
-            # loop is a runtime var; bake the whole role tree so the runtime can
-            # resolve whichever file the rendered src points to.
+            # loop is a runtime var; bake every file it could resolve to.
             return
         else:
             node["fallback"] = True
@@ -960,31 +965,42 @@ def _bake_sources(node, task, basedir):
     node["_baked_meta"] = meta
 
 
-def _bake_role_tree(node, task, subdir):
-    """Bake every file under the role's templates/ (or files/) dir, keyed by path
-    relative to that dir, so a dynamic src like "services/{{ item.name }}.service.j2"
-    resolves at runtime. Returns True if anything was baked."""
-    role = getattr(task, "_role", None)
-    role_path = getattr(role, "_role_path", None) if role else None
-    if not role_path:
+def _starts_with_jinja_dir(src):
+    literal = _JINJA_RE.sub("", src)
+    return "/" in literal and "/" not in _literal_head(src)
+
+
+def _literal_head(src):
+    m = _JINJA_RE.search(src)
+    return src[:m.start()] if m else src
+
+
+def _bake_search_tree(node, task, search_dirs, src):
+    """Bake every file under the search dirs that a dynamic role src could resolve to, keyed by path relative to
+    its search dir (the first dir wins, as in _resolve_src). Returns True if anything was baked."""
+    if getattr(task, "_role", None) is None:
         return False
-    tree_dir = os.path.join(role_path, subdir)
-    if not os.path.isdir(tree_dir):
-        return False
+    prefix = _literal_head(src).rpartition("/")[0]
     baked = {}
-    for root, _dirs, files in os.walk(tree_dir):
-        for fn in files:
-            full = os.path.join(root, fn)
-            rel = os.path.relpath(full, tree_dir)
-            try:
-                with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                    baked[rel] = fh.read()
-            except OSError:
-                continue
+    for i, base in enumerate(search_dirs):
+        # Every third search dir is a whole role, task or playbook dir (see _search_dirs). Without a literal subdir to
+        # narrow it down, walking one would bake the entire playbook tree, so only templates/ and files/ are baked.
+        if not prefix and i % 3 == 2:
+            continue
+        for root, _dirs, files in os.walk(os.path.join(base, prefix)):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, base)
+                if rel in baked:
+                    continue
+                try:
+                    with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
+                        baked[rel] = fh.read()
+                except OSError:
+                    continue
     if not baked:
         return False
     node["_baked"] = baked
-    node["_baked_tree"] = subdir
     return True
 
 

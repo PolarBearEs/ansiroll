@@ -482,6 +482,66 @@ def test_dynamic_src_naming_playbook_dir_outside_jinja_bakes_role_tree(tmp_path)
     assert dest.read_text() == "value=2"
 
 
+def _role_template_task(tmp_path, src, files):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", dict({
+        "roles/a/tasks/main.yml": """
+- template:
+    src: %s
+    dest: %s
+""" % (json.dumps(src), json.dumps(str(dest))),
+        "roles/a/defaults/main.yml": "name: conf\nmy_abs_dir: %s\n" % json.dumps(str(tmp_path / "abs")),
+        "roles/a/templates/other.j2": "unused",
+    }, **files))
+    plays, _ = parse_playbook(str(playbook))
+    task = next(t for block in plays[0]["tasks"] for t in block.get("block", [])
+                if t.get("action", "").split(".")[-1] == "template")
+    return playbook, dest, task
+
+
+@pytest.mark.parametrize("src", ["{{ my_abs_dir }}/{{ name }}.j2", "{{ role_path }}/templates/{{ name }}.j2"])
+def test_dynamic_src_starting_with_a_jinja_dir_falls_back(tmp_path, src):
+    playbook, dest, task = _role_template_task(tmp_path, src, {
+        "abs/conf.j2": "value={{ 1 + 1 }}",
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    assert task["fallback"] is True
+    assert "_baked" not in task
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert dest.read_text() == "value=2"
+
+
+def test_role_path_src_is_resolved_at_compile_time(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ role_path }}/templates/conf.j2", {
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    assert not task.get("fallback")
+    _ansiroll(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+
+
+@pytest.mark.parametrize("src, path", [
+    ("{{ name }}.j2", "templates/conf.j2"),
+    ("sub/{{ name }}.j2", "sub/conf.j2"),
+    ("sub/{{ name }}.j2", "roles/a/tasks/sub/conf.j2"),
+])
+def test_dynamic_role_src_bakes_the_whole_search_path(tmp_path, src, path):
+    playbook, dest, task = _role_template_task(tmp_path, src, {path: "value={{ 1 + 1 }}"})
+    assert not task.get("fallback")
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == "value=2"
+
+
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
     _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
         "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
