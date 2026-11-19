@@ -16,6 +16,7 @@ pytest.importorskip("ansible")
 
 from ansiroll.cli import _load_extra_vars, main  # noqa: E402
 from ansiroll.compiler import compile_playbook  # noqa: E402
+from ansible.release import __version__ as ANSIBLE_VERSION  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RECAP_RE = re.compile(
@@ -1194,6 +1195,9 @@ def test_unresolved_vars_files_name_keeps_includes_named_by_extra_vars_or_litera
     assert manifest["fallback_tasks"] == []
 
 
+_CORE = tuple(int(part) for part in ANSIBLE_VERSION.split(".")[:2])
+
+
 def _run_both(playbook, tmp_path, *compile_args):
     """Return (returncode, output) of ansible-playbook and of the compiled script, for runs that may abort."""
     ansible = subprocess.run(
@@ -1213,7 +1217,8 @@ def _run_both(playbook, tmp_path, *compile_args):
     ("vars/{{ nope_undefined }}.yml", "true", True),
     ("vars/{{ nope_undefined }}.yml", "false", False),
     ("vars/{{ ansible_nope | default('a') + 1 }}.yml", "false", True),
-    ("vars/{{ ansible_system | lower }}-missing.yml", "true", False),
+    # Before 2.15 get_vars defaulted to include_delegate_to=True, which makes a missing vars file fatal.
+    ("vars/{{ ansible_system | lower }}-missing.yml", "true", _CORE < (2, 15)),
 ])
 def test_deferred_vars_files_abort_like_ansible(tmp_path, name, gather, aborts):
     _write(tmp_path, {"pb.yml": """

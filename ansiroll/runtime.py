@@ -2298,6 +2298,9 @@ class Runtime:
                         play_vars.update(value)
                     break
             else:
+                # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
+                if not _core_at_least(2, 15):
+                    raise VarsFilesError("vars file %s was not found" % (item,))
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
                 sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                  % (item,))
