@@ -491,6 +491,22 @@ def test_play_keywords_see_the_plays_own_playbook_dir(tmp_path):
     assert msgs == ["outer=False", "inner=True"]
 
 
+def test_playbook_dir_outranks_task_vars_and_set_fact(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="task={{ playbook_dir != '/other' }}"
+      vars: {playbook_dir: /other}
+    - set_fact: {playbook_dir: /other}
+    - debug: msg="fact={{ playbook_dir != '/other' }}"
+    - block:
+        - debug: msg="block={{ playbook_dir != '/other' }}"
+      vars: {playbook_dir: /other}
+""")
+    assert msgs == ["task=True", "fact=True", "block=True"]
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
