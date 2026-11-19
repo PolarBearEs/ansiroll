@@ -451,14 +451,30 @@ def _runtime_dependent(value, variables, env, _seen=None):
         parsed = env.parse(value)
     except Exception:
         return False
+    def depends(name):
+        if name in seen:
+            return False
+        seen.add(name)
+        return _runtime_dependent(variables[name], variables, env, seen)
+
+    for call in parsed.find_all(nodes.Call):
+        if not (isinstance(call.node, nodes.Name) and call.node.name in _CONTROLLER_GLOBALS
+                and call.args and isinstance(call.args[0], nodes.Const)
+                and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")):
+            continue
+        if call.dyn_args is not None:
+            return True
+        for arg in call.args[1:]:
+            if not isinstance(arg, nodes.Const) or not isinstance(arg.value, str):
+                return True
+            if arg.value in variables and depends(arg.value):
+                return True
     for node in parsed.find_all(nodes.Name):
         if node.ctx != "load":
             continue
         if node.name in variables:
-            if node.name not in seen:
-                seen.add(node.name)
-                if _runtime_dependent(variables[node.name], variables, env, seen):
-                    return True
+            if depends(node.name):
+                return True
         elif (node.name in env.globals and node.name not in _CONTROLLER_GLOBALS
               and node.name not in _DETERMINISTIC_GLOBALS):
             return True
@@ -509,11 +525,22 @@ def _condition_cache_key(condition):
     return None
 
 
+def _condition_source(condition):
+    if isinstance(condition, dict) and set(condition) == {"__ansiroll_trusted_condition__"}:
+        return condition["__ansiroll_trusted_condition__"]
+    return "{{ (%s) }}" % condition if isinstance(condition, str) else condition
+
+
 def _simplify_when(conditions, variables, templater, stats, cache, shadowed=frozenset()):
+    unmasked = variables
     if shadowed:
         variables = {k: v for k, v in variables.items() if k not in shadowed}
     remaining = []
     for condition in conditions or []:
+        # Masking a loop binding is not enough when another variable reads it, e.g. alias: "{{ env }}".
+        if shadowed and _depends_on_vars(_condition_source(condition), unmasked, shadowed.__contains__):
+            remaining.append(condition)
+            continue
         key = _condition_cache_key(condition)
         if key is not None:
             key = (key, tuple(sorted(shadowed)))

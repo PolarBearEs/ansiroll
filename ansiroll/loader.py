@@ -328,6 +328,7 @@ def _fact_schema():
 
 def _resolved_play_vars(play, all_vars, basedir):
     """Merge static vars_files at their play-var precedence."""
+    from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
     out = dict(play.vars or {})
@@ -349,7 +350,8 @@ def _resolved_play_vars(play, all_vars, basedir):
                     loaded = play._loader.load_from_file(path, trusted_as_template=True)
                 except TypeError:
                     loaded = play._loader.load_from_file(path)
-            except Exception:
+            except AnsibleFileNotFound:
+                # Like Ansible: only a missing file moves on to the next candidate.
                 continue
             for item in _as_list(loaded) or []:
                 if isinstance(item, dict):
@@ -965,15 +967,11 @@ def _template_include_filename(task, value, includes):
     from ansible.utils.vars import combine_vars
 
     role_defaults, role_vars = _role_vars(task)
-    variables = {}
-    variables.update(role_defaults)
-    variables.update(includes.play_vars)
-    variables.update(includes.all_vars or {})
-    variables.update(role_vars)
-    for scope in _include_scope(task):
-        variables.update(scope)
     extra_vars = task.get_variable_manager().extra_vars
-    variables = combine_vars(variables, extra_vars)
+    variables = {}
+    for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
+                  *_include_scope(task), extra_vars):
+        variables = combine_vars(variables, layer)
 
     loop_names = set()
     parent = task

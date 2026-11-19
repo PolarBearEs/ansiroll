@@ -33,7 +33,8 @@ def main(argv=None):
     pc.add_argument("--freeze-var", action="append", default=[], metavar="NAME",
                     help="freeze one named play/group variable (repeatable)")
     pc.add_argument("-e", "--extra-vars", action="append", default=[], metavar="VARS",
-                    help="fixed extra vars: key=value, JSON/YAML mapping, or @file")
+                    help="fixed extra vars, parsed like ansible-playbook -e: key=value, "
+                         "'{key: value}' (JSON/YAML starting with { or [), or @file")
 
     pr = sub.add_parser("run", help="Compile and run a playbook locally")
     pr.add_argument("playbook")

@@ -31,6 +31,7 @@ def _env():
     env["ANSIBLE_COLLECTIONS_PATH"] = os.path.join(ROOT, "collections")
     env["ANSIBLE_DEPRECATION_WARNINGS"] = "False"
     env["ANSIBLE_NOCOLOR"] = "1"
+    env["ANSIBLE_STDOUT_CALLBACK"] = "default"
     return env
 
 
@@ -1068,3 +1069,74 @@ def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         outputs.append(out.read_bytes())
     assert outputs[0] == outputs[1]
+
+
+def test_freeze_follows_vars_lookups_to_runtime_values(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    home: "{{ '~' | expanduser }}"
+    alias: "{{ lookup('vars', 'home') }}"
+  tasks:
+    - debug: msg="{{ alias }}"
+"""})
+    playbook = tmp_path / "pb.yml"
+    _source, manifest = compile_playbook(str(playbook), freeze_playbook_vars=True)
+    assert "alias" not in manifest["tree_shake"]["frozen_var_names"]
+    with pytest.raises(ValueError):
+        compile_playbook(str(playbook), freeze_vars=["alias"])
+
+
+def test_tree_shake_keeps_conditions_reading_loop_bindings_through_aliases(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg=ALIAS
+      loop: [dev]
+      loop_control: {loop_var: env}
+      when: alias == 'dev'
+"""})
+    playbook = tmp_path / "pb.yml"
+    extra = {"env": "prod", "alias": "{{ env | default('prod') }}"}
+    expected = _ansible(playbook, "-e", json.dumps(extra))
+    assert expected[0] == ["ALIAS"]
+    _source, manifest = compile_playbook(str(playbook), extra_vars=extra, tree_shake=True)
+    assert manifest["tree_shake"]["removed_nodes"] == 0
+    assert _ansiroll(playbook, tmp_path, "--tree-shake", "-e", json.dumps(extra)) == expected
+
+
+def test_vars_files_parse_error_does_not_try_next_candidate(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - [broken.yml, fallback.yml]
+  tasks:
+    - debug: msg=RAN
+""", "broken.yml": "key: [unclosed\n", "fallback.yml": "key: value\n",
+        "vars/broken.yml": "key: [unclosed\n", "vars/fallback.yml": "key: value\n"})
+    with pytest.raises(Exception, match="YAML parsing failed"):
+        compile_playbook(str(tmp_path / "pb.yml"))
+
+
+def test_include_filename_merges_role_defaults_and_play_vars(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selection: {other: value}
+  roles: [r]
+""", "roles/r/defaults/main.yml": "selection: {part: left}\n",
+        "roles/r/tasks/main.yml": '- include_tasks: "{{ selection.part }}.yml"\n',
+        "roles/r/tasks/left.yml": "- debug: msg=MERGED\n"})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook)
+    assert expected[0] == ["MERGED"]
+    assert compile_playbook(str(playbook))[1]["fallback_tasks"] == []
+    assert _ansiroll(playbook, tmp_path) == expected
