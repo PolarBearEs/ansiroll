@@ -430,6 +430,34 @@ def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
     assert dest.read_text() == "value=2"
 
 
+def test_imported_playbook_uses_its_own_playbook_dir(tmp_path):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- import_playbook: sub/inner.yml
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="{{ playbook_dir }}"
+""", {
+        "sub/inner.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="{{ playbook_dir }}"
+    - template:
+        src: "{{ playbook_dir }}/templates/t.j2"
+        dest: %s
+""" % json.dumps(str(dest)),
+        "sub/templates/t.j2": "inner={{ 1 + 1 }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == [str(tmp_path / "sub"), str(tmp_path)]
+    assert dest.read_text() == "inner=2"
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == "inner=2"
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost

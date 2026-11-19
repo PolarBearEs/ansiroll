@@ -124,7 +124,9 @@ def parse_playbook(path, vault_password_file=None):
     plays = []
     actions = set()
     for play in pb.get_plays():
-        node = _convert_play(play, actions, basedir)
+        # Like PlaybookExecutor: an imported playbook's plays use its own directory.
+        play_basedir = getattr(play, "_included_path", None) or basedir
+        node = _convert_play(play, actions, play_basedir)
         plays.append(node)
     return plays, actions
 
