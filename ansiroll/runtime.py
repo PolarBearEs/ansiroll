@@ -2069,17 +2069,17 @@ class Runtime:
             set(self.extra_vars) | set(self._set_fact_overrides)
         )
         self._play_var_templates = {}
-        self._rebindable_play_vars = {}
         if not _legacy_non_native(self.vars):
             self._play_var_templates = {
                 key: value for key, value in (play.get("vars") or {}).items()
                 if _looks_templated(value)
             }
-            # Containers render lazily against the play context, so they need rebinding too.
-            self._rebindable_play_vars = {
-                key: value for key, value in (play.get("vars") or {}).items()
-                if any(_looks_templated(text) for text in _template_strings(value))
-            }
+        # Containers render lazily against the play context, so they need rebinding in either mode; legacy
+        # non-native scalars stay raw and already render in the task context.
+        self._rebindable_play_vars = dict(self._play_var_templates)
+        self._rebindable_play_vars.update(
+            (key, value) for key, value in (play.get("vars") or {}).items()
+            if isinstance(value, (dict, list)) and any(_looks_templated(text) for text in _template_strings(value)))
         self.vars.update(self.template_vars(
             play.get("vars"), self.ctx(), dynamic=True))
         # Host variables created by set_fact have higher precedence than play
