@@ -1176,3 +1176,19 @@ def test_unresolved_vars_files_name_leaves_templated_include_to_runtime(tmp_path
 """, "old.yml": "- debug: msg=OLD\n"})
     _source, manifest = compile_playbook(str(tmp_path / "pb.yml"))
     assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
+
+
+def test_unresolved_vars_files_name_keeps_includes_named_by_extra_vars_or_literals(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ ansible_system | lower }}.yml"
+  tasks:
+    - name: From extra vars
+      include_tasks: "{{ flavor }}.yml"
+    - name: From a literal
+      include_tasks: "{{ 'x' }}.yml"
+""", "x.yml": "- debug: msg=X\n"})
+    _source, manifest = compile_playbook(str(tmp_path / "pb.yml"), extra_vars={"flavor": "x"})
+    assert manifest["fallback_tasks"] == []

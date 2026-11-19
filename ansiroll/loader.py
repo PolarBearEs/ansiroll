@@ -995,20 +995,28 @@ def _include_tasks_path(task, include_target, includes):
     return include_file
 
 
+_MAGIC_VAR_NAMES = frozenset((
+    "role_path", "role_name", "playbook_dir", "inventory_dir", "inventory_file", "inventory_hostname",
+    "groups", "hostvars", "ansible_play_hosts", "ansible_play_batch",
+))
+
+
 def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
-    if includes.incomplete:
-        return None
+    from ansible.vars.reserved import is_reserved_name
 
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
+    include_scope = _include_scope(task)
     variables = {}
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
-                  *_include_scope(task), extra_vars):
+                  *include_scope, extra_vars):
         variables = combine_vars(variables, layer)
+    # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
+    above_vars_files = set(role_vars).union(*include_scope)
 
     loop_names = set()
     parent = task
@@ -1022,6 +1030,9 @@ def _template_include_filename(task, value, includes):
 
     def is_runtime(name):
         if name in loop_names:
+            return True
+        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
+                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):
             return False
