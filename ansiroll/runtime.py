@@ -2327,18 +2327,26 @@ class Runtime:
                     stale.append(key)
                     grew = True
         pending = [key for key in stale if key in self._rebindable_play_vars]
+        rendered = []
         while pending:
-            # Render a play var only once the stale play vars it reads are rendered. One that can read any variable
-            # renders alone once no other is ready, first those a waiting play var reads; a cycle renders in key order.
+            # Render a play var only once the stale play vars it reads are rendered, and one that can read any
+            # variable once no other is ready; a cycle renders in key order.
             direct = [key for key in pending if refs[key] is not None]
-            indirect = [key for key in pending if refs[key] is None]
-            needed = [key for key in indirect if any(key in refs[other] for other in direct)]
             ready = ([key for key in direct if refs[key].isdisjoint(set(pending) - {key})]
-                     or (needed or indirect)[:1] or direct[:1])
+                     or [key for key in pending if refs[key] is None][:1] or direct[:1])
             for key in ready:
-                render_ctx = ctx if refs[key] is not None else dict(ctx, vars=_vars_snapshot(ctx))
-                ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
+                self._render_play_var(ctx, key, refs[key])
                 pending.remove(key)
+                rendered.append(key)
+        # What a play var reading vars, hostvars or a lookup depends on is unknown, so it may have read a stale value;
+        # each further pass settles one more such hop.
+        for _ in range(sum(1 for key in rendered if refs[key] is None)):
+            for key in rendered:
+                self._render_play_var(ctx, key, refs[key])
+
+    def _render_play_var(self, ctx, key, names):
+        render_ctx = ctx if names is not None else dict(ctx, vars=_vars_snapshot(ctx))
+        ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
 
     def _refresh_play_vars(self):
         """Re-evaluate lazy play vars against facts produced by earlier tasks."""

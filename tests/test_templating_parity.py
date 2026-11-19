@@ -1145,8 +1145,12 @@ def test_rebound_indirect_and_container_play_vars_follow_chains_declared_before_
     cfg: {name: "{{ alias }}"}
     alias: "{{ env }}"
     env: prod
+    a: "{{ a_ind }}"
+    a_ind: "{{ lookup('vars', 'b') }}"
+    b: "{{ b_ind }}"
+    b_ind: "{{ lookup('vars', 'env') }}"
   tasks:
-    - debug: msg="{{ indirect }} {{ cfg.name }} {{ via_indirect }} {{ outer }}"
+    - debug: msg="{{ indirect }} {{ cfg.name }} {{ via_indirect }} {{ outer }} {{ a }}"
       vars: {env: task}
 """)
-    assert msgs == ["task task task task"]
+    assert msgs == ["task task task task task"]
