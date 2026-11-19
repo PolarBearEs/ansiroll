@@ -9,7 +9,9 @@ inlined runtime can interpret. This module runs only at compile time.
 from __future__ import annotations
 
 import os
+import pkgutil
 import re
+from functools import lru_cache
 
 from .compat import init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
@@ -711,6 +713,16 @@ def _convert_task(task, actions, basedir):
         "notify": _as_list(task.notify),
         "special": _special_of(action),
     }
+    if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
+                                       "ansible.legacy.async_status"):
+        from ansible.plugins.loader import shell_loader
+
+        node["async_options"] = {
+            "version": _core_version(include_patch=True),
+            "dir": shell_loader.get("sh").get_option("async_dir"),
+        }
+        if node["async_val"] and node["poll"] == 0:
+            node["async_options"]["poll_before_timeout"] = _async_poll_before_timeout()
     accelerator = _classify_accelerator(action, node["args"], node.get("loop"))
     if accelerator:
         node["accelerator"] = accelerator
@@ -779,12 +791,26 @@ def _legacy_command_warn_supported():
         return False
 
 
+def _core_version(include_patch=False):
+    from ansible.release import __version__
+
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", __version__)
+    version = tuple(int(part or "0") for part in match.groups()) if match else (0, 0, 0)
+    return version if include_patch else version[:2]
+
+
+@lru_cache(maxsize=1)
+def _async_poll_before_timeout():
+    # The watchdog loop differs across patch releases (e.g. 2.20.0 and
+    # 2.20.11). Bake the installed wrapper's behavior into the agent.
+    source = pkgutil.get_data("ansible", "modules/async_wrapper.py")
+    return b"step = remaining / 2" in (source or b"")
+
+
 def _accelerator_options(action):
     name = str(action or "").split(".")[-1]
     try:
-        from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        version = tuple(map(int, match.groups())) if match else (0, 0)
+        version = _core_version()
         if name == "stat" and version >= (2, 21):
             return {"disk_usage_bytes": True}
         if name in ("command", "shell"):

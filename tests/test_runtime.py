@@ -931,7 +931,8 @@ def test_async_poll_zero_starts_without_sync_run(monkeypatch):
     task["special"] = None
     rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
 
-    def async_run(action, args, become=False):
+    def async_run(action, args, become=False, async_val=0, ctx=None, options=None):
+        assert async_val == 2000
         return {
             "changed": True,
             "ansible_job_id": "123.456",
@@ -1269,6 +1270,7 @@ def test_become_worker_authenticates_without_writing_password_to_protocol(monkey
 
     monkeypatch.setattr("ansiroll.runtime.subprocess.run", fake_run)
     monkeypatch.setattr("ansiroll.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("ansiroll.runtime._WorkerStderr", lambda proc: None)
     rt = Runtime(
         {}, "", {"inventory_hostname": "h"}, become_password="secret-password"
     )
@@ -1315,6 +1317,7 @@ def test_same_uid_become_uses_the_normal_worker(monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("ansiroll.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("ansiroll.runtime._WorkerStderr", lambda proc: None)
     monkeypatch.setattr(
         "ansiroll.runtime.subprocess.run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected sudo")),
