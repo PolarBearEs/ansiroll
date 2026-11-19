@@ -265,6 +265,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "tasks": tasks,
         "handlers": handlers,
     }
+    if unresolved_vars_files:
+        result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
     names = _controller_env_names(result)
     if names:
         result["controller_env"] = {
@@ -358,10 +360,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
                 if use_search_stack:
                     path = play._loader.path_dwim_relative_stack(
                         play.get_search_path(), "vars", filename)
-                try:
-                    loaded = play._loader.load_from_file(path, trusted_as_template=True)
-                except TypeError:
-                    loaded = play._loader.load_from_file(path)
+                loaded = _load_vars_file(play, path)
             except AnsibleFileNotFound:
                 # Like Ansible: only a missing file moves on to the next candidate.
                 continue
@@ -388,6 +387,55 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
             if key in all_vars:
                 out[key] = all_vars[key]
     return out
+
+
+def _load_vars_file(play, path):
+    try:
+        return play._loader.load_from_file(path, trusted_as_template=True)
+    except TypeError:
+        return play._loader.load_from_file(path)
+
+
+def _deferred_vars_files(play, basedir, entries):
+    """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
+
+    A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
+    in another directory level than the template's position.
+    """
+    import glob
+
+    if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
+        dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
+    else:
+        dirs, subdir = [basedir], None
+    dirs = [os.path.normpath(d) for d in dirs]
+    deferred = []
+    for entry in entries:
+        names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
+        files = {}
+        for name in names:
+            pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+            if name.startswith(os.path.sep):
+                patterns = [pattern]
+            else:
+                patterns = []
+                for d in dirs:
+                    if subdir and name.split("/")[0] != subdir:
+                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
+                    patterns.append(os.path.join(glob.escape(d), pattern))
+            for path in patterns:
+                for found in glob.glob(path):
+                    found = os.path.normpath(found)
+                    if found in files or not os.path.isfile(found):
+                        continue
+                    try:
+                        loaded = _load_vars_file(play, found)
+                    except Exception:
+                        # Only a selected file must parse; the runtime reports a candidate it cannot find.
+                        continue
+                    files[found] = _tag_untrusted([item for item in _as_list(loaded) if isinstance(item, dict)])
+        deferred.append({"names": names, "dirs": dirs, "subdir": subdir, "files": files})
+    return deferred
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars):

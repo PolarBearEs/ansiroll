@@ -1731,6 +1731,9 @@ class Runtime:
             include_vars = task.get("action", "").rsplit(".", 1)[-1] == "include_vars"
             self.vars[name] = _mark_unsafe(result, preserve_included_vars=include_vars)
             self._untrusted_runtime_vars.add(name)
+            # A registered result is a host fact: it outranks play vars here and in later plays.
+            self._runtime_var_overrides.add(name)
+            self._set_fact_overrides[name] = self.vars[name]
 
     def template(self, value, ctx, _seen=None):
         if isinstance(value, (dict, list, tuple)):
@@ -2068,20 +2071,21 @@ class Runtime:
         self._runtime_var_overrides = (
             set(self.extra_vars) | set(self._set_fact_overrides)
         )
+        play_vars = self._with_deferred_vars_files(play)
         self._play_var_templates = {}
         self._rebindable_play_vars = {}
         if not _legacy_non_native(self.vars):
             self._play_var_templates = {
-                key: value for key, value in (play.get("vars") or {}).items()
+                key: value for key, value in play_vars.items()
                 if _looks_templated(value)
             }
             # Containers render lazily against the play context, so they need rebinding too.
             self._rebindable_play_vars = {
-                key: value for key, value in (play.get("vars") or {}).items()
+                key: value for key, value in play_vars.items()
                 if any(_looks_templated(text) for text in _template_strings(value))
             }
         self.vars.update(self.template_vars(
-            play.get("vars"), self.ctx(), dynamic=True))
+            play_vars, self.ctx(), dynamic=True))
         # Host variables created by set_fact have higher precedence than play
         # vars and retain that precedence for later plays in the same run.
         self.vars.update(self._set_fact_overrides)
@@ -2240,6 +2244,40 @@ class Runtime:
             else:
                 raise failed_exc
 
+    def _with_deferred_vars_files(self, play):
+        """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
+        files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
+        play_vars = dict(play.get("vars") or {})
+        for entry in play.get("deferred_vars_files") or ():
+            ctx = self.ctx(play_vars, self.extra_vars)
+            for raw in entry["names"]:
+                try:
+                    name = _fail_on_undef(self.template(raw, ctx))
+                except Exception:
+                    sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
+                                     % (entry["names"],))
+                    break
+                if not isinstance(name, str):
+                    continue
+                if name.startswith(os.path.sep):
+                    candidates = [name]
+                else:
+                    candidates = []
+                    for d in entry["dirs"]:
+                        if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
+                            candidates.append(os.path.join(d, entry["subdir"], name))
+                        candidates.append(os.path.join(d, name))
+                found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
+                if found:
+                    for item in entry["files"][found[0]]:
+                        play_vars.update(item)
+                    break
+            else:
+                # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
+                sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
+                                 % (entry["names"],))
+        return play_vars
+
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < play/host/facts/registers
         # < role vars < block/parent overlay < task vars < loop item.
@@ -2249,12 +2287,14 @@ class Runtime:
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
-        task_vars = self.template_vars(task.get("vars"), ctx)
-        ctx.update(task_vars)
-        if task.get("role_magic"):
-            ctx.update(task["role_magic"])
-        self._rebind_play_vars(ctx, set(task.get("role_vars") or ()).union(
-            overlay, task_vars or (), task.get("role_magic") or ()))
+        raw_task_vars = task.get("vars") or {}
+        role_magic = task.get("role_magic") or {}
+        # Rebind before rendering task vars, which may read a rebound play var; the raw task vars stay visible so
+        # the rebound play vars can read them in turn, as with Ansible's lazy templating.
+        self._rebind_play_vars(ctx, set(task.get("role_vars") or ()).union(overlay, raw_task_vars, role_magic),
+                               dict(raw_task_vars, **role_magic))
+        ctx.update(self.template_vars(raw_task_vars, ctx))
+        ctx.update(role_magic)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -2296,10 +2336,10 @@ class Runtime:
             self._play_var_refs_cache = refs
         return refs[1]
 
-    def _rebind_play_vars(self, ctx, overrides):
+    def _rebind_play_vars(self, ctx, overrides, unrendered=None):
         """Ansible templates play vars lazily in the task's context, so a play var reading a name that task vars,
         role vars, include params or a loop binding override must see the overriding value. overrides holds the
-        names those higher layers set."""
+        names those higher layers set; unrendered holds raw layers visible only while rendering."""
         overrides = frozenset(overrides)
         if not overrides:
             return
@@ -2318,13 +2358,14 @@ class Runtime:
                     stale.append(key)
                     grew = True
         pending = list(stale)
+        view = dict(ctx, **unrendered) if unrendered else ctx
         while pending:
             # Render a play var only once the stale play vars it reads are rendered; a cycle renders in key order.
             ready = [key for key in pending
                      if refs[key] is None or refs[key].isdisjoint(set(pending) - {key})] or pending[:1]
             for key in ready:
-                render_ctx = ctx if refs[key] is not None else dict(ctx, vars=_vars_snapshot(ctx))
-                ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
+                render_ctx = view if refs[key] is not None else dict(view, vars=_vars_snapshot(view))
+                view[key] = ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
                 pending.remove(key)
 
     def _refresh_play_vars(self):
@@ -3937,6 +3978,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         "worker_startup": 0.0,
     }
     rt = None
+    fact_overrides = {}
     for play in plays:
         if pretty:
             banner = "PLAY [%s] " % (play.get("name") or play.get("hosts") or "")
@@ -3947,6 +3989,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      become_password=become_password, extra_vars=extra_vars,
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
+                     host_var_overrides=fact_overrides,
                      native_only=native_only)
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
@@ -3958,6 +4001,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
             rt.cleanup()  # shut the worker down
             engine_profile["worker_cleanup"] += time.monotonic() - cleanup_started
         host_vars = rt.vars  # carry facts/registers across plays for the same host
+        fact_overrides = rt._set_fact_overrides
         host = rt.host
         failed = failed or rt.failed
         for k in total:

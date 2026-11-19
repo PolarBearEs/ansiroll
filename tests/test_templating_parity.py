@@ -1132,3 +1132,58 @@ def test_rebound_play_vars_keep_loop_vars_order_explicit_overrides_and_indirect_
       vars: {env: dev, debug_mode: false}
 """)
     assert msgs == ["task-task task task", "a", "b", "debug=False"]
+
+
+def test_task_vars_read_rebound_play_vars(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    alias: "{{ env }}"
+    full: "{{ alias }}-{{ suffix }}"
+  tasks:
+    - debug: msg="{{ alias }} {{ label }} {{ full }}"
+      vars: {env: task, label: "{{ alias }}", suffix: "{{ label }}"}
+""")
+    assert msgs == ["task task task-task"]
+
+
+def test_registered_result_outranks_templated_play_var(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    out: "{{ env }}"
+  tasks:
+    - command: echo hi
+      register: out
+      changed_when: false
+    - debug: msg="{{ out.stdout }}"
+    - debug: msg="{{ out.stdout }}"
+      vars: {env: task}
+- hosts: localhost
+  gather_facts: false
+  vars:
+    out: literal
+  tasks:
+    - debug: msg="{{ out.stdout }}"
+""")
+    assert msgs == ["hi", "hi", "hi"]
+
+
+def test_vars_files_named_from_facts_load_at_runtime(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  vars:
+    from_play: play
+    os_name: play
+  vars_files:
+    - "vars/{{ ansible_system | lower }}.yml"
+    - ["missing-{{ ansible_system }}.yml", "fallback.yml"]
+  tasks:
+    - debug: msg="{{ os_name }} {{ derived }} {{ fb }}"
+""", {"vars/linux.yml": 'os_name: linux\nderived: "{{ from_play }}-{{ ansible_facts.system }}"\n',
+      "vars/darwin.yml": "os_name: darwin\nderived: darwin\n", "fallback.yml": "fb: fallback\n"})
+    assert msgs == ["linux play-Linux fallback"]
