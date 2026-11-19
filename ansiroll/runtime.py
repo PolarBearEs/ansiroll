@@ -2050,6 +2050,8 @@ class Runtime:
         # Extra-vars have the highest Ansible precedence; play vars must not
         # overwrite values injected via -e.
         self.vars.update(self.extra_vars)
+        if play.get("playbook_dir"):
+            self.vars["playbook_dir"] = play["playbook_dir"]
         try:
             self.run_nodes(play.get("tasks", []), {}, play.get("become", False))
         except TaskFailed as ex:

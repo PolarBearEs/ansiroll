@@ -39,6 +39,7 @@ BAKED_ACTIONS = {
 
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
+_PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
     r"""([A-Za-z_][A-Za-z0-9_]*)["']"""
@@ -207,6 +208,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None, a
         "become": bool(play.become),
         "become_user": getattr(play, "become_user", None),
         "vars": _tag_untrusted(_resolved_play_vars(play, all_vars, basedir)),
+        "playbook_dir": basedir,
         "tasks": tasks,
         "handlers": handlers,
     }
@@ -913,6 +915,9 @@ def _bake_sources(node, task, basedir):
 
     subdir = "templates" if node.get("action", "").split(".")[-1] == "template" else "files"
     search_dirs = _search_dirs(task, basedir, subdir)
+    # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
+    # same path, which then matches the baked key.
+    src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
 
     candidates = []
     if _JINJA_RE.search(src):

@@ -397,6 +397,39 @@ def test_fileglob_paths_are_baked_and_delivered_as_data(tmp_path):
     assert dest.read_text() == "fixture"
 
 
+def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/roles/b/templates/conf.j2"
+    dest: %s
+- debug: msg="{{ playbook_dir }}"
+""" % json.dumps(str(dest)),
+        "roles/a/templates/own.j2": "unrelated",
+        "roles/b/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == [str(tmp_path)]
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    src, _ = compile_playbook(str(playbook))
+    # The target has no controller tree, so the template must come from the artifact.
+    (tmp_path / "roles/b/templates/conf.j2").unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert dest.read_text() == "value=2"
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
