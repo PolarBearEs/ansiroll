@@ -430,6 +430,15 @@ def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
     assert dest.read_text() == "value=2"
 
 
+def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
+    _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
+        "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
+    })
+    monkeypatch.chdir(tmp_path)
+    plays, _ = parse_playbook("play.yml")
+    assert plays[0]["playbook_dir"] == str(tmp_path / "sub")
+
+
 def test_imported_playbook_uses_its_own_playbook_dir(tmp_path):
     dest = tmp_path / "rendered.txt"
     playbook = _write(tmp_path, """
