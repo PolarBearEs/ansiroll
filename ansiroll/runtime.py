@@ -66,7 +66,7 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs"}
+                "__ansiroll_search_dirs", "__ansiroll_rebound_play_vars"}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -2229,6 +2229,7 @@ class Runtime:
         ctx.update(self.template_vars(task.get("vars"), ctx))
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
+        self._rebind_play_vars(ctx)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -2242,13 +2243,57 @@ class Runtime:
         current = dict(hostvars.get(self.host) or {})
         current.update({
             key: value for key, value in ctx.items()
-            if key not in ("hostvars", "vars")
+            if key not in ("hostvars", "vars", "__ansiroll_rebound_play_vars")
         })
         hostvars[self.host] = current
         ctx["hostvars"] = hostvars
         if "vars" not in ctx:
             ctx["vars"] = _vars_snapshot(ctx)
         return ctx
+
+    def _play_var_refs(self):
+        refs = getattr(self, "_play_var_refs_cache", None)
+        if refs is None or refs[0] is not self._play_var_templates:
+            from jinja2 import meta as jinja_meta
+            names = {}
+            for key, raw in self._play_var_templates.items():
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    names[key] = jinja_meta.find_undeclared_variables(self.templater.env.parse(raw))
+                except Exception:
+                    continue
+            refs = (self._play_var_templates, names)
+            self._play_var_refs_cache = refs
+        return refs[1]
+
+    def _rebind_play_vars(self, ctx):
+        """Ansible templates play vars lazily in the task's context, so a play var reading a name that task vars,
+        role vars, include params or a loop binding override must see the overriding value."""
+        if not self._play_var_templates:
+            return
+        refs = self._play_var_refs()
+        earlier = ctx.get("__ansiroll_rebound_play_vars") or frozenset()
+        rebound = set()
+        for _ in range(3):
+            progress = False
+            for key, names in refs.items():
+                if key in rebound or key in self._runtime_var_overrides:
+                    continue
+                if (key not in earlier and key in ctx and key in self.vars
+                        and ctx[key] is not self.vars[key]):
+                    continue  # a higher layer set the play var itself
+                if not any(name in rebound or (name in ctx and (name not in self.vars
+                                                               or ctx[name] is not self.vars[name]))
+                           for name in names):
+                    continue
+                ctx[key] = self.templater.render_string(self._play_var_templates[key], ctx)
+                rebound.add(key)
+                progress = True
+            if not progress:
+                break
+        if rebound:
+            ctx["__ansiroll_rebound_play_vars"] = frozenset(rebound) | earlier
 
     def _refresh_play_vars(self):
         """Re-evaluate lazy play vars against facts produced by earlier tasks."""
@@ -2446,6 +2491,7 @@ class Runtime:
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
             ctx.update(self._loop_item_vars(task, items, i, base_ctx))
+            self._rebind_play_vars(ctx)
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
             res, ignore = self._task_gate(task, ctx)

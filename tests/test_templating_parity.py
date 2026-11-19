@@ -1073,3 +1073,37 @@ def test_mapping_keys_stay_literal(tmp_path):
         msg: "{{ mapping.keys() | list | sort | join(',') }}"
 """)
     assert msgs == ["{{ label }},{{ label }}-literal"]
+
+
+def test_play_vars_see_task_vars_include_params_and_loop_bindings(tmp_path):
+    msgs, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    alias: "{{ env }}"
+    chained: "{{ alias }}-x"
+  tasks:
+    - debug: msg="{{ alias }} {{ chained }}"
+    - debug: msg="{{ alias }} {{ chained }}"
+      vars: {env: task}
+    - debug: msg="{{ alias }} {{ chained }}"
+      loop: [loop]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }} {{ chained }}"
+      vars: {env: task}
+      loop: [a]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }}"
+      vars: {alias: own}
+      loop: [b]
+      loop_control: {loop_var: env}
+    - include_tasks: inc.yml
+      vars: {env: param}
+    - include_tasks: inc.yml
+      loop: [incloop]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }} {{ chained }}"
+""", {"inc.yml": '- debug: msg="{{ alias }} {{ chained }}"\n'})
+    assert msgs == ["prod prod-x", "task task-x", "loop loop-x", "a a-x", "own",
+                    "param param-x", "incloop incloop-x", "prod prod-x"]
