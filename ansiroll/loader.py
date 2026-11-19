@@ -194,7 +194,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             basedir = play._loader.get_basedir()
         except Exception:
             basedir = os.getcwd()
-    play_vars = _resolved_play_vars(play, all_vars, basedir)
+    unresolved_vars_files = []
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -208,6 +209,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.incomplete = bool(unresolved_vars_files)
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -326,8 +328,12 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir):
-    """Merge static vars_files at their play-var precedence."""
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
+    """Merge static vars_files at their play-var precedence.
+
+    Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
+    appended to ``unresolved``.
+    """
     from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
@@ -337,9 +343,15 @@ def _resolved_play_vars(play, all_vars, basedir):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
+            raw = filename
             filename = re.sub(r"{{\s*playbook_dir\s*}}", basedir, filename)
             if _is_templated(filename):
-                break
+                # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
+                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
+                if filename is None:
+                    if unresolved is not None:
+                        unresolved.append(entry)
+                    break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
                 path = filename
@@ -376,6 +388,26 @@ def _resolved_play_vars(play, all_vars, basedir):
             if key in all_vars:
                 out[key] = all_vars[key]
     return out
+
+
+def _template_vars_file_name(play, filename, play_vars, all_vars):
+    from ansible.utils.vars import combine_vars
+
+    variables = combine_vars(play_vars, all_vars or {})
+    variables = combine_vars(variables, play.get_variable_manager().extra_vars)
+    try:
+        from ansible.template import Templar
+        try:
+            templar = Templar(loader=play._loader, variables=variables)
+        except TypeError:
+            templar = Templar(loader=play._loader)
+            templar.available_variables = variables
+        rendered = templar.template(filename, fail_on_undefined=True)
+    except Exception:
+        return None
+    if not isinstance(rendered, str) or _is_templated(rendered):
+        return None
+    return rendered
 
 
 def _tag_untrusted(value, template_syntax_only=False):
@@ -680,6 +712,8 @@ class _IncludeVariables:
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
         self.resolved_template = False
+        # A vars file whose name is only known at runtime may redefine any play var.
+        self.incomplete = False
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -965,6 +999,9 @@ def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
+
+    if includes.incomplete:
+        return None
 
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars

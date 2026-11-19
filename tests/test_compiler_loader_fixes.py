@@ -1140,3 +1140,37 @@ def test_include_filename_merges_role_defaults_and_play_vars(tmp_path, monkeypat
     assert expected[0] == ["MERGED"]
     assert compile_playbook(str(playbook))[1]["fallback_tasks"] == []
     assert _ansiroll(playbook, tmp_path) == expected
+
+
+def test_vars_files_name_from_extra_vars_selects_include(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    selected: old.yml
+  vars_files:
+    - "{{ config_file }}"
+  tasks:
+    - include_tasks: "{{ selected }}"
+""", "selection.yml": "selected: new.yml\n", "vars/selection.yml": "selected: new.yml\n",
+        "old.yml": "- debug: msg=OLD\n", "new.yml": "- debug: msg=NEW\n"})
+    playbook = tmp_path / "pb.yml"
+    args = ("-e", "config_file=selection.yml")
+    expected = _ansible(playbook, *args)
+    assert expected[0] == ["NEW"]
+    assert _ansiroll(playbook, tmp_path, *args) == expected
+
+
+def test_unresolved_vars_files_name_leaves_templated_include_to_runtime(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  vars:
+    selected: old.yml
+  vars_files:
+    - "{{ ansible_system | lower }}.yml"
+  tasks:
+    - name: Select task file
+      include_tasks: "{{ selected }}"
+""", "old.yml": "- debug: msg=OLD\n"})
+    _source, manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
