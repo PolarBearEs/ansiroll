@@ -1203,3 +1203,44 @@ def test_vars_files_named_from_facts_load_at_runtime(tmp_path):
 """, {"vars/linux.yml": 'os_name: linux\nderived: "{{ from_play }}-{{ ansible_facts.system }}"\n',
       "vars/darwin.yml": "os_name: darwin\nderived: darwin\n", "fallback.yml": "fb: fallback\n"})
     assert msgs == ["linux play-Linux fallback"]
+
+
+def test_rebound_play_vars_render_in_order_through_raw_task_vars(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    x: "{{ label }}"
+    alias: "{{ env }}"
+  tasks:
+    - debug: msg="{{ x }}"
+      vars: {env: task, label: "{{ alias }}"}
+""")
+    assert msgs == ["task"]
+
+
+def test_vars_files_names_ignore_set_fact_and_register_from_earlier_plays(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact: {tier: sf}
+    - command: echo hi
+      register: reg
+      changed_when: false
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "vars/{{ reg.stdout }}.yml"
+  tasks:
+    - debug: msg="{{ pick | default('none') }}"
+- hosts: localhost
+  vars:
+    tier: pv
+  vars_files:
+    - "vars/{{ tier }}{{ ansible_system[:0] }}.yml"
+  tasks:
+    - debug: msg="{{ pick }} {{ tier }}"
+""", {"vars/sf.yml": "pick: from_set_fact\n", "vars/pv.yml": "pick: from_play\n", "vars/hi.yml": "pick: from_reg\n"})
+    assert msgs == ["none", "from_play sf"]

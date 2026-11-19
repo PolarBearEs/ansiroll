@@ -109,6 +109,13 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
     """Parse, embed modules, and return (source_text, manifest_dict)."""
     plays, actions = parse_playbook(playbook_path, vault_password_file=vault_password_file,
                                    extra_vars=extra_vars)
+    for play in plays:
+        for entry in play.get("deferred_vars_files") or ():
+            if entry.get("unmodeled"):
+                raise ValueError(
+                    "ansiroll: vars_files name %r starts with a template that is only known at run time, so its "
+                    "files cannot be bundled; make it resolvable at compile time (e.g. with -e)"
+                    % entry["unmodeled"][0])
     group_vars = load_adjacent_group_vars(playbook_path,
                                           vault_password_file=vault_password_file)
     frozen_vars, freeze_info = _resolve_frozen_vars(
@@ -254,6 +261,11 @@ def _shadowed_var_names(plays):
     for play in plays:
         walk(play.get("tasks"))
         walk(play.get("handlers"))
+        for entry in play.get("deferred_vars_files") or ():
+            for data in entry["files"].values():
+                if isinstance(data, list):
+                    for item in data:
+                        names.update(item)
     return names
 
 
@@ -287,11 +299,11 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
         if is_shadowed(name):
             if explicit:
                 raise ValueError(
-                    "ansiroll: cannot freeze %r because a task, block, role, "
-                    "set_fact, include_vars, register or loop variable shadows it" % name
+                    "ansiroll: cannot freeze %r because a task, block, role, set_fact, "
+                    "include_vars, register, loop variable or run-time vars_files shadows it" % name
                 )
             skipped[name] = (
-                "shadowed by task/block/role vars, set_fact, include_vars, register or loop var"
+                "shadowed by task/block/role vars, set_fact, include_vars, register, loop var or run-time vars_files"
             )
             continue
         values = []
