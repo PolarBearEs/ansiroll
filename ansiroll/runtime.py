@@ -2391,18 +2391,27 @@ class Runtime:
         pending = [key for key in stale if key in self._rebindable_play_vars]
         view = dict(ctx, **unrendered) if unrendered else ctx
         order = self._refs_through(refs, unrendered) if unrendered and pending else refs
+        rendered = []
         while pending:
-            # Render a play var only once the stale play vars it reads are rendered. One that can read any variable
-            # renders alone once no other is ready, first those a waiting play var reads; a cycle renders in key order.
+            # Render a play var only once the stale play vars it reads are rendered, and one that can read any
+            # variable once no other is ready; a cycle renders in key order.
             direct = [key for key in pending if order[key] is not None]
-            indirect = [key for key in pending if order[key] is None]
-            needed = [key for key in indirect if any(key in order[other] for other in direct)]
             ready = ([key for key in direct if order[key].isdisjoint(set(pending) - {key})]
-                     or (needed or indirect)[:1] or direct[:1])
+                     or [key for key in pending if order[key] is None][:1] or direct[:1])
             for key in ready:
-                render_ctx = view if refs[key] is not None else dict(view, vars=_vars_snapshot(view))
-                view[key] = ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
+                self._render_play_var(ctx, view, key, refs[key])
                 pending.remove(key)
+                rendered.append(key)
+        # What a play var reading vars, hostvars or a lookup depends on is unknown, so it may have read a stale value;
+        # each further pass settles one more such hop.
+        for _ in range(sum(1 for key in rendered if order[key] is None)):
+            for key in rendered:
+                self._render_play_var(ctx, view, key, refs[key])
+
+    def _render_play_var(self, ctx, view, key, names):
+        """view is ctx plus the raw task vars a play var may read before they are rendered."""
+        render_ctx = view if names is not None else dict(view, vars=_vars_snapshot(view))
+        view[key] = ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
 
     def _refs_through(self, refs, unrendered):
         """refs extended with what the raw unrendered vars they read go on to read, transitively."""
