@@ -982,10 +982,10 @@ def _bake_search_tree(node, task, search_dirs, src):
         return False
     prefix = _literal_head(src).rpartition("/")[0]
     baked = {}
-    for i, base in enumerate(search_dirs):
-        # Every third search dir is a whole role, task or playbook dir (see _search_dirs). Without a literal subdir to
-        # narrow it down, walking one would bake the entire playbook tree, so only templates/ and files/ are baked.
-        if not prefix and i % 3 == 2:
+    for base in search_dirs:
+        # Without a literal subdir to narrow it down, walking a whole role, task or playbook dir would bake the entire
+        # playbook tree, so only templates/ and files/ are baked.
+        if not prefix and os.path.basename(base) not in ("templates", "files"):
             continue
         for root, _dirs, files in os.walk(os.path.join(base, prefix)):
             for fn in files:
