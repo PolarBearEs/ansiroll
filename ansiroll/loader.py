@@ -283,9 +283,7 @@ def _resolved_play_vars(play, all_vars, basedir):
     for entry in (_as_list(getattr(play, "vars_files", None)) or []):
         if not isinstance(entry, str):
             continue
-        entry = re.sub(
-            r"{{\s*playbook_dir\s*}}", basedir, entry
-        )
+        entry = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, entry)
         if "{{" in entry or "{%" in entry:
             continue
         path = entry if os.path.isabs(entry) else os.path.join(basedir, entry)
@@ -927,7 +925,8 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        elif _bake_role_tree(node, task, subdir):
+        # A role tree is keyed relative to the role, so it can never match a src that renders to an absolute path.
+        elif not (os.path.isabs(src) or "playbook_dir" in src) and _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
             # loop is a runtime var; bake the whole role tree so the runtime can
             # resolve whichever file the rendered src points to.

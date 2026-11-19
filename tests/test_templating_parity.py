@@ -430,6 +430,34 @@ def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
     assert dest.read_text() == "value=2"
 
 
+def test_playbook_dir_src_with_other_jinja_falls_back(tmp_path):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/roles/b/templates/{{ name }}.j2"
+    dest: %s
+""" % json.dumps(str(dest)),
+        "roles/a/defaults/main.yml": "name: conf\n",
+        "roles/a/templates/conf.j2": "wrong role",
+        "roles/b/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    plays, _ = parse_playbook(str(playbook))
+    task = next(t for block in plays[0]["tasks"] for t in block.get("block", [])
+                if t.get("action", "").split(".")[-1] == "template")
+    assert task["fallback"] is True
+    assert "_baked" not in task
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert dest.read_text() == "value=2"
+
+
 def test_imported_playbook_uses_its_own_playbook_dir(tmp_path):
     dest = tmp_path / "rendered.txt"
     playbook = _write(tmp_path, """
