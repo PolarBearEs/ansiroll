@@ -2002,6 +2002,8 @@ class Runtime:
     # ---- execution -------------------------------------------------------
     def run_play(self, play, defer_handlers=False, initial_notified=None):
         invocation_check_mode = self.check_mode
+        if play.get("playbook_dir"):
+            self.vars["playbook_dir"] = play["playbook_dir"]
         play_check_mode = play.get("check_mode")
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):

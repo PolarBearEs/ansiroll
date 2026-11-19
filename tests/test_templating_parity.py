@@ -467,6 +467,30 @@ def test_imported_playbook_uses_its_own_playbook_dir(tmp_path):
     assert dest.read_text() == "inner=2"
 
 
+def test_play_keywords_see_the_plays_own_playbook_dir(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  check_mode: "{{ playbook_dir.endswith('/sub') }}"
+  tasks:
+    - command: "true"
+      register: outer
+    - debug: msg="outer={{ outer.skipped | default(false) }}"
+- import_playbook: sub/inner.yml
+""", {
+        "sub/inner.yml": """
+- hosts: localhost
+  gather_facts: false
+  check_mode: "{{ playbook_dir.endswith('/sub') }}"
+  tasks:
+    - command: "true"
+      register: inner
+    - debug: msg="inner={{ inner.skipped | default(false) }}"
+""",
+    })
+    assert msgs == ["outer=False", "inner=True"]
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
