@@ -76,6 +76,7 @@ if __name__ == "__main__":
     _pretty = os.environ.get("ANSIROLL_RAW", "").lower() not in ("1", "true", "yes")
     _profile = os.environ.get("ANSIROLL_PROFILE", "").lower() in ("1", "true", "yes", "on")
     _native_only = os.environ.get("ANSIROLL_NATIVE_ONLY", "").lower() in ("1", "true", "yes", "on")
+    _SPECIALIZED_VARS.update(_FROZEN_VARS)
     _conflicts = sorted(k for k, v in _SPECIALIZED_VARS.items()
                         if k in _extra_vars and _extra_vars[k] != v)
     if _conflicts:
@@ -139,9 +140,13 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
         _mark_unsupported(plays, unsupported_actions)
 
     fallbacks = _collect_fallbacks(plays)
+    # Frozen values were already rendered here; ship them as data so the
+    # runtime does not template them a second time.
+    shipped_vars = {name: _encode_rendered(value)
+                    for name, value in frozen_vars.items()}
     source, bundle_stats = _render_source_with_stats(
         plays, modules, embedder.ansiballz_code or "", group_vars,
-        specialized_vars=specialized_vars,
+        specialized_vars=extra_vars, frozen_vars=shipped_vars,
     )
     manifest = {
         "version": 2,
@@ -184,6 +189,26 @@ def _contains_undefined(value):
     if isinstance(value, (list, tuple)):
         return any(_contains_undefined(v) for v in value)
     return False
+
+
+def _encode_rendered(value):
+    """Wire form of a rendered value, including literal string provenance."""
+    from .runtime import _UntrustedConditionValue
+
+    if isinstance(value, _UntrustedConditionValue):
+        return {"untrusted": str(value)}
+    if isinstance(value, str):
+        if "{{" in value or "{%" in value:
+            return {"text": str(value)}
+        return value
+    if isinstance(value, dict):
+        return {"mapping": [[_encode_rendered(k), _encode_rendered(v)]
+                            for k, v in value.items()]}
+    if isinstance(value, tuple):
+        return {"tuple": [_encode_rendered(v) for v in value]}
+    if isinstance(value, list):
+        return [_encode_rendered(v) for v in value]
+    return value
 
 
 def _freeze_value(value, context):
@@ -283,7 +308,6 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
 
 def _condition_value(condition, variables, templater):
     """Return True/False, or None when a conditional is not statically known."""
-    from .runtime import _is_undef, _to_bool
     import jinja2
 
     trusted = (isinstance(condition, dict)
@@ -321,12 +345,9 @@ def _condition_value(condition, variables, templater):
             )(**variables)
         except Exception:
             return None
-        if TrackingUndefined.accessed or _is_undef(result):
+        if TrackingUndefined.accessed:
             return None
-        try:
-            return bool(_to_bool(result))
-        except Exception:
-            return None
+        return result if isinstance(result, bool) else None
     if isinstance(condition, str) and ("{{" in condition or "{%" in condition):
         if not trusted:
             return None
@@ -339,12 +360,8 @@ def _condition_value(condition, variables, templater):
             result = templater.evaluate(condition, variables)
         except Exception:
             return None
-    if _is_undef(result):
-        return None
-    try:
-        return bool(_to_bool(result))
-    except Exception:
-        return None
+    # Leave non-boolean results to the runtime's core/config policy.
+    return result if isinstance(result, bool) else None
 
 
 def _condition_cache_key(condition):
@@ -680,7 +697,8 @@ def _module_archive_entries(raw):
     return entries
 
 
-def _build_bundles(plays, modules, group_vars=None, specialized_vars=None):
+def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
+                   frozen_vars=None):
     module_meta = {}
     module_archives = {}
     for action in sorted(modules):
@@ -708,6 +726,8 @@ def _build_bundles(plays, modules, group_vars=None, specialized_vars=None):
         "group_vars.json": json.dumps(group_vars or {}, default=_json_default).encode("utf-8"),
         "specialized_vars.json": json.dumps(
             specialized_vars or {}, default=_json_default).encode("utf-8"),
+        "frozen_vars.json": json.dumps(
+            frozen_vars or {}, default=_json_default).encode("utf-8"),
     }
     for digest, data in assets.items():
         data_entries["assets/" + digest] = data
@@ -814,6 +834,15 @@ _bundle_sys.meta_path.insert(0, _ansiroll_import_finder)
 ''' % base64.b64encode(import_bundle)
 
 
+def _controller_core_version():
+    """ansible-core version doing the compilation (baked into the artifact)."""
+    try:
+        from ansible.release import __version__
+        return str(__version__)
+    except Exception:
+        return None
+
+
 def _render_source(plays, modules, ansiballz_code, group_vars=None):
     return _render_source_with_stats(
         plays, modules, ansiballz_code, group_vars
@@ -821,9 +850,9 @@ def _render_source(plays, modules, ansiballz_code, group_vars=None):
 
 
 def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
-                              specialized_vars=None):
+                              specialized_vars=None, frozen_vars=None):
     import_bundle, data_bundle, stats = _build_bundles(
-        plays, modules, group_vars, specialized_vars
+        plays, modules, group_vars, specialized_vars, frozen_vars
     )
     with open(_RUNTIME_PATH, "r") as fh:
         runtime_src = fh.read()
@@ -850,6 +879,7 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         runtime_src,
         "\n\n# ===== embedded data =====\n",
         '_ANSIROLL_HOST = "localhost"\n',
+        "_ANSIROLL_CORE_VERSION = " + repr(_controller_core_version()) + "\n",
         "ANSIBALLZ_CODE = " + repr(ansiballz_code) + "\n",
         "_ANSIROLL_DATA_BUNDLE = " + repr(base64.b64encode(data_bundle)) + "\n",
         "_ansiroll_data_zip = _bundle_zipfile.ZipFile(_bundle_io.BytesIO("
@@ -862,6 +892,8 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         "PLAYS = _ansiroll_bundle_json('plays.json')\n",
         "_BAKED_GROUP_VARS = _ansiroll_bundle_json('group_vars.json')\n",
         "_SPECIALIZED_VARS = _ansiroll_bundle_json('specialized_vars.json')\n",
+        "_FROZEN_VARS = {k: _decode_frozen_value(v) for k, v in "
+        "_ansiroll_bundle_json('frozen_vars.json').items()}\n",
         "_ANSIROLL_BOOTSTRAP_SECONDS = (\n"
         "    _ansiroll_boot_time.monotonic() - _ANSIROLL_BOOT_STARTED\n"
         ")\n",
