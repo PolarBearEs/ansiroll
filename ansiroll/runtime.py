@@ -1662,6 +1662,7 @@ class Runtime:
         }
         self.extra_vars = dict(extra_vars or {})
         self._play_var_templates = {}
+        self._templated_play_vars = {}
         self._rebindable_play_vars = {}
         self._runtime_var_overrides = set(self.extra_vars)
         # The controller passes its nonpersistent fact cache separately from
@@ -2074,12 +2075,16 @@ class Runtime:
                 key: value for key, value in (play.get("vars") or {}).items()
                 if _looks_templated(value)
             }
+        self._templated_play_vars = {
+            key: value for key, value in (play.get("vars") or {}).items()
+            if any(_looks_templated(text) for text in _template_strings(value))
+        }
         # Containers render lazily against the play context, so they need rebinding in either mode; legacy
-        # non-native scalars stay raw and already render in the task context.
-        self._rebindable_play_vars = dict(self._play_var_templates)
-        self._rebindable_play_vars.update(
-            (key, value) for key, value in (play.get("vars") or {}).items()
-            if isinstance(value, (dict, list)) and any(_looks_templated(text) for text in _template_strings(value)))
+        # non-native scalars stay raw and already render in the task context, but still carry dependencies.
+        self._rebindable_play_vars = {
+            key: value for key, value in self._templated_play_vars.items()
+            if key in self._play_var_templates or isinstance(value, (dict, list))
+        }
         self.vars.update(self.template_vars(
             play.get("vars"), self.ctx(), dynamic=True))
         # Host variables created by set_fact have higher precedence than play
@@ -2279,20 +2284,24 @@ class Runtime:
     def _play_var_refs(self):
         """Names each templated play var reads; None when it can read any variable (vars, hostvars, lookups)."""
         refs = getattr(self, "_play_var_refs_cache", None)
-        if refs is None or refs[0] is not self._rebindable_play_vars:
-            from jinja2 import meta as jinja_meta
+        if refs is None or refs[0] is not self._templated_play_vars:
+            from jinja2 import meta as jinja_meta, nodes as jinja_nodes
             names = {}
-            for key, raw in self._rebindable_play_vars.items():
+            for key, raw in self._templated_play_vars.items():
                 found = set()
                 try:
                     for text in _template_strings(raw):
-                        found |= jinja_meta.find_undeclared_variables(self.templater.env.parse(text))
+                        tree = self.templater.env.parse(text)
+                        found |= jinja_meta.find_undeclared_variables(tree)
+                        # find_undeclared_variables skips globals such as lookup and query.
+                        found |= {node.name for node in tree.find_all(jinja_nodes.Name)
+                                  if node.name in _INDIRECT_VAR_NAMES}
                 except Exception:
                     found = None
                 if found is not None and not found.isdisjoint(_INDIRECT_VAR_NAMES):
                     found = None
                 names[key] = found
-            refs = (self._rebindable_play_vars, names)
+            refs = (self._templated_play_vars, names)
             self._play_var_refs_cache = refs
         return refs[1]
 
@@ -2317,11 +2326,12 @@ class Runtime:
                                          or not names.isdisjoint(stale)):
                     stale.append(key)
                     grew = True
-        pending = list(stale)
+        pending = [key for key in stale if key in self._rebindable_play_vars]
         while pending:
-            # Render a play var only once the stale play vars it reads are rendered; a cycle renders in key order.
-            ready = [key for key in pending
-                     if refs[key] is None or refs[key].isdisjoint(set(pending) - {key})] or pending[:1]
+            # Render a play var only once the stale play vars it reads are rendered, and one that can read any
+            # variable last; a cycle renders in key order.
+            direct = [key for key in pending if refs[key] is not None]
+            ready = [key for key in direct if refs[key].isdisjoint(set(pending) - {key})] or direct[:1] or pending
             for key in ready:
                 render_ctx = ctx if refs[key] is not None else dict(ctx, vars=_vars_snapshot(ctx))
                 ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]

@@ -1132,3 +1132,19 @@ def test_rebound_play_vars_keep_loop_vars_order_explicit_overrides_and_indirect_
       vars: {env: dev, debug_mode: false}
 """)
     assert msgs == ["task-task task task", "a", "b", "debug=False"]
+
+
+def test_rebound_indirect_and_container_play_vars_follow_chains_declared_before_them(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    indirect: "{{ lookup('vars', 'alias') }}"
+    cfg: {name: "{{ alias }}"}
+    alias: "{{ env }}"
+    env: prod
+  tasks:
+    - debug: msg="{{ indirect }} {{ cfg.name }}"
+      vars: {env: task}
+""")
+    assert msgs == ["task task"]
