@@ -11,6 +11,8 @@ import shutil
 import stat as stat_module
 import subprocess
 
+from . import _stdin
+
 
 _PATH_KEYS = ("path", "dest", "name")
 _MIME_KEYS = ("get_mime", "mime", "mime_type", "mime-type")
@@ -73,7 +75,7 @@ def _digest(path, algorithm):
 
 def _command(command):
     try:
-        process = subprocess.Popen(
+        process = _stdin.popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         stdout, stderr = process.communicate()

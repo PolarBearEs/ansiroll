@@ -9,7 +9,9 @@ inlined runtime can interpret. This module runs only at compile time.
 from __future__ import annotations
 
 import os
+import pkgutil
 import re
+from functools import lru_cache
 
 from .compat import init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
@@ -93,8 +95,12 @@ def load_adjacent_group_vars(playbook_path, vault_password_file=None):
             files.append(candidate)
     merged = {}
     for path in files:
-        merged.update(loader.load_from_file(path) or {})
-    return merged
+        try:
+            data = loader.load_from_file(path, trusted_as_template=True)
+        except TypeError:  # older ansible-core without the trust kwarg
+            data = loader.load_from_file(path)
+        merged.update(data or {})
+    return _tag_untrusted(merged)
 
 
 def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
@@ -262,16 +268,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
         }
+    from ansible import constants as C
+
     config_names = _controller_config_names(result)
-    if config_names:
+    config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE"))
+    controller_config = {}
+    for name in sorted(config_names):
         try:
-            from ansible import constants as C
-            result["controller_config"] = {
-                name: C.config.get_config_value(name)
-                for name in sorted(config_names)
-            }
+            controller_config[name] = C.config.get_config_value(name)
         except Exception:
+            # Config keys differ across core releases.
             pass
+    if controller_config:
+        result["controller_config"] = controller_config
     return result
 
 
@@ -367,20 +376,27 @@ def _resolved_play_vars(play, all_vars, basedir):
     return out
 
 
-def _tag_untrusted(value):
+def _tag_untrusted(value, template_syntax_only=False):
     """Mark strings that are explicitly not trusted (for example `!unsafe`)."""
     try:
         from ansible._internal._datatag._tags import TrustedAsTemplate
     except ImportError:
-        return value
+        def untrusted(v):
+            return getattr(v, "__UNSAFE__", False)
+    else:
+        def untrusted(v):
+            return not TrustedAsTemplate.is_tagged_on(v)
 
     def walk(v):
-        if isinstance(v, str) and not TrustedAsTemplate.is_tagged_on(v):
-            return {"__ansiroll_unsafe__": str(v)}
+        if isinstance(v, str) and untrusted(v):
+            if not template_syntax_only or "{{" in v or "{%" in v:
+                return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
             return {k: walk(x) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(walk(x) for x in v)
         return v
 
     return walk(value)
@@ -765,15 +781,17 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "uuid": task._uuid,
         "name": task.name or action,
         "action": action,
+        "register": _register_of(task),
+        **_ignore_errors_keywords(task),
         "file": fname,
-        "when": _as_list(task.when),
-        "loop": _loop_of(task, basedir),
+        "when": _conditions(task.when),
+        "loop": _tag_loop_values(task, _loop_of(task, basedir)),
         "loop_var": _loop_var(task),
         "index_var": _index_var(task),
         **_loop_control(task),
         "vars": _tag_untrusted(dict(task.vars or {})),
-        "role_defaults": role_defaults,
-        "role_vars": role_vars,
+        "role_defaults": _tag_untrusted(role_defaults),
+        "role_vars": _tag_untrusted(role_vars),
         "become": bool(task.become),
         "tasks": tasks,
     }
@@ -1119,10 +1137,12 @@ def _convert_task(task, actions, basedir):
             raw = str(task.args.get("_raw_params", ""))
         if "flush_handlers" in raw:
             return {"type": "task", "uuid": task._uuid, "name": "Flush handlers",
-                    "action": "meta", "special": "meta_flush_handlers"}
+                    "action": "meta", "special": "meta_flush_handlers",
+                    "when": _conditions(task.when)}
         if "clear_host_errors" in raw:
             return {"type": "task", "uuid": task._uuid, "name": "Clear host errors",
-                    "action": "meta", "special": "meta_clear_host_errors"}
+                    "action": "meta", "special": "meta_clear_host_errors",
+                    "when": _conditions(task.when)}
         return None  # other meta actions are no-ops in v1
 
     role_defaults, role_vars = _role_vars(task)
@@ -1152,7 +1172,7 @@ def _convert_task(task, actions, basedir):
         "environment": _as_list(getattr(task, "environment", None)) or None,
         "search_dirs": _search_dirs(task, basedir, "files"),
         "search_path": _raw_search_path(task, basedir),
-        "ignore_errors": _boolean_or_template(task.ignore_errors),
+        **_ignore_errors_keywords(task),
         "no_log": bool(getattr(task, "no_log", False)),
         "async_val": int(getattr(task, "async_val", 0) or 0),
         "poll": int(getattr(task, "poll", 0) or 0),
@@ -1163,12 +1183,22 @@ def _convert_task(task, actions, basedir):
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
-        "role_defaults": role_defaults,  # lowest precedence (below play vars)
-        "role_vars": role_vars,          # above play vars, below block/task vars
+        "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)
+        "role_vars": _tag_untrusted(role_vars),          # above play vars, below block/task vars
         "role_magic": _role_magic(task),
         "notify": _as_list(task.notify),
         "special": _special_of(action),
     }
+    if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
+                                       "ansible.legacy.async_status"):
+        from ansible.plugins.loader import shell_loader
+
+        node["async_options"] = {
+            "version": _core_version(include_patch=True),
+            "dir": shell_loader.get("sh").get_option("async_dir"),
+        }
+        if node["async_val"] and node["poll"] == 0:
+            node["async_options"]["poll_before_timeout"] = _async_poll_before_timeout()
     accelerator = _classify_accelerator(action, node["args"], node.get("loop"))
     if accelerator:
         node["accelerator"] = accelerator
@@ -1199,6 +1229,20 @@ def _convert_task(task, actions, basedir):
         node["fallback_reason"] = "controller-coupled action %s" % action
     elif node["special"] is None:
         actions.add(action)
+    if node["special"] == "set_fact":
+        # Only top-level fact names from the authored argument mapping may
+        # be templates. Preserve their trust before serialization strips tags.
+        keys = [k for k in node["args"] if isinstance(k, str)
+                and ("{{" in k or "{%" in k)]
+        trusted_keys = [k for k in _tag_untrusted(keys) if isinstance(k, str)]
+        if trusted_keys:
+            node["set_fact_key_templates"] = trusted_keys
+    if action.split(".")[-1] == "assert":
+        node["args"] = {k: v if k == "that" else _tag_untrusted(v)
+                        for k, v in node["args"].items()}
+    else:
+        node["args"] = _tag_untrusted(node["args"])
+    node["loop"] = _tag_loop_values(task, node["loop"])
     return node
 
 
@@ -1241,12 +1285,26 @@ def _legacy_command_warn_supported():
         return False
 
 
+def _core_version(include_patch=False):
+    from ansible.release import __version__
+
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", __version__)
+    version = tuple(int(part or "0") for part in match.groups()) if match else (0, 0, 0)
+    return version if include_patch else version[:2]
+
+
+@lru_cache(maxsize=1)
+def _async_poll_before_timeout():
+    # The watchdog loop differs across patch releases (e.g. 2.20.0 and
+    # 2.20.11). Bake the installed wrapper's behavior into the agent.
+    source = pkgutil.get_data("ansible", "modules/async_wrapper.py")
+    return b"step = remaining / 2" in (source or b"")
+
+
 def _accelerator_options(action):
     name = str(action or "").split(".")[-1]
     try:
-        from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        version = tuple(map(int, match.groups())) if match else (0, 0)
+        version = _core_version()
         if name == "stat" and version >= (2, 21):
             return {"disk_usage_bytes": True}
         if name in ("command", "shell"):
@@ -1548,6 +1606,16 @@ def _clean_args(args):
     return dict(args)
 
 
+def _tag_loop_values(task, loop):
+    if getattr(task, "loop_with", None) == "fileglob" and isinstance(loop, list):
+        # The compiler uses raw paths for baking, but lookup results must
+        # reach the runtime as data, just like results of runtime lookups.
+        return [{"__ansiroll_unsafe__": path} for path in loop]
+    if isinstance(loop, dict) and "__ansiroll_lookup" in loop:
+        return dict(loop, terms=_tag_untrusted(loop["terms"]))
+    return _tag_untrusted(loop)
+
+
 def _loop_of(task, basedir):
     loop = getattr(task, "loop", None)
     # with_fileglob is a controller-side lookup: expand the globs now (the
@@ -1634,9 +1702,24 @@ def _numeric_or_template(value, cast):
         return value  # templated value; the runtime resolves it per-host
 
 
+def _ignore_errors_keywords(task):
+    value = _boolean_or_template(task.ignore_errors)
+    result = {"ignore_errors": value}
+    if isinstance(value, str):
+        try:
+            from ansible.playbook.base import Sentinel
+
+            inherited = task._get_parent_attribute("ignore_errors", omit=True)
+        except (ImportError, TypeError):  # Older cores use the keyword default.
+            return result
+        if inherited is not Sentinel and inherited is not None:
+            result["ignore_errors_on_omit"] = _boolean_or_template(inherited)
+    return result
+
+
 def _boolean_or_template(value):
-    """Preserve task-keyword expressions instead of coercing strings eagerly."""
-    return value if isinstance(value, str) else bool(value)
+    """Defer validation and preserve the trust of keyword expressions."""
+    return False if value is None else _tag_untrusted(value)
 
 
 def _register_of(task):

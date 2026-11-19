@@ -20,26 +20,58 @@ import base64
 import json
 import os
 import struct
+import selectors
 import subprocess
 import sys
 import time
 import hashlib
 import re
 import shlex
+from numbers import Number
 
 RESULT_MARKER = "__ANSIROLL_RESULT__"
 STATE_MARKER = "__ANSIROLL_STATE__"
 STATS_MARKER = "__ANSIROLL_STATS__"
 
 
+# ansible-core version of the controller that compiled this artifact. The
+# compiler bakes it into the generated source; target hosts usually have no
+# Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
+_ANSIROLL_CORE_VERSION = None
+
+
 def _core_at_least(major, minor):
-    """Best-effort controller/core feature gate without making Ansible a runtime dependency."""
-    try:
-        from ansible.release import __version__
-        match = re.match(r"^(\d+)\.(\d+)", __version__)
-        return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
-    except Exception:
-        return False
+    """Feature gate on the compiling controller's ansible-core version."""
+    version = _ANSIROLL_CORE_VERSION
+    if not version:
+        # Imported directly on the controller (not compiled): use its Ansible.
+        try:
+            from ansible.release import __version__ as version
+        except Exception:
+            return False
+    match = re.match(r"^(\d+)\.(\d+)", str(version))
+    return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
+
+
+def _legacy_templating():
+    return _core_at_least(2, 10) and not _core_at_least(2, 19)
+
+
+def _legacy_non_native(ctx):
+    config = ctx.get("__ansiroll_controller_config") or {}
+    return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
+
+
+def _vars_snapshot(ctx):
+    # Ansible exposes a shallow copy of the task context under the magic
+    # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
+    excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
+                "__ansiroll_search_dirs"}
+    snapshot = {key: value for key, value in ctx.items() if key not in excluded}
+    if _core_at_least(2, 20):
+        snapshot["vars"] = dict(snapshot)
+    return snapshot
+
 
 # Persistent worker: one long-lived process per privilege level. It keeps each
 # module's decoded zip in RAM (decode-once) and forks a child per task -- the fork
@@ -59,13 +91,62 @@ def _worker_source():
             _WORKER_CODE = worker_file.read()
     return _WORKER_CODE
 
+class _WorkerStderr:
+    """Drain diagnostics alongside request writes and response reads."""
+
+    def __init__(self, proc):
+        self.stream = proc.stderr
+        self.tail = b""
+        os.set_blocking(proc.stdin.fileno(), False)
+        os.set_blocking(self.stream.fileno(), False)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.stream, selectors.EVENT_READ)
+
+    def _drain(self):
+        try:
+            data = os.read(self.stream.fileno(), 65536)
+        except BlockingIOError:
+            return
+        if data:
+            self.tail = (self.tail + data)[-65536:]
+        elif self.selector.get_map().get(self.stream.fileno()) is not None:
+            self.selector.unregister(self.stream)
+
+    def wait(self, stream, event):
+        self.selector.register(stream, event)
+        try:
+            while True:
+                ready = False
+                for key, _ in self.selector.select():
+                    if key.fileobj is self.stream:
+                        self._drain()
+                    else:
+                        ready = True
+                if ready:
+                    return
+        finally:
+            self.selector.unregister(stream)
+
+    def read(self):
+        self._drain()
+        return self.tail.decode("utf-8", "surrogateescape").strip()
+
+    def close(self):
+        self.selector.close()
+        self.stream.close()
+
+
 # __ANSIROLL_JINJA_BUNDLE__
 import jinja2  # type: ignore
 
 
 # Sentinel for the `omit` magic variable; args/env entries equal to it are
 # dropped before the module runs (mirrors Ansible's omit placeholder).
-_OMIT = "__omit_place_holder__ansiroll"
+class _Omit(str):
+    pass
+
+
+_OMIT = _Omit("__omit_place_holder__ansiroll")
 
 
 class _UnsafeTemplate(str):
@@ -80,7 +161,93 @@ class _TrustedAsTemplateValue(str):
     """A string produced by set_fact and trusted for later templating."""
 
 
+class _UnsafeText(str):
+    """Text that must never be templated again.
+
+    Mirrors Ansible: module results, facts, lookup output and the output of a
+    render are data, not templates (AnsibleUnsafeText before 2.19, a missing
+    TrustedAsTemplate tag since).  Only strings that look like templates are
+    wrapped, so ordinary values keep their plain ``str`` type."""
+
+
+# Strings the templater returns verbatim.
+_NO_TEMPLATE = (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue)
+
+
+class _IncludedVars(dict):
+    """Controller-loaded include_vars definitions carried in a task result."""
+
+
+def _decode_included_var(value):
+    if isinstance(value, dict):
+        if set(value) == {"__ansiroll_unsafe__"}:
+            return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
+        return {key: _decode_included_var(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_included_var(item) for item in value]
+    return value
+
+
+def _looks_templated(value):
+    return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _mark_unsafe(value, _seen=None, preserve_included_vars=False):
+    """Deep-copy `value`, marking template-looking strings as never-templated."""
+    if preserve_included_vars and isinstance(value, _IncludedVars):
+        return value
+    if isinstance(value, str):
+        if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+            return _UnsafeText(value)
+        return value
+    if isinstance(value, (dict, list, tuple)):
+        if _seen is None:
+            _seen = {}
+        # Keep source containers alive because lazy views create temporary
+        # wrappers whose object IDs could be reused during this traversal.
+        if id(value) in _seen:
+            return _seen[id(value)][1]
+        if isinstance(value, dict):
+            out = {}
+            _seen[id(value)] = (value, out)
+            # Lazy views render on access; plain containers are read raw.
+            getter = (value.__getitem__ if isinstance(value, _LazyTplDict)
+                      else lambda key: dict.__getitem__(value, key))
+            for k in list(dict.keys(value)):
+                out[_mark_unsafe(k, _seen)] = _mark_unsafe(
+                    getter(k), _seen, preserve_included_vars)
+            return out
+        if isinstance(value, list):
+            out = []
+            _seen[id(value)] = (value, out)
+            items = (iter(value) if isinstance(value, _LazyTplList)
+                     else list.__iter__(value))
+            out.extend(_mark_unsafe(v, _seen, preserve_included_vars) for v in items)
+            return out
+        return tuple(_mark_unsafe(v, _seen, preserve_included_vars) for v in value)
+    return value
+
+
+def _decode_frozen_value(value):
+    """Decode a value from the compiler's frozen-vars section."""
+    if isinstance(value, dict):
+        if "mapping" in value:
+            return {_decode_frozen_value(k): _decode_frozen_value(v)
+                    for k, v in value["mapping"]}
+        if "tuple" in value:
+            return tuple(_decode_frozen_value(v) for v in value["tuple"])
+        if "text" in value:
+            return _UnsafeText(value["text"])
+        if "untrusted" in value:
+            return _UntrustedConditionValue(value["untrusted"])
+    if isinstance(value, list):
+        return [_decode_frozen_value(v) for v in value]
+    return value
+
+
 def _trust_set_fact_value(value):
+    if isinstance(value, _NO_TEMPLATE):
+        return value
     if isinstance(value, str):
         return _TrustedAsTemplateValue(value)
     if isinstance(value, dict):
@@ -102,16 +269,43 @@ def _strip_omit(args):
 
 
 def _fail_on_undef(value):
-    """Raise the captured error of any Undefined nested in module args."""
+    """Raise the captured error of any Undefined nested in a value."""
     if isinstance(value, dict):
-        for v in value.values():
+        for k, v in value.items():
+            _fail_on_undef(k)
             _fail_on_undef(v)
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         for v in value:
             _fail_on_undef(v)
     elif _is_undef(value):
         value._fail_with_undefined_error()
     return value
+
+
+def _debug_var_value(value):
+    if not _core_at_least(2, 19):
+        try:
+            return _fail_on_undef(value)
+        except jinja2.UndefinedError:
+            return "VARIABLE IS NOT DEFINED!"
+
+    error_count = 0
+
+    def replace(v):
+        nonlocal error_count
+        if _is_undef(v):
+            try:
+                v._fail_with_undefined_error()
+            except jinja2.UndefinedError as ex:
+                error_count += 1
+                return "<< error %d - %s >>" % (error_count, ex)
+        if isinstance(v, dict):
+            return {k: replace(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [replace(x) for x in v]
+        return v
+
+    return replace(value)
 
 
 def _contains_untrusted_condition_value(value):
@@ -127,16 +321,6 @@ def _contains_untrusted_condition_value(value):
     return False
 
 
-def _fail_on_direct_undef(value):
-    """Raise direct/list errors without forcing every value in a mapping."""
-    if isinstance(value, (list, tuple)):
-        for v in value:
-            _fail_on_direct_undef(v)
-    elif _is_undef(value):
-        value._fail_with_undefined_error()
-    return value
-
-
 class TaskFailed(Exception):
     """Raised when a task fails and is not ignored (drives block/rescue)."""
 
@@ -146,8 +330,38 @@ class TaskFailed(Exception):
         self.result = result or {"failed": True, "msg": str(name)}
 
 
-class UntrustedConditional(Exception):
+class ConditionalError(Exception):
+    """Evaluating a `when` conditional failed (undefined variable, error)."""
+
+
+class UntrustedConditional(ConditionalError):
     """A conditional contained an embedded template and was refused."""
+
+
+class _BrokenConditional(RuntimeError):
+    """A conditional violated ansible-core's expression or result requirements."""
+
+
+def _conditional_error_message(cond, error, keyword="when"):
+    """Ansible's message for a conditional that raised while being evaluated.
+    `keyword` names the failing expression (`when`, `until`); None for
+    assert, whose message carries no expression prefix."""
+    if isinstance(cond, dict) and len(cond) == 1:
+        cond = list(cond.values())[0]
+    if keyword is None or not _core_at_least(2, 21):
+        prefix = "Task failed: "
+    else:
+        prefix = "Task failed: %s '%s' expression failed: " % (
+            "An" if keyword[0] in "aeiou" else "A", keyword)
+    if isinstance(error, _BrokenConditional):
+        return prefix + str(error)
+    if _core_at_least(2, 19):
+        kind = ("Error while evaluating conditional"
+                if isinstance(error, jinja2.UndefinedError)
+                else "Error rendering expression")
+        return "%s%s: %s" % (prefix, kind, error)
+    return ("The conditional check '%s' failed. The error was: error while "
+            "evaluating conditional (%s): %s" % (cond, cond, error))
 
 
 class _UnsupportedLookup(Exception):
@@ -177,18 +391,43 @@ def _to_bool(value):
     return bool(value)
 
 
+_BOOLEANS_TRUE = frozenset(("y", "yes", "on", "1", "true", "t", 1))
+_BOOLEANS_FALSE = frozenset(("n", "no", "off", "0", "false", "f", 0))
+
+
+def _boolean(value, strict=False):
+    """Keyword/action-arg coercion: ansible.module_utils.parsing.convert_bool
+    .boolean, which (unlike the `bool` filter) also accepts y/t and n/f."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (str, bytes)):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        value = value.lower().strip()
+    try:
+        if value in _BOOLEANS_TRUE:
+            return True
+        if not strict or value in _BOOLEANS_FALSE:
+            return False
+    except TypeError:
+        if not strict:
+            return False
+    raise TypeError("Invalid boolean value")
+
+
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
 
+    # Copy through items(): dict(lazy_view) bypasses rendering on Python 3.5.
     def merge(a, b):
-        out = dict(a)
+        out = dict(a.items())
         for k, v in b.items():
             if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
         return out
-    result = dict(d or {})
+    result = dict((d or {}).items())
     for o in others:
         result = merge(result, o or {})
     return result
@@ -202,9 +441,21 @@ def _f_items2dict(lst, key_name="key", value_name="value"):
     return {i[key_name]: i[value_name] for i in (lst or [])}
 
 
-def _f_regex_replace(s, pattern, repl="", count=0):
+def _f_regex_replace(s="", pattern="", repl="", ignorecase=False,
+                     multiline=False, count=0, mandatory_count=0):
+    # Mirrors ansible.plugins.filter.core.regex_replace.
     import re
-    return re.sub(pattern, repl, str(s), count=count)
+    flags = 0
+    if ignorecase:
+        flags |= re.I
+    if multiline:
+        flags |= re.M
+    text = s if isinstance(s, str) else str(s)
+    output, subs = re.compile(pattern, flags).subn(repl, text, count=count)
+    if mandatory_count and mandatory_count != subs:
+        raise ValueError("'%s' should match %d times, but matches %d times "
+                         "in '%s'" % (pattern, mandatory_count, count, s))
+    return output
 
 
 def _f_regex_search(s, pattern, *args, **kwargs):
@@ -251,7 +502,8 @@ def _to_text_str(v):
 def _f_ternary(condition, true_val, false_val=None, none_val=None):
     if condition is None and none_val is not None:
         return none_val
-    return true_val if _to_bool(condition) else false_val
+    # Ansible uses plain Python truthiness here, not boolean coercion.
+    return true_val if condition else false_val
 
 
 def _f_hash(v, hashtype="sha1"):
@@ -480,7 +732,7 @@ _ANSIBLE_FILTERS = {
     "symmetric_difference": _f_symmetric_difference,
     "flatten": _f_flatten,
     "quote": _f_quote,
-    "type_debug": lambda v: type(v).__name__,
+    "type_debug": lambda v: _type_debug(v),
     "basename": lambda v: os.path.basename(str(v)),
     "dirname": lambda v: os.path.dirname(str(v)),
     "expanduser": lambda v: os.path.expanduser(str(v)),
@@ -528,6 +780,10 @@ def _as_result(v):
     return v if isinstance(v, dict) else {}
 
 
+def _test_succeeded(result):
+    return not _as_result(result).get("failed", False)
+
+
 # A subset of Ansible's Jinja2 tests (pure stdlib).
 _ANSIBLE_TESTS = {
     "version": _test_version,
@@ -535,8 +791,9 @@ _ANSIBLE_TESTS = {
     "match": _test_match,
     "search": _test_search,
     "regex": lambda v, pattern, **k: _test_search(v, pattern),
-    "succeeded": lambda r: not _as_result(r).get("failed", False),
-    "success": lambda r: not _as_result(r).get("failed", False),
+    "succeeded": _test_succeeded,
+    "success": _test_succeeded,
+    "successful": _test_succeeded,
     "failed": lambda r: _as_result(r).get("failed", False),
     "failure": lambda r: _as_result(r).get("failed", False),
     "changed": lambda r: _as_result(r).get("changed", False),
@@ -692,7 +949,7 @@ def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
 
 
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
-    if isinstance(value, str):
+    if isinstance(value, (str, tuple)):
         return rt.template(value, ctx)
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_unsafe__"}:
         return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
@@ -739,6 +996,18 @@ class _LazyTplDict(dict):
 
     def copy(self):
         return {k: self[k] for k in dict.keys(self)}
+
+    def __iter__(self):
+        # Overriding __iter__ makes dict(view) and {**view} read through
+        # __getitem__ instead of the raw storage on Python 3.6+ (Ansible's
+        # _AnsibleLazyTemplateDict does the same).
+        return dict.__iter__(self)
+
+    def __repr__(self):
+        # str()/repr() inside a template shows the rendered values.
+        return repr(self.copy())
+
+    __str__ = __repr__
 
     def __eq__(self, other):
         mine = {k: self[k] for k in dict.keys(self)}
@@ -787,10 +1056,69 @@ class _LazyTplList(list):
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
 
+    # list's C-level operations read the raw storage; render first, like
+    # Ansible's _AnsibleLazyTemplateList.
+    def __contains__(self, item):
+        return item in list(iter(self))
+
+    def __reversed__(self):
+        return reversed(list(iter(self)))
+
+    def __add__(self, other):
+        if isinstance(other, _LazyTplList):
+            other = list(iter(other))
+        return list.__add__(list(iter(self)), other)
+
+    def __radd__(self, other):
+        if not isinstance(other, list):
+            return NotImplemented
+        return list(other) + list(iter(self))
+
+    def __mul__(self, other):
+        return list.__mul__(list(iter(self)), other)
+
+    __rmul__ = __mul__
+
+    def index(self, *args):
+        return list(iter(self)).index(*args)
+
+    def count(self, item):
+        return list(iter(self)).count(item)
+
+    def __repr__(self):
+        return repr(list(iter(self)))
+
+    __str__ = __repr__
+
     def __ne__(self, other):
         return not self.__eq__(other)
 
     __hash__ = None
+
+
+def _jinja_dict(*args, **kwargs):
+    # Python 3.5's dict(view) may copy a dict subclass's raw storage.
+    if args and isinstance(args[0], _LazyTplDict):
+        args = (args[0].items(),) + args[1:]
+    return dict(*args, **kwargs)
+
+
+def _type_name(value):
+    """type_debug: internal wrappers report the builtin type they stand for."""
+    for internal, name in ((_LazyTplDict, "dict"), (_LazyTplList, "list")):
+        if isinstance(value, internal):
+            return name
+    if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
+                       _TrustedAsTemplateValue):
+        return "str"
+    return type(value).__name__
+
+
+def _type_debug(value):
+    if (isinstance(value, (_UnsafeTemplate, _UntrustedConditionValue))
+            and _legacy_templating()):
+        return "AnsibleUnsafeText"
+    return _type_name(value)
 
 
 def _concretize(value):
@@ -834,11 +1162,52 @@ def _wrap_filter(fn):
 
 
 class _AnsirollUndefined(jinja2.ChainableUndefined):
-    """ChainableUndefined, except `x in undefined` raises (jinja 3.1 silently
-    returns False, Ansible errors)."""
+    """Ansible's undefined: attribute/item access chains (keeping the first
+    failure), but using the value -- str(), iteration, truth, comparison,
+    `x in undefined` -- raises, like StrictUndefined (AnsibleUndefined)."""
+
+    __str__ = __iter__ = __len__ = __eq__ = __ne__ = __bool__ = __hash__ = \
+        jinja2.Undefined._fail_with_undefined_error
+    __nonzero__ = __bool__
+
+    def __init__(self, hint=None, obj=jinja2.utils.missing, name=None,
+                 exc=jinja2.exceptions.UndefinedError):
+        if hint is None and obj is not jinja2.utils.missing:
+            # Name the builtin type, never an internal wrapper class.
+            type_name = _type_name(obj)
+            if _core_at_least(2, 19):
+                hint = "object of type %r has no attribute %r" % (type_name, name)
+            elif isinstance(name, str):
+                hint = "'%s object' has no attribute %r" % (type_name, name)
+            else:
+                hint = "%s object has no element %r" % (type_name, name)
+        jinja2.ChainableUndefined.__init__(self, hint, obj, name, exc)
+
+    def __html__(self):
+        self._fail_with_undefined_error()
 
     def __contains__(self, item):
         self._fail_with_undefined_error()
+
+
+class _AnsirollContext(jinja2.runtime.Context):
+    """Template variables are templated lazily when a template looks them up.
+
+    Like Ansible's AnsibleJ2Vars (<= 2.18) and lazy templating (2.19+), a
+    trusted variable value that is itself a template renders on access; data
+    marked as never-templated (results, facts, rendered output) is returned
+    verbatim.  Names bound inside the template itself are never touched."""
+
+    def resolve_or_missing(self, key):
+        if key in self.vars:
+            return self.vars[key]
+        if key not in self.parent:
+            return jinja2.runtime.missing
+        value = self.parent[key]
+        templater = getattr(self.environment, "_ansiroll_templater", None)
+        if templater is None or str(key).startswith("__ansiroll"):
+            return value
+        return templater.resolve_variable(key, value, self.parent)
 
 
 class _PluginDict(dict):
@@ -887,7 +1256,6 @@ class _Templater:
     def __init__(self):
         self._expr_cache = {}
         self._template_cache = {}
-        self._embedded_constant_cache = {}
         self._current_ctx = {}
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
@@ -898,6 +1266,10 @@ class _Templater:
             keep_trailing_newline=True,
             finalize=_concretize,
         )
+        self.env.context_class = _AnsirollContext
+        self.env._ansiroll_templater = self
+        self._resolving = []        # variable templates being rendered (cycles)
+        self._runtime = None        # bound by Runtime for lazy containers
         filters = _PluginDict("filter", self._plugin_errors["filter"])
         filters.update(self.env.filters)
         self.env.filters = filters
@@ -916,16 +1288,32 @@ class _Templater:
         self.env.globals.setdefault("q", self._g_query)
         self.env.globals.setdefault("now", _jinja_now)
         self.env.globals.setdefault("undef", _jinja_undef)
+        self.env.globals["dict"] = _jinja_dict
+
+    def _lookup_ctx(self, name, terms):
+        """The vars lookup templates trusted values like a variable reference."""
+        ctx = self._current_ctx
+        if str(name).rsplit(".", 1)[-1] != "vars" or not isinstance(ctx, dict):
+            return ctx
+        view = dict(ctx)
+        for term in terms:
+            key = str(term)
+            if key in ctx and not key.startswith("__ansiroll"):
+                view[key] = self.resolve_variable(key, ctx[key], ctx)
+        return view
 
     def _g_lookup(self, name, *a, **k):
         try:
             a = tuple(self._template_lookup_arg(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
-            return _lookup(name, *a, _ansiroll_ctx=self._current_ctx, **k)
+            # Lookup output is data and is never templated again.
+            return _mark_unsafe(
+                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
                 return vals
+            vals = _mark_unsafe(vals)
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
@@ -936,9 +1324,11 @@ class _Templater:
         try:
             a = tuple(self._template_lookup_arg(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
-            return _query(name, *a, _ansiroll_ctx=self._current_ctx, **k)
+            return _mark_unsafe(
+                _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
-            return self._plugin_lookup(name, a, k)
+            vals = self._plugin_lookup(name, a, k)
+            return vals if _is_undef(vals) else _mark_unsafe(vals)
         except Exception as e:
             return _captured(str(e))
 
@@ -1015,12 +1405,52 @@ class _Templater:
             return _captured("lookup plugin '%s' failed to load: %s" % (name, e))
         return self._plugin_lookup(name, args, kwargs)
 
+    def resolve_variable(self, key, value, ctx):
+        """Template a variable's trusted value when a template references it."""
+        if type(value) is str and ("{{" in value or "{%" in value):
+            marker = (key, value)
+            if marker in self._resolving:
+                return _captured("Recursive loop detected in template: %s" % value)
+            self._resolving.append(marker)
+            try:
+                return self.render_string(value, ctx)
+            finally:
+                self._resolving.pop()
+        if self._runtime is not None and type(value) in (dict, list):
+            return _lazy_wrap(value, self._runtime, ctx)
+        return value
+
     def render_string(self, text, ctx, _depth=0):
-        if not isinstance(text, str):
+        if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if "{{" not in text and "{%" not in text:
             return text
+        previous = self._current_ctx
         self._current_ctx = ctx
+        try:
+            result = self._render_string(text, ctx)
+        finally:
+            # A nested render (a lazily templated variable, a lookup term)
+            # must not leave its context behind for the outer template.
+            self._current_ctx = previous
+        if (isinstance(result, Number) and not isinstance(result, bool)
+                and _legacy_non_native(ctx)):
+            # Legacy non-native concatenation stringifies numbers unless the
+            # whole template names a variable whose raw value is a number.
+            single = re.match(r"^\{\{\s*(\w+)\s*\}\}$", text)
+            if single is None or not isinstance(ctx.get(single.group(1)), Number):
+                return str(result)
+        if isinstance(result, _UntrustedConditionValue):
+            return result
+        if isinstance(result, str):
+            # Rendered output is data: like Ansible, it is never templated
+            # again (trusted variable values are templated when looked up).
+            return (_UnsafeText(result) if _looks_templated(result)
+                    else str(result) if isinstance(result, _UnsafeTemplate)
+                    else result)
+        return result
+
+    def _render_string(self, text, ctx):
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
@@ -1069,34 +1499,6 @@ class _Templater:
             return _captured_jinja_error(
                 e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
             )
-        if isinstance(result, _UnsafeTemplate):
-            return str(result)
-        # Resolve nested templates (a var whose value is itself a template), like
-        # Ansible -- re-render until stable; a self-referencing template is a
-        # recursion error (captured, so it fails where it is used).
-        if (isinstance(result, str)
-                and "{% raw" not in text and "{% endraw" not in text
-                and ("{{" in result or "{%" in result)
-                and not self._has_embedded_template_constant(text)):
-            if result == text or _depth >= 10:
-                return _captured("Recursive loop detected in template: %s" % text)
-            return self.render_string(result, ctx, _depth + 1)
-        return result
-
-    def _has_embedded_template_constant(self, text):
-        """Whether Jinja source contains a literal string that looks templated."""
-        cached = self._embedded_constant_cache.get(text)
-        if cached is not None:
-            return cached
-        try:
-            parsed = self.env.parse(text)
-        except jinja2.TemplateSyntaxError:
-            result = False
-        else:
-            result = any(isinstance(node.value, str)
-                         and ("{{" in node.value or "{%" in node.value)
-                         for node in parsed.find_all(jinja2.nodes.Const))
-        self._embedded_constant_cache[text] = result
         return result
 
     def evaluate(self, expr, ctx):
@@ -1104,12 +1506,16 @@ class _Templater:
         if isinstance(expr, bool):
             return expr
         expr = str(expr)
+        previous = self._current_ctx
         self._current_ctx = ctx
-        compiled = self._expr_cache.get(expr)
-        if compiled is None:
-            compiled = self.env.compile_expression(expr, undefined_to_none=False)
-            self._expr_cache[expr] = compiled
-        return compiled(**ctx)
+        try:
+            compiled = self._expr_cache.get(expr)
+            if compiled is None:
+                compiled = self.env.compile_expression(expr, undefined_to_none=False)
+                self._expr_cache[expr] = compiled
+            return compiled(**ctx)
+        finally:
+            self._current_ctx = previous
 
 
 def _is_undef(v):
@@ -1120,7 +1526,10 @@ def _as_text(v):
     """Coerce a rendered value to text for writing to a file."""
     if isinstance(v, str):
         return v
-    if _is_undef(v) or v is None:
+    if _is_undef(v):
+        # A captured render error or undefined value fails, never writes "".
+        v._fail_with_undefined_error()
+    if v is None:
         return ""
     if isinstance(v, (dict, list)):
         return json.dumps(v)
@@ -1261,7 +1670,11 @@ class Runtime:
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
         self.templater = _Templater()
+        self.templater._runtime = self
         self.handlers = []
+        # Hand-built runtime nodes can supply block conditions independently;
+        # parsed tasks already carry the accumulated conditions from Ansible.
+        self._inherited_when = []
         self.notified = []  # ordered, de-duplicated handler names
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
@@ -1289,18 +1702,21 @@ class Runtime:
             if o:
                 d.update(o)
         d.setdefault("omit", _OMIT)
-        d.setdefault("hostvars", {self.host: d})
-        d.setdefault("vars", d)
+        if "hostvars" not in d:
+            d["hostvars"] = {self.host: dict(d)}
+        if "vars" not in d:
+            d["vars"] = _vars_snapshot(d)
         return d
 
     def _store_register(self, task, result):
         name = task.get("register")
         if name:
-            self.vars[name] = result
+            include_vars = task.get("action", "").rsplit(".", 1)[-1] == "include_vars"
+            self.vars[name] = _mark_unsafe(result, preserve_included_vars=include_vars)
             self._untrusted_runtime_vars.add(name)
 
     def template(self, value, ctx, _seen=None):
-        if isinstance(value, (dict, list)):
+        if isinstance(value, (dict, list, tuple)):
             if _seen is None:
                 _seen = set()
             if id(value) in _seen:  # cycles (e.g. hostvars references the ctx)
@@ -1313,23 +1729,28 @@ class Runtime:
                 )  # `!unsafe`: never templated
             if set(value.keys()) == {"__ansiroll_vault__"}:
                 return value
-            return {self.template(k, ctx, _seen) if isinstance(k, str) and "{{" in k else k:
-                    self.template(v, ctx, _seen) for k, v in value.items()}
+            # Ansible leaves mapping keys literal.
+            return {_mark_unsafe(k): self.template(v, ctx, _seen)
+                    for k, v in value.items()}
         if isinstance(value, list):
             return [self.template(v, ctx, _seen) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self.template(v, ctx, _seen) for v in value)
         if isinstance(value, str):
             out = self.templater.render_string(value, ctx)
-            if isinstance(out, (dict, list)) and out is not value:
-                # A bare expression returned a container that may hold raw
-                # (lazily deferred) templates -- resolve them now that it is used.
-                out = self.template(out, ctx, _seen)
+            if isinstance(out, (dict, list, tuple)) and out is not value:
+                # A bare expression returned a container that may hold lazy
+                # variable views -- resolve them now that it is used.  The
+                # result is data and is never templated again.
+                out = _mark_unsafe(out)
             return out
         return value
 
     def template_vars(self, d, ctx, dynamic=False):
         """Template a vars mapping lazily: top-level strings render now (with
         sibling vars visible), but containers become lazy wrappers that render
-        values only on access (side-effect laziness, like Ansible 2.19).
+        values only on access. Legacy non-native templating also keeps scalar
+        sources so its raw single-variable type check sees the original value.
 
         Dynamic play vars may legitimately refer to variables that are only
         available to a later, tag-selected task.  Preserve those expressions
@@ -1340,8 +1761,9 @@ class Runtime:
         base = dict(ctx)
         base.update(d)
         out = {}
+        legacy = _legacy_non_native(base)
         for k, v in d.items():
-            if isinstance(v, str):
+            if isinstance(v, str) and not legacy:
                 try:
                     out[k] = self.templater.render_string(v, base)
                 except Exception:
@@ -1354,103 +1776,123 @@ class Runtime:
                 out[k] = _lazy_container(v, self, base, dynamic)
         return out
 
-    def when(self, conds, ctx, strict=False):
+    def when(self, conds, ctx, strict=False, keyword="when"):
+        """All conditions true?  An evaluation error raises: the raw error in
+        strict mode (changed_when/failed_when), else ConditionalError, which
+        fails the task like Ansible instead of silently skipping it."""
         for cond in (conds or []):
-            if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
-                raise UntrustedConditional(
-                    "Encountered untrusted template or expression."
-                )
-            if (
-                    isinstance(cond, dict)
-                    and set(cond) == {"__ansiroll_untrusted_condition__"}):
-                raise UntrustedConditional(
-                    "Encountered untrusted template or expression."
-                )
-            trusted_template = (isinstance(cond, dict)
-                                and set(cond) == {"__ansiroll_trusted_condition__"})
-            if trusted_template:
-                cond = cond["__ansiroll_trusted_condition__"]
-            # Like Ansible, refuse conditionals with embedded templates: the
-            # expression may come from untrusted data (template injection).
-            if isinstance(cond, str) and ("{{" in cond or "{%" in cond):
-                if not trusted_template:
-                    raise UntrustedConditional(
-                        "Conditional %r is an untrusted template or expression and "
-                        "cannot be evaluated." % cond)
-                try:
-                    from jinja2 import meta as jinja_meta
-                    referenced = jinja_meta.find_undeclared_variables(
-                        self.templater.env.parse(cond)
-                    )
-                except Exception:
-                    referenced = ()
-                if any(
-                        name in ctx
-                        and (
-                            name in self._untrusted_runtime_vars
-                            or _contains_untrusted_condition_value(ctx[name])
-                        )
-                        for name in referenced):
-                    raise UntrustedConditional(
-                        "Encountered untrusted template or expression."
-                    )
-                result = self.templater.render_string(cond, ctx)
-                # Assert accepts an indirected list of expressions (for
-                # example `that: "{{ expression_list }}"`). Evaluate the
-                # resolved members as conditions rather than treating the
-                # non-empty list itself as truthy.
-                if isinstance(result, (list, tuple)):
-                    if not self.when(list(result), ctx, strict=strict):
-                        return False
-                    continue
-                if isinstance(result, (_UnsafeTemplate, _UntrustedConditionValue)):
-                    raise UntrustedConditional(
-                        "Encountered untrusted template or expression."
-                    )
-                if isinstance(result, str) and result.strip().lower() not in (
-                        "true", "false"):
-                    if re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S):
-                        raise UntrustedConditional(
-                            "Encountered untrusted template or expression."
-                        )
-                    result = self.templater.evaluate(result, ctx)
-                if strict and _is_undef(result):
-                    raise RuntimeError(
-                        "The conditional check %r failed: the expression is undefined" % cond)
-                if not self._condition_truth(result, ctx):
-                    return False
-                continue
             try:
-                result = self.templater.evaluate(cond, ctx)
-                if strict and _is_undef(result):
-                    raise RuntimeError(
-                        "The conditional check %r failed: the expression is undefined" % cond)
-                if not self._condition_truth(result, ctx):
+                if not self._condition(cond, ctx, strict, keyword):
                     return False
-            except UntrustedConditional:
+            except ConditionalError:
                 raise
-            except Exception:
+            except Exception as ex:
                 if strict:
                     raise
-                return False
+                raise ConditionalError(_conditional_error_message(cond, ex, keyword))
         return True
 
-    def _condition_truth(self, result, ctx):
+    def _condition(self, cond, ctx, strict=False, keyword="when"):
+        modern = _core_at_least(2, 19)
+        config = ctx.get("__ansiroll_controller_config") or {}
+        allow_broken = modern and _to_bool(
+            config.get("ALLOW_BROKEN_CONDITIONALS", False))
+        if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
+            raise UntrustedConditional(
+                "Encountered untrusted template or expression."
+            )
+        if (
+                isinstance(cond, dict)
+                and set(cond) == {"__ansiroll_untrusted_condition__"}):
+            raise UntrustedConditional(
+                "Encountered untrusted template or expression."
+            )
+        trusted_template = (isinstance(cond, dict)
+                            and set(cond) == {"__ansiroll_trusted_condition__"})
+        if trusted_template:
+            cond = cond["__ansiroll_trusted_condition__"]
+        # Like Ansible, refuse conditionals with embedded templates: the
+        # expression may come from untrusted data (template injection).
+        if isinstance(cond, str) and ("{{" in cond or "{%" in cond):
+            if not trusted_template:
+                raise UntrustedConditional(
+                    "Conditional %r is an untrusted template or expression and "
+                    "cannot be evaluated." % cond)
+            try:
+                from jinja2 import meta as jinja_meta
+                referenced = jinja_meta.find_undeclared_variables(
+                    self.templater.env.parse(cond)
+                )
+            except Exception:
+                referenced = ()
+            if any(
+                    name in ctx
+                    and (
+                        name in self._untrusted_runtime_vars
+                        or _contains_untrusted_condition_value(ctx[name])
+                    )
+                    for name in referenced):
+                raise UntrustedConditional(
+                    "Encountered untrusted template or expression."
+                )
+            result = self.templater.render_string(cond, ctx)
+            # Assert accepts an indirected list of expressions (for
+            # example `that: "{{ expression_list }}"`). Evaluate the
+            # resolved members as conditions rather than treating the
+            # non-empty list itself as truthy.
+            if (keyword is None or not modern) and isinstance(result, (list, tuple)):
+                return self.when(list(result), ctx, strict=strict,
+                                 keyword=keyword)
+            if modern and (result is None or
+                           isinstance(result, str) and not result.strip()):
+                if allow_broken:
+                    return True
+                raise _BrokenConditional("Empty conditional expressions are not allowed.")
+            if isinstance(result, (_UnsafeTemplate, _UntrustedConditionValue)):
+                raise UntrustedConditional(
+                    "Encountered untrusted template or expression."
+                )
+            if isinstance(result, str):
+                whole_template = re.match(r"^\s*\{\{.*\}\}\s*$", cond, re.S)
+                boolean_text = result.strip().lower() in ("true", "false")
+                if whole_template and (modern or not boolean_text):
+                    raise UntrustedConditional(
+                        "Encountered untrusted template or expression."
+                    )
+                if boolean_text:
+                    result = _to_bool(result)
+                else:
+                    result = self.templater.evaluate(result, ctx)
+            if strict and _is_undef(result):
+                raise RuntimeError(
+                    "The conditional check %r failed: the expression is undefined" % cond)
+            return self._condition_truth(result, modern, allow_broken)
+        if cond is None or (isinstance(cond, str) and not cond.strip()):
+            if cond is not None and modern and not allow_broken:
+                raise _BrokenConditional("Empty conditional expressions are not allowed.")
+            return True
+        if not isinstance(cond, (bool, str)) and modern:
+            if not allow_broken:
+                raise _BrokenConditional("Conditional expressions must be strings.")
+            return bool(_fail_on_undef(self.template(cond, ctx)))
+        result = self.templater.evaluate(cond, ctx)
+        if strict and _is_undef(result):
+            raise RuntimeError(
+                "The conditional check %r failed: the expression is undefined" % cond)
+        return self._condition_truth(result, modern, allow_broken)
+
+    def _condition_truth(self, result, modern, allow_broken):
         if isinstance(result, bool):
             return result
-        if isinstance(result, str) and result.strip().lower() in (
-                "true", "false"):
-            return _to_bool(result)
-        if _core_at_least(2, 20) and not _is_undef(result):
-            config = ctx.get("__ansiroll_controller_config") or {}
-            if _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False)):
+        if modern and not _is_undef(result):
+            if allow_broken:
                 return bool(result)
-            raise RuntimeError(
-                "Conditional result was derived from value of type '%s'. "
+            raise _BrokenConditional(
+                "Conditional result (%s) was derived from value of type '%s'. "
                 "Conditionals must have a boolean result."
-                % type(result).__name__
+                % (bool(result), _type_name(result))
             )
-        return _to_bool(result)
+        return bool(result)
 
     # ---- result emission -------------------------------------------------
     def _node_name(self, node):
@@ -1513,6 +1955,17 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if (not is_item and not node.get("no_log") and node.get("register")
+                    and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
+                entries = result["results"] if "results" in result else [result]
+                references = {}
+                for index, entry in enumerate(entries):
+                    facts = entry.get("ansible_facts")
+                    reference = getattr(facts, "controller_reference", None)
+                    if isinstance(facts, _IncludedVars) and reference is not None:
+                        references[str(index)] = reference
+                if references:
+                    frame["included_vars_references"] = references
             self.on_result(frame)
         elif self.pretty:
             self._emit_pretty(frame)
@@ -1568,7 +2021,7 @@ class Runtime:
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):
                 play_check_mode = self.template(play_check_mode, self.ctx())
-            self.check_mode = _to_bool(play_check_mode)
+            self.check_mode = _boolean(play_check_mode)
         if play.get("jinja_plugins"):
             plugins = []
             for plugin in play["jinja_plugins"]:
@@ -1598,10 +2051,12 @@ class Runtime:
         self._runtime_var_overrides = (
             set(self.extra_vars) | set(self._set_fact_overrides)
         )
-        self._play_var_templates = {
-            key: value for key, value in (play.get("vars") or {}).items()
-            if isinstance(value, str) and ("{{" in value or "{%" in value)
-        }
+        self._play_var_templates = {}
+        if not _legacy_non_native(self.vars):
+            self._play_var_templates = {
+                key: value for key, value in (play.get("vars") or {}).items()
+                if _looks_templated(value)
+            }
         self.vars.update(self.template_vars(
             play.get("vars"), self.ctx(), dynamic=True))
         # Host variables created by set_fact have higher precedence than play
@@ -1658,8 +2113,14 @@ class Runtime:
             else:
                 self.run_task(node, overlay, become)
 
+    def _when_of(self, node):
+        own = node.get("when") or []
+        if own[:len(self._inherited_when)] == self._inherited_when:
+            return own
+        return self._inherited_when + list(own)
+
     def _include_steps(self, node, overlay, become):
-        """Run a compile-time-expanded include, once per loop item if looped."""
+        """Run a compile-time-expanded include_tasks or include_role, once per loop item if looped."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
@@ -1670,48 +2131,53 @@ class Runtime:
         if node.get("tasks_ref"):
             # Recursive include: run the enclosing include's expansion again.
             tasks = targets.get(node["tasks_ref"], tasks)
-        try:
-            run_it = self.when(node.get("when"), base_ctx)
-        except UntrustedConditional as ex:
-            self.emit(node, "failed", {"failed": True, "changed": False, "msg": str(ex)})
-            self._tally("failures")
-            result = {"failed": True, "changed": False, "msg": str(ex)}
-            exc = TaskFailed(node.get("name"), node, result)
-            exc.counted = True
-            raise exc
-        if not run_it:
-            self.emit(node, "skipped", {"changed": False, "skipped": True,
-                                        "skip_reason": "Conditional result was False"})
-            self._tally("skipped")
+        items, result, ignore = self._resolve_task_loop(node, base_ctx)
+        if items is not None and not items:
+            result = {"changed": False, "skipped": True, "results": [],
+                      "msg": "No items in the list"}
+        if result is None:
+            result, ignore = self._task_gate(node, base_ctx)
+        if result is not None:
+            self._store_register(node, result)
+            self.emit(node, _status_of(result), result, ignored=ignore)
+            if result.get("skipped"):
+                self._tally("skipped")
+            elif ignore:
+                self._tally("ok")
+                self._tally("ignored")
+            else:
+                raise TaskFailed(node.get("name"), node, result)
             return
         scope = dict(overlay)
         scope.update(self.template_vars(node.get("vars"), base_ctx))
-        loop = node.get("loop")
-        if loop is None:
+        tally_ok = node.get("tally_include_ok", True)
+        if items is None:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
-            if node.get("tally_include_ok", True):
+            if tally_ok:
                 self._tally("ok")
             yield self._node_steps(tasks, scope, b)
             return
-        items = self._resolve_loop(loop, base_ctx)
         for i, it in enumerate(items):
             item_scope = dict(scope)
             item_scope.update(self._loop_item_vars(node, items, i, base_ctx))
             self.emit(node, "ok", {"changed": False, "include": node.get("file"),
                                    "item": it}, item=it, is_item=True)
-            if node.get("tally_include_ok", True):
+            if tally_ok:
                 self._tally("ok")
             yield self._node_steps(tasks, item_scope, b)
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
         scope.update(self.template_vars(block.get("vars"), self.ctx(overlay)))
-        if not self.when(block.get("when"), self.ctx(scope)):
-            b_become = bool(block.get("become")) or become
-            yield self._skip_steps(block.get("block", []), scope, b_become)
-            if block.get("always"):
-                yield self._skip_steps(block["always"], scope, b_become)
-            return
+        # Frames run strictly nested, so the block's conditions stay in force while its children are on the stack.
+        inherited = self._inherited_when
+        self._inherited_when = self._when_of(block)
+        try:
+            yield from self._block_body_steps(block, scope, become)
+        finally:
+            self._inherited_when = inherited
+
+    def _block_body_steps(self, block, scope, become):
         b_become = bool(block.get("become")) or become
         failed_exc = None
         try:
@@ -1751,46 +2217,6 @@ class Runtime:
             else:
                 raise failed_exc
 
-    def _skip_steps(self, nodes, overlay, become):
-        for node in nodes:
-            if node.get("type") == "block":
-                scope = dict(overlay)
-                scope.update(self.template_vars(node.get("vars"), self.ctx(overlay)))
-                b_become = bool(node.get("become")) or become
-                yield self._skip_steps(node.get("block", []), scope, b_become)
-                if node.get("always"):
-                    yield self._skip_steps(node["always"], scope, b_become)
-            else:
-                # Skipped dynamic includes report a skip without loading children.
-                self._skip_task(node, overlay)
-
-    def _skip_task(self, task, overlay):
-        self.emit_start(task)
-        ctx = self._task_ctx(task, overlay)
-        result = {"skipped": True, "changed": False, "skip_reason": "Conditional result was False"}
-        loop = task.get("loop", None)
-        if loop is not None:
-            items = self._resolve_loop(loop, ctx)
-            agg = {"results": [], "changed": False, "skipped": True, "msg": "All items skipped"}
-            for it in items:
-                item_ctx = dict(ctx)
-                item_ctx[task.get("loop_var") or "item"] = it
-                item_res = dict(result)
-                item_res["item"] = it
-                label = self._loop_label(task, item_ctx)
-                if label is not None:
-                    item_res["_ansible_item_label"] = label
-                agg["results"].append(item_res)
-                self.emit(task, "skipped", item_res, item=it, is_item=True)
-            if task.get("register"):
-                self._store_register(task, agg)
-            self.emit(task, "skipped", agg)
-        else:
-            if task.get("register"):
-                self._store_register(task, result)
-            self.emit(task, "skipped", result)
-        self._tally("skipped")
-
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < play/host/facts/registers
         # < role vars < block/parent overlay < task vars < loop item.
@@ -1809,21 +2235,19 @@ class Runtime:
         if task.get("search_path"):
             ctx.setdefault("ansible_search_path", task["search_path"])
         hostvars = ctx.get("hostvars")
-        if isinstance(hostvars, dict):
-            # The controller snapshot predates include_vars/set_fact/register
-            # changes made by this long-lived agent. Refresh this host's entry
-            # for every task while preserving other hosts from the snapshot.
-            hostvars = dict(hostvars)
-            current = dict(hostvars.get(self.host) or {})
-            current.update({
-                key: value for key, value in ctx.items()
-                if key not in ("hostvars", "vars")
-            })
-            hostvars[self.host] = current
-            ctx["hostvars"] = hostvars
-        else:
-            ctx["hostvars"] = {self.host: ctx}
-        ctx.setdefault("vars", ctx)
+        # The controller snapshot predates include_vars/set_fact/register
+        # changes made by this long-lived agent. Refresh this host's entry
+        # for every task while preserving other hosts from the snapshot.
+        hostvars = dict(hostvars) if isinstance(hostvars, dict) else {}
+        current = dict(hostvars.get(self.host) or {})
+        current.update({
+            key: value for key, value in ctx.items()
+            if key not in ("hostvars", "vars")
+        })
+        hostvars[self.host] = current
+        ctx["hostvars"] = hostvars
+        if "vars" not in ctx:
+            ctx["vars"] = _vars_snapshot(ctx)
         return ctx
 
     def _refresh_play_vars(self):
@@ -1870,12 +2294,28 @@ class Runtime:
             total["max"] = max(total["max"], elapsed)
 
     def _run_task(self, task, overlay, become=False):
-        if task.get("special") == "meta_flush_handlers":
-            self.emit_start(task)
-            self.flush_handlers()
-            return
-        if task.get("special") == "meta_clear_host_errors":
-            self._errors_cleared = True
+        special = task.get("special")
+        if special in ("meta_flush_handlers", "meta_clear_host_errors"):
+            conditions = self._when_of(task)
+            if conditions:
+                try:
+                    if not self.when(conditions, self._task_ctx(task, overlay)):
+                        return
+                except ConditionalError as ex:
+                    result = {"failed": True, "changed": False, "msg": str(ex)}
+                    self.emit_start(task)
+                    self.emit(task, "failed", result)
+                    raise TaskFailed(task.get("name"), task, result)
+            if special == "meta_flush_handlers":
+                self.emit_start(task)
+                inherited = self._inherited_when
+                self._inherited_when = []
+                try:
+                    self.flush_handlers()
+                finally:
+                    self._inherited_when = inherited
+            else:
+                self._errors_cleared = True
             return
         effective_become = bool(task.get("become")) or become
         base_ctx = self._task_ctx(task, overlay)
@@ -1884,7 +2324,7 @@ class Runtime:
             try:
                 if isinstance(run_once, str):
                     run_once = self.template(run_once, base_ctx)
-                if _to_bool(run_once):
+                if _boolean(run_once):
                     # Ansible emits no skipped event for hosts which do not
                     # execute a run_once task.
                     return
@@ -1893,70 +2333,25 @@ class Runtime:
                 pass
         self.emit_start(task)
 
-        ignore = task.get("ignore_errors", False)
-        if isinstance(ignore, str):
-            ignore = _to_bool(self.template(ignore, base_ctx))
-        else:
-            ignore = _to_bool(ignore)
-        loop = task.get("loop", None)
-        if loop is not None:
-            # A literal-false task conditional short-circuits loop templating.
-            # An undefined loop expression must not fabricate an undefined item
-            # or emit both an item-level and aggregate skipped result.
-            conditions = task.get("when") or []
-            literal_false = any(
-                cond is False or (
-                    isinstance(cond, str)
-                    and cond.strip().lower() in ("false", "no", "off", "0")
-                )
-                for cond in conditions
-            )
-            if literal_false:
-                res = {"changed": False, "skipped": True,
-                       "skip_reason": "Conditional result was False"}
-                if task.get("register"):
-                    self._store_register(task, res)
-                self.emit(task, "skipped", res)
-                self._tally("skipped")
-                return
-            try:
-                res = self._run_loop(task, base_ctx, effective_become, ignore)
-            except TaskFailed:
-                raise
-            except Exception as ex:
-                # A loop that fails to resolve fails the task -- unless a false
-                # `when` short-circuits it to skipped (ansible/ansible#45189).
+        if task.get("loop") is not None:
+            items, res, ignore = self._resolve_task_loop(task, base_ctx)
+            if res is None:
                 try:
-                    skipped = not self.when(task.get("when"), base_ctx)
-                except Exception:
-                    skipped = False
-                if skipped:
-                    res = {"changed": False, "skipped": True,
-                           "skip_reason": "Conditional result was False"}
-                else:
+                    res, ignore = self._run_loop(task, items, base_ctx, effective_become)
+                except TaskFailed:
+                    raise
+                except Exception as ex:
                     res = {"failed": True, "changed": False, "msg": str(ex)}
-                if task.get("register"):
-                    self._store_register(task, res)
+                    ignore = self._ignore_before_validation(task)
         else:
-            try:
-                run_it = self.when(task.get("when"), base_ctx)
-            except UntrustedConditional as ex:
-                run_it = None
-                res = {"failed": True, "changed": False, "msg": str(ex)}
-            if run_it is False:
-                skip_res = {"changed": False, "skipped": True, "skip_reason": "Conditional result was False"}
-                if task.get("register"):
-                    self._store_register(task, skip_res)
-                self.emit(task, "skipped", skip_res)
-                self._tally("skipped")
-                return
-            if run_it:
+            res, ignore = self._task_gate(task, base_ctx)
+            if res is None:
                 res = self._exec_with_retries(task, base_ctx, effective_become)
-            if task.get("register"):
-                res.setdefault("failed", False)
-                res.setdefault("changed", False)
-                self._store_register(task, res)
-            self._absorb_facts(task, res)
+                self._absorb_facts(task, res)
+        if task.get("register"):
+            res.setdefault("failed", False)
+            res.setdefault("changed", False)
+            self._store_register(task, res)
 
         tally_changed = res.pop("_ansiroll_tally_changed", res.get("changed", False))
         status = _status_of(res)
@@ -1973,6 +2368,50 @@ class Runtime:
         else:
             self._tally("changed" if res.get("changed") else "ok")
             self._queue_notify(task, res)
+
+    def _conditional_skip(self):
+        return {"changed": False, "skipped": True,
+                "skip_reason": "Conditional result was False"}
+
+    def _ignore_before_validation(self, task):
+        ignore = task.get("ignore_errors")
+        # Older executors pass through the inherited keyword on a validation
+        # error. In 2.21+ only a literal bool can take effect this early.
+        return ignore is True if _core_at_least(2, 21) else bool(ignore)
+
+    def _task_gate(self, task, ctx):
+        """Evaluate the task condition, then resolve its ignore_errors keyword."""
+        ignore = task.get("ignore_errors")
+        try:
+            if not self.when(self._when_of(task), ctx):
+                return self._conditional_skip(), self._ignore_before_validation(task)
+        except ConditionalError as ex:
+            result = {"failed": True, "changed": False, "msg": str(ex)}
+            return result, self._ignore_before_validation(task)
+        if ignore is None or isinstance(ignore, bool):
+            return None, bool(ignore)
+        try:
+            value = _fail_on_undef(self.template(ignore, ctx))
+            if isinstance(value, _Omit):
+                value = task.get("ignore_errors_on_omit", False)
+                if not _core_at_least(2, 19):
+                    # These executors restore context and skip boolean validation.
+                    return None, bool(value)
+        except jinja2.UndefinedError as ex:
+            detail = str(ex)
+        except Exception as ex:
+            detail = "Error rendering template: %s" % ex
+        else:
+            try:
+                return None, _boolean(value, strict=True)
+            except TypeError:
+                detail = "The value %r could not be converted to 'bool'." % value
+        if _core_at_least(2, 19):
+            message = "Task failed: Error processing keyword 'ignore_errors': " + detail
+        else:
+            message = "The field 'ignore_errors' has an invalid value: " + detail
+        result = {"failed": True, "changed": False, "msg": message}
+        return result, self._ignore_before_validation(task)
 
     def _loop_item_vars(self, task, items, i, ctx=None):
         """Per-item loop variables: loop_var, index_var and ansible_loop."""
@@ -2000,24 +2439,24 @@ class Runtime:
             out["ansible_loop"] = loop_info
         return out
 
-    def _run_loop(self, task, base_ctx, become=False, ignore_errors=False):
-        items = self._resolve_loop(task.get("loop"), base_ctx)
+    def _run_loop(self, task, items, base_ctx, become=False):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
-        any_ran = False
+        ignore_loop = False
+        failed_items_ignored = True
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
             ctx.update(self._loop_item_vars(task, items, i, base_ctx))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
-            if not self.when(task.get("when"), ctx):
-                res = {"skipped": True, "changed": False,
-                       "skip_reason": "Conditional result was False"}
-            else:
-                any_ran = True
+            res, ignore = self._task_gate(task, ctx)
+            if res is None:
                 res = self._exec_with_retries(task, ctx, become)
                 self._absorb_facts(task, res)
-                if isinstance(res.get("ansible_facts"), dict):
-                    base_ctx.update(res["ansible_facts"])
+                facts = res.get("ansible_facts")
+                if isinstance(facts, _IncludedVars):
+                    base_ctx.update({key: self.vars[key] for key in facts})
+                elif isinstance(facts, dict):
+                    base_ctx.update(facts)
             res["item"] = it
             if task.get("loop_label") is not None:
                 label_ctx = dict(ctx)
@@ -2031,6 +2470,24 @@ class Runtime:
                 except Exception as ex:
                     res = {"failed": True, "changed": False, "item": it,
                            "msg": "Failed to template loop_control.label: %s" % ex}
+            stop = False
+            bw = task.get("loop_break_when")
+            if bw:
+                bctx = dict(ctx)
+                if task.get("register"):
+                    bctx[task["register"]] = res
+                try:
+                    stop = self.when(bw, bctx, keyword="break_when")
+                except ConditionalError as ex:
+                    if not _core_at_least(2, 21):
+                        # Older executors emitted the item before evaluating
+                        # break_when, then returned the task-level error.
+                        self.emit(task, _status_of(res), res, item=it,
+                                  ignored=ignore, is_item=True)
+                        return {"failed": True, "changed": False, "msg": str(ex)}, ignore
+                    res["failed"] = True
+                    res["break_when_result"] = str(ex)
+                    stop = True
             tally_changed = res.pop(
                 "_ansiroll_tally_changed", res.get("changed", False)
             )
@@ -2040,41 +2497,69 @@ class Runtime:
                 agg["_ansiroll_tally_changed"] = True
             if res.get("failed"):
                 agg["failed"] = True
-            self.emit(task, _status_of(res), res, item=it,
-                      ignored=ignore_errors, is_item=True)
-            bw = task.get("loop_break_when")
-            if bw:
-                bctx = dict(ctx)
-                if task.get("register"):
-                    bctx[task["register"]] = res
-                if self.when(bw, bctx):
-                    break
+                failed_items_ignored = failed_items_ignored and ignore
+            ignore_loop = ignore_loop or ignore
+            self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
+            if stop:
+                break
         if not items:
-            # Ansible reports a loop that resolves to no items as skipped.
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
-        elif not any_ran:
+        elif all(res.get("skipped") for res in agg["results"]):
             agg["skipped"] = True
             agg["msg"] = "All items skipped"
-        if task.get("register"):
-            self._store_register(task, agg)
-        return agg
+        elif agg["failed"]:
+            agg["msg"] = "One or more items failed"
+        return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
-    def _loop_label(self, task, ctx):
-        label = task.get("loop_label")
-        if label is None:
-            return None
+    def _resolve_task_loop(self, task, ctx):
+        loop = task.get("loop")
+        if loop is None:
+            return None, None, False
         try:
-            return self.template(label, ctx)
-        except Exception:
-            return None
+            return self._resolve_loop(loop, ctx), None, False
+        except jinja2.UndefinedError as ex:
+            # Only undefined loop values are deferred until the task's
+            # condition has had a chance to skip it.
+            try:
+                skipped = not self.when(self._when_of(task), ctx)
+            except ConditionalError:
+                skipped = False
+            if skipped:
+                result = self._conditional_skip()
+            else:
+                message = "Task failed: %s" % ex if _core_at_least(2, 19) else str(ex)
+                result = {"failed": True, "changed": False, "msg": message}
+        except Exception as ex:
+            result = {"failed": True, "changed": False, "msg": str(ex)}
+        return None, result, self._ignore_before_validation(task)
 
     def _resolve_loop(self, loop, ctx):
+        items = _mark_unsafe(self._resolve_loop_items(loop, ctx))
+        if not isinstance(loop, list) or not _legacy_templating():
+            return items
+        # Legacy core can template an inline item again when the task reads it.
+        # Limit this to output authored entirely as literals in the playbook,
+        # so values flowing from vars, lookups or filters stay data.
+        for i, source in enumerate(loop):
+            if type(source) is not str or type(items[i]) is not _UnsafeText:
+                continue
+            parsed = self.templater.env.parse(source)
+            if all(isinstance(node, jinja2.nodes.Output) and
+                   all(isinstance(part, (jinja2.nodes.Const, jinja2.nodes.TemplateData))
+                       for part in node.nodes)
+                   for node in parsed.body):
+                items[i] = str(items[i])
+        return items
+
+    def _resolve_loop_items(self, loop, ctx):
         if isinstance(loop, dict) and "__ansiroll_lookup" in loop:
             name = loop["__ansiroll_lookup"]
             if name == "sequence":
                 return self._resolve_sequence_loop(loop.get("terms"), ctx)
-            terms = self.template(loop.get("terms"), ctx)
+            # Defer undefined lookup terms to the task condition, before a
+            # lookup can turn them into loop items or different errors.
+            terms = _fail_on_undef(self.template(loop.get("terms"), ctx))
             if not isinstance(terms, list):
                 terms = [terms]
             try:
@@ -2084,11 +2569,13 @@ class Runtime:
                 if _is_undef(vals):
                     vals._fail_with_undefined_error()
                 return vals
-        items = self.template(loop, ctx)
-        if items is None:
-            return []
+        items = _fail_on_undef(self.template(loop, ctx))
         if not isinstance(items, list):
-            items = [items]
+            if _core_at_least(2, 19):
+                message = "The `loop` value must resolve to a 'list', not %r." % _type_name(items)
+            else:
+                message = "Invalid data passed to 'loop', it requires a list, got this instead: %s" % items
+            raise ValueError(message)
         return items
 
     def _resolve_sequence_loop(self, terms, ctx):
@@ -2101,7 +2588,7 @@ class Runtime:
 
         out = []
         for term in terms:
-            rendered = self.template(term, ctx) if isinstance(term, str) else term
+            rendered = self.template(term, ctx)
             out.extend(_sequence_items(str(rendered)))
         return out
 
@@ -2121,7 +2608,12 @@ class Runtime:
             if task.get("register"):
                 eval_ctx[task["register"]] = res
             last = res
-            if self.when(until, eval_ctx):
+            try:
+                done = self.when(until, eval_ctx, keyword="until")
+            except ConditionalError as ex:
+                # Ansible replaces the module result with the error.
+                return {"failed": True, "changed": False, "msg": str(ex)}
+            if done:
                 return res
             if attempt < attempts and delay > 0:
                 time.sleep(delay)
@@ -2140,12 +2632,15 @@ class Runtime:
         inherited_check_mode = self.check_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
+        refreshed_vars = None
+        included_vars = None
+        included_vars_reference = None
         try:
             check_override = task.get("check_mode")
             if check_override is not None:
                 if isinstance(check_override, str):
                     check_override = self.template(check_override, ctx)
-                self.check_mode = _to_bool(check_override)
+                self.check_mode = _boolean(check_override)
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -2182,23 +2677,39 @@ class Runtime:
                         self.template(task.get("args") or {}, ctx)
                     ))
                     res = self.delegate_fn(task, args, become, ctx)
+                    action = task["action"].rsplit(".", 1)[-1]
+                    if action == "group_by":
+                        # Preserve trust only for controller inventory metadata.
+                        refreshed_vars = res.pop("_ansiroll_vars", None)
+                    elif action == "include_vars":
+                        payload = res.pop("_ansiroll_included_vars", None)
+                        included_vars_reference = res.pop("_ansiroll_included_vars_reference", None)
+                        if payload is not None:
+                            included_vars = json.loads(payload)
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(self.template(task.get("args") or {}, ctx)))
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
-                    res = self._run_async_module(task["action"], args, become=become)
+                    res = self._run_async_module(
+                        task["action"], args, become=become,
+                        async_val=int(task.get("async_val") or 0), ctx=ctx,
+                        options=task.get("async_options"))
+                elif task.get("action") in ("async_status", "ansible.builtin.async_status",
+                                            "ansible.legacy.async_status"):
+                    res = self._run_async_status(task["action"], args, become, ctx,
+                                                 task.get("async_options"))
                 elif task.get("accelerator") and (
                         self.accelerated_modules
                         or task.get("accelerator") == "required"):
                     res = self._run_accelerated_action(task, args, become)
+                    if res is not None:
+                        provenance = {
+                            "mode": "native-agent",
+                            "reason": "accelerated action",
+                        }
                 else:
                     res = None
-                if res is not None:
-                    provenance = {
-                        "mode": "native-agent",
-                        "reason": "accelerated action",
-                    }
                 if res is None:
                     res = self.run_module(task["action"], args, become=become)
         except Exception as ex:
@@ -2210,7 +2721,18 @@ class Runtime:
             self._module_env = None
             self.check_mode = inherited_check_mode
             self.become_user = inherited_become_user
+        # Module output is data, never a template (Ansible marks it unsafe).
+        res = _mark_unsafe(res)
+        if isinstance(included_vars, dict):
+            # Only the include_vars controller reply carries authored definitions.
+            res["ansible_facts"] = _IncludedVars(
+                (key, _decode_included_var(value))
+                for key, value in included_vars.items()
+            )
+            res["ansible_facts"].controller_reference = included_vars_reference
         self._apply_overrides(task, res, ctx)
+        if refreshed_vars is not None:
+            res["_ansiroll_vars"] = refreshed_vars
         if self.profile:
             module_profile = res.get("_ansiroll_profile") or {}
             elapsed = time.monotonic() - task_started
@@ -2383,7 +2905,11 @@ class Runtime:
 
     def _run_special(self, special, task, ctx, become=False):
         name = special.split(".")[-1]
-        args = self.template(task.get("args") or {}, ctx)
+        raw_args = task.get("args") or {}
+        if name == "assert":
+            # Its condition expressions are interpreted only by when().
+            raw_args = {k: v for k, v in raw_args.items() if k != "that"}
+        args = self.template(raw_args, ctx)
         # Ansible accepts the complete module argument dictionary through a
         # single template, representing it internally as `_raw_params`.
         if (
@@ -2392,35 +2918,46 @@ class Runtime:
                 and isinstance(args["_raw_params"], dict)):
             args = dict(args["_raw_params"])
         if name == "debug":
-            for value in args.values():
-                _fail_on_direct_undef(value)
-        else:
-            args = _fail_on_undef(args)
-        if name == "debug":
+            for key, value in args.items():
+                try:
+                    _fail_on_undef(value)
+                except jinja2.UndefinedError as ex:
+                    if _core_at_least(2, 19):
+                        return {
+                            "changed": False, "failed": True,
+                            "msg": ("Task failed: Finalization of task args for "
+                                    "'ansible.builtin.debug' failed: Error while "
+                                    "resolving value for %r: %s" % (key, ex)),
+                        }
+                    raise
             if "var" in args:
                 key = args["var"]
                 # `var:` takes an expression (often dotted), evaluated against vars.
                 try:
                     val = self.templater.evaluate(key, ctx)
+                except jinja2.UndefinedError as ex:
+                    val = _captured(str(ex))
                 except Exception:
                     val = ctx.get(key, self.vars.get(key))
-                if _is_undef(val):
-                    val = "VARIABLE IS NOT DEFINED!"
-                return {"changed": False, key: val, "_ansible_verbose_always": True}
+                return {"changed": False, key: _debug_var_value(val),
+                        "_ansible_verbose_always": True}
             return {
                 "changed": False,
                 "msg": args.get("msg", "Hello world!"),
                 "_ansible_verbose_always": True,
             }
+        args = _fail_on_undef(args)
         if name == "set_fact":
             import keyword
-            facts = {
-                _trust_set_fact_value(k): _trust_set_fact_value(v)
-                for k, v in args.items() if k not in ("cacheable",)
-            }
-            cacheable = _to_bool(args.get("cacheable", False))
+            facts = {}
+            key_templates = set(task.get("set_fact_key_templates", ()))
+            cacheable = _boolean(args.get("cacheable", False))
             reserved = ("true", "false", "yes", "no", "on", "off", "none", "null")
-            for k in facts:
+            for k, value in args.items():
+                if k == "cacheable":
+                    continue
+                if k in key_templates:
+                    k = _fail_on_undef(self.template(str(k), ctx))
                 if not isinstance(k, str):
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s' of type '%s'"
@@ -2428,6 +2965,7 @@ class Runtime:
                 if not k.isidentifier() or keyword.iskeyword(k) or k.lower() in reserved:
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s'" % k}
+                facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
             self.vars.update(facts)
             return {
                 "changed": False,
@@ -2453,7 +2991,10 @@ class Runtime:
             tests = (task.get("args") or {}).get("that", args.get("that", []))
             if isinstance(tests, str):
                 tests = [tests]
-            ok = self.when(tests, ctx)
+            try:
+                ok = self.when(tests, ctx, keyword=None)
+            except ConditionalError as ex:
+                return {"failed": True, "changed": False, "msg": str(ex)}
             if ok:
                 return {"changed": False, "msg": args.get("success_msg", "All assertions passed")}
             return {"failed": True, "changed": False,
@@ -2572,13 +3113,96 @@ class Runtime:
             self._close_workers()
             return None
 
-    def _run_async_module(self, action, args, become=False):
+    def _async_dir_option(self, ctx, options, version):
+        """Resolve the configured shell option and its task overrides."""
+        env = self._module_env or {}
+        if version < (2, 12) and "ANSIBLE_ASYNC_DIR" in env:
+            return env["ANSIBLE_ASYNC_DIR"]
+        value = (ctx or {}).get("ansible_async_dir")
+        if value is None or _is_undef(value):
+            value = options.get("dir", "~/.ansible_async")
+        return _as_text(self.template(value, ctx))
+
+    def _remote_expand_user(self, path, become):
+        """ActionBase._remote_expand_user: a bare ~ means the become user's home."""
+        if not path.startswith("~"):
+            return path
+        head, sep, rest = path.partition(os.path.sep)
+        if head == "~" and become and self.become_user:
+            head = "~%s" % self.become_user
+        return os.path.expanduser(head) + sep + rest
+
+    def _run_async_status(self, action, args, become, ctx, options=None):
+        """ansible.builtin.async_status action plugin around its module."""
+        options = options or {}
+        version = tuple(options.get("version", (2, 21)))
+        unsupported = sorted(set(args) - {"jid", "mode"})
+        if unsupported:
+            if version >= (2, 13):
+                msg = ("Unsupported parameters for (%s) module: %s. "
+                       "Supported parameters include: jid, mode." %
+                       (action, ", ".join(unsupported)))
+            else:
+                msg = "Invalid options for %s: %s" % (action, ",".join(unsupported))
+            return {"failed": True, "changed": False, "msg": msg}
+        async_dir = self._async_dir_option(ctx, options, version)
+        module_args = dict(args, _async_dir=async_dir)
+        if version < (2, 12):
+            if "jid" not in args:
+                return {"failed": True, "msg": "jid is required"}
+            return self.run_module(action, module_args, become=become)
+
+        module_args["_async_dir"] = self._remote_expand_user(async_dir, become)
+        modern_flags = version >= (2, 19)
+        stopped = False if modern_flags else 0
+        results = {
+            "started": stopped, "finished": stopped, "stdout": "", "stderr": "",
+            "stdout_lines": [], "stderr_lines": [],
+        }
+        if "jid" not in args:
+            if version[:2] == (2, 12):
+                results.update(failed=True, msg="jid is required")
+                return results
+            return {"failed": True, "changed": False, "msg": "missing required arguments: jid"}
+        mode = args.get("mode", "status")
+        if version >= (2, 13) and mode not in ("status", "cleanup"):
+            message = "value of mode must be one of: status, cleanup, got: %s" % _as_text(mode)
+            return {"failed": True, "changed": False, "msg": message.rstrip()}
+
+        jid = _as_text(args["jid"])
+        results["ansible_job_id"] = jid
+        log_path = os.path.join(module_args["_async_dir"], jid)
+        if mode == "cleanup":
+            results["erased"] = log_path
+        else:
+            results["results_file"] = log_path
+            results["started"] = True if modern_flags else 1
+        results = _f_combine(results, self.run_module(action, module_args, become=become),
+                             recursive=True)
+        if modern_flags:
+            for convert in ("started", "finished"):
+                results[convert] = bool(results[convert])
+        return results
+
+    def _run_async_module(self, action, args, become=False, async_val=0, ctx=None,
+                          options=None):
         meta = self.modules.get(action)
         if meta is None:
             return None
-        params = json.dumps({"ANSIBLE_MODULE_ARGS": args})
+        options = options or {}
+        version = tuple(options.get("version", (2, 21)))
+        if self.check_mode and version < (2, 17):
+            return {"failed": True, "changed": False,
+                    "msg": "check mode and async cannot be used on same task."}
+        params = self._module_params(args)
+        # The wrapper and its module receive the same task environment.
+        env = dict(self._module_env or {})
+        env["ANSIBLE_ASYNC_DIR"] = self._async_dir_option(ctx, options, version)
         try:
-            ack = self._run_async_via_worker(meta, params, become)
+            ack = self._run_async_via_worker(
+                meta, params, become, env=env,
+                time_limit=async_val, version=version,
+                poll_before_timeout=options.get("poll_before_timeout", False))
         except Exception as ex:
             detail = self._worker_stderr(bool(become))
             self._close_workers()
@@ -2589,14 +3213,9 @@ class Runtime:
                        % (meta["module_fqn"], ex, (": " + detail) if detail else ""),
                 "module_stderr": detail,
             }
-        jid = ack.get("jid") or str(ack.get("pid"))
-        return {
-            "changed": True,
-            "ansible_job_id": jid,
-            "started": 1,
-            "finished": 0,
-            "results_file": "",
-        }
+        if not ack.get("failed"):
+            ack["changed"] = True
+        return ack
 
     def _run_file_action(self, name, task, args, ctx, become=False):
         """Handle template/copy using src content baked at compile time.
@@ -2661,7 +3280,11 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    new_content = _as_text(self.templater.render_string(raw, tctx))
+                    rendered = self.templater.render_string(raw, tctx)
+                    if _core_at_least(2, 19) and isinstance(rendered, _Omit):
+                        return {"failed": True, "changed": False,
+                                "msg": "Task failed: A template was resolved to an Omit scalar."}
+                    new_content = _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
@@ -2710,7 +3333,15 @@ class Runtime:
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
         facts = res.get("ansible_facts")
-        if isinstance(facts, dict):
+        if isinstance(facts, _IncludedVars):
+            for key, value in facts.items():
+                if (key not in self.extra_vars and key not in self._set_fact_overrides
+                        and key not in self._untrusted_runtime_vars):
+                    self.vars[key] = value
+                    self._runtime_var_overrides.add(key)
+        elif isinstance(facts, dict):
+            # Facts are module output: never templated (Ansible marks them unsafe).
+            facts = _mark_unsafe(facts)
             self.vars.update(facts)
             if str(task.get("action") or "").rsplit(".", 1)[-1] == "set_fact":
                 self._runtime_var_overrides.update(facts)
@@ -2820,15 +3451,18 @@ class Runtime:
             return marker
         return self._asset_bytes(marker).decode("utf-8", "surrogateescape")
 
+    def _module_params(self, args):
+        module_args = dict(args)
+        module_args["_ansible_check_mode"] = bool(self.check_mode)
+        module_args["_ansible_diff"] = bool(self.diff_mode)
+        return json.dumps({"ANSIBLE_MODULE_ARGS": module_args})
+
     def run_module(self, action, args, become=False):
         meta = self.modules.get(action)
         if meta is None:
             return {"failed": True, "changed": False,
                     "msg": "ansiroll: module %r was not embedded" % action}
-        module_args = dict(args)
-        module_args["_ansible_check_mode"] = bool(self.check_mode)
-        module_args["_ansible_diff"] = bool(self.diff_mode)
-        params = json.dumps({"ANSIBLE_MODULE_ARGS": module_args})
+        params = self._module_params(args)
         # Modules run in the persistent forking worker (in-memory, decode-once).
         # If the worker DIES (OOM / bug / sudo failure), the task's outcome is
         # unknown -- so we fail loudly rather than silently retrying (which could
@@ -2890,7 +3524,8 @@ class Runtime:
             result["_ansiroll_profile"] = profile_data
         return result
 
-    def _run_async_via_worker(self, meta, params, become):
+    def _run_async_via_worker(self, meta, params, become, env, time_limit, version,
+                              poll_before_timeout):
         w = self._get_worker(bool(become))
         fqn = meta["module_fqn"]
         profile = meta.get("profile", "legacy")
@@ -2904,7 +3539,9 @@ class Runtime:
                 raise RuntimeError("worker load failed: %r" % (ack,))
             w["loaded"].add(fqn)
         request = {"op": "async_run", "fqn": fqn,
-                   "params": params, "profile": profile}
+                   "params": params, "profile": profile, "env": env,
+                   "time_limit": time_limit, "version": version,
+                   "poll_before_timeout": poll_before_timeout}
         self._send_worker_request(w["proc"], request, self._module_source_bytes)
         ack = self._frame_recv(w["proc"])
         if not isinstance(ack, dict) or ack.get("error"):
@@ -2938,8 +3575,10 @@ class Runtime:
         become = self._needs_become(become)
         key = (True, self.become_user) if become else False
         w = self._workers.get(key)
-        if w and w["proc"].poll() is None:
-            return w
+        if w:
+            if w["proc"].poll() is None:
+                return w
+            self._stop_worker(self._workers.pop(key))
         startup_started = time.monotonic()
         worker_code = _worker_source()
         cmd = [self.python, "-c", worker_code]
@@ -2973,45 +3612,57 @@ class Runtime:
         self.engine_profile["worker_spawn"] += time.monotonic() - spawn_started
         identity = "sudo:%s" % self.become_user if become else "current-user"
         w = {"proc": proc, "loaded": set(), "identity": identity}
+        try:
+            proc._ansiroll_stderr = _WorkerStderr(proc)
+        except BaseException:
+            self._stop_worker(w)
+            raise
+        self._workers[key] = w
         bundle_started = time.monotonic()
         if self.module_bundle is not None:
             bundle_bytes = self.module_bundle
             self._frame_send(proc, {
                 "op": "bundle", "size": len(bundle_bytes),
             })
-            proc.stdin.write(bundle_bytes)
-            proc.stdin.flush()
+            self._write_all(proc, bundle_bytes)
             ack = self._frame_recv(proc)
             if not isinstance(ack, dict) or not ack.get("ok"):
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
                 raise RuntimeError("worker raw bundle load failed: %r" % (ack,))
         self.engine_profile["worker_bundle"] += time.monotonic() - bundle_started
         self.engine_profile["workers_started"] += 1
         identities = self.engine_profile.setdefault("worker_identities", {})
         identities[identity] = identities.get(identity, 0) + 1
         self.engine_profile["worker_startup"] += time.monotonic() - startup_started
-        self._workers[key] = w
         return w
 
     def _worker_stderr(self, become):
-        """Best-effort read of a dead worker's stderr (why it died)."""
+        """Return up to the last 64 KiB of worker diagnostics."""
         become = self._needs_become(become)
         key = (True, self.become_user) if become else False
         w = self._workers.get(key)
-        if not w or not w["proc"].stderr:
+        if not w:
             return ""
         try:
-            return w["proc"].stderr.read().decode("utf-8", "surrogateescape").strip()
-        except Exception:
+            return w["proc"]._ansiroll_stderr.read()
+        except OSError:
             return ""
 
     def _frame_send(self, proc, obj):
         b = json.dumps(obj).encode("utf-8")
-        proc.stdin.write(struct.pack(">I", len(b)))
-        proc.stdin.write(b)
+        self._write_all(proc, struct.pack(">I", len(b)) + b)
+
+    @staticmethod
+    def _write_all(proc, data):
+        # The worker pipes are unbuffered (bufsize=0): write() may be short.
+        view = memoryview(data)
+        diagnostics = getattr(proc, "_ansiroll_stderr", None)
+        while view:
+            if diagnostics is not None:
+                diagnostics.wait(proc.stdin, selectors.EVENT_WRITE)
+            written = proc.stdin.write(view)
+            if not written:
+                raise OSError("worker request write made no progress")
+            view = view[written:]
         proc.stdin.flush()
 
     def _send_worker_request(self, proc, request, source=None):
@@ -3021,24 +3672,26 @@ class Runtime:
         request = dict(request)
         request["source_size"] = len(source)
         self._frame_send(proc, request)
-        proc.stdin.write(source)
-        proc.stdin.flush()
+        self._write_all(proc, source)
 
     def _frame_recv(self, proc):
-        head = self._readn(proc.stdout, 4)
+        diagnostics = getattr(proc, "_ansiroll_stderr", None)
+        head = self._readn(proc.stdout, 4, diagnostics)
         if not head:
             return None
         (n,) = struct.unpack(">I", head)
-        body = self._readn(proc.stdout, n)
+        body = self._readn(proc.stdout, n, diagnostics)
         if body is None:
             return None
         return json.loads(body.decode("utf-8"))
 
     @staticmethod
-    def _readn(stream, n):
+    def _readn(stream, n, diagnostics=None):
         chunks = []
         got = 0
         while got < n:
+            if diagnostics is not None:
+                diagnostics.wait(stream, selectors.EVENT_READ)
             c = stream.read(n - got)
             if not c:
                 return None
@@ -3046,24 +3699,30 @@ class Runtime:
             got += len(c)
         return b"".join(chunks)
 
+    def _stop_worker(self, worker):
+        proc = worker["proc"]
+        # EOF ends the worker's request loop. Closing avoids waiting for a
+        # worker whose request pipe is full.
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        finally:
+            proc.stdout.close()
+            capture = getattr(proc, "_ansiroll_stderr", None)
+            if capture is not None:
+                capture.close()
+            else:
+                proc.stderr.close()
+
     def _close_workers(self):
-        for w in self._workers.values():
-            proc = w["proc"]
-            try:
-                self._frame_send(proc, {"op": "quit"})
-            except Exception:
-                pass
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        for worker in self._workers.values():
+            self._stop_worker(worker)
         self._workers = {}
 
 
@@ -3168,6 +3827,11 @@ def _hostname():
         return "localhost"
 
 
+def _state_json_default(value):
+    # The final state can include lazy play vars which were never resolved.
+    return None if _is_undef(value) else str(value)
+
+
 def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_mode=False,
          become_password=None, defer_handlers=False, initial_notified=None,
          extra_vars=None, pretty=False, profile=False, module_bundle=None,
@@ -3268,7 +3932,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         # can carry them into the next segment (segment-driven delegation).
         sys.stdout.write("%s %s\n" % (STATE_MARKER, json.dumps(
             {"vars": (rt.vars if rt else host_vars), "notified": (rt.notified if rt else [])},
-            default=str)))
+            default=_state_json_default)))
         # Authoritative recap line for controllers (the strategy parses this).
         sys.stdout.write("%s %s\n" % (STATS_MARKER, json.dumps({"host": host, "stats": total})))
         sys.stdout.flush()
@@ -3396,8 +4060,12 @@ def _chan_recv():
 
 def _chan_send(out_fd, obj):
     b = json.dumps(obj, default=str).encode("utf-8", "surrogateescape")
-    os.write(out_fd, struct.pack(">I", len(b)))
-    os.write(out_fd, b)
+    view = memoryview(struct.pack(">I", len(b)) + b)
+    while view:
+        written = os.write(out_fd, view)
+        if not written:
+            raise OSError("agent channel write made no progress")
+        view = view[written:]
 
 
 def _delegate_vars(ctx):
@@ -3407,10 +4075,11 @@ def _delegate_vars(ctx):
         if key == "vars":
             continue
         try:
-            json.dumps(value, default=str)
-        except (TypeError, ValueError):
+            # Materialize lazy values once so sending the frame cannot
+            # resolve the same context a second time.
+            safe[key] = json.loads(json.dumps(value, default=str))
+        except (TypeError, ValueError, jinja2.UndefinedError):
             continue
-        safe[key] = value
     return safe
 
 
@@ -3429,9 +4098,10 @@ def agent_main():
     host_vars.update(g.get("_BAKED_GROUP_VARS") or {})
     if "_INJECTED_VARS" in g:
         host_vars.update(g["_INJECTED_VARS"])
-    extra_vars = g.get("_INJECTED_EXTRA_VARS") or {}
+    extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
     host_var_overrides = g.get("_INJECTED_HOST_VAR_OVERRIDES") or {}
-    specialized_vars = g.get("_SPECIALIZED_VARS") or {}
+    specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
+    specialized_vars.update(g.get("_FROZEN_VARS") or {})
     conflicts = sorted(k for k, value in specialized_vars.items()
                        if k in extra_vars and extra_vars[k] != value)
     if conflicts:

@@ -781,7 +781,7 @@ def test_explicit_freeze_allows_deterministic_jinja_globals(tmp_path):
     playbook = tmp_path / "pb.yml"
     source, manifest = compile_playbook(str(playbook), freeze_vars=["ports"])
     assert manifest["tree_shake"]["frozen_var_names"] == ["ports"]
-    assert _bundle_json(source, "specialized_vars.json")["ports"] == [8000, 8001, 8002]
+    assert _bundle_json(source, "frozen_vars.json")["ports"] == [8000, 8001, 8002]
     expected = _ansible(playbook)
     assert expected[0] == ["8000,8001,8002"]
     assert _ansiroll(playbook, tmp_path, "--freeze-var", "ports") == expected

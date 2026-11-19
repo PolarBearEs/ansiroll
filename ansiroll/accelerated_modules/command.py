@@ -10,6 +10,8 @@ import os
 import selectors
 import shlex
 import subprocess
+
+from . import _stdin
 import sys
 import traceback
 
@@ -101,6 +103,10 @@ def _fork_python_import(source, environment=None, chdir=None):
             os.dup2(stderr_write, 2)
             os.close(stdout_write)
             os.close(stderr_write)
+            stdin_read = _stdin.eof_pipe()
+            os.dup2(stdin_read, 0)
+            os.close(stdin_read)
+            sys.stdin = io.open(0, "r", encoding="utf-8", closefd=False)
             sys.stdout = io.open(1, "w", encoding="utf-8", closefd=False)
             sys.stderr = io.open(2, "w", encoding="utf-8", closefd=False)
             if environment:
@@ -216,7 +222,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
                     chdir=args.get("chdir"))
                 proc = None
             else:
-                proc = subprocess.Popen(
+                proc = _stdin.popen(
                     raw, shell=True, executable=args.get("executable"),
                     cwd=args.get("chdir"),
                     stdin=subprocess.PIPE if stdin is not None else None,
@@ -232,7 +238,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
                     chdir=args.get("chdir"))
                 proc = None
             else:
-                proc = subprocess.Popen(
+                proc = _stdin.popen(
                     cmd, cwd=args.get("chdir"),
                     stdin=subprocess.PIPE if stdin is not None else None,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,

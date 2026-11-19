@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 
+from . import _stdin
+
 
 _PACKAGE_KEYS = ("name", "package", "pkg")
 _ALLOWED = frozenset(_PACKAGE_KEYS + (
@@ -72,7 +74,7 @@ def _environment(environment, force_c_locale=False):
 
 def _command(argv, environment=None, force_c_locale=False):
     try:
-        process = subprocess.Popen(
+        process = _stdin.popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

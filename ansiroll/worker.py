@@ -1,18 +1,23 @@
 """Persistent stdlib-only module worker embedded into compiled agents."""
 
+import atexit
 import base64
 import ctypes
-import datetime
 import importlib.abc
 import importlib.util
 import io
 import json
 import os
+import random
 import runpy
 import selectors
 import shutil
+import signal
 import struct
 import sys
+import tempfile
+import time
+import traceback
 import zipfile
 
 _in = sys.stdin.buffer
@@ -124,12 +129,20 @@ def _recv():
     return json.loads(_readn(n).decode("utf-8"))
 
 
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if not written:
+            raise OSError("worker write made no progress")
+        view = view[written:]
+
+
 def _send(obj):
     if obj is None:
         obj = {"_ansiroll_fallback": True}
     b = json.dumps(obj).encode("utf-8")
-    os.write(_RESP, struct.pack(">I", len(b)))
-    os.write(_RESP, b)
+    _write_all(_RESP, struct.pack(">I", len(b)) + b)
 
 
 def _load_zip_bytes(data):
@@ -248,33 +261,64 @@ def _fast_write(args, check_mode):
 
 def _drain_pair(r_out, r_err):
     chunks = {r_out: [], r_err: []}
-    sel = selectors.DefaultSelector()
-    sel.register(r_out, selectors.EVENT_READ)
-    sel.register(r_err, selectors.EVENT_READ)
-    while sel.get_map():
-        for key, _ in sel.select():
-            fd = key.fd
-            try:
-                c = os.read(fd, 65536)
-            except OSError:
-                c = b""
-            if c:
-                chunks[fd].append(c)
-            else:
-                try:
+    with selectors.DefaultSelector() as sel:
+        sel.register(r_out, selectors.EVENT_READ)
+        sel.register(r_err, selectors.EVENT_READ)
+        while sel.get_map():
+            for key, _ in sel.select():
+                fd = key.fd
+                chunk = os.read(fd, 65536)
+                if chunk:
+                    chunks[fd].append(chunk)
+                else:
                     sel.unregister(fd)
-                except Exception:
-                    pass
     return (
         b"".join(chunks[r_out]).decode("utf-8", "surrogateescape"),
         b"".join(chunks[r_err]).decode("utf-8", "surrogateescape"),
     )
 
 
+def _eof_stdin():
+    # Connection plugins hand modules a pipe on stdin and close its write end
+    # (local.py: Popen(stdin=PIPE) + communicate()), and run_command children
+    # inherit it. Never leak the worker's request pipe into a module.
+    r, w = os.pipe()
+    os.close(w)
+    os.dup2(r, 0)
+    os.close(r)
+    sys.stdin = sys.__stdin__ = io.open(0, "r", closefd=False)
+
+
+def _run_exit_handlers():
+    # A real AnsiballZ process ends with normal interpreter shutdown: join
+    # non-daemon threads, then run atexit callbacks (AnsibleModule.tmpdir
+    # registers shutil.rmtree for its ansible-moduletmp-* directory).
+    threading = sys.modules.get("threading")
+    if threading is not None:
+        try:
+            threading._shutdown()
+        except BaseException:
+            pass
+    try:
+        atexit._run_exitfuncs()
+    except BaseException:
+        pass
+
+
 def _run(fqn, params, profile, env=None):
     r_out, w_out = os.pipe()
-    r_err, w_err = os.pipe()
-    pid = os.fork()
+    try:
+        r_err, w_err = os.pipe()
+        try:
+            pid = os.fork()
+        except OSError:
+            os.close(r_err)
+            os.close(w_err)
+            raise
+    except OSError:
+        os.close(r_out)
+        os.close(w_out)
+        raise
     if pid == 0:
         os.close(r_out)
         os.close(r_err)
@@ -283,6 +327,15 @@ def _run(fqn, params, profile, env=None):
         os.close(w_out)
         os.close(w_err)
         try:
+            # Callbacks inherited from the worker belong to the worker.
+            atexit._clear()
+            logging = sys.modules.get("logging")
+            if logging is not None:
+                atexit.register(logging.shutdown)
+        except BaseException:
+            pass
+        try:
+            _eof_stdin()
             if env:
                 os.environ.update({str(k): str(v) for k, v in env.items()})
             from ansible.module_utils import basic
@@ -297,10 +350,11 @@ def _run(fqn, params, profile, env=None):
             pass
         except BaseException as e:
             try:
-                sys.stderr.write("ansiroll-worker: %r\\n" % (e,))
+                sys.stderr.write("ansiroll-worker: %r\n" % (e,))
             except Exception:
                 pass
         finally:
+            _run_exit_handlers()
             try:
                 sys.stdout.flush()
             except Exception:
@@ -312,38 +366,255 @@ def _run(fqn, params, profile, env=None):
             os._exit(0)
     os.close(w_out)
     os.close(w_err)
-    out, err = _drain_pair(r_out, r_err)
-    os.close(r_out)
-    os.close(r_err)
-    os.waitpid(pid, 0)
+    try:
+        out, err = _drain_pair(r_out, r_err)
+    finally:
+        os.close(r_out)
+        os.close(r_err)
+        os.waitpid(pid, 0)
     return {"out": out, "err": err, "rc": 0}
 
 
-def _async_run(fqn, params, profile, source_fd=None):
-    pid = os.fork()
+def _filter_non_json_lines(data):
+    # Copied from ansible/modules/async_wrapper.py.
+    warnings = []
+    lines = data.splitlines()
+    for start, line in enumerate(lines):
+        line = line.strip()
+        if line.startswith(u"{"):
+            break
+    else:
+        raise ValueError("No start of json char found")
+    lines = lines[start:]
+    for reverse_end_offset, line in enumerate(reversed(lines)):
+        if line.strip().endswith(u"}"):
+            break
+    else:
+        raise ValueError("No end of json char found")
+    if reverse_end_offset > 0:
+        trailing_junk = lines[len(lines) - reverse_end_offset:]
+        for line in trailing_junk:
+            if line.strip():
+                warnings.append(
+                    "Module invocation had junk after the JSON data: %s"
+                    % "\n".join(trailing_junk)
+                )
+                break
+    lines = lines[: (len(lines) - reverse_end_offset)]
+    return ("\n".join(lines), warnings)
+
+
+def _jwrite(job_path, info):
+    jobfile = job_path + ".tmp"
+    with open(jobfile, "w") as tjob:
+        json.dump(info, tjob)
+    os.rename(jobfile, job_path)
+
+
+def _async_module(jid, job_path, fqn, params, profile, source_fd, notify,
+                  version):
+    """Run one async job and leave its result where async_status reads it.
+
+    Mirrors async_wrapper._run_module: write the started marker, signal the
+    launcher, run the module, then replace the marker with the parsed result."""
+    modern_flags = version >= (2, 19)
+    started = True if modern_flags else 1
+    finished = False if modern_flags else 0
+    _jwrite(job_path, {"started": started, "finished": finished, "ansible_job_id": jid})
+    try:
+        os.write(notify, b"1")
+    except OSError:
+        pass
+    os.close(notify)
+    outdata = ""
+    stderr = ""
+    try:
+        if source_fd is not None:
+            payload = json.loads(params)
+            payload["ANSIBLE_MODULE_ARGS"]["src"] = "/proc/%d/fd/%d" % (
+                os.getpid(),
+                source_fd,
+            )
+            params = json.dumps(payload)
+        response = _run(fqn, params, profile)
+        outdata = response["out"]
+        stderr = response["err"]
+        filtered_outdata, json_warnings = _filter_non_json_lines(outdata)
+        result = json.loads(filtered_outdata)
+        if json_warnings:
+            module_warnings = result.get("warnings", [])
+            if not isinstance(module_warnings, list):
+                module_warnings = [module_warnings]
+            module_warnings.extend(json_warnings)
+            result["warnings"] = module_warnings
+        if stderr:
+            result["stderr"] = stderr
+        _jwrite(job_path, result)
+    except OSError as e:
+        _jwrite(job_path, {
+            "failed": started,
+            "cmd": fqn,
+            "msg": str(e),
+            "outdata": outdata,
+            "stderr": stderr,
+            "ansible_job_id": jid,
+        })
+    except Exception:
+        _jwrite(job_path, {
+            "failed": started,
+            "cmd": fqn,
+            "data": outdata,
+            "stderr": stderr,
+            "msg": traceback.format_exc(),
+            "ansible_job_id": jid,
+        })
+
+
+def _async_timed_out(pid, time_limit, poll_before_timeout):
+    step = 5
+    remaining = int(time_limit)
+    if poll_before_timeout and 0 < remaining <= step:
+        step = remaining / 2
+    time.sleep(step)
+    while os.waitpid(pid, os.WNOHANG) == (0, 0):
+        if not poll_before_timeout:
+            # The original watchdog charges this interval even if the job
+            # exits during it. It checks for exit on the next iteration.
+            time.sleep(step)
+        remaining -= step
+        if remaining <= 0:
+            return True
+        if poll_before_timeout:
+            time.sleep(step)
+    return False
+
+
+def _async_supervise(jid, job_path, time_limit, fqn, params, profile, env,
+                     source_fd, notify, version, poll_before_timeout):
+    # async_wrapper's daemonized supervisor: detach from the worker's pipes,
+    # run the module in its own process group and kill it at the time limit.
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.close(devnull)
+    os.close(_RESP)
+    # Re-evaluate the temp location in the task environment. Only remove
+    # this private directory, even if multiple jobs share the temp parent.
+    os.environ.update({str(k): str(v) for k, v in env.items()})
+    tempfile.tempdir = None
+    tmpdir = tempfile.mkdtemp(prefix="ansiroll-async-")
+    try:
+        payload = json.loads(params)
+        payload["ANSIBLE_MODULE_ARGS"]["_ansible_tmpdir"] = tmpdir
+        params = json.dumps(payload)
+        sub_pid = os.fork()
+        if sub_pid == 0:
+            try:
+                os.setpgid(0, 0)
+            except OSError:
+                pass
+            try:
+                _async_module(jid, job_path, fqn, params, profile, source_fd, notify,
+                              version)
+            finally:
+                os._exit(0)
+        os.close(notify)
+        if source_fd is not None:
+            os.close(source_fd)
+        try:
+            os.setpgid(sub_pid, sub_pid)
+        except OSError:
+            pass
+        timed_out = _async_timed_out(sub_pid, time_limit, poll_before_timeout)
+        if timed_out:
+            # Reap the writer before replacing its result. Otherwise a
+            # concurrent write can overwrite the timeout or its temp file.
+            try:
+                os.killpg(sub_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(sub_pid, 0)
+        if timed_out and version >= (2, 12):
+            if poll_before_timeout:
+                # This watchdog publishes the timeout one second after killing.
+                time.sleep(1)
+            _jwrite(job_path, {
+                "msg": "Timeout exceeded", "failed": True, "child_pid": sub_pid,
+            })
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _async_run(fqn, params, profile, env, time_limit, source_fd, version,
+               poll_before_timeout):
+    async_dir = env.get("ANSIBLE_ASYNC_DIR", "~/.ansible_async")
+    if "HOME" in env and (async_dir == "~" or async_dir.startswith("~/")):
+        jobdir = env["HOME"].rstrip("/") + async_dir[1:]
+    else:
+        jobdir = os.path.expanduser(async_dir)
+    modern_flags = version >= (2, 19)
+    try:
+        os.makedirs(jobdir, exist_ok=True)
+    except OSError as e:
+        return {
+            "failed": True if modern_flags else 1,
+            "msg": "%s: %s - %s" % (
+                "could not create directory" if version >= (2, 12) else "could not create",
+                jobdir, e,
+            ),
+            "exception": traceback.format_exc(),
+        }
+    if version >= (2, 18):
+        random_id = random.SystemRandom().randrange(999999999999)
+    else:
+        random_id = random.randint(0, 999999999999)
+    prefix = ("j" if version >= (2, 14, 5) else "") + str(random_id)
+    r, w = os.pipe()
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(r)
+        os.close(w)
+        raise
     if pid == 0:
         try:
-            if source_fd is not None:
-                payload = json.loads(params)
-                payload["ANSIBLE_MODULE_ARGS"]["src"] = "/proc/%d/fd/%d" % (
-                    os.getpid(),
-                    source_fd,
-                )
-                params = json.dumps(payload)
-            _run(fqn, params, profile)
-        except BaseException:
-            pass
-        finally:
-            if source_fd is not None:
+            os.close(r)
+            jid = "%s.%d" % (prefix, os.getpid())
+            job_path = os.path.join(jobdir, jid)
+            os.setsid()
+            os.umask(0o022)
+            # Daemonize: the worker reaps this process immediately and the
+            # supervisor is re-parented, so finished jobs never linger as
+            # zombies of the worker.
+            if os.fork() == 0:
                 try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
+                    _async_supervise(jid, job_path, time_limit, fqn, params,
+                                     profile, env, source_fd, w, version,
+                                     poll_before_timeout)
+                finally:
+                    os._exit(0)
+        finally:
             os._exit(0)
-    return {
-        "pid": pid,
-        "jid": "%s.%s" % (int(datetime.datetime.utcnow().timestamp()), pid),
+    os.close(w)
+    try:
+        os.waitpid(pid, 0)
+        # async_wrapper waits up to 2.5s for the job to report that it started.
+        with selectors.DefaultSelector() as sel:
+            sel.register(r, selectors.EVENT_READ)
+            if sel.select(2.5) and not os.read(r, 1):
+                raise RuntimeError("async job exited before writing its start marker")
+    finally:
+        os.close(r)
+    jid = "%s.%d" % (prefix, pid)
+    ack = {
+        "started": True if modern_flags else 1,
+        "finished": False if modern_flags else 0,
+        "ansible_job_id": jid,
+        "results_file": os.path.join(jobdir, jid),
     }
+    if version >= (2, 12):
+        ack["failed"] = False if modern_flags else 0
+    return ack
 
 
 def main():
@@ -406,7 +677,16 @@ def main():
                 if req.get("source_size") is not None and source is None:
                     raise EOFError("worker module source ended early")
                 params, source_fd = _memfd_source(req["params"], source)
-                response = _async_run(req["fqn"], params, req["profile"], source_fd)
+                response = _async_run(
+                    req["fqn"],
+                    params,
+                    req["profile"],
+                    req.get("env") or {},
+                    req.get("time_limit") or 0,
+                    source_fd,
+                    tuple(req.get("version", (2, 21))),
+                    req.get("poll_before_timeout", False),
+                )
                 _send(response)
             except Exception as e:
                 _send({"error": repr(e)})

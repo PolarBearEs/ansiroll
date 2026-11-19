@@ -1312,7 +1312,6 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
 """ % destination)
 
     src, manifest = compile_playbook(str(play))
-    assert "tempfile" not in src
     assert "ansiroll-unarchive-" not in src
     assert "memfd_create" in src
     generated = tmp_path / "compiled.py"
@@ -1337,13 +1336,15 @@ def test_async_unarchive_keeps_memory_source_alive_until_extraction(tmp_path):
     play.write_text("""
 - hosts: localhost
   gather_facts: false
+  vars:
+    ansible_async_dir: %s
   tasks:
     - ansible.builtin.unarchive:
         src: async-payload.zip
         dest: %s
       async: 30
       poll: 0
-""" % destination)
+""" % (tmp_path / "async-jobs", destination))
 
     src, _ = compile_playbook(str(play))
     generated = tmp_path / "async-compiled.py"
