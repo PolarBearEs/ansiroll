@@ -430,6 +430,38 @@ def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
     assert dest.read_text() == "value=2"
 
 
+def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {names: [conf]}
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2"
+    dest: %s/out-{{ item }}
+  loop: "{{ names }}"
+""" % str(tmp_path),
+        "roles/a/templates/own.j2": "unrelated",
+        "roles/b/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    dest = tmp_path / "out-conf"
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    src, _ = compile_playbook(str(playbook))
+    (tmp_path / "roles/b/templates/conf.j2").unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert dest.read_text() == "value=2"
+
+
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
     _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
         "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
