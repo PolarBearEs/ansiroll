@@ -966,8 +966,7 @@ def _bake_sources(node, task, basedir):
 
 
 def _starts_with_jinja_dir(src):
-    literal = _JINJA_RE.sub("", src)
-    return "/" in literal and "/" not in _literal_head(src)
+    return _literal_head(src) == "" and "/" in _JINJA_RE.sub("", src)
 
 
 def _literal_head(src):
@@ -981,17 +980,22 @@ def _bake_search_tree(node, task, search_dirs, src):
     if getattr(task, "_role", None) is None:
         return False
     prefix = _literal_head(src).rpartition("/")[0]
+    if ".." in prefix.split("/"):
+        return False
     baked = {}
-    for base in search_dirs:
+    skipped = []
+    for i, base in enumerate(search_dirs):
         # Without a literal subdir to narrow it down, walking a whole role, task or playbook dir would bake the entire
-        # playbook tree, so only templates/ and files/ are baked.
-        if not prefix and os.path.basename(base) not in ("templates", "files"):
+        # playbook tree, so only the action's own templates/ or files/ dirs are baked.
+        if not prefix and i % 3 != 0:
+            skipped.append(base)
             continue
         for root, _dirs, files in os.walk(os.path.join(base, prefix)):
             for fn in files:
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if rel in baked:
+                # A copy in an earlier, unbaked dir would win, so leave it out and let the runtime fail loudly.
+                if rel in baked or any(os.path.isfile(os.path.join(d, rel)) for d in skipped):
                     continue
                 try:
                     with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
@@ -1014,7 +1018,8 @@ def _raw_search_path(task, basedir):
 
 
 def _search_dirs(task, basedir, subdir):
-    """Build the ordered list of directories to look for a src file in."""
+    """Build the ordered list of directories to look for a src file in: a (subdir, other subdir, base) triple per
+    search path entry."""
     dirs = []
     try:
         stack = list(task.get_search_path() or [])
