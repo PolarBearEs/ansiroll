@@ -1281,12 +1281,14 @@ def test_deferred_vars_files_bundle_only_plain_mappings(tmp_path):
     - debug: msg=reached
 """, "tasks.yml": "- debug: msg=task\n", "plain.yml": "x: 1\n", "pw.txt": "pw\n"})
     (tmp_path / "vault.yml").write_bytes(secret)
+    inline = VaultLib([("default", VaultSecret(b"pw"))]).encrypt("hunter3").decode()
+    (tmp_path / "inline.yml").write_text("token: !vault |\n" + "".join("  %s\n" % line for line in inline.splitlines()))
     plays, _actions = parse_playbook(str(tmp_path / "pb.yml"), vault_password_file=str(tmp_path / "pw.txt"))
     files = {os.path.basename(path): data for path, data in plays[0]["deferred_vars_files"][0]["files"].items()}
     assert files["plain.yml"] == [{"x": 1}]
-    for name in ("pb.yml", "tasks.yml", "vault.yml"):
+    for name in ("pb.yml", "tasks.yml", "vault.yml", "inline.yml"):
         assert set(files[name]) == {"__ansiroll_vars_file_error__"}, name
-    assert "hunter2" not in json.dumps(files)
+    assert "hunter2" not in json.dumps(files) and "hunter3" not in json.dumps(files)
 
 
 def test_deferred_vars_files_name_with_leading_template_fails_to_compile(tmp_path):

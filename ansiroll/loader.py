@@ -443,10 +443,12 @@ def _bundled_vars_file(play, path):
     from ansible.errors import AnsibleParserError
 
     with open(path, "rb") as fh:
-        if fh.read(14) == b"$ANSIBLE_VAULT":
-            # Never ship a decrypted secret the run may not select.
-            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r is vault-encrypted, so it was not bundled "
-                    "for a name only known at run time; make the vars_files name resolvable at compile time" % path}
+        # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
+        # select.
+        if b"$ANSIBLE_VAULT" in fh.read():
+            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                    % path}
     try:
         loaded = _load_vars_file(play, path)
         if isinstance(loaded, dict) or loaded is None:
