@@ -2393,9 +2393,10 @@ class Runtime:
         order = self._refs_through(refs, unrendered) if unrendered and pending else refs
         while pending:
             # Render a play var only once the stale play vars it reads are rendered, and one that can read any
-            # variable last; a cycle renders in key order.
+            # variable once no other is ready; a cycle renders in key order.
             direct = [key for key in pending if order[key] is not None]
-            ready = [key for key in direct if order[key].isdisjoint(set(pending) - {key})] or direct[:1] or pending
+            ready = ([key for key in direct if order[key].isdisjoint(set(pending) - {key})]
+                     or [key for key in pending if order[key] is None] or direct[:1])
             for key in ready:
                 render_ctx = view if refs[key] is not None else dict(view, vars=_vars_snapshot(view))
                 view[key] = ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]

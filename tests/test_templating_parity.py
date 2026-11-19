@@ -1139,15 +1139,16 @@ def test_rebound_indirect_and_container_play_vars_follow_chains_declared_before_
 - hosts: localhost
   gather_facts: false
   vars:
+    via_indirect: "{{ indirect }}"
     indirect: "{{ lookup('vars', 'alias') }}"
     cfg: {name: "{{ alias }}"}
     alias: "{{ env }}"
     env: prod
   tasks:
-    - debug: msg="{{ indirect }} {{ cfg.name }}"
+    - debug: msg="{{ indirect }} {{ cfg.name }} {{ via_indirect }}"
       vars: {env: task}
 """)
-    assert msgs == ["task task"]
+    assert msgs == ["task task task"]
 
 
 def test_task_vars_read_rebound_play_vars(tmp_path):
