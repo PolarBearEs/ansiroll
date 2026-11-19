@@ -975,6 +975,7 @@ class _LazyTplDict(dict):
             return self._ctx
         ctx = dict(self._ctx)
         ctx.update(self._rt.vars)
+        self._rt._pin_magic_vars(ctx)
         return ctx
 
     def __getitem__(self, k):
@@ -1035,6 +1036,7 @@ class _LazyTplList(list):
             return self._ctx
         ctx = dict(self._ctx)
         ctx.update(self._rt.vars)
+        self._rt._pin_magic_vars(ctx)
         return ctx
 
     def __getitem__(self, i):
@@ -1702,12 +1704,18 @@ class Runtime:
         for o in overlays:
             if o:
                 d.update(o)
+        self._pin_magic_vars(d)
         d.setdefault("omit", _OMIT)
         if "hostvars" not in d:
             d["hostvars"] = {self.host: dict(d)}
         if "vars" not in d:
             d["vars"] = _vars_snapshot(d)
         return d
+
+    def _pin_magic_vars(self, ctx):
+        # Ansible ranks playbook_dir above play, block and task vars, set_fact and registers.
+        if self._playbook_dir:
+            ctx["playbook_dir"] = self._playbook_dir
 
     def _store_register(self, task, result):
         name = task.get("register")
@@ -2019,8 +2027,7 @@ class Runtime:
     def run_play(self, play, defer_handlers=False, initial_notified=None):
         invocation_check_mode = self.check_mode
         self._playbook_dir = play.get("playbook_dir")
-        if self._playbook_dir:
-            self.vars["playbook_dir"] = self._playbook_dir
+        self._pin_magic_vars(self.vars)
         play_check_mode = play.get("check_mode")
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):
@@ -2069,8 +2076,7 @@ class Runtime:
         # Extra-vars have the highest Ansible precedence; play vars must not
         # overwrite values injected via -e.
         self.vars.update(self.extra_vars)
-        if self._playbook_dir:
-            self.vars["playbook_dir"] = self._playbook_dir
+        self._pin_magic_vars(self.vars)
         try:
             self.run_nodes(play.get("tasks", []), {}, play.get("become", False))
         except TaskFailed as ex:
@@ -2232,11 +2238,11 @@ class Runtime:
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
+        self._pin_magic_vars(ctx)
         ctx.update(self.template_vars(task.get("vars"), ctx))
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
-        if self._playbook_dir:
-            ctx["playbook_dir"] = self._playbook_dir
+        self._pin_magic_vars(ctx)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -2264,11 +2270,10 @@ class Runtime:
             return
         for _ in range(3):
             ctx = dict(self.vars)
-            if self._playbook_dir:
-                ctx["playbook_dir"] = self._playbook_dir
+            self._pin_magic_vars(ctx)
             changed = False
             for key, raw in self._play_var_templates.items():
-                if key in self._runtime_var_overrides:
+                if key in self._runtime_var_overrides or (key == "playbook_dir" and self._playbook_dir):
                     continue
                 rendered = self.templater.render_string(raw, ctx)
                 try:

@@ -507,6 +507,27 @@ def test_playbook_dir_outranks_task_vars_and_set_fact(tmp_path):
     assert msgs == ["task=True", "fact=True", "block=True"]
 
 
+def test_vars_derived_from_playbook_dir_ignore_a_set_fact_override(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    src_dir: "{{ playbook_dir }}/templates"
+    chained: "{{ src_dir }}/x"
+    cfg: {path: "{{ playbook_dir }}/cfg"}
+  tasks:
+    - set_fact: {playbook_dir: /other}
+    - debug: msg="task={{ source_dir.startswith('/other') }}"
+      vars: {source_dir: "{{ playbook_dir }}/templates"}
+    - block:
+        - debug: msg="block={{ block_dir.startswith('/other') }}"
+      vars: {block_dir: "{{ playbook_dir }}/templates"}
+    - debug: msg="play={{ chained.startswith('/other') }}"
+    - debug: msg="container={{ cfg.path.startswith('/other') }}"
+""")
+    assert msgs == ["task=False", "block=False", "play=False", "container=False"]
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
