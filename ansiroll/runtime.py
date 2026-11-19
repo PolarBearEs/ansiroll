@@ -2341,12 +2341,19 @@ class Runtime:
         # What a play var reading vars, hostvars or a lookup depends on is unknown, so it may have read a stale value;
         # each further pass settles one more such hop.
         for _ in range(sum(1 for key in rendered if refs[key] is None)):
-            for key in rendered:
-                self._render_play_var(ctx, key, refs[key])
+            changed = [self._render_play_var(ctx, key, refs[key]) for key in rendered]
+            if not any(changed):
+                break
 
     def _render_play_var(self, ctx, key, names):
+        """Render a play var into ctx; return whether its value changed."""
         render_ctx = ctx if names is not None else dict(ctx, vars=_vars_snapshot(ctx))
+        old = ctx.get(key)
         ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
+        try:
+            return bool(old != ctx[key])
+        except Exception:
+            return True
 
     def _refresh_play_vars(self):
         """Re-evaluate lazy play vars against facts produced by earlier tasks."""
