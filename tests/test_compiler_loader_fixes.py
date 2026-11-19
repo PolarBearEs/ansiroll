@@ -1117,7 +1117,9 @@ def test_vars_files_parse_error_does_not_try_next_candidate(tmp_path):
     - debug: msg=RAN
 """, "broken.yml": "key: [unclosed\n", "fallback.yml": "key: value\n",
         "vars/broken.yml": "key: [unclosed\n", "vars/fallback.yml": "key: value\n"})
-    with pytest.raises(Exception, match="YAML parsing failed"):
+    from ansible.errors import AnsibleParserError
+
+    with pytest.raises(AnsibleParserError):
         compile_playbook(str(tmp_path / "pb.yml"))
 
 
