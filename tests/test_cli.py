@@ -1,16 +1,22 @@
 import json
+import os
 import stat
+import subprocess
+import sys
 from argparse import Namespace
+
+import pytest
 
 from ansiroll import cli
 
 
-def test_compile_writes_source_to_stdout(monkeypatch, tmp_path, capsys):
-    source = "print('ok')\n"
+def test_compile_writes_source_to_stdout(monkeypatch, tmp_path, capfdbinary):
+    source = "print('olá')\n"
     manifest = {"modules": [], "fallback_tasks": []}
 
     def compile_playbook(*args, **kwargs):
         print("compiler diagnostic")
+        subprocess.run([sys.executable, "-c", "print('helper diagnostic')"], check=True)
         return source, manifest
 
     monkeypatch.chdir(tmp_path)
@@ -18,12 +24,39 @@ def test_compile_writes_source_to_stdout(monkeypatch, tmp_path, capsys):
 
     assert cli.main(["compile", "play.yml", "-o", "-", "-m", "manifest.json"]) == 0
 
-    captured = capsys.readouterr()
-    assert captured.out == source
-    assert "compiler diagnostic\n" in captured.err
-    assert "ansiroll: compiled play.yml -> stdout" in captured.err
+    captured = capfdbinary.readouterr()
+    assert captured.out == source.encode("utf-8")
+    assert b"compiler diagnostic\n" in captured.err
+    assert b"helper diagnostic\n" in captured.err
+    assert b"ansiroll: compiled play.yml -> stdout" in captured.err
     assert sorted(path.name for path in tmp_path.iterdir()) == ["manifest.json"]
     assert json.loads((tmp_path / "manifest.json").read_text()) == manifest
+
+
+def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+        env=dict(os.environ, PYTHONIOENCODING="utf-16le"),
+        capture_output=True,
+        check=True,
+    )
+
+    assert result.stdout.startswith(b"#!")
+    compile(result.stdout, "<stdout>", "exec")
+
+
+def test_compile_stdout_stays_empty_if_manifest_write_fails(monkeypatch, tmp_path, capfdbinary):
+    manifest = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("print('ok')\n", manifest))
+
+    with pytest.raises(IsADirectoryError):
+        cli.main(["compile", "play.yml", "-o", "-", "-m", str(tmp_path)])
+
+    assert capfdbinary.readouterr().out == b""
 
 
 def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys):

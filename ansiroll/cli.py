@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import nullcontext, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -54,9 +54,22 @@ def main(argv=None):
     parser.error("unknown command")
 
 
+@contextmanager
+def _compile_diagnostics_to_stderr():
+    # Redirect inherited stdout for helpers as well as Python's stdout stream.
+    sys.stdout.flush()
+    with os.fdopen(os.dup(1), "wb") as saved_stdout:
+        os.dup2(2, 1)
+        try:
+            with redirect_stdout(sys.stderr):
+                yield
+        finally:
+            os.dup2(saved_stdout.fileno(), 1)
+
+
 def _cmd_compile(args):
     to_stdout = args.output == "-"
-    with redirect_stdout(sys.stderr) if to_stdout else nullcontext():
+    with _compile_diagnostics_to_stderr() if to_stdout else nullcontext():
         try:
             extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
         except Exception as ex:
@@ -77,15 +90,15 @@ def _cmd_compile(args):
                 message = "ansiroll: " + message
             sys.stderr.write(message + "\n")
             return 2
-    if to_stdout:
-        sys.stdout.write(source)
-    else:
+    if not to_stdout:
         with open(args.output, "w") as fh:
             fh.write(source)
         os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
         with open(args.manifest, "w") as fh:
             json.dump(manifest, fh, indent=2)
+    if to_stdout:
+        sys.stdout.buffer.write(source.encode("utf-8"))
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
         % (args.playbook, "stdout" if to_stdout else args.output, len(manifest["modules"]),

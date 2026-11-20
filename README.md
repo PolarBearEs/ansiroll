@@ -46,6 +46,15 @@ python3 -m ansiroll.cli compile playbook.yml -o compiled.py -m compiled.json
 ANSIROLL_HOST=myhost python3 compiled.py
 ```
 
+Use `-o -` to stream the generated Python directly to the interpreter. In Bash,
+`pipefail` makes the pipeline report a compiler failure even if Python exits
+successfully.
+
+```bash
+set -o pipefail
+python3 -m ansiroll.cli compile playbook.yml -o - | python3 -
+```
+
 Compile-time extra vars can optionally remove branches that are provably
 unreachable. Unknown conditions are retained, and the resulting artifact rejects
 conflicting runtime values for specialized variables:
