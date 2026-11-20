@@ -23,6 +23,7 @@ import zipfile
 
 from .embed import ModuleEmbedder
 from .loader import (
+    COPY_ACTION_MODULES,
     _can_write_var,
     _depends_on_vars,
     _loop_binding_names,
@@ -667,6 +668,8 @@ def _actions_in_plays(plays):
                 action = node.get("action")
                 if action:
                     actions.add(action)
+                if node.get("special") in ("template", "copy"):
+                    actions.update(COPY_ACTION_MODULES)
     for play in plays:
         walk(play.get("tasks"))
         walk(play.get("handlers"))
@@ -736,6 +739,9 @@ def _accelerated_only_actions(plays, actions):
                 if (
                         node.get("accelerator") != "always"
                         or node.get("fallback")
+                        # The command guard cannot always restore the agent's cwd.
+                        or (str(action).split(".")[-1] in ("command", "shell")
+                            and (node.get("args") or {}).get("chdir") is not None)
                         or int(node.get("async_val") or 0)):
                     eligible.discard(action)
 

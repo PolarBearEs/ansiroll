@@ -6,6 +6,7 @@ from . import (
     apt, blockinfile, command, file, find, group, replace, service, slurp,
     stat, systemd, user,
 )
+from .environment import module_environment
 
 _IMPLEMENTATIONS = {
     "apt": apt,
@@ -54,7 +55,9 @@ def can_accelerate(name, args, check_mode=False):
 def run(name, args, check_mode=False, environment=None, options=None):
     short_name = str(name).split(".")[-1]
     implementation = _IMPLEMENTATIONS[short_name]
-    return implementation.run(
-        args or {}, check_mode=bool(check_mode), shell=short_name == "shell",
-        environment=environment, options=options or {},
-    )
+    options = options or {}
+    with module_environment(environment, options.get("legacy_locale")) as module_env:
+        return implementation.run(
+            args or {}, check_mode=bool(check_mode), shell=short_name == "shell",
+            environment=module_env, options=options,
+        )

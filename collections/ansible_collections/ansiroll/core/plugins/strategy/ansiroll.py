@@ -26,6 +26,7 @@ import json
 import inspect
 import os
 import shlex
+import stat
 import struct
 import subprocess
 import sys
@@ -401,13 +402,14 @@ class StrategyModule(StrategyBase):
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
-            st = os.stat(path)
+                st = os.fstat(fh.fileno())
             return {
                 "data": base64.b64encode(data).decode("ascii"),
                 "meta": {
                     "fullpath": os.path.abspath(path),
                     "mtime": st.st_mtime,
                     "uid": st.st_uid,
+                    "mode": stat.S_IMODE(st.st_mode),
                 },
             }
         except OSError as ex:
@@ -559,7 +561,7 @@ class StrategyModule(StrategyBase):
         try:
             with open(src, "rb") as fh:
                 raw = fh.read().decode("utf-8", "surrogateescape")
-            st = os.stat(src)
+                st = os.fstat(fh.fileno())
         except OSError as ex:
             return {"failed": True, "changed": False, "msg": str(ex)}
         rt = self._local_runtime(become_pass)
@@ -573,6 +575,7 @@ class StrategyModule(StrategyBase):
                         "fullpath": os.path.abspath(src),
                         "mtime": st.st_mtime,
                         "uid": st.st_uid,
+                        "mode": stat.S_IMODE(st.st_mode),
                     },
                 },
             }

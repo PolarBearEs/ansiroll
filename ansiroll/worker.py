@@ -209,54 +209,82 @@ def _memfd_source(params, data):
         raise
 
 
-def _norm_mode(mode):
-    if mode is None:
-        return None
-    if isinstance(mode, int):
-        return "0%o" % mode
-    return str(mode)
+def _copy_stat(args):
+    """The parts of the stat module the copy action plugin reads
+    (ActionBase._execute_remote_stat): sha1 checksum of a readable regular
+    file, '1' when missing and '' when no checksum applies."""
+    import hashlib
+    import stat as stat_mod
 
-
-def _chmod_chown(path, mode, owner, group):
+    path = os.path.expanduser(os.path.expandvars(args.get("path") or ""))
     try:
-        if mode:
-            os.chmod(path, int(mode, 8))
-    except Exception:
-        pass
-    if owner or group:
-        try:
-            shutil.chown(path, user=owner, group=group)
-        except Exception:
-            pass
+        st = os.stat(path) if args.get("follow") else os.lstat(path)
+    except FileNotFoundError:
+        return {"exists": False, "checksum": "1"}
+    except OSError as e:
+        return {"failed": True, "msg": e.strerror}
+    out = {
+        "exists": True,
+        "isdir": stat_mod.S_ISDIR(st.st_mode),
+        "islnk": stat_mod.S_ISLNK(st.st_mode),
+        "checksum": "",
+    }
+    if out["islnk"]:
+        out["lnk_source"] = os.path.realpath(path)
+    if (args.get("checksum") and stat_mod.S_ISREG(st.st_mode)
+            and os.access(path, os.R_OK)):
+        digest = hashlib.sha1()
+        with open(os.path.realpath(path), "rb") as fh:
+            block = fh.read(65536)
+            while block:
+                digest.update(block)
+                block = fh.read(65536)
+        out["checksum"] = digest.hexdigest()
+    return out
 
 
-def _fast_write(args, check_mode):
-    dest = args.get("dest")
-    content = args.get("content", "")
-    if not dest:
-        return {"failed": True, "changed": False, "msg": "write: dest is required"}
-    mode = _norm_mode(args.get("mode"))
-    owner = args.get("owner")
-    group = args.get("group")
+def _copy_stage(args):
+    """Stage copy/template data in a private temp dir, like the action
+    plugin's transfer to the remote tmpdir."""
+    import tempfile
+
+    data = base64.b64decode(args.get("data") or "")
+    if args.get("path"):
+        # copy raw=yes: the transfer itself writes dest.
+        with open(args["path"], "wb") as fh:
+            fh.write(data)
+        return {"path": args["path"]}
+    tmpdir = tempfile.mkdtemp(prefix="ansible-tmp-")
+    path = os.path.join(tmpdir, args["filename"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return {"tmpdir": tmpdir, "path": path}
+
+
+def _copy_cleanup(args):
+    tmpdir = args.get("tmpdir")
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return {"ok": True}
+
+
+def _copy_read(args):
+    """Read a destination for the copy action's diff (the slurp module)."""
     try:
-        old = None
-        if os.path.exists(dest):
-            try:
-                with open(dest, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                    old = fh.read()
-            except OSError:
-                old = None
-        changed = old != content
-        if changed and not check_mode:
-            parent = os.path.dirname(dest)
-            if parent and not os.path.isdir(parent):
-                os.makedirs(parent, exist_ok=True)
-            with open(dest, "w", encoding="utf-8", errors="surrogateescape") as fh:
-                fh.write(content)
-            _chmod_chown(dest, mode, owner, group)
-        return {"changed": changed, "dest": dest}
-    except Exception as e:
-        return {"failed": True, "changed": False, "dest": dest, "msg": str(e)}
+        path = os.path.expanduser(os.path.expandvars(args.get("path") or ""))
+        with open(path, "rb") as fh:
+            return {"content": base64.b64encode(fh.read()).decode("ascii")}
+    except OSError as e:
+        return {"failed": True, "msg": str(e)}
+
+
+_COPY_OPS = {
+    "copy_stat": _copy_stat,
+    "copy_stage": _copy_stage,
+    "copy_cleanup": _copy_cleanup,
+    "copy_read": _copy_read,
+}
 
 
 def _drain_pair(r_out, r_err):
@@ -693,8 +721,19 @@ def main():
             finally:
                 if source_fd is not None:
                     os.close(source_fd)
-        elif op == "fast_write":
-            _send(_fast_write(req.get("args") or {}, bool(req.get("check_mode"))))
+        elif op in _COPY_OPS:
+            try:
+                args = req.get("args") or {}
+                if op in ("copy_stat", "copy_read"):
+                    from ansiroll.accelerated_modules.environment import module_environment
+
+                    with module_environment(req.get("env")):
+                        result = _COPY_OPS[op](args)
+                else:
+                    result = _COPY_OPS[op](args)
+                _send(result)
+            except Exception as e:
+                _send({"failed": True, "msg": str(e)})
         elif op == "accelerated":
             try:
                 from ansiroll.accelerated_modules import run as run_accelerated

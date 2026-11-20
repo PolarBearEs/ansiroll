@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import pkgutil
 import re
+import stat
 from functools import lru_cache
 
 from .compat import init_loader
@@ -36,6 +37,9 @@ BAKED_ACTIONS = {
     "copy", "ansible.builtin.copy",
     "unarchive", "ansible.builtin.unarchive",
 }
+
+# Official modules the copy/template action plugins execute on the target.
+COPY_ACTION_MODULES = ("ansible.builtin.copy", "ansible.builtin.file")
 
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
@@ -1341,10 +1345,15 @@ def _convert_task(task, actions, basedir):
         _bake_sources(node, task, basedir)
         if node["special"] is None:
             actions.add(action)
-        elif node["special"] == "copy" and _remote_src(node["args"]) is not False:
-            # remote_src copies run the copy module on the target, like the
-            # copy action plugin's remote_src path.
-            actions.add(action)
+        else:
+            # The runtime runs these like the copy action plugin: through the
+            # official copy and file modules.
+            actions.update(COPY_ACTION_MODULES)
+            node.update(_copy_action_settings())
+            if node["special"] == "copy" and _remote_src(node["args"]) is not False:
+                # remote_src copies run the copy module on the target, like the
+                # copy action plugin's remote_src path.
+                actions.add(action)
     elif action in CONTROLLER_COUPLED:
         node["fallback"] = True
         node["fallback_reason"] = "controller-coupled action %s" % action
@@ -1425,48 +1434,96 @@ def _async_poll_before_timeout():
 def _accelerator_options(action):
     name = str(action or "").split(".")[-1]
     try:
-        version = _core_version()
+        full_version = _core_version(include_patch=True)
+        version = full_version[:2]
+        options = {}
+        # AnsibleModule._check_locale started selecting a UTF-8 fallback in 2.12.
+        if (2, 10) <= version < (2, 12):
+            options["legacy_locale"] = True
         if name == "stat" and version >= (2, 21):
-            return {"disk_usage_bytes": True}
-        if name in ("command", "shell"):
-            options = {}
+            options["disk_usage_bytes"] = True
+        elif name in ("command", "shell"):
             if version < (2, 12):
                 options["check_always_skipped"] = True
-            if version >= (2, 16):
-                options["expand_argument_vars"] = True
+            if version < (2, 11):
+                options["omit_exec_error_output"] = True
+            if version < (2, 19):
+                options["chdir_error_detail"] = True
+                options["exec_error_detail"] = True
             if version >= (2, 14):
                 options["check_skip_unchanged"] = True
             if version >= (2, 21):
                 options["verbose_nonzero"] = True
-            return options or None
-        if name == "find" and version >= (2, 12):
-            options = {
-                "all_paths_examined": True,
-                "structured_skipped_paths": True,
-            }
+        elif name == "find" and version >= (2, 12):
+            options["all_paths_examined"] = True
+            options["structured_skipped_paths"] = True
             if version >= (2, 21):
                 options["disk_usage_bytes"] = True
             if version >= (2, 19):
                 options["typed_warnings"] = True
-            return options
-        if name == "slurp":
+        elif name == "slurp":
             if version < (2, 19):
-                return {"lowercase_not_found": True}
-            return {"typed_exceptions": True}
-        if name == "replace":
-            options = {}
+                options["lowercase_not_found"] = True
+            else:
+                options["typed_exceptions"] = True
+        elif name == "apt":
+            if version >= (2, 12):
+                options["parsable_locale"] = True
+            if version >= (2, 18):
+                options["language_locale"] = True
+        elif name == "blockinfile":
+            if version < (2, 17):
+                options["chmod_before_chown"] = True
+            if version >= (2, 20):
+                options["text_mode"] = True
+        # Older file modules returned only dest for a touch in check mode.
+        elif name == "file" and (
+                full_version < (2, 13, 8) or (2, 14, 0) <= full_version < (2, 14, 2)):
+            options["omit_touch_check_changed"] = True
+        elif name == "replace":
+            if version < (2, 17):
+                options["chmod_before_chown"] = True
             if version < (2, 20):
                 options["binary_io"] = True
-            if version < (2, 14):
+            if version < (2, 13):
                 options["omit_result_rc"] = True
-            return options or None
-        if name == "user" and version >= (2, 21):
-            return {"result_memberships": True}
-        if name in ("systemd", "systemd_service") and version >= (2, 14):
-            return {"modern_is_enabled": True}
+        elif name == "user":
+            if full_version >= (2, 18, 9):
+                options["home_mode"] = True
+            if version >= (2, 21):
+                options["result_memberships"] = True
+                options["placeholder_homes"] = True
+        elif name in ("systemd", "systemd_service") and version >= (2, 14):
+            options["modern_is_enabled"] = True
+        return options or None
     except Exception:
         pass
     return None
+
+
+def _copy_action_settings():
+    """Controller-side copy action settings from the compiling ansible-core."""
+    from ansible.release import __version__
+
+    settings = {}
+    version = tuple(map(int, __version__.split(".")[:2]))
+    # 2.17 switched to hidden temporary names and kept the suffix for validate.
+    if version < (2, 17):
+        settings["_copy_legacy_stage"] = True
+    # 2.16 started using the destination as the diff header for inline content.
+    if version < (2, 16):
+        settings["_copy_inline_diff_source"] = True
+    try:
+        from ansible.plugins.action.copy import REAL_FILE_ARGS
+        settings["_copy_file_args"] = sorted(REAL_FILE_ARGS)
+    except Exception:
+        pass
+    try:
+        from ansible import constants as C
+        settings["_max_diff_size"] = int(C.MAX_FILE_SIZE_FOR_DIFF)
+    except Exception:
+        pass
+    return settings
 
 
 def _special_of(action):
@@ -1494,6 +1551,10 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
+    # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
+    # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
+    mode = args.get("mode")
+    with_meta = name == "template" or (name == "copy" and (mode == "preserve" or _contains_dynamic_value(mode)))
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
     src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
@@ -1507,7 +1568,7 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        elif _bake_absolute_tree(node, src, basedir, name == "template"):
+        elif _bake_absolute_tree(node, src, basedir, with_meta):
             return
         # Baked search trees are keyed relative to a search dir, so they can never match a src that renders to an
         # absolute path, which a leading Jinja dir (e.g. "{{ some_dir }}/x") may well do.
@@ -1537,15 +1598,13 @@ def _bake_sources(node, task, basedir):
             return
         with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
             baked[rel] = fh.read()
-        if name != "template":
+        if not with_meta:
             continue
-        # Only template exposes source metadata (template_fullpath,
-        # template_mtime, template_uid); copy/unarchive never read it, so it
-        # is not embedded for them.
         try:
             st = os.stat(path)
             meta[rel] = {"fullpath": os.path.abspath(path),
-                         "mtime": st.st_mtime, "uid": st.st_uid}
+                         "mtime": st.st_mtime, "uid": st.st_uid,
+                         "mode": stat.S_IMODE(st.st_mode)}
         except OSError:
             pass
     node["_baked"] = baked
@@ -1622,7 +1681,8 @@ def _bake_absolute_tree(node, src, basedir, with_meta):
             except OSError:
                 continue
             if with_meta:
-                meta[path] = {"fullpath": os.path.abspath(path), "mtime": st.st_mtime, "uid": st.st_uid}
+                meta[path] = {"fullpath": os.path.abspath(path), "mtime": st.st_mtime, "uid": st.st_uid,
+                              "mode": stat.S_IMODE(st.st_mode)}
     if not baked:
         return False
     node["_baked"] = baked
@@ -1688,7 +1748,8 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     st = os.stat(full)
                 except OSError:
                     continue
-                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid}
+                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
+                             "mode": stat.S_IMODE(st.st_mode)}
     if not baked:
         return False
     node["_baked"] = baked

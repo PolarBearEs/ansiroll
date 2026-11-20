@@ -5,10 +5,16 @@ from __future__ import absolute_import
 import grp
 import os
 import pwd
+import re
 import shutil
 import subprocess
 
 from . import _stdin
+
+_LOGIN_DEFS = "/etc/login.defs"
+_SKELETON = "/etc/skel"
+# ansible-core >= 2.21 never creates these conventional placeholder homes.
+_PLACEHOLDER_HOME_DIRS = frozenset(("/nonexistent", "/dev/null", "/var/empty"))
 
 
 _ALLOWED = frozenset((
@@ -100,7 +106,84 @@ def _execute(command, environment):
     )
 
 
+class _HomeError(Exception):
+    pass
+
+
+def _create_homedir(path, home_mode):
+    """User.create_homedir(): copy the skeleton, then apply the login.defs mode."""
+    if os.path.exists(path):
+        return
+    skeleton, login_defs = _SKELETON, _LOGIN_DEFS
+    try:
+        if os.path.exists(skeleton) and skeleton != os.devnull:
+            shutil.copytree(skeleton, path, symlinks=True)
+        else:
+            os.makedirs(path)
+    except OSError as error:
+        raise _HomeError(str(error))
+    if not os.path.exists(login_defs):
+        return
+    with open(login_defs, "r") as handle:
+        lines = handle.readlines()
+    if home_mode:
+        # ansible-core >= 2.18.9: HOME_MODE wins, else UMASK, else 0755.
+        mode = 0o755
+        for line in lines:
+            match = re.match(r"^HOME_MODE\s+(\d+)$", line)
+            if match:
+                mode = int(match.group(1), 8)
+                break
+            match = re.match(r"^UMASK\s+(\d+)$", line)
+            if match:
+                mode = 0o777 & ~int(match.group(1), 8)
+        modes = [mode]
+    else:
+        # Older releases chmod for every UMASK line and ignore HOME_MODE.
+        modes = [
+            0o777 & ~int(match.group(1), 8)
+            for match in (re.match(r"^UMASK\s+(\d+)$", line) for line in lines)
+            if match
+        ]
+    for mode in modes:
+        try:
+            os.chmod(path, mode)
+        except OSError as error:
+            raise _HomeError(str(error))
+
+
+def _chown_homedir(uid, gid, path):
+    """User.chown_homedir()."""
+    try:
+        os.chown(path, uid, gid)
+        for root, dirs, files in os.walk(path):
+            for name in dirs:
+                os.chown(os.path.join(root, name), uid, gid)
+            for name in files:
+                full_path = os.path.join(root, name)
+                if not os.path.islink(full_path):
+                    os.chown(full_path, uid, gid)
+    except OSError as error:
+        raise _HomeError(str(error))
+
+
 def run(args, check_mode=False, shell=False, environment=None, options=None):
+    try:
+        return _run(args, check_mode, environment, options or {})
+    except _HomeError as error:
+        # create_homedir/chown_homedir use exit_json(failed=True, msg=...).
+        return {"failed": True, "msg": str(error)}
+
+
+def _run(args, check_mode, environment, options):
+    args = dict(args)
+    # comment/shell are type='str' and home is type='path' in the official
+    # argument_spec, so ints are compared as text and home is expanded.
+    for key in ("comment", "shell", "home"):
+        if args.get(key) is not None:
+            args[key] = str(args[key])
+    if args.get("home") is not None:
+        args["home"] = os.path.expanduser(os.path.expandvars(args["home"]))
     name = args["name"]
     if args.get("append") and args.get("groups") is None:
         return {
@@ -172,8 +255,16 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
     if check_mode and not existed:
         return {"changed": True}
 
+    create_home = args.get("create_home", args.get("createhome", True))
+    # useradd cannot create missing parents: the official module creates the
+    # home first and chowns it once the user exists.
+    path_needs_parents = (
+        not existed and args.get("home") and create_home
+        and not os.path.isdir(os.path.dirname(args["home"])))
     stdout = stderr = ""
     if changed and not check_mode:
+        if path_needs_parents:
+            _create_homedir(args["home"], options.get("home_mode"))
         rc, stdout, stderr = _execute(command, environment)
         if rc is None:
             return {"failed": True, "msg": stderr}
@@ -198,6 +289,8 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         entry = pwd.getpwnam(name)
     except KeyError:
         return result
+    if path_needs_parents:
+        _chown_homedir(entry.pw_uid, entry.pw_gid, args["home"])
     result.update({
         "uid": entry.pw_uid,
         "group": entry.pw_gid,
@@ -205,7 +298,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         "home": entry.pw_dir,
         "shell": entry.pw_shell,
     })
-    if (options or {}).get("result_memberships"):
+    if options.get("result_memberships"):
         result["groups"] = ",".join(_memberships(name))
     elif args.get("groups") is not None:
         groups = args["groups"]
@@ -213,13 +306,14 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
             groups if isinstance(groups, str)
             else ",".join(str(group) for group in groups)
         )
-    create_home = args.get("create_home", args.get("createhome", True))
+    home = args["home"] if args.get("home") is not None else entry.pw_dir
     if (
             create_home
-            and entry.pw_dir not in ("/", "/var/empty")
-            and not os.path.exists(entry.pw_dir)):
-        result["changed"] = True
+            and not os.path.exists(home)
+            and not (options.get("placeholder_homes")
+                     and home in _PLACEHOLDER_HOME_DIRS)):
         if not check_mode:
-            os.makedirs(entry.pw_dir)
-            os.chown(entry.pw_dir, entry.pw_uid, entry.pw_gid)
+            _create_homedir(home, options.get("home_mode"))
+            _chown_homedir(entry.pw_uid, entry.pw_gid, home)
+        result["changed"] = True
     return result

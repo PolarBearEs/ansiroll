@@ -3323,6 +3323,7 @@ class Runtime:
             w = self._get_worker(bool(become))
             self._frame_send(w["proc"], {
                 "op": op, "args": args, "check_mode": self.check_mode,
+                "env": self._module_env,
             })
             response = self._frame_recv(w["proc"])
             if response is None:
@@ -3437,19 +3438,80 @@ class Runtime:
         return ack
 
     def _run_file_action(self, name, task, args, ctx, become=False):
-        """Handle template/copy using src content baked at compile time.
+        """Run template/copy like their action plugins, with src baked at
+        compile time.
 
-        With a real UID change, the persistent sudo worker writes root-owned
-        destinations such as /etc/sudoers.d directly."""
-        dest = args.get("dest")
-        if not dest:
-            return {"failed": True, "changed": False, "msg": "%s: dest is required" % name}
+        Mirrors ansible's plugins/action/template.py and copy.py: render the
+        source, compare its sha1 with a stat of dest, then let the official
+        ``copy`` module (content differs) or ``file`` module (attributes only)
+        apply it, so validate/backup/force/mode/owner/symlink handling and
+        the result keys are the official ones."""
+        args = _strip_omit(args)
+        if not isinstance(args, dict):
+            return {"failed": True, "changed": False,
+                    "msg": "%s: arguments must be a dictionary" % name}
+        args = dict(args)
+        for internal in ("_original_basename", "_diff_peek"):
+            if args.get(internal) is not None:
+                return {"failed": True, "changed": False,
+                        "msg": 'Invalid parameter specified: "%s"' % internal}
         baked = task.get("_baked") or {}
         src = args.get("src")
-        if name == "copy" and "content" in args:
-            new_content = args["content"]
-            if not isinstance(new_content, str):
-                new_content = json.dumps(new_content)
+        meta = {}
+        lmode = None
+        if name == "template":
+            for key in ("src", "dest", "state", "newline_sequence"):
+                value = args.get(key)
+                if value is not None and not isinstance(value, str):
+                    return {"failed": True, "changed": False,
+                            "msg": "%s is expected to be a string, but got %s instead"
+                                   % (key, type(value))}
+            newline_sequence = args.get("newline_sequence", "\n")
+            wrong = ["\\n", "\\r", "\\r\\n"]
+            if newline_sequence in wrong:
+                newline_sequence = ["\n", "\r", "\r\n"][wrong.index(newline_sequence)]
+            if args.get("state") is not None:
+                return {"failed": True, "changed": False,
+                        "msg": "'state' cannot be specified on a template"}
+            if src is None or args.get("dest") is None:
+                return {"failed": True, "changed": False,
+                        "msg": "src and dest are required"}
+            if newline_sequence not in ("\n", "\r", "\r\n"):
+                return {"failed": True, "changed": False,
+                        "msg": "newline_sequence needs to be one of: \n, \r or \r\n"}
+        dest = args.get("dest")
+        if name == "copy":
+            content = args.get("content")
+            failure = None
+            if not src and content is None:
+                failure = "src (or content) is required"
+            elif not dest:
+                failure = "dest is required"
+            elif src and content is not None:
+                failure = "src and content are mutually exclusive"
+            elif content is not None and str(dest).endswith("/"):
+                failure = "can not use content with a dir as dest"
+            if failure:
+                return {"failed": True, "changed": False, "msg": failure}
+            if content is None and _ansible_bool(args.get("remote_src", False)):
+                return self.run_module(_COPY_MODULE, args, become=become)
+        else:
+            content = None
+
+        if content is not None:
+            if isinstance(content, (dict, list)):
+                content = json.dumps(content)
+            data = _as_text(content).encode("utf-8", "surrogateescape")
+            prefix = "tmp" if task.get("_copy_legacy_stage") else "."
+            source_rel = prefix + _random_suffix()
+            source_display = os.path.join(_tempfile_dir(), source_rel)
+            if args.get("mode") == "preserve":
+                # The copy action preserves the mode of its mkstemp source.
+                import stat
+                import tempfile
+
+                with tempfile.TemporaryFile() as source:
+                    lmode = "0%03o" % stat.S_IMODE(os.fstat(source.fileno()).st_mode)
         else:
             if src is None:
                 return {"failed": True, "changed": False, "msg": "%s: src is required" % name}
@@ -3475,9 +3537,17 @@ class Runtime:
             except Exception as ex:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
+            fullpath = meta.get("fullpath", src)
+            source_display = fullpath
+            source_rel = os.path.basename(str(fullpath))
+            if args.get("mode") == "preserve":
+                if meta.get("mode") is None:
+                    return {"failed": True, "changed": False,
+                            "msg": "%s: mode=preserve needs the source file mode, "
+                                   "which was not baked for %r" % (name, src)}
+                lmode = "0%03o" % meta["mode"]
             if name == "template":
                 tctx = dict(ctx)
-                fullpath = meta.get("fullpath", src)
                 try:
                     import platform
                     import pwd
@@ -3503,49 +3573,211 @@ class Runtime:
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
-                    new_content = _as_text(rendered)
+                    rendered = _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
+                encoding = args.get("output_encoding") or "utf-8"
+                try:
+                    data = rendered.encode(encoding, "surrogateescape")
+                except (LookupError, UnicodeError) as ex:
+                    return {"failed": True, "changed": False,
+                            "msg": "template: %s" % ex}
+                # The template action passes mode (resolved for 'preserve'),
+                # follow and dest on to copy and drops template-only options.
+                args["mode"] = lmode if lmode is not None else args.get("mode")
+                args["follow"] = _ansible_bool(args.get("follow", False))
+                for key in _TEMPLATE_ONLY_ARGS:
+                    args.pop(key, None)
             else:
-                new_content = raw
-
-        # When dest is a directory (trailing slash or existing dir), copy into it
-        # under the source's basename, like Ansible's copy/template.
-        if src and (str(dest).endswith("/") or os.path.isdir(dest)):
-            dest = os.path.join(dest, os.path.basename(str(src)))
-
-        mode = _norm_mode(args.get("mode"))
-        owner = args.get("owner")
-        group = args.get("group")
-        needs_become = self._needs_become(become)
+                data = raw.encode("utf-8", "surrogateescape")
         try:
-            if needs_become:
-                res = self._run_worker_operation(
-                    "fast_write",
-                    {"dest": dest, "content": new_content, "mode": mode,
-                     "owner": owner, "group": group},
-                    become=True,
-                )
-                if res is not None:
-                    if res.get("failed"):
-                        return {"failed": True, "changed": False,
-                                "msg": "%s: %s" % (name, res.get("msg"))}
-                    return res
-                return {"failed": True, "changed": False,
-                        "msg": "%s: privileged worker unavailable" % name}
-            old = _read_maybe(dest, False, self)
-            changed = old != new_content
-            if changed and not self.check_mode:
-                parent = os.path.dirname(dest)
-                if parent and not os.path.isdir(parent):
-                    os.makedirs(parent, exist_ok=True)
-                with open(dest, "w", encoding="utf-8", errors="surrogateescape") as fh:
-                    fh.write(new_content)
-                _chmod_chown(dest, mode, owner, group)
-            return {"changed": changed, "dest": dest}
-        except OSError as ex:
-            return {"failed": True, "changed": False, "msg": "%s: %s" % (name, ex)}
+            return self._copy_single_file(
+                task, args, data, source_rel, source_display,
+                content is not None, lmode, become)
+        except _CopyActionError as ex:
+            return {"failed": True, "changed": False, "msg": str(ex)}
+
+    def _copy_op(self, op, args, become):
+        res = self._run_worker_operation(op, args, become=become)
+        if res is None:
+            raise _CopyActionError(
+                "ansiroll: worker unavailable for %s"
+                % ("privileged file transfer" if self._needs_become(become)
+                   else "file transfer"))
+        return res
+
+    def _copy_remote_stat(self, path, follow, checksum, become):
+        """ActionBase._execute_remote_stat on the copy destination."""
+        res = self._copy_op("copy_stat", {
+            "path": path, "follow": bool(follow), "checksum": bool(checksum),
+        }, become)
+        if res.get("failed"):
+            raise _CopyActionError(
+                "Failed to get information on remote file (%s): %s"
+                % (path, res.get("msg")))
+        return res
+
+    def _copy_expand_user(self, path, become):
+        """ActionBase._remote_expand_user: ~ and ~user, as the become user
+        when sudo changes identity."""
+        if not path.startswith("~"):
+            return path
+        head, sep, rest = path.partition(os.path.sep)
+        if head == "~" and self._needs_become(become) and self.become_user:
+            head = "~%s" % self.become_user
+        expanded = os.path.expanduser(head)
+        if expanded == head:
+            return path
+        return expanded + sep + rest if sep else expanded
+
+    def _copy_single_file(self, task, args, data, source_rel, source_display,
+                          from_content, lmode, become):
+        """ansible plugins/action/copy.py ActionModule._copy_file + the
+        single-file result handling of ActionModule._run."""
+        force = _ansible_bool(args.get("force", "yes"))
+        raw = _ansible_bool(args.get("raw", "no"))
+        follow = _ansible_bool(args.get("follow", False))
+        dest = self._copy_expand_user(str(args.get("dest")), become)
+        if dest.endswith("/"):
+            dest_file = os.path.join(dest, source_rel)
+        else:
+            dest_file = dest
+        dest_status = self._copy_remote_stat(dest_file, follow, force, become)
+        if dest_status.get("exists") and dest_status.get("isdir"):
+            if from_content:
+                return {"failed": True, "changed": False, "diff": [],
+                        "msg": "can not use content with a dir as dest"}
+            dest_file = os.path.join(dest, source_rel)
+            dest_status = self._copy_remote_stat(dest_file, follow, force, become)
+        if dest_status.get("exists") and not force:
+            return {"changed": False, "dest": dest, "src": source_display}
+
+        local_checksum = hashlib.sha1(data).hexdigest()
+        result = {"diff": []}
+        if local_checksum != dest_status.get("checksum"):
+            if self.diff_mode and not raw:
+                result["diff"].append(self._copy_diff(
+                    task, dest_file, data, source_display, from_content, become))
+            if self.check_mode:
+                result["changed"] = True
+                return result
+            if raw:
+                # raw=yes transfers the data straight to dest; no module runs.
+                put = self._copy_op("copy_stage", {
+                    "data": base64.b64encode(data).decode("ascii"),
+                    "path": dest_file,
+                }, become)
+                if put.get("failed"):
+                    raise _CopyActionError(
+                        "failed to transfer file to %s: %s" % (dest_file, put.get("msg")))
+                return {"changed": False, "dest": dest, "src": source_display}
+            tmp_src = "source"
+            if not task.get("_copy_legacy_stage"):
+                tmp_src = ".source" + os.path.splitext(dest_file)[1]
+            staged = self._copy_op("copy_stage", {
+                "data": base64.b64encode(data).decode("ascii"),
+                "filename": tmp_src,
+            }, become)
+            if staged.get("failed"):
+                raise _CopyActionError(
+                    "failed to transfer file to %s: %s" % (tmp_src, staged.get("msg")))
+            module_args = dict(
+                (k, v) for k, v in args.items() if k not in ("content", "decrypt"))
+            module_args.update({
+                "src": staged["path"],
+                "dest": dest,
+                "_original_basename": source_rel,
+                "follow": follow,
+            })
+            if not args.get("checksum"):
+                module_args["checksum"] = local_checksum
+            if lmode:
+                module_args["mode"] = lmode
+            try:
+                module_return = self.run_module(_COPY_MODULE, module_args, become=become)
+            finally:
+                self._run_worker_operation(
+                    "copy_cleanup", {"tmpdir": staged.get("tmpdir")}, become=become)
+        else:
+            if raw:
+                return {"changed": False, "dest": dest, "src": source_display}
+            if follow:
+                nofollow = self._copy_remote_stat(dest_file, False, True, become)
+                if nofollow.get("islnk") and "lnk_source" in nofollow:
+                    dest = nofollow["lnk_source"]
+            file_args = self._copy_real_file_args(task)
+            module_args = dict(
+                (k, v) for k, v in args.items() if k in file_args)
+            module_args.update({
+                "dest": dest,
+                "_original_basename": source_rel,
+                "recurse": False,
+                "state": "file",
+            })
+            module_args.pop("src", None)
+            if lmode:
+                module_args["mode"] = lmode
+            module_return = self.run_module(_FILE_MODULE, module_args, become=become)
+        if not module_return.get("checksum"):
+            module_return["checksum"] = local_checksum
+        result.update(module_return)
+        if result.get("failed"):
+            return result
+        if "path" in result and "dest" not in result:
+            result["dest"] = result["path"]
+        return result
+
+    @staticmethod
+    def _copy_real_file_args(task):
+        """copy action REAL_FILE_ARGS, baked from the compiling ansible-core."""
+        baked = task.get("_copy_file_args")
+        if baked:
+            return frozenset(baked)
+        return _DEFAULT_REAL_FILE_ARGS
+
+    def _copy_diff(self, task, destination, data, source_display,
+                   from_content, become):
+        """ActionBase._get_diff_data for an in-memory source."""
+        max_size = task.get("_max_diff_size")
+        if max_size is None:
+            max_size = 104448
+        diff = {}
+        peek = self.run_module(
+            _FILE_MODULE, {"path": destination, "_diff_peek": True}, become=become)
+        if peek.get("failed", False):
+            sys.stderr.write("[WARNING]: Failed to get diff between '%s' and '%s': %s\n"
+                             % (os.path.basename(source_display), destination,
+                                peek.get("msg", "")))
+            return diff
+        if peek.get("rc", 0) == 0:
+            if peek.get("state") in (None, "absent"):
+                diff["before"] = ""
+            elif peek.get("appears_binary"):
+                diff["dst_binary"] = 1
+            elif peek.get("size") and max_size > 0 and peek["size"] > max_size:
+                diff["dst_larger"] = max_size
+            else:
+                current = self._copy_op("copy_read", {"path": destination}, become)
+                if "content" in current:
+                    diff["before_header"] = destination
+                    diff["before"] = base64.b64decode(current["content"]).decode(
+                        "utf-8", "surrogateescape")
+            if max_size > 0 and len(data) > max_size:
+                diff["src_larger"] = max_size
+            elif b"\x00" in data:
+                diff["src_binary"] = 1
+            else:
+                inline_header = from_content and not task.get("_copy_inline_diff_source")
+                diff["after_header"] = destination if inline_header else source_display
+                diff["after"] = data.decode("utf-8", "surrogateescape")
+        if task.get("no_log"):
+            if "before" in diff:
+                diff["before"] = ""
+            if "after" in diff:
+                diff["after"] = (" [[ Diff output has been hidden because "
+                                 "'no_log: true' was specified for this result ]]\n")
+        return diff
 
     def _absorb_facts(self, task, res):
         refreshed_vars = res.pop("_ansiroll_vars", None)
@@ -3608,8 +3840,10 @@ class Runtime:
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
+                from ansiroll.accelerated_modules.environment import module_environment
                 started = time.monotonic()
-                res = facts.run(fact_schema=fact_schema)
+                with module_environment(self._module_env):
+                    res = facts.run(fact_schema=fact_schema)
                 provenance = {
                     "mode": "native-agent",
                     "reason": "accelerated facts",
@@ -3946,49 +4180,46 @@ class Runtime:
         self._workers = {}
 
 
-def _norm_mode(mode):
-    if mode is None:
-        return None
-    if isinstance(mode, int):
-        return "0%o" % mode  # YAML unquoted octal arrives as int
-    return str(mode)
+_COPY_MODULE = "ansible.builtin.copy"
+_FILE_MODULE = "ansible.builtin.file"
+# Template action options that are not passed on to the copy action.
+_TEMPLATE_ONLY_ARGS = (
+    "newline_sequence", "block_start_string", "block_end_string",
+    "variable_start_string", "variable_end_string", "comment_start_string",
+    "comment_end_string", "trim_blocks", "lstrip_blocks", "output_encoding",
+)
+# ansible-core 2.21 plugins/action/copy.py REAL_FILE_ARGS; compiled tasks
+# carry the compiling ansible-core's own set in ``_copy_file_args``.
+_DEFAULT_REAL_FILE_ARGS = frozenset((
+    "mode", "owner", "group", "seuser", "serole", "selevel", "setype",
+    "attributes", "unsafe_writes", "state", "path", "_original_basename",
+    "recurse", "force", "_diff_peek", "src",
+))
 
 
-def _read_maybe(path, become, rt):
-    """Read existing file content for change detection; tolerate no-permission."""
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                return fh.read()
-        return None
-    except OSError:
-        if become:
-            try:
-                cmd = ["sudo"]
-                cmd += (["-S", "-p", ""] if rt.become_password else ["-n"])
-                cmd += ["-u", rt.become_user]
-                cmd += ["cat", path]
-                stdin = (rt.become_password + "\n") if rt.become_password else None
-                proc = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-                if proc.returncode == 0:
-                    return proc.stdout
-            except Exception:
-                pass
-        return None  # unreadable -> treat as changed
+class _CopyActionError(Exception):
+    pass
 
 
-def _chmod_chown(path, mode, owner, group):
-    try:
-        if mode:
-            os.chmod(path, int(mode, 8))
-    except Exception:
-        pass
-    if owner or group:
-        try:
-            import shutil
-            shutil.chown(path, user=owner, group=group)
-        except Exception:
-            pass
+def _ansible_bool(value):
+    """ansible.module_utils.parsing.convert_bool.boolean(value, strict=False)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        value = value.lower().strip()
+    return value in ("y", "yes", "on", "1", "true", "t", 1, 1.0)
+
+
+def _random_suffix():
+    import random
+    import string
+    chars = string.ascii_lowercase + string.digits
+    return "".join(random.choice(chars) for _ in range(8))
+
+
+def _tempfile_dir():
+    import tempfile
+    return tempfile.gettempdir()
 
 
 def _parse_output(out, err, rc):
