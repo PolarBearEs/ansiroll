@@ -3,30 +3,22 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import os
-import re
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stdout
+from contextlib import redirect_stdout
 
 from .compiler import compile_playbook
 
 
-def main(argv=None):
-    return _main(argv, callable_stdout=True)
-
-
 def entrypoint():
-    return _main(None, callable_stdout=False)
+    return main(_standalone=True)
 
 
-def _main(argv, *, callable_stdout):
+def main(argv=None, *, _standalone=False):
     parser = argparse.ArgumentParser(prog="ansiroll", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -61,8 +53,8 @@ def _main(argv, *, callable_stdout):
 
     if args.command == "compile":
         if args.output == "-":
-            if callable_stdout:
-                return _cmd_compile_stdout_in_child(args)
+            if not _standalone:
+                parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
             return _cmd_compile_stdout(args)
         return _cmd_compile(args)
     if args.command == "run":
@@ -70,204 +62,47 @@ def _main(argv, *, callable_stdout):
     parser.error("unknown command")
 
 
-@contextmanager
-def _compile_diagnostics_to_stderr():
-    # Only used in processes dedicated to compilation. Keep fd 1 redirected
-    # through shutdown so native buffers and exit handlers also go to stderr.
-    with os.fdopen(os.dup(1), "wb") as saved_stdout:
-        os.dup2(2, 1)
-        sys.stdout.flush()
-        with redirect_stdout(sys.stderr):
-            yield saved_stdout
-
-
-def _stdout_manifest_path(path, *stdout_fds):
+def _manifest_for_stdout(path, stdout_fd):
+    if not path:
+        return path
     try:
-        manifest_stat = os.stat(path)
+        aliases_stdout = os.path.samestat(os.stat(path), os.fstat(stdout_fd))
     except FileNotFoundError:
         return path
-    if not any(_fd_matches(manifest_stat, fd) for fd in stdout_fds if fd is not None):
+    if not aliases_stdout:
         return path
     if os.path.samefile(path, os.devnull):
-        # A path such as /dev/stdout would point to stderr after redirection.
         return os.devnull
-    sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % path)
-    return None
-
-
-def _fd_matches(path_stat, fd):
-    try:
-        return os.path.samestat(path_stat, os.fstat(fd))
-    except OSError as error:
-        if error.errno != errno.EBADF:
-            raise
-        return False
+    raise ValueError("manifest path points to stdout: %s" % path)
 
 
 def _cmd_compile_stdout(args):
-    manifest_path = args.manifest
-    if manifest_path:
-        manifest_path = _stdout_manifest_path(manifest_path, 1)
-        if manifest_path is None:
-            return 2
-    with _compile_diagnostics_to_stderr() as saved_stdout:
-        compiled = _compile_source(args)
-        if compiled is None:
-            return 2
-        source, manifest = compiled
-        if manifest_path:
-            # Duplicating stdout may have made a /dev/fd path resolve to it.
-            manifest_path = _stdout_manifest_path(manifest_path, saved_stdout.fileno())
-            if manifest_path is None:
-                return 2
-            _write_manifest(manifest_path, manifest)
-        saved_stdout.write(source.encode("utf-8"))
-
-    _report_compiled(args.playbook, "stdout", manifest)
-    return 0
-
-
-def _compile_worker(channel_fd):
-    with socket.socket(fileno=channel_fd) as channel:
-        channel.set_inheritable(False)
-        with channel.makefile("rb") as request_stream:
-            request = json.load(request_stream)
-        sys.path[:] = request["import_path"]
-        compiled = _compile_source(argparse.Namespace(**request["args"]))
-        if compiled is None:
-            return 2
-        channel.sendall(json.dumps(compiled).encode("utf-8"))
-    return 0
-
-
-def _compile_input_fds(args):
-    paths = [args.playbook, args.vault_password_file, os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE")]
-    paths.extend(value[1:] for value in args.extra_vars if value.startswith("@"))
-    requested = set()
-    for path in paths:
-        if path:
-            directory, name = os.path.split(os.path.abspath(path))
-            if name.isascii() and name.isdecimal():
-                directory = os.path.realpath(directory)
-                if directory == "/dev/fd" or re.fullmatch(r"/proc/\d+(?:/task/\d+)?/fd", directory):
-                    requested.add(int(name))
-
-    available = set()
-    for directory in ("/proc/self/fd", "/dev/fd"):
-        try:
-            available = {int(name) for name in os.listdir(directory) if name.isdigit()}
-        except OSError:
-            continue
-        break
-    descriptors = []
-    for fd in sorted((available | requested) - {0, 1, 2}):
-        try:
-            if os.get_inheritable(fd) or fd in requested:
-                descriptors.append(fd)
-        except OSError:
-            # A descriptor may have closed since the directory was read.
-            continue
-    return descriptors
-
-
-def _run_compile_worker(args):
-    request = json.dumps({
-        "args": vars(args),
-        "import_path": [path for path in sys.path if isinstance(path, str)],
-    }).encode("utf-8")
-    input_fds = _compile_input_fds(args)
     try:
-        os.fstat(0)
-        stdin = 0
-    except OSError:
-        stdin = None
-    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    worker = (
-        "import sys; sys.path.insert(0, sys.argv[1]); "
-        "from ansiroll.cli import _compile_worker; sys.exit(_compile_worker(int(sys.argv[2])))"
-    )
-    flags = []
-    if sys.flags.isolated:
-        flags.append("-I")
-    else:
-        if sys.flags.ignore_environment:
-            flags.append("-E")
-        if sys.flags.no_user_site:
-            flags.append("-s")
-        if getattr(sys.flags, "safe_path", False):
-            flags.append("-P")
-    if sys.flags.no_site:
-        flags.append("-S")
-    parent, child = socket.socketpair()
-    with parent, child:
-        with subprocess.Popen(
-            [sys.executable, *flags, "-c", worker, package_root, str(child.fileno())],
-            stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            pass_fds=(*input_fds, child.fileno()),
-            env=dict(os.environ, PYTHONIOENCODING="utf-8"),
-        ) as proc:
-            child.close()
-            # Drain diagnostics while exchanging the request and artifact.
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                drain = pool.submit(proc.communicate)
-                try:
-                    parent.sendall(request)
-                    parent.shutdown(socket.SHUT_WR)
-                    with parent.makefile("rb") as response:
-                        payload = response.read()
-                except (BrokenPipeError, ConnectionResetError):
-                    payload = b""
-                diagnostics, _ = drain.result()
-    return proc.returncode, payload, diagnostics.decode("utf-8", errors="replace")
+        args.manifest = _manifest_for_stdout(args.manifest, 1)
+        with os.fdopen(os.dup(1), "wb") as stdout:
+            # Keep inherited stdout and native buffers on stderr through CLI exit.
+            os.dup2(2, 1)
+            sys.stdout.flush()
+            with redirect_stdout(sys.stderr):
+                return _cmd_compile(args, stdout)
+    except ValueError as ex:
+        sys.stderr.write("ansiroll: %s\n" % ex)
+        return 2
 
 
-def _cmd_compile_stdout_in_child(args):
-    stdout, stderr = sys.stdout, sys.stderr
-    try:
-        stdout_fd = stdout.fileno()
-    except (AttributeError, OSError, ValueError):
-        stdout_fd = None
-    manifest_path = args.manifest
-    if manifest_path:
-        manifest_path = _stdout_manifest_path(manifest_path, 1, stdout_fd)
-        if manifest_path is None:
-            return 2
-
-    # Compile in a fresh interpreter so application threads and retained
-    # streams are unaffected by the compiler's process-wide redirection.
-    returncode, payload, diagnostics = _run_compile_worker(args)
-    if diagnostics:
-        stderr.write(diagnostics)
-    if returncode:
-        return returncode
-    source, manifest = json.loads(payload)
-    if manifest_path:
-        manifest_path = _stdout_manifest_path(manifest_path, 1, stdout_fd)
-        if manifest_path is None:
-            return 2
-        _write_manifest(manifest_path, manifest)
-    if stdout is sys.__stdout__ and stdout_fd == 1:
-        stdout.flush()
-        stdout.buffer.write(source.encode("utf-8"))
-    else:
-        stdout.write(source)
-    _report_compiled(args.playbook, "stdout", manifest)
-    return 0
-
-
-def _compile_source(args):
+def _cmd_compile(args, stdout=None):
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
         sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
-        return None
+        return 2
     try:
-        return compile_playbook(args.playbook, python_interpreter=args.interpreter,
-                                vault_password_file=args.vault_password_file,
-                                extra_vars=extra_vars,
-                                tree_shake=args.tree_shake,
-                                freeze_playbook_vars=args.freeze_playbook_vars,
-                                freeze_vars=args.freeze_var)
+        source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
+                                            vault_password_file=args.vault_password_file,
+                                            extra_vars=extra_vars,
+                                            tree_shake=args.tree_shake,
+                                            freeze_playbook_vars=args.freeze_playbook_vars,
+                                            freeze_vars=args.freeze_var)
     except Exception as ex:
         if not isinstance(ex, (ValueError,) + _ansible_errors()):
             raise
@@ -275,33 +110,24 @@ def _compile_source(args):
         if not message.startswith("ansiroll: "):
             message = "ansiroll: " + message
         sys.stderr.write(message + "\n")
-        return None
-
-
-def _cmd_compile(args):
-    compiled = _compile_source(args)
-    if compiled is None:
         return 2
-    source, manifest = compiled
-    with open(args.output, "w") as fh:
-        fh.write(source)
-    os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
+    if stdout is None:
+        with open(args.output, "w") as fh:
+            fh.write(source)
+        os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
-        _write_manifest(args.manifest, manifest)
-    _report_compiled(args.playbook, args.output, manifest)
-    return 0
-
-
-def _write_manifest(path, manifest):
-    with open(path, "w") as fh:
-        json.dump(manifest, fh, indent=2)
-
-
-def _report_compiled(playbook, destination, manifest):
+        manifest_path = _manifest_for_stdout(args.manifest, stdout.fileno()) if stdout else args.manifest
+        with open(manifest_path, "w") as fh:
+            json.dump(manifest, fh, indent=2)
+    if stdout is not None:
+        stdout.write(source.encode("utf-8"))
+        stdout.flush()
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
-        % (playbook, destination, len(manifest["modules"]), len(manifest["fallback_tasks"]))
+        % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),
+           len(manifest["fallback_tasks"]))
     )
+    return 0
 
 
 def _ansible_errors():
