@@ -492,7 +492,7 @@ def test_looped_playbook_dir_src_bakes_nested_items_and_doubled_separators(tmp_p
     assert (tmp_path / "out-conf").read_text() == "nested=3 conf.j2"
 
 
-def test_looped_src_directly_under_playbook_dir_is_baked_not_the_role_tree(tmp_path):
+def test_looped_src_directly_under_playbook_dir_falls_back_not_to_the_role_tree(tmp_path):
     playbook = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -508,20 +508,10 @@ def test_looped_src_directly_under_playbook_dir_is_baked_not_the_role_tree(tmp_p
         "roles/a/templates/conf.j2": "unrelated",
         "conf.j2": "value={{ 1 + 1 }}",
     })
-    dest = tmp_path / "out-conf"
-    expected = _ansible(playbook, tmp_path)
-    assert dest.read_text() == "value=2"
-    dest.unlink()
-    src, _ = compile_playbook(str(playbook))
-    (tmp_path / "conf.j2").unlink()
-    script = tmp_path / "compiled.py"
-    script.write_text(src)
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
-    )
-    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
-    assert dest.read_text() == "value=2"
+    # Baking the playbook dir itself would embed vault files and keys, and the role's tree is unrelated.
+    _src, info = compile_playbook(str(playbook))
+    assert [task["reason"] for task in info["fallback_tasks"]] == [
+        "dynamic baked src not resolvable at compile time: %s/{{ item }}.j2" % tmp_path]
 
 
 def test_absolute_dynamic_src_bakes_only_matching_files_inside_the_playbook_dir(tmp_path):
@@ -537,10 +527,25 @@ def test_absolute_dynamic_src_bakes_only_matching_files_inside_the_playbook_dir(
     (pb / "link.j2").symlink_to(tmp_path / "outside.j2")
     (pb / "nested").mkdir()
     (pb / "nested" / "sub.j2").write_text("sub")
+    # The static directory must lie below the playbook dir, which would otherwise expose the whole tree.
+    assert not loader._bake_absolute_tree({}, str(pb) + "/{{ item }}.j2", str(pb), True)
+    (pb / ".secrets").mkdir()
+    (pb / ".secrets" / "password").write_text("hunter2")
+    tpl = pb / "templates"
+    (tpl / "real").mkdir(parents=True)
+    (tpl / "conf.j2").write_text("conf")
+    (tpl / "real" / "sub.j2").write_text("sub")
+    (tpl / "alias").symlink_to(tpl / "real")
+    (tpl / "loop").symlink_to(tpl)
+    (tpl / "private.j2").symlink_to(pb / ".secrets" / "password")
+    (tpl / "escape.j2").symlink_to(tmp_path / "outside.j2")
+    (tpl / ".hidden.j2").write_text("hidden")
     node = {}
-    assert loader._bake_absolute_tree(node, str(pb) + "/{{ item }}.j2", str(pb), True)
-    assert node["_baked"] == {str(pb / "conf.j2"): "conf", str(pb / "nested" / "sub.j2"): "sub"}
-    assert node["_baked_meta"][str(pb / "conf.j2")]["fullpath"] == str(pb / "conf.j2")
+    assert loader._bake_absolute_tree(node, str(tpl) + "/{{ item }}.j2", str(pb), True)
+    assert node["_baked"] == {
+        str(tpl / "alias" / "sub.j2"): "sub", str(tpl / "conf.j2"): "conf", str(tpl / "real" / "sub.j2"): "sub"}
+    assert node["_baked_meta"][str(tpl / "conf.j2")]["fullpath"] == str(tpl / "conf.j2")
+    assert not loader._bake_absolute_tree({}, str(pb) + "/.secrets/{{ item }}", str(pb), False)
 
 
 def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, monkeypatch):

@@ -1457,26 +1457,36 @@ def _bake_absolute_tree(node, src, basedir, with_meta):
     """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
     separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
     below the src's static directory, so "{{ playbook_dir }}/templates/{{ item }}.j2" bakes nested .j2 files too.
-    Dot entries (.git, vault password files) and anything resolving outside the playbook dir are never baked."""
+
+    The static directory must lie strictly below the playbook dir: "{{ playbook_dir }}/{{ item }}" would otherwise
+    embed vault files, inventories and keys. Hidden entries (.git, vault password files), on the lexical or the
+    resolved path, and anything resolving outside the playbook dir are never baked."""
     src = re.sub(r"/+", "/", src)
     if not os.path.isabs(src):
         return False
     tree_dir = os.path.dirname(_JINJA_RE.split(src, 1)[0])
     root = os.path.realpath(basedir)
-    real_tree = os.path.realpath(tree_dir)
-    if not (real_tree == root or real_tree.startswith(os.path.join(root, ""))) or not os.path.isdir(tree_dir):
+    if not os.path.isdir(tree_dir) or not _visible_below(tree_dir, basedir) or not _visible_below(
+            os.path.realpath(tree_dir), root):
         return False
     pattern = re.compile(".*".join(re.escape(part) for part in _JINJA_RE.split(src)) + r"\Z", re.S)
     baked = {}
     meta = {}
     size = 0
-    for walk_root, dirs, files in os.walk(tree_dir):
-        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+    for walk_root, dirs, files in os.walk(tree_dir, followlinks=True):
+        real_root = os.path.realpath(walk_root)
+        if not _visible_below(real_root, root):
+            dirs[:] = []
+            continue
+        # A link back to this directory or an ancestor would loop forever.
+        dirs[:] = sorted(
+            d for d in dirs if not d.startswith(".")
+            and not os.path.join(real_root, "").startswith(os.path.join(os.path.realpath(os.path.join(walk_root, d)), "")))
         for fn in sorted(files):
             path = os.path.join(walk_root, fn)
             if fn.startswith(".") or not pattern.match(path) or not os.path.isfile(path):
                 continue
-            if not os.path.realpath(path).startswith(os.path.join(root, "")):
+            if not _visible_below(os.path.realpath(path), root):
                 continue
             try:
                 st = os.stat(path)
@@ -1495,6 +1505,12 @@ def _bake_absolute_tree(node, src, basedir, with_meta):
     if meta:
         node["_baked_meta"] = meta
     return True
+
+
+def _visible_below(path, root):
+    """Whether path lies strictly below root through no hidden (dot) component."""
+    rel = os.path.relpath(path, root)
+    return rel != "." and not any(part.startswith(".") for part in rel.split(os.sep))
 
 
 def _bake_role_tree(node, task, subdir):
