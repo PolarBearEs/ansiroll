@@ -1080,15 +1080,20 @@ def test_gather_facts_failure_honors_play_ignore_errors(monkeypatch):
     assert rt.stats["ignored"] == 1
 
 
-def test_setup_condition_and_ignore_errors_gate_the_module(monkeypatch):
+@pytest.mark.parametrize("version,ignored", [("2.14.18", True), ("2.21.1", False)])
+def test_setup_condition_and_ignore_errors_gate_the_module(monkeypatch, version, ignored):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
     rt = Runtime({}, "", {})
     calls = []
     monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: calls.append(args))
     assert rt.gather_facts(when=[False])
-    assert not rt.gather_facts(ignore_errors="{{ missing_value }}")
+    assert rt.gather_facts(ignore_errors="{{ missing_value }}") is ignored
     assert calls == []
     assert rt.stats["skipped"] == 1
-    assert rt.stats["failures"] == 1
+    assert rt.stats["failures"] == int(not ignored)
+    assert rt.stats["ignored"] == int(ignored)
 
 
 def test_setup_censors_failures_and_hides_success_details(monkeypatch):
