@@ -1075,6 +1075,62 @@ def test_legacy_force_handlers_flushes_after_failure(monkeypatch, version, force
     assert bool(by_name(frames, "h1")) is ran
 
 
+@pytest.mark.parametrize("version,registered_failed,registered_exception", [
+    ("2.20.1", True, "(traceback unavailable)"), ("2.21.1", False, None)])
+def test_until_exhausted_failed_when_decides_outcome(
+        monkeypatch, version, registered_failed, registered_exception):
+    import ansiroll.runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.run_play({"tasks": [
+        _task("1", "retry", "debug", args={"msg": "x"}, register="r",
+              until=["false"], retries=1, delay=0, failed_when=["false"]),
+        _task("2", "after", "debug", args={"msg": "{{ r.failed }}"}),
+    ], "handlers": [], "gather_facts": False, "vars": {}})
+    assert not rt.failed
+    assert rt.vars["r"]["failed"] is registered_failed
+    assert rt.vars["r"].get("exception") == registered_exception
+
+
+def test_returned_module_facts_are_visible_to_task_conditions(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.21.1")
+    rt = Runtime({}, "", {})
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: {
+        "ansible_facts": {"ansible_system": "Linux"}, "changed": False,
+    })
+    task = _task("setup", "Gather", None, action="ansible.builtin.setup",
+                 changed_when=["ansible_facts.system == 'Linux'"],
+                 failed_when=["ansible_facts.previous is not defined"])
+    result = rt._exec_one(task, {"ansible_facts": {"previous": 1}})
+    assert result["changed"]
+    assert not result["failed"]
+
+
+def test_legacy_templated_false_until_retries_to_exhaustion(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.18.10")
+    rt = Runtime({}, "", {})
+    task = _task("retry", "Retry", "debug", until=[
+        {"__ansiroll_trusted_condition__": "{{ 'false' }}"}
+    ], retries=2, delay=0)
+    result = rt._exec_with_retries(task, {})
+    assert result["failed"]
+    assert result["attempts"] == 2
+
+
+def test_core_version_gate_uses_baked_version(monkeypatch):
+    # The compiled script bakes the controller's ansible-core version; any
+    # ansible installed on the target must not influence version gates.
+    import ansiroll.runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.15.3")
+    assert runtime_mod._core_at_least(2, 15)
+    assert not runtime_mod._core_at_least(2, 16)
+
+
 def test_assert_pass_and_fail():
     rt, frames = run([_task("1", "a", "assert", args={"that": ["1 == 1"]})])
     assert frames[0]["status"] == "ok"
@@ -1260,17 +1316,16 @@ def test_until_retries_until_condition_passes(monkeypatch):
                  "", {"inventory_hostname": "h"})
     attempts = []
 
-    def run_once(_task, _ctx, _become):
-        attempts.append(1)
+    def run_once(_task, _ctx, _become, attempt=None, args_cache=None):
+        attempts.append(attempt)
         rc = 1 if len(attempts) == 1 else 0
         return {"changed": True, "failed": rc != 0, "rc": rc}
 
     monkeypatch.setattr(rt, "_exec_one", run_once)
     res = rt._exec_with_retries(task, rt.ctx({}), False)
 
-    assert len(attempts) == 2
+    assert attempts == [1, 2]
     assert res["rc"] == 0
-    assert res["attempts"] == 2
 
 
 def test_accelerated_command_runs_without_embedded_module(monkeypatch):
@@ -1881,3 +1936,111 @@ def test_to_yaml_filters_accept_lazy_vars_and_set_fact_values():
     assert by_name(frames, "cfg")[0]["result"]["msg"] == "enabled: true\nnested:\n- 2\n"
     assert by_name(frames, "nice")[0]["result"]["msg"] == "hi\n...\n"
     assert by_name(frames, "lst")[0]["result"]["msg"] == "- a\n- b\n"
+
+
+def test_retry_conditions_see_current_facts_and_arguments_are_stable(monkeypatch):
+    rt = Runtime({}, "", {})
+    rendered = []
+    rt.templater.env.globals["once"] = lambda: rendered.append("args") or "original"
+    calls = []
+
+    def action(_name, args, **_kwargs):
+        calls.append(args["value"])
+        return {"ansible_facts": {"ready": True} if len(calls) == 1 else {}, "rc": 2}
+
+    monkeypatch.setattr(rt, "run_module", action)
+    task = _task("retry", "Retry", None, action="test", register="result",
+                 args={"value": "{{ once() }} {{ result.value }}"}, retries=3, delay=0,
+                 until=["ready and result.failed and result.attempts == 2"])
+    result = rt._exec_with_retries(task, {"result": {"value": "seed"}})
+
+    assert result["attempts"] == 2
+    assert calls == ["original seed", "original seed"]
+    assert rendered == ["args"]
+
+
+@pytest.mark.parametrize("result", [
+    {"rc": 2, "_ansiroll_unknown_outcome": True},
+    {"skipped": True},
+])
+def test_retries_stop_for_unknown_or_skipped_outcome(monkeypatch, result):
+    calls = []
+    rt = Runtime({}, "", {})
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: calls.append(args) or dict(result))
+    task = _task("retry", "Retry", None, action="test", retries=3, delay=0,
+                 failed_when=["true"])
+    final = rt._exec_with_retries(task, {})
+    assert len(calls) == 1
+    assert "_ansiroll_unknown_outcome" not in final
+    if result.get("skipped"):
+        assert not final.get("failed")
+
+
+def test_explicit_until_retries_module_skip_and_sees_result_defaults(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.19.15")
+    rt = Runtime({}, "", {})
+    calls = []
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: calls.append(args) or {"skipped": True})
+    task = _task("retry", "Retry", None, action="test", register="result", retries=1, delay=0,
+                 until=["result.failed or result.changed"])
+    result = rt._exec_with_retries(task, {})
+    assert len(calls) == 2
+    assert result["failed"] is True
+    assert result["attempts"] == 1
+
+
+def test_async_acknowledgment_loss_stops_retries(monkeypatch):
+    rt = Runtime({"test": {"module_fqn": "test"}}, "", {})
+    calls = []
+
+    def lose_ack(*args, **kwargs):
+        calls.append(args)
+        raise EOFError("worker closed")
+
+    monkeypatch.setattr(rt, "_run_async_via_worker", lose_ack)
+    task = _task("async", "Async", None, action="test", retries=3, delay=0,
+                 async_val=1, poll=0, until=[False])
+    result = rt._exec_with_retries(task, {})
+    assert len(calls) == 1
+    assert result["failed"]
+    assert "launch outcome is unknown" in result["msg"]
+    assert "_ansiroll_unknown_outcome" not in result
+
+
+@pytest.mark.parametrize("version", ["2.19.15", "2.20.11", "2.21.1"])
+def test_conditions_keep_namespaced_facts_and_controller_precedence(monkeypatch, version):
+    import ansiroll.runtime as runtime_mod
+    from ansiroll.runtime import _override_ctx
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    modern = version.startswith("2.21")
+    rt = Runtime({}, "", {})
+    ctx = {
+        "inventory_hostname": "real",
+        "route_facts": True,
+        "ansible_facts": {"ansible_local": {"first": 1}},
+        "__ansiroll_controller_config": {
+            "DEFAULT_HASH_BEHAVIOUR": "merge",
+            "ansiroll_restricted_facts": ["inventory_hostname", "add_host", "add_group"],
+        },
+    }
+    result = {"ansible_facts": {
+        "ansible_local": {"second": 2},
+        "inventory_hostname": "fake",
+        "add_host": {},
+        "_ready": [{"_ansible_hidden": True, "data": 1}],
+    }}
+    effective = _override_ctx({"action": "setup"}, result, ctx)
+    assert effective["inventory_hostname"] == "real"
+    assert effective["_ready"] == [{"data": 1}]
+    assert "add_host" not in effective
+    if modern:
+        assert effective["ansible_facts"]["ansible_local"] == {"first": 1, "second": 2}
+    else:
+        assert effective["ansible_facts"]["ansible_local"] == {"first": 1}
+        assert effective["ansible_facts"]["ansible_facts"]["ansible_local"] == {"second": 2}
+    assert _override_ctx({"action": "debug"}, result, ctx) == ctx
+    delegated = {"action": "setup", "delegate_to": "other", "delegate_facts": "{{ route_facts }}"}
+    assert _override_ctx(delegated, result, ctx, rt.template) == (ctx if modern else effective)

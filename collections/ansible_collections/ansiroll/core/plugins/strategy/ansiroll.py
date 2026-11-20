@@ -533,6 +533,11 @@ class StrategyModule(StrategyBase):
             concrete.loop_with = None
             concrete.register = None
             concrete.notify = []
+            # The agent applies the original retry policy around each controller call.
+            concrete.retries = 0
+            concrete.until = []
+            concrete.changed_when = []
+            concrete.failed_when = []
             job_vars = dict(hv or {})
             job_vars.update(frame.get("vars") or {})
 

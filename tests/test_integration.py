@@ -1987,6 +1987,36 @@ def test_compile_embeds_worker_file():
     assert "# __ANSIROLL_WORKER_CODE__" not in src
 
 
+def test_compile_bakes_controller_core_version():
+    from ansible.release import __version__
+    src, _ = compile_playbook(os.path.join(FIXTURES, "simple.yml"))
+    assert "\n_ANSIROLL_CORE_VERSION = %r\n" % str(__version__) in src
+
+
+def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
+    import copy
+    from ansible.executor import task_executor
+
+    class Executor:
+        def __init__(self, host, task, *args):
+            self.task = task
+
+        def run(self):
+            return {"retries": self.task.retries, "until": self.task.until,
+                    "changed_when": self.task.changed_when, "failed_when": self.task.failed_when}
+
+    monkeypatch.setattr(task_executor, "TaskExecutor", Executor)
+    mod = _load_strategy_module()
+    strategy = SimpleNamespace(_loader=None, _variable_manager=None)
+    original = SimpleNamespace(retries=2, until=["ready"], changed_when=["registered.rc == 0"],
+                               failed_when=["registered.rc != 0"])
+    original.copy = lambda: copy.copy(original)
+    frame = {"runtime_id": "sync", "action": "ansible.posix.synchronize"}
+    result = mod.StrategyModule._run_native_controller_task(strategy, frame, None, {}, {"sync": original}, None)
+    assert result == {"retries": 0, "until": [], "changed_when": [], "failed_when": []}
+    assert original.retries == 2 and original.until == ["ready"]
+
+
 def test_gather_embeds_setup():
     src, manifest = compile_playbook(os.path.join(FIXTURES, "gather.yml"))
     assert any(m.endswith("setup") for m in manifest["modules"])
