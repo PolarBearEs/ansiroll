@@ -39,6 +39,10 @@ BAKED_ACTIONS = {
 
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
+# A src like "{{ playbook_dir }}/roles/{{ role }}/..." can match many files; past this it is left unbaked.
+_ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
+_PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
+_USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
     r"""([A-Za-z_][A-Za-z0-9_]*)["']"""
@@ -262,6 +266,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "become": bool(play.become),
         "become_user": getattr(play, "become_user", None),
         "vars": _tag_untrusted(play_vars),
+        "playbook_dir": basedir,
         "tasks": tasks,
         "handlers": handlers,
     }
@@ -346,7 +351,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
             if not isinstance(filename, str):
                 continue
             raw = filename
-            filename = re.sub(r"{{\s*playbook_dir\s*}}", basedir, filename)
+            filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
@@ -1491,6 +1496,9 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
+    # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
+    # same path, which then matches the baked key.
+    src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
 
     candidates = []
     if _JINJA_RE.search(src):
@@ -1498,7 +1506,10 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        elif _bake_role_tree(node, task, subdir):
+        elif _bake_absolute_tree(node, src, basedir, name == "template"):
+            return
+        # A role tree is keyed relative to the role, so it can never match a src that renders to an absolute path.
+        elif not (os.path.isabs(src) or _USES_PLAYBOOK_DIR_RE.search(src)) and _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
             # loop is a runtime var; bake the whole role tree so the runtime can
             # resolve whichever file the rendered src points to.
@@ -1562,6 +1573,66 @@ def _find_needle(task, subdir, rel):
     except Exception:
         return None
     return path if os.path.isfile(path) else None
+
+
+def _bake_absolute_tree(node, src, basedir, with_meta):
+    """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
+    separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
+    below the src's static directory, so "{{ playbook_dir }}/templates/{{ item }}.j2" bakes nested .j2 files too.
+
+    The static directory must lie strictly below the playbook dir: "{{ playbook_dir }}/{{ item }}" would otherwise
+    embed vault files, inventories and keys. Hidden entries (.git, vault password files), on the lexical or the
+    resolved path, and anything resolving outside the playbook dir are never baked."""
+    src = re.sub(r"/+", "/", src)
+    if not os.path.isabs(src):
+        return False
+    tree_dir = os.path.dirname(_JINJA_RE.split(src, 1)[0])
+    root = os.path.realpath(basedir)
+    if not os.path.isdir(tree_dir) or not _visible_below(tree_dir, basedir) or not _visible_below(
+            os.path.realpath(tree_dir), root):
+        return False
+    pattern = re.compile(".*".join(re.escape(part) for part in _JINJA_RE.split(src)) + r"\Z", re.S)
+    baked = {}
+    meta = {}
+    size = 0
+    for walk_root, dirs, files in os.walk(tree_dir, followlinks=True):
+        real_root = os.path.realpath(walk_root)
+        if not _visible_below(real_root, root):
+            dirs[:] = []
+            continue
+        # A link back to this directory or an ancestor would loop forever.
+        dirs[:] = sorted(
+            d for d in dirs if not d.startswith(".")
+            and not os.path.join(real_root, "").startswith(os.path.join(os.path.realpath(os.path.join(walk_root, d)), "")))
+        for fn in sorted(files):
+            path = os.path.join(walk_root, fn)
+            if fn.startswith(".") or not pattern.match(path) or not os.path.isfile(path):
+                continue
+            if not _visible_below(os.path.realpath(path), root):
+                continue
+            try:
+                st = os.stat(path)
+                size += st.st_size
+                if size > _ABSOLUTE_TREE_LIMIT:
+                    return False
+                with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+                    baked[path] = fh.read()
+            except OSError:
+                continue
+            if with_meta:
+                meta[path] = {"fullpath": os.path.abspath(path), "mtime": st.st_mtime, "uid": st.st_uid}
+    if not baked:
+        return False
+    node["_baked"] = baked
+    if meta:
+        node["_baked_meta"] = meta
+    return True
+
+
+def _visible_below(path, root):
+    """Whether path lies strictly below root through no hidden (dot) component."""
+    rel = os.path.relpath(path, root)
+    return rel != "." and not any(part.startswith(".") for part in rel.split(os.sep))
 
 
 def _bake_role_tree(node, task, subdir):
