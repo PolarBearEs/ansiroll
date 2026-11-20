@@ -912,7 +912,9 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "tasks": tasks,
     }
     if action == "include_role":
-        node["include_params"] = _tag_untrusted(task.get_include_params())
+        # The runtime overlay already has the enclosing invocations' evaluated
+        # parameters and live loop bindings. Preserve this role's own params.
+        node["include_params"] = _tag_untrusted(task.copy(exclude_parent=True).get_include_params())
         if _core_version() < (2, 17):
             # Older linear strategies do not count successful role includes in ok.
             node["tally_include_ok"] = False

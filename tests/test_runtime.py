@@ -98,12 +98,12 @@ def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch)
 def test_rescue_variables_use_the_current_failure():
     failed = _task("new", "Current failure", "fail", args={"msg": "current"})
     report = _task("show", "Report", "debug", args={"msg": "{{ ansible_failed_result.msg }}"})
-    block = {"type": "block", "block": [failed], "rescue": [report]}
+    block = {"type": "block", "block": [failed], "rescue": [report], "always": [report]}
     seed = _task("seed", "Seed", "set_fact", args={"ansible_failed_result": {"msg": "old"}})
 
     _, frames = run([seed, block])
 
-    assert by_name(frames, "Report")[0]["result"]["msg"] == "current"
+    assert [frame["result"]["msg"] for frame in by_name(frames, "Report")] == ["current", "current"]
 
 
 def test_ordinary_facts_do_not_overwrite_play_aliases(monkeypatch):
@@ -121,6 +121,17 @@ def test_ordinary_facts_do_not_overwrite_play_aliases(monkeypatch):
 
     assert by_name(frames, "Use Play")[0]["result"]["msg"] == "Play"
     assert rt.vars["ansible_facts"]["distribution"] == "Facts"
+    rt.run_play({"tasks": [
+        _task("later", "Use {{ ansible_distribution }}", "debug", args={"msg": "{{ ansible_distribution }}"})
+    ]})
+    assert by_name(frames, "Use Facts")[0]["result"]["msg"] == "Facts"
+
+
+def test_task_names_render_role_parameters_and_keep_text_type():
+    rt = Runtime({}, "", {})
+    assert rt._node_name({"name": "Deploy {{ region }}", "role_params": {"region": "west"}}) == "Deploy west"
+    assert rt._node_name({"name": "{{ 0 }}"}) == "0"
+    assert rt._node_name({"name": "{{ 42 }}"}) == "42"
 
 
 def test_debug_result_is_always_visible_to_ansible_callbacks():

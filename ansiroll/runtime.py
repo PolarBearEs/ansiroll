@@ -1818,6 +1818,7 @@ class Runtime:
         self._set_fact_overrides = dict(host_var_overrides or {})
         self._include_vars_layer = {}
         self._play_var_names = set()
+        self._module_fact_layer = {}
         self._strict_var_resolution = False
         self._untrusted_runtime_vars = set()
         self._facts_gathered = False
@@ -2084,8 +2085,11 @@ class Runtime:
             ctx = dict(node.get("role_defaults") or {})
             ctx.update(self.ctx())
             ctx.update(node.get("role_vars") or {})
+            ctx.update(node.get("role_params") or {})
+            ctx.update(self.extra_vars)
+            self._pin_magic_vars(ctx)
             with self._strict_vars():
-                return _fail_on_undef(self.template(name, ctx, strict=True)) or name
+                return _as_text(_fail_on_undef(self.template(name, ctx, strict=True))) or name
         except Exception:
             return name
 
@@ -2217,6 +2221,8 @@ class Runtime:
             for name in initial_notified:
                 if name not in self.notified:
                     self.notified.append(name)
+        self._play_var_names.clear()
+        self.vars.update(self._visible_module_facts(self._module_fact_layer))
         if play.get("gather_facts"):
             self.gather_facts(
                 play.get("environment"),
@@ -2366,11 +2372,11 @@ class Runtime:
                 if not rescue:
                     raise
                 self._tally("rescued")
-                failed_scope = _with_high_vars(scope, {
+                scope = _with_high_vars(scope, {
                     "ansible_failed_task": ex.task,
                     "ansible_failed_result": ex.result,
                 })
-                yield self._node_steps(rescue, failed_scope, b_become)
+                yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
             failed_exc = ex
         if block.get("always"):
@@ -3827,6 +3833,7 @@ class Runtime:
                 self.vars.update(facts)
                 self._include_vars_layer.update(facts)
             else:
+                self._module_fact_layer.update(facts)
                 self.vars.update(self._visible_module_facts(facts))
             existing = self.vars.get("ansible_facts")
             if not isinstance(existing, dict):
@@ -4340,6 +4347,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     rt = None
     host_var_overrides = {}
     include_vars_layer = {}
+    module_fact_layer = {}
     for play in plays:
         if pretty:
             banner = "PLAY [%s] " % (play.get("name") or play.get("hosts") or "")
@@ -4353,6 +4361,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      host_var_overrides=host_var_overrides,
                      native_only=native_only)
         rt._include_vars_layer = dict(include_vars_layer)
+        rt._module_fact_layer = dict(module_fact_layer)
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
@@ -4368,6 +4377,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         host_vars = rt.vars  # carry facts/registers across plays for the same host
         host_var_overrides = rt._set_fact_overrides
         include_vars_layer = rt._include_vars_layer
+        module_fact_layer = rt._module_fact_layer
         host = rt.host
         failed = failed or rt.failed
         for k in total:

@@ -412,3 +412,20 @@ def test_role_magic_is_visible_when_resolving_task_aliases(tmp_path):
         """,
     })
     assert messages == ['"r"']
+
+
+def test_nested_role_include_keeps_enclosing_loop_binding(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_tasks: outer.yml
+                  vars: {entry: declaration}
+                  loop: [live]
+                  loop_control: {loop_var: entry}
+        """,
+        "outer.yml": "- include_role: {name: nested}",
+        "roles/nested/tasks/main.yml": '- debug: {msg: "{{ entry }}"}',
+    })
+    assert messages == ['"live"']
