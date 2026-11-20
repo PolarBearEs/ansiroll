@@ -14,34 +14,28 @@ import pytest
 from ansiroll import cli
 
 
-def test_compile_writes_source_to_stdout(monkeypatch, tmp_path, capfdbinary):
-    source = "print('olá')\n"
-    manifest = {"modules": [], "fallback_tasks": []}
+@pytest.fixture
+def playbook(tmp_path):
+    pytest.importorskip("ansible")
+    path = tmp_path / "play.yml"
+    path.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    return path
 
-    def compile_playbook(*args, **kwargs):
-        print("compiler diagnostic")
-        subprocess.run([sys.executable, "-c", "print('helper diagnostic')"], check=True)
-        return source, manifest
 
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+def test_compile_writes_source_to_stdout(monkeypatch, playbook, capfdbinary):
+    monkeypatch.chdir(playbook.parent)
 
     assert cli.main(["compile", "play.yml", "-o", "-", "-m", "manifest.json"]) == 0
 
     captured = capfdbinary.readouterr()
-    assert captured.out == source.encode("utf-8")
-    assert b"compiler diagnostic\n" in captured.err
-    assert b"helper diagnostic\n" in captured.err
+    assert captured.out.startswith(b"#!")
+    compile(captured.out, "<stdout>", "exec")
     assert b"ansiroll: compiled play.yml -> stdout" in captured.err
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["manifest.json"]
-    assert json.loads((tmp_path / "manifest.json").read_text()) == manifest
+    assert sorted(path.name for path in playbook.parent.iterdir()) == ["manifest.json", "play.yml"]
+    assert json.loads((playbook.parent / "manifest.json").read_text())["playbook"] == str(playbook)
 
 
-def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
-    pytest.importorskip("ansible")
-    playbook = tmp_path / "play.yml"
-    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
-
+def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(playbook):
     result = subprocess.run(
         [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
         env=dict(os.environ, PYTHONIOENCODING="utf-16le"),
@@ -54,13 +48,7 @@ def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
 
 
 @pytest.mark.parametrize("forward_to_fd", [False, True])
-def test_callable_compile_writes_to_the_callers_stdout(monkeypatch, capfdbinary, forward_to_fd):
-    manifest = {"modules": [], "fallback_tasks": []}
-
-    def compile_playbook(*args, **kwargs):
-        print("compiler diagnostic")
-        return "print('olá')\n", manifest
-
+def test_callable_compile_writes_to_the_callers_stdout(playbook, capfdbinary, forward_to_fd):
     class Tee(StringIO):
         def fileno(self):
             return 1
@@ -69,63 +57,75 @@ def test_callable_compile_writes_to_the_callers_stdout(monkeypatch, capfdbinary,
             os.write(self.fileno(), text.encode("utf-8"))
             return super().write(text)
 
-    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
     output = Tee() if forward_to_fd else StringIO()
 
     with redirect_stdout(output):
-        assert cli.main(["compile", "play.yml", "-o", "-"]) == 0
-        print("caller after compile")
+        assert cli.main(["compile", str(playbook), "-o", "-"]) == 0
 
-    expected = "print('olá')\ncaller after compile\n"
-    assert output.getvalue() == expected
+    source = output.getvalue()
+    assert source.startswith("#!")
+    compile(source, "<stdout>", "exec")
     captured = capfdbinary.readouterr()
-    assert captured.out == (expected.encode("utf-8") if forward_to_fd else b"")
-    assert b"compiler diagnostic\n" in captured.err
+    assert captured.out == (source.encode("utf-8") if forward_to_fd else b"")
+    assert b" -> stdout " in captured.err
 
 
-def test_overlapping_callable_compiles_serialize_stdout_redirection(monkeypatch, capfdbinary):
-    first_compiling = Event()
-    allow_first_to_finish = Event()
-    second_calling = Event()
-    second_compiling = Event()
-    manifest = {"modules": [], "fallback_tasks": []}
+def test_callable_compile_leaves_host_stdout_untouched(monkeypatch, playbook, capfdbinary):
+    worker_started = Event()
+    allow_worker_to_finish = Event()
+    run = subprocess.run
 
-    def compile_playbook(playbook, **kwargs):
-        if playbook == "first":
-            first_compiling.set()
-            assert allow_first_to_finish.wait(5)
-        else:
-            second_compiling.set()
-        return "# %s\n" % playbook, manifest
+    def run_worker(*args, **kwargs):
+        worker_started.set()
+        assert allow_worker_to_finish.wait(5)
+        return run(*args, **kwargs)
 
-    def compile_second():
-        second_calling.set()
-        return cli.main(["compile", "second", "-o", "-"])
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    output = StringIO()
+    with redirect_stdout(output), os.fdopen(os.dup(1), "wb") as retained_stdout:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            task = pool.submit(cli.main, ["compile", str(playbook), "-o", "-"])
+            try:
+                assert worker_started.wait(5)
+                print("application output")
+                os.write(1, b"fd 1 output\n")
+                retained_stdout.write(b"retained descriptor output\n")
+                retained_stdout.flush()
+            finally:
+                allow_worker_to_finish.set()
+            assert task.result(timeout=10) == 0
 
-    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(cli.main, ["compile", "first", "-o", "-"])
+    application_output, source = output.getvalue().split("\n", 1)
+    assert application_output == "application output"
+    compile(source, "<stdout>", "exec")
+    captured = capfdbinary.readouterr()
+    assert captured.out == b"fd 1 output\nretained descriptor output\n"
+    assert b"application output" not in captured.err
+
+
+def test_callable_compile_keeps_the_callers_fd_inheritance(playbook, monkeypatch, capfdbinary):
+    inheritable = os.get_inheritable(1)
+    args = ["ansiroll", "compile", str(playbook), "-o", "-"]
+    monkeypatch.setattr(sys, "argv", args)
+    output = StringIO()
+    with redirect_stdout(output):
+        os.set_inheritable(1, False)
         try:
-            assert first_compiling.wait(5)
-            second = pool.submit(compile_second)
-            assert second_calling.wait(5)
-            assert not second_compiling.wait(0.2)
+            assert cli.main() == 0
+            assert not os.get_inheritable(1)
         finally:
-            allow_first_to_finish.set()
-        assert first.result(timeout=5) == 0
-        assert second.result(timeout=5) == 0
-
-    print("caller after compile")
-    assert capfdbinary.readouterr().out == b"# first\n# second\ncaller after compile\n"
+            os.set_inheritable(1, inheritable)
+    assert output.getvalue().startswith("#!")
+    assert capfdbinary.readouterr().out == b""
 
 
 @pytest.mark.parametrize("compile_fails", [False, True])
-@pytest.mark.parametrize("invocation", ["entrypoint", "implicit_args", "explicit_args"])
+@pytest.mark.parametrize("invocation", ["entrypoint", "worker"])
 def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails, invocation):
     script = r"""
 import atexit
 import ctypes
-import os
+import subprocess
 import sys
 from ansiroll import cli
 
@@ -135,8 +135,8 @@ puts.argtypes = [ctypes.c_char_p]
 def compile_playbook(*args, **kwargs):
     sys.__stdout__.write("buffered diagnostic\n")
     puts(b"native diagnostic")
-    if invocation == "entrypoint":
-        atexit.register(puts, b"native shutdown diagnostic")
+    atexit.register(puts, b"native shutdown diagnostic")
+    subprocess.run([sys.executable, "-c", "print('helper diagnostic')"], check=True)
     if compile_fails == "True":
         raise ValueError("compile failed")
     return "print('ok')\n", {"modules": [], "fallback_tasks": []}
@@ -147,38 +147,37 @@ args = ["compile", "play.yml", "-o", "-"]
 sys.argv[1:] = args
 if invocation == "entrypoint":
     raise SystemExit(cli.entrypoint())
-os.set_inheritable(1, False)
-puts(b"caller before compile")
-result = cli.main(args) if invocation == "explicit_args" else cli.main()
-assert not os.get_inheritable(1)
-print("caller after compile")
-raise SystemExit(result)
+raise SystemExit(cli._compile_worker())
 """
     env = dict(os.environ)
     env.pop("PYTHONUNBUFFERED", None)
 
     result = subprocess.run(
         [sys.executable, "-c", script, str(compile_fails), invocation],
+        input=b'{"playbook": "play.yml", "extra_vars": [], "vault_password_file": null, '
+              b'"interpreter": "python3", "tree_shake": false, "freeze_playbook_vars": false, '
+              b'"freeze_var": []}',
         capture_output=True, env=env,
     )
 
     assert result.returncode == (2 if compile_fails else 0), result.stderr
     source = b"" if compile_fails else b"print('ok')\n"
-    if invocation == "entrypoint":
+    if compile_fails or invocation == "entrypoint":
         assert result.stdout == source
-        assert b"native shutdown diagnostic\n" in result.stderr
     else:
-        assert result.stdout == b"caller before compile\n" + source + b"caller after compile\n"
+        assert json.loads(result.stdout)[0] == source.decode("utf-8")
+    assert b"native shutdown diagnostic\n" in result.stderr
     assert b"buffered diagnostic\n" in result.stderr
     assert b"native diagnostic\n" in result.stderr
+    assert b"helper diagnostic\n" in result.stderr
 
 
-def test_compile_rejects_manifest_that_points_to_stdout(monkeypatch, capfdbinary):
-    manifest = {"modules": [], "fallback_tasks": []}
-    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("print('ok')\n", manifest))
+def test_compile_rejects_manifest_that_points_to_stdout(capfdbinary):
+    output = StringIO()
+    with redirect_stdout(output):
+        assert cli.main(["compile", "play.yml", "-o", "-", "-m", "/dev/stdout"]) == 2
 
-    assert cli.main(["compile", "play.yml", "-o", "-", "-m", "/dev/stdout"]) == 2
-
+    assert not output.getvalue()
     captured = capfdbinary.readouterr()
     assert captured.out == b""
     assert b"manifest path points to stdout" in captured.err
@@ -205,11 +204,7 @@ raise SystemExit(cli.entrypoint())
 
 
 @pytest.mark.parametrize("manifest_path", [os.devnull, "/dev/stdout"])
-def test_compile_allows_manifest_and_source_to_be_discarded(tmp_path, manifest_path):
-    pytest.importorskip("ansible")
-    playbook = tmp_path / "play.yml"
-    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
-
+def test_compile_allows_manifest_and_source_to_be_discarded(playbook, manifest_path):
     result = subprocess.run(
         [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
          "-o", "-", "-m", manifest_path],
@@ -220,12 +215,9 @@ def test_compile_allows_manifest_and_source_to_be_discarded(tmp_path, manifest_p
     assert b'"fallback_tasks":' not in result.stderr
 
 
-def test_compile_stdout_stays_empty_if_manifest_write_fails(monkeypatch, tmp_path, capfdbinary):
-    manifest = {"modules": [], "fallback_tasks": []}
-    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("print('ok')\n", manifest))
-
+def test_compile_stdout_stays_empty_if_manifest_write_fails(playbook, capfdbinary):
     with pytest.raises(IsADirectoryError):
-        cli.main(["compile", "play.yml", "-o", "-", "-m", str(tmp_path)])
+        cli.main(["compile", str(playbook), "-o", "-", "-m", str(playbook.parent)])
 
     assert capfdbinary.readouterr().out == b""
 

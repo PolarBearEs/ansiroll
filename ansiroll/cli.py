@@ -10,24 +10,19 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stdout
-from threading import RLock
 
 from .compiler import compile_playbook
 
-_main_lock = RLock()
-
 
 def main(argv=None):
-    # Callable invocations share the process's stdout stream and descriptor.
-    with _main_lock:
-        return _main(argv, restore_stdout=True)
+    return _main(argv, callable_stdout=True)
 
 
 def entrypoint():
-    return _main(None, restore_stdout=False)
+    return _main(None, callable_stdout=False)
 
 
-def _main(argv, *, restore_stdout):
+def _main(argv, *, callable_stdout):
     parser = argparse.ArgumentParser(prog="ansiroll", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -62,7 +57,9 @@ def _main(argv, *, restore_stdout):
 
     if args.command == "compile":
         if args.output == "-":
-            return _cmd_compile_stdout(args, restore_stdout=restore_stdout)
+            if callable_stdout:
+                return _cmd_compile_stdout_in_child(args)
+            return _cmd_compile_stdout(args)
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -70,44 +67,22 @@ def _main(argv, *, restore_stdout):
 
 
 @contextmanager
-def _compile_diagnostics_to_stderr(restore_stdout):
-    # Redirect inherited stdout for helpers as well as Python's stdout stream.
-    stdout = sys.stdout
-    stdout.flush()
-    original_stdout = sys.__stdout__
-    if original_stdout is not None and original_stdout is not stdout:
-        original_stdout.flush()
-    if restore_stdout:
-        from ctypes import CDLL
-
-        stdout_inheritable = os.get_inheritable(1)
-        # Drain the caller's existing C stdio output before redirecting fd 1.
-        flush_native = CDLL(None).fflush
-        flush_native(None)
+def _compile_diagnostics_to_stderr():
+    # Only used in processes dedicated to compilation. Keep fd 1 redirected
+    # through shutdown so native buffers and exit handlers also go to stderr.
+    sys.stdout.flush()
     with os.fdopen(os.dup(1), "wb") as saved_stdout:
         os.dup2(2, 1)
-        try:
-            with redirect_stdout(sys.stderr):
-                yield saved_stdout
-        finally:
-            # The standalone CLI keeps fd 1 redirected through process shutdown
-            # so native buffers and exit handlers also write their diagnostics to stderr.
-            if restore_stdout:
-                try:
-                    stdout.flush()
-                    if original_stdout is not None and original_stdout is not stdout:
-                        original_stdout.flush()
-                    flush_native(None)
-                finally:
-                    os.dup2(saved_stdout.fileno(), 1, inheritable=stdout_inheritable)
+        with redirect_stdout(sys.stderr):
+            yield saved_stdout
 
 
-def _stdout_manifest_path(path, stdout_fd):
+def _stdout_manifest_path(path, *stdout_fds):
     try:
         manifest_stat = os.stat(path)
     except FileNotFoundError:
         return path
-    if not os.path.samestat(manifest_stat, os.fstat(stdout_fd)):
+    if not any(os.path.samestat(manifest_stat, os.fstat(fd)) for fd in stdout_fds if fd is not None):
         return path
     if os.path.samefile(path, os.devnull):
         # A path such as /dev/stdout would point to stderr after redirection.
@@ -116,38 +91,77 @@ def _stdout_manifest_path(path, stdout_fd):
     return None
 
 
-def _cmd_compile_stdout(args, restore_stdout):
-    stdout = sys.stdout
-    stdout_fd = 1
-    if restore_stdout:
-        try:
-            stdout_fd = stdout.fileno()
-        except (AttributeError, OSError, ValueError):
-            stdout_fd = None
-    if args.manifest and stdout_fd is not None:
-        manifest_path = _stdout_manifest_path(args.manifest, stdout_fd)
+def _cmd_compile_stdout(args):
+    manifest_path = args.manifest
+    if manifest_path:
+        manifest_path = _stdout_manifest_path(manifest_path, 1)
         if manifest_path is None:
             return 2
-        args.manifest = manifest_path
-    use_caller_stream = restore_stdout and (stdout is not sys.__stdout__ or stdout_fd != 1)
-    with _compile_diagnostics_to_stderr(restore_stdout) as saved_stdout:
+    with _compile_diagnostics_to_stderr() as saved_stdout:
         compiled = _compile_source(args)
         if compiled is None:
             return 2
         source, manifest = compiled
-        if args.manifest:
+        if manifest_path:
             # Duplicating stdout may have made a /dev/fd path resolve to it.
-            destination_fd = saved_stdout.fileno() if stdout_fd == 1 else stdout_fd
-            manifest_path = args.manifest
-            if destination_fd is not None:
-                manifest_path = _stdout_manifest_path(manifest_path, destination_fd)
-                if manifest_path is None:
-                    return 2
+            manifest_path = _stdout_manifest_path(manifest_path, saved_stdout.fileno())
+            if manifest_path is None:
+                return 2
             _write_manifest(manifest_path, manifest)
-        if not use_caller_stream:
-            saved_stdout.write(source.encode("utf-8"))
+        saved_stdout.write(source.encode("utf-8"))
 
-    if use_caller_stream:
+    _report_compiled(args.playbook, "stdout", manifest)
+    return 0
+
+
+def _compile_worker():
+    args = argparse.Namespace(**json.load(sys.stdin))
+    with _compile_diagnostics_to_stderr() as output:
+        compiled = _compile_source(args)
+        if compiled is None:
+            return 2
+        output.write(json.dumps(compiled).encode("utf-8"))
+    return 0
+
+
+def _cmd_compile_stdout_in_child(args):
+    stdout, stderr = sys.stdout, sys.stderr
+    try:
+        stdout_fd = stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        stdout_fd = None
+    manifest_path = args.manifest
+    if manifest_path:
+        manifest_path = _stdout_manifest_path(manifest_path, 1, stdout_fd)
+        if manifest_path is None:
+            return 2
+
+    # Compile in a fresh interpreter so application threads and retained
+    # streams are unaffected by the compiler's process-wide redirection.
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    worker = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from ansiroll.cli import _compile_worker; sys.exit(_compile_worker())"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", worker, package_root],
+        input=json.dumps(vars(args)), capture_output=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+    )
+    if proc.stderr:
+        stderr.write(proc.stderr)
+    if proc.returncode:
+        return proc.returncode
+    source, manifest = json.loads(proc.stdout)
+    if manifest_path:
+        manifest_path = _stdout_manifest_path(manifest_path, 1, stdout_fd)
+        if manifest_path is None:
+            return 2
+        _write_manifest(manifest_path, manifest)
+    if stdout is sys.__stdout__ and stdout_fd == 1:
+        stdout.flush()
+        stdout.buffer.write(source.encode("utf-8"))
+    else:
         stdout.write(source)
     _report_compiled(args.playbook, "stdout", manifest)
     return 0
