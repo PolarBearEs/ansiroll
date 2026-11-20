@@ -1096,12 +1096,12 @@ class _PlayVarScope(dict):
 
     def __init__(self, ctx, templater, strict):
         super().__init__(ctx)
-        self["vars"] = self
         self.templater = templater
         self.strict = strict
         self.resolving = set()
         self.resolved = {}
         self.accesses = 0
+        self["vars"] = _PlayVarView(_vars_snapshot(ctx), self)
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
@@ -1124,12 +1124,31 @@ class _PlayVarScope(dict):
     def get(self, key, default=None):
         return self[key] if key in self else default
 
+
+class _PlayVarView(dict):
+    """The finite public vars mapping for a lazy play-variable scope."""
+
+    def __init__(self, snapshot, scope):
+        super().__init__(snapshot)
+        self.scope = scope
+        if "vars" in snapshot:
+            self["vars"] = _PlayVarView(snapshot["vars"], scope)
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if key != "vars":
+            return self.scope[key]
+        return value
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
     def items(self):
         resolve = _core_at_least(2, 19)
         for key in self:
             # A value read from vars must retain its provenance even when
             # legacy Ansible exposes the unresolved string on iteration.
-            self.accesses += 1
+            self.scope.accesses += 1
             yield key, self[key] if resolve else dict.__getitem__(self, key)
 
     def values(self):
@@ -1220,14 +1239,14 @@ class _LazyTplList(list):
 
 def _jinja_dict(*args, **kwargs):
     # Python 3.5's dict(view) may copy a dict subclass's raw storage.
-    if args and isinstance(args[0], (_LazyTplDict, _PlayVarScope)):
+    if args and isinstance(args[0], (_LazyTplDict, _PlayVarView)):
         args = (args[0].items(),) + args[1:]
     return dict(*args, **kwargs)
 
 
 def _type_name(value):
     """type_debug: internal wrappers report the builtin type they stand for."""
-    for internal, name in ((_LazyTplDict, "dict"), (_LazyTplList, "list")):
+    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"), (_LazyTplList, "list")):
         if isinstance(value, internal):
             return name
     if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
@@ -1343,8 +1362,8 @@ class _AnsirollContext(jinja2.runtime.Context):
         if key not in self.parent:
             return jinja2.runtime.missing
         value = self.parent[key]
-        if isinstance(value, _PlayVarTemplate) and isinstance(scope, _PlayVarScope):
-            return scope[key]
+        if isinstance(value, _PlayVarTemplate) and isinstance(scope, _PlayVarView):
+            return scope.scope[key]
         templater = getattr(self.environment, "_ansiroll_templater", None)
         if templater is None or str(key).startswith("__ansiroll"):
             return value

@@ -266,6 +266,7 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
   gather_facts: false
   vars:
     label: sample
+    alias: '{{ label }}'
     __ansiroll_label: user-provided
     nested: {leaf: '{{ label }}'}
   tasks:
@@ -275,7 +276,7 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
           register: all_hosts
         - debug: {msg: '{{ hostvars.localhost }}'}
           register: one_host
-        - debug: {msg: '{{ vars }}'}
+        - debug: {msg: '{{ vars | to_json | from_json }}'}
           register: all_vars
     - assert:
         that:
@@ -289,6 +290,7 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
           - "'__ansiroll_controller_config' not in all_vars.msg"
           - "%s"
           - all_vars.msg.nested.leaf == 'sample'
+          - all_vars.msg.alias == 'sample'
           - all_vars.msg.one_host.msg.inventory_hostname == 'localhost'
 """ % nested_vars_check)
     _, linear_recap = _ansible(path, tmp_path)
@@ -979,7 +981,7 @@ def test_unsafe_role_group_loop_and_argument_values_remain_literal(tmp_path, use
 - hosts: localhost
   gather_facts: false
   vars: {sentinel: rendered}
-  roles: [r]
+  roles: [{role: r, param_value: !unsafe "{{ sentinel }}"}]
   tasks:
     - debug: msg="{{ from_group }}/{{ group_mapping.k }}"
     - debug: {msg: !unsafe "{{ sentinel }}"}
@@ -994,7 +996,7 @@ default_mapping: {k: !unsafe "{{ sentinel }}"}
 """,
         "roles/r/vars/main.yml": 'role_value: !unsafe "{{ sentinel }}"\n',
         "roles/r/tasks/main.yml": """
-- debug: msg="{{ default_value }}/{{ default_mapping.k }}/{{ role_value }}"
+- debug: msg="{{ default_value }}/{{ default_mapping.k }}/{{ role_value }}/{{ param_value }}"
 """,
         "group_vars/all.yml": """
 from_group: !unsafe "{{ sentinel }}"
@@ -1002,7 +1004,7 @@ group_mapping: {k: !unsafe "{{ sentinel }}"}
 """,
     }, use_strategy=use_strategy)
     assert msgs == [
-        "{{ sentinel }}/{{ sentinel }}/{{ sentinel }}",
+        "{{ sentinel }}/{{ sentinel }}/{{ sentinel }}/{{ sentinel }}",
         "{{ sentinel }}/{{ sentinel }}",
         "{{ sentinel }}",
         "{{ sentinel }}",

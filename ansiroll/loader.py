@@ -926,7 +926,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),
         "role_vars": _tag_untrusted(role_vars),
-        "role_params": _role_params(task),
+        "role_params": _tag_untrusted(_role_params(task)),
         "become": bool(task.become),
         "tasks": tasks,
     }
@@ -1369,7 +1369,7 @@ def _convert_task(task, actions, basedir):
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)
         "role_vars": _tag_untrusted(role_vars),          # above play vars, below block/task vars
-        "role_params": _role_params(task),  # above set_fact/register
+        "role_params": _tag_untrusted(_role_params(task)),  # above set_fact/register
         "role_magic": _role_magic(task),
         "notify": _as_list(task.notify),
         "special": _special_of(action),
