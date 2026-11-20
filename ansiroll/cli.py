@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -73,9 +74,9 @@ def _main(argv, *, callable_stdout):
 def _compile_diagnostics_to_stderr():
     # Only used in processes dedicated to compilation. Keep fd 1 redirected
     # through shutdown so native buffers and exit handlers also go to stderr.
-    sys.stdout.flush()
     with os.fdopen(os.dup(1), "wb") as saved_stdout:
         os.dup2(2, 1)
+        sys.stdout.flush()
         with redirect_stdout(sys.stderr):
             yield saved_stdout
 
@@ -85,13 +86,22 @@ def _stdout_manifest_path(path, *stdout_fds):
         manifest_stat = os.stat(path)
     except FileNotFoundError:
         return path
-    if not any(os.path.samestat(manifest_stat, os.fstat(fd)) for fd in stdout_fds if fd is not None):
+    if not any(_fd_matches(manifest_stat, fd) for fd in stdout_fds if fd is not None):
         return path
     if os.path.samefile(path, os.devnull):
         # A path such as /dev/stdout would point to stderr after redirection.
         return os.devnull
     sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % path)
     return None
+
+
+def _fd_matches(path_stat, fd):
+    try:
+        return os.path.samestat(path_stat, os.fstat(fd))
+    except OSError as error:
+        if error.errno != errno.EBADF:
+            raise
+        return False
 
 
 def _cmd_compile_stdout(args):
@@ -136,9 +146,11 @@ def _compile_input_fds(args):
     requested = set()
     for path in paths:
         if path:
-            match = re.fullmatch(r"/(?:dev/fd|proc/self/fd)/(\d+)", os.path.abspath(path))
-            if match:
-                requested.add(int(match.group(1)))
+            directory, name = os.path.split(os.path.abspath(path))
+            if name.isascii() and name.isdecimal():
+                directory = os.path.realpath(directory)
+                if directory == "/dev/fd" or re.fullmatch(r"/proc/\d+(?:/task/\d+)?/fd", directory):
+                    requested.add(int(name))
 
     available = set()
     for directory in ("/proc/self/fd", "/dev/fd"):
@@ -174,10 +186,22 @@ def _run_compile_worker(args):
         "import sys; sys.path.insert(0, sys.argv[1]); "
         "from ansiroll.cli import _compile_worker; sys.exit(_compile_worker(int(sys.argv[2])))"
     )
+    flags = []
+    if sys.flags.isolated:
+        flags.append("-I")
+    else:
+        if sys.flags.ignore_environment:
+            flags.append("-E")
+        if sys.flags.no_user_site:
+            flags.append("-s")
+        if getattr(sys.flags, "safe_path", False):
+            flags.append("-P")
+    if sys.flags.no_site:
+        flags.append("-S")
     parent, child = socket.socketpair()
     with parent, child:
         with subprocess.Popen(
-            [sys.executable, "-c", worker, package_root, str(child.fileno())],
+            [sys.executable, *flags, "-c", worker, package_root, str(child.fileno())],
             stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             pass_fds=(*input_fds, child.fileno()),
             env=dict(os.environ, PYTHONIOENCODING="utf-8"),

@@ -55,6 +55,9 @@ set -o pipefail
 python3 -m ansiroll.cli compile playbook.yml -o - | python3 -
 ```
 
+Configure any Python startup hooks, such as `sitecustomize`, to send their
+messages to stderr so they cannot add text to the pipeline before Ansiroll runs.
+
 Compile-time extra vars can optionally remove branches that are provably
 unreachable. Unknown conditions are retained, and the resulting artifact rejects
 conflicting runtime values for specialized variables:

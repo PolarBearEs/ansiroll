@@ -73,14 +73,18 @@ def test_callable_compile_writes_to_the_callers_stdout(playbook, capfdbinary, fo
 def test_callable_compile_leaves_host_stdout_untouched(monkeypatch, playbook, capfdbinary):
     worker_started = Event()
     allow_worker_to_finish = Event()
-    run = cli._run_compile_worker
+    popen = subprocess.Popen
 
-    def run_worker(*args, **kwargs):
+    def start_worker(*args, **kwargs):
+        worker = popen(*args, **kwargs)
         worker_started.set()
-        assert allow_worker_to_finish.wait(5)
-        return run(*args, **kwargs)
+        if not allow_worker_to_finish.wait(5):
+            worker.kill()
+            worker.communicate()
+            pytest.fail("host output was not checked while the worker was active")
+        return worker
 
-    monkeypatch.setattr(cli, "_run_compile_worker", run_worker)
+    monkeypatch.setattr(cli.subprocess, "Popen", start_worker)
     output = StringIO()
     with redirect_stdout(output), os.fdopen(os.dup(1), "wb") as retained_stdout:
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -160,20 +164,25 @@ raise SystemExit(cli.entrypoint())
     assert b"helper diagnostic\n" in result.stderr
 
 
-@pytest.mark.parametrize("vars_input", ["stdin", "descriptor"])
-def test_callable_compile_preserves_descriptor_backed_inputs(playbook, vars_input):
+@pytest.mark.parametrize("input_path", [
+    "/dev/stdin",
+    "/dev/fd",
+    pytest.param("/proc/thread-self/fd", marks=pytest.mark.skipif(
+        not os.path.isdir("/proc/thread-self/fd"), reason="requires thread-self procfs descriptors")),
+])
+def test_callable_compile_preserves_descriptor_backed_inputs(playbook, input_path):
     script = """
 import os
 import sys
 from ansiroll import cli
 
-path, manifest, vars_file = sys.argv[1:]
+path, manifest, vars_file, input_path = sys.argv[1:]
 args = ["compile", path, "-o", "-", "-m", manifest]
-if vars_file == "-":
-    raise SystemExit(cli.main(args + ["-e", "@/dev/stdin"]))
+if input_path == "/dev/stdin":
+    raise SystemExit(cli.main(args + ["-e", "@" + input_path]))
 with open(vars_file, "rb") as stream:
     assert not os.get_inheritable(stream.fileno())
-    raise SystemExit(cli.main(args + ["-e", "@/dev/fd/%d" % stream.fileno()]))
+    raise SystemExit(cli.main(args + ["-e", "@%s/%d" % (input_path, stream.fileno())]))
 """
     extra_vars = b'{"pipe_input": 42}'
     vars_file = playbook.with_name("vars.json")
@@ -181,7 +190,7 @@ with open(vars_file, "rb") as stream:
     manifest = playbook.with_name("manifest.json")
     result = subprocess.run(
         [sys.executable, "-c", script, str(playbook), str(manifest),
-         "-" if vars_input == "stdin" else str(vars_file)],
+         str(vars_file), input_path],
         input=extra_vars, capture_output=True,
     )
 
@@ -228,6 +237,63 @@ def test_worker_startup_output_is_diagnostic(monkeypatch, playbook, capfdbinary)
     compile(captured.out, "<stdout>", "exec")
     assert b"startup diagnostic\n" in captured.err
     assert b"native startup diagnostic\n" in captured.err
+
+
+def test_module_compile_routes_buffered_startup_output_to_stderr(playbook):
+    (playbook.parent / "sitecustomize.py").write_text("print('buffered startup diagnostic')\n")
+    env = dict(os.environ, PYTHONPATH=str(playbook.parent))
+    env.pop("PYTHONUNBUFFERED", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+        capture_output=True, env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    compile(result.stdout, "<stdout>", "exec")
+    assert b"buffered startup diagnostic\n" in result.stderr
+
+
+@pytest.mark.parametrize("isolation_flag", ["-E", "-I"])
+def test_callable_worker_keeps_interpreter_isolation(playbook, isolation_flag):
+    (playbook.parent / "sitecustomize.py").write_text("print('unexpected startup output')\n")
+    script = """
+import json
+import sys
+sys.path[:] = json.loads(sys.argv[1])
+from ansiroll import cli
+raise SystemExit(cli.main(["compile", sys.argv[2], "-o", "-"]))
+"""
+    result = subprocess.run(
+        [sys.executable, isolation_flag, "-c", script, json.dumps(sys.path), str(playbook)],
+        capture_output=True, env=dict(os.environ, PYTHONPATH=str(playbook.parent)),
+    )
+
+    assert result.returncode == 0, result.stderr
+    compile(result.stdout, "<stdout>", "exec")
+    assert b"unexpected startup output" not in result.stderr
+
+
+def test_callable_compile_writes_manifest_with_closed_fd_one(playbook):
+    script = """
+import io
+import os
+import sys
+from ansiroll import cli
+
+os.close(1)
+sys.stdout = io.StringIO()
+result = cli.main(["compile", sys.argv[1], "-o", "-", "-m", sys.argv[2]])
+assert result == 0
+compile(sys.stdout.getvalue(), "<stdout>", "exec")
+"""
+    manifest = playbook.with_name("manifest.json")
+    manifest.touch()
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(playbook), str(manifest)], capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(manifest.read_text())["playbook"] == str(playbook)
 
 
 def test_compile_rejects_manifest_that_points_to_stdout(capfdbinary):
