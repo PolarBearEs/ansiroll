@@ -36,6 +36,34 @@ def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
 
 
+@pytest.mark.parametrize("version,resolve", [("2.18.20", False), ("2.19.15", True)])
+def test_play_var_mapping_iteration_only_resolves_consumed_values(monkeypatch, version, resolve):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    called = []
+
+    def measure(value):
+        called.append(value)
+        return value
+
+    rt.templater.env.globals["measure"] = measure
+    values = {
+        "first": "{{ measure('first') }}",
+        "second": "{{ measure('second') }}",
+    }
+    prepared = rt.template_vars(values, {}, dynamic=True)
+
+    expected = "first" if resolve else values["first"]
+    assert rt.template("{{ vars.items() | first }}", prepared) == ("first", expected)
+    assert called == (["first"] if resolve else [])
+    assert rt.template("{{ vars.values() | first }}", prepared) == expected
+    assert called == (["first", "first"] if resolve else [])
+    assert rt.template("{{ (vars | dict2items | first).value }}", prepared) == expected
+    assert called == (["first", "first", "first", "second"] if resolve else [])
+
+
 def test_debug_and_set_fact_register():
     tasks = [
         _task("1", "sf", "set_fact", args={"foo": "{{ 1 + 1 }}"}),

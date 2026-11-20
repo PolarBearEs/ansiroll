@@ -453,11 +453,10 @@ def test_tree_shake_keeps_enclosing_include_loop_bindings(tmp_path):
     playbook = tmp_path / "pb.yml"
     args = ("-e", "env=prod position=3")
     extra = {"env": "prod", "position": "3"}
-    # Linear applies extra vars after the include parameters attached to the
-    # child. Ansiroll's runner carries the loop values as a runtime overlay.
-    assert _ansible(playbook, *args)[0] == ["LINEAR_EXTRA_VARS"]
-    expected = _ansible(playbook, *args, strategy="ansiroll.core.ansiroll")
-    assert expected[0] == ["INHERITED_LOOP"]
+    # Extra vars outrank the include parameters that carry the loop values, in linear and in ansiroll alike.
+    expected = _ansible(playbook, *args)
+    assert expected[0] == ["LINEAR_EXTRA_VARS"]
+    assert _ansible(playbook, *args, strategy="ansiroll.core.ansiroll") == expected
     assert _ansiroll(playbook, tmp_path, *args) == expected
     source, manifest = compile_playbook(str(playbook), extra_vars=extra, tree_shake=True)
     assert manifest["tree_shake"]["removed_nodes"] == 1
@@ -490,7 +489,9 @@ def test_tree_shake_keeps_recursive_include_loop_bindings(tmp_path):
     nodes = _task_nodes(_bundle_json(source)[0]["tasks"])
     assert any(node.get("tasks_ref") for node in nodes)
     assert manifest["tree_shake"]["removed_nodes"] == 0
-    assert _ansiroll(playbook, tmp_path, "--tree-shake", *args)[0] == ["RECURSIVE_LOOP"]
+    # Extra vars outrank the include's loop_var, so the recursion never sees env == 'dev'.
+    assert _ansible(playbook, *args)[0] == []
+    assert _ansiroll(playbook, tmp_path, "--tree-shake", *args)[0] == []
 
 
 def test_freeze_playbook_vars_follows_runtime_dependencies(tmp_path):

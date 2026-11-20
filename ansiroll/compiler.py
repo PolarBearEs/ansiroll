@@ -241,27 +241,35 @@ def _freeze_value(value, context):
     return resolved, True
 
 
-def _shadowed_var_names(plays):
-    names = set()
-
+def _walk_play_nodes(plays):
     def walk(nodes):
         for node in nodes or []:
-            names.update(node.get("vars") or {})
-            names.update(node.get("role_vars") or {})
-            names.update(_runtime_write_names(
-                node.get("action"), node.get("args") or {}, node.get("register"),
-            ))
-            names.update(_loop_shadowed_names(node))
+            if node.get("tree_shaken_handler"):
+                continue
+            yield node
             if node.get("type") == "block":
-                walk(node.get("block"))
-                walk(node.get("rescue"))
-                walk(node.get("always"))
+                for section in ("block", "rescue", "always"):
+                    yield from walk(node.get(section))
             elif node.get("type") == "include":
-                walk(node.get("tasks"))
+                yield from walk(node.get("tasks"))
+                yield from walk(node.get("handlers"))
 
     for play in plays:
-        walk(play.get("tasks"))
-        walk(play.get("handlers"))
+        yield from walk(play.get("tasks"))
+        yield from walk(play.get("handlers"))
+
+
+def _shadowed_var_names(plays):
+    names = set()
+    for node in _walk_play_nodes(plays):
+        names.update(node.get("vars") or {})
+        names.update(node.get("role_vars") or {})
+        names.update(node.get("role_params") or {})
+        names.update(_runtime_write_names(
+            node.get("action"), node.get("args") or {}, node.get("register"),
+        ))
+        names.update(_loop_shadowed_names(node))
+    for play in plays:
         for entry in play.get("deferred_vars_files") or ():
             for data in entry["files"].values():
                 if isinstance(data, list):
