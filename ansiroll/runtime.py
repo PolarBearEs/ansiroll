@@ -994,6 +994,9 @@ def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
 
 
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
+    if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
+        # Play containers resolve their members in the task's context.
+        return _lazy_container(value._raw, rt, ctx)
     if isinstance(value, (str, tuple)):
         if getattr(rt, "_strict_var_resolution", False):
             return rt.template(value, ctx, strict=True)
@@ -1557,8 +1560,7 @@ class _Templater:
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
-            # Play containers resolve their members in the task's context.
-            return _lazy_container(value._raw, value._rt, ctx)
+            return _lazy_wrap(value, value._rt, ctx)
         if self._runtime is not None and type(value) in (dict, list):
             return _lazy_wrap(value, self._runtime, ctx)
         return value
@@ -1566,9 +1568,7 @@ class _Templater:
     def _play_var_scope(self, ctx, strict):
         if isinstance(ctx, _PlayVarScope):
             return ctx
-        if any(isinstance(value, _PlayVarTemplate)
-               or (isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic)
-               for value in ctx.values()):
+        if any(isinstance(value, _PlayVarTemplate) for value in ctx.values()):
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
