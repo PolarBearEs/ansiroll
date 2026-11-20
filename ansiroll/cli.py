@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import nullcontext, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -19,7 +20,7 @@ def main(argv=None):
 
     pc = sub.add_parser("compile", help="Compile a playbook to a single .py file")
     pc.add_argument("playbook")
-    pc.add_argument("-o", "--output", required=True, help="output .py path")
+    pc.add_argument("-o", "--output", required=True, help="output .py path (use - for stdout)")
     pc.add_argument("-m", "--manifest", help="optional manifest .json path")
     pc.add_argument("--interpreter", default="/usr/bin/python3",
                     help="target python interpreter path (default: /usr/bin/python3)")
@@ -54,35 +55,40 @@ def main(argv=None):
 
 
 def _cmd_compile(args):
-    try:
-        extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
-    except Exception as ex:
-        sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
-        return 2
-    try:
-        source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
-                                            vault_password_file=args.vault_password_file,
-                                            extra_vars=extra_vars,
-                                            tree_shake=args.tree_shake,
-                                            freeze_playbook_vars=args.freeze_playbook_vars,
-                                            freeze_vars=args.freeze_var)
-    except Exception as ex:
-        if not isinstance(ex, (ValueError,) + _ansible_errors()):
-            raise
-        message = str(ex)
-        if not message.startswith("ansiroll: "):
-            message = "ansiroll: " + message
-        sys.stderr.write(message + "\n")
-        return 2
-    with open(args.output, "w") as fh:
-        fh.write(source)
-    os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
+    to_stdout = args.output == "-"
+    with redirect_stdout(sys.stderr) if to_stdout else nullcontext():
+        try:
+            extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
+        except Exception as ex:
+            sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
+            return 2
+        try:
+            source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
+                                                vault_password_file=args.vault_password_file,
+                                                extra_vars=extra_vars,
+                                                tree_shake=args.tree_shake,
+                                                freeze_playbook_vars=args.freeze_playbook_vars,
+                                                freeze_vars=args.freeze_var)
+        except Exception as ex:
+            if not isinstance(ex, (ValueError,) + _ansible_errors()):
+                raise
+            message = str(ex)
+            if not message.startswith("ansiroll: "):
+                message = "ansiroll: " + message
+            sys.stderr.write(message + "\n")
+            return 2
+    if to_stdout:
+        sys.stdout.write(source)
+    else:
+        with open(args.output, "w") as fh:
+            fh.write(source)
+        os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
         with open(args.manifest, "w") as fh:
             json.dump(manifest, fh, indent=2)
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
-        % (args.playbook, args.output, len(manifest["modules"]),
+        % (args.playbook, "stdout" if to_stdout else args.output, len(manifest["modules"]),
            len(manifest["fallback_tasks"]))
     )
     return 0
