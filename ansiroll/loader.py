@@ -42,7 +42,7 @@ _JINJA_RE = re.compile(r"{{.*?}}")
 # A src like "{{ playbook_dir }}/roles/{{ role }}/..." can match many files; past this it is left unbaked.
 _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
-_USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*\bplaybook_dir\b", re.S)
+_USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
     r"""([A-Za-z_][A-Za-z0-9_]*)["']"""

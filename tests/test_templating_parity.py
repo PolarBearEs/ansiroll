@@ -612,6 +612,30 @@ def test_dynamic_src_naming_playbook_dir_outside_jinja_bakes_role_tree(tmp_path)
     assert dest.read_text() == "value=2"
 
 
+def test_playbook_dir_attribute_of_another_var_bakes_role_tree(tmp_path):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ svc.playbook_dir }}/{{ svc.name }}.j2"
+    dest: %s
+""" % json.dumps(str(dest)),
+        "roles/a/defaults/main.yml": "svc: {playbook_dir: services, name: conf}\n",
+        "roles/a/templates/services/conf.j2": "value={{ 1 + 1 }}",
+    })
+    plays, _ = parse_playbook(str(playbook))
+    task = next(t for block in plays[0]["tasks"] for t in block.get("block", [])
+                if t.get("action", "").split(".")[-1] == "template")
+    assert not task.get("fallback")
+    assert "services/conf.j2" in task["_baked"]
+    _ansiroll(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+
+
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
     _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
         "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
