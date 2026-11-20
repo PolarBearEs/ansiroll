@@ -1043,6 +1043,86 @@ def test_handler_name_is_cached_for_all_aliases_until_next_play(monkeypatch):
     assert handled == ["run first", "run second"]
 
 
+@pytest.mark.parametrize("setup", ["failed", "raises"])
+def test_gather_facts_failure_fails_host(monkeypatch, setup):
+    # Ansible: a failed setup is fatal on "Gathering Facts" and the play's
+    # tasks never run for that host.
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+
+    def fake_setup(*_args, **_kwargs):
+        if setup == "raises":
+            raise OSError("boom")
+        return {"failed": True, "changed": False, "msg": "setup failed"}
+
+    monkeypatch.setattr(rt, "run_module", fake_setup)
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+    rt.run_play({"tasks": [_task("1", "after", "debug", args={"msg": "x"})],
+                 "handlers": [], "gather_facts": True, "vars": {}})
+    assert [f["status"] for f in by_name(frames, "Gathering Facts")] == ["failed"]
+    assert not by_name(frames, "after")
+    assert rt.failed
+    assert rt.stats["failures"] == 1
+
+
+def test_gather_facts_failure_honors_play_ignore_errors(monkeypatch):
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    monkeypatch.setattr(rt, "run_module", lambda *_a, **_k: {
+        "failed": True, "changed": False, "msg": "setup failed"})
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+    rt.run_play({"tasks": [_task("1", "after", "debug", args={"msg": "x"})],
+                 "handlers": [], "gather_facts": True, "vars": {},
+                 "ignore_errors": True})
+    assert by_name(frames, "after")
+    assert not rt.failed
+    assert rt.stats["failures"] == 0
+    assert rt.stats["ignored"] == 1
+
+
+@pytest.mark.parametrize("version,ignored", [("2.14.18", True), ("2.21.1", False)])
+def test_setup_condition_and_ignore_errors_gate_the_module(monkeypatch, version, ignored):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    calls = []
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: calls.append(args))
+    assert rt.gather_facts(when=[False])
+    assert rt.gather_facts(ignore_errors="{{ missing_value }}") is ignored
+    assert calls == []
+    assert rt.stats["skipped"] == 1
+    assert rt.stats["failures"] == int(not ignored)
+    assert rt.stats["ignored"] == int(ignored)
+
+
+def test_setup_censors_failures_and_hides_success_details(monkeypatch):
+    frames = []
+    rt = Runtime({}, "", {}, on_result=frames.append)
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: {
+        "failed": True, "msg": "private failure",
+    })
+    assert not rt.gather_facts(no_log=True)
+    assert "private failure" not in repr(frames[-1]["result"])
+
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: {
+        "ansible_facts": {"ansible_system": "Linux"}, "changed": False,
+    })
+    assert rt.gather_facts()
+    result = frames[-1]["result"]
+    assert result["_ansible_verbose_override"] is True
+    assert rt.vars["ansible_facts"]["system"] == "Linux"
+
+
+def test_smart_gathering_uses_existing_setup_marker(monkeypatch):
+    rt = Runtime({}, "", {"ansible_facts": {"_ansible_facts_gathered": True}})
+    calls = []
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: calls.append(args))
+    rt.run_play({"tasks": [], "gather_facts": True, "smart_gathering": True})
+    assert calls == []
+    assert not rt.failed
+
+
 def _force_handlers_play(force):
     flush = {"type": "task", "uuid": "f", "name": "Flush handlers",
              "action": "meta", "special": "meta_flush_handlers"}

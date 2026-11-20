@@ -107,6 +107,31 @@ def check(tmp_path, files, args=(), strategy=True):
     return expected
 
 
+FAILED_HOST_PLAYS = """
+- hosts: localhost
+  gather_facts: false
+  {force}
+  tasks:
+    - command: /bin/true
+      notify: h1
+    - fail: msg=boom
+  handlers:
+    - name: h1
+      debug: msg=H1_RAN
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg=PLAY2_RAN
+"""
+
+
+@pytest.mark.parametrize("force", ["", "force_handlers: true"])
+def test_failed_host_skips_later_plays_and_honors_force_handlers(tmp_path, force):
+    msgs, _ = check(tmp_path, {"pb.yml": FAILED_HOST_PLAYS.format(force=force)})
+    assert ('"PLAY2_RAN"' in msgs) is False
+    assert ('"H1_RAN"' in msgs) is bool(force)
+
+
 def test_handlers_run_in_definition_order_with_chains_and_listen(tmp_path):
     msgs, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
@@ -189,6 +214,39 @@ def test_handler_chain_notified_backwards_during_final_flush(tmp_path):
             - {name: h2, debug: msg=H2, changed_when: true, notify: h1}
             - {name: h3, debug: msg=H3, changed_when: true, notify: h2}
         """})
+
+
+FAILING_HANDLER = """
+- hosts: localhost
+  gather_facts: false
+  {force}
+  tasks:
+    - command: /bin/true
+      notify: [ha, hb]
+    - meta: flush_handlers
+    - debug: msg=AFTER_FLUSH
+    - command: /bin/true
+      notify: [hc]
+  post_tasks:
+    - debug: msg=POST
+  handlers:
+    - name: ha
+      fail: msg=HA_FAIL
+    - name: hb
+      debug: msg=HB_RAN
+    - name: hc
+      debug: msg=HC_RAN
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg=PLAY2
+"""
+
+
+@pytest.mark.parametrize("force", ["", "force_handlers: true"])
+def test_failing_handler_fails_host_with_clean_recap(tmp_path, force):
+    _, recap = check(tmp_path, {"pb.yml": FAILING_HANDLER.format(force=force)})
+    assert recap[3] == "1"
 
 
 @pytest.mark.parametrize("topic", ["r_topic", "r : r_topic"])
@@ -791,6 +849,23 @@ def test_failed_command_exception_after_retry_exhaustion(tmp_path, monkeypatch, 
     assert msgs == ['"1 True (traceback unavailable)"']
 
 
+def test_failed_task_facts_persist_after_rescue(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - block:
+                - fail: msg=first
+                  name: failing one
+              rescue:
+                - debug: msg="r1 {{ ansible_failed_task.name }} {{ ansible_failed_result.msg }}"
+                - set_fact: {ansible_failed_result: {msg: overridden}}
+                - debug: msg="r2 {{ ansible_failed_result.msg }}"
+            - debug: msg="after {{ ansible_failed_task.name }} {{ ansible_failed_result.msg }}"
+        """})
+    assert msgs[-1] == '"after failing one overridden"'
+
+
 def _run_mode(tmp_path, mode):
     if mode == "standalone":
         return _standalone_run(tmp_path, ())
@@ -934,6 +1009,34 @@ SETUP_FAILURE = """
   tasks:
     - debug: msg=NEXT_PLAY
 """
+
+
+def test_strategy_skips_filtered_setup(tmp_path, monkeypatch):
+    _reject_setup_become(tmp_path, monkeypatch)
+    _write(tmp_path, {"pb.yml": SETUP_FAILURE.format(ignore="")})
+    args = ["--skip-tags", "always"]
+    expected = _ansible(tmp_path, args)
+    assert _ansible(tmp_path, args, "ansiroll.core.ansiroll") == expected
+    assert expected == (['"AFTER_SETUP"', '"NEXT_PLAY"'], ("2", "0", "0", "0", "0", "0", "0"))
+
+
+def test_setup_failure_uses_play_ignore_context_and_displays_result(tmp_path, monkeypatch):
+    _reject_setup_become(tmp_path, monkeypatch)
+    ignore = 'ignore_errors: "{{ ignore_setup_error }}"\n  vars: {ignore_setup_error: true}'
+    _write(tmp_path, {"pb.yml": SETUP_FAILURE.format(ignore=ignore)})
+    runs = [
+        _ansible_run(tmp_path, ()),
+        _standalone_run(tmp_path, ()),
+        _ansible_run(tmp_path, (), "ansiroll.core.ansiroll"),
+    ]
+    for out in runs:
+        assert out.returncode == 0, out.stdout + out.stderr
+        assert "TASK [Gathering Facts]" in out.stdout
+        assert "FAILED" in out.stdout
+        assert "...ignoring" in out.stdout
+        msgs, recap = _summary(out.stdout + out.stderr)
+        assert msgs[-2:] == ['"AFTER_SETUP"', '"NEXT_PLAY"']
+        assert recap == ("3", "0", "0", "0", "0", "0", "1")
 
 
 def test_nested_dynamic_role_inherits_parent_params_in_tasks_and_handlers(tmp_path):

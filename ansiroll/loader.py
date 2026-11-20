@@ -194,7 +194,7 @@ def _rewrite_includes(data):
 
 
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
-                  all_vars=None, runtime_writes=None):
+                  all_vars=None, runtime_writes=None, gather_facts=None):
     from ansible import constants as C
 
     if basedir is None:
@@ -244,9 +244,13 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if runtime_writes is not None:
         runtime_writes.update(includes.runtime_writes)
     _assign_runtime_ids(tasks, handlers)
-    gather = play.gather_facts
+    # The strategy supplies the iterator's filtered setup decision. Standalone
+    # uses the play keyword and the controller's default gathering policy.
+    gather = gather_facts
     if gather is None:
-        gather = C.DEFAULT_GATHERING != "explicit"
+        gather = play.gather_facts
+        if gather is None:
+            gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
     core_version = _core_version()
@@ -255,6 +259,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "hosts": hosts,
         "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
+        "smart_gathering": gather_facts is None and C.DEFAULT_GATHERING == "smart",
+        "gather_when": _conditions(getattr(play, "_included_conditional", None)),
+        "gather_no_log": getattr(play, "no_log", False),
         "error_on_missing_handler": C.ERROR_ON_MISSING_HANDLER,
         "allow_broken_conditionals": (
             core_version >= (2, 19)
@@ -266,6 +273,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "become": bool(play.become),
         "become_user": getattr(play, "become_user", None),
         "force_handlers": bool(getattr(play, "force_handlers", False)),
+        "ignore_errors": getattr(play, "ignore_errors", None),
         "vars": _tag_untrusted(play_vars),
         "playbook_dir": basedir,
         "tasks": tasks,

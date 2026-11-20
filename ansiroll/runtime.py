@@ -2341,13 +2341,23 @@ class Runtime:
         )
         self._play_var_names.clear()
         self.vars.update(self._visible_module_facts(self._module_fact_layer))
-        if play.get("gather_facts"):
-            self.gather_facts(
+        saved_facts = self.vars.get("ansible_facts")
+        gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
+                         and saved_facts.get("_ansible_facts_gathered"))
+        if play.get("gather_facts") and not gather_cached:
+            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
+            gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
                 become_user=play.get("become_user"),
                 fact_schema=play.get("fact_schema"),
+                ignore_errors=play.get("ignore_errors"),
+                ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
             )
+            if not gathered:
+                self.failed = True
+                self.check_mode = invocation_check_mode
+                return
         # Play templates resolve when consumed, after task precedence is applied.
         play_vars = self._with_deferred_vars_files(play)
         self._play_var_names = set(play_vars)
@@ -2534,10 +2544,14 @@ class Runtime:
                 if not rescue:
                     raise
                 self._tally("rescued")
-                scope = _with_high_vars(scope, {
+                # Saved as nonpersistent facts (set_fact level) that outlive
+                # the rescue (StrategyBase._process_pending_results).
+                failed_facts = {
                     "ansible_failed_task": ex.task,
                     "ansible_failed_result": ex.result,
-                })
+                }
+                self.vars.update(failed_facts)
+                self._set_fact_overrides.update(failed_facts)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
             if getattr(ex, "ends_play", False):
@@ -4257,17 +4271,32 @@ class Runtime:
 
     # ---- facts -----------------------------------------------------------
     def gather_facts(self, environment=None, become=False, become_user=None,
-                     fact_schema=None):
+                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
-                "runtime_id": "__gather_facts__"}
+                "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
+                "when": when, "ignore_errors": ignore_errors, "no_log": bool(no_log)}
+        if ctx is None:
+            ctx = self.ctx()
         self.emit_start(node)
+        blocked, ignore = self._task_gate(node, ctx)
+        if blocked is not None:
+            self.emit(node, _status_of(blocked), blocked, ignored=ignore)
+            if blocked.get("skipped"):
+                self._tally("skipped")
+                return True
+            if ignore:
+                self._tally("ok")
+                self._tally("ignored")
+                return True
+            self._tally("failures")
+            return False
         inherited_become_user = self.become_user
         try:
             if become_user:
-                self.become_user = _as_text(become_user)
+                self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
-                {"environment": environment}, self.ctx())
+                {"environment": environment}, ctx)
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
@@ -4296,17 +4325,37 @@ class Runtime:
             else:
                 provenance = {"mode": "real-ansiballz"}
                 res = self.run_module("ansible.builtin.setup", {}, become=become)
-        except Exception as ex:  # pragma: no cover
-            sys.stderr.write("ansiroll: fact gathering failed: %s\n" % ex)
-            return
+        except Exception as ex:
+            provenance = {"mode": "native-agent"}
+            res = {"failed": True, "changed": False,
+                   "msg": "ansiroll: fact gathering raised %s: %s"
+                          % (type(ex).__name__, ex)}
         finally:
             self._module_env = None
             self.become_user = inherited_become_user
+        self._task_provenance[id(node)] = provenance
+        if not isinstance(res, dict) or res.get("failed"):
+            # Like Ansible, a failed setup is a fatal task failure for the host.
+            if not isinstance(res, dict):
+                res = {"failed": True, "changed": False,
+                       "msg": "ansiroll: fact gathering returned no result"}
+            res.setdefault("changed", False)
+            if ignore:
+                self.emit(node, "failed", res, ignored=True)
+                self._tally("ok")
+                self._tally("ignored")
+                return True
+            self.emit(node, "failed", res)
+            self._tally("failures")
+            return False
+        if isinstance(res.get("ansible_facts"), dict):
+            res["ansible_facts"]["_ansible_facts_gathered"] = True
         self._absorb_facts({"action": "setup"}, res)
         self._facts_gathered = True
-        self._task_provenance[id(node)] = provenance
-        self.emit(node, "ok", {"changed": False})
+        res["_ansible_verbose_override"] = True
+        self.emit(node, "ok", res if self.on_result else {"changed": False})
         self._tally("ok")
+        return True
 
     # ---- module execution ------------------------------------------------
     def cleanup(self):
@@ -4753,6 +4802,9 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     include_vars_layer = {}
     module_fact_layer = {}
     for play in plays:
+        if failed:
+            # A host that failed is removed from the rest of the playbook.
+            break
         if pretty:
             banner = "PLAY [%s] " % (play.get("name") or play.get("hosts") or "")
             sys.stdout.write("\n" + banner + "*" * max(3, 79 - len(banner)) + "\n")
@@ -5119,11 +5171,16 @@ def agent_main():
              "unreachable": 0, "rescued": 0, "ignored": 0}
     try:
         for play in plays:
+            if not g.get("_INJECTED_GATHER_FACTS", True):
+                play = dict(play, gather_facts=False)
             rt.run_play(play)
             failed = failed or rt.failed
             for k in total:
                 total[k] += rt.stats.get(k, 0)
             rt.stats = {k: 0 for k in total}
+            if failed:
+                # A host that failed is removed from the rest of the playbook.
+                break
     except MissingHandler as ex:
         _chan_send(resp_fd, {"t": "error", "message": str(ex)})
         return
