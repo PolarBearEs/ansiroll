@@ -1,4 +1,5 @@
 import io
+import time
 from types import SimpleNamespace
 
 from ansible.module_utils.facts.system import date_time as official_date_time
@@ -48,7 +49,14 @@ def test_debian_version_uses_os_release_id_not_point_release(monkeypatch):
 
 def test_date_time_matches_compiling_ansible_contract(monkeypatch):
     epoch = 1594449296.123456
+    real_strftime = official_date_time.time.strftime
     monkeypatch.setattr(official_date_time.time, "time", lambda: epoch)
+    # The collector reads tz/tz_offset via time.strftime() at the *real*
+    # current time; freeze it at the same epoch so DST cannot differ.
+    monkeypatch.setattr(
+        official_date_time.time, "strftime",
+        lambda fmt, t=None: real_strftime(
+            fmt, time.localtime(epoch) if t is None else t))
     official = official_date_time.DateTimeFactCollector().collect()["date_time"]
     accelerated = facts._date_time(
         fact_schema=".".join(ansible_version.split(".")[:2]),

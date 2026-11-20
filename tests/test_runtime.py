@@ -968,15 +968,46 @@ def test_assert_pass_and_fail():
     assert frames[0]["status"] == "failed"
 
 
+def _copy_modules():
+    pytest.importorskip("ansible")
+    from ansiroll.embed import ModuleEmbedder
+    from ansiroll.loader import COPY_ACTION_MODULES
+
+    embedder = ModuleEmbedder()
+    return {name: embedder.embed(name) for name in COPY_ACTION_MODULES}
+
+
 def test_copy_content_writes_file(tmp_path):
+    modules = _copy_modules()
     dest = os.path.join(tmp_path, "out.txt")
     tasks = [_task("1", "c", "copy", args={"content": "hello", "dest": dest})]
-    rt, frames = run(tasks)
-    assert frames[0]["status"] == "changed"
+
+    def run_copy():
+        frames = []
+        rt = Runtime(modules, "", {"inventory_hostname": "h"}, on_result=frames.append)
+        try:
+            rt.run_play({"tasks": tasks, "handlers": [], "gather_facts": False, "vars": {}})
+        finally:
+            rt.cleanup()
+        return frames
+
+    assert run_copy()[0]["status"] == "changed"
     assert open(dest).read() == "hello"
     # Second run is idempotent (no change).
-    rt2, frames2 = run(tasks)
-    assert frames2[0]["status"] == "ok"
+    assert run_copy()[0]["status"] == "ok"
+
+
+def test_copy_without_embedded_modules_fails_clearly(tmp_path):
+    dest = tmp_path / "out.txt"
+    rt = Runtime({}, "", {"inventory_hostname": "h"})
+    try:
+        result = rt._run_file_action(
+            "copy", {}, {"content": "hello", "dest": str(dest)}, {})
+    finally:
+        rt.cleanup()
+    assert result["failed"] is True
+    assert "was not embedded" in result["msg"]
+    assert not dest.exists()
 
 
 def test_copy_fetches_runtime_created_controller_source(tmp_path):
@@ -984,16 +1015,20 @@ def test_copy_fetches_runtime_created_controller_source(tmp_path):
     src.parent.mkdir()
     src.write_bytes(b"services:\n  app:\n    image: test\xff\n")
     dest = tmp_path / "remote" / "docker-compose.yml"
-    rt = Runtime({}, "", {"inventory_hostname": "h"})
+    dest.parent.mkdir()
+    rt = Runtime(_copy_modules(), "", {"inventory_hostname": "h"})
     rt.controller_source_fn = lambda path: {
         "data": open(path, "rb").read(),
         "meta": {"fullpath": path},
     }
 
-    result = rt._run_file_action(
-        "copy", {"_baked": {}},
-        {"src": str(src), "dest": str(dest)}, {},
-    )
+    try:
+        result = rt._run_file_action(
+            "copy", {"_baked": {}},
+            {"src": str(src), "dest": str(dest)}, {},
+        )
+    finally:
+        rt.cleanup()
 
     assert result["changed"] is True
     assert dest.read_bytes() == src.read_bytes()
@@ -1134,7 +1169,7 @@ def test_accelerated_command_runs_without_embedded_module(monkeypatch):
     assert rt._workers == {}
 
 
-def test_accelerated_command_expands_argument_vars_when_requested(
+def test_accelerated_command_expands_argument_vars(
         monkeypatch):
     monkeypatch.setenv("ANSIROLL_COMMAND_VALUE", "expanded")
     from ansiroll.accelerated_modules import run as run_accelerated
@@ -1147,13 +1182,12 @@ def test_accelerated_command_expands_argument_vars_when_requested(
                 "$ANSIROLL_COMMAND_VALUE",
             ],
         },
-        options={"expand_argument_vars": True},
     )
 
     assert result["rc"] == 0
 
 
-def test_accelerated_python_import_uses_isolated_fork():
+def test_accelerated_python_import_probe_runs_as_a_process():
     from ansiroll.accelerated_modules import run as run_accelerated
 
     success = run_accelerated(
@@ -1173,7 +1207,7 @@ def test_accelerated_python_import_uses_isolated_fork():
     assert "ModuleNotFoundError" in failure["stderr"]
 
 
-def test_accelerated_shell_python_import_uses_isolated_fork():
+def test_accelerated_shell_python_import_probe_runs_as_a_process():
     from ansiroll.accelerated_modules import run as run_accelerated
 
     result = run_accelerated(
@@ -1474,26 +1508,32 @@ def test_same_uid_become_uses_the_normal_worker(monkeypatch):
     assert rt.engine_profile["worker_identities"] == {"current-user": 1}
 
 
-def test_worker_baked_write_op(tmp_path):
-    dest = tmp_path / "nested" / "out.txt"
+def test_worker_copy_stat_and_stage_ops(tmp_path):
+    import base64
+    import hashlib
+
+    dest = tmp_path / "out.txt"
     rt = Runtime({}, "", {"inventory_hostname": "h"})
     try:
-        res = rt._run_worker_operation(
-            "fast_write",
-            {"dest": str(dest), "content": "hello", "mode": "0644"},
-        )
-        assert res["changed"] is True
-        assert dest.read_text() == "hello"
-        res = rt._run_worker_operation(
-            "fast_write",
-            {"dest": str(dest), "content": "hello", "mode": "0644"},
-        )
-        assert res["changed"] is False
+        assert rt._run_worker_operation(
+            "copy_stat", {"path": str(dest), "follow": False, "checksum": True},
+        ) == {"exists": False, "checksum": "1"}
+        dest.write_bytes(b"hello")
+        stat = rt._run_worker_operation(
+            "copy_stat", {"path": str(dest), "follow": False, "checksum": True})
+        assert stat["checksum"] == hashlib.sha1(b"hello").hexdigest()
+        staged = rt._run_worker_operation("copy_stage", {
+            "data": base64.b64encode(b"data").decode("ascii"), "filename": ".source.conf"})
+        assert staged["path"].endswith("/.source.conf")
+        with open(staged["path"], "rb") as fh:
+            assert fh.read() == b"data"
+        rt._run_worker_operation("copy_cleanup", {"tmpdir": staged["tmpdir"]})
+        assert not os.path.exists(staged["tmpdir"])
     finally:
         rt.cleanup()
 
 
-def test_privileged_baked_write_does_not_fall_back_to_a_temp_file(
+def test_privileged_copy_does_not_fall_back_to_an_unprivileged_write(
         monkeypatch, tmp_path):
     destination = tmp_path / "must-not-be-written"
     rt = Runtime({}, "", {"inventory_hostname": "h"})
@@ -1508,7 +1548,7 @@ def test_privileged_baked_write_does_not_fall_back_to_a_temp_file(
     assert result == {
         "failed": True,
         "changed": False,
-        "msg": "copy: privileged worker unavailable",
+        "msg": "ansiroll: worker unavailable for privileged file transfer",
     }
     assert not destination.exists()
 

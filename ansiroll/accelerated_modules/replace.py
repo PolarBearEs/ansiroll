@@ -3,11 +3,13 @@
 from __future__ import absolute_import
 
 import codecs
+import errno
 import io
 import os
 import re
-import stat
 import tempfile
+
+from ._atomic import copy_replacement_attributes
 
 
 _PATH_KEYS = ("path", "dest", "destfile", "name")
@@ -82,7 +84,8 @@ def _section(contents, after, before):
     )
 
 
-def _atomic_write(path, contents, encoding, original):
+def _atomic_write(path, contents, encoding, original, chmod_before_chown):
+    """Match atomic_move's attribute ordering and ignore EPERM before renaming."""
     directory = os.path.dirname(path) or "."
     descriptor, temporary = tempfile.mkstemp(prefix=".ansiroll-replace-", dir=directory)
     try:
@@ -91,14 +94,12 @@ def _atomic_write(path, contents, encoding, original):
                 descriptor, mode, encoding=None if mode == "wb" else encoding,
                 closefd=True) as output:
             output.write(contents)
-        os.chmod(temporary, stat.S_IMODE(original.st_mode))
-        if os.geteuid() == 0:
-            os.chown(temporary, original.st_uid, original.st_gid)
-        elif original.st_uid != os.geteuid():
-            os.unlink(temporary)
-            return False
-        os.replace(temporary, path)
-        return True
+        try:
+            copy_replacement_attributes(path, temporary, original, chmod_before_chown)
+        except OSError as error:
+            if error.errno != errno.EPERM:
+                raise
+        os.rename(temporary, path)
     finally:
         try:
             os.unlink(temporary)
@@ -107,6 +108,7 @@ def _atomic_write(path, contents, encoding, original):
 
 
 def run(args, check_mode=False, shell=False, environment=None, options=None):
+    options = options or {}
     path = _single(args, _PATH_KEYS)
     encoding = args.get("encoding", "utf-8")
     if os.path.isdir(path):
@@ -114,8 +116,8 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
     if not os.path.exists(path):
         return _failed("Path %s does not exist !" % path, 257)
     real_path = os.path.realpath(path)
-    binary_io = bool((options or {}).get("binary_io"))
-    include_rc = not bool((options or {}).get("omit_result_rc"))
+    binary_io = bool(options.get("binary_io"))
+    include_rc = not bool(options.get("omit_result_rc"))
     try:
         original = os.stat(real_path)
         mode = "rb" if binary_io else "r"
@@ -172,7 +174,8 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         )
     if not check_mode:
         try:
-            _atomic_write(real_path, replacement, encoding, original)
+            _atomic_write(real_path, replacement, encoding, original,
+                          options.get("chmod_before_chown"))
         except (IOError, OSError) as error:
             return _failed("Unable to write changes to %r: %s" % (path, error))
     result = {
@@ -181,7 +184,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
     }
     if include_rc:
         result["rc"] = 0
-    if (options or {}).get("diff_mode"):
+    if options.get("diff_mode"):
         def text(value):
             return (
                 value.decode("utf-8", "surrogateescape")

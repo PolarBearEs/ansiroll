@@ -23,6 +23,7 @@ import zipfile
 
 from .embed import ModuleEmbedder
 from .loader import (
+    COPY_ACTION_MODULES,
     _can_write_var,
     _depends_on_vars,
     _loop_binding_names,
@@ -677,6 +678,8 @@ def _actions_in_plays(plays):
         node["action"] for node in _walk_play_nodes(plays)
         if node.get("action") and node.get("type") != "include"
     }
+    if any(node.get("special") in ("template", "copy") for node in _walk_play_nodes(plays)):
+        actions.update(COPY_ACTION_MODULES)
     if any(play.get("gather_facts") for play in plays):
         actions.add("ansible.builtin.setup")
     return actions
@@ -720,6 +723,9 @@ def _accelerated_only_actions(plays, actions):
         if (
                 node.get("accelerator") != "always"
                 or node.get("fallback")
+                # The command guard cannot always restore the agent's cwd.
+                or (str(action).split(".")[-1] in ("command", "shell")
+                    and (node.get("args") or {}).get("chdir") is not None)
                 or int(node.get("async_val") or 0)):
             eligible.discard(action)
     return eligible & seen

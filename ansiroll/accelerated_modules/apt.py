@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 from . import _stdin
+from .environment import best_parsable_locale
 
 
 _PACKAGE_KEYS = ("name", "package", "pkg")
@@ -62,23 +63,25 @@ def can_accelerate(args, check_mode=False, shell=False):
     return True
 
 
-def _environment(environment, force_c_locale=False):
+def _environment(environment, force_c_locale=False, overrides=None):
     result = os.environ.copy()
     if environment:
         result.update({str(key): str(value) for key, value in environment.items()})
     if force_c_locale:
         result["LC_ALL"] = "C"
         result["LANG"] = "C"
+    if overrides:
+        result.update(overrides)
     return result
 
 
-def _command(argv, environment=None, force_c_locale=False):
+def _command(argv, environment=None, force_c_locale=False, overrides=None):
     try:
         process = _stdin.popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_environment(environment, force_c_locale),
+            env=_environment(environment, force_c_locale, overrides),
         )
         stdout, stderr = process.communicate()
         return (
@@ -88,6 +91,24 @@ def _command(argv, environment=None, force_c_locale=False):
         )
     except Exception as error:
         return None, "", str(error)
+
+
+def _apt_environment(environment, options):
+    """APT_ENV_VARS, the run_command_environ_update of the official module."""
+    # ansible-core < 2.12 hard-coded C; 2.18 added LANGUAGE.
+    locale = (best_parsable_locale(environment)
+              if options.get("parsable_locale") else "C")
+    variables = {
+        "DEBIAN_FRONTEND": "noninteractive",
+        "DEBIAN_PRIORITY": "critical",
+        "LANG": locale,
+        "LC_ALL": locale,
+        "LC_MESSAGES": locale,
+        "LC_CTYPE": locale,
+    }
+    if options.get("language_locale"):
+        variables["LANGUAGE"] = locale
+    return variables
 
 
 def _requested_name(binary_name, requested):
@@ -179,7 +200,9 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         return {"changed": False}
 
     command = _apt_remove_command(apt_get, remove, args, check_mode)
-    returncode, stdout, stderr = _command(command, environment)
+    returncode, stdout, stderr = _command(
+        command, environment,
+        overrides=_apt_environment(environment, options or {}))
     if returncode is None:
         # The process may have started before communication failed. Never
         # fall back after a potentially mutating command: that could apply a

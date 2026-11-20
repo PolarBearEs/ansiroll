@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -180,6 +181,200 @@ def test_accelerated_command_matches_official_module_semantics(action):
         assert accelerated.get(key) == official.get(key)
 
 
+def _command_parity_cases(base):
+    os.makedirs(os.path.join(base, "sub"))
+    open(os.path.join(base, "sub", "marker"), "w").close()
+    return [
+        # chdir is applied (and ~-expanded) before creates/removes.
+        ("command", {"_raw_params": "echo ran", "chdir": os.path.join(base, "sub"),
+                     "creates": "marker"}),
+        ("command", {"_raw_params": "pwd", "chdir": "~"}),
+        ("command", {"_raw_params": "true", "chdir": os.path.join(base, "nope")}),
+        ("command", {"_raw_params": "echo x", "creates": "~/"}),
+        # argv gets ~ and $VAR expansion, the reported cmd does not.
+        ("command", {"_raw_params": "echo ~ $HOME '$HOME' ~root/x"}),
+        # Bytes output: no newline translation, surrogateescape decoding.
+        ("shell", {"_raw_params": "printf '\\377ok\\r\\n'", "_uses_shell": True}),
+        ("shell", {"_raw_params": "printf 'a\\r\\nb\\r\\n'", "_uses_shell": True,
+                   "strip_empty_ends": False}),
+        # python -c 'import ...' is run as a real process.
+        ("command", {"_raw_params": "%s -c 'import ansiroll_no_such_mod'" % sys.executable}),
+        ("command", {"_raw_params": "ansiroll_no_such_cmd_xyz --password=x -p y"}),
+        ("command", {"_raw_params": "./ansiroll-relative"}),
+        ("shell", {"_raw_params": "echo $0 x", "_uses_shell": True,
+                   "executable": "/bin/bash"}),
+        ("shell", {"_raw_params": "echo $0 x", "_uses_shell": True,
+                   "executable": "/nonexistent/sh"}),
+    ]
+
+
+def test_accelerated_command_edge_cases_match_official(tmp_path):
+    from ansiroll.loader import _accelerator_options
+
+    cases = _command_parity_cases(str(tmp_path))
+    emb = ModuleEmbedder()
+    rt = Runtime({"command": emb.embed("command"), "shell": emb.embed("shell")},
+                 "", {"inventory_hostname": "localhost"})
+    skip = ("start", "end", "delta", "invocation", "exception")
+    try:
+        for action, args in cases:
+            official = rt.run_module(action, dict(args))
+            accelerated = run_accelerated(
+                action, dict(args), options=_accelerator_options(action))
+            official = {k: v for k, v in official.items() if k not in skip}
+            accelerated = {k: v for k, v in accelerated.items() if k not in skip}
+            assert accelerated == official, (action, args)
+    finally:
+        rt.cleanup()
+
+
+@pytest.mark.parametrize("search_only", [False, True])
+def test_accelerated_command_guards_use_task_environment_and_literal_chdir(
+        tmp_path, monkeypatch, search_only):
+    from ansiroll.loader import _accelerator_options
+
+    work = tmp_path / "literal[1]"
+    work.mkdir()
+    (work / "guard.txt").touch()
+    (tmp_path / "absolute.txt").touch()
+    monkeypatch.setenv("ANSIROLL_GUARD", "missing")
+    monkeypatch.setenv("ANSIROLL_COMMAND_PATH", str(tmp_path))
+    environment = {
+        "ANSIROLL_GUARD": "guard.*",
+        "ANSIROLL_COMMAND_PATH": str(work),
+    }
+    cases = [
+        ({"creates": "$ANSIROLL_GUARD"}, False),
+        ({"removes": "$ANSIROLL_GUARD"}, True),
+        ({"removes": "missing"}, False),
+        ({"creates": str(tmp_path / "absolute.txt")}, False),
+    ]
+    start = tmp_path / "start"
+    start.mkdir()
+    monkeypatch.chdir(start)
+    if search_only:
+        if os.geteuid() == 0:
+            pytest.skip("root can read a search-only working directory")
+        start.chmod(0o111)
+    rt = Runtime({"command": ModuleEmbedder().embed("command")},
+                 "", {"inventory_hostname": "localhost"})
+    rt._module_env = environment
+    cwd = os.getcwd()
+    try:
+        for guard, changed in cases:
+            args = dict(guard, chdir="$ANSIROLL_COMMAND_PATH",
+                        _raw_params="printf %s $ANSIROLL_GUARD")
+            official = rt.run_module("command", dict(args))
+            accelerated = run_accelerated(
+                "command", args, environment=environment,
+                options=_accelerator_options("command"))
+            ignored = ("start", "end", "delta", "invocation")
+            assert ({k: v for k, v in accelerated.items() if k not in ignored}
+                    == {k: v for k, v in official.items() if k not in ignored})
+            assert accelerated["changed"] is changed
+            if changed:
+                assert accelerated["stdout"] == "guard.*"
+            assert os.getcwd() == cwd
+            assert os.environ["ANSIROLL_GUARD"] == "missing"
+    finally:
+        start.chmod(0o700)
+        rt.cleanup()
+
+
+def test_compiled_command_loop_restores_search_only_cwd(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root can read a search-only working directory")
+    start = tmp_path / "start"
+    start.mkdir()
+    guarded = tmp_path / "literal[1]"
+    guarded.mkdir()
+    (guarded / "marker").touch()
+    unguarded = tmp_path / "literal[2]"
+    unguarded.mkdir()
+    playbook = tmp_path / "guards.yml"
+    playbook.write_text(
+        """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command:
+        cmd: pwd
+        chdir: "{{ item }}"
+        creates: mark*
+      loop: %s
+    - command: pwd
+""" % json.dumps([str(guarded), str(unguarded)]))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(playbook))[0])
+    start.chmod(0o111)
+    try:
+        proc = subprocess.run([sys.executable, str(script)], cwd=str(start),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=dict(os.environ, ANSIROLL_RAW="1",
+                                       ANSIROLL_ACCELERATED_MODULES="command"),
+                              universal_newlines=True)
+    finally:
+        start.chmod(0o700)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    prefix = "__ANSIROLL_RESULT__ "
+    events = [json.loads(line[len(prefix):]) for line in proc.stdout.splitlines()
+              if line.startswith(prefix)]
+    skipped, executed = [event["result"] for event in events if event["is_item"]]
+    following = [event["result"] for event in events if not event["is_item"]][-1]
+    assert skipped["changed"] is False
+    assert executed["changed"] is True
+    assert executed["stdout"] == str(unguarded)
+    assert following["stdout"] == str(start)
+
+
+@pytest.mark.parametrize("action,chdir", [("command", None), ("command", 0), ("shell", False)])
+def test_compiled_command_falls_back_when_cwd_loses_search_permission(tmp_path, action, chdir):
+    if os.geteuid() == 0:
+        pytest.skip("root can search a directory without permissions")
+    start = tmp_path / "start"
+    start.mkdir()
+    target = tmp_path / "literal[1]"
+    target.mkdir()
+    (target / "marker").touch()
+    playbook = tmp_path / "guard.yml"
+    playbook.write_text(
+        """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: %s
+        state: directory
+        mode: "0000"
+    - %s:
+        cmd: pwd
+        chdir: %s
+        creates: marker
+      ignore_errors: true
+""" % (json.dumps(str(start)), action,
+       json.dumps(str(target) if chdir is None else chdir)))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(playbook))[0])
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)], cwd=str(start),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_ACCELERATED_MODULES=action),
+            universal_newlines=True,
+        )
+    finally:
+        start.chmod(0o700)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    prefix = "__ANSIROLL_RESULT__ "
+    result = [json.loads(line[len(prefix):])["result"] for line in proc.stdout.splitlines()
+              if line.startswith(prefix)][-1]
+    assert result["changed"] is False
+    if chdir is None:
+        assert result["rc"] == 0
+        assert "since marker exists" in result["stdout"]
+    else:
+        assert result["failed"] is True
+        assert result["msg"].startswith("Unable to change directory before execution")
+
+
 def test_accelerated_command_matches_legacy_warn_semantics():
     import ansible
 
@@ -228,6 +423,62 @@ def test_accelerated_apt_absent_matches_official_module_semantics():
 
     assert accelerated.get("failed") == official.get("failed")
     assert accelerated["changed"] == official["changed"] is False
+
+
+def test_accelerated_apt_remove_uses_official_apt_environment(tmp_path):
+    """apt-get runs with the official module's APT_ENV_VARS; fake dpkg-query and
+    apt-get on the task PATH record it, so no package state is touched."""
+    import ansible
+    from ansiroll.loader import _accelerator_options
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    record = tmp_path / "env.json"
+    (bin_dir / "dpkg-query").write_text(
+        "#!/bin/sh\nprintf 'ansiroll-fake\\tii \\n'\n")
+    (bin_dir / "apt-get").write_text(
+        "#!%s\nimport json, os, sys\n"
+        "json.dump({'argv': sys.argv[1:], 'env': dict(os.environ)}, open(%r, 'w'))\n"
+        % (sys.executable, str(record)))
+    for name in ("dpkg-query", "apt-get"):
+        os.chmod(str(bin_dir / name), 0o755)
+    environment = {
+        "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "LANG": "es_ES.UTF-8", "LC_ALL": "es_ES.UTF-8", "LANGUAGE": "es",
+        "DEBIAN_FRONTEND": "dialog",
+    }
+    result = run_accelerated(
+        "apt", {"name": "ansiroll-fake", "state": "absent"},
+        environment=environment, options=_accelerator_options("apt"))
+    assert result.get("changed") is True, result
+
+    class _Module(object):
+        def get_bin_path(self, name):
+            return shutil.which(name, path=environment["PATH"])
+
+        def run_command(self, args):
+            proc = subprocess.run(args, capture_output=True, text=True,
+                                  env=dict(os.environ, **environment))
+            return proc.returncode, proc.stdout, proc.stderr
+
+        def debug(self, msg):
+            pass
+
+    source = open(os.path.join(
+        os.path.dirname(ansible.__file__), "modules", "apt.py")).read()
+    block = re.search(r"APT_ENV_VARS = dict\((.*?)\)", source, re.S).group(1)
+    locale = None
+    if re.search(r"=\s*locale\b", block):
+        from ansible.module_utils.common.locale import get_best_parsable_locale
+        locale = get_best_parsable_locale(_Module())
+    expected = {}
+    for key, value in re.findall(r"(\w+)=([^,\n]+)", block):
+        expected[key] = locale if value.strip() == "locale" else value.strip("'\" ")
+    assert "LANG" in expected and "DEBIAN_FRONTEND" in expected
+    recorded = json.load(open(str(record)))
+    assert {key: recorded["env"].get(key) for key in expected} == expected
+    assert recorded["env"]["LANGUAGE"] == expected.get("LANGUAGE", "es")
+    assert recorded["argv"][-2:] == ["remove", "ansiroll-fake"]
 
 
 def test_accelerated_slurp_matches_official_module_semantics(tmp_path):
@@ -287,6 +538,97 @@ def test_accelerated_slurp_missing_file_matches_official_failure(tmp_path):
     assert accelerated == expected
 
 
+def _translated_locale():
+    """A non-English UTF-8 locale whose strerror() differs from English."""
+    try:
+        names = subprocess.run(
+            ["locale", "-a"], stdout=subprocess.PIPE,
+            universal_newlines=True).stdout.split()
+    except OSError:
+        return None
+    for name in names:
+        if name.lower().endswith((".utf8", ".utf-8")) and \
+                not name.startswith(("C.", "en_", "POSIX")):
+            return name
+    return None
+
+
+@pytest.mark.parametrize("task_override", [False, True])
+def test_accelerated_modules_apply_locale_like_ansible_module(tmp_path, task_override):
+    # AnsibleModule._check_locale() (module_utils/basic.py) runs
+    # setlocale(LC_ALL, ''), so official error texts follow the user's locale.
+    name = _translated_locale()
+    if name is None:
+        pytest.skip("no translated UTF-8 locale installed")
+    script = (
+        "import json, sys\n"
+        "from ansiroll.embed import ModuleEmbedder\n"
+        "from ansiroll.runtime import Runtime\n"
+        "from ansiroll.accelerated_modules import run\n"
+        "args = {'src': sys.argv[1]}\n"
+        "rt = Runtime({'slurp': ModuleEmbedder().embed('slurp')}, '',\n"
+        "             {'inventory_hostname': 'localhost'})\n"
+        "try:\n"
+        "    task_env = {'LC_ALL': sys.argv[2], 'LANGUAGE': ''} if sys.argv[2] else None\n"
+        "    rt._module_env = task_env\n"
+        "    official = rt.run_module('slurp', args)\n"
+        "finally:\n"
+        "    rt.cleanup()\n"
+        "official.pop('invocation', None)\n"
+        "from ansible.release import __version__ as v\n"
+        "new = tuple(map(int, v.split('.')[:2])) >= (2, 19)\n"
+        "accelerated = run('slurp', args, environment=task_env, options={\n"
+        "    'lowercase_not_found': not new, 'typed_exceptions': new})\n"
+        "print(json.dumps([official, accelerated]))\n"
+    )
+    inherited = "C" if task_override else name
+    env = dict(os.environ, LANG=inherited, LC_ALL=inherited, LANGUAGE="")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+         env.get("PYTHONPATH", "")])
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "missing"),
+         name if task_override else ""],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, check=True)
+    official, accelerated = json.loads(proc.stdout.splitlines()[-1])
+    assert accelerated == official
+
+
+@pytest.mark.parametrize("path", [None, ""])
+def test_accelerated_shell_locale_fallback_matches_official(monkeypatch, path):
+    import locale
+    from ansiroll.loader import _accelerator_options
+
+    monkeypatch.setenv("LC_ALL", "C")
+    original_locale = locale.setlocale(locale.LC_ALL)
+    original_env = dict(os.environ)
+    args = {
+        "_raw_params": 'printf "%s\n" "$LANG" "$LC_ALL" "$LC_MESSAGES"',
+        "_uses_shell": True,
+    }
+    environment = {"LC_ALL": "ansiroll_invalid_locale"}
+    if path is not None:
+        environment["PATH"] = path
+    rt = Runtime({"shell": ModuleEmbedder().embed("shell")},
+                 "", {"inventory_hostname": "localhost"})
+    rt._module_env = environment
+    try:
+        official = rt.run_module("shell", dict(args))
+        accelerated = run_accelerated(
+            "shell", args, environment=environment, options=_accelerator_options("shell"))
+        following = run_accelerated("shell", args)
+    finally:
+        rt.cleanup()
+    assert accelerated["stdout_lines"] == official["stdout_lines"]
+    fallback = official["stdout_lines"][0]
+    assert fallback and fallback != environment["LC_ALL"]
+    assert accelerated["stdout_lines"] == [fallback] * 3
+    assert following["stdout_lines"][1] == "C"
+    assert locale.setlocale(locale.LC_ALL) == original_locale
+    assert dict(os.environ) == original_env
+
+
 @pytest.mark.parametrize("initial,args", [
     (
         "before\nold=one\nold=two\nafter\n",
@@ -302,6 +644,8 @@ def test_accelerated_slurp_missing_file_matches_official_failure(tmp_path):
 ])
 def test_accelerated_replace_matches_official_module_semantics(
         tmp_path, initial, args):
+    from ansiroll.loader import _accelerator_options
+
     official_path = tmp_path / "official"
     accelerated_path = tmp_path / "accelerated"
     official_path.write_text(initial)
@@ -314,20 +658,68 @@ def test_accelerated_replace_matches_official_module_semantics(
             "replace", dict(args, path=str(official_path)))
     finally:
         rt.cleanup()
-    from ansible.release import __version__ as ansible_version
-    version = tuple(map(int, ansible_version.split(".")[:2]))
     accelerated = run_accelerated(
         "replace",
         dict(args, path=str(accelerated_path)),
-        options={
-            "binary_io": version < (2, 20),
-            "omit_result_rc": version < (2, 14),
-        },
+        options=_accelerator_options("replace"),
     )
 
     official.pop("invocation", None)
     assert accelerated == official
     assert accelerated_path.read_bytes() == official_path.read_bytes()
+
+
+@pytest.mark.parametrize("action,args", [
+    ("replace", {"regexp": "^old=.*$", "replace": "new=2"}),
+    ("blockinfile", {"insertafter": "EOF", "block": "new=2"}),
+])
+def test_accelerated_atomic_write_matches_official_when_chown_is_denied(
+        tmp_path, monkeypatch, action, args):
+    """Non-root replacing a file it may not chown back (another owner, or a
+    group it is not in): atomic_move ignores EPERM and still writes."""
+    import errno as errno_module
+    from ansiroll.loader import _accelerator_options
+
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "def _denied(*args, **kwargs):\n"
+        "    raise OSError(errno.EPERM, 'Operation not permitted')\n"
+        "os.chown = _denied\n"
+    )
+    official_path = tmp_path / "official"
+    accelerated_path = tmp_path / "accelerated"
+    for path in (official_path, accelerated_path):
+        path.write_text("old=1\n")
+        os.chmod(str(path), 0o644)
+    monkeypatch.setenv("PYTHONPATH", str(hooks))
+    meta = ModuleEmbedder().embed(action)
+    rt = Runtime({action: meta}, "", {"inventory_hostname": "localhost"})
+    try:
+        official = rt.run_module(action, dict(args, path=str(official_path)))
+    finally:
+        rt.cleanup()
+    monkeypatch.delenv("PYTHONPATH")
+
+    def denied(*args, **kwargs):
+        raise OSError(errno_module.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chown", denied)
+    accelerated = run_accelerated(
+        action, dict(args, path=str(accelerated_path)),
+        options=_accelerator_options(action))
+
+    official.pop("invocation", None)
+    assert official["changed"] is True
+    for result, path in ((official, official_path), (accelerated, accelerated_path)):
+        if "diff" in result:
+            result["diff"] = json.loads(json.dumps(result["diff"]).replace(str(path), "<path>"))
+    assert accelerated == official
+    assert accelerated_path.read_bytes() == official_path.read_bytes()
+    assert b"new=2" in accelerated_path.read_bytes()
+    assert (oct(os.stat(str(accelerated_path)).st_mode & 0o7777)
+            == oct(os.stat(str(official_path)).st_mode & 0o7777))
 
 
 def test_accelerated_file_directory_matches_official_idempotence(tmp_path):
@@ -357,6 +749,206 @@ def test_accelerated_file_directory_matches_official_idempotence(tmp_path):
     assert accelerated_second["changed"] == official_second["changed"] is False
     assert (official_path.stat().st_mode & 0o7777) == 0o750
     assert (accelerated_path.stat().st_mode & 0o7777) == 0o750
+
+
+def test_accelerated_file_results_and_created_parents_match_official(tmp_path):
+    import stat as stat_module
+    from ansiroll.accelerated_modules import can_accelerate
+    from ansiroll.loader import _accelerator_options
+
+    cases = [
+        # mode applies to every directory mkdir -p creates.
+        ({"path": "a/b/c", "state": "directory", "mode": "0750"}, False),
+        ({"path": "a/b/c", "state": "directory", "mode": "0750"}, False),
+        ({"path": "existing/new/../target", "state": "directory", "mode": "0700"}, False),
+        ({"path": "q/r", "state": "directory", "mode": "g+w"}, False),
+        # mode/owner/size/... are reported even when not requested.
+        ({"path": "m/n", "state": "directory"}, False),
+        ({"path": "exist", "state": "directory", "mode": "0700"}, False),
+        ({"path": "exist", "state": "directory", "owner": str(os.getuid())}, False),
+        # A regular file is not a directory, in check mode too.
+        ({"path": "regular", "state": "directory"}, True),
+        ({"path": "regular", "state": "directory"}, False),
+        ({"path": "newdir", "state": "directory"}, True),
+        ({"path": "t1", "state": "touch"}, False),
+        ({"path": "t1", "state": "touch", "mode": "0600"}, False),
+        ({"path": "t1", "state": "touch", "mode": "0644"}, True),
+        ({"path": "missing-touch", "state": "touch"}, True),
+        ({"path": "t3", "state": "touch", "modification_time": "preserve",
+          "access_time": "preserve"}, False),
+        ({"path": "lnk", "state": "absent"}, True),
+        ({"path": "l2", "src": "exist", "state": "link"}, False),
+        ({"path": "l2", "src": "exist", "state": "link"}, False),
+        ({"path": "regular", "state": "absent"}, False),
+        ({"path": "missing", "state": "absent"}, False),
+    ]
+    from ansible.release import __version__ as ansible_version
+    if tuple(map(int, ansible_version.split(".")[:2])) < (2, 19):
+        # Before 2.19 the official module raises AnsibleModuleError for a
+        # directory over a regular file and relies on its sys.excepthook to
+        # emit fail_json, which Runtime's embedded execution does not install;
+        # ansible-playbook reports the fail_json the accelerated module returns.
+        cases = [case for case in cases
+                 if case[0] != {"path": "regular", "state": "directory"}]
+    for side in ("official", "accelerated"):
+        base = tmp_path / side
+        (base / "exist").mkdir(parents=True)
+        (base / "existing").mkdir()
+        os.chmod(str(base / "existing"), 0o775)
+        (base / "regular").write_text("")
+        os.chmod(str(base / "regular"), 0o644)
+        os.symlink("regular", str(base / "lnk"))
+
+    def tree(base):
+        out = {}
+        for root, dirs, files in os.walk(base):
+            for name in dirs + files:
+                full = os.path.join(root, name)
+                out[os.path.relpath(full, base)] = oct(
+                    stat_module.S_IMODE(os.lstat(full).st_mode))
+        return out
+
+    def normalized(result, base):
+        result = {k: v for k, v in result.items() if k not in ("invocation", "diff")}
+        return json.loads(json.dumps(result).replace(base, "<D>"))
+
+    rt = Runtime({"file": ModuleEmbedder().embed("file")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        for args, check in cases:
+            official_base = str(tmp_path / "official")
+            accelerated_base = str(tmp_path / "accelerated")
+            official_args = dict(args, path=os.path.join(official_base, args["path"]))
+            accelerated_args = dict(
+                args, path=os.path.join(accelerated_base, args["path"]))
+            assert can_accelerate("file", dict(accelerated_args), check_mode=check)
+            rt.check_mode = check
+            official = rt.run_module("file", official_args)
+            accelerated = run_accelerated(
+                "file", accelerated_args, check_mode=check,
+                options=_accelerator_options("file"))
+            assert not accelerated.get("_ansiroll_fallback"), args
+            assert (normalized(accelerated, accelerated_base)
+                    == normalized(official, official_base)), (args, check)
+            assert tree(accelerated_base) == tree(official_base), (args, check)
+    finally:
+        rt.cleanup()
+
+
+def test_accelerated_file_paths_use_task_environment(tmp_path, monkeypatch):
+    from ansiroll.loader import _accelerator_options
+
+    args = {"path": "$ANSIROLL_TARGET", "state": "absent"}
+    link = {"path": "~/link", "src": "$ANSIROLL_SOURCE", "state": "link"}
+    rt = Runtime({"file": ModuleEmbedder().embed("file")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        for side in ("official", "accelerated"):
+            base = tmp_path / side
+            base.mkdir()
+            (base / "stale").touch()
+            (base / "wanted").touch()
+            monkeypatch.setenv("ANSIROLL_TARGET", str(base / "stale"))
+            environment = {
+                "HOME": str(base),
+                "ANSIROLL_TARGET": str(base / "wanted"),
+                "ANSIROLL_SOURCE": "stale",
+            }
+            rt._module_env = environment
+            if side == "official":
+                absent = rt.run_module("file", dict(args))
+                linked = rt.run_module("file", dict(link))
+            else:
+                options = _accelerator_options("file")
+                absent = run_accelerated(
+                    "file", args, environment=environment, options=options)
+                linked = run_accelerated(
+                    "file", link, environment=environment, options=options)
+            assert absent["changed"] is True
+            assert linked["changed"] is True
+            assert not (base / "wanted").exists()
+            assert (base / "stale").is_file()
+            assert os.readlink(str(base / "link")) == "stale"
+            assert os.environ["ANSIROLL_TARGET"] == str(base / "stale")
+    finally:
+        rt.cleanup()
+
+
+@pytest.mark.parametrize(
+    "state", ["directory", "recursive_directory", "new_directory", "absent", "touch", "link"])
+def test_file_nested_path_expansion_matches_official(tmp_path, state):
+    from ansiroll.loader import _accelerator_options
+
+    args = {"path": "$ANSIROLL_FIRST", "state": state}
+    if state in ("new_directory", "recursive_directory"):
+        args["state"] = "directory"
+    if state in ("directory", "new_directory", "touch"):
+        args["mode"] = "0700"
+    if state == "recursive_directory":
+        args.update(mode="g+w", recurse=True)
+    if state == "touch":
+        args.update(access_time="preserve", modification_time="preserve")
+    if state == "link":
+        args["src"] = "$ANSIROLL_SOURCE"
+    rt = Runtime({"file": ModuleEmbedder().embed("file")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        for side in ("official", "accelerated"):
+            base = tmp_path / side
+            base.mkdir()
+            literal = base / "$ANSIROLL_SECOND"
+            actual = base / "$ANSIROLL_THIRD"
+            actual.mkdir()
+            actual.chmod(0o755)
+            third = base / "third"
+            third.mkdir()
+            third.chmod(0o755)
+            if state in ("directory", "recursive_directory", "absent", "touch"):
+                literal.mkdir()
+                literal.chmod(0o755)
+            if state == "recursive_directory":
+                for directory in (literal, actual):
+                    child = directory / "child"
+                    child.touch()
+                    child.chmod(0o644)
+            (base / "$ANSIROLL_TARGET").touch()
+            environment = {
+                "ANSIROLL_FIRST": str(literal),
+                "ANSIROLL_SECOND": "$ANSIROLL_THIRD",
+                "ANSIROLL_THIRD": "third",
+                "ANSIROLL_SOURCE": "$ANSIROLL_TARGET",
+                "ANSIROLL_TARGET": "missing",
+            }
+            rt._module_env = environment
+            if side == "accelerated":
+                result = run_accelerated("file", args, environment=environment,
+                                         options=_accelerator_options("file"))
+                fallback = state in ("touch", "link")
+                assert bool(result.get("_ansiroll_fallback")) is fallback
+                if fallback:
+                    assert literal.exists() is (state == "touch")
+                    assert actual.stat().st_mode & 0o777 == 0o755
+                    result = rt.run_module("file", dict(args))
+            else:
+                result = rt.run_module("file", dict(args))
+            assert result["changed"] and not result.get("failed"), result
+            if state == "absent":
+                assert not literal.exists()
+            elif state == "link":
+                assert os.readlink(str(literal)) == "$ANSIROLL_TARGET"
+            else:
+                assert literal.stat().st_mode & 0o777 == (
+                    0o700 if state == "new_directory" else 0o755)
+            if state == "recursive_directory":
+                assert actual.stat().st_mode & 0o777 == 0o775
+                assert (actual / "child").stat().st_mode & 0o777 == 0o644
+                assert (literal / "child").stat().st_mode & 0o777 == 0o664
+            else:
+                assert actual.stat().st_mode & 0o777 == (
+                    0o700 if state in ("directory", "touch") else 0o755)
+            assert third.stat().st_mode & 0o777 == 0o755
+    finally:
+        rt.cleanup()
 
 
 def test_accelerated_file_attribute_free_recurse_matches_official(tmp_path):
@@ -520,6 +1112,88 @@ def test_accelerated_blockinfile_matches_official_idempotence(tmp_path):
     assert accelerated_path.read_bytes() == official_path.read_bytes()
 
 
+def test_accelerated_blockinfile_create_mode_and_line_splitting_match_official(
+        tmp_path):
+    import stat as stat_module
+    from ansiroll.loader import _accelerator_options
+
+    files = {
+        # \x0c, \x1c and U+0085 split str lines but not bytes lines.
+        "ff": b"a\x0cb\nc\xc2\x85d\x1ce\n",
+        "crlf": b"one\r\ntwo\r\n",
+    }
+    cases = [
+        {"path": "new", "create": True, "block": "x"},
+        {"path": "sub/dir/new", "create": True, "block": "x"},
+        {"path": "ff", "block": "x", "insertbefore": "b"},
+        {"path": "ff", "block": "y"},
+        {"path": "crlf", "block": "z", "insertafter": "one"},
+    ]
+    for side in ("official", "accelerated"):
+        (tmp_path / side).mkdir()
+        for name, data in files.items():
+            (tmp_path / side / name).write_bytes(data)
+    rt = Runtime({"blockinfile": ModuleEmbedder().embed("blockinfile")},
+                 "", {"inventory_hostname": "localhost"})
+    options = _accelerator_options("blockinfile")
+
+    def outcome(result, side, rel):
+        base = str(tmp_path / side)
+        result = json.loads(json.dumps(
+            {k: v for k, v in result.items() if k != "invocation"}
+        ).replace(base, "<D>"))
+        path = os.path.join(base, rel)
+        mode = stat_module.S_IMODE(os.stat(path).st_mode)
+        with open(path, "rb") as handle:
+            return result, oct(mode), handle.read()
+
+    try:
+        for case in cases:
+            official = rt.run_module("blockinfile", dict(
+                case, path=str(tmp_path / "official" / case["path"])))
+            accelerated = run_accelerated("blockinfile", dict(
+                case, path=str(tmp_path / "accelerated" / case["path"])),
+                options=options)
+            assert (outcome(accelerated, "accelerated", case["path"])
+                    == outcome(official, "official", case["path"])), case
+    finally:
+        rt.cleanup()
+
+
+def test_accelerated_blockinfile_non_utf8_file_matches_official(tmp_path):
+    from ansiroll.loader import _accelerator_options
+
+    options = _accelerator_options("blockinfile") or {}
+    official_path = tmp_path / "official"
+    accelerated_path = tmp_path / "accelerated"
+    for path in (official_path, accelerated_path):
+        path.write_bytes(b"caf\xe9\nend\n")
+    args = {"block": "x", "insertafter": "caf"}
+    accelerated = run_accelerated(
+        "blockinfile", dict(args, path=str(accelerated_path)), options=options)
+    if options.get("text_mode"):
+        # ansible-core >= 2.20 decodes utf-8 and the module dies; ansible-playbook
+        # registers this failure (the runtime's crash wrapping differs).
+        assert accelerated == {
+            "failed": True, "changed": False,
+            "msg": "Task failed: Module failed: 'utf-8' codec can't decode "
+                   "byte 0xe9 in position 3: invalid continuation byte",
+        }
+        assert accelerated_path.read_bytes() == b"caf\xe9\nend\n"
+        return
+    rt = Runtime({"blockinfile": ModuleEmbedder().embed("blockinfile")},
+                 "", {"inventory_hostname": "localhost"})
+    try:
+        official = rt.run_module("blockinfile", dict(args, path=str(official_path)))
+    finally:
+        rt.cleanup()
+    official.pop("invocation", None)
+    for result, path in ((official, official_path), (accelerated, accelerated_path)):
+        result["diff"] = json.loads(json.dumps(result["diff"]).replace(str(path), "<p>"))
+    assert accelerated == official
+    assert accelerated_path.read_bytes() == official_path.read_bytes()
+
+
 def test_accelerated_user_and_group_noops_match_official():
     import grp
     import pwd
@@ -661,6 +1335,202 @@ def test_accelerated_find_missing_path_matches_official_result(tmp_path):
         if key not in ("invocation",)
     }
     assert accelerated == expected
+
+
+def test_accelerated_find_splits_comma_separated_lists_like_official(tmp_path):
+    from ansiroll.loader import _accelerator_options
+
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        for name in ("x.txt", "y.log", "z.cfg"):
+            (tmp_path / sub / name).write_text(name)
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    cases = [
+        {"paths": "%s,%s" % (a, b), "patterns": "*.txt,*.log"},
+        {"paths": a, "patterns": "*.txt,*.log", "excludes": "x*,nomatch"},
+        {"path": a, "pattern": "*.cfg"},
+    ]
+    rt = Runtime({"find": ModuleEmbedder().embed("find")},
+                 "", {"inventory_hostname": "localhost"})
+
+    def normalized(result):
+        result = {k: v for k, v in result.items() if k != "invocation"}
+        result["files"] = sorted(result["files"], key=lambda item: item["path"])
+        return result
+
+    try:
+        for case in cases:
+            official = rt.run_module("find", dict(case))
+            accelerated = run_accelerated(
+                "find", dict(case), options=_accelerator_options("find"))
+            assert normalized(accelerated) == normalized(official), case
+            assert official["matched"] > 0
+    finally:
+        rt.cleanup()
+
+
+@pytest.mark.parametrize("login_defs", [
+    "UMASK 027\nHOME_MODE 0750\n",
+    "HOME_MODE 0700\nUMASK 022\n",
+    "UMASK 077\nUMASK 002\n",
+    "# no mode\n",
+    None,
+])
+def test_accelerated_user_home_creation_matches_official_create_homedir(
+        tmp_path, monkeypatch, login_defs):
+    import stat as stat_module
+    from ansible.modules import user as official_user
+    from ansiroll.accelerated_modules import user as accelerated_user
+    from ansiroll.loader import _accelerator_options
+
+    skel = tmp_path / "skel"
+    (skel / "sub").mkdir(parents=True)
+    (skel / ".profile").write_text("profile")
+    (skel / "sub" / "f").write_text("f")
+    os.chmod(str(skel / ".profile"), 0o640)
+    os.symlink(".profile", str(skel / "link"))
+    defs = tmp_path / "login.defs"
+    if login_defs is not None:
+        defs.write_text(login_defs)
+
+    class _Module(object):
+        def exit_json(self, **kwargs):
+            raise AssertionError(kwargs)
+
+    official = official_user.User.__new__(official_user.User)
+    official.module = _Module()
+    official.skeleton = str(skel)
+    official.LOGIN_DEFS = str(defs)
+    official.create_homedir(str(tmp_path / "official" / "home"))
+    official.chown_homedir(os.getuid(), os.getgid(), str(tmp_path / "official" / "home"))
+
+    monkeypatch.setattr(accelerated_user, "_SKELETON", str(skel))
+    monkeypatch.setattr(accelerated_user, "_LOGIN_DEFS", str(defs))
+    options = _accelerator_options("user") or {}
+    accelerated_user._create_homedir(
+        str(tmp_path / "accelerated" / "home"), options.get("home_mode"))
+    accelerated_user._chown_homedir(
+        os.getuid(), os.getgid(), str(tmp_path / "accelerated" / "home"))
+
+    def tree(base):
+        out = {}
+        for root, dirs, files in os.walk(base):
+            for name in dirs + files + ["."]:
+                full = os.path.normpath(os.path.join(root, name))
+                st = os.lstat(full)
+                out[os.path.relpath(full, base)] = (
+                    oct(stat_module.S_IMODE(st.st_mode)),
+                    os.readlink(full) if os.path.islink(full) else None)
+        return out
+
+    assert (tree(str(tmp_path / "accelerated" / "home"))
+            == tree(str(tmp_path / "official" / "home")))
+
+
+def test_accelerated_user_expands_home_like_official_path_type():
+    import pwd as pwd_module
+    from ansiroll.loader import _accelerator_options
+
+    me = pwd_module.getpwuid(os.getuid())
+    args = {"name": me.pw_name, "home": "~", "shell": me.pw_shell}
+    meta = ModuleEmbedder().embed("user")
+    rt = Runtime({"user": meta}, "", {"inventory_hostname": "localhost"})
+    rt.check_mode = True
+    try:
+        official = rt.run_module("user", dict(args))
+    finally:
+        rt.cleanup()
+    official.pop("invocation", None)
+    accelerated = run_accelerated(
+        "user", dict(args), check_mode=True,
+        options=_accelerator_options("user"))
+    if me.pw_dir != os.path.expanduser("~"):
+        pytest.skip("HOME does not match the passwd home")
+    assert accelerated == official
+    assert official["changed"] is False
+
+
+def test_accelerated_user_home_uses_task_environment(tmp_path, monkeypatch):
+    import pwd as pwd_module
+    from ansiroll.loader import _accelerator_options
+
+    me = pwd_module.getpwuid(os.getuid())
+    monkeypatch.setenv("ANSIROLL_USER_HOME", str(tmp_path / "stale"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    args = {"name": me.pw_name, "home": "$ANSIROLL_USER_HOME", "create_home": False}
+    environment = {"ANSIROLL_USER_HOME": "~", "HOME": me.pw_dir}
+    rt = Runtime({"user": ModuleEmbedder().embed("user")},
+                 "", {"inventory_hostname": "localhost"}, check_mode=True)
+    rt._module_env = environment
+    try:
+        official = rt.run_module("user", dict(args))
+    finally:
+        rt.cleanup()
+    official.pop("invocation", None)
+    accelerated = run_accelerated(
+        "user", args, check_mode=True, environment=environment,
+        options=_accelerator_options("user"))
+    assert accelerated == official
+    assert official["changed"] is False
+    assert os.environ["HOME"] == str(tmp_path)
+
+
+def test_accelerated_user_compares_int_fields_as_strings(monkeypatch):
+    """comment/shell are type='str' in the official argument_spec, so an int
+    that matches the passwd field is not a change."""
+    import pwd as pwd_module
+    from ansiroll.accelerated_modules import user as accelerated_user
+
+    entry = pwd_module.struct_passwd(
+        ("ansiroll-fake", "x", 4242, 4242, "123", "/", "7"))
+    monkeypatch.setattr(accelerated_user.pwd, "getpwnam", lambda name: entry)
+    monkeypatch.setattr(accelerated_user.grp, "getgrall", lambda: [])
+
+    def no_execute(*_args, **_kwargs):
+        raise AssertionError("usermod must not run")
+
+    monkeypatch.setattr(accelerated_user, "_execute", no_execute)
+    result = accelerated_user.run(
+        {"name": "ansiroll-fake", "comment": 123, "shell": 7})
+    assert result["changed"] is False
+    assert result["comment"] == "123"
+
+
+def test_accelerated_user_creates_missing_home_parents_before_useradd(
+        tmp_path, monkeypatch):
+    import pwd as pwd_module
+    from ansiroll.accelerated_modules import user as accelerated_user
+
+    skel = tmp_path / "skel"
+    skel.mkdir()
+    (skel / ".bashrc").write_text("rc")
+    defs = tmp_path / "login.defs"
+    defs.write_text("UMASK 077\n")
+    home = tmp_path / "missing" / "parent" / "home"
+    monkeypatch.setattr(accelerated_user, "_SKELETON", str(skel))
+    monkeypatch.setattr(accelerated_user, "_LOGIN_DEFS", str(defs))
+    created = []
+    entry = pwd_module.struct_passwd(
+        ("ansiroll-fake", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh"))
+
+    def getpwnam(name):
+        if not created:
+            raise KeyError(name)
+        return entry
+
+    def execute(command, environment):
+        # The official module creates the home (and its parents) first.
+        assert (home / ".bashrc").read_text() == "rc"
+        created.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(accelerated_user.pwd, "getpwnam", getpwnam)
+    monkeypatch.setattr(accelerated_user.grp, "getgrall", lambda: [])
+    monkeypatch.setattr(accelerated_user, "_execute", execute)
+    result = accelerated_user.run({"name": "ansiroll-fake", "home": str(home)})
+    assert result["changed"] is True
+    assert created and created[0][0] == "useradd" and "-m" in created[0]
+    assert oct(os.stat(str(home)).st_mode & 0o777) == oct(0o700)
 
 
 def test_compile_omits_total_static_official_module_and_forces_accelerator(
@@ -1318,6 +2188,8 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
 """ % destination)
 
     src, manifest = compile_playbook(str(play))
+    # copy/template stage their data in a temp dir like the action plugin;
+    # unarchive must keep using the in-memory source.
     assert "ansiroll-unarchive-" not in src
     assert "memfd_create" in src
     generated = tmp_path / "compiled.py"
@@ -1549,6 +2421,31 @@ def test_strategy_reads_runtime_created_controller_source_losslessly(tmp_path):
 
     assert base64.b64decode(result["data"]) == source.read_bytes()
     assert result["meta"]["fullpath"] == str(source)
+
+
+@pytest.mark.parametrize("action", ["copy", "template"])
+def test_strategy_preserves_runtime_created_source_mode(tmp_path, action):
+    delegation = "      delegate_to: localhost" if action == "template" else ""
+    source = tmp_path / "runtime.txt"
+    destination = tmp_path / "result.txt"
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - copy:
+        content: fixture
+        dest: %s
+        mode: '0641'
+    - %s:
+        src: %s
+        dest: %s
+        mode: preserve
+%s
+""" % (source, action, source, destination, delegation)
+    result = _run_strategy_play(tmp_path, playbook)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert destination.read_text() == "fixture"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o641
 
 
 def test_strategy_does_not_create_an_empty_recap_row():
