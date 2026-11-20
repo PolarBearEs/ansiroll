@@ -39,6 +39,8 @@ BAKED_ACTIONS = {
 
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
+# A src like "{{ playbook_dir }}/roles/{{ role }}/..." would embed every role's files; past this it is left unbaked.
+_ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
@@ -1460,11 +1462,15 @@ def _bake_absolute_tree(node, src, basedir):
     if not tree_dir.startswith(os.path.join(os.path.normpath(basedir), "")) or not os.path.isdir(tree_dir):
         return False
     baked = {}
+    size = 0
     for root, dirs, files in os.walk(tree_dir):
         dirs.sort()
         for fn in sorted(files):
             full = os.path.join(root, fn)
             try:
+                size += os.path.getsize(full)
+                if size > _ABSOLUTE_TREE_LIMIT:
+                    return False
                 with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
                     baked[full] = fh.read()
             except OSError:

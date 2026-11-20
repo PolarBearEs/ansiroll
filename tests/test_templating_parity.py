@@ -462,6 +462,18 @@ def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_p
     assert dest.read_text() == "value=2"
 
 
+def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, monkeypatch):
+    from ansiroll import loader
+
+    monkeypatch.setattr(loader, "_ABSOLUTE_TREE_LIMIT", 10)
+    tree = tmp_path / "big"
+    tree.mkdir()
+    (tree / "a.j2").write_text("x" * 20)
+    node = {}
+    assert not loader._bake_absolute_tree(node, str(tree) + "/{{ item }}.j2", str(tmp_path))
+    assert "_baked" not in node
+
+
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
     _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
         "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
