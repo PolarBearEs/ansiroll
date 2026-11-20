@@ -149,6 +149,22 @@ def test_start_and_result_share_one_rendered_task_name():
     assert next(sequence) == 2
 
 
+def test_looped_include_keeps_its_name_after_children_start():
+    rt = Runtime({}, "", {})
+    sequence = iter([1, 2])
+    rt.templater._strict_env.globals["next_name"] = lambda: next(sequence)
+    starts = []
+    results = []
+    rt.on_task_start = starts.append
+    rt.on_result = results.append
+    include = {"type": "include", "uuid": "include", "name": "{{ next_name() }}",
+               "loop": ["a", "b"], "tasks": [_task("child", "Child", "debug")]}
+    rt.run_play({"tasks": [include]})
+    assert [frame["task"] for frame in results if frame["uuid"] == "include"] == ["1", "1"]
+    assert starts[0]["task"] == "1"
+    assert next(sequence) == 2
+
+
 def test_legacy_vars_items_and_values_are_sized(monkeypatch):
     import ansiroll.runtime as runtime_mod
 
@@ -157,6 +173,7 @@ def test_legacy_vars_items_and_values_are_sized(monkeypatch):
     values = rt.template_vars({"source": "sample", "alias": "{{ source }}"}, {}, dynamic=True)
     assert rt.template("{{ vars.items() | length }}", values) == 2
     assert rt.template("{{ vars.values() | length }}", values) == 2
+    assert rt.template("{{ (vars.items() | list)[1][1] | type_debug }}", values) == "str"
 
 
 def test_delegated_template_alias_uses_agent_filters():
@@ -164,8 +181,43 @@ def test_delegated_template_alias_uses_agent_filters():
 
     rt = Runtime({}, "", {})
     rt.templater.env.filters["local_filter"] = lambda value: value.upper()
-    values = rt.template_vars({"alias": "{{ 'agent' | local_filter }}"}, {}, dynamic=True)
-    assert _delegate_vars(values, rt.templater)["alias"] == "AGENT"
+    values = rt.template_vars({
+        "source": "play",
+        "alias": "{{ source | local_filter }}",
+        "nested": {"value": "{{ source | local_filter }}", "literal": "{{ '{{ untouched }}' }}"},
+        "sequence": ["{{ source | local_filter }}"],
+    }, {}, dynamic=True)
+    values["source"] = "task"
+    sent = _delegate_vars(values, rt.templater)
+    assert sent["alias"] == "TASK"
+    assert sent["nested"] == {"value": "TASK", "literal": {"__ansiroll_unsafe__": "{{ untouched }}"}}
+    assert sent["sequence"] == ["TASK"]
+
+
+def test_delegation_resolves_selected_action_variables():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    values = rt.template_vars({
+        "ansible_rsync_path": "{{ rsync_binary }}",
+        "rsync_binary": "/usr/bin/rsync",
+        "unused": "{{ rsync_binary }}",
+    }, {}, dynamic=True)
+    sent = _delegate_vars(values, rt.templater, {"ansible_rsync_path"})
+    assert sent["ansible_rsync_path"] == "/usr/bin/rsync"
+    assert sent["unused"] == "{{ rsync_binary }}"
+
+
+@pytest.mark.parametrize("controller_snapshot", [False, True])
+def test_play_alias_can_read_shadowed_inventory_value(controller_snapshot):
+    frames = []
+    host_vars = {"inventory_hostname": "h", "foo": "inventory_value"}
+    if controller_snapshot:
+        host_vars["hostvars"] = {"h": {"foo": "inventory_value"}}
+    rt = Runtime({}, "", host_vars, on_result=frames.append)
+    rt.run_play({"vars": {"foo": "{{ hostvars[inventory_hostname].foo }}"},
+                 "tasks": [_task("read", "Read", "debug", args={"msg": "{{ foo }}"})]})
+    assert frames[0]["result"]["msg"] == "inventory_value"
 
 
 def test_overridden_include_var_does_not_eagerly_consume_its_lookup():

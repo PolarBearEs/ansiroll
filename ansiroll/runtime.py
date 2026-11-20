@@ -1095,6 +1095,9 @@ class _PlayVarView(dict):
 
     def __init__(self, snapshot, scope):
         super().__init__(snapshot)
+        if not _core_at_least(2, 19):
+            self.update({key: str(value) for key, value in snapshot.items()
+                         if isinstance(value, _PlayVarTemplate)})
         self.scope = scope
         if "vars" in snapshot:
             self["vars"] = type(self)(snapshot["vars"], scope)
@@ -1791,7 +1794,8 @@ class Runtime:
                  module_bundle=None, resource_reader=None,
                  host_var_overrides=None, native_only=False):
         self.modules = modules
-        self.vars = dict(host_vars or {})
+        self._initial_host_vars = dict(host_vars or {})
+        self.vars = dict(self._initial_host_vars)
         self.python = python or sys.executable
         self.check_mode = check_mode
         self.diff_mode = diff_mode
@@ -2106,11 +2110,12 @@ class Runtime:
         }
         if self.on_task_start:
             self.on_task_start(frame)
+        return name
 
     def _tally(self, bucket):
         self.stats[bucket] = self.stats.get(bucket, 0) + 1
 
-    def emit(self, node, status, result, item=None, ignored=False, is_item=False):
+    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None):
         # Reporting only; recap tallies are applied explicitly by the caller so
         # rescued/ignored/loop semantics match Ansible.
         emitted_result = result
@@ -2123,13 +2128,15 @@ class Runtime:
                 emitted_result["item"] = item
             if isinstance(result, dict) and "_ansible_item_label" in result:
                 emitted_result["_ansible_item_label"] = result["_ansible_item_label"]
-        started_node, name = self._started_task_name
+        if name is None:
+            started_node, started_name = self._started_task_name
+            name = started_name if started_node is node else self._node_name(node)
         frame = {
             "_ansiroll": True,
             "host": self.host,
             "runtime_id": node.get("runtime_id"),
             "uuid": node.get("uuid"),
-            "task": name if started_node is node else self._node_name(node),
+            "task": name,
             "action": node.get("action"),
             "status": status,
             "ignored": ignored,
@@ -2308,7 +2315,7 @@ class Runtime:
     def _include_steps(self, node, overlay, become):
         """Run a compile-time-expanded include_tasks or include_role, once per loop item if looped."""
         base_ctx = self._task_ctx(node, overlay)
-        self.emit_start(node)
+        name = self.emit_start(node)
         b = bool(node.get("become")) or become
         targets = self.__dict__.setdefault("_include_targets", {})
         if node.get("include_id"):
@@ -2348,7 +2355,7 @@ class Runtime:
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
             params.update(loop_vars)
             scope = _with_high_vars(overlay, params)
-            self.emit(node, "ok", result, item=item, is_item=looped)
+            self.emit(node, "ok", result, item=item, is_item=looped, name=name)
             if tally_ok:
                 self._tally("ok")
             yield self._node_steps(tasks, scope, b)
@@ -2505,10 +2512,18 @@ class Runtime:
         # for every task while preserving other hosts from the snapshot.
         hostvars = dict(hostvars) if isinstance(hostvars, dict) else {}
         current = dict(hostvars.get(self.host) or {})
-        current.update({
-            key: value for key, value in ctx.items()
-            if key not in ("hostvars", "vars")
-        })
+        for key, value in ctx.items():
+            if key in ("hostvars", "vars"):
+                continue
+            if isinstance(value, _PlayVarTemplate) or (
+                    isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
+                # A play alias can refer back to the host value it shadows.
+                if key in self._initial_host_vars:
+                    current.setdefault(key, self._initial_host_vars[key])
+                if key in self._module_fact_layer:
+                    current[key] = self._module_fact_layer[key]
+                continue
+            current[key] = value
         hostvars[self.host] = current
         ctx["hostvars"] = hostvars
         if "vars" not in ctx:
@@ -4573,7 +4588,17 @@ def _chan_send(out_fd, obj):
         view = view[written:]
 
 
-def _delegate_vars(ctx, templater=None):
+def _delegate_template_value(value):
+    if isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
+        return {"__ansiroll_unsafe__": str(value)}
+    if isinstance(value, dict):
+        return {key: _delegate_template_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_delegate_template_value(item) for item in value]
+    return value
+
+
+def _delegate_vars(ctx, templater=None, resolve_keys=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
@@ -4581,14 +4606,19 @@ def _delegate_vars(ctx, templater=None):
         if key == "vars":
             continue
         try:
-            if templater is not None and isinstance(value, _PlayVarTemplate):
-                value = scope[key]
-                if isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
-                    value = {"__ansiroll_unsafe__": str(value)}
+            if templater is not None and (resolve_keys is None or key in resolve_keys):
+                if isinstance(value, _PlayVarTemplate):
+                    value = scope[key]
+                    if resolve_keys is None:
+                        value = _delegate_template_value(value)
+                elif isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
+                    value = templater.resolve_variable(key, value, scope)
+                    if resolve_keys is None:
+                        value = _delegate_template_value(value)
             # Materialize lazy values once so sending the frame cannot
             # resolve the same context a second time.
             safe[key] = json.loads(json.dumps(value, default=str))
-        except (TypeError, ValueError, jinja2.UndefinedError):
+        except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
             continue
     return safe
 
@@ -4656,14 +4686,18 @@ def agent_main():
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
-            # Controller-side template actions render the source on the controller,
-            # but only the agent has the play's bundled filters and lookup plugins.
+            # Only the agent has the play's bundled filters and lookup plugins.
+            # Synchronize also reads connection and executable vars directly.
             action = (task.get("action") or "").rsplit(".", 1)[-1]
-            templater = rt.templater if action == "template" else None
+            templater = rt.templater if action in ("template", "synchronize") else None
+            resolve_keys = None
+            if action == "synchronize":
+                resolve_keys = {"ansible_rsync_path", "ansible_port", "ansible_ssh_pass",
+                                "ansible_password", "ansible_user"}
             _chan_send(resp_fd, {"t": "delegate", "uuid": task.get("uuid"),
                                  "runtime_id": task.get("runtime_id"),
                                  "action": task.get("action"), "args": args,
-                                 "vars": _delegate_vars(ctx, templater),
+                                 "vars": _delegate_vars(ctx, templater, resolve_keys),
                                  "become": become, "to": task.get("delegate_to"),
                                  "become_user": rt.become_user,
                                  "check_mode": bool(rt.check_mode),
