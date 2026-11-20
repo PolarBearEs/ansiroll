@@ -1112,14 +1112,14 @@ def _template_include_filename(task, value, includes):
 
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
-    include_scope = _include_scope(task)
+    task_vars, include_params = _include_scope(task)
     role_params = _role_params(task)
     variables = {}
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
-                  *include_scope, role_params, extra_vars):
+                  task_vars, role_params, include_params, extra_vars):
         variables = combine_vars(variables, layer)
     # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
-    above_vars_files = set(role_vars).union(*include_scope, role_params)
+    above_vars_files = set(role_vars).union(task_vars, role_params, include_params)
 
     loop_names = set()
     parent = task
@@ -1246,8 +1246,9 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 play_defaults = {}
                 for play_role in play.get_roles():
                     play_defaults = combine_vars(play_defaults, play_role.get_default_vars())
+                tagged_defaults = _tag_untrusted(play_defaults)
                 for handler in handlers:
-                    handler["role_defaults"] = combine_vars(play_defaults, handler.get("role_defaults") or {})
+                    handler["role_defaults"] = combine_vars(tagged_defaults, handler.get("role_defaults") or {})
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                                skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]

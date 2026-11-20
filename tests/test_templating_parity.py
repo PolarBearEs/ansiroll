@@ -256,7 +256,8 @@ def test_looped_include_vars_keeps_each_registered_definition_across_plays(tmp_p
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Templar parity")
-def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
+@pytest.mark.parametrize("expression", ["vars", "vars | to_json | from_json"])
+def test_magic_variable_mappings_flatten_without_recursion(tmp_path, expression):
     nested_vars_check = (
         "all_vars.msg.vars.label == 'sample' and 'vars' not in all_vars.msg.vars"
         if Version(__version__) >= Version("2.20") else "'vars' not in all_vars.msg"
@@ -276,7 +277,7 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
           register: all_hosts
         - debug: {msg: '{{ hostvars.localhost }}'}
           register: one_host
-        - debug: {msg: '{{ vars | to_json | from_json }}'}
+        - debug: {msg: '{{ %s }}'}
           register: all_vars
     - assert:
         that:
@@ -292,7 +293,7 @@ def test_magic_variable_mappings_flatten_without_recursion(tmp_path):
           - all_vars.msg.nested.leaf == 'sample'
           - all_vars.msg.alias == 'sample'
           - all_vars.msg.one_host.msg.inventory_hostname == 'localhost'
-""" % nested_vars_check)
+""" % (expression, nested_vars_check))
     _, linear_recap = _ansible(path, tmp_path)
     _, ansiroll_recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
     assert ansiroll_recap == linear_recap == ("4", "0", "0", "0", "0", "0", "0")

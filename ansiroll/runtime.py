@@ -213,11 +213,9 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False):
             out = {}
             _seen[id(value)] = (value, out)
             # Lazy views render on access; plain containers are read raw.
-            getter = (value.__getitem__ if isinstance(value, _LazyTplDict)
-                      else lambda key: dict.__getitem__(value, key))
-            for k in list(dict.keys(value)):
-                out[_mark_unsafe(k, _seen)] = _mark_unsafe(
-                    getter(k), _seen, preserve_included_vars)
+            items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
+            for key, item in items:
+                out[_mark_unsafe(key, _seen)] = _mark_unsafe(item, _seen, preserve_included_vars)
             return out
         if isinstance(value, list):
             out = []
@@ -1945,13 +1943,14 @@ class Runtime:
             return out
         return value
 
-    def template_vars(self, d, ctx, dynamic=False):
+    def template_vars(self, d, ctx, dynamic=False, higher_vars=None):
         """Prepare variables with lazy containers and deferred play templates.
         Legacy non-native templating also keeps scalar sources so its raw
         single-variable type check sees the original value."""
         d = d or {}
         base = dict(ctx)
         base.update(d)
+        base.update(higher_vars or {})
         self._pin_magic_vars(base)
         out = {}
         legacy = _legacy_non_native(base)
@@ -2537,10 +2536,11 @@ class Runtime:
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
-        role_params = task.get("role_params")
-        self._layered_ctx(ctx, overlay, role_params)
-        ctx.update(self.template_vars(task.get("vars"), ctx))
-        self._layered_ctx(ctx, overlay, role_params)
+        higher_vars = self._layered_ctx({}, overlay, task.get("role_params"))
+        ctx.pop(_HIGH_VARS_KEY, None)
+        ctx.pop(_INCLUDE_PARAMS_KEY, None)
+        ctx.update(self.template_vars(task.get("vars"), ctx, higher_vars=higher_vars))
+        ctx.update(higher_vars)
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
         self._pin_magic_vars(ctx)
@@ -4058,8 +4058,8 @@ class Runtime:
                 if idx in self._notified_handlers:
                     self._notified_handlers.discard(idx)
                     handler, scope, become = self.handlers[idx]
-                    self.run_task(handler, self._handler_scope(handler, scope),
-                                  become or self._play_become)
+                    scope = self._handler_scope(handler, scope)
+                    self.run_nodes([handler], scope, become or self._play_become)
                 idx += 1
         except TaskFailed as ex:
             # In 2.14 a failed HANDLERS state goes straight to COMPLETE.

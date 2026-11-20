@@ -552,7 +552,8 @@ def _condition_source(condition):
     return "{{ (%s) }}" % condition if isinstance(condition, str) else condition
 
 
-def _simplify_when(conditions, variables, templater, stats, cache, shadowed=frozenset()):
+def _simplify_when(conditions, variables, templater, stats, cache, shadowed=frozenset(),
+                   preserve_errors=False):
     unmasked = variables
     if shadowed:
         variables = {k: v for k, v in variables.items() if k not in shadowed}
@@ -572,6 +573,9 @@ def _simplify_when(conditions, variables, templater, stats, cache, shadowed=froz
             if key is not None:
                 cache[key] = value
         if value is False:
+            if preserve_errors and remaining:
+                # An unresolved earlier condition can fail before this one skips.
+                return True, remaining + [False]
             return False, []
         if value is True:
             stats["simplified_conditions"] += 1
@@ -617,7 +621,7 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache, recursive_loops
         loop_names = enclosing_loops | _loop_shadowed_names(node)
         possible, remaining = _simplify_when(
             node.get("when"), variables, templater, stats, cache,
-            loop_names,
+            loop_names, preserve_errors=handlers,
         )
         if not possible:
             stats["removed_nodes"] += 1

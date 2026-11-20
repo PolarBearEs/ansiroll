@@ -576,6 +576,79 @@ def test_role_params_outrank_set_fact(tmp_path):
     assert msgs == ['"b=roleparam c=sf"']
 
 
+def test_task_aliases_see_role_parameter_and_include_precedence(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles:
+                - {role: r, value: param, file: role.yml}
+        """,
+        "roles/r/tasks/main.yml": """
+            - debug: msg="{{ value }} {{ alias }}"
+              vars: {value: task, alias: "{{ value }}"}
+            - include_tasks: "{{ file }}"
+              vars: {file: site.yml}
+            - include_tasks: "{{ file }}"
+        """,
+        "roles/r/tasks/role.yml": "- debug: {msg: ROLE_FILE}",
+        "roles/r/tasks/site.yml": "- debug: {msg: INCLUDE_FILE}",
+    })
+    assert messages == ['"param param"', '"INCLUDE_FILE"', '"ROLE_FILE"']
+
+
+def test_include_tasks_handler_runs_its_body(tmp_path):
+    messages, recap = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                - debug: {msg: notifying}
+                  changed_when: true
+                  notify: [expanded handler, skipped handler]
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: expanded handler
+              include_tasks: handler.yml
+              vars: {handler_message: included}
+            - name: skipped handler
+              include_tasks: handler.yml
+              when: false
+        """,
+        "roles/r/tasks/handler.yml": '- debug: {msg: "{{ handler_message }}"}',
+    })
+    assert messages == ['"notifying"', '"included"']
+    assert recap[4] == "1"
+
+
+def test_legacy_child_handler_preserves_unsafe_play_role_defaults(tmp_path):
+    if CORE_VERSION >= (2, 15):
+        pytest.skip("legacy child handlers infer defaults from play roles")
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars: {sentinel: expanded}
+              roles: [parent]
+        """,
+        "roles/parent/defaults/main.yml": 'literal: !unsafe "{{ sentinel }}"\n',
+        "roles/parent/tasks/main.yml": """
+            - include_role: {name: child}
+        """,
+        "roles/child/tasks/main.yml": """
+            - debug: {msg: notifying}
+              changed_when: true
+              notify: child handler
+        """,
+        "roles/child/handlers/main.yml": """
+            - name: child handler
+              debug: {msg: "{{ literal }}"}
+        """,
+    })
+    assert messages == ['"notifying"', '"{{ sentinel }}"']
+
+
 def test_until_successful_uses_failed_when_for_each_loop_item(tmp_path):
     msgs, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
@@ -1088,6 +1161,29 @@ def test_tree_shake_preserves_dynamic_role_handlers(tmp_path):
     assert any(name.split(".")[-1] == "slurp" for name in manifest["accelerated_only_modules"])
     assert any(name.split(".")[-1] == "find" for name in manifest["tree_shake"]["removed_modules"])
     assert "shadowed" in manifest["tree_shake"]["skipped_playbook_vars"]
+
+
+def test_tree_shake_preserves_unresolved_handler_condition_before_false(tmp_path):
+    _write(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                - debug: {msg: notifying}
+                  changed_when: true
+                  notify: conditional handler
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: conditional handler
+              debug: {msg: unexpected}
+              when: [missing_flag, false]
+        """,
+    })
+    for result in (_ansible_run(tmp_path, ()),
+                   _standalone_run(tmp_path, (), ["--tree-shake", "--freeze-playbook-vars"])):
+        assert result.returncode != 0
+        assert "missing_flag" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("error_on_missing", [True, False])
