@@ -42,6 +42,7 @@ _JINJA_RE = re.compile(r"{{.*?}}")
 # A src like "{{ playbook_dir }}/roles/{{ role }}/..." can match many files; past this it is left unbaked.
 _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
+_ROLE_PATH_RE = re.compile(r"{{\s*role_path\s*}}")
 _USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
@@ -164,30 +165,27 @@ def _make_rewriting_loader(DataLoader):
     return RewritingDataLoader()
 
 
+_TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+
+
 def _rewrite_includes(data):
     # Rewrite in place: ansible-core's parsed containers carry origin tags
     # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies.
-    if isinstance(data, list):
-        for index, item in enumerate(data):
-            data[index] = _rewrite_includes(item)
+    # must not be replaced by plain copies. Only task lists are touched, since
+    # vars files go through this loader too.
+    if not isinstance(data, list):
         return data
-    if isinstance(data, dict):
-        rename = "include" in data and isinstance(data.get("include"), str)
-        if rename:
-            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for k in _TASK_LIST_KEYS:
+            _rewrite_includes(item.get(k))
+        if "include" in item and isinstance(item.get("include"), str):
+            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            items = list(data.items())
-            data.clear()
-            for k, v in items:
-                if k == "include":
-                    data[new_key] = v
-                else:
-                    data[k] = _rewrite_includes(v)
-        else:
-            for k in list(data):
-                data[k] = _rewrite_includes(data[k])
-        return data
+            items = [(new_key if k == "include" else k, v) for k, v in item.items()]
+            item.clear()
+            item.update(items)
     return data
 
 
@@ -1499,6 +1497,9 @@ def _bake_sources(node, task, basedir):
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
     src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
+    role_path = getattr(getattr(task, "_role", None), "_role_path", None)
+    if role_path:
+        src = _ROLE_PATH_RE.sub(lambda _m: role_path, src)
 
     candidates = []
     if _JINJA_RE.search(src):
@@ -1508,11 +1509,12 @@ def _bake_sources(node, task, basedir):
                 candidates.append(_ITEM_RE.sub(str(it), src))
         elif _bake_absolute_tree(node, src, basedir, name == "template"):
             return
-        # A role tree is keyed relative to the role, so it can never match a src that renders to an absolute path.
-        elif not (os.path.isabs(src) or _USES_PLAYBOOK_DIR_RE.search(src)) and _bake_role_tree(node, task, subdir):
-            # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
-            # loop is a runtime var; bake the whole role tree so the runtime can
-            # resolve whichever file the rendered src points to.
+        # Baked search trees are keyed relative to a search dir, so they can never match a src that renders to an
+        # absolute path, which a leading Jinja dir (e.g. "{{ some_dir }}/x") may well do.
+        elif (not (os.path.isabs(src) or _USES_PLAYBOOK_DIR_RE.search(src) or _starts_with_jinja_dir(src))
+              and _bake_search_tree(node, task, basedir, subdir, src)):
+            # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the loop is a runtime var; bake every
+            # file it could resolve to.
             return
         elif remote is None:
             return  # remote_src decided at runtime; src may be a target path
@@ -1635,45 +1637,71 @@ def _visible_below(path, root):
     return rel != "." and not any(part.startswith(".") for part in rel.split(os.sep))
 
 
-def _bake_role_tree(node, task, subdir):
-    """Bake every file under the role's templates/ (or files/) dir, keyed by path
-    relative to that dir, so a dynamic src like "services/{{ item.name }}.service.j2"
-    resolves at runtime. Returns True if anything was baked."""
-    role = getattr(task, "_role", None)
-    role_path = getattr(role, "_role_path", None) if role else None
-    if not role_path:
+def _starts_with_jinja_dir(src):
+    return _literal_head(src) == "" and "/" in _JINJA_RE.sub("", src)
+
+
+def _literal_head(src):
+    m = _JINJA_RE.search(src)
+    return src[:m.start()] if m else src
+
+
+def _bake_search_tree(node, task, basedir, subdir, src):
+    """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
+    its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
+    or files/ dirs are walked, since a whole role, task or playbook dir would bundle the entire playbook tree. A file
+    that an unwalked, earlier dir would shadow is left out so the runtime fails loudly. Returns True if anything was
+    baked."""
+    if getattr(task, "_role", None) is None:
         return False
-    tree_dir = os.path.join(role_path, subdir)
-    if not os.path.isdir(tree_dir):
-        return False
+    prefix = _literal_head(src).rpartition("/")[0]
+    if ".." in prefix.split("/"):
+        if os.path.normpath(prefix).split("/")[0] == "..":
+            return False
+        # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
+        prefix = ""
     baked = {}
-    directories = []
+    meta = {}
+    directories = set()
     aliases = {}
-    real_tree_dir = os.path.realpath(tree_dir)
-    for root, dirs, files in os.walk(tree_dir):
-        dirs.sort()
-        directories.append(os.path.relpath(root, tree_dir))
-        for dirname in dirs:
-            full = os.path.join(root, dirname)
-            if os.path.islink(full):
-                aliases[os.path.relpath(full, tree_dir)] = os.path.relpath(
-                    os.path.realpath(full), real_tree_dir)
-        for fn in sorted(files):
-            full = os.path.join(root, fn)
-            rel = os.path.relpath(full, tree_dir)
-            try:
-                with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                    baked[rel] = fh.read()
-            except OSError:
-                continue
+    skipped = []
+    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
+        if not prefix and not is_subdir:
+            skipped.append(base)
+            continue
+        real_base = os.path.realpath(base)
+        for root, dirs, files in os.walk(os.path.join(base, prefix)):
+            dirs.sort()
+            directories.add(os.path.relpath(root, base))
+            for dirname in dirs:
+                full = os.path.join(root, dirname)
+                if os.path.islink(full):
+                    aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
+            for fn in sorted(files):
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, base)
+                if rel in baked or any(os.path.isfile(os.path.join(d, rel)) for d in skipped):
+                    continue
+                try:
+                    with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
+                        baked[rel] = fh.read()
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid}
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
-    node["_baked_tree_dirs"] = directories
+    # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
+    for directory in list(directories):
+        while directory not in ("", "."):
+            directory = os.path.dirname(directory)
+            directories.add(directory or ".")
+    node["_baked_tree_dirs"] = sorted(directories)
     # Capture links to directories already in the tree without walking them.
-    directory_set = set(directories)
-    aliases = {path: target for path, target in aliases.items() if target in directory_set}
+    aliases = {path: target for path, target in aliases.items() if target in directories}
     if aliases:
         node["_baked_tree_aliases"] = aliases
     return True
@@ -1688,10 +1716,11 @@ def _raw_search_path(task, basedir):
     return stack or [basedir]
 
 
-def _search_dirs(task, basedir, subdir):
+def _search_dirs(task, basedir, subdir, tagged=False):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
     a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
-    call it: each task search path (role-aware), then the loader basedir."""
+    call it: each task search path (role-aware), then the loader basedir.
+    With ``tagged``, each comes paired with whether it is a ``subdir`` dir."""
     loader = getattr(task, "_loader", None)
     try:
         stack = list(task.get_search_path() or [])
@@ -1715,17 +1744,17 @@ def _search_dirs(task, basedir, subdir):
             except Exception:
                 pass
         if is_role and pb_base_dir.endswith("/tasks"):
-            dirs.append(os.path.join(os.path.dirname(pb_base_dir), subdir))
-            dirs.append(pb_base_dir)
-        dirs.append(os.path.join(upath, subdir))
-        dirs.append(upath)
+            dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True))
+            dirs.append((pb_base_dir, False))
+        dirs.append((os.path.join(upath, subdir), True))
+        dirs.append((upath, False))
     try:
         base = loader.get_basedir()
     except Exception:
         base = basedir
-    dirs.append(os.path.join(base, subdir))
-    dirs.append(base)
-    return dirs
+    dirs.append((os.path.join(base, subdir), True))
+    dirs.append((base, False))
+    return dirs if tagged else [d for d, _ in dirs]
 
 
 def _only_item(src):
