@@ -1067,7 +1067,8 @@ class _PlayVarScope(dict):
         self.resolving = set()
         self.resolved = {}
         self.accesses = 0
-        self["vars"] = _PlayVarView(_vars_snapshot(ctx), self)
+        view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
+        self["vars"] = view(_vars_snapshot(ctx), self)
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
@@ -1098,7 +1099,7 @@ class _PlayVarView(dict):
         super().__init__(snapshot)
         self.scope = scope
         if "vars" in snapshot:
-            self["vars"] = _PlayVarView(snapshot["vars"], scope)
+            self["vars"] = type(self)(snapshot["vars"], scope)
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
@@ -1124,6 +1125,26 @@ class _PlayVarView(dict):
 
     def copy(self):
         return _jinja_dict(self)
+
+
+class _ModernPlayVarView(_PlayVarView):
+    """Expose resolved values through Python's mapping operations."""
+
+    def __iter__(self):
+        return dict.__iter__(self)
+
+    def __eq__(self, other):
+        if isinstance(other, _PlayVarView):
+            other = other.copy()
+        return self.copy() == other
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    __str__ = __repr__
 
 
 class _LazyTplList(list):
@@ -1330,8 +1351,9 @@ class _AnsirollContext(jinja2.runtime.Context):
         templater = getattr(self.environment, "_ansiroll_templater", None)
         if templater is None or str(key).startswith("__ansiroll"):
             return value
+        context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
         return templater.resolve_variable(
-            key, value, self.parent, strict=self.environment is templater._strict_env)
+            key, value, context, strict=self.environment is templater._strict_env)
 
 
 class _PluginDict(dict):
@@ -1795,6 +1817,7 @@ class Runtime:
         # play vars, a distinction that is otherwise lost after serialization.
         self._set_fact_overrides = dict(host_var_overrides or {})
         self._include_vars_layer = {}
+        self._play_var_names = set()
         self._strict_var_resolution = False
         self._untrusted_runtime_vars = set()
         self._facts_gathered = False
@@ -2061,8 +2084,8 @@ class Runtime:
             ctx = dict(node.get("role_defaults") or {})
             ctx.update(self.ctx())
             ctx.update(node.get("role_vars") or {})
-            env = jinja2.Environment(undefined=jinja2.StrictUndefined)
-            return env.from_string(name).render(**ctx) or name
+            with self._strict_vars():
+                return _fail_on_undef(self.template(name, ctx, strict=True)) or name
         except Exception:
             return name
 
@@ -2207,8 +2230,9 @@ class Runtime:
             play.get("controller_config") or {}
         )
         # Play templates resolve when consumed, after task precedence is applied.
-        self.vars.update(self.template_vars(
-            self._with_deferred_vars_files(play), self.ctx(), dynamic=True))
+        play_vars = self._with_deferred_vars_files(play)
+        self._play_var_names = set(play_vars)
+        self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
         # precedence than play vars and keep it for later plays in the run.
         self.vars.update(self._include_vars_layer)
@@ -2311,7 +2335,7 @@ class Runtime:
                 result["item"] = item
             ctx = dict(base_ctx)
             ctx.update(loop_vars)
-            params = self.template_vars(invocation_params, ctx)
+            params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
             params.update(loop_vars)
             scope = _with_high_vars(overlay, params)
             self.emit(node, "ok", result, item=item, is_item=looped)
@@ -2342,9 +2366,11 @@ class Runtime:
                 if not rescue:
                     raise
                 self._tally("rescued")
-                scope["ansible_failed_task"] = ex.task
-                scope["ansible_failed_result"] = ex.result
-                yield self._node_steps(rescue, scope, b_become)
+                failed_scope = _with_high_vars(scope, {
+                    "ansible_failed_task": ex.task,
+                    "ansible_failed_result": ex.result,
+                })
+                yield self._node_steps(rescue, failed_scope, b_become)
         except TaskFailed as ex:
             failed_exc = ex
         if block.get("always"):
@@ -2447,13 +2473,15 @@ class Runtime:
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
         higher_vars = self._layered_ctx({}, overlay, task.get("role_params"))
+        if task.get("type") == "include":
+            higher_vars.update(task.get("include_params", task.get("vars")) or {})
+            higher_vars.update(self.extra_vars)
+        higher_vars.update(task.get("role_magic") or {})
+        self._pin_magic_vars(higher_vars)
         ctx.pop(_HIGH_VARS_KEY, None)
         ctx.pop(_INCLUDE_PARAMS_KEY, None)
         ctx.update(self.template_vars(task.get("vars"), ctx, higher_vars=higher_vars))
         ctx.update(higher_vars)
-        if task.get("role_magic"):
-            ctx.update(task["role_magic"])
-        self._pin_magic_vars(ctx)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -2660,7 +2688,8 @@ class Runtime:
                 if isinstance(facts, _IncludedVars):
                     base_ctx.update({key: self.vars[key] for key in facts})
                 elif isinstance(facts, dict):
-                    base_ctx.update(facts)
+                    action = (task.get("action") or "").rsplit(".", 1)[-1]
+                    base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
             res["item"] = it
             if task.get("loop_label") is not None:
                 label_ctx = dict(ctx)
@@ -3771,6 +3800,11 @@ class Runtime:
                                  "'no_log: true' was specified for this result ]]\n")
         return diff
 
+    def _visible_module_facts(self, facts):
+        return {key: value for key, value in facts.items()
+                if key not in self._play_var_names and key not in self._include_vars_layer
+                and key not in self._set_fact_overrides and key not in self.extra_vars}
+
     def _absorb_facts(self, task, res):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
@@ -3785,12 +3819,15 @@ class Runtime:
         elif isinstance(facts, dict):
             # Facts are module output: never templated (Ansible marks them unsafe).
             facts = _mark_unsafe(facts)
-            self.vars.update(facts)
             short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
             if short_action == "set_fact":
+                self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
             elif short_action == "include_vars":
+                self.vars.update(facts)
                 self._include_vars_layer.update(facts)
+            else:
+                self.vars.update(self._visible_module_facts(facts))
             existing = self.vars.get("ansible_facts")
             if not isinstance(existing, dict):
                 existing = self.vars["ansible_facts"] = {}

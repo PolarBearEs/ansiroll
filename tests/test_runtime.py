@@ -74,6 +74,55 @@ def test_debug_and_set_fact_register():
     assert rt.stats["ok"] == 2
 
 
+def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.20.1")
+    rt = Runtime({}, "", {})
+    calls = []
+    rt.templater.env.globals["measure"] = lambda: calls.append("value") or "sample"
+    prepared = rt.template_vars({"alias": "{{ measure() }}", "nested": {"leaf": "{{ alias }}"}},
+                                {}, dynamic=True)
+
+    assert rt.template("{{ [alias, nested.leaf] }}", prepared) == ["sample", "sample"]
+    assert calls == ["value"]
+    assert rt.template("{{ vars == dict(vars) and dict(**vars).alias == 'sample' }}", prepared)
+    assert "{{ measure() }}" not in rt.template("{{ vars | string }}", prepared)
+
+    cycle = rt.template_vars({"alias": "{{ nested.leaf }}", "nested": {"leaf": "{{ alias }}"}},
+                             {}, dynamic=True)
+    with pytest.raises(Exception, match="Recursive loop"):
+        str(rt.template("{{ alias }}", cycle))
+
+
+def test_rescue_variables_use_the_current_failure():
+    failed = _task("new", "Current failure", "fail", args={"msg": "current"})
+    report = _task("show", "Report", "debug", args={"msg": "{{ ansible_failed_result.msg }}"})
+    block = {"type": "block", "block": [failed], "rescue": [report]}
+    seed = _task("seed", "Seed", "set_fact", args={"ansible_failed_result": {"msg": "old"}})
+
+    _, frames = run([seed, block])
+
+    assert by_name(frames, "Report")[0]["result"]["msg"] == "current"
+
+
+def test_ordinary_facts_do_not_overwrite_play_aliases(monkeypatch):
+    rt = Runtime({}, "", {})
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: {
+        "ansible_facts": {"ansible_distribution": "Facts"}, "changed": False,
+    })
+    frames = []
+    rt.on_result = frames.append
+    rt.run_play({"tasks": [
+        _task("setup", "Gather", None, action="ansible.builtin.setup"),
+        _task("show", "Use {{ ansible_distribution }}", "debug",
+              args={"msg": "{{ ansible_distribution }}"}),
+    ], "vars": {"ansible_distribution": "{{ replacement }}", "replacement": "Play"}})
+
+    assert by_name(frames, "Use Play")[0]["result"]["msg"] == "Play"
+    assert rt.vars["ansible_facts"]["distribution"] == "Facts"
+
+
 def test_debug_result_is_always_visible_to_ansible_callbacks():
     _rt, frames = run([
         _task("1", "show", "debug", args={"msg": "Tagged_task"}),

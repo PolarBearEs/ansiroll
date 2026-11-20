@@ -379,3 +379,36 @@ SETUP_FAILURE = """
   tasks:
     - debug: msg=NEXT_PLAY
 """
+
+
+def test_include_uses_own_parameters_before_its_condition(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - set_fact: {enabled: false}
+                - include_tasks: child.yml
+                  vars: {enabled: true}
+                  when: enabled
+        """,
+        "child.yml": "- debug: {msg: included}",
+    })
+    assert messages == ['"included"']
+
+
+def test_role_magic_is_visible_when_resolving_task_aliases(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars:
+                role_directory: "{{ role_path | basename }}"
+              roles: [r]
+        """,
+        "roles/r/tasks/main.yml": """
+            - debug: {msg: "{{ task_alias }}"}
+              vars: {task_alias: "{{ role_directory }}"}
+        """,
+    })
+    assert messages == ['"r"']
