@@ -80,18 +80,42 @@ def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     assert output == b"ansiroll: compile -o - requires separate stdout and stderr streams\n"
 
 
-def test_compile_streams_python_with_stderr_closed(tmp_path):
-    pytest.importorskip("ansible")
-    playbook = tmp_path / "play.yml"
-    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+def test_stdout_compile_rejects_shared_terminal():
+    pty = pytest.importorskip("pty")
+    master, slave = pty.openpty()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", "play.yml", "-o", "-"],
+            stdout=slave, stderr=slave,
+        )
+        os.set_blocking(master, False)
+        output = os.read(master, 4096)
+    finally:
+        os.close(slave)
+        os.close(master)
+
+    assert result.returncode == 2
+    assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
+
+
+@pytest.mark.parametrize("redirection", ['exec "$@" 2>&-', 'exec "$@" 2</dev/null'])
+def test_compile_streams_python_without_writable_stderr(redirection):
+    script = r"""
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **k: ("pass\n", {"modules": [], "fallback_tasks": []})
+sys.argv[1:] = ["compile", "\u00e1.yml", "-o", "-"]
+raise SystemExit(cli.entrypoint())
+"""
     result = subprocess.run(
-        ["sh", "-c", 'exec "$@" 2>&-', "ansiroll",
-         sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+        ["sh", "-c", redirection, "ansiroll", sys.executable, "-c", script],
+        env=dict(os.environ, LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0",
+                 PYTHONIOENCODING="ascii"),
         capture_output=True, check=True,
     )
 
-    assert result.stdout.startswith(b"#!")
-    compile(result.stdout, "<stdout>", "exec")
+    assert result.stdout == b"pass\n"
     assert result.stderr == b""
 
 

@@ -82,7 +82,7 @@ def _cmd_compile_stdout(args):
         stdout_stat = os.fstat(1)
         stderr_stat = _compile_stderr_stat()
         if ((stat.S_ISFIFO(stdout_stat.st_mode) or stat.S_ISREG(stdout_stat.st_mode)
-             or stat.S_ISSOCK(stdout_stat.st_mode))
+             or stat.S_ISSOCK(stdout_stat.st_mode) or os.isatty(1))
                 and os.path.samestat(stdout_stat, stderr_stat)):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
@@ -99,11 +99,17 @@ def _cmd_compile_stdout(args):
 
 def _compile_stderr_stat():
     try:
-        return os.fstat(2)
+        stderr_stat = os.fstat(2)
+        if os.name != "posix":
+            return stderr_stat
+        from fcntl import F_GETFL, fcntl
+
+        if (fcntl(2, F_GETFL) & os.O_ACCMODE) != os.O_RDONLY:
+            return stderr_stat
     except OSError as ex:
         if ex.errno != errno.EBADF:
             raise
-    # Supply a sink when the shell explicitly closed diagnostics (2>&-).
+    # A closed stderr can be reused by interpreter startup for a read-only file.
     sink = os.open(os.devnull, os.O_WRONLY)
     if sink == 2:
         os.set_inheritable(2, True)
@@ -113,7 +119,7 @@ def _compile_stderr_stat():
         finally:
             os.close(sink)
     if sys.stderr is None:
-        sys.stderr = open(2, "w", closefd=False)
+        sys.stderr = open(2, "w", closefd=False, errors="backslashreplace")
     return os.fstat(2)
 
 
