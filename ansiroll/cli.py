@@ -77,13 +77,41 @@ def _manifest_for_stdout(path, stdout_fd):
     raise ValueError("manifest path points to stdout: %s" % path)
 
 
+def _same_terminal(first_fd, second_fd):
+    if not sys.platform.startswith("linux") or not (os.isatty(first_fd) and os.isatty(second_fd)):
+        return False
+    from fcntl import ioctl
+
+    # Linux TIOCGDEV returns the terminal's device number even via /dev/tty.
+    try:
+        return ioctl(first_fd, 0x80045432, bytes(4)) == ioctl(second_fd, 0x80045432, bytes(4))
+    except OSError:
+        return False
+
+
+def _write_stdout_manifest(path, manifest, stdout_fd):
+    path = _manifest_for_stdout(path, stdout_fd)
+    # Validate the actual destination before truncating or writing anything.
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
+        manifest_stat = os.fstat(fh.fileno())
+        if (_same_terminal(fh.fileno(), stdout_fd)
+                or (os.path.samestat(manifest_stat, os.fstat(stdout_fd))
+                    and not os.path.samestat(manifest_stat, os.stat(os.devnull)))):
+            raise ValueError("manifest path points to stdout: %s" % path)
+        if stat.S_ISREG(manifest_stat.st_mode):
+            fh.truncate(0)
+        json.dump(manifest, fh, indent=2)
+
+
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
         stderr_stat = _compile_stderr_stat()
-        if ((stat.S_ISFIFO(stdout_stat.st_mode) or stat.S_ISREG(stdout_stat.st_mode)
-             or stat.S_ISSOCK(stdout_stat.st_mode) or os.isatty(1))
-                and os.path.samestat(stdout_stat, stderr_stat)):
+        stream_mode = stdout_stat.st_mode
+        if (_same_terminal(1, 2)
+                or ((stat.S_ISFIFO(stream_mode) or stat.S_ISREG(stream_mode)
+                     or stat.S_ISSOCK(stream_mode) or os.isatty(1))
+                    and os.path.samestat(stdout_stat, stderr_stat))):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:
@@ -149,9 +177,11 @@ def _cmd_compile(args, stdout=None):
             fh.write(source)
         os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
-        manifest_path = _manifest_for_stdout(args.manifest, stdout.fileno()) if stdout else args.manifest
-        with open(manifest_path, "w") as fh:
-            json.dump(manifest, fh, indent=2)
+        if stdout is not None:
+            _write_stdout_manifest(args.manifest, manifest, stdout.fileno())
+        else:
+            with open(args.manifest, "w") as fh:
+                json.dump(manifest, fh, indent=2)
     if stdout is not None:
         stdout.write(source.encode("utf-8"))
         stdout.flush()

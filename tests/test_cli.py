@@ -98,6 +98,84 @@ def test_stdout_compile_rejects_shared_terminal():
     assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux controlling terminals")
+@pytest.mark.parametrize("alias", ["stderr", "manifest"])
+def test_stdout_compile_rejects_controlling_terminal_alias(alias):
+    import pty
+    from select import select
+
+    script = """
+import fcntl
+import os
+import sys
+import termios
+from ansiroll import cli
+
+fcntl.ioctl(1, termios.TIOCSCTTY, 0)
+cli.compile_playbook = lambda *a, **k: ("pass", {"modules": [], "fallback_tasks": []})
+args = ["compile", "play.yml", "-o", "-"]
+if sys.argv[1] == "stderr":
+    with open("/dev/tty", "w") as terminal:
+        os.dup2(terminal.fileno(), 2)
+else:
+    args.extend(["-m", "/dev/tty"])
+sys.argv[1:] = args
+raise SystemExit(cli.entrypoint())
+"""
+    master, slave = pty.openpty()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, alias],
+            stdout=slave, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        output = os.read(master, 4096) if select([master], [], [], 0)[0] else b""
+    finally:
+        os.close(slave)
+        os.close(master)
+
+    assert result.returncode == 2
+    if alias == "stderr":
+        assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
+    else:
+        assert output == b""
+        assert b"manifest path points to stdout" in result.stderr
+
+
+def test_stdout_compile_rejects_manifest_replaced_with_alias(tmp_path):
+    script = """
+import os
+import sys
+from ansiroll import cli
+
+output, manifest = sys.argv[1:]
+cli.compile_playbook = lambda *a, **k: ("pass", {"modules": [], "fallback_tasks": []})
+open_fd = os.open
+
+def replace_manifest(path, flags, *args, **kwargs):
+    if path == manifest:
+        os.unlink(manifest)
+        os.symlink(output, manifest)
+    return open_fd(path, flags, *args, **kwargs)
+
+os.open = replace_manifest
+sys.argv[1:] = ["compile", "play.yml", "-o", "-", "-m", manifest]
+raise SystemExit(cli.entrypoint())
+"""
+    output = tmp_path / "compiled.py"
+    output.write_text("# existing output\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.touch()
+    with output.open("r+b") as stream:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(output), str(manifest)],
+            stdout=stream, stderr=subprocess.PIPE,
+        )
+
+    assert result.returncode == 2
+    assert output.read_text() == "# existing output\n"
+    assert b"manifest path points to stdout" in result.stderr
+
+
 @pytest.mark.parametrize("redirection", ['exec "$@" 2>&-', 'exec "$@" 2</dev/null'])
 def test_compile_streams_python_without_writable_stderr(redirection):
     script = r"""
