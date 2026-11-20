@@ -1859,6 +1859,7 @@ class Runtime:
         # parsed tasks already carry the accumulated conditions from Ansible.
         self._inherited_when = []
         self._handler_blocks = []
+        self._handler_names = {}  # successfully rendered aliases, indexed by invocation
         self.notified = []  # ordered, de-duplicated pending notifications
         self._notified_handlers = set()  # indexes into self.handlers
         self._flushing = False
@@ -2244,6 +2245,7 @@ class Runtime:
             self.templater.register_plugins(plugins)
         self.handlers = []
         self._handler_blocks = []
+        self._handler_names.clear()
         self._add_handlers(play.get("handlers", []), {}, False)
         self._error_on_missing_handler = play.get("error_on_missing_handler", True)
         self._allow_broken_conditionals = play.get("allow_broken_conditionals")
@@ -3999,11 +4001,15 @@ class Runtime:
         Search the newest blocks first, in declaration order within each block.
         Also match listeners, deduplicated by handler name on modern cores.
         """
-        def names(handler, scope):
+        def names(index):
+            if index in self._handler_names:
+                return self._handler_names[index]
+            handler, scope, _ = self.handlers[index]
             values = handler.get("handler_names")
             if values is None:
                 values = [handler["name"]] if handler.get("name") else []
-            if any("{{" in value or "{%" in value for value in values):
+            if values and _looks_templated(values[0]):
+                raw_name = values[0]
                 ctx = dict(handler.get("handler_name_vars") or {})
                 ctx.update(scope.get(_INCLUDE_PARAMS_KEY) or {})
                 ctx.update(self.extra_vars)
@@ -4011,31 +4017,36 @@ class Runtime:
                     ctx[key] = self.vars.get(key) or {}
                 ctx["vars"] = _HandlerNameVars(ctx, self, ctx)
                 with self._strict_vars():
-                    values = [self.template(value, ctx, strict=True) for value in values]
-                # Through 2.11 an undefined name aborts notification lookup.
-                if _core_at_least(2, 10) and not _core_at_least(2, 12):
-                    try:
-                        _fail_on_undef(values)
-                    except jinja2.UndefinedError as ex:
-                        raise MissingHandler(str(ex))
-                values = [value for value in values if not _is_undef(value)]
+                    rendered = self.template(raw_name, ctx, strict=True)
+                if _is_undef(rendered):
+                    # Through 2.11 an undefined name aborts notification lookup.
+                    if _core_at_least(2, 10) and not _core_at_least(2, 12):
+                        try:
+                            _fail_on_undef(rendered)
+                        except jinja2.UndefinedError as ex:
+                            raise MissingHandler(str(ex))
+                    return []
+                # The loader builds qualified aliases by prefixing the raw name.
+                # Rendering the name once keeps all aliases tied to the same lookup.
+                values = [rendered] + [alias[:-len(raw_name)] + _as_text(rendered)
+                                       for alias in values[1:]]
+            self._handler_names[index] = values
             return values
 
         found = []
         indexes = [idx for block in reversed(self._handler_blocks) for idx in block]
         for idx in indexes:
-            handler, scope, _ = self.handlers[idx]
-            if notification in names(handler, scope):
+            if notification in names(idx):
                 found.append(idx)
                 break
         seen = set()
         modern = _core_at_least(2, 15)
         listener_indexes = indexes if modern else range(len(self.handlers))
         for idx in listener_indexes:
-            handler, scope, _ = self.handlers[idx]
+            handler, _, _ = self.handlers[idx]
             if notification in (handler.get("listen") or []):
                 if modern:
-                    own = names(handler, scope)
+                    own = names(idx)
                     own = own[0] if own else None
                     if own and own in seen:
                         continue

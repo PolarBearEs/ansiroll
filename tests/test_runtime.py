@@ -864,6 +864,27 @@ def test_handler_notify_and_flush():
     assert "h1" in [f["task"] for f in frames]
 
 
+def test_handler_name_is_cached_for_all_aliases_until_next_play(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.20.1")
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rendered = iter(("first", "second"))
+    rt.templater._strict_env.globals["next_name"] = lambda: next(rendered)
+    raw_name = "run {{ next_name() }}"
+    handlers = [_task("h", raw_name, "debug", args={"msg": "handled"},
+                      handler_names=[raw_name, "r : " + raw_name])]
+
+    for name in ("first", "second"):
+        tasks = [_task("notify", "trigger", "debug", args={"msg": "notifying"},
+                       changed_when=["true"], notify=["r : run " + name, "run " + name])]
+        tasks.append(_task("flush", "Flush handlers", "meta_flush_handlers", action="meta"))
+        rt.run_play({"tasks": tasks, "handlers": handlers, "gather_facts": False})
+
+    assert [frame["result"]["msg"] for frame in by_name(frames, raw_name)] == ["handled", "handled"]
+
+
 @pytest.mark.parametrize("setup", ["failed", "raises"])
 def test_gather_facts_failure_fails_host(monkeypatch, setup):
     # Ansible: a failed setup is fatal on "Gathering Facts" and the play's
