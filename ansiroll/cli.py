@@ -77,17 +77,64 @@ def _manifest_for_stdout(path, stdout_fd):
     raise ValueError("manifest path points to stdout: %s" % path)
 
 
-def _terminal_alias(first_fd, second_fd):
-    if not (os.isatty(first_fd) and os.isatty(second_fd)):
+def _pty_slave_name(fd):
+    if hasattr(os, "ptsname"):
+        try:
+            return os.ptsname(fd)
+        except OSError:
+            return None
+    from ctypes import CDLL, c_char_p
+
+    ptsname = getattr(CDLL(None), "ptsname", None)
+    if ptsname is not None:
+        ptsname.restype = c_char_p
+        return ptsname(fd)
+    return None
+
+
+def _terminal_endpoint(fd):
+    peer = _pty_slave_name(fd)
+    if peer:
+        try:
+            return True, os.stat(peer).st_rdev
+        except OSError:
+            return True, None
+
+    device = os.fstat(fd).st_rdev
+    try:
+        if device != os.stat(os.ctermid()).st_rdev:
+            return False, device
+    except (AttributeError, OSError):
+        return False, device
+
+    # Linux reports the controlling terminal's device as tty_nr in procfs.
+    try:
+        with open("/proc/self/stat") as proc_stat:
+            tty_nr = proc_stat.read().rsplit(")", 1)[1].split()[4]
+        return False, (int(tty_nr) & 0xFFFFFFFF) or None
+    except (OSError, IndexError, ValueError):
+        return False, None
+
+
+def _streams_overlap(stdout_fd, other_fd):
+    if not (os.isatty(stdout_fd) and os.isatty(other_fd)):
+        return os.path.samestat(os.fstat(stdout_fd), os.fstat(other_fd))
+
+    stdout_master, stdout_device = _terminal_endpoint(stdout_fd)
+    other_master, other_device = _terminal_endpoint(other_fd)
+    if stdout_device is None or other_device is None:
+        return True
+    if stdout_device != other_device:
+        return False
+    if stdout_master == other_master:
+        return True
+    if stdout_master:
         return False
 
-    # A controlling-terminal device node can refer to either terminal without
-    # having the same inode as the device it forwards to.
-    try:
-        controlling_terminal = os.stat(os.ctermid())
-    except (AttributeError, OSError):
-        return False
-    return controlling_terminal.st_rdev in (os.fstat(first_fd).st_rdev, os.fstat(second_fd).st_rdev)
+    # Input sent to the master can echo back alongside output from the slave.
+    import termios
+
+    return bool(termios.tcgetattr(stdout_fd)[3] & (termios.ECHO | termios.ECHONL))
 
 
 def _write_stdout_manifest(path, manifest, stdout_fd):
@@ -95,9 +142,8 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
     # Validate the actual destination before truncating or writing anything.
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
         manifest_stat = os.fstat(fh.fileno())
-        if (_terminal_alias(fh.fileno(), stdout_fd)
-                or (os.path.samestat(manifest_stat, os.fstat(stdout_fd))
-                    and not os.path.samestat(manifest_stat, os.stat(os.devnull)))):
+        if (_streams_overlap(stdout_fd, fh.fileno())
+                and not os.path.samestat(manifest_stat, os.stat(os.devnull))):
             raise ValueError("manifest path points to stdout: %s" % path)
         if stat.S_ISREG(manifest_stat.st_mode):
             fh.truncate(0)
@@ -107,12 +153,10 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
-        stderr_stat = _compile_stderr_stat()
+        _prepare_compile_stderr()
         stream_mode = stdout_stat.st_mode
-        if (_terminal_alias(1, 2)
-                or ((stat.S_ISFIFO(stream_mode) or stat.S_ISREG(stream_mode)
-                     or stat.S_ISSOCK(stream_mode) or os.isatty(1))
-                    and os.path.samestat(stdout_stat, stderr_stat))):
+        if ((stat.S_ISFIFO(stream_mode) or stat.S_ISREG(stream_mode)
+             or stat.S_ISSOCK(stream_mode) or os.isatty(1)) and _streams_overlap(1, 2)):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:
@@ -126,15 +170,15 @@ def _cmd_compile_stdout(args):
         return 2
 
 
-def _compile_stderr_stat():
+def _prepare_compile_stderr():
     try:
-        stderr_stat = os.fstat(2)
+        os.fstat(2)
         if os.name != "posix":
-            return stderr_stat
+            return
         from fcntl import F_GETFL, fcntl
 
         if (fcntl(2, F_GETFL) & os.O_ACCMODE) != os.O_RDONLY:
-            return stderr_stat
+            return
     except OSError as ex:
         if ex.errno != errno.EBADF:
             raise
@@ -149,7 +193,6 @@ def _compile_stderr_stat():
             os.close(sink)
     if sys.stderr is None:
         sys.stderr = open(2, "w", closefd=False, errors="backslashreplace")
-    return os.fstat(2)
 
 
 def _cmd_compile(args, stdout=None):

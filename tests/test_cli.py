@@ -98,7 +98,8 @@ def test_stdout_compile_rejects_shared_terminal():
     assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
 
 
-def test_stdout_compile_accepts_opposite_pseudoterminal_ends():
+@pytest.mark.parametrize("echo", [False, True])
+def test_stdout_compile_checks_echo_between_pseudoterminal_ends(echo):
     pty = pytest.importorskip("pty")
     import tty
 
@@ -112,13 +113,18 @@ raise SystemExit(cli.entrypoint())
 """
     master, slave = pty.openpty()
     try:
-        tty.setraw(slave)
+        if not echo:
+            tty.setraw(slave)
         result = subprocess.run([sys.executable, "-c", script], stdout=slave, stderr=master)
         os.set_blocking(master, False)
         os.set_blocking(slave, False)
-        assert result.returncode == 0
-        assert os.read(master, 4096) == b"pass\n"
-        assert b" -> stdout " in os.read(slave, 4096)
+        if echo:
+            assert result.returncode == 2
+            assert b"requires separate stdout and stderr" in os.read(slave, 4096)
+        else:
+            assert result.returncode == 0
+            assert os.read(master, 4096) == b"pass\n"
+            assert b" -> stdout " in os.read(slave, 4096)
     finally:
         os.close(slave)
         os.close(master)
@@ -126,19 +132,20 @@ raise SystemExit(cli.entrypoint())
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux controlling terminals")
 @pytest.mark.parametrize("alias", ["stderr", "manifest"])
-def test_stdout_compile_rejects_controlling_terminal_alias(alias):
+@pytest.mark.parametrize("same_terminal", [False, True])
+def test_stdout_compile_checks_controlling_terminal_alias(alias, same_terminal):
     import pty
     from select import select
 
-    script = """
+    script = r"""
 import fcntl
 import os
 import sys
 import termios
 from ansiroll import cli
 
-fcntl.ioctl(1, termios.TIOCSCTTY, 0)
-cli.compile_playbook = lambda *a, **k: ("pass", {"modules": [], "fallback_tasks": []})
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+cli.compile_playbook = lambda *a, **k: ("pass\n", {"modules": [], "fallback_tasks": []})
 args = ["compile", "play.yml", "-o", "-"]
 if sys.argv[1] == "stderr":
     with open("/dev/tty", "w") as terminal:
@@ -149,22 +156,64 @@ sys.argv[1:] = args
 raise SystemExit(cli.entrypoint())
 """
     master, slave = pty.openpty()
+    controlling_master, controlling_slave = pty.openpty()
     try:
         result = subprocess.run(
             [sys.executable, "-c", script, alias],
+            stdin=slave if same_terminal else controlling_slave,
             stdout=slave, stderr=subprocess.PIPE, start_new_session=True,
         )
         output = os.read(master, 4096) if select([master], [], [], 0)[0] else b""
+        if not same_terminal:
+            assert result.returncode == 0, result.stderr
+            assert output == b"pass\r\n"
+            os.set_blocking(controlling_master, False)
+            diagnostics = os.read(controlling_master, 4096)
+            expected = b" -> stdout " if alias == "stderr" else b'"fallback_tasks": []'
+            assert expected in diagnostics
     finally:
+        os.close(controlling_slave)
+        os.close(controlling_master)
         os.close(slave)
         os.close(master)
 
-    assert result.returncode == 2
-    if alias == "stderr":
-        assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
-    else:
-        assert output == b""
-        assert b"manifest path points to stdout" in result.stderr
+    if same_terminal:
+        assert result.returncode == 2
+        if alias == "stderr":
+            assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
+        else:
+            assert output == b""
+            assert b"manifest path points to stdout" in result.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux PTY masters")
+def test_stdout_compile_accepts_independent_pseudoterminal_masters():
+    import pty
+    import tty
+
+    script = r"""
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **k: ("pass\n", {"modules": [], "fallback_tasks": []})
+sys.argv[1:] = ["compile", "play.yml", "-o", "-"]
+raise SystemExit(cli.entrypoint())
+"""
+    stdout_master, stdout_slave = pty.openpty()
+    stderr_master, stderr_slave = pty.openpty()
+    try:
+        tty.setraw(stdout_slave)
+        tty.setraw(stderr_slave)
+        subprocess.run(
+            [sys.executable, "-c", script], stdout=stdout_master, stderr=stderr_master, check=True,
+        )
+        os.set_blocking(stdout_slave, False)
+        os.set_blocking(stderr_slave, False)
+        assert os.read(stdout_slave, 4096) == b"pass\n"
+        assert b" -> stdout " in os.read(stderr_slave, 4096)
+    finally:
+        for fd in (stdout_master, stdout_slave, stderr_master, stderr_slave):
+            os.close(fd)
 
 
 def test_stdout_compile_rejects_manifest_replaced_with_alias(tmp_path):
