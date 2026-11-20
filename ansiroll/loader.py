@@ -42,6 +42,7 @@ _JINJA_RE = re.compile(r"{{.*?}}")
 # A src like "{{ playbook_dir }}/roles/{{ role }}/..." can match many files; past this it is left unbaked.
 _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
+_USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
     r"""([A-Za-z_][A-Za-z0-9_]*)["']"""
@@ -341,7 +342,7 @@ def _resolved_play_vars(play, all_vars, basedir):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
-            filename = re.sub(r"{{\s*playbook_dir\s*}}", basedir, filename)
+            filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 break
             try:
@@ -1387,7 +1388,8 @@ def _bake_sources(node, task, basedir):
                 candidates.append(_ITEM_RE.sub(str(it), src))
         elif _bake_absolute_tree(node, src, basedir, name == "template"):
             return
-        elif not os.path.isabs(src) and _bake_role_tree(node, task, subdir):
+        # A role tree is keyed relative to the role, so it can never match a src that renders to an absolute path.
+        elif not (os.path.isabs(src) or _USES_PLAYBOOK_DIR_RE.search(src)) and _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
             # loop is a runtime var; bake the whole role tree so the runtime can
             # resolve whichever file the rendered src points to.
