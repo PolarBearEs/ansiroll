@@ -57,14 +57,32 @@ def main(argv=None):
 @contextmanager
 def _compile_diagnostics_to_stderr():
     # Redirect inherited stdout for helpers as well as Python's stdout stream.
-    sys.stdout.flush()
+    stdout = sys.stdout
+    stdout.flush()
+    original_stdout = sys.__stdout__
+    if original_stdout is not None and original_stdout is not stdout:
+        original_stdout.flush()
     with os.fdopen(os.dup(1), "wb") as saved_stdout:
         os.dup2(2, 1)
         try:
             with redirect_stdout(sys.stderr):
-                yield
+                try:
+                    yield
+                finally:
+                    # Plugins can write through a reference saved before redirection.
+                    stdout.flush()
+                    if original_stdout is not None and original_stdout is not stdout:
+                        original_stdout.flush()
         finally:
             os.dup2(saved_stdout.fileno(), 1)
+
+
+def _manifest_aliases_stdout(path):
+    try:
+        manifest_stat = os.stat(path)
+    except FileNotFoundError:
+        return False
+    return os.path.samestat(manifest_stat, os.fstat(1))
 
 
 def _cmd_compile(args):
@@ -95,6 +113,9 @@ def _cmd_compile(args):
             fh.write(source)
         os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
+        if to_stdout and _manifest_aliases_stdout(args.manifest):
+            sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % args.manifest)
+            return 2
         with open(args.manifest, "w") as fh:
             json.dump(manifest, fh, indent=2)
     if to_stdout:

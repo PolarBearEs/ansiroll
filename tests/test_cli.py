@@ -49,6 +49,44 @@ def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
     compile(result.stdout, "<stdout>", "exec")
 
 
+@pytest.mark.parametrize("compile_fails", [False, True])
+def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails):
+    script = r"""
+import sys
+from ansiroll import cli
+
+def compile_playbook(*args, **kwargs):
+    sys.__stdout__.write("buffered diagnostic\n")
+    if sys.argv[1] == "True":
+        raise ValueError("compile failed")
+    return "print('ok')\n", {"modules": [], "fallback_tasks": []}
+
+cli.compile_playbook = compile_playbook
+raise SystemExit(cli.main(["compile", "play.yml", "-o", "-"]))
+"""
+    env = dict(os.environ)
+    env.pop("PYTHONUNBUFFERED", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(compile_fails)], capture_output=True, env=env,
+    )
+
+    assert result.returncode == (2 if compile_fails else 0), result.stderr
+    assert result.stdout == (b"" if compile_fails else b"print('ok')\n")
+    assert b"buffered diagnostic\n" in result.stderr
+
+
+def test_compile_rejects_manifest_that_points_to_stdout(monkeypatch, capfdbinary):
+    manifest = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("print('ok')\n", manifest))
+
+    assert cli.main(["compile", "play.yml", "-o", "-", "-m", "/dev/stdout"]) == 2
+
+    captured = capfdbinary.readouterr()
+    assert captured.out == b""
+    assert b"manifest path points to stdout" in captured.err
+
+
 def test_compile_stdout_stays_empty_if_manifest_write_fails(monkeypatch, tmp_path, capfdbinary):
     manifest = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("print('ok')\n", manifest))
