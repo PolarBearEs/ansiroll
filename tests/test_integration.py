@@ -2504,6 +2504,32 @@ def test_strategy_empty_tag_filtered_play_does_not_use_local_python(tmp_path):
     assert "No such file or directory: '/usr/bin/python3'" not in output
 
 
+def test_strategy_excludes_failed_hosts_from_later_native_plays(tmp_path):
+    result = _run_strategy_play(
+        tmp_path,
+        """- hosts: bad:good
+  gather_facts: false
+  connection: local
+  tasks:
+    - command: /bin/true
+    - fail: {msg: expected host failure}
+      when: inventory_hostname == 'bad'
+- hosts: bad:good
+  gather_facts: false
+  connection: local
+  tasks:
+    - copy:
+        content: reached
+        dest: "{{ playbook_dir }}/{{ inventory_hostname }}.txt"
+""",
+        "-i", "bad,good,",
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "good.txt").read_text() == "reached", result.stdout + result.stderr
+    assert not (tmp_path / "bad.txt").exists()
+
+
 def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
