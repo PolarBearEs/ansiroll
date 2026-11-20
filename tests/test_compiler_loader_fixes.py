@@ -16,6 +16,7 @@ pytest.importorskip("ansible")
 
 from ansiroll.cli import _load_extra_vars, main  # noqa: E402
 from ansiroll.compiler import compile_playbook  # noqa: E402
+from ansible.release import __version__ as ANSIBLE_VERSION  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RECAP_RE = re.compile(
@@ -1192,3 +1193,111 @@ def test_unresolved_vars_files_name_keeps_includes_named_by_extra_vars_or_litera
 """, "x.yml": "- debug: msg=X\n"})
     _source, manifest = compile_playbook(str(tmp_path / "pb.yml"), extra_vars={"flavor": "x"})
     assert manifest["fallback_tasks"] == []
+
+
+_CORE = tuple(int(part) for part in ANSIBLE_VERSION.split(".")[:2])
+
+
+def _run_both(playbook, tmp_path, *compile_args):
+    """Return (returncode, output) of ansible-playbook and of the compiled script, for runs that may abort."""
+    ansible = subprocess.run(
+        [os.path.join(os.path.dirname(sys.executable), "ansible-playbook"), "-i", "localhost,", "-c", "local",
+         "-e", "ansible_python_interpreter=" + sys.executable, str(playbook)],
+        cwd=str(playbook.parent), env=_env(), capture_output=True, text=True)
+    out = tmp_path / "compiled.py"
+    proc = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(out)]
+                          + list(compile_args), cwd=ROOT, env=_env(), capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    run = subprocess.run([sys.executable, str(out)], cwd=str(playbook.parent), env=_env(),
+                         capture_output=True, text=True)
+    return ((ansible.returncode, ansible.stdout + ansible.stderr), (run.returncode, run.stdout + run.stderr))
+
+
+@pytest.mark.parametrize("name, gather, aborts", [
+    ("vars/{{ nope_undefined }}.yml", "true", True),
+    ("vars/{{ nope_undefined }}.yml", "false", False),
+    ("vars/{{ ansible_nope | default('a') + 1 }}.yml", "false", True),
+    # Before 2.15 get_vars defaulted to include_delegate_to=True, which makes a missing vars file fatal.
+    ("vars/{{ ansible_system | lower }}-missing.yml", "true", _CORE < (2, 15)),
+])
+def test_deferred_vars_files_abort_like_ansible(tmp_path, name, gather, aborts):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: %s
+  vars_files:
+    - "%s"
+  tasks:
+    - debug: msg=reached
+""" % (gather, name), "vars/other.yml": "x: 1\n"})
+    (ansible_rc, ansible_out), (rc, out) = _run_both(tmp_path / "pb.yml", tmp_path)
+    assert (ansible_rc != 0, "reached" not in ansible_out) == (aborts, aborts), ansible_out
+    assert (rc != 0, "reached" not in out) == (aborts, aborts), out
+    assert "Traceback" not in out
+
+
+def test_selected_deferred_vars_file_that_fails_to_parse_aborts(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  vars_files:
+    - ["vars/{{ ansible_system | lower }}.yml", "vars/default.yml"]
+  tasks:
+    - debug: msg=reached
+""", "vars/linux.yml": "a: [1\n", "vars/darwin.yml": "a: [1\n", "vars/default.yml": "x: 1\n"})
+    (ansible_rc, ansible_out), (rc, out) = _run_both(tmp_path / "pb.yml", tmp_path)
+    assert ansible_rc == 4 and "reached" not in ansible_out
+    assert rc == 4 and "reached" not in out, out
+
+
+def test_freezing_skips_names_set_by_deferred_vars_files(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  vars:
+    os_name: generic
+  vars_files:
+    - "vars/{{ ansible_system | lower }}.yml"
+  tasks:
+    - debug: msg="{{ os_name }}"
+""", "vars/linux.yml": "os_name: linux\n", "vars/darwin.yml": "os_name: darwin\n"})
+    playbook = tmp_path / "pb.yml"
+    _source, manifest = compile_playbook(str(playbook), freeze_playbook_vars=True)
+    assert "os_name" not in manifest["tree_shake"]["frozen_var_names"]
+    with pytest.raises(ValueError, match="shadows it"):
+        compile_playbook(str(playbook), freeze_vars=["os_name"])
+    expected = _ansible(playbook)
+    assert expected[0] == ["linux"]
+    assert _ansiroll(playbook, tmp_path, "--freeze-playbook-vars") == expected
+
+
+def test_deferred_vars_files_bundle_only_plain_mappings(tmp_path):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import parse_playbook
+
+    secret = VaultLib([("default", VaultSecret(b"pw"))]).encrypt("token: hunter2\n")
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  vars_files:
+    - "{{ ansible_system | lower }}.yml"
+  tasks:
+    - debug: msg=reached
+""", "tasks.yml": "- debug: msg=task\n", "plain.yml": "x: 1\n", "pw.txt": "pw\n"})
+    (tmp_path / "vault.yml").write_bytes(secret)
+    inline = VaultLib([("default", VaultSecret(b"pw"))]).encrypt("hunter3").decode()
+    (tmp_path / "inline.yml").write_text("token: !vault |\n" + "".join("  %s\n" % line for line in inline.splitlines()))
+    plays, _actions = parse_playbook(str(tmp_path / "pb.yml"), vault_password_file=str(tmp_path / "pw.txt"))
+    files = {os.path.basename(path): data for path, data in plays[0]["deferred_vars_files"][0]["files"].items()}
+    assert files["plain.yml"] == [{"x": 1}]
+    for name in ("pb.yml", "tasks.yml", "vault.yml", "inline.yml"):
+        assert set(files[name]) == {"__ansiroll_vars_file_error__"}, name
+    assert "hunter2" not in json.dumps(files) and "hunter3" not in json.dumps(files)
+
+
+def test_deferred_vars_files_name_with_leading_template_fails_to_compile(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  vars_files:
+    - "{{ ansible_env.HOME }}/vars.yml"
+  tasks:
+    - debug: msg=reached
+"""})
+    with pytest.raises(ValueError, match="starts with a template"):
+        compile_playbook(str(tmp_path / "pb.yml"))

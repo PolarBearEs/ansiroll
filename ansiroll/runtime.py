@@ -346,6 +346,14 @@ class TaskFailed(Exception):
         self.result = result or {"failed": True, "msg": str(name)}
 
 
+class VarsFilesError(Exception):
+    """A vars_files failure, which aborts the whole run in Ansible; rc is ansible-playbook's exit code."""
+
+    def __init__(self, message, rc=1):
+        Exception.__init__(self, message)
+        self.rc = rc
+
+
 class ConditionalError(Exception):
     """Evaluating a `when` conditional failed (undefined variable, error)."""
 
@@ -1673,6 +1681,7 @@ class Runtime:
         # play vars, a distinction that is otherwise lost after serialization.
         self._set_fact_overrides = dict(host_var_overrides or {})
         self._untrusted_runtime_vars = set()
+        self._facts_gathered = False
         self.native_only = bool(native_only)
         self._task_provenance = {}
         self.skip_run_once = bool(skip_run_once)
@@ -1717,8 +1726,8 @@ class Runtime:
                     pass
 
     # ---- context / templating -------------------------------------------
-    def ctx(self, *overlays):
-        d = dict(self.vars)
+    def ctx(self, *overlays, base=None):
+        d = dict(self.vars if base is None else base)
         for o in overlays:
             if o:
                 d.update(o)
@@ -1741,6 +1750,9 @@ class Runtime:
             include_vars = task.get("action", "").rsplit(".", 1)[-1] == "include_vars"
             self.vars[name] = _mark_unsafe(result, preserve_included_vars=include_vars)
             self._untrusted_runtime_vars.add(name)
+            # A registered result is a host fact: it outranks play vars here and in later plays.
+            self._runtime_var_overrides.add(name)
+            self._set_fact_overrides[name] = self.vars[name]
 
     def template(self, value, ctx, _seen=None):
         if isinstance(value, (dict, list, tuple)):
@@ -2081,14 +2093,15 @@ class Runtime:
         self._runtime_var_overrides = (
             set(self.extra_vars) | set(self._set_fact_overrides)
         )
+        play_vars = self._with_deferred_vars_files(play)
         self._play_var_templates = {}
         if not _legacy_non_native(self.vars):
             self._play_var_templates = {
-                key: value for key, value in (play.get("vars") or {}).items()
+                key: value for key, value in play_vars.items()
                 if _looks_templated(value)
             }
         self._templated_play_vars = {
-            key: value for key, value in (play.get("vars") or {}).items()
+            key: value for key, value in play_vars.items()
             if any(_looks_templated(text) for text in _template_strings(value))
         }
         # Containers render lazily against the play context, so they need rebinding in either mode; legacy
@@ -2098,7 +2111,7 @@ class Runtime:
             if key in self._play_var_templates or isinstance(value, (dict, list))
         }
         self.vars.update(self.template_vars(
-            play.get("vars"), self.ctx(), dynamic=True))
+            play_vars, self.ctx(), dynamic=True))
         # Host variables created by set_fact have higher precedence than play
         # vars and retain that precedence for later plays in the same run.
         self.vars.update(self._set_fact_overrides)
@@ -2258,6 +2271,54 @@ class Runtime:
             else:
                 raise failed_exc
 
+    def _with_deferred_vars_files(self, play):
+        """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
+        files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
+        play_vars = dict(play.get("vars") or {})
+        # Ansible renders these names before merging set_fact and register results, so they cannot see them.
+        base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        for entry in play.get("deferred_vars_files") or ():
+            ctx = self.ctx(play_vars, self.extra_vars, base=base)
+            item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
+            for raw in entry["names"]:
+                try:
+                    name = _fail_on_undef(self.template(raw, ctx))
+                except jinja2.UndefinedError as ex:
+                    if self.vars.get("module_setup") or self._facts_gathered:
+                        raise VarsFilesError("an undefined variable was found when attempting to template the "
+                                             "vars_files item %r: %s" % (item, ex))
+                    sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
+                                     % (item,))
+                    break
+                except Exception as ex:
+                    raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
+                if not isinstance(name, str):
+                    continue
+                if name.startswith(os.path.sep):
+                    candidates = [name]
+                else:
+                    candidates = []
+                    for d in entry["dirs"]:
+                        if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
+                            candidates.append(os.path.join(d, entry["subdir"], name))
+                        candidates.append(os.path.join(d, name))
+                found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
+                if found:
+                    data = entry["files"][found[0]]
+                    if isinstance(data, dict):
+                        raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
+                    for value in data:
+                        play_vars.update(value)
+                    break
+            else:
+                # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
+                if not _core_at_least(2, 15):
+                    raise VarsFilesError("vars file %s was not found" % (item,))
+                # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
+                sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
+                                 % (item,))
+        return play_vars
+
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < play/host/facts/registers
         # < role vars < block/parent overlay < task vars < loop item.
@@ -2268,12 +2329,14 @@ class Runtime:
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
         self._pin_magic_vars(ctx)
-        task_vars = self.template_vars(task.get("vars"), ctx)
-        ctx.update(task_vars)
-        if task.get("role_magic"):
-            ctx.update(task["role_magic"])
-        self._rebind_play_vars(ctx, set(task.get("role_vars") or ()).union(
-            overlay, task_vars or (), task.get("role_magic") or ()))
+        raw_task_vars = task.get("vars") or {}
+        role_magic = task.get("role_magic") or {}
+        # Rebind before rendering task vars, which may read a rebound play var; the raw task vars stay visible so
+        # the rebound play vars can read them in turn, as with Ansible's lazy templating.
+        self._rebind_play_vars(ctx, set(task.get("role_vars") or ()).union(overlay, raw_task_vars, role_magic),
+                               dict(raw_task_vars, **role_magic))
+        ctx.update(self.template_vars(raw_task_vars, ctx))
+        ctx.update(role_magic)
         self._pin_magic_vars(ctx)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -2300,30 +2363,29 @@ class Runtime:
         """Names each templated play var reads; None when it can read any variable (vars, hostvars, lookups)."""
         refs = getattr(self, "_play_var_refs_cache", None)
         if refs is None or refs[0] is not self._templated_play_vars:
-            from jinja2 import meta as jinja_meta, nodes as jinja_nodes
-            names = {}
-            for key, raw in self._templated_play_vars.items():
-                found = set()
-                try:
-                    for text in _template_strings(raw):
-                        tree = self.templater.env.parse(text)
-                        found |= jinja_meta.find_undeclared_variables(tree)
-                        # find_undeclared_variables skips globals such as lookup and query.
-                        found |= {node.name for node in tree.find_all(jinja_nodes.Name)
-                                  if node.name in _INDIRECT_VAR_NAMES}
-                except Exception:
-                    found = None
-                if found is not None and not found.isdisjoint(_INDIRECT_VAR_NAMES):
-                    found = None
-                names[key] = found
+            names = {key: self._template_refs(raw) for key, raw in self._templated_play_vars.items()}
             refs = (self._templated_play_vars, names)
             self._play_var_refs_cache = refs
         return refs[1]
 
-    def _rebind_play_vars(self, ctx, overrides):
+    def _template_refs(self, raw):
+        """Names a raw value's templates read; None when it can read any variable."""
+        from jinja2 import meta as jinja_meta, nodes as jinja_nodes
+        found = set()
+        try:
+            for text in _template_strings(raw):
+                tree = self.templater.env.parse(text)
+                found |= jinja_meta.find_undeclared_variables(tree)
+                # find_undeclared_variables skips globals such as lookup and query.
+                found |= {node.name for node in tree.find_all(jinja_nodes.Name) if node.name in _INDIRECT_VAR_NAMES}
+        except Exception:
+            return None
+        return found if found.isdisjoint(_INDIRECT_VAR_NAMES) else None
+
+    def _rebind_play_vars(self, ctx, overrides, unrendered=None):
         """Ansible templates play vars lazily in the task's context, so a play var reading a name that task vars,
         role vars, include params or a loop binding override must see the overriding value. overrides holds the
-        names those higher layers set."""
+        names those higher layers set; unrendered holds raw layers visible only while rendering."""
         overrides = frozenset(overrides)
         if not overrides:
             return
@@ -2343,33 +2405,59 @@ class Runtime:
                     stale.append(key)
                     grew = True
         pending = [key for key in stale if key in self._rebindable_play_vars]
+        view = dict(ctx, **unrendered) if unrendered else ctx
+        order = self._refs_through(refs, unrendered) if unrendered and pending else refs
         rendered = []
         while pending:
             # Render a play var only once the stale play vars it reads are rendered, and one that can read any
             # variable once no other is ready; a cycle renders in key order.
-            direct = [key for key in pending if refs[key] is not None]
-            ready = ([key for key in direct if refs[key].isdisjoint(set(pending) - {key})]
-                     or [key for key in pending if refs[key] is None][:1] or direct[:1])
+            direct = [key for key in pending if order[key] is not None]
+            ready = ([key for key in direct if order[key].isdisjoint(set(pending) - {key})]
+                     or [key for key in pending if order[key] is None][:1] or direct[:1])
             for key in ready:
-                self._render_play_var(ctx, key, refs[key])
+                self._render_play_var(ctx, view, key, refs[key])
                 pending.remove(key)
                 rendered.append(key)
         # What a play var reading vars, hostvars or a lookup depends on is unknown, so it may have read a stale value;
         # each further pass settles one more such hop.
-        for _ in range(sum(1 for key in rendered if refs[key] is None)):
-            changed = [self._render_play_var(ctx, key, refs[key]) for key in rendered]
+        for _ in range(sum(1 for key in rendered if order[key] is None)):
+            changed = [self._render_play_var(ctx, view, key, refs[key]) for key in rendered]
             if not any(changed):
                 break
 
-    def _render_play_var(self, ctx, key, names):
-        """Render a play var into ctx; return whether its value changed."""
-        render_ctx = ctx if names is not None else dict(ctx, vars=_vars_snapshot(ctx))
+    def _render_play_var(self, ctx, view, key, names):
+        """Render a play var into ctx and view; return whether its value changed.
+
+        view is ctx plus the raw task vars a play var may read before they are rendered."""
+        render_ctx = view if names is not None else dict(view, vars=_vars_snapshot(view))
         old = ctx.get(key)
-        ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
+        view[key] = ctx[key] = self.template_vars({key: self._rebindable_play_vars[key]}, render_ctx)[key]
         try:
             return bool(old != ctx[key])
         except Exception:
             return True
+
+    def _refs_through(self, refs, unrendered):
+        """refs extended with what the raw unrendered vars they read go on to read, transitively."""
+        via = {}
+        out = {}
+        for key, names in refs.items():
+            todo = list(names or ())
+            seen = set()
+            while names is not None and todo:
+                name = todo.pop()
+                if name in seen or name not in unrendered:
+                    continue
+                seen.add(name)
+                if name not in via:
+                    via[name] = self._template_refs(unrendered[name])
+                if via[name] is None:
+                    names = None
+                else:
+                    names = names | via[name]
+                    todo.extend(via[name])
+            out[key] = names
+        return out
 
     def _refresh_play_vars(self):
         """Re-evaluate lazy play vars against facts produced by earlier tasks."""
@@ -3550,6 +3638,7 @@ class Runtime:
             self._module_env = None
             self.become_user = inherited_become_user
         self._absorb_facts({"action": "setup"}, res)
+        self._facts_gathered = True
         self._task_provenance[id(node)] = provenance
         self.emit(node, "ok", {"changed": False})
         self._tally("ok")
@@ -3989,6 +4078,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         "worker_startup": 0.0,
     }
     rt = None
+    fact_overrides = {}
     for play in plays:
         if pretty:
             banner = "PLAY [%s] " % (play.get("name") or play.get("hosts") or "")
@@ -3999,17 +4089,22 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      become_password=become_password, extra_vars=extra_vars,
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
+                     host_var_overrides=fact_overrides,
                      native_only=native_only)
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
             rt.run_play(play, defer_handlers=defer_handlers, initial_notified=initial_notified)
+        except VarsFilesError as ex:
+            sys.stderr.write("[ERROR]: %s\n" % ex)
+            return ex.rc
         finally:
             engine_profile["play_execution"] += time.monotonic() - play_started
             cleanup_started = time.monotonic()
             rt.cleanup()  # shut the worker down
             engine_profile["worker_cleanup"] += time.monotonic() - cleanup_started
         host_vars = rt.vars  # carry facts/registers across plays for the same host
+        fact_overrides = rt._set_fact_overrides
         host = rt.host
         failed = failed or rt.failed
         for k in total:
