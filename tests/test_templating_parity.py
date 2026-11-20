@@ -621,19 +621,122 @@ def test_playbook_dir_attribute_of_another_var_bakes_role_tree(tmp_path):
 """, {
         "roles/a/tasks/main.yml": """
 - template:
-    src: "{{ svc.playbook_dir }}/{{ svc.name }}.j2"
+    src: "services/{{ svc.playbook_dir }}/{{ svc.name }}.j2"
     dest: %s
 """ % json.dumps(str(dest)),
-        "roles/a/defaults/main.yml": "svc: {playbook_dir: services, name: conf}\n",
-        "roles/a/templates/services/conf.j2": "value={{ 1 + 1 }}",
+        "roles/a/defaults/main.yml": "svc: {playbook_dir: app, name: conf}\n",
+        "roles/a/templates/services/app/conf.j2": "value={{ 1 + 1 }}",
     })
     plays, _ = parse_playbook(str(playbook))
     task = next(t for block in plays[0]["tasks"] for t in block.get("block", [])
                 if t.get("action", "").split(".")[-1] == "template")
     assert not task.get("fallback")
-    assert "services/conf.j2" in task["_baked"]
+    assert "services/app/conf.j2" in task["_baked"]
     _ansiroll(playbook, tmp_path)
     assert dest.read_text() == "value=2"
+
+
+def _role_template_task(tmp_path, src, files):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", dict({
+        "roles/a/tasks/main.yml": """
+- template:
+    src: %s
+    dest: %s
+""" % (json.dumps(src), json.dumps(str(dest))),
+        "roles/a/defaults/main.yml": "name: conf\nmy_abs_dir: %s\n" % json.dumps(str(tmp_path / "abs")),
+        "roles/a/templates/other.j2": "unused",
+    }, **files))
+    plays, _ = parse_playbook(str(playbook))
+    task = next(t for block in plays[0]["tasks"] for t in block.get("block", [])
+                if t.get("action", "").split(".")[-1] == "template")
+    return playbook, dest, task
+
+
+def test_dynamic_src_starting_with_a_jinja_dir_falls_back(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ my_abs_dir }}/{{ name }}.j2", {
+        "abs/conf.j2": "value={{ 1 + 1 }}",
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    assert task["fallback"] is True
+    assert "_baked" not in task
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert dest.read_text() == "value=2"
+
+
+def test_dynamic_role_path_src_is_baked_under_its_absolute_path(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ role_path }}/templates/{{ name }}.j2", {
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    assert not task.get("fallback")
+    assert str(tmp_path / "roles/a/templates/conf.j2") in task["_baked"]
+    expected = _ansible(playbook, tmp_path)
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == "value=2"
+
+
+def test_role_path_src_is_resolved_at_compile_time(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ role_path }}/templates/conf.j2", {
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    assert not task.get("fallback")
+    _ansiroll(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+
+
+@pytest.mark.parametrize("src, path", [
+    ("{{ name }}.j2", "templates/conf.j2"),
+    ("sub/{{ name }}.j2", "sub/conf.j2"),
+    ("sub/{{ name }}.j2", "roles/a/tasks/sub/conf.j2"),
+    ("x{{ name }}/app.j2", "roles/a/templates/xconf/app.j2"),
+])
+def test_dynamic_role_src_bakes_the_whole_search_path(tmp_path, src, path):
+    playbook, dest, task = _role_template_task(tmp_path, src, {path: "value={{ 1 + 1 }}"})
+    assert not task.get("fallback")
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == "value=2"
+
+
+def test_dynamic_src_with_a_parent_dir_prefix_falls_back(tmp_path):
+    _, _, task = _role_template_task(tmp_path, "../{{ name }}.j2", {"roles/a/conf.j2": "value={{ 1 + 1 }}"})
+    assert task["fallback"] is True
+    assert "_baked" not in task
+
+
+def test_dynamic_src_does_not_bake_a_playbook_dir_named_templates(tmp_path):
+    _, _, task = _role_template_task(tmp_path / "templates", "{{ name }}.j2", {
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    assert sorted(task["_baked"]) == ["conf.j2", "other.j2"]
+
+
+def test_dynamic_src_without_prefix_bakes_only_the_action_subdir(tmp_path):
+    _, _, task = _role_template_task(tmp_path, "{{ name }}.j2", {
+        "roles/a/templates/conf.j2": "value={{ 1 + 1 }}",
+        "roles/a/files/blob.bin": "binary",
+    })
+    assert sorted(task["_baked"]) == ["conf.j2", "other.j2"]
+
+
+def test_dynamic_src_does_not_bake_a_file_shadowed_by_an_unbaked_dir(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ name }}.j2", {
+        "roles/a/conf.j2": "role root",
+        "templates/conf.j2": "playbook templates",
+    })
+    assert "conf.j2" not in task["_baked"]
+    _ansible(playbook, tmp_path)
+    assert dest.read_text() == "role root"
 
 
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
