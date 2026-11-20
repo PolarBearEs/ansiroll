@@ -397,6 +397,281 @@ def test_fileglob_paths_are_baked_and_delivered_as_data(tmp_path):
     assert dest.read_text() == "fixture"
 
 
+def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/roles/b/templates/conf.j2"
+    dest: %s
+- debug: msg="{{ playbook_dir }}"
+""" % json.dumps(str(dest)),
+        "roles/a/templates/own.j2": "unrelated",
+        "roles/b/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == [str(tmp_path)]
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    src, _ = compile_playbook(str(playbook))
+    # The target has no controller tree, so the template must come from the artifact.
+    (tmp_path / "roles/b/templates/conf.j2").unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert dest.read_text() == "value=2"
+
+
+def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {names: [conf]}
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2"
+    dest: %s/out-{{ item }}
+  loop: "{{ names }}"
+""" % str(tmp_path),
+        "roles/a/templates/own.j2": "unrelated",
+        "roles/b/templates/conf.j2": "value={{ 1 + 1 }}",
+    })
+    dest = tmp_path / "out-conf"
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    src, _ = compile_playbook(str(playbook))
+    (tmp_path / "roles/b/templates/conf.j2").unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert dest.read_text() == "value=2"
+
+
+def test_looped_playbook_dir_src_bakes_nested_items_and_doubled_separators(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {names: [flat, nested/conf]}
+  tasks:
+    - template:
+        src: "{{ playbook_dir }}/templates//{{ item }}.j2"
+        dest: "%s/out-{{ item | basename }}"
+      loop: "{{ names }}"
+""" % str(tmp_path), {
+        "templates/flat.j2": "flat={{ 1 + 1 }}",
+        "templates/nested/conf.j2": "nested={{ 1 + 2 }} {{ template_fullpath | basename }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert (tmp_path / "out-conf").read_text() == "nested=3 conf.j2"
+    src, _ = compile_playbook(str(playbook))
+    for name in ("out-flat", "out-conf", "templates/flat.j2", "templates/nested/conf.j2"):
+        (tmp_path / name).unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert (tmp_path / "out-flat").read_text() == "flat=2"
+    assert (tmp_path / "out-conf").read_text() == "nested=3 conf.j2"
+
+
+def test_looped_src_directly_under_playbook_dir_falls_back_not_to_the_role_tree(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {names: [conf]}
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/{{ item }}.j2"
+    dest: %s/out-{{ item }}
+  loop: "{{ names }}"
+""" % str(tmp_path),
+        "roles/a/templates/conf.j2": "unrelated",
+        "conf.j2": "value={{ 1 + 1 }}",
+    })
+    # Baking the playbook dir itself would embed vault files and keys, and the role's tree is unrelated.
+    _src, info = compile_playbook(str(playbook))
+    assert [task["reason"] for task in info["fallback_tasks"]] == [
+        "dynamic baked src not resolvable at compile time: %s/{{ item }}.j2" % tmp_path]
+
+
+def test_absolute_dynamic_src_bakes_only_matching_files_inside_the_playbook_dir(tmp_path):
+    from ansiroll import loader
+
+    pb = tmp_path / "pb"
+    (pb / ".git").mkdir(parents=True)
+    (pb / "conf.j2").write_text("conf")
+    (pb / "notes.txt").write_text("other")
+    (pb / ".vault.j2").write_text("secret")
+    (pb / ".git" / "x.j2").write_text("object")
+    (tmp_path / "outside.j2").write_text("outside")
+    (pb / "link.j2").symlink_to(tmp_path / "outside.j2")
+    (pb / "nested").mkdir()
+    (pb / "nested" / "sub.j2").write_text("sub")
+    # The static directory must lie below the playbook dir, which would otherwise expose the whole tree.
+    assert not loader._bake_absolute_tree({}, str(pb) + "/{{ item }}.j2", str(pb), True)
+    (pb / ".secrets").mkdir()
+    (pb / ".secrets" / "password").write_text("hunter2")
+    tpl = pb / "templates"
+    (tpl / "real").mkdir(parents=True)
+    (tpl / "conf.j2").write_text("conf")
+    (tpl / "real" / "sub.j2").write_text("sub")
+    (tpl / "alias").symlink_to(tpl / "real")
+    (tpl / "loop").symlink_to(tpl)
+    (tpl / "private.j2").symlink_to(pb / ".secrets" / "password")
+    (tpl / "escape.j2").symlink_to(tmp_path / "outside.j2")
+    (tpl / ".hidden.j2").write_text("hidden")
+    node = {}
+    assert loader._bake_absolute_tree(node, str(tpl) + "/{{ item }}.j2", str(pb), True)
+    assert node["_baked"] == {
+        str(tpl / "alias" / "sub.j2"): "sub", str(tpl / "conf.j2"): "conf", str(tpl / "real" / "sub.j2"): "sub"}
+    assert node["_baked_meta"][str(tpl / "conf.j2")]["fullpath"] == str(tpl / "conf.j2")
+    assert not loader._bake_absolute_tree({}, str(pb) + "/.secrets/{{ item }}", str(pb), False)
+
+
+def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, monkeypatch):
+    from ansiroll import loader
+
+    monkeypatch.setattr(loader, "_ABSOLUTE_TREE_LIMIT", 10)
+    tree = tmp_path / "big"
+    tree.mkdir()
+    (tree / "a.j2").write_text("x" * 20)
+    node = {}
+    assert not loader._bake_absolute_tree(node, str(tree) + "/{{ item }}.j2", str(tmp_path), False)
+    assert "_baked" not in node
+
+
+def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
+    _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
+        "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
+    })
+    monkeypatch.chdir(tmp_path)
+    plays, _ = parse_playbook("play.yml")
+    assert plays[0]["playbook_dir"] == str(tmp_path / "sub")
+
+
+def test_imported_playbook_uses_its_own_playbook_dir(tmp_path):
+    dest = tmp_path / "rendered.txt"
+    playbook = _write(tmp_path, """
+- import_playbook: sub/inner.yml
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="{{ playbook_dir }}"
+""", {
+        "sub/inner.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="{{ playbook_dir }}"
+    - template:
+        src: "{{ playbook_dir }}/templates/t.j2"
+        dest: %s
+""" % json.dumps(str(dest)),
+        "sub/templates/t.j2": "inner={{ 1 + 1 }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == [str(tmp_path / "sub"), str(tmp_path)]
+    assert dest.read_text() == "inner=2"
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == "inner=2"
+
+
+def test_play_keywords_see_the_plays_own_playbook_dir(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  check_mode: "{{ playbook_dir.endswith('/sub') }}"
+  tasks:
+    - command: "true"
+      register: outer
+    - debug: msg="outer={{ outer.skipped | default(false) }}"
+- import_playbook: sub/inner.yml
+""", {
+        "sub/inner.yml": """
+- hosts: localhost
+  gather_facts: false
+  check_mode: "{{ playbook_dir.endswith('/sub') }}"
+  tasks:
+    - command: "true"
+      register: inner
+    - debug: msg="inner={{ inner.skipped | default(false) }}"
+""",
+    })
+    assert msgs == ["outer=False", "inner=True"]
+
+
+def test_playbook_dir_outranks_task_vars_and_set_fact(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="task={{ playbook_dir != '/other' }}"
+      vars: {playbook_dir: /other}
+    - set_fact: {playbook_dir: /other}
+    - debug: msg="fact={{ playbook_dir != '/other' }}"
+    - block:
+        - debug: msg="block={{ playbook_dir != '/other' }}"
+      vars: {playbook_dir: /other}
+""")
+    assert msgs == ["task=True", "fact=True", "block=True"]
+
+
+def test_vars_derived_from_playbook_dir_ignore_a_set_fact_override(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    src_dir: "{{ playbook_dir }}/templates"
+    chained: "{{ src_dir }}/x"
+    cfg: {path: "{{ playbook_dir }}/cfg"}
+  tasks:
+    - set_fact: {playbook_dir: /other}
+    - debug: msg="task={{ source_dir.startswith('/other') }}"
+      vars: {source_dir: "{{ playbook_dir }}/templates"}
+    - block:
+        - debug: msg="block={{ block_dir.startswith('/other') }}"
+      vars: {block_dir: "{{ playbook_dir }}/templates"}
+    - debug: msg="play={{ chained.startswith('/other') }}"
+    - debug: msg="container={{ cfg.path.startswith('/other') }}"
+""")
+    assert msgs == ["task=False", "block=False", "play=False", "container=False"]
+
+
+def test_vars_derived_from_playbook_dir_ignore_an_override_in_the_same_mapping(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="task={{ source_dir.startswith('/other') }}"
+      vars: {playbook_dir: /other, source_dir: "{{ playbook_dir }}/templates"}
+    - block:
+        - debug: msg="block={{ block_dir.startswith('/other') }}"
+      vars: {playbook_dir: /other, block_dir: "{{ playbook_dir }}/templates"}
+""")
+    assert msgs == ["task=False", "block=False"]
+
+
 def test_frozen_vars_are_templated_once(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
