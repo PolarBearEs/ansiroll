@@ -195,6 +195,8 @@ def _rewrite_includes(data):
 
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                   all_vars=None, runtime_writes=None):
+    from ansible import constants as C
+
     if basedir is None:
         try:
             basedir = play._loader.get_basedir()
@@ -205,6 +207,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
+    _apply_force_handlers_default(play)
     blocks = play.compile()
     handler_blocks = _handler_blocks(play)
     known_writes = set(runtime_writes or ())
@@ -231,11 +234,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                                  skip_tags=skip_tags, includes=includes)
             if node:
                 tasks.append(node)
-        handlers = []
-        for hblock in handler_blocks:
-            # A notified handler runs regardless of --tags.
-            _convert_node(hblock, play_actions, basedir, flatten_handler=True,
-                          sink=handlers, includes=includes)
+        handlers = _convert_handlers(handler_blocks, play_actions, basedir, includes)
         # Includes can expose additional writes, including writes that precede
         # another include on a later loop iteration. Revisit provisional paths
         # when the set grows, keeping only the final graph and task IDs.
@@ -244,29 +243,25 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     actions.update(play_actions)
     if runtime_writes is not None:
         runtime_writes.update(includes.runtime_writes)
-    handlers = _dedup_by_uuid(handlers)
     _assign_runtime_ids(tasks, handlers)
-    # An unset gather_facts follows the configured gathering policy: implicit
-    # and smart gather, explicit does not.
     gather = play.gather_facts
     if gather is None:
-        try:
-            from ansible import constants as C
-            gather = C.DEFAULT_GATHERING != "explicit"
-        except Exception:
-            gather = True
+        gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
+    core_version = _core_version()
     result = {
         "name": play.name or "",
         "hosts": hosts,
         "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
-        "fact_schema": _fact_schema(),
+        "error_on_missing_handler": C.ERROR_ON_MISSING_HANDLER,
+        "fact_schema": "%d.%d" % core_version,
         "environment": _as_list(getattr(play, "environment", None)) or None,
         "check_mode": getattr(play, "check_mode", None),
         "become": bool(play.become),
         "become_user": getattr(play, "become_user", None),
+        "force_handlers": bool(getattr(play, "force_handlers", False)),
         "vars": _tag_untrusted(play_vars),
         "playbook_dir": basedir,
         "tasks": tasks,
@@ -293,6 +288,24 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if controller_config:
         result["controller_config"] = controller_config
     return result
+
+
+def _apply_force_handlers_default(play):
+    """Resolve an unset ``force_handlers`` from Ansible's configuration.
+
+    ``Play.force_handlers`` defaults to the ``--force-handlers`` CLI argument,
+    whose own default is ``DEFAULT_FORCE_HANDLERS`` (ANSIBLE_FORCE_HANDLERS /
+    ansible.cfg). ``ansiroll compile`` has no Ansible CLI context, so apply
+    that configured default before ``play.compile()`` wraps each section in a
+    block whose ``always`` flushes handlers.
+    """
+    try:
+        if getattr(play, "force_handlers", None) is not None:
+            return
+        from ansible import constants as C
+        play.force_handlers = bool(C.DEFAULT_FORCE_HANDLERS)
+    except Exception:
+        pass
 
 
 def _controller_env_names(value):
@@ -347,7 +360,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
     from ansible.utils.vars import combine_vars
 
     out = dict(play.vars or {})
-    use_search_stack = tuple(map(int, _fact_schema().split("."))) >= (2, 12)
+    use_search_stack = _core_version() >= (2, 12)
     for entry in _as_list(getattr(play, "vars_files", None)):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
@@ -586,6 +599,7 @@ def _assign_runtime_ids(tasks, handlers):
                 counter[0] += 1
                 if node.get("type") == "include":
                     walk(node.get("tasks", []))
+                    walk(node.get("handlers", []))
 
     walk(tasks)
     walk(handlers)
@@ -614,7 +628,14 @@ def _assign_stable_uuids(tasks, handlers, mapping=None):
             magic = node.get("role_magic")
             if isinstance(magic, dict) and "role_uuid" in magic:
                 magic["role_uuid"] = stable(magic["role_uuid"])
-            for key in ("block", "rescue", "always", "tasks"):
+            name_vars = node.get("handler_name_vars")
+            if isinstance(name_vars, dict) and "role_uuid" in name_vars:
+                role_uuid = name_vars["role_uuid"]
+                if isinstance(role_uuid, dict) and "__ansiroll_unsafe__" in role_uuid:
+                    role_uuid["__ansiroll_unsafe__"] = stable(role_uuid["__ansiroll_unsafe__"])
+                else:
+                    name_vars["role_uuid"] = stable(role_uuid)
+            for key in ("block", "rescue", "always", "tasks", "handlers"):
                 if node.get(key):
                     walk(node[key])
 
@@ -622,16 +643,20 @@ def _assign_stable_uuids(tasks, handlers, mapping=None):
     walk(handlers)
 
 
-def _dedup_by_uuid(nodes):
+def _convert_handlers(blocks, actions, basedir, includes):
     seen = set()
-    out = []
-    for n in nodes:
-        uid = n.get("uuid")
-        if uid in seen:
-            continue
-        seen.add(uid)
-        out.append(n)
-    return out
+    handlers = []
+    for block_index, block in enumerate(blocks):
+        for handler in block.block or []:
+            # Ignore tag selection for handlers, which run when notified.
+            node = _convert_node(handler, actions, basedir, includes=includes)
+            if node and node.get("uuid") not in seen:
+                seen.add(node.get("uuid"))
+                node["handler_block"] = block_index
+                if node.get("type") == "include":
+                    node.update(_handler_match(handler))
+                handlers.append(node)
+    return handlers
 
 
 def _handler_blocks(play):
@@ -645,20 +670,12 @@ def _handler_blocks(play):
     return blocks
 
 
-def _convert_node(node, actions, basedir, flatten_handler=False, sink=None,
+def _convert_node(node, actions, basedir,
                   only_tags=None, skip_tags=None, includes=None):
     from ansible.playbook.block import Block
     from ansible.playbook.task import Task
 
     if isinstance(node, Block):
-        if flatten_handler and sink is not None:
-            # Handlers are flat; emit each contained task into the sink.
-            for sub in (node.block or []):
-                conv = _convert_node(sub, actions, basedir, only_tags=only_tags,
-                                     skip_tags=skip_tags, includes=includes)
-                if conv:
-                    sink.append(conv)
-            return None
         block_node = {
             "type": "block",
             "when": _conditions(node.when),
@@ -858,9 +875,19 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 data = task._loader.load_from_file(path, trusted_as_template=True)
             except TypeError:  # older ansible-core without the trust kwarg
                 data = task._loader.load_from_file(path)
+            handler = _is_handler(task)
+            parent = task
+            if handler and args.get("apply"):
+                include = task.copy()
+                include.args = dict(args, apply=dict(args["apply"]))
+                parent = include.build_parent_block()
             blocks = load_list_of_blocks(
-                data, play=_play_of(task), task_include=task, role=task._role,
-                variable_manager=task.get_variable_manager(), loader=task._loader)
+                data, play=_play_of(task), task_include=parent, role=task._role,
+                use_handlers=handler, variable_manager=task.get_variable_manager(),
+                loader=task._loader)
+            if parent is not task:
+                for block in blocks:
+                    block.vars = dict(parent.vars, **(block.vars or {}))
         except Exception:
             return None
         includes.record_writes(blocks)
@@ -890,7 +917,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
 
 
 def _include_node(task, action, fname, basedir, role_defaults, role_vars,
-                  tasks, include_id, ref):
+                  tasks, include_id, ref, handlers=None):
     node = {
         "type": "include",
         "uuid": task._uuid,
@@ -912,6 +939,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "tasks": tasks,
     }
     if action == "include_role":
+        node["handlers"] = handlers or []
         # The runtime overlay already has the enclosing invocations' evaluated
         # parameters and live loop bindings. Preserve this role's own params.
         node["include_params"] = _tag_untrusted(task.copy(exclude_parent=True).get_include_params())
@@ -1189,27 +1217,60 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
         return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
+    handlers = []
     if ref is None:
         try:
             role = Role.load(ri, play, parent_role=parent_role,
                              from_files=from_files or None, from_include=True)
             if _core_version() >= (2, 15):
                 dep_chain = role.get_dep_chain()
+                handler_dep_chain = dep_chain
             else:
                 dep_chain = list(parent_role.get_parents()) + [parent_role] if parent_role else []
+                # Through 2.14, IncludeRole passes the chain to tasks only.
+                handler_dep_chain = None
             blocks = role.compile(play, dep_chain=dep_chain)
+            handler_blocks = role.get_handler_blocks(play, dep_chain=handler_dep_chain) or []
+            if handler_blocks and args.get("apply"):
+                include = task.copy()
+                include.args = dict(args, apply=dict(args["apply"]))
+                parent = include.build_parent_block()
+                for block in handler_blocks:
+                    block._parent = parent
         except Exception:
             return None
-        includes.record_writes(blocks)
+        includes.record_writes(blocks + handler_blocks)
         _register_included(blocks)
+        _register_included(handler_blocks)
         task._role_path = role._role_path
-        role_roots = [id(block) for block in blocks if getattr(block, "_parent", None) is None]
+        role_roots = [id(block) for block in blocks + handler_blocks
+                      if getattr(block, "_parent", None) is None]
+        if handler_blocks and args.get("apply"):
+            role_roots.append(id(parent))
         _INCLUDE_ROLE_PARENTS.update(dict.fromkeys(role_roots, task))
         include_id = _new_include_id()
         # Keep the guard while converting the role's tasks: that is where a
         # recursive include_role is reached.
         _INCLUDE_STACK[key] = include_id
         try:
+            # Executing include_role appends the role's handlers to the play's
+            # handlers (ansible/playbook/role_include.py IncludeRole.get_block_list).
+            handlers = _convert_handlers(handler_blocks, actions, basedir, includes)
+            if handlers and args.get("apply") and parent.vars:
+                applied_vars = _tag_untrusted(dict(parent.vars))
+                for handler in handlers:
+                    handler["handler_block_vars"] = applied_vars
+            if handlers and handler_dep_chain is None:
+                # Through 2.14 the child handler has no dependency chain. It still
+                # sees defaults from roles declared on the play via VariableManager.
+                from ansible.utils.vars import combine_vars
+
+                play_defaults = {}
+                for play_role in play.get_roles():
+                    play_defaults = combine_vars(play_defaults, play_role.get_default_vars())
+                tagged_defaults = _tag_untrusted(play_defaults)
+                for handler in handlers:
+                    handler["role_defaults"] = combine_vars(tagged_defaults, handler.get("role_defaults") or {})
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                                skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]
@@ -1219,7 +1280,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 del _INCLUDE_ROLE_PARENTS[root]
     role_defaults, role_vars = _role_vars(task)
     return _include_node(task, "include_role", name, basedir,
-                         role_defaults, role_vars, tasks, include_id, ref)
+                         role_defaults, role_vars, tasks, include_id, ref, handlers)
 
 
 def _play_of(task):
@@ -1257,6 +1318,14 @@ def _register_included(blocks):
 def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
     if not only_tags and not skip_tags:
         return True
+    from ansible import constants as C
+
+    if task.action in C._ACTION_META:
+        # Core 2.10 keeps all meta tasks; later cores keep implicit ones.
+        # From 2.19.4 generated flushes have "always" and use normal tag rules.
+        if (_core_version() < (2, 11)
+                or (getattr(task, "implicit", False) and "always" not in task.tags)):
+            return True
     try:
         return bool(task.evaluate_tags(only_tags or set(), skip_tags or set(), all_vars or {}))
     except Exception:
@@ -1322,9 +1391,11 @@ def _convert_task(task, actions, basedir):
         "role_vars": _tag_untrusted(role_vars),          # above play vars, below block/task vars
         "role_params": _tag_untrusted(_role_params(task)),  # above set_fact/register
         "role_magic": _role_magic(task),
-        "notify": _as_list(task.notify),
+        "notify": _tag_untrusted(task.notify),
         "special": _special_of(action),
     }
+    if _is_handler(task):
+        node.update(_handler_match(task))
     if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
                                        "ansible.legacy.async_status"):
         from ansible.plugins.loader import shell_loader
@@ -1385,6 +1456,49 @@ def _convert_task(task, actions, basedir):
         node["args"] = _tag_untrusted(node["args"])
     node["loop"] = _tag_loop_values(task, node["loop"])
     return node
+
+
+def _role_names(task):
+    role = getattr(task, "_role", None)
+    if role is None:
+        return []
+    names = []
+    for fqcn in (False, True):
+        try:
+            name = role.get_name(include_role_fqcn=fqcn)
+        except TypeError:
+            name = role.get_name()
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _handler_match(task):
+    """Names and ``listen`` topics a notification can match a handler by.
+
+    Mirrors StrategyBase.search_handlers_by_notification: a handler matches
+    its own name or its role-qualified name. Since 2.17,
+    Handler._validate_listen also adds role-qualified topics.
+    """
+    roles = _role_names(task)
+    names = []
+    if task.name:
+        names.append(str(task.name))
+        names.extend("%s : %s" % (role, task.name) for role in roles)
+    # ansible-core 2.17+ includes role-qualified aliases in task.listen.
+    listen = list(dict.fromkeys(map(str, _as_list(getattr(task, "listen", None)))))
+    match = {"handler_names": names, "listen": listen}
+    if names and _is_templated(names[0]):
+        if isinstance(_tag_untrusted(task.name, template_syntax_only=True), dict):
+            match["handler_name_trusted"] = False
+            return match
+        # StrategyBase resolves handler names with play/task vars and no host.
+        variables = task.get_variable_manager().get_vars(
+            play=_play_of(task), task=task, include_hostvars=False)
+        variables.pop("vars", None)  # rebuilt after applying invocation vars
+        variables.pop("omit", None)  # use the stable runtime omit token
+        match["handler_name_vars"] = _tag_untrusted(variables)
+    return match
 
 
 def _contains_dynamic_value(value):

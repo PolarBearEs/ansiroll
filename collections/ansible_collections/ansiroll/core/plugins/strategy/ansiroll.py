@@ -44,6 +44,7 @@ DOCUMENTATION = """
 """
 
 from ansible import context
+from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
@@ -272,6 +273,8 @@ class StrategyModule(StrategyBase):
             if node.get("type") == "include":
                 for sub in node.get("tasks", []) or []:
                     walk_node(sub)
+                for sub in node.get("handlers", []) or []:
+                    walk_node(sub)
             rid = node.get("runtime_id")
             if not rid:
                 return
@@ -386,6 +389,10 @@ class StrategyModule(StrategyBase):
                     "t": "source_result",
                     "source": self._read_controller_source(frame.get("path")),
                 })
+            elif t == "warning":
+                display.warning(frame["message"])
+            elif t == "error":
+                raise AnsibleError(frame["message"])
             elif t == "stats":
                 self._apply_stats(host, frame.get("stats", {}))
             elif t == "done":
@@ -1170,6 +1177,7 @@ def _controller_fallbacks(play_node):
                 continue
             if node.get("type") == "include":
                 walk(node.get("tasks"))
+                walk(node.get("handlers"))
             if node.get("fallback"):
                 found.append({
                     "kind": "controller-fallback",
