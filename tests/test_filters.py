@@ -236,6 +236,9 @@ class _StubRuntime(object):
     def template(self, value, ctx):
         return _Templater().render_string(value, ctx)
 
+    def _pin_magic_vars(self, ctx):
+        pass
+
 
 def test_to_yaml_renders_aliased_lazy_list_per_context():
     from ansiroll.runtime import _LazyTplList
