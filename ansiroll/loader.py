@@ -8,7 +8,6 @@ inlined runtime can interpret. This module runs only at compile time.
 
 from __future__ import annotations
 
-import glob
 import os
 import pkgutil
 import re
@@ -1386,7 +1385,7 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        elif _bake_absolute_tree(node, src, basedir):
+        elif _bake_absolute_tree(node, src, basedir, name == "template"):
             return
         elif not os.path.isabs(src) and _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
@@ -1454,30 +1453,47 @@ def _find_needle(task, subdir, rel):
     return path if os.path.isfile(path) else None
 
 
-def _bake_absolute_tree(node, src, basedir):
-    """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths. Each {{ ... }}
-    becomes a glob wildcard, so "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2" bakes that dir's .j2 files and
-    nothing else: no dotfiles (.git, vault password files) and nothing a symlink points to outside the playbook dir."""
+def _bake_absolute_tree(node, src, basedir, with_meta):
+    """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
+    separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
+    below the src's static directory, so "{{ playbook_dir }}/templates/{{ item }}.j2" bakes nested .j2 files too.
+    Dot entries (.git, vault password files) and anything resolving outside the playbook dir are never baked."""
+    src = re.sub(r"/+", "/", src)
     if not os.path.isabs(src):
         return False
-    pattern = "*".join(glob.escape(part) for part in _JINJA_RE.split(src))
-    root = os.path.join(os.path.realpath(basedir), "")
+    tree_dir = os.path.dirname(_JINJA_RE.split(src, 1)[0])
+    root = os.path.realpath(basedir)
+    real_tree = os.path.realpath(tree_dir)
+    if not (real_tree == root or real_tree.startswith(os.path.join(root, ""))) or not os.path.isdir(tree_dir):
+        return False
+    pattern = re.compile(".*".join(re.escape(part) for part in _JINJA_RE.split(src)) + r"\Z", re.S)
     baked = {}
+    meta = {}
     size = 0
-    for path in sorted(glob.glob(pattern)):
-        if not os.path.isfile(path) or not os.path.realpath(path).startswith(root):
-            continue
-        try:
-            size += os.path.getsize(path)
-            if size > _ABSOLUTE_TREE_LIMIT:
-                return False
-            with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                baked[path] = fh.read()
-        except OSError:
-            continue
+    for walk_root, dirs, files in os.walk(tree_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for fn in sorted(files):
+            path = os.path.join(walk_root, fn)
+            if fn.startswith(".") or not pattern.match(path) or not os.path.isfile(path):
+                continue
+            if not os.path.realpath(path).startswith(os.path.join(root, "")):
+                continue
+            try:
+                st = os.stat(path)
+                size += st.st_size
+                if size > _ABSOLUTE_TREE_LIMIT:
+                    return False
+                with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+                    baked[path] = fh.read()
+            except OSError:
+                continue
+            if with_meta:
+                meta[path] = {"fullpath": os.path.abspath(path), "mtime": st.st_mtime, "uid": st.st_uid}
     if not baked:
         return False
     node["_baked"] = baked
+    if meta:
+        node["_baked_meta"] = meta
     return True
 
 

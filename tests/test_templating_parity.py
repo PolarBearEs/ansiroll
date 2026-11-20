@@ -462,6 +462,36 @@ def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_p
     assert dest.read_text() == "value=2"
 
 
+def test_looped_playbook_dir_src_bakes_nested_items_and_doubled_separators(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {names: [flat, nested/conf]}
+  tasks:
+    - template:
+        src: "{{ playbook_dir }}/templates//{{ item }}.j2"
+        dest: "%s/out-{{ item | basename }}"
+      loop: "{{ names }}"
+""" % str(tmp_path), {
+        "templates/flat.j2": "flat={{ 1 + 1 }}",
+        "templates/nested/conf.j2": "nested={{ 1 + 2 }} {{ template_fullpath | basename }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert (tmp_path / "out-conf").read_text() == "nested=3 conf.j2"
+    src, _ = compile_playbook(str(playbook))
+    for name in ("out-flat", "out-conf", "templates/flat.j2", "templates/nested/conf.j2"):
+        (tmp_path / name).unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert (tmp_path / "out-flat").read_text() == "flat=2"
+    assert (tmp_path / "out-conf").read_text() == "nested=3 conf.j2"
+
+
 def test_looped_src_directly_under_playbook_dir_is_baked_not_the_role_tree(tmp_path):
     playbook = _write(tmp_path, """
 - hosts: localhost
@@ -505,9 +535,12 @@ def test_absolute_dynamic_src_bakes_only_matching_files_inside_the_playbook_dir(
     (pb / ".git" / "x.j2").write_text("object")
     (tmp_path / "outside.j2").write_text("outside")
     (pb / "link.j2").symlink_to(tmp_path / "outside.j2")
+    (pb / "nested").mkdir()
+    (pb / "nested" / "sub.j2").write_text("sub")
     node = {}
-    assert loader._bake_absolute_tree(node, str(pb) + "/{{ item }}.j2", str(pb))
-    assert node["_baked"] == {str(pb / "conf.j2"): "conf"}
+    assert loader._bake_absolute_tree(node, str(pb) + "/{{ item }}.j2", str(pb), True)
+    assert node["_baked"] == {str(pb / "conf.j2"): "conf", str(pb / "nested" / "sub.j2"): "sub"}
+    assert node["_baked_meta"][str(pb / "conf.j2")]["fullpath"] == str(pb / "conf.j2")
 
 
 def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, monkeypatch):
@@ -518,7 +551,7 @@ def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, mo
     tree.mkdir()
     (tree / "a.j2").write_text("x" * 20)
     node = {}
-    assert not loader._bake_absolute_tree(node, str(tree) + "/{{ item }}.j2", str(tmp_path))
+    assert not loader._bake_absolute_tree(node, str(tree) + "/{{ item }}.j2", str(tmp_path), False)
     assert "_baked" not in node
 
 

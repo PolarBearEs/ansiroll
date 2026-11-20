@@ -2778,8 +2778,15 @@ class Runtime:
 
     @staticmethod
     def _baked_source_key(task, src):
+        if isinstance(src, str) and os.path.isabs(src):
+            # Dynamic absolute sources are baked with repeated separators collapsed.
+            if src not in (task.get("_baked") or {}):
+                collapsed = re.sub(r"/+", "/", src)
+                if collapsed in (task.get("_baked") or {}):
+                    return collapsed
+            return src
         # Role trees are baked under paths relative to files/ or templates/.
-        if not task.get("_baked_tree") or not isinstance(src, str) or os.path.isabs(src):
+        if not task.get("_baked_tree") or not isinstance(src, str):
             return src
         parts = src.split("/")
         if parts[-1] in ("", ".", ".."):
