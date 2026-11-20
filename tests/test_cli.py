@@ -52,17 +52,26 @@ def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
 @pytest.mark.parametrize("compile_fails", [False, True])
 def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails):
     script = r"""
+import atexit
+import ctypes
 import sys
 from ansiroll import cli
 
+puts = ctypes.CDLL(None).puts
+puts.argtypes = [ctypes.c_char_p]
+
 def compile_playbook(*args, **kwargs):
     sys.__stdout__.write("buffered diagnostic\n")
-    if sys.argv[1] == "True":
+    puts(b"native diagnostic")
+    atexit.register(puts, b"native shutdown diagnostic")
+    if compile_fails == "True":
         raise ValueError("compile failed")
     return "print('ok')\n", {"modules": [], "fallback_tasks": []}
 
 cli.compile_playbook = compile_playbook
-raise SystemExit(cli.main(["compile", "play.yml", "-o", "-"]))
+compile_fails = sys.argv[1]
+sys.argv[1:] = ["compile", "play.yml", "-o", "-"]
+raise SystemExit(cli.main())
 """
     env = dict(os.environ)
     env.pop("PYTHONUNBUFFERED", None)
@@ -74,6 +83,8 @@ raise SystemExit(cli.main(["compile", "play.yml", "-o", "-"]))
     assert result.returncode == (2 if compile_fails else 0), result.stderr
     assert result.stdout == (b"" if compile_fails else b"print('ok')\n")
     assert b"buffered diagnostic\n" in result.stderr
+    assert b"native diagnostic\n" in result.stderr
+    assert b"native shutdown diagnostic\n" in result.stderr
 
 
 def test_compile_rejects_manifest_that_points_to_stdout(monkeypatch, capfdbinary):
@@ -85,6 +96,22 @@ def test_compile_rejects_manifest_that_points_to_stdout(monkeypatch, capfdbinary
     captured = capfdbinary.readouterr()
     assert captured.out == b""
     assert b"manifest path points to stdout" in captured.err
+
+
+@pytest.mark.parametrize("manifest_path", [os.devnull, "/dev/stdout"])
+def test_compile_allows_manifest_and_source_to_be_discarded(tmp_path, manifest_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+         "-o", "-", "-m", manifest_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
+    )
+
+    assert b" -> stdout " in result.stderr
+    assert b'"fallback_tasks":' not in result.stderr
 
 
 def test_compile_stdout_stays_empty_if_manifest_write_fails(monkeypatch, tmp_path, capfdbinary):

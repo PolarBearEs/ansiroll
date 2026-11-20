@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager, nullcontext, redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -48,6 +48,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "compile":
+        if args.output == "-":
+            return _cmd_compile_stdout(args, restore_stdout=argv is not None)
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -55,7 +57,7 @@ def main(argv=None):
 
 
 @contextmanager
-def _compile_diagnostics_to_stderr():
+def _compile_diagnostics_to_stderr(restore_stdout):
     # Redirect inherited stdout for helpers as well as Python's stdout stream.
     stdout = sys.stdout
     stdout.flush()
@@ -66,15 +68,17 @@ def _compile_diagnostics_to_stderr():
         os.dup2(2, 1)
         try:
             with redirect_stdout(sys.stderr):
+                yield saved_stdout
+        finally:
+            # The standalone CLI keeps fd 1 redirected through process shutdown
+            # so native buffers and exit handlers also write their diagnostics to stderr.
+            if restore_stdout:
                 try:
-                    yield
-                finally:
-                    # Plugins can write through a reference saved before redirection.
                     stdout.flush()
                     if original_stdout is not None and original_stdout is not stdout:
                         original_stdout.flush()
-        finally:
-            os.dup2(saved_stdout.fileno(), 1)
+                finally:
+                    os.dup2(saved_stdout.fileno(), 1)
 
 
 def _manifest_aliases_stdout(path):
@@ -85,44 +89,50 @@ def _manifest_aliases_stdout(path):
     return os.path.samestat(manifest_stat, os.fstat(1))
 
 
-def _cmd_compile(args):
-    to_stdout = args.output == "-"
-    with _compile_diagnostics_to_stderr() if to_stdout else nullcontext():
-        try:
-            extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
-        except Exception as ex:
-            sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
+def _cmd_compile_stdout(args, restore_stdout):
+    if args.manifest and _manifest_aliases_stdout(args.manifest):
+        if not os.path.samefile(args.manifest, os.devnull):
+            sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % args.manifest)
             return 2
-        try:
-            source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
-                                                vault_password_file=args.vault_password_file,
-                                                extra_vars=extra_vars,
-                                                tree_shake=args.tree_shake,
-                                                freeze_playbook_vars=args.freeze_playbook_vars,
-                                                freeze_vars=args.freeze_var)
-        except Exception as ex:
-            if not isinstance(ex, (ValueError,) + _ansible_errors()):
-                raise
-            message = str(ex)
-            if not message.startswith("ansiroll: "):
-                message = "ansiroll: " + message
-            sys.stderr.write(message + "\n")
-            return 2
-    if not to_stdout:
+        # A path such as /dev/stdout would point to stderr after redirection.
+        args.manifest = os.devnull
+    with _compile_diagnostics_to_stderr(restore_stdout) as stdout:
+        return _cmd_compile(args, stdout=stdout)
+
+
+def _cmd_compile(args, stdout=None):
+    try:
+        extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
+    except Exception as ex:
+        sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
+        return 2
+    try:
+        source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
+                                            vault_password_file=args.vault_password_file,
+                                            extra_vars=extra_vars,
+                                            tree_shake=args.tree_shake,
+                                            freeze_playbook_vars=args.freeze_playbook_vars,
+                                            freeze_vars=args.freeze_var)
+    except Exception as ex:
+        if not isinstance(ex, (ValueError,) + _ansible_errors()):
+            raise
+        message = str(ex)
+        if not message.startswith("ansiroll: "):
+            message = "ansiroll: " + message
+        sys.stderr.write(message + "\n")
+        return 2
+    if stdout is None:
         with open(args.output, "w") as fh:
             fh.write(source)
         os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
-        if to_stdout and _manifest_aliases_stdout(args.manifest):
-            sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % args.manifest)
-            return 2
         with open(args.manifest, "w") as fh:
             json.dump(manifest, fh, indent=2)
-    if to_stdout:
-        sys.stdout.buffer.write(source.encode("utf-8"))
+    if stdout is not None:
+        stdout.write(source.encode("utf-8"))
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
-        % (args.playbook, "stdout" if to_stdout else args.output, len(manifest["modules"]),
+        % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),
            len(manifest["fallback_tasks"]))
     )
     return 0
