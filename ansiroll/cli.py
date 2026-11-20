@@ -77,16 +77,17 @@ def _manifest_for_stdout(path, stdout_fd):
     raise ValueError("manifest path points to stdout: %s" % path)
 
 
-def _same_terminal(first_fd, second_fd):
-    if not sys.platform.startswith("linux") or not (os.isatty(first_fd) and os.isatty(second_fd)):
+def _terminal_alias(first_fd, second_fd):
+    if not (os.isatty(first_fd) and os.isatty(second_fd)):
         return False
-    from fcntl import ioctl
 
-    # Linux TIOCGDEV returns the terminal's device number even via /dev/tty.
+    # A controlling-terminal device node can refer to either terminal without
+    # having the same inode as the device it forwards to.
     try:
-        return ioctl(first_fd, 0x80045432, bytes(4)) == ioctl(second_fd, 0x80045432, bytes(4))
-    except OSError:
+        controlling_terminal = os.stat(os.ctermid())
+    except (AttributeError, OSError):
         return False
+    return controlling_terminal.st_rdev in (os.fstat(first_fd).st_rdev, os.fstat(second_fd).st_rdev)
 
 
 def _write_stdout_manifest(path, manifest, stdout_fd):
@@ -94,7 +95,7 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
     # Validate the actual destination before truncating or writing anything.
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
         manifest_stat = os.fstat(fh.fileno())
-        if (_same_terminal(fh.fileno(), stdout_fd)
+        if (_terminal_alias(fh.fileno(), stdout_fd)
                 or (os.path.samestat(manifest_stat, os.fstat(stdout_fd))
                     and not os.path.samestat(manifest_stat, os.stat(os.devnull)))):
             raise ValueError("manifest path points to stdout: %s" % path)
@@ -108,7 +109,7 @@ def _cmd_compile_stdout(args):
         stdout_stat = os.fstat(1)
         stderr_stat = _compile_stderr_stat()
         stream_mode = stdout_stat.st_mode
-        if (_same_terminal(1, 2)
+        if (_terminal_alias(1, 2)
                 or ((stat.S_ISFIFO(stream_mode) or stat.S_ISREG(stream_mode)
                      or stat.S_ISSOCK(stream_mode) or os.isatty(1))
                     and os.path.samestat(stdout_stat, stderr_stat))):

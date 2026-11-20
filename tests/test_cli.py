@@ -98,6 +98,32 @@ def test_stdout_compile_rejects_shared_terminal():
     assert output.rstrip() == b"ansiroll: compile -o - requires separate stdout and stderr streams"
 
 
+def test_stdout_compile_accepts_opposite_pseudoterminal_ends():
+    pty = pytest.importorskip("pty")
+    import tty
+
+    script = """
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **k: ("pass\\n", {"modules": [], "fallback_tasks": []})
+sys.argv[1:] = ["compile", "play.yml", "-o", "-"]
+raise SystemExit(cli.entrypoint())
+"""
+    master, slave = pty.openpty()
+    try:
+        tty.setraw(slave)
+        result = subprocess.run([sys.executable, "-c", script], stdout=slave, stderr=master)
+        os.set_blocking(master, False)
+        os.set_blocking(slave, False)
+        assert result.returncode == 0
+        assert os.read(master, 4096) == b"pass\n"
+        assert b" -> stdout " in os.read(slave, 4096)
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux controlling terminals")
 @pytest.mark.parametrize("alias", ["stderr", "manifest"])
 def test_stdout_compile_rejects_controlling_terminal_alias(alias):
