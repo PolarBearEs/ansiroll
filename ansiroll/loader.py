@@ -165,30 +165,27 @@ def _make_rewriting_loader(DataLoader):
     return RewritingDataLoader()
 
 
+_TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+
+
 def _rewrite_includes(data):
     # Rewrite in place: ansible-core's parsed containers carry origin tags
     # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies.
-    if isinstance(data, list):
-        for index, item in enumerate(data):
-            data[index] = _rewrite_includes(item)
+    # must not be replaced by plain copies. Only task lists are touched, since
+    # vars files go through this loader too.
+    if not isinstance(data, list):
         return data
-    if isinstance(data, dict):
-        rename = "include" in data and isinstance(data.get("include"), str)
-        if rename:
-            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for k in _TASK_LIST_KEYS:
+            _rewrite_includes(item.get(k))
+        if "include" in item and isinstance(item.get("include"), str):
+            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            items = list(data.items())
-            data.clear()
-            for k, v in items:
-                if k == "include":
-                    data[new_key] = v
-                else:
-                    data[k] = _rewrite_includes(v)
-        else:
-            for k in list(data):
-                data[k] = _rewrite_includes(data[k])
-        return data
+            items = [(new_key if k == "include" else k, v) for k, v in item.items()]
+            item.clear()
+            item.update(items)
     return data
 
 
@@ -201,7 +198,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             basedir = play._loader.get_basedir()
         except Exception:
             basedir = os.getcwd()
-    play_vars = _resolved_play_vars(play, all_vars, basedir)
+    unresolved_vars_files = []
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -216,6 +214,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.incomplete = bool(unresolved_vars_files)
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -273,6 +272,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "tasks": tasks,
         "handlers": handlers,
     }
+    if unresolved_vars_files:
+        result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
     names = _controller_env_names(result)
     if names:
         result["controller_env"] = {
@@ -344,8 +345,24 @@ def _controller_config_names(value):
     return names
 
 
-def _resolved_play_vars(play, all_vars, basedir):
-    """Merge static vars_files at their play-var precedence."""
+def _fact_schema():
+    """Fact shape emitted by the ansible-core version doing the compilation."""
+    try:
+        from ansible.release import __version__
+        match = re.match(r"^(\d+)\.(\d+)", __version__)
+        if match:
+            return "%s.%s" % match.groups()
+    except Exception:
+        pass
+    return "2.10"
+
+
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
+    """Merge static vars_files at their play-var precedence.
+
+    Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
+    appended to ``unresolved``.
+    """
     from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
@@ -355,19 +372,22 @@ def _resolved_play_vars(play, all_vars, basedir):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
+            raw = filename
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
-                break
+                # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
+                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
+                if filename is None:
+                    if unresolved is not None:
+                        unresolved.append(entry)
+                    break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
                 path = filename
                 if use_search_stack:
                     path = play._loader.path_dwim_relative_stack(
                         play.get_search_path(), "vars", filename)
-                try:
-                    loaded = play._loader.load_from_file(path, trusted_as_template=True)
-                except TypeError:
-                    loaded = play._loader.load_from_file(path)
+                loaded = _load_vars_file(play, path)
             except AnsibleFileNotFound:
                 # Like Ansible: only a missing file moves on to the next candidate.
                 continue
@@ -394,6 +414,99 @@ def _resolved_play_vars(play, all_vars, basedir):
             if key in all_vars:
                 out[key] = all_vars[key]
     return out
+
+
+def _load_vars_file(play, path):
+    try:
+        return play._loader.load_from_file(path, trusted_as_template=True)
+    except TypeError:
+        return play._loader.load_from_file(path)
+
+
+def _deferred_vars_files(play, basedir, entries):
+    """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
+
+    A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
+    in another directory level than the template's position. A name whose leading directory is a template
+    can render to any directory, so its entry lists it under ``unmodeled``. A file the runtime must not load is bundled
+    as an error marker that aborts the run if it is selected.
+    """
+    import glob
+
+    if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
+        dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
+    else:
+        dirs, subdir = [basedir], None
+    dirs = [os.path.normpath(d) for d in dirs]
+    deferred = []
+    for entry in entries:
+        names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
+        files = {}
+        unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
+        for name in names:
+            pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+            if name.startswith(os.path.sep):
+                patterns = [pattern]
+            else:
+                patterns = []
+                for d in dirs:
+                    if subdir and name.split("/")[0] != subdir:
+                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
+                    patterns.append(os.path.join(glob.escape(d), pattern))
+            for path in patterns:
+                for found in glob.glob(path):
+                    found = os.path.normpath(found)
+                    if found not in files and os.path.isfile(found):
+                        files[found] = _bundled_vars_file(play, found)
+        entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
+        if unmodeled:
+            entry["unmodeled"] = unmodeled
+        deferred.append(entry)
+    return deferred
+
+
+def _bundled_vars_file(play, path):
+    """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
+    from ansible.errors import AnsibleParserError
+
+    with open(path, "rb") as fh:
+        # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
+        # select.
+        if b"$ANSIBLE_VAULT" in fh.read():
+            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                    % path}
+    try:
+        loaded = _load_vars_file(play, path)
+        if isinstance(loaded, dict) or loaded is None:
+            return _tag_untrusted([loaded] if loaded else [])
+        from ansible.vars.manager import preprocess_vars
+        preprocess_vars(loaded)
+    except Exception as ex:
+        return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
+                "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+    return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
+            "a mapping" % path}
+
+
+def _template_vars_file_name(play, filename, play_vars, all_vars):
+    from ansible.utils.vars import combine_vars
+
+    variables = combine_vars(play_vars, all_vars or {})
+    variables = combine_vars(variables, play.get_variable_manager().extra_vars)
+    try:
+        from ansible.template import Templar
+        try:
+            templar = Templar(loader=play._loader, variables=variables)
+        except TypeError:
+            templar = Templar(loader=play._loader)
+            templar.available_variables = variables
+        rendered = templar.template(filename, fail_on_undefined=True)
+    except Exception:
+        return None
+    if not isinstance(rendered, str) or _is_templated(rendered):
+        return None
+    return rendered
 
 
 def _tag_untrusted(value, template_syntax_only=False):
@@ -693,6 +806,8 @@ class _IncludeVariables:
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
         self.resolved_template = False
+        # A vars file whose name is only known at runtime may redefine any play var.
+        self.incomplete = False
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -978,17 +1093,29 @@ def _include_tasks_path(task, include_target, includes):
     return include_file
 
 
+_MAGIC_VAR_NAMES = frozenset((
+    "role_path", "role_name", "playbook_dir", "inventory_dir", "inventory_file", "inventory_hostname",
+    "groups", "hostvars", "ansible_play_hosts", "ansible_play_batch",
+))
+
+
 def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
+    from ansible.vars.reserved import is_reserved_name
+
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
+    include_scope = _include_scope(task)
+    role_params = _role_params(task)
     variables = {}
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
-                  *_include_scope(task), _role_params(task), extra_vars):
+                  *include_scope, role_params, extra_vars):
         variables = combine_vars(variables, layer)
+    # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
+    above_vars_files = set(role_vars).union(*include_scope, role_params)
 
     loop_names = set()
     parent = task
@@ -1002,6 +1129,9 @@ def _template_include_filename(task, value, includes):
 
     def is_runtime(name):
         if name in loop_names:
+            return True
+        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
+                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):
             return False
@@ -1632,6 +1762,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
     baked = {}
+    meta = {}
     directories = set()
     aliases = {}
     skipped = []
@@ -1655,11 +1786,14 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 try:
                     with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
                         baked[rel] = fh.read()
+                    st = os.stat(full)
                 except OSError:
                     continue
+                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid}
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
     for directory in list(directories):

@@ -739,6 +739,31 @@ def test_dynamic_src_does_not_bake_a_file_shadowed_by_an_unbaked_dir(tmp_path):
     assert dest.read_text() == "role root"
 
 
+def test_dynamic_src_template_fullpath_names_the_baked_file(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ name }}.j2", {
+        "roles/a/templates/conf.j2": "{{ template_fullpath }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == str(tmp_path / "roles/a/templates/conf.j2")
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == str(tmp_path / "roles/a/templates/conf.j2")
+
+
+def test_include_key_in_role_defaults_is_data(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": "- debug: msg=\"{{ nginx | to_json }}\"\n",
+        "roles/a/defaults/main.yml": "nginx:\n  include: conf.d/*.conf\n",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == ['{"include": "conf.d/*.conf"}']
+    assert _ansiroll(playbook, tmp_path) == expected
+
+
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
     _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
         "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
@@ -1527,3 +1552,180 @@ def test_mapping_keys_stay_literal(tmp_path):
         msg: "{{ mapping.keys() | list | sort | join(',') }}"
 """)
     assert msgs == ["{{ label }},{{ label }}-literal"]
+
+
+def test_play_vars_see_task_vars_include_params_and_loop_bindings(tmp_path):
+    msgs, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    alias: "{{ env }}"
+    chained: "{{ alias }}-x"
+  tasks:
+    - debug: msg="{{ alias }} {{ chained }}"
+    - debug: msg="{{ alias }} {{ chained }}"
+      vars: {env: task}
+    - debug: msg="{{ alias }} {{ chained }}"
+      loop: [loop]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }} {{ chained }}"
+      vars: {env: task}
+      loop: [a]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }}"
+      vars: {alias: own}
+      loop: [b]
+      loop_control: {loop_var: env}
+    - include_tasks: inc.yml
+      vars: {env: param}
+    - include_tasks: inc.yml
+      loop: [incloop]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }} {{ chained }}"
+""", {"inc.yml": '- debug: msg="{{ alias }} {{ chained }}"\n'})
+    assert msgs == ["prod prod-x", "task task-x", "loop loop-x", "a a-x", "own",
+                    "param param-x", "incloop incloop-x", "prod prod-x"]
+
+
+def test_rebound_play_vars_keep_loop_vars_order_explicit_overrides_and_indirect_reads(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    full: "{{ env }}-{{ alias }}"
+    pkg: "{{ env }}"
+    alias: "{{ env }}"
+    debug_mode: "{{ env != 'prod' }}"
+    cfg: {name: "{{ env }}"}
+    indirect: "{{ vars['env'] }}"
+    env: prod
+  tasks:
+    - debug: msg="{{ full }} {{ cfg.name }} {{ indirect }}"
+      vars: {env: task}
+    - debug: msg="{{ pkg }}"
+      vars: {env: task}
+      loop: [a, b]
+      loop_control: {loop_var: pkg}
+    - debug: msg="debug={{ debug_mode }}"
+      vars: {env: dev, debug_mode: false}
+""")
+    assert msgs == ["task-task task task", "a", "b", "debug=False"]
+
+
+def test_rebound_indirect_and_container_play_vars_follow_chains_declared_before_them(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    outer: "{{ lookup('vars', 'via_indirect') }}"
+    via_indirect: "{{ indirect }}"
+    indirect: "{{ lookup('vars', 'alias') }}"
+    cfg: {name: "{{ alias }}"}
+    alias: "{{ env }}"
+    env: prod
+    a: "{{ a_ind }}"
+    a_ind: "{{ lookup('vars', 'b') }}"
+    b: "{{ b_ind }}"
+    b_ind: "{{ lookup('vars', 'env') }}"
+  tasks:
+    - debug: msg="{{ indirect }} {{ cfg.name }} {{ via_indirect }} {{ outer }} {{ a }}"
+      vars: {env: task}
+""")
+    assert msgs == ["task task task task task"]
+
+
+def test_task_vars_read_rebound_play_vars(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    alias: "{{ env }}"
+    full: "{{ alias }}-{{ suffix }}"
+  tasks:
+    - debug: msg="{{ alias }} {{ label }} {{ full }}"
+      vars: {env: task, label: "{{ alias }}", suffix: "{{ label }}"}
+""")
+    assert msgs == ["task task task-task"]
+
+
+def test_registered_result_outranks_templated_play_var(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    out: "{{ env }}"
+  tasks:
+    - command: echo hi
+      register: out
+      changed_when: false
+    - debug: msg="{{ out.stdout }}"
+    - debug: msg="{{ out.stdout }}"
+      vars: {env: task}
+- hosts: localhost
+  gather_facts: false
+  vars:
+    out: literal
+  tasks:
+    - debug: msg="{{ out.stdout }}"
+""")
+    assert msgs == ["hi", "hi", "hi"]
+
+
+def test_vars_files_named_from_facts_load_at_runtime(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  vars:
+    from_play: play
+    os_name: play
+  vars_files:
+    - "vars/{{ ansible_system | lower }}.yml"
+    - ["missing-{{ ansible_system }}.yml", "fallback.yml"]
+  tasks:
+    - debug: msg="{{ os_name }} {{ derived }} {{ fb }}"
+""", {"vars/linux.yml": 'os_name: linux\nderived: "{{ from_play }}-{{ ansible_facts.system }}"\n',
+      "vars/darwin.yml": "os_name: darwin\nderived: darwin\n", "fallback.yml": "fb: fallback\n"})
+    assert msgs == ["linux play-Linux fallback"]
+
+
+def test_rebound_play_vars_render_in_order_through_raw_task_vars(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    x: "{{ label }}"
+    alias: "{{ env }}"
+  tasks:
+    - debug: msg="{{ x }}"
+      vars: {env: task, label: "{{ alias }}"}
+""")
+    assert msgs == ["task"]
+
+
+def test_vars_files_names_ignore_set_fact_and_register_from_earlier_plays(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact: {tier: sf}
+    - command: echo hi
+      register: reg
+      changed_when: false
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "vars/{{ reg.stdout }}.yml"
+  tasks:
+    - debug: msg="{{ pick | default('none') }}"
+- hosts: localhost
+  vars:
+    tier: pv
+  vars_files:
+    - "vars/{{ tier }}{{ ansible_system[:0] }}.yml"
+  tasks:
+    - debug: msg="{{ pick }} {{ tier }}"
+""", {"vars/sf.yml": "pick: from_set_fact\n", "vars/pv.yml": "pick: from_play\n", "vars/hi.yml": "pick: from_reg\n"})
+    assert msgs == ["none", "from_play sf"]

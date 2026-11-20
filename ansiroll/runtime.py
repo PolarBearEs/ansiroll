@@ -367,6 +367,14 @@ class MissingHandler(Exception):
     """A changed task requested a handler that has not been loaded."""
 
 
+class VarsFilesError(Exception):
+    """A vars_files failure, which aborts the whole run in Ansible; rc is ansible-playbook's exit code."""
+
+    def __init__(self, message, rc=1):
+        Exception.__init__(self, message)
+        self.rc = rc
+
+
 class ConditionalError(Exception):
     """Evaluating a `when` conditional failed (undefined variable, error)."""
 
@@ -1094,6 +1102,8 @@ class _PlayVarScope(dict):
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
+        if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
+            return self.templater.resolve_variable(key, value, self, strict=self.strict)
         if not isinstance(value, _PlayVarTemplate):
             return value
         self.accesses += 1
@@ -1546,6 +1556,9 @@ class _Templater:
                 return self.render_string(value, ctx, strict=strict)
             finally:
                 self._resolving.pop()
+        if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
+            # Play containers resolve their members in the task's context.
+            return _lazy_container(value._raw, value._rt, ctx)
         if self._runtime is not None and type(value) in (dict, list):
             return _lazy_wrap(value, self._runtime, ctx)
         return value
@@ -1553,7 +1566,9 @@ class _Templater:
     def _play_var_scope(self, ctx, strict):
         if isinstance(ctx, _PlayVarScope):
             return ctx
-        if any(isinstance(value, _PlayVarTemplate) for value in ctx.values()):
+        if any(isinstance(value, _PlayVarTemplate)
+               or (isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic)
+               for value in ctx.values()):
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
@@ -1801,6 +1816,7 @@ class Runtime:
         # include_vars results: above task vars, below set_fact/register.
         self._include_vars_layer = {}
         self._untrusted_runtime_vars = set()
+        self._facts_gathered = False
         self.native_only = bool(native_only)
         self._task_provenance = {}
         self.skip_run_once = bool(skip_run_once)
@@ -1851,8 +1867,8 @@ class Runtime:
                     pass
 
     # ---- context / templating -------------------------------------------
-    def ctx(self, *overlays):
-        d = dict(self.vars)
+    def ctx(self, *overlays, base=None):
+        d = dict(self.vars if base is None else base)
         for o in overlays:
             if o:
                 d.update(o)
@@ -2241,7 +2257,7 @@ class Runtime:
                 return
         # Play templates resolve when consumed, after task precedence is applied.
         self.vars.update(self.template_vars(
-            play.get("vars"), self.ctx(), dynamic=True))
+            self._with_deferred_vars_files(play), self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
         # precedence than play vars and keep it for later plays in the run.
         self.vars.update(self._include_vars_layer)
@@ -2444,6 +2460,54 @@ class Runtime:
         ctx.update(self.extra_vars)
         self._pin_magic_vars(ctx)
         return ctx
+
+    def _with_deferred_vars_files(self, play):
+        """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
+        files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
+        play_vars = dict(play.get("vars") or {})
+        # Ansible renders these names before merging set_fact and register results, so they cannot see them.
+        base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        for entry in play.get("deferred_vars_files") or ():
+            ctx = self.ctx(play_vars, self.extra_vars, base=base)
+            item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
+            for raw in entry["names"]:
+                try:
+                    name = _fail_on_undef(self.template(raw, ctx))
+                except jinja2.UndefinedError as ex:
+                    if self.vars.get("module_setup") or self._facts_gathered:
+                        raise VarsFilesError("an undefined variable was found when attempting to template the "
+                                             "vars_files item %r: %s" % (item, ex))
+                    sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
+                                     % (item,))
+                    break
+                except Exception as ex:
+                    raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
+                if not isinstance(name, str):
+                    continue
+                if name.startswith(os.path.sep):
+                    candidates = [name]
+                else:
+                    candidates = []
+                    for d in entry["dirs"]:
+                        if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
+                            candidates.append(os.path.join(d, entry["subdir"], name))
+                        candidates.append(os.path.join(d, name))
+                found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
+                if found:
+                    data = entry["files"][found[0]]
+                    if isinstance(data, dict):
+                        raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
+                    for value in data:
+                        play_vars.update(value)
+                    break
+            else:
+                # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
+                if not _core_at_least(2, 15):
+                    raise VarsFilesError("vars file %s was not found" % (item,))
+                # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
+                sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
+                                 % (item,))
+        return play_vars
 
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < host vars/facts/play vars
@@ -3826,6 +3890,7 @@ class Runtime:
         if isinstance(res.get("ansible_facts"), dict):
             res["ansible_facts"]["_ansible_facts_gathered"] = True
         self._absorb_facts({"action": "setup"}, res)
+        self._facts_gathered = True
         self.emit(node, "ok", res if self.on_result else {"changed": False})
         self._tally("ok")
         return True
@@ -4298,6 +4363,9 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         except MissingHandler as ex:
             sys.stderr.write("ERROR: %s\n" % ex)
             return 1
+        except VarsFilesError as ex:
+            sys.stderr.write("[ERROR]: %s\n" % ex)
+            return ex.rc
         finally:
             engine_profile["play_execution"] += time.monotonic() - play_started
             cleanup_started = time.monotonic()
