@@ -1066,7 +1066,6 @@ class _PlayVarScope(dict):
         self.strict = strict
         self.resolving = set()
         self.resolved = {}
-        self.accesses = 0
         view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
         self["vars"] = view(_vars_snapshot(ctx), self)
 
@@ -1076,7 +1075,6 @@ class _PlayVarScope(dict):
             return self.templater.resolve_variable(key, value, self, strict=self.strict)
         if not isinstance(value, _PlayVarTemplate):
             return value
-        self.accesses += 1
         if key in self.resolving:
             return _captured("Recursive loop detected in play variable: %s" % key)
         if key not in self.resolved:
@@ -1112,16 +1110,10 @@ class _PlayVarView(dict):
         return self[key] if key in self else default
 
     def items(self):
-        resolve = _core_at_least(2, 19)
-        for key in self:
-            # A value read from vars must retain its provenance even when
-            # legacy Ansible exposes the unresolved string on iteration.
-            self.scope.accesses += 1
-            yield key, self[key] if resolve else dict.__getitem__(self, key)
+        return dict.items(self)
 
     def values(self):
-        for _, value in self.items():
-            yield value
+        return dict.values(self)
 
     def copy(self):
         return _jinja_dict(self)
@@ -1132,6 +1124,14 @@ class _ModernPlayVarView(_PlayVarView):
 
     def __iter__(self):
         return dict.__iter__(self)
+
+    def items(self):
+        for key in self:
+            yield key, self[key]
+
+    def values(self):
+        for _, value in self.items():
+            yield value
 
     def __eq__(self, other):
         if isinstance(other, _PlayVarView):
@@ -1839,6 +1839,7 @@ class Runtime:
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
+        self._started_task_name = (None, None)
         self.templater = _Templater()
         self.templater._runtime = self
         self.handlers = []
@@ -2089,16 +2090,18 @@ class Runtime:
             ctx.update(self.extra_vars)
             self._pin_magic_vars(ctx)
             with self._strict_vars():
-                return _as_text(_fail_on_undef(self.template(name, ctx, strict=True))) or name
+                return str(_fail_on_undef(self.template(name, ctx, strict=True))) or name
         except Exception:
             return name
 
     def emit_start(self, node):
+        name = self._node_name(node)
+        self._started_task_name = (node, name)
         frame = {
             "_ansiroll": True,
             "runtime_id": node.get("runtime_id"),
             "uuid": node.get("uuid"),
-            "task": self._node_name(node),
+            "task": name,
             "action": node.get("action"),
         }
         if self.on_task_start:
@@ -2120,12 +2123,13 @@ class Runtime:
                 emitted_result["item"] = item
             if isinstance(result, dict) and "_ansible_item_label" in result:
                 emitted_result["_ansible_item_label"] = result["_ansible_item_label"]
+        started_node, name = self._started_task_name
         frame = {
             "_ansiroll": True,
             "host": self.host,
             "runtime_id": node.get("runtime_id"),
             "uuid": node.get("uuid"),
-            "task": self._node_name(node),
+            "task": name if started_node is node else self._node_name(node),
             "action": node.get("action"),
             "status": status,
             "ignored": ignored,
@@ -2486,7 +2490,9 @@ class Runtime:
         self._pin_magic_vars(higher_vars)
         ctx.pop(_HIGH_VARS_KEY, None)
         ctx.pop(_INCLUDE_PARAMS_KEY, None)
-        ctx.update(self.template_vars(task.get("vars"), ctx, higher_vars=higher_vars))
+        task_vars = {key: value for key, value in (task.get("vars") or {}).items()
+                     if key not in higher_vars}
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -4567,13 +4573,18 @@ def _chan_send(out_fd, obj):
         view = view[written:]
 
 
-def _delegate_vars(ctx):
+def _delegate_vars(ctx, templater=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
+    scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
     for key, value in (ctx or {}).items():
         if key == "vars":
             continue
         try:
+            if templater is not None and isinstance(value, _PlayVarTemplate):
+                value = scope[key]
+                if isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
+                    value = {"__ansiroll_unsafe__": str(value)}
             # Materialize lazy values once so sending the frame cannot
             # resolve the same context a second time.
             safe[key] = json.loads(json.dumps(value, default=str))
@@ -4645,10 +4656,14 @@ def agent_main():
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
+            # Controller-side template actions render the source on the controller,
+            # but only the agent has the play's bundled filters and lookup plugins.
+            action = (task.get("action") or "").rsplit(".", 1)[-1]
+            templater = rt.templater if action == "template" else None
             _chan_send(resp_fd, {"t": "delegate", "uuid": task.get("uuid"),
                                  "runtime_id": task.get("runtime_id"),
                                  "action": task.get("action"), "args": args,
-                                 "vars": _delegate_vars(ctx),
+                                 "vars": _delegate_vars(ctx, templater),
                                  "become": become, "to": task.get("delegate_to"),
                                  "become_user": rt.become_user,
                                  "check_mode": bool(rt.check_mode),

@@ -132,6 +132,51 @@ def test_task_names_render_role_parameters_and_keep_text_type():
     assert rt._node_name({"name": "Deploy {{ region }}", "role_params": {"region": "west"}}) == "Deploy west"
     assert rt._node_name({"name": "{{ 0 }}"}) == "0"
     assert rt._node_name({"name": "{{ 42 }}"}) == "42"
+    assert rt._node_name({"name": "{{ true }}"}) == "True"
+    assert rt._node_name({"name": "{{ none }}"}) == "None"
+
+
+def test_start_and_result_share_one_rendered_task_name():
+    rt = Runtime({}, "", {})
+    sequence = iter([1, 2])
+    rt.templater._strict_env.globals["next_name"] = lambda: next(sequence)
+    starts = []
+    results = []
+    rt.on_task_start = starts.append
+    rt.on_result = results.append
+    rt.run_play({"tasks": [_task("one", "{{ next_name() }}", "debug", when=[False])]})
+    assert starts[0]["task"] == results[0]["task"] == "1"
+    assert next(sequence) == 2
+
+
+def test_legacy_vars_items_and_values_are_sized(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.18.10")
+    rt = Runtime({}, "", {})
+    values = rt.template_vars({"source": "sample", "alias": "{{ source }}"}, {}, dynamic=True)
+    assert rt.template("{{ vars.items() | length }}", values) == 2
+    assert rt.template("{{ vars.values() | length }}", values) == 2
+
+
+def test_delegated_template_alias_uses_agent_filters():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["local_filter"] = lambda value: value.upper()
+    values = rt.template_vars({"alias": "{{ 'agent' | local_filter }}"}, {}, dynamic=True)
+    assert _delegate_vars(values, rt.templater)["alias"] == "AGENT"
+
+
+def test_overridden_include_var_does_not_eagerly_consume_its_lookup():
+    rt = Runtime({}, "", {})
+    calls = []
+    rt.templater.env.globals["measure"] = lambda: calls.append("read") or True
+    include = {"type": "include", "vars": {"enabled": "{{ measure() }}"}, "when": ["enabled"]}
+    ctx = rt._task_ctx(include, {})
+    assert calls == []
+    assert rt._task_gate(include, ctx)[0] is None
+    assert calls == ["read"]
 
 
 def test_debug_result_is_always_visible_to_ansible_callbacks():
