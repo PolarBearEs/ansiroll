@@ -991,6 +991,7 @@ class _LazyTplDict(dict):
             return self._ctx
         ctx = dict(self._ctx)
         ctx.update(self._rt.vars)
+        self._rt._pin_magic_vars(ctx)
         return ctx
 
     def __getitem__(self, k):
@@ -1051,6 +1052,7 @@ class _LazyTplList(list):
             return self._ctx
         ctx = dict(self._ctx)
         ctx.update(self._rt.vars)
+        self._rt._pin_magic_vars(ctx)
         return ctx
 
     def __getitem__(self, i):
@@ -1664,6 +1666,7 @@ class Runtime:
         self._play_var_templates = {}
         self._templated_play_vars = {}
         self._rebindable_play_vars = {}
+        self._playbook_dir = None
         self._runtime_var_overrides = set(self.extra_vars)
         # The controller passes its nonpersistent fact cache separately from
         # the flattened host snapshot. Those values (set_fact/register) outrank
@@ -1719,12 +1722,18 @@ class Runtime:
         for o in overlays:
             if o:
                 d.update(o)
+        self._pin_magic_vars(d)
         d.setdefault("omit", _OMIT)
         if "hostvars" not in d:
             d["hostvars"] = {self.host: dict(d)}
         if "vars" not in d:
             d["vars"] = _vars_snapshot(d)
         return d
+
+    def _pin_magic_vars(self, ctx):
+        # Ansible ranks playbook_dir above play, block and task vars, set_fact and registers.
+        if self._playbook_dir:
+            ctx["playbook_dir"] = self._playbook_dir
 
     def _store_register(self, task, result):
         name = task.get("register")
@@ -1778,6 +1787,7 @@ class Runtime:
         d = d or {}
         base = dict(ctx)
         base.update(d)
+        self._pin_magic_vars(base)
         out = {}
         legacy = _legacy_non_native(base)
         for k, v in d.items():
@@ -2035,6 +2045,8 @@ class Runtime:
     # ---- execution -------------------------------------------------------
     def run_play(self, play, defer_handlers=False, initial_notified=None):
         invocation_check_mode = self.check_mode
+        self._playbook_dir = play.get("playbook_dir")
+        self._pin_magic_vars(self.vars)
         play_check_mode = play.get("check_mode")
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):
@@ -2093,6 +2105,7 @@ class Runtime:
         # Extra-vars have the highest Ansible precedence; play vars must not
         # overwrite values injected via -e.
         self.vars.update(self.extra_vars)
+        self._pin_magic_vars(self.vars)
         try:
             self.run_nodes(play.get("tasks", []), {}, play.get("become", False))
         except TaskFailed as ex:
@@ -2254,12 +2267,14 @@ class Runtime:
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
+        self._pin_magic_vars(ctx)
         task_vars = self.template_vars(task.get("vars"), ctx)
         ctx.update(task_vars)
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
         self._rebind_play_vars(ctx, set(task.get("role_vars") or ()).union(
             overlay, task_vars or (), task.get("role_magic") or ()))
+        self._pin_magic_vars(ctx)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -2316,7 +2331,8 @@ class Runtime:
         if not self._rebindable_play_vars:
             return
         refs = {key: names for key, names in self._play_var_refs().items()
-                if key not in overrides and key not in self._runtime_var_overrides}
+                if key not in overrides and key not in self._runtime_var_overrides
+                and not (key == "playbook_dir" and self._playbook_dir)}
         stale = []
         grew = True
         while grew:
@@ -2361,9 +2377,10 @@ class Runtime:
             return
         for _ in range(3):
             ctx = dict(self.vars)
+            self._pin_magic_vars(ctx)
             changed = False
             for key, raw in self._play_var_templates.items():
-                if key in self._runtime_var_overrides:
+                if key in self._runtime_var_overrides or (key == "playbook_dir" and self._playbook_dir):
                     continue
                 rendered = self.templater.render_string(raw, ctx)
                 try:
@@ -2869,8 +2886,15 @@ class Runtime:
 
     @staticmethod
     def _baked_source_key(task, src):
+        if isinstance(src, str) and os.path.isabs(src):
+            # Dynamic absolute sources are baked with repeated separators collapsed.
+            if src not in (task.get("_baked") or {}):
+                collapsed = re.sub(r"/+", "/", src)
+                if collapsed in (task.get("_baked") or {}):
+                    return collapsed
+            return src
         # Role trees are baked under paths relative to files/ or templates/.
-        if not task.get("_baked_tree") or not isinstance(src, str) or os.path.isabs(src):
+        if not task.get("_baked_tree") or not isinstance(src, str):
             return src
         parts = src.split("/")
         if parts[-1] in ("", ".", ".."):
