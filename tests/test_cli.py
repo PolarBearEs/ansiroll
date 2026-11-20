@@ -65,11 +65,27 @@ def test_stdout_compile_rejects_manifest_alias():
     assert b"manifest path points to stdout" in result.stderr
 
 
+@pytest.mark.parametrize("destination", ["pipe", "file"])
+def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
+    path = tmp_path / "compiled.py"
+    with path.open("wb") as stream:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", "play.yml", "-o", "-"],
+            stdout=subprocess.PIPE if destination == "pipe" else stream,
+            stderr=subprocess.STDOUT,
+        )
+
+    assert result.returncode == 2
+    output = result.stdout if destination == "pipe" else path.read_bytes()
+    assert output == b"ansiroll: compile -o - requires separate stdout and stderr streams\n"
+
+
 def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys):
     manifest = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
     output = tmp_path / "compiled.py"
-    output.touch(mode=0o640)
+    output.touch()
+    output.chmod(0o640)
 
     assert cli.main(["compile", "play.yml", "-o", str(output)]) == 0
 

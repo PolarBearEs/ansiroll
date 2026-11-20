@@ -57,6 +57,9 @@ python3 -m ansiroll.cli compile playbook.yml -o - | python3 -
 
 Configure any Python startup hooks, such as `sitecustomize`, to send their
 messages to stderr so they cannot add text to the pipeline before Ansiroll runs.
+When Ansiroll and Ansible are installed in the interpreter's environment, use
+`python3 -I -m ansiroll.cli` to ignore startup hooks from `PYTHONPATH` and the
+user site directory.
 
 Compile-time extra vars can optionally remove branches that are provably
 unreachable. Unknown conditions are retained, and the resulting artifact rejects

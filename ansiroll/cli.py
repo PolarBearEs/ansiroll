@@ -78,6 +78,11 @@ def _manifest_for_stdout(path, stdout_fd):
 
 def _cmd_compile_stdout(args):
     try:
+        stdout_stat = os.fstat(1)
+        if ((stat.S_ISFIFO(stdout_stat.st_mode) or stat.S_ISREG(stdout_stat.st_mode)
+             or stat.S_ISSOCK(stdout_stat.st_mode))
+                and os.path.samestat(stdout_stat, os.fstat(2))):
+            raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:
             # Keep inherited stdout and native buffers on stderr through CLI exit.
