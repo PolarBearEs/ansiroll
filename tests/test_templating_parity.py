@@ -1552,3 +1552,84 @@ def test_mapping_keys_stay_literal(tmp_path):
         msg: "{{ mapping.keys() | list | sort | join(',') }}"
 """)
     assert msgs == ["{{ label }},{{ label }}-literal"]
+
+
+def test_play_vars_see_task_vars_include_params_and_loop_bindings(tmp_path):
+    msgs, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    env: prod
+    alias: "{{ env }}"
+    chained: "{{ alias }}-x"
+  tasks:
+    - debug: msg="{{ alias }} {{ chained }}"
+    - debug: msg="{{ alias }} {{ chained }}"
+      vars: {env: task}
+    - debug: msg="{{ alias }} {{ chained }}"
+      loop: [loop]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }} {{ chained }}"
+      vars: {env: task}
+      loop: [a]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }}"
+      vars: {alias: own}
+      loop: [b]
+      loop_control: {loop_var: env}
+    - include_tasks: inc.yml
+      vars: {env: param}
+    - include_tasks: inc.yml
+      loop: [incloop]
+      loop_control: {loop_var: env}
+    - debug: msg="{{ alias }} {{ chained }}"
+""", {"inc.yml": '- debug: msg="{{ alias }} {{ chained }}"\n'})
+    assert msgs == ["prod prod-x", "task task-x", "loop loop-x", "a a-x", "own",
+                    "param param-x", "incloop incloop-x", "prod prod-x"]
+
+
+def test_rebound_play_vars_keep_loop_vars_order_explicit_overrides_and_indirect_reads(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    full: "{{ env }}-{{ alias }}"
+    pkg: "{{ env }}"
+    alias: "{{ env }}"
+    debug_mode: "{{ env != 'prod' }}"
+    cfg: {name: "{{ env }}"}
+    indirect: "{{ vars['env'] }}"
+    env: prod
+  tasks:
+    - debug: msg="{{ full }} {{ cfg.name }} {{ indirect }}"
+      vars: {env: task}
+    - debug: msg="{{ pkg }}"
+      vars: {env: task}
+      loop: [a, b]
+      loop_control: {loop_var: pkg}
+    - debug: msg="debug={{ debug_mode }}"
+      vars: {env: dev, debug_mode: false}
+""")
+    assert msgs == ["task-task task task", "a", "b", "debug=False"]
+
+
+def test_rebound_indirect_and_container_play_vars_follow_chains_declared_before_them(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    outer: "{{ lookup('vars', 'via_indirect') }}"
+    via_indirect: "{{ indirect }}"
+    indirect: "{{ lookup('vars', 'alias') }}"
+    cfg: {name: "{{ alias }}"}
+    alias: "{{ env }}"
+    env: prod
+    a: "{{ a_ind }}"
+    a_ind: "{{ lookup('vars', 'b') }}"
+    b: "{{ b_ind }}"
+    b_ind: "{{ lookup('vars', 'env') }}"
+  tasks:
+    - debug: msg="{{ indirect }} {{ cfg.name }} {{ via_indirect }} {{ outer }} {{ a }}"
+      vars: {env: task}
+""")
+    assert msgs == ["task task task task task"]
