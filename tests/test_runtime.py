@@ -1014,9 +1014,65 @@ def test_uncaught_failure_tallies_and_stops():
 def test_handler_notify_and_flush():
     tasks = [_task("1", "trigger", "debug", args={"msg": "x"},
                    changed_when=["true"], notify=["h1"])]
+    flush = {"type": "task", "uuid": "f", "name": "Flush handlers",
+             "action": "meta", "special": "meta_flush_handlers"}
     handlers = [_task("h", "h1", "debug", args={"msg": "handled"})]
-    rt, frames = run(tasks, handlers=handlers)
+    rt, frames = run(tasks + [flush], handlers=handlers)
     assert "h1" in [f["task"] for f in frames]
+
+
+def test_handler_name_is_cached_for_all_aliases_until_next_play(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.20.1")
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rendered = iter(("first", "second"))
+    rt.templater._strict_env.globals["next_name"] = lambda: next(rendered)
+    raw_name = "run {{ next_name() }}"
+    handlers = [_task("h", raw_name, "debug", args={"msg": "handled"},
+                      handler_names=[raw_name, "r : " + raw_name])]
+
+    for name in ("first", "second"):
+        tasks = [_task("notify", "trigger", "debug", args={"msg": "notifying"},
+                       changed_when=["true"], notify=["r : run " + name, "run " + name])]
+        tasks.append(_task("flush", "Flush handlers", "meta_flush_handlers", action="meta"))
+        rt.run_play({"tasks": tasks, "handlers": handlers, "gather_facts": False})
+
+    handled = [frame["task"] for frame in frames if frame["result"].get("msg") == "handled"]
+    assert handled == ["run first", "run second"]
+
+
+def _force_handlers_play(force):
+    flush = {"type": "task", "uuid": "f", "name": "Flush handlers",
+             "action": "meta", "special": "meta_flush_handlers"}
+    return {
+        "tasks": [
+            _task("1", "trigger", "debug", args={"msg": "x"},
+                  changed_when=["true"], notify=["h1"]),
+            _task("2", "boom", "fail", args={"msg": "boom"}),
+            flush,
+        ],
+        "handlers": [_task("h", "h1", "debug", args={"msg": "handled"})],
+        "gather_facts": False, "vars": {}, "force_handlers": force,
+    }
+
+
+@pytest.mark.parametrize("version,force,ran", [
+    ("2.13.13", True, True),
+    ("2.13.13", False, False),
+    # 2.14+: play.compile() wraps sections in an `always` flush instead, so
+    # a bare task list without that wrapper flushes nothing after a failure.
+    ("2.14.0", True, False),
+])
+def test_legacy_force_handlers_flushes_after_failure(monkeypatch, version, force, ran):
+    import ansiroll.runtime as runtime_mod
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.run_play(_force_handlers_play(force))
+    assert rt.failed
+    assert bool(by_name(frames, "h1")) is ran
 
 
 def test_assert_pass_and_fail():

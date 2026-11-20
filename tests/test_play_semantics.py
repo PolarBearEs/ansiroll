@@ -14,6 +14,9 @@ import sys
 import textwrap
 
 import pytest
+from packaging.version import Version
+
+from tests.run_official_suite import parse_task_trace
 
 pytest.importorskip("ansible")
 from ansible.release import __version__
@@ -102,6 +105,127 @@ def check(tmp_path, files, args=(), strategy=True):
     if strategy:
         assert _ansible(tmp_path, args, "ansiroll.core.ansiroll") == expected
     return expected
+
+
+def test_handlers_run_in_definition_order_with_chains_and_listen(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              notify: [h2, h1, topic, hb]
+          handlers:
+            - name: h0
+              debug: msg=H0_RAN
+            - name: h1
+              debug: msg=H1_RAN
+              changed_when: true
+              notify: h3
+            - name: h2
+              debug: msg=H2_RAN
+              changed_when: true
+              notify: h0
+            - name: hb
+              debug: msg=HB_RAN
+              listen: topic
+            - name: h3
+              debug: msg=H3_RAN
+        """})
+    assert msgs == ['"H1_RAN"', '"H2_RAN"', '"HB_RAN"', '"H3_RAN"', '"H0_RAN"']
+
+
+@pytest.mark.parametrize("skip_always", [False, True])
+def test_tag_selected_role_respects_implicit_flush_tag_rules(tmp_path, skip_always):
+    handler_runs = not skip_always or Version(__version__) < Version("2.19.4")
+    _write(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles:
+                - {role: tagged, tags: selected}
+              post_tasks:
+                - name: verify implicit flush
+                  assert:
+                    that: (role_handler_ran | default(false)) == %s
+                  tags: selected
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - debug: msg="handler ran {{ role_handler_ran | default(false) }}"
+                  tags: selected
+        """ % str(handler_runs).lower(),
+        "roles/tagged/tasks/main.yml": """
+            - command: /bin/true
+              notify: record handler
+        """,
+        "roles/tagged/handlers/main.yml": """
+            - name: record handler
+              set_fact: {role_handler_ran: true}
+        """,
+    })
+    args = ("--tags", "selected")
+    if skip_always:
+        args += ("--skip-tags", "always")
+    expected = _ansible_run(tmp_path, args)
+    assert expected.returncode == 0, expected.stdout + expected.stderr
+    actual = _ansible_run(tmp_path, args, "ansiroll.core.ansiroll")
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    messages, recap = _summary(actual.stdout)
+    assert recap == _summary(expected.stdout)[1]
+    assert parse_task_trace(actual.stdout) == parse_task_trace(expected.stdout)
+    assert messages == ['"handler ran %s"' % handler_runs]
+
+
+def test_handler_chain_notified_backwards_during_final_flush(tmp_path):
+    check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          post_tasks:
+            - command: /bin/true
+              notify: [h3]
+          handlers:
+            - {name: h0, debug: msg=H0}
+            - {name: h1, debug: msg=H1, changed_when: true, notify: h0}
+            - {name: h2, debug: msg=H2, changed_when: true, notify: h1}
+            - {name: h3, debug: msg=H3, changed_when: true, notify: h2}
+        """})
+
+
+@pytest.mark.parametrize("topic", ["r_topic", "r : r_topic"])
+def test_listen_and_include_role_handlers(tmp_path, topic):
+    files = {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: name=r
+                - command: /bin/true
+                  notify: [r_handler, "%s", plain_topic]
+              handlers:
+                - name: real name
+                  debug: msg=PLAY_LISTEN_RAN
+                  listen: plain_topic
+            """ % topic,
+        "roles/r/tasks/main.yml": """
+            - command: /bin/true
+              notify: r_handler
+            """,
+        "roles/r/handlers/main.yml": """
+            - name: r_handler
+              debug: msg=R_HANDLER_RAN
+            - name: r_listener
+              debug: msg=R_LISTEN_RAN
+              listen: r_topic
+            """,
+    }
+    if CORE_VERSION < (2, 17) and topic != "r_topic":
+        _write(tmp_path, files)
+        for out in [_ansible_run(tmp_path, ()), _standalone_run(tmp_path, ())]:
+            assert out.returncode != 0
+            assert "The requested handler 'r : r_topic' was not found" in out.stdout + out.stderr
+        return
+    msgs, _ = check(tmp_path, files)
+    assert msgs == ['"PLAY_LISTEN_RAN"', '"R_HANDLER_RAN"', '"R_LISTEN_RAN"']
 
 
 def test_variable_precedence(tmp_path):
@@ -352,10 +476,210 @@ def test_task_aliases_see_role_parameter_and_include_precedence(tmp_path):
     assert messages == ['"param param"', '"INCLUDE_FILE"', '"ROLE_FILE"']
 
 
+def test_include_tasks_handler_runs_its_body(tmp_path):
+    messages, recap = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                - debug: {msg: notifying}
+                  changed_when: true
+                  notify: ["r : expanded handler", expanded topic, skipped handler]
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: expanded handler
+              include_tasks: handler.yml
+              listen: expanded topic
+              vars: {handler_message: included}
+            - name: skipped handler
+              include_tasks: handler.yml
+              when: false
+        """,
+        "roles/r/tasks/handler.yml": '- debug: {msg: "{{ handler_message }}"}',
+    })
+    assert messages == ['"notifying"', '"included"']
+    assert recap[4] == "1"
+
+
+def test_role_loop_registers_later_handlers_before_first_body(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                  loop: [first, second]
+                  loop_control: {loop_var: invocation}
+        """,
+        "roles/r/tasks/main.yml": """
+            - debug: msg="{{ invocation }}"
+              changed_when: true
+              notify: run second
+              when: invocation == 'first'
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: "run {{ invocation }}"
+              debug: msg="handler {{ invocation }}"
+        """,
+    })
+    assert messages == ['"first"', '"handler second"']
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 18), reason="break_when was added in ansible-core 2.18")
+def test_role_loop_stops_registering_handlers_on_break_when(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                  loop: [first, second]
+                  loop_control:
+                    loop_var: invocation
+                    break_when: invocation == 'first'
+        """,
+        "roles/r/tasks/main.yml": """
+            - debug: msg="{{ invocation }}"
+              changed_when: true
+              notify: run
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: run
+              debug: msg="handler {{ invocation }}"
+        """,
+    })
+    assert messages == ['"first"', '"handler first"']
+
+
+def test_dynamic_role_handler_inherits_apply_directives(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role:
+                    name: r
+                    apply:
+                      when: false
+                - debug: msg=notify
+                  changed_when: true
+                  notify: run
+        """,
+        "roles/r/handlers/main.yml": "- name: run\n  debug: msg=handler",
+    })
+    assert messages == ['"notify"']
+
+
+def test_dynamic_role_handler_resolves_include_params_from_handler_vars(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                  vars:
+                    message: "{{ suffix }}"
+                - debug: msg=notify
+                  changed_when: true
+                  notify: run
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: run
+              vars: {suffix: handler}
+              debug: msg="{{ message }}"
+        """,
+    })
+    assert messages == ['"notify"', '"handler"']
+
+
+def test_expanded_task_handler_passes_apply_vars_to_children(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                - debug: msg=notify
+                  changed_when: true
+                  notify: run
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: run
+              include_tasks:
+                file: show.yml
+                apply:
+                  vars: {message: applied}
+        """,
+        "roles/r/tasks/show.yml": '- debug: {msg: "{{ message }}"}',
+    })
+    assert messages == ['"notify"', '"applied"']
+
+
+def test_legacy_child_handler_preserves_unsafe_play_role_defaults(tmp_path):
+    if CORE_VERSION >= (2, 15):
+        pytest.skip("legacy child handlers infer defaults from play roles")
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars: {sentinel: expanded}
+              roles: [parent]
+        """,
+        "roles/parent/defaults/main.yml": 'literal: !unsafe "{{ sentinel }}"\n',
+        "roles/parent/tasks/main.yml": """
+            - include_role: {name: child}
+        """,
+        "roles/child/tasks/main.yml": """
+            - debug: {msg: notifying}
+              changed_when: true
+              notify: child handler
+        """,
+        "roles/child/handlers/main.yml": """
+            - name: child handler
+              debug: {msg: "{{ literal }}"}
+        """,
+    })
+    assert messages == ['"notifying"', '"{{ sentinel }}"']
+
+
 def _run_mode(tmp_path, mode):
     if mode == "standalone":
         return _standalone_run(tmp_path, ())
     return _ansible_run(tmp_path, (), "ansiroll.core.ansiroll" if mode == "strategy" else None)
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+@pytest.mark.parametrize("loop", ["", "loop: [first, second]"])
+@pytest.mark.parametrize("notify", [
+    "run {{ missing_notification }}", "{{ config.handler }}",
+    "{{ notification_value }}", "{{ notification_alias }}",
+])
+def test_invalid_notify_fails_before_dispatch(tmp_path, mode, loop, notify):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            config: {handler: "run {{ missing_notification }}"}
+            notification_alias: "{{ notification_value }}"
+            notification_value: "run {{ missing_notification }}"
+          tasks:
+            - shell: echo attempt >> attempts
+              notify: "{{ missing_notification }}"
+              when: false
+            - shell: echo attempt >> attempts
+              notify: "%s"
+              %s
+              changed_when: false
+              ignore_errors: true
+            - debug: msg=AFTER_NOTIFY
+        """ % (notify, loop)})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode == 0, output
+    assert "missing_notification" in output
+    assert not (tmp_path / "attempts").exists()
+    assert _summary(output) == (['"AFTER_NOTIFY"'], ("2", "0", "0", "0", "1", "0", "1"))
 
 
 def _reject_setup_become(tmp_path, monkeypatch):
@@ -379,6 +703,391 @@ SETUP_FAILURE = """
   tasks:
     - debug: msg=NEXT_PLAY
 """
+
+
+def test_nested_dynamic_role_inherits_parent_params_in_tasks_and_handlers(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles:
+                - {role: parent, value: parent_param}
+            """,
+        "roles/parent/tasks/main.yml": """
+            - set_fact: {value: fact}
+            - include_role: {name: child}
+            """,
+        "roles/child/tasks/main.yml": """
+            - debug: msg="task {{ value }}"
+              changed_when: true
+              notify: child_handler
+            """,
+        "roles/child/handlers/main.yml": """
+            - name: child_handler
+              debug: msg="handler {{ value }}"
+            """,
+    })
+    assert msgs == ['"task parent_param"', '"handler parent_param"']
+
+
+def test_nested_dynamic_role_handler_resolves_invocation_with_parent_default(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles: [parent]
+            """,
+        "roles/parent/defaults/main.yml": "fallback_value: owner_default",
+        "roles/parent/vars/main.yml": "outer_value: outer",
+        "roles/parent/tasks/main.yml": """
+            - include_role: {name: child}
+              vars: {value: "{{ fallback_value }}:{{ outer_value }}"}
+            """,
+        "roles/child/tasks/main.yml": """
+            - debug: msg="task {{ value }}"
+              changed_when: true
+              notify: run child
+            """,
+        "roles/child/handlers/main.yml": """
+            - name: run {{ role_name }}
+              debug: msg="handler {{ value }}"
+            """,
+    })
+    assert msgs == ['"task owner_default:outer"', '"handler owner_default:outer"']
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+def test_handler_name_uses_play_vars_without_host_facts(tmp_path, monkeypatch, mode):
+    monkeypatch.setenv("ANSIBLE_ERROR_ON_MISSING_HANDLER", "False")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            suffix: "{{ alias }}"
+            alias: play
+          tasks:
+            - set_fact: {suffix: fact, host_only: target}
+            - debug: msg=trigger
+              changed_when: true
+              notify: [run PLAY, run TARGET]
+          handlers:
+            - name: run {{ suffix | upper }}
+              debug: msg="play handler sees {{ suffix }}"
+            - name: run {{ host_only | upper }}
+              debug: msg=HOST_HANDLER_RAN
+        """})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    if CORE_VERSION < (2, 12):
+        assert out.returncode != 0, output
+        assert "'host_only' is undefined" in output
+        assert "HOST_HANDLER_RAN" not in output
+        return
+    assert out.returncode == 0, output
+    assert "The requested handler 'run TARGET' was not found" in output
+    assert _summary(output)[0] == ['"trigger"', '"play handler sees fact"']
+
+
+def test_handler_name_can_explicitly_read_live_hostvars(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - set_fact: {suffix: live}
+            - debug: msg=trigger
+              changed_when: true
+              notify: run live
+          handlers:
+            - name: run {{ hostvars['localhost'].suffix }}
+              debug: msg=handler
+        """})
+    expected = _ansible(tmp_path, [])
+    assert expected[0] == ['"trigger"', '"handler"']
+    assert _ansible(tmp_path, [], "ansiroll.core.ansiroll") == expected
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="modern template trust and handler matching")
+def test_handler_matching_skips_render_errors_and_respects_unsafe_names(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - debug: msg=trigger
+              changed_when: true
+              notify: [run good, literal topic]
+          handlers:
+            - name: "run {{ 1 // 0 }}"
+              debug: msg=broken
+            - name: !unsafe "run {{ 'good' }}"
+              listen: literal topic
+              debug: msg=literal
+            - name: run good
+              debug: msg=good
+    """})
+    assert messages == ['"trigger"', '"literal"', '"good"']
+
+
+@pytest.mark.parametrize("looped", [False, True])
+def test_dynamic_role_handler_keeps_invocation_vars(tmp_path, looped):
+    if looped:
+        invocation = """
+      vars: {value: "from_{{ role_item }}"}
+      loop: [first, last]
+      loop_control: {loop_var: role_item}
+        """.rstrip()
+        expected = '"from_last / last"'
+    else:
+        invocation = '\n      vars: {value: "{{ latest }}"}'
+        expected = '"from_include / no item"'
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {latest: before_include}
+  tasks:
+    - include_role: {name: r}%s
+    - set_fact: {latest: from_include}
+    - debug: msg=trigger
+      changed_when: true
+      notify: run_role_handler
+            """ % invocation,
+        "roles/r/tasks/main.yml": """
+            - debug: msg=ROLE_TASK
+            """,
+        "roles/r/handlers/main.yml": """
+            - name: run_role_handler
+              debug:
+                msg: "{{ value | default('missing') }} / {{ role_item | default('no item') }}"
+            """,
+    })
+    assert msgs[-1] == expected
+
+
+def test_same_named_dynamic_handler_respects_binding_version(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - debug: msg=trigger
+                  changed_when: true
+                  notify: restart
+                - include_role: name=r
+              handlers:
+                - name: restart
+                  debug: msg=PLAY_HANDLER
+            """,
+        "roles/r/tasks/main.yml": "- debug: msg=ROLE_TASK",
+        "roles/r/handlers/main.yml": """
+            - name: restart
+              debug: msg=ROLE_HANDLER
+            """,
+    })
+    assert msgs[-1] == ('"ROLE_HANDLER"' if CORE_VERSION >= (2, 15) else '"PLAY_HANDLER"')
+
+
+def test_duplicate_handler_names_follow_block_order(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              roles: [static_role]
+              handlers:
+                - name: direct
+                  debug: msg=PLAY_FIRST
+                - name: direct
+                  debug: msg=PLAY_SECOND
+                - name: listener
+                  listen: topic
+                  debug: msg=PLAY_LISTENER_FIRST
+                - name: listener
+                  listen: topic
+                  debug: msg=PLAY_LISTENER_SECOND
+              tasks:
+                - name: Notify play handler
+                  debug: msg=NOTIFY_PLAY
+                  changed_when: true
+                  notify: direct
+                - meta: flush_handlers
+                - include_role: {name: dynamic_role}
+                - name: Notify dynamic handler and listeners
+                  debug: msg=NOTIFY_DYNAMIC
+                  changed_when: true
+                  notify: [direct, topic]
+        """,
+        "roles/static_role/handlers/main.yml": """
+            - name: direct
+              debug: msg=STATIC_DIRECT
+            - name: listener
+              listen: topic
+              debug: msg=STATIC_LISTENER
+        """,
+        "roles/dynamic_role/handlers/main.yml": """
+            - name: direct
+              debug: msg=DYNAMIC_FIRST
+            - name: direct
+              debug: msg=DYNAMIC_SECOND
+            - name: listener
+              listen: topic
+              debug: msg=DYNAMIC_LISTENER_FIRST
+            - name: listener
+              listen: topic
+              debug: msg=DYNAMIC_LISTENER_SECOND
+        """,
+    })
+    expected = ['"NOTIFY_PLAY"', '"PLAY_FIRST"', '"NOTIFY_DYNAMIC"']
+    if CORE_VERSION < (2, 15):
+        expected += ['"STATIC_LISTENER"', '"PLAY_LISTENER_FIRST"', '"PLAY_LISTENER_SECOND"']
+    expected += ['"DYNAMIC_FIRST"', '"DYNAMIC_LISTENER_FIRST"']
+    if CORE_VERSION < (2, 15):
+        expected.append('"DYNAMIC_LISTENER_SECOND"')
+    assert msgs == expected
+
+
+def test_tree_shake_preserves_dynamic_role_handlers(tmp_path):
+    _write(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars:
+                shadowed: play
+              tasks:
+                - include_tasks: nested.yml
+                - debug: msg=BEFORE_NOTIFY
+                - debug:
+                    msg: notifying
+                  changed_when: true
+                  notify: [ping handler, slurp handler, disabled handler]
+                - meta: flush_handlers
+                - debug:
+                    msg: "{{ ping_result.ping }} {{ slurp_result.content | b64decode }} {{ shadowed }}"
+        """,
+        "nested.yml": "- include_role: {name: dynamic_role}",
+        "roles/dynamic_role/handlers/main.yml": """
+            - name: ping handler
+              ping: {data: PONG}
+              register: ping_result
+            - name: slurp handler
+              slurp:
+                src: "{{ fixture_path }}"
+              register: slurp_result
+            - name: disabled handler
+              find: {paths: .}
+              when: disabled
+            - name: unused handler
+              set_fact: {shadowed: handler}
+        """,
+        "payload.txt": "PAYLOAD",
+    })
+    args = ["-e", json.dumps({"fixture_path": str(tmp_path / "payload.txt"), "disabled": False})]
+    expected = _ansible_run(tmp_path, args)
+    assert expected.returncode == 0, expected.stdout + expected.stderr
+    actual = _standalone_run(tmp_path, args, [
+        "--tree-shake", "--freeze-playbook-vars", "--manifest", "manifest.json",
+    ])
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    assert _summary(actual.stdout) == _summary(expected.stdout)
+    handler_calls = re.findall(r"^RUNNING HANDLER \[([^\]]+)\]", expected.stdout, re.M)
+    assert [name.split(" : ")[-1] for name in handler_calls] == [
+        "ping handler", "slurp handler", "disabled handler",
+    ]
+    trace = parse_task_trace(actual.stdout)
+    for name, status in (("ping handler", "ok"), ("slurp handler", "ok"),
+                         ("disabled handler", "skipped")):
+        assert trace[(name, "localhost", status)] == 1
+    assert '"PONG PAYLOAD play"' in _summary(actual.stdout)[0]
+    assert "unused handler" not in actual.stdout
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert any(name.split(".")[-1] == "ping" for name in manifest["modules"])
+    assert any(name.split(".")[-1] == "slurp" for name in manifest["accelerated_only_modules"])
+    assert any(name.split(".")[-1] == "find" for name in manifest["tree_shake"]["removed_modules"])
+    assert "shadowed" in manifest["tree_shake"]["skipped_playbook_vars"]
+
+
+def test_tree_shake_preserves_unresolved_handler_condition_before_false(tmp_path):
+    _write(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                - debug: {msg: notifying}
+                  changed_when: true
+                  notify: conditional handler
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: conditional handler
+              debug: {msg: unexpected}
+              when: [missing_flag, false]
+        """,
+    })
+    for result in (_ansible_run(tmp_path, ()),
+                   _standalone_run(tmp_path, (), ["--tree-shake", "--freeze-playbook-vars"])):
+        assert result.returncode != 0
+        assert "missing_flag" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("error_on_missing", [True, False])
+def test_notification_validated_before_role_handler_loads(tmp_path, monkeypatch, error_on_missing):
+    monkeypatch.setenv("ANSIBLE_ERROR_ON_MISSING_HANDLER", str(error_on_missing))
+    _write(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars: {topic: later_handler}
+              tasks:
+                - debug: msg=trigger
+                  changed_when: true
+                  notify: "{{ topic }}"
+                - include_role: name=r
+            """,
+        "roles/r/tasks/main.yml": "- debug: msg=ROLE_LOADED",
+        "roles/r/handlers/main.yml": """
+            - name: later_handler
+              debug: msg=HANDLER_RAN
+            """,
+    })
+    # include_role uses the strategy's linear fallback. The additional playbook
+    # below exercises the same immediate error through the shipped agent.
+    for out in [_ansible_run(tmp_path, ()), _standalone_run(tmp_path, ())]:
+        output = out.stdout + out.stderr
+        assert "The requested handler 'later_handler' was not found" in output
+        assert "HANDLER_RAN" not in output
+        assert (out.returncode != 0) == error_on_missing
+        assert ('"ROLE_LOADED"' in output) == (not error_on_missing)
+
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - debug: msg=trigger
+              changed_when: true
+              notify: missing
+            - debug: msg=NEXT_TASK
+        """})
+    for strategy in [None, "ansiroll.core.ansiroll"]:
+        out = _ansible_run(tmp_path, (), strategy)
+        output = out.stdout + out.stderr
+        assert "The requested handler 'missing' was not found" in output
+        assert (out.returncode != 0) == error_on_missing
+        assert ('"NEXT_TASK"' in output) == (not error_on_missing)
+
+
+def test_notification_names_resolve_for_each_loop_item(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              loop: [second, first]
+              notify: "handle {{ item }}"
+          handlers:
+            - name: handle first
+              debug: msg=FIRST_HANDLER
+            - name: handle second
+              debug: msg=SECOND_HANDLER
+        """})
+    assert msgs[-2:] == ['"FIRST_HANDLER"', '"SECOND_HANDLER"']
 
 
 def test_include_uses_own_parameters_before_its_condition(tmp_path):
@@ -412,6 +1121,51 @@ def test_role_magic_is_visible_when_resolving_task_aliases(tmp_path):
         """,
     })
     assert messages == ['"r"']
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="modern notification template trust")
+def test_notify_respects_unsafe_literals_and_null_results(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars: {suffix: rendered}
+          tasks:
+            - debug: {msg: no notification}
+              changed_when: true
+              notify: "{{ none }}"
+            - debug: {msg: literal notification}
+              changed_when: true
+              notify: !unsafe "run {{ suffix }}"
+          handlers:
+            - name: !unsafe "run {{ suffix }}"
+              debug: {msg: literal handler}
+            - name: run rendered
+              debug: {msg: wrong handler}
+    """})
+    assert messages == ['"no notification"', '"literal notification"', '"literal handler"']
+
+
+def test_role_loop_registers_only_matching_items(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars: {item: allowed}
+              tasks:
+                - include_role: {name: r}
+                  vars: {suffix: local, message: "{{ suffix }}"}
+                  loop: [allowed, skipped]
+                  when: item != 'skipped'
+                - debug: {msg: trigger}
+                  changed_when: true
+                  notify: show item
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: show item
+              debug: {msg: "{{ item }} / {{ message }}"}
+        """,
+    }, args=["-e", "suffix=extra"])
+    assert messages == ['"trigger"', '"allowed / extra"']
 
 
 def test_nested_role_include_keeps_enclosing_loop_binding(tmp_path):
