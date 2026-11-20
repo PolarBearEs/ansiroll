@@ -278,8 +278,60 @@ def _with_high_vars(overlay, values):
     return out
 
 
-def _normalized_facts(facts):
-    return {key[8:] if isinstance(key, str) and key.startswith("ansible_") else key: value
+def _override_ctx(task, res, ctx, template=None):
+    """Variables visible to changed_when/failed_when.
+
+    TaskExecutor exposes the registered result and any facts the action
+    returned, never the bare result keys (``rc``, ``stdout``...).
+    """
+    ectx = dict(ctx)
+    facts = res.get("ansible_facts")
+    action = (task.get("action") or "").rsplit(".", 1)[-1]
+    clean_action = action in ("set_fact", "include_vars")
+    modern_facts = _core_at_least(2, 21)
+    delegate_facts = False
+    if isinstance(facts, dict) and task.get("delegate_to") and (clean_action or modern_facts):
+        flag = task.get("delegate_facts")
+        delegate_facts = _to_bool(template(flag, ctx) if template else flag)
+    if isinstance(facts, dict) and action != "debug" and not delegate_facts:
+        config = ctx.get("__ansiroll_controller_config") or {}
+        if clean_action:
+            ectx.update(facts)
+        elif config.get("INJECT_FACTS_AS_VARS", True):
+            restricted = set(config.get("ansiroll_restricted_facts", ("inventory_hostname",)))
+            prefixes = tuple(config.get("ansiroll_connection_fact_prefixes", ()))
+            ectx.update({key: _without_internal_fact_keys(value) for key, value in facts.items()
+                         if key.startswith("ansible_ssh_host_key_")
+                         or (key not in restricted
+                             and not key.startswith(("_ansible_", "ansible_become_"))
+                             and not re.match(r"^ansible_.*_interpreter$", key)
+                             and (not key.startswith(prefixes)
+                                  or key.endswith(("_bridge", "_gwbridge"))))})
+        if not clean_action or (modern_facts and res.get("_ansible_facts_cacheable")):
+            existing = ctx.get("ansible_facts")
+            namespaced = _normalized_facts(facts, preserve_local=True)
+            if not modern_facts:
+                namespaced = {"ansible_facts": namespaced}
+            ectx["ansible_facts"] = _f_combine(
+                existing if isinstance(existing, dict) else {}, namespaced,
+                recursive=config.get("DEFAULT_HASH_BEHAVIOUR") == "merge")
+    if task.get("register"):
+        ectx[task["register"]] = res
+    return ectx
+
+
+def _without_internal_fact_keys(value):
+    if isinstance(value, dict):
+        return {key: _without_internal_fact_keys(item) for key, item in value.items()
+                if not (isinstance(key, str) and key.startswith("_ansible_"))}
+    if isinstance(value, list):
+        return [_without_internal_fact_keys(item) for item in value]
+    return value
+
+
+def _normalized_facts(facts, preserve_local=False):
+    return {key[8:] if isinstance(key, str) and key.startswith("ansible_")
+            and not (preserve_local and key == "ansible_local") else key: value
             for key, value in facts.items()}
 
 
@@ -1883,6 +1935,7 @@ class Runtime:
         self.notified = []  # ordered, de-duplicated pending notifications
         self._notified_handlers = set()  # indexes into self.handlers
         self._flushing = False
+        self._allow_broken_conditionals = None
         self._strict_var_resolution = False
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
@@ -2010,11 +2063,18 @@ class Runtime:
                 raise ConditionalError(_conditional_error_message(cond, ex, keyword))
         return True
 
+    def _broken_conditionals_allowed(self, ctx):
+        if self._allow_broken_conditionals is not None:
+            return self._allow_broken_conditionals
+        config = ctx.get("__ansiroll_controller_config") or {}
+        return _to_bool(config.get("ALLOW_BROKEN_CONDITIONALS", False))
+
     def _condition(self, cond, ctx, strict=False, keyword="when"):
         modern = _core_at_least(2, 19)
-        config = ctx.get("__ansiroll_controller_config") or {}
-        allow_broken = modern and _to_bool(
-            config.get("ALLOW_BROKEN_CONDITIONALS", False))
+        until = keyword == "until"
+        # Modern `until` resolves variables strictly: an undefined one is an error, not a falsy result.
+        strict_vars = until and modern
+        allow_broken = modern and self._broken_conditionals_allowed(ctx)
         if isinstance(cond, (_UnsafeTemplate, _UntrustedConditionValue)):
             raise UntrustedConditional(
                 "Encountered untrusted template or expression."
@@ -2053,12 +2113,12 @@ class Runtime:
                 raise UntrustedConditional(
                     "Encountered untrusted template or expression."
                 )
-            result = self.templater.render_string(cond, ctx)
+            result = self.templater.render_string(cond, ctx, strict=strict_vars)
             # Assert accepts an indirected list of expressions (for
             # example `that: "{{ expression_list }}"`). Evaluate the
             # resolved members as conditions rather than treating the
             # non-empty list itself as truthy.
-            if (keyword is None or not modern) and isinstance(result, (list, tuple)):
+            if (keyword is None or not modern) and not until and isinstance(result, (list, tuple)):
                 return self.when(list(result), ctx, strict=strict,
                                  keyword=keyword)
             if modern and (result is None or
@@ -2078,22 +2138,25 @@ class Runtime:
                         "Encountered untrusted template or expression."
                     )
                 if boolean_text:
-                    result = _to_bool(result)
+                    if not until or not modern:
+                        result = _to_bool(result)
                 else:
-                    result = self.templater.evaluate(result, ctx)
+                    result = self.templater.evaluate(result, ctx, strict=strict_vars)
             if strict and _is_undef(result):
                 raise RuntimeError(
                     "The conditional check %r failed: the expression is undefined" % cond)
             return self._condition_truth(result, modern, allow_broken)
         if cond is None or (isinstance(cond, str) and not cond.strip()):
-            if cond is not None and modern and not allow_broken:
+            if modern and not allow_broken and (cond is not None or until):
                 raise _BrokenConditional("Empty conditional expressions are not allowed.")
             return True
         if not isinstance(cond, (bool, str)) and modern:
             if not allow_broken:
                 raise _BrokenConditional("Conditional expressions must be strings.")
             return bool(_fail_on_undef(self.template(cond, ctx)))
-        result = self.templater.evaluate(cond, ctx)
+        result = self.templater.evaluate(cond, ctx, strict=strict_vars)
+        if strict_vars and _is_undef(result):
+            result._fail_with_undefined_error()
         if strict and _is_undef(result):
             raise RuntimeError(
                 "The conditional check %r failed: the expression is undefined" % cond)
@@ -2263,6 +2326,7 @@ class Runtime:
         self._handler_names.clear()
         self._add_handlers(play.get("handlers", []), {}, False)
         self._error_on_missing_handler = play.get("error_on_missing_handler", True)
+        self._allow_broken_conditionals = play.get("allow_broken_conditionals")
         self._notified_handlers = set()
         self._flushing = False
         self._play_become = play.get("become", False)
@@ -2942,6 +3006,24 @@ class Runtime:
             out.extend(_sequence_items(str(rendered)))
         return out
 
+    def _attempt_count(self, task, ctx):
+        """Total runs for a task (TaskExecutor._execute's attempt loop)."""
+        until = task.get("until")
+        raw = task.get("retries")
+        retries = None if raw is None else int(self.template(raw, ctx) or 0)
+        if _core_at_least(2, 16):
+            # 2.16+: `retries` alone retries until the task succeeds; unset
+            # retries default to 3 only when `until` is set.
+            if retries is not None:
+                return 1 + max(0, retries)
+            return 4 if until else 1
+        # Older cores only retry with `until`; the Task field defaults to 3.
+        if not until:
+            return 1
+        if retries is None:
+            return 3
+        return 1 if retries <= 0 else retries + 1
+
     def _exec_notifying_task(self, task, ctx, become, notifications):
         # Like TaskExecutor.post_validate, resolve notify after when and
         # before dispatch, including on unchanged tasks and per loop item.
@@ -2957,40 +3039,72 @@ class Runtime:
 
     def _exec_with_retries(self, task, ctx, become=False):
         until = task.get("until")
-        retries = int(self.template(task.get("retries"), ctx) or 0)
-        if not until:
-            return self._exec_one(task, ctx, become)
+        attempts = self._attempt_count(task, ctx)
+        if attempts <= 1 and not (until and not _core_at_least(2, 16)):
+            result = self._exec_one(task, ctx, become)
+            result.pop("_ansiroll_unknown_outcome", None)
+            return result
 
-        attempts = retries + 1
         delay = float(self.template(task.get("delay"), ctx) or 0)
-        last = None
-        eval_ctx = dict(ctx)
+        if delay < 0:
+            delay = 1
+        args_cache = {}
+        attempt_ctx = dict(ctx)
         for attempt in range(1, attempts + 1):
-            res = self._exec_one(task, eval_ctx, become)
-            res["attempts"] = attempt
+            res = self._exec_one(task, attempt_ctx, become, attempt=attempt, args_cache=args_cache)
+            if res.pop("_ansiroll_unknown_outcome", False) or attempts <= 1:
+                return res
             if task.get("register"):
-                eval_ctx[task["register"]] = res
-            last = res
-            try:
-                done = self.when(until, eval_ctx, keyword="until")
-            except ConditionalError as ex:
-                # Ansible replaces the module result with the error.
-                return {"failed": True, "changed": False, "msg": str(ex)}
+                attempt_ctx[task["register"]] = res
+            # 2.16+: without `until` the default condition is `not failed`.
+            if until:
+                try:
+                    if _core_at_least(2, 19):
+                        with self._strict_vars():
+                            done = self.when(until, attempt_ctx, keyword="until")
+                    else:
+                        done = self.when(until, attempt_ctx, keyword="until")
+                except ConditionalError as ex:
+                    # Ansible replaces the module result with the error.
+                    return {"failed": True, "changed": False, "msg": str(ex)}
+            else:
+                done = not res.get("failed")
             if done:
                 return res
             if attempt < attempts and delay > 0:
                 time.sleep(delay)
-        # `until` never came true: the task fails (like Ansible's retry logic),
-        # but failed_when/changed_when get the last word on the final result
-        # (which now carries `attempts`).
-        if last is None:
-            last = {"changed": False, "attempts": attempts}
-        last["failed"] = True
-        if task.get("failed_when") is not None or task.get("changed_when") is not None:
-            self._apply_overrides(task, last, eval_ctx)
-        return last
+        # Out of attempts: TaskExecutor reports attempts = retries - 1 and
+        # marks the result failed. From 2.21 an evaluated failed_when result
+        # still decides `failed` (UnifiedTaskResult.failed).
+        res["attempts"] = attempts - 1
+        fw_result = res.get("failed_when_result")
+        modern_result = _core_at_least(2, 21)
+        action_failed = res.get("failed")
+        if (modern_result and isinstance(fw_result, bool)
+                and task.get("failed_when") is not None):
+            res["failed"] = fw_result
+        else:
+            res["failed"] = True
+        if _core_at_least(2, 19) and (not modern_result or action_failed):
+            # Core projects the captured task error as a traceback string.
+            # From 2.21 exhaustion alone no longer creates a captured error.
+            config = ctx.get("__ansiroll_controller_config") or {}
+            modes = config.get("DISPLAY_TRACEBACK") or ()
+            if "always" in modes or ("error" in modes and "never" not in modes):
+                if "Traceback (most recent call last)" not in str(res.get("exception") or ""):
+                    res["exception"] = "(traceback missing)"
+            else:
+                res["exception"] = "(traceback unavailable)"
+        return res
 
-    def _exec_one(self, task, ctx, become=False):
+    def _render_action_args(self, raw_args, ctx, args_cache):
+        if args_cache is None:
+            return self.template(raw_args, ctx)
+        if "args" not in args_cache:
+            args_cache["args"] = self.template(raw_args, ctx)
+        return args_cache["args"]
+
+    def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
         inherited_become_user = self.become_user
@@ -3013,7 +3127,7 @@ class Runtime:
             special = task.get("special")
             if special and (special == "debug"
                             or not (self.delegate_fn and task.get("delegate_to"))):
-                res = self._run_special(special, task, ctx, become)
+                res = self._run_special(special, task, ctx, become, args_cache)
             elif self.delegate_fn and (task.get("delegate_to") or task.get("fallback")):
                 # Run on the controller (or delegated host): template args here where
                 # the vars live, then hand the concrete call to the controller.
@@ -3037,7 +3151,7 @@ class Runtime:
                     }
                 else:
                     args = _fail_on_undef(_strip_omit(
-                        self.template(task.get("args") or {}, ctx)
+                        self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
                     res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
@@ -3051,7 +3165,8 @@ class Runtime:
                             included_vars = json.loads(payload)
             else:
                 provenance = {"mode": "real-ansiballz"}
-                args = _fail_on_undef(_strip_omit(self.template(task.get("args") or {}, ctx)))
+                args = _fail_on_undef(_strip_omit(
+                    self._render_action_args(task.get("args") or {}, ctx, args_cache)))
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
                     res = self._run_async_module(
@@ -3093,7 +3208,24 @@ class Runtime:
                 for key, value in included_vars.items()
             )
             res["ansible_facts"].controller_reference = included_vars_reference
-        self._apply_overrides(task, res, ctx)
+        if attempt is not None:
+            # Available early so changed_when/failed_when can use it.
+            res["attempts"] = attempt
+        if "rc" in res:
+            res.setdefault("failed", res["rc"] not in (0, "0"))
+        ectx = ctx
+        if (not res.get("_ansiroll_unknown_outcome") and
+                (attempt is not None or task.get("changed_when") is not None or task.get("failed_when") is not None)):
+            res.setdefault("failed", False)
+            res.setdefault("changed", False)
+            try:
+                ectx = _override_ctx(task, res, ctx, self.template)
+            except jinja2.UndefinedError as ex:
+                return {"failed": True, "changed": False, "msg": str(ex)}
+            if attempt is not None:
+                ctx.update(ectx)
+        if not res.get("skipped") and not res.get("_ansiroll_unknown_outcome"):
+            self._apply_overrides(task, res, ectx)
         if refreshed_vars is not None:
             res["_ansiroll_vars"] = refreshed_vars
         if self.profile:
@@ -3209,17 +3341,15 @@ class Runtime:
         fw = task.get("failed_when")
         module_failed = res.get("failed", False)
         module_exception = res.get("exception") or res.get("msg")
+        changed_when_failed = False
         try:
             if cw is not None:
-                ectx = dict(ctx)
-                ectx.update(res)
-                if task.get("register"):
-                    ectx[task["register"]] = res
                 try:
-                    res["changed"] = self.when(cw if isinstance(cw, list) else [cw], ectx, strict=True)
+                    res["changed"] = self.when(cw if isinstance(cw, list) else [cw], ctx, strict=True)
                 except UntrustedConditional:
                     raise
                 except Exception as ex:
+                    changed_when_failed = True
                     original_changed = bool(res.get("changed"))
                     res["failed"] = True
                     res["changed_when_result"] = str(ex)
@@ -3239,13 +3369,11 @@ class Runtime:
                             "failed. Error rendering expression. %s" % ex
                         )
                     res["exception"] = str(ex)
-            if fw is not None:
-                ectx = dict(ctx)
-                ectx.update(res)
-                if task.get("register"):
-                    ectx[task["register"]] = res
+            # TaskExecutor evaluates failed_when only when changed_when
+            # succeeded.
+            if fw is not None and not changed_when_failed:
                 try:
-                    fw_result = self.when(fw if isinstance(fw, list) else [fw], ectx, strict=True)
+                    fw_result = self.when(fw if isinstance(fw, list) else [fw], ctx, strict=True)
                 except UntrustedConditional:
                     raise
                 except Exception as ex:
@@ -3273,13 +3401,13 @@ class Runtime:
         if res.get("failed") and "exception" not in res:
             res["exception"] = str(res.get("msg") or "Task failed")
 
-    def _run_special(self, special, task, ctx, become=False):
+    def _run_special(self, special, task, ctx, become=False, args_cache=None):
         name = special.split(".")[-1]
         raw_args = task.get("args") or {}
         if name == "assert":
             # Its condition expressions are interpreted only by when().
             raw_args = {k: v for k, v in raw_args.items() if k != "that"}
-        args = self.template(raw_args, ctx)
+        args = self._render_action_args(raw_args, ctx, args_cache)
         # Ansible accepts the complete module argument dictionary through a
         # single template, representing it internally as `_raw_params`.
         if (
@@ -3580,9 +3708,10 @@ class Runtime:
             return {
                 "failed": True,
                 "changed": False,
-                "msg": "ansiroll: async worker failed for %s (%s)%s"
+                "msg": "ansiroll: async worker failed for %s (%s); launch outcome is unknown%s"
                        % (meta["module_fqn"], ex, (": " + detail) if detail else ""),
                 "module_stderr": detail,
+                "_ansiroll_unknown_outcome": True,
             }
         if not ack.get("failed"):
             ack["changed"] = True
@@ -4236,6 +4365,7 @@ class Runtime:
                         "result for %s (%s); task outcome is unknown%s"
                         % (meta["module_fqn"], ex, (": " + detail) if detail else "")),
                 "module_stderr": detail,
+                "_ansiroll_unknown_outcome": True,
             }
 
     # ---- persistent worker -------------------------------------------------

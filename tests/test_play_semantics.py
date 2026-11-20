@@ -293,6 +293,58 @@ def test_register_not_clobbered_by_templated_play_var(tmp_path):
         """})
 
 
+def test_play_alias_uses_task_scope(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars:
+                notification: "handle {{ source }}"
+                source: "{{ missing_source }}"
+                fact_notification: "{{ missing_fact }}"
+                registered: "{{ missing_registered }}"
+                extra_notification: "{{ missing_extra }}"
+                done: "{{ current.stdout == 'ready' }}"
+              handlers:
+                - name: handle marker
+                  debug: msg=HANDLED
+              tasks:
+                - debug: msg=task
+                  vars: {source: marker}
+                  changed_when: true
+                  notify: "{{ notification }}"
+                - block:
+                    - debug: msg=block
+                      changed_when: true
+                      notify: "{{ notification }}"
+                  vars: {source: marker}
+                - include_role: {name: scoped}
+                - set_fact: {fact_notification: handle marker}
+                - command: echo handle marker
+                  register: registered
+                - debug: msg=facts
+                  changed_when: true
+                  notify: ["{{ fact_notification }}", "{{ registered.stdout }}",
+                           "{{ extra_notification }}"]
+                - command: echo from loop
+                  loop: [marker]
+                  loop_control: {loop_var: source}
+                  notify: "{{ notification }}"
+                - command: echo ready
+                  register: current
+                  until: done
+                  delay: 0
+        """,
+        "roles/scoped/vars/main.yml": "source: marker",
+        "roles/scoped/tasks/main.yml": """
+            - debug: msg=role
+              changed_when: true
+              notify: "{{ notification }}"
+        """,
+    }, args=["-e", "extra_notification='handle marker'"])
+    assert msgs == ['"task"', '"block"', '"role"', '"facts"', '"HANDLED"']
+
+
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
 def test_unused_play_template_does_not_run_lookup(tmp_path, mode):
     _write(tmp_path, {"pb.yml": """
@@ -431,6 +483,38 @@ def test_deferred_play_vars_keep_literal_mapping_values(tmp_path, mode):
     if CORE_VERSION < (2, 19):
         expected = "{{ marker.stdout }}"
     assert _summary(result.stdout)[0] == [json.dumps(expected)] * 2
+
+
+def test_until_and_retries_semantics(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              register: r1
+              until: false
+              delay: 0
+              ignore_errors: true
+            - debug: msg="T1 attempts={{ r1.attempts | default('none') }} failed={{ r1.failed }}"
+            - command: /bin/false
+              register: r2
+              retries: 2
+              delay: 0
+              ignore_errors: true
+            - debug: msg="T2 attempts={{ r2.attempts | default('none') }} failed={{ r2.failed }}"
+            - command: /bin/true
+              register: r3
+              until: false
+              retries: 1
+              delay: 0
+              failed_when: false
+            - debug: msg="T3 attempts={{ r3.attempts | default('none') }} failed={{ r3.failed }}"
+            - command: echo hi
+              register: r4
+              changed_when: stdout is defined
+            - debug: msg="T4 changed={{ r4.changed }}"
+        """})
+    assert '"T4 changed=False"' in msgs
 
 
 def test_role_params_outrank_set_fact(tmp_path):
@@ -643,10 +727,157 @@ def test_legacy_child_handler_preserves_unsafe_play_role_defaults(tmp_path):
     assert messages == ['"notifying"', '"{{ sentinel }}"']
 
 
+def test_until_successful_uses_failed_when_for_each_loop_item(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              loop: [first, second]
+              register: outcome
+              failed_when: true
+              until: outcome is successful
+              retries: 2
+              delay: 0
+              ignore_errors: true
+            - debug: msg="attempts {{ outcome.results | map(attribute='attempts') | join(',') }}"
+        """})
+    assert msgs == ['"attempts 2,2"']
+
+
+def test_until_exhausted_registered_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_DISPLAY_TRACEBACK", "never")
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/true
+              register: a
+              until: false
+              retries: 1
+              delay: 0
+              ignore_errors: true
+            - debug:
+                msg: "A {{ a.attempts }} {{ a.failed }} {{ a.exception | default('none') }}"
+            - command: /bin/false
+              register: e
+              until: e.rc == 0
+              retries: 1
+              delay: 0
+              failed_when: e.rc == 7
+            - debug: msg="E {{ e.attempts }} {{ e.failed }}"
+        """})
+    exception = "(traceback unavailable)" if (2, 19) <= CORE_VERSION < (2, 21) else "none"
+    assert msgs[0] == '"A 1 True %s"' % exception
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="captured task errors start in Core 2.19")
+@pytest.mark.parametrize("until", ["", "until: false"])
+def test_failed_command_exception_after_retry_exhaustion(tmp_path, monkeypatch, until):
+    monkeypatch.setenv("ANSIBLE_DISPLAY_TRACEBACK", "never")
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - command: /bin/false
+              %s
+              retries: 1
+              delay: 0
+              register: outcome
+              ignore_errors: true
+            - debug:
+                msg: "{{ outcome.attempts }} {{ outcome.failed }} {{ outcome.exception }}"
+        """ % until})
+    assert msgs == ['"1 True (traceback unavailable)"']
+
+
 def _run_mode(tmp_path, mode):
     if mode == "standalone":
         return _standalone_run(tmp_path, ())
     return _ansible_run(tmp_path, (), "ansiroll.core.ansiroll" if mode == "strategy" else None)
+
+
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+@pytest.mark.parametrize("condition", ["missing_condition", "'false'", "1 - 1", "1 + 0"])
+def test_invalid_until_does_not_repeat_side_effects(tmp_path, monkeypatch, mode, condition):
+    if condition != "missing_condition" and CORE_VERSION < (2, 19):
+        pytest.skip("boolean results are required from ansible-core 2.19")
+    monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "False")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - shell: echo attempt >> attempts
+              until: "%s"
+              delay: 0
+            - debug: msg=AFTER_UNTIL
+        """ % condition})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode != 0
+    assert _summary(output)[1][3] == "1"
+    assert "AFTER_UNTIL" not in output
+    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"]
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="boolean results are required from Core 2.19")
+@pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
+@pytest.mark.parametrize("condition", ["missing_condition ~ 'suffix'", "condition_alias"])
+def test_until_rejects_undefined_operand_with_broken_conditionals(
+        tmp_path, monkeypatch, mode, condition):
+    monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "True")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            condition_alias: "{{ missing_condition ~ 'suffix' }}"
+          tasks:
+            - shell: echo attempt >> attempts
+              until: %s
+              delay: 0
+            - debug: msg=AFTER_UNTIL
+        """ % condition})
+    out = _run_mode(tmp_path, mode)
+    output = out.stdout + out.stderr
+    assert out.returncode != 0
+    assert "missing_condition" in output
+    assert "AFTER_UNTIL" not in output
+    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"]
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="added in ansible-core 2.19")
+@pytest.mark.parametrize("source", ["env", "config"])
+def test_until_allows_broken_conditionals_without_config_lookup(tmp_path, monkeypatch, source):
+    files = {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - shell: echo attempt >> attempts
+              until: "'false'"
+              delay: 0
+            - shell: echo attempt >> attempts
+              until: 1 + 0
+              delay: 0
+            - shell: echo attempt >> attempts
+              until: 1 - 1
+              retries: 1
+              delay: 0
+              register: exhausted
+              ignore_errors: true
+            - shell: echo attempt >> attempts
+              until: ["", null, "   ", true]
+              delay: 0
+            - debug: msg="EXHAUSTED {{ exhausted.attempts }} {{ exhausted.failed }}"
+        """}
+    monkeypatch.delenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", raising=False)
+    if source == "env":
+        monkeypatch.setenv("ANSIBLE_ALLOW_BROKEN_CONDITIONALS", "True")
+    else:
+        files["ansible.cfg"] = "[defaults]\nallow_broken_conditionals = True\n"
+        monkeypatch.setenv("ANSIBLE_CONFIG", str(tmp_path / "ansible.cfg"))
+    msgs, _ = check(tmp_path, files)
+    assert msgs == ['"EXHAUSTED 1 True"']
+    assert (tmp_path / "attempts").read_text().splitlines() == ["attempt"] * 15
 
 
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])

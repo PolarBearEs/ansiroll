@@ -256,6 +256,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
         "error_on_missing_handler": C.ERROR_ON_MISSING_HANDLER,
+        "allow_broken_conditionals": (
+            core_version >= (2, 19)
+            and C.config.get_config_value("ALLOW_BROKEN_CONDITIONALS")
+        ),
         "fact_schema": "%d.%d" % core_version,
         "environment": _as_list(getattr(play, "environment", None)) or None,
         "check_mode": getattr(play, "check_mode", None),
@@ -277,7 +281,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     from ansible import constants as C
 
     config_names = _controller_config_names(result)
-    config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE"))
+    config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE",
+                         "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
+    if core_version >= (2, 19):
+        config_names.add("DISPLAY_TRACEBACK")
     controller_config = {}
     for name in sorted(config_names):
         try:
@@ -285,8 +292,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             # Config keys differ across core releases.
             pass
-    if controller_config:
-        result["controller_config"] = controller_config
+    from ansible.plugins.loader import connection_loader
+
+    restricted = set(C.RESTRICTED_RESULT_KEYS).union(C.COMMON_CONNECTION_VARS)
+    if core_version < (2, 21):
+        restricted.update(getattr(C, "INTERNAL_RESULT_KEYS", ()))
+    for aliases in C.MAGIC_VARIABLE_MAPPING.values():
+        restricted.update(aliases)
+    controller_config["ansiroll_restricted_facts"] = sorted(restricted)
+    controller_config["ansiroll_connection_fact_prefixes"] = sorted({
+        "ansible_%s_" % os.path.splitext(os.path.basename(path))[0]
+        for path in connection_loader.all(path_only=True)
+    })
+    result["controller_config"] = controller_config
     return result
 
 
@@ -1371,7 +1389,10 @@ def _convert_task(task, actions, basedir):
         "changed_when": _conditions(task.changed_when) or None,
         "failed_when": _conditions(task.failed_when) or None,
         "until": _conditions(getattr(task, "until", None)) or None,
-        "retries": _numeric_or_template(getattr(task, "retries", 0), int),
+        # None = unset: TaskExecutor applies the default (3 retries with
+        # `until`; ansible-core < 2.16 bakes 3 into the field default).
+        "retries": (None if getattr(task, "retries", None) is None
+                    else _numeric_or_template(task.retries, int)),
         "delay": _numeric_or_template(getattr(task, "delay", 0), float),
         "environment": _as_list(getattr(task, "environment", None)) or None,
         "search_dirs": _search_dirs(task, basedir, "files"),
@@ -1422,6 +1443,7 @@ def _convert_task(task, actions, basedir):
     # the target); the loader no longer forces a fallback for delegate_to.
     delegate = getattr(task, "delegate_to", None)
     node["delegate_to"] = str(delegate) if delegate else None
+    node["delegate_facts"] = getattr(task, "delegate_facts", False)
 
     if action in BAKED_ACTIONS:
         _bake_sources(node, task, basedir)
