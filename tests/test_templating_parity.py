@@ -739,6 +739,31 @@ def test_dynamic_src_does_not_bake_a_file_shadowed_by_an_unbaked_dir(tmp_path):
     assert dest.read_text() == "role root"
 
 
+def test_dynamic_src_template_fullpath_names_the_baked_file(tmp_path):
+    playbook, dest, task = _role_template_task(tmp_path, "{{ name }}.j2", {
+        "roles/a/templates/conf.j2": "{{ template_fullpath }}",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == str(tmp_path / "roles/a/templates/conf.j2")
+    dest.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert dest.read_text() == str(tmp_path / "roles/a/templates/conf.j2")
+
+
+def test_include_key_in_role_defaults_is_data(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": "- debug: msg=\"{{ nginx | to_json }}\"\n",
+        "roles/a/defaults/main.yml": "nginx:\n  include: conf.d/*.conf\n",
+    })
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == ['{"include": "conf.d/*.conf"}']
+    assert _ansiroll(playbook, tmp_path) == expected
+
+
 def test_imported_playbook_dir_is_absolute_for_a_relative_playbook_path(tmp_path, monkeypatch):
     _write(tmp_path, "- import_playbook: sub/inner.yml\n", {
         "sub/inner.yml": "- hosts: localhost\n  gather_facts: false\n  tasks: []\n",
