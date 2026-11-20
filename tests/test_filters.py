@@ -90,6 +90,7 @@ def test_to_uuid_stable(t):
     ("{{ 'buster' is search('ste') }}", {}, True),
     ("{{ r is changed }}", {"r": {"changed": True}}, True),
     ("{{ r is succeeded }}", {"r": {"failed": False}}, True),
+    ("{{ r is successful }}", {"r": {"failed": True}}, False),
     ("{{ r is failed }}", {"r": {"failed": True}}, True),
     ("{{ r is skipped }}", {"r": {"skipped": True}}, True),
 ])
@@ -162,7 +163,7 @@ def test_embedded_template_constants_are_not_rendered_outside_lookups(t):
     assert render(t, "{% set a = '{{ 1 }}' %}{{ a }}") == "{{ 1 }}"
 
 
-def test_embedded_template_constant_detection_is_cached(monkeypatch):
+def test_embedded_template_constant_is_not_rendered_again(monkeypatch):
     templater = _Templater()
     source = '{{ prefix }} {{ "{{ service }}" }}'
     parse = templater.env.parse
@@ -173,9 +174,12 @@ def test_embedded_template_constant_detection_is_cached(monkeypatch):
         return parse(value, *args, **kwargs)
 
     monkeypatch.setattr(templater.env, "parse", counted_parse)
-    assert templater.render_string(source, {"prefix": "one"}) == "one {{ service }}"
-    assert templater.render_string(source, {"prefix": "two"}) == "two {{ service }}"
-    assert calls == [source]
+    ctx = {"prefix": "one", "service": "running"}
+    assert templater.render_string(source, ctx) == "one {{ service }}"
+    ctx["prefix"] = "two"
+    assert templater.render_string(source, ctx) == "two {{ service }}"
+    # Rendered output is never templated again, so no AST scan is needed.
+    assert calls == []
 
 
 def test_normal_render_skips_embedded_constant_ast_scan(monkeypatch):
@@ -231,6 +235,9 @@ class _StubRuntime(object):
 
     def template(self, value, ctx):
         return _Templater().render_string(value, ctx)
+
+    def _pin_magic_vars(self, ctx):
+        pass
 
 
 def test_to_yaml_renders_aliased_lazy_list_per_context():

@@ -9,6 +9,8 @@ import re
 import shlex
 import subprocess
 
+from . import _stdin
+
 _ALLOWED = frozenset((
     "_raw_params", "_uses_shell", "cmd", "chdir", "creates", "removes",
     "stdin", "stdin_add_newline", "strip_empty_ends", "executable",
@@ -205,7 +207,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
             script = (" ".join(shlex.quote(value) for value in raw)
                       if isinstance(raw, (list, tuple)) else raw)
             argv = [executable, "-c", script] if executable else script
-            proc = subprocess.Popen(
+            proc = _stdin.popen(
                 [value.encode("utf-8", "surrogateescape") for value in argv]
                 if executable else script.encode("utf-8", "surrogateescape"),
                 shell=not executable,
@@ -218,7 +220,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
             # run_command(expand_user_and_vars=True) expands ~ and $VARS in
             # every argument (even quoted ones); the reported cmd is not.
             argv = [os.path.expanduser(os.path.expandvars(value)) for value in cmd]
-            proc = subprocess.Popen(
+            proc = _stdin.popen(
                 [value.encode("utf-8", "surrogateescape") for value in argv],
                 cwd=chdir or None,
                 stdin=subprocess.PIPE if stdin is not None else None,

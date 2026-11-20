@@ -1,6 +1,7 @@
 import os
 import base64
 import io
+import json
 import subprocess
 import sys
 import zipfile
@@ -12,6 +13,7 @@ from ansiroll.compiler import (
     _accelerated_only_actions,
     _build_bundles,
     _deterministic_zip,
+    _encode_rendered,
     _mark_required_accelerators,
     _render_source,
     _specialize_accelerators,
@@ -44,6 +46,19 @@ def test_bundle_union_deduplicates_identical_import_paths():
     assert stats["unique_module_archives"] == 1
     assert stats["import_encoded_size"] == len(base64.b64encode(import_bundle))
     assert stats["data_encoded_size"] == len(base64.b64encode(data_bundle))
+
+
+def test_frozen_encoding_preserves_tuple_and_literal_string_types():
+    from ansiroll.runtime import (
+        _UnsafeText, _UntrustedConditionValue, _decode_frozen_value,
+    )
+
+    value = {"mapping": ("{{ label }}", _UntrustedConditionValue("literal"))}
+    decoded = _decode_frozen_value(json.loads(json.dumps(_encode_rendered(value))))
+
+    assert decoded == value
+    assert isinstance(decoded["mapping"][0], _UnsafeText)
+    assert isinstance(decoded["mapping"][1], _UntrustedConditionValue)
 
 
 def test_resolved_play_vars_preserve_ansible_role_magic_lists():

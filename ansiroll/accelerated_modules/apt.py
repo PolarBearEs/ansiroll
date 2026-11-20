@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 
+from . import _stdin
 from .environment import best_parsable_locale
 
 
@@ -76,7 +77,7 @@ def _environment(environment, force_c_locale=False, overrides=None):
 
 def _command(argv, environment=None, force_c_locale=False, overrides=None):
     try:
-        process = subprocess.Popen(
+        process = _stdin.popen(
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
