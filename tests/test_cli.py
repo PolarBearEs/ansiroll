@@ -73,14 +73,14 @@ def test_callable_compile_writes_to_the_callers_stdout(playbook, capfdbinary, fo
 def test_callable_compile_leaves_host_stdout_untouched(monkeypatch, playbook, capfdbinary):
     worker_started = Event()
     allow_worker_to_finish = Event()
-    run = subprocess.run
+    run = cli._run_compile_worker
 
     def run_worker(*args, **kwargs):
         worker_started.set()
         assert allow_worker_to_finish.wait(5)
         return run(*args, **kwargs)
 
-    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    monkeypatch.setattr(cli, "_run_compile_worker", run_worker)
     output = StringIO()
     with redirect_stdout(output), os.fdopen(os.dup(1), "wb") as retained_stdout:
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -120,8 +120,7 @@ def test_callable_compile_keeps_the_callers_fd_inheritance(playbook, monkeypatch
 
 
 @pytest.mark.parametrize("compile_fails", [False, True])
-@pytest.mark.parametrize("invocation", ["entrypoint", "worker"])
-def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails, invocation):
+def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails):
     script = r"""
 import atexit
 import ctypes
@@ -142,34 +141,93 @@ def compile_playbook(*args, **kwargs):
     return "print('ok')\n", {"modules": [], "fallback_tasks": []}
 
 cli.compile_playbook = compile_playbook
-compile_fails, invocation = sys.argv[1:]
-args = ["compile", "play.yml", "-o", "-"]
-sys.argv[1:] = args
-if invocation == "entrypoint":
-    raise SystemExit(cli.entrypoint())
-raise SystemExit(cli._compile_worker())
+compile_fails = sys.argv[1]
+sys.argv[1:] = ["compile", "play.yml", "-o", "-"]
+raise SystemExit(cli.entrypoint())
 """
     env = dict(os.environ)
     env.pop("PYTHONUNBUFFERED", None)
 
     result = subprocess.run(
-        [sys.executable, "-c", script, str(compile_fails), invocation],
-        input=b'{"playbook": "play.yml", "extra_vars": [], "vault_password_file": null, '
-              b'"interpreter": "python3", "tree_shake": false, "freeze_playbook_vars": false, '
-              b'"freeze_var": []}',
-        capture_output=True, env=env,
+        [sys.executable, "-c", script, str(compile_fails)], capture_output=True, env=env,
     )
 
     assert result.returncode == (2 if compile_fails else 0), result.stderr
-    source = b"" if compile_fails else b"print('ok')\n"
-    if compile_fails or invocation == "entrypoint":
-        assert result.stdout == source
-    else:
-        assert json.loads(result.stdout)[0] == source.decode("utf-8")
+    assert result.stdout == (b"" if compile_fails else b"print('ok')\n")
     assert b"native shutdown diagnostic\n" in result.stderr
     assert b"buffered diagnostic\n" in result.stderr
     assert b"native diagnostic\n" in result.stderr
     assert b"helper diagnostic\n" in result.stderr
+
+
+@pytest.mark.parametrize("vars_input", ["stdin", "descriptor"])
+def test_callable_compile_preserves_descriptor_backed_inputs(playbook, vars_input):
+    script = """
+import os
+import sys
+from ansiroll import cli
+
+path, manifest, vars_file = sys.argv[1:]
+args = ["compile", path, "-o", "-", "-m", manifest]
+if vars_file == "-":
+    raise SystemExit(cli.main(args + ["-e", "@/dev/stdin"]))
+with open(vars_file, "rb") as stream:
+    assert not os.get_inheritable(stream.fileno())
+    raise SystemExit(cli.main(args + ["-e", "@/dev/fd/%d" % stream.fileno()]))
+"""
+    extra_vars = b'{"pipe_input": 42}'
+    vars_file = playbook.with_name("vars.json")
+    vars_file.write_bytes(extra_vars)
+    manifest = playbook.with_name("manifest.json")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(playbook), str(manifest),
+         "-" if vars_input == "stdin" else str(vars_file)],
+        input=extra_vars, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(manifest.read_text())["tree_shake"]["specialized_var_names"] == ["pipe_input"]
+    compile(result.stdout, "<stdout>", "exec")
+
+
+def test_callable_worker_uses_callers_import_path(monkeypatch, playbook, capfdbinary):
+    import ansible
+
+    shim = playbook.parent / "ansible"
+    shim.mkdir()
+    original_path = ansible.__file__
+    (shim / "__init__.py").write_text(
+        "__path__.append(%r)\n"
+        "__file__ = %r\n"
+        "with open(__file__, 'rb') as source:\n"
+        "    exec(compile(source.read(), __file__, 'exec'))\n"
+        "print('caller Ansible path')\n"
+        % (os.path.dirname(original_path), original_path)
+    )
+    monkeypatch.syspath_prepend(str(playbook.parent))
+
+    assert cli.main(["compile", str(playbook), "-o", "-"]) == 0
+
+    captured = capfdbinary.readouterr()
+    compile(captured.out, "<stdout>", "exec")
+    assert b"caller Ansible path\n" in captured.err
+
+
+def test_worker_startup_output_is_diagnostic(monkeypatch, playbook, capfdbinary):
+    (playbook.parent / "sitecustomize.py").write_text(
+        "import ctypes\n"
+        "print('startup diagnostic', flush=True)\n"
+        "ctypes.CDLL(None).puts(b'native startup diagnostic')\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(playbook.parent), prepend=os.pathsep)
+
+    assert cli.main(["compile", str(playbook), "-o", "-"]) == 0
+
+    captured = capfdbinary.readouterr()
+    assert captured.out.startswith(b"#!")
+    compile(captured.out, "<stdout>", "exec")
+    assert b"startup diagnostic\n" in captured.err
+    assert b"native startup diagnostic\n" in captured.err
 
 
 def test_compile_rejects_manifest_that_points_to_stdout(capfdbinary):

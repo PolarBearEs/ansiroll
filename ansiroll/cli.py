@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stdout
 
 from .compiler import compile_playbook
@@ -114,14 +117,84 @@ def _cmd_compile_stdout(args):
     return 0
 
 
-def _compile_worker():
-    args = argparse.Namespace(**json.load(sys.stdin))
-    with _compile_diagnostics_to_stderr() as output:
-        compiled = _compile_source(args)
+def _compile_worker(channel_fd):
+    with socket.socket(fileno=channel_fd) as channel:
+        channel.set_inheritable(False)
+        with channel.makefile("rb") as request_stream:
+            request = json.load(request_stream)
+        sys.path[:] = request["import_path"]
+        compiled = _compile_source(argparse.Namespace(**request["args"]))
         if compiled is None:
             return 2
-        output.write(json.dumps(compiled).encode("utf-8"))
+        channel.sendall(json.dumps(compiled).encode("utf-8"))
     return 0
+
+
+def _compile_input_fds(args):
+    paths = [args.playbook, args.vault_password_file, os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE")]
+    paths.extend(value[1:] for value in args.extra_vars if value.startswith("@"))
+    requested = set()
+    for path in paths:
+        if path:
+            match = re.fullmatch(r"/(?:dev/fd|proc/self/fd)/(\d+)", os.path.abspath(path))
+            if match:
+                requested.add(int(match.group(1)))
+
+    available = set()
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            available = {int(name) for name in os.listdir(directory) if name.isdigit()}
+        except OSError:
+            continue
+        break
+    descriptors = []
+    for fd in sorted((available | requested) - {0, 1, 2}):
+        try:
+            if os.get_inheritable(fd) or fd in requested:
+                descriptors.append(fd)
+        except OSError:
+            # A descriptor may have closed since the directory was read.
+            continue
+    return descriptors
+
+
+def _run_compile_worker(args):
+    request = json.dumps({
+        "args": vars(args),
+        "import_path": [path for path in sys.path if isinstance(path, str)],
+    }).encode("utf-8")
+    input_fds = _compile_input_fds(args)
+    try:
+        os.fstat(0)
+        stdin = 0
+    except OSError:
+        stdin = None
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    worker = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from ansiroll.cli import _compile_worker; sys.exit(_compile_worker(int(sys.argv[2])))"
+    )
+    parent, child = socket.socketpair()
+    with parent, child:
+        with subprocess.Popen(
+            [sys.executable, "-c", worker, package_root, str(child.fileno())],
+            stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            pass_fds=(*input_fds, child.fileno()),
+            env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+        ) as proc:
+            child.close()
+            # Drain diagnostics while exchanging the request and artifact.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                drain = pool.submit(proc.communicate)
+                try:
+                    parent.sendall(request)
+                    parent.shutdown(socket.SHUT_WR)
+                    with parent.makefile("rb") as response:
+                        payload = response.read()
+                except (BrokenPipeError, ConnectionResetError):
+                    payload = b""
+                diagnostics, _ = drain.result()
+    return proc.returncode, payload, diagnostics.decode("utf-8", errors="replace")
 
 
 def _cmd_compile_stdout_in_child(args):
@@ -138,21 +211,12 @@ def _cmd_compile_stdout_in_child(args):
 
     # Compile in a fresh interpreter so application threads and retained
     # streams are unaffected by the compiler's process-wide redirection.
-    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    worker = (
-        "import sys; sys.path.insert(0, sys.argv[1]); "
-        "from ansiroll.cli import _compile_worker; sys.exit(_compile_worker())"
-    )
-    proc = subprocess.run(
-        [sys.executable, "-c", worker, package_root],
-        input=json.dumps(vars(args)), capture_output=True, encoding="utf-8", errors="replace",
-        env=dict(os.environ, PYTHONIOENCODING="utf-8"),
-    )
-    if proc.stderr:
-        stderr.write(proc.stderr)
-    if proc.returncode:
-        return proc.returncode
-    source, manifest = json.loads(proc.stdout)
+    returncode, payload, diagnostics = _run_compile_worker(args)
+    if diagnostics:
+        stderr.write(diagnostics)
+    if returncode:
+        return returncode
+    source, manifest = json.loads(payload)
     if manifest_path:
         manifest_path = _stdout_manifest_path(manifest_path, 1, stdout_fd)
         if manifest_path is None:
