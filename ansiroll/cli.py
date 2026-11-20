@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import stat
@@ -79,9 +80,10 @@ def _manifest_for_stdout(path, stdout_fd):
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
+        stderr_stat = _compile_stderr_stat()
         if ((stat.S_ISFIFO(stdout_stat.st_mode) or stat.S_ISREG(stdout_stat.st_mode)
              or stat.S_ISSOCK(stdout_stat.st_mode))
-                and os.path.samestat(stdout_stat, os.fstat(2))):
+                and os.path.samestat(stdout_stat, stderr_stat)):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:
@@ -93,6 +95,26 @@ def _cmd_compile_stdout(args):
     except ValueError as ex:
         sys.stderr.write("ansiroll: %s\n" % ex)
         return 2
+
+
+def _compile_stderr_stat():
+    try:
+        return os.fstat(2)
+    except OSError as ex:
+        if ex.errno != errno.EBADF:
+            raise
+    # Supply a sink when the shell explicitly closed diagnostics (2>&-).
+    sink = os.open(os.devnull, os.O_WRONLY)
+    if sink == 2:
+        os.set_inheritable(2, True)
+    else:
+        try:
+            os.dup2(sink, 2)
+        finally:
+            os.close(sink)
+    if sys.stderr is None:
+        sys.stderr = open(2, "w", closefd=False)
+    return os.fstat(2)
 
 
 def _cmd_compile(args, stdout=None):

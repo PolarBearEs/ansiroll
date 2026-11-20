@@ -80,6 +80,21 @@ def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     assert output == b"ansiroll: compile -o - requires separate stdout and stderr streams\n"
 
 
+def test_compile_streams_python_with_stderr_closed(tmp_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    result = subprocess.run(
+        ["sh", "-c", 'exec "$@" 2>&-', "ansiroll",
+         sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+        capture_output=True, check=True,
+    )
+
+    assert result.stdout.startswith(b"#!")
+    compile(result.stdout, "<stdout>", "exec")
+    assert result.stderr == b""
+
+
 def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys):
     manifest = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
