@@ -4,6 +4,10 @@ import stat
 import subprocess
 import sys
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from io import StringIO
+from threading import Event
 
 import pytest
 
@@ -49,12 +53,69 @@ def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
     compile(result.stdout, "<stdout>", "exec")
 
 
+def test_callable_compile_writes_to_the_callers_stdout(monkeypatch, capfdbinary):
+    manifest = {"modules": [], "fallback_tasks": []}
+
+    def compile_playbook(*args, **kwargs):
+        print("compiler diagnostic")
+        return "print('olá')\n", manifest
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+    output = StringIO()
+
+    with redirect_stdout(output):
+        assert cli.main(["compile", "play.yml", "-o", "-"]) == 0
+        print("caller after compile")
+
+    assert output.getvalue() == "print('olá')\ncaller after compile\n"
+    captured = capfdbinary.readouterr()
+    assert captured.out == b""
+    assert b"compiler diagnostic\n" in captured.err
+
+
+def test_overlapping_callable_compiles_serialize_stdout_redirection(monkeypatch, capfdbinary):
+    first_compiling = Event()
+    allow_first_to_finish = Event()
+    second_calling = Event()
+    second_compiling = Event()
+    manifest = {"modules": [], "fallback_tasks": []}
+
+    def compile_playbook(playbook, **kwargs):
+        if playbook == "first":
+            first_compiling.set()
+            assert allow_first_to_finish.wait(5)
+        else:
+            second_compiling.set()
+        return "# %s\n" % playbook, manifest
+
+    def compile_second():
+        second_calling.set()
+        return cli.main(["compile", "second", "-o", "-"])
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(cli.main, ["compile", "first", "-o", "-"])
+        try:
+            assert first_compiling.wait(5)
+            second = pool.submit(compile_second)
+            assert second_calling.wait(5)
+            assert not second_compiling.wait(0.2)
+        finally:
+            allow_first_to_finish.set()
+        assert first.result(timeout=5) == 0
+        assert second.result(timeout=5) == 0
+
+    print("caller after compile")
+    assert capfdbinary.readouterr().out == b"# first\n# second\ncaller after compile\n"
+
+
 @pytest.mark.parametrize("compile_fails", [False, True])
 @pytest.mark.parametrize("invocation", ["entrypoint", "implicit_args", "explicit_args"])
 def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails, invocation):
     script = r"""
 import atexit
 import ctypes
+import os
 import sys
 from ansiroll import cli
 
@@ -76,8 +137,10 @@ args = ["compile", "play.yml", "-o", "-"]
 sys.argv[1:] = args
 if invocation == "entrypoint":
     raise SystemExit(cli.entrypoint())
+os.set_inheritable(1, False)
 puts(b"caller before compile")
 result = cli.main(args) if invocation == "explicit_args" else cli.main()
+assert not os.get_inheritable(1)
 print("caller after compile")
 raise SystemExit(result)
 """

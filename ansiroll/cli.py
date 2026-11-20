@@ -10,12 +10,17 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stdout
+from threading import RLock
 
 from .compiler import compile_playbook
 
+_main_lock = RLock()
+
 
 def main(argv=None):
-    return _main(argv, restore_stdout=True)
+    # Callable invocations share the process's stdout stream and descriptor.
+    with _main_lock:
+        return _main(argv, restore_stdout=True)
 
 
 def entrypoint():
@@ -75,6 +80,7 @@ def _compile_diagnostics_to_stderr(restore_stdout):
     if restore_stdout:
         from ctypes import CDLL
 
+        stdout_inheritable = os.get_inheritable(1)
         # Drain the caller's existing C stdio output before redirecting fd 1.
         flush_native = CDLL(None).fflush
         flush_native(None)
@@ -93,7 +99,7 @@ def _compile_diagnostics_to_stderr(restore_stdout):
                         original_stdout.flush()
                     flush_native(None)
                 finally:
-                    os.dup2(saved_stdout.fileno(), 1)
+                    os.dup2(saved_stdout.fileno(), 1, inheritable=stdout_inheritable)
 
 
 def _stdout_manifest_path(path, stdout_fd):
@@ -111,16 +117,29 @@ def _stdout_manifest_path(path, stdout_fd):
 
 
 def _cmd_compile_stdout(args, restore_stdout):
-    if args.manifest:
-        manifest_path = _stdout_manifest_path(args.manifest, 1)
+    stdout = sys.stdout
+    stdout_fd = 1
+    if restore_stdout:
+        try:
+            stdout_fd = stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdout_fd = None
+    if args.manifest and stdout_fd is not None:
+        manifest_path = _stdout_manifest_path(args.manifest, stdout_fd)
         if manifest_path is None:
             return 2
         args.manifest = manifest_path
-    with _compile_diagnostics_to_stderr(restore_stdout) as stdout:
-        return _cmd_compile(args, stdout=stdout)
+    with _compile_diagnostics_to_stderr(restore_stdout) as saved_stdout:
+        if stdout_fd != 1:
+            return _cmd_compile(args, write_source=stdout.write, stdout_fd=stdout_fd)
+
+        def write_source(source):
+            saved_stdout.write(source.encode("utf-8"))
+
+        return _cmd_compile(args, write_source=write_source, stdout_fd=saved_stdout.fileno())
 
 
-def _cmd_compile(args, stdout=None):
+def _cmd_compile(args, write_source=None, stdout_fd=None):
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
@@ -141,24 +160,24 @@ def _cmd_compile(args, stdout=None):
             message = "ansiroll: " + message
         sys.stderr.write(message + "\n")
         return 2
-    if stdout is None:
+    if write_source is None:
         with open(args.output, "w") as fh:
             fh.write(source)
         os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
         manifest_path = args.manifest
-        if stdout is not None:
+        if stdout_fd is not None:
             # Duplicating stdout may have made a /dev/fd path resolve to it.
-            manifest_path = _stdout_manifest_path(manifest_path, stdout.fileno())
+            manifest_path = _stdout_manifest_path(manifest_path, stdout_fd)
             if manifest_path is None:
                 return 2
         with open(manifest_path, "w") as fh:
             json.dump(manifest, fh, indent=2)
-    if stdout is not None:
-        stdout.write(source.encode("utf-8"))
+    if write_source is not None:
+        write_source(source)
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
-        % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),
+        % (args.playbook, "stdout" if write_source is not None else args.output, len(manifest["modules"]),
            len(manifest["fallback_tasks"]))
     )
     return 0
