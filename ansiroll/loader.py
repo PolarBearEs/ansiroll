@@ -169,30 +169,27 @@ def _make_rewriting_loader(DataLoader):
     return RewritingDataLoader()
 
 
+_TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+
+
 def _rewrite_includes(data):
     # Rewrite in place: ansible-core's parsed containers carry origin tags
     # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies.
-    if isinstance(data, list):
-        for index, item in enumerate(data):
-            data[index] = _rewrite_includes(item)
+    # must not be replaced by plain copies. Only task lists are touched, since
+    # vars files go through this loader too.
+    if not isinstance(data, list):
         return data
-    if isinstance(data, dict):
-        rename = "include" in data and isinstance(data.get("include"), str)
-        if rename:
-            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for k in _TASK_LIST_KEYS:
+            _rewrite_includes(item.get(k))
+        if "include" in item and isinstance(item.get("include"), str):
+            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            items = list(data.items())
-            data.clear()
-            for k, v in items:
-                if k == "include":
-                    data[new_key] = v
-                else:
-                    data[k] = _rewrite_includes(v)
-        else:
-            for k in list(data):
-                data[k] = _rewrite_includes(data[k])
-        return data
+            items = [(new_key if k == "include" else k, v) for k, v in item.items()]
+            item.clear()
+            item.update(items)
     return data
 
 
@@ -203,7 +200,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             basedir = play._loader.get_basedir()
         except Exception:
             basedir = os.getcwd()
-    play_vars = _resolved_play_vars(play, all_vars, basedir)
+    unresolved_vars_files = []
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -217,6 +215,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.incomplete = bool(unresolved_vars_files)
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -336,8 +335,12 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir):
-    """Merge static vars_files at their play-var precedence."""
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
+    """Merge static vars_files at their play-var precedence.
+
+    Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
+    appended to ``unresolved``.
+    """
     from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
@@ -347,9 +350,15 @@ def _resolved_play_vars(play, all_vars, basedir):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
+            raw = filename
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
-                break
+                # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
+                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
+                if filename is None:
+                    if unresolved is not None:
+                        unresolved.append(entry)
+                    break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
                 path = filename
@@ -386,6 +395,26 @@ def _resolved_play_vars(play, all_vars, basedir):
             if key in all_vars:
                 out[key] = all_vars[key]
     return out
+
+
+def _template_vars_file_name(play, filename, play_vars, all_vars):
+    from ansible.utils.vars import combine_vars
+
+    variables = combine_vars(play_vars, all_vars or {})
+    variables = combine_vars(variables, play.get_variable_manager().extra_vars)
+    try:
+        from ansible.template import Templar
+        try:
+            templar = Templar(loader=play._loader, variables=variables)
+        except TypeError:
+            templar = Templar(loader=play._loader)
+            templar.available_variables = variables
+        rendered = templar.template(filename, fail_on_undefined=True)
+    except Exception:
+        return None
+    if not isinstance(rendered, str) or _is_templated(rendered):
+        return None
+    return rendered
 
 
 def _tag_untrusted(value, template_syntax_only=False):
@@ -690,6 +719,8 @@ class _IncludeVariables:
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
         self.resolved_template = False
+        # A vars file whose name is only known at runtime may redefine any play var.
+        self.incomplete = False
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -971,17 +1002,28 @@ def _include_tasks_path(task, include_target, includes):
     return include_file
 
 
+_MAGIC_VAR_NAMES = frozenset((
+    "role_path", "role_name", "playbook_dir", "inventory_dir", "inventory_file", "inventory_hostname",
+    "groups", "hostvars", "ansible_play_hosts", "ansible_play_batch",
+))
+
+
 def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
+    from ansible.vars.reserved import is_reserved_name
+
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
+    include_scope = _include_scope(task)
     variables = {}
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
-                  *_include_scope(task), extra_vars):
+                  *include_scope, extra_vars):
         variables = combine_vars(variables, layer)
+    # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
+    above_vars_files = set(role_vars).union(*include_scope)
 
     loop_names = set()
     parent = task
@@ -995,6 +1037,9 @@ def _template_include_filename(task, value, includes):
 
     def is_runtime(name):
         if name in loop_names:
+            return True
+        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
+                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):
             return False
