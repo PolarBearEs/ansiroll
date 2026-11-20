@@ -494,6 +494,22 @@ def test_looped_src_directly_under_playbook_dir_is_baked_not_the_role_tree(tmp_p
     assert dest.read_text() == "value=2"
 
 
+def test_absolute_dynamic_src_bakes_only_matching_files_inside_the_playbook_dir(tmp_path):
+    from ansiroll import loader
+
+    pb = tmp_path / "pb"
+    (pb / ".git").mkdir(parents=True)
+    (pb / "conf.j2").write_text("conf")
+    (pb / "notes.txt").write_text("other")
+    (pb / ".vault.j2").write_text("secret")
+    (pb / ".git" / "x.j2").write_text("object")
+    (tmp_path / "outside.j2").write_text("outside")
+    (pb / "link.j2").symlink_to(tmp_path / "outside.j2")
+    node = {}
+    assert loader._bake_absolute_tree(node, str(pb) + "/{{ item }}.j2", str(pb))
+    assert node["_baked"] == {str(pb / "conf.j2"): "conf"}
+
+
 def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, monkeypatch):
     from ansiroll import loader
 

@@ -8,6 +8,7 @@ inlined runtime can interpret. This module runs only at compile time.
 
 from __future__ import annotations
 
+import glob
 import os
 import pkgutil
 import re
@@ -39,7 +40,7 @@ BAKED_ACTIONS = {
 
 _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
-# A src like "{{ playbook_dir }}/roles/{{ role }}/..." would embed every role's files; past this it is left unbaked.
+# A src like "{{ playbook_dir }}/roles/{{ role }}/..." can match many files; past this it is left unbaked.
 _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ENV_LOOKUP_RE = re.compile(
@@ -1454,28 +1455,26 @@ def _find_needle(task, subdir, rel):
 
 
 def _bake_absolute_tree(node, src, basedir):
-    """Bake the files under an absolute dynamic src's static directory, keyed by their absolute paths, when that
-    directory is or lies inside the playbook dir (e.g. "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2")."""
+    """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths. Each {{ ... }}
+    becomes a glob wildcard, so "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2" bakes that dir's .j2 files and
+    nothing else: no dotfiles (.git, vault password files) and nothing a symlink points to outside the playbook dir."""
     if not os.path.isabs(src):
         return False
-    tree_dir = os.path.normpath(os.path.dirname(_JINJA_RE.split(src, 1)[0]))
-    basedir = os.path.normpath(basedir)
-    if not (tree_dir == basedir or tree_dir.startswith(os.path.join(basedir, ""))) or not os.path.isdir(tree_dir):
-        return False
+    pattern = "*".join(glob.escape(part) for part in _JINJA_RE.split(src))
+    root = os.path.join(os.path.realpath(basedir), "")
     baked = {}
     size = 0
-    for root, dirs, files in os.walk(tree_dir):
-        dirs.sort()
-        for fn in sorted(files):
-            full = os.path.join(root, fn)
-            try:
-                size += os.path.getsize(full)
-                if size > _ABSOLUTE_TREE_LIMIT:
-                    return False
-                with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                    baked[full] = fh.read()
-            except OSError:
-                continue
+    for path in sorted(glob.glob(pattern)):
+        if not os.path.isfile(path) or not os.path.realpath(path).startswith(root):
+            continue
+        try:
+            size += os.path.getsize(path)
+            if size > _ABSOLUTE_TREE_LIMIT:
+                return False
+            with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+                baked[path] = fh.read()
+        except OSError:
+            continue
     if not baked:
         return False
     node["_baked"] = baked
