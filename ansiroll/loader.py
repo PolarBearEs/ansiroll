@@ -1387,7 +1387,7 @@ def _bake_sources(node, task, basedir):
                 candidates.append(_ITEM_RE.sub(str(it), src))
         elif _bake_absolute_tree(node, src, basedir):
             return
-        elif _bake_role_tree(node, task, subdir):
+        elif not os.path.isabs(src) and _bake_role_tree(node, task, subdir):
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the
             # loop is a runtime var; bake the whole role tree so the runtime can
             # resolve whichever file the rendered src points to.
@@ -1455,11 +1455,12 @@ def _find_needle(task, subdir, rel):
 
 def _bake_absolute_tree(node, src, basedir):
     """Bake the files under an absolute dynamic src's static directory, keyed by their absolute paths, when that
-    directory lies inside the playbook dir (e.g. "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2")."""
+    directory is or lies inside the playbook dir (e.g. "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2")."""
     if not os.path.isabs(src):
         return False
     tree_dir = os.path.normpath(os.path.dirname(_JINJA_RE.split(src, 1)[0]))
-    if not tree_dir.startswith(os.path.join(os.path.normpath(basedir), "")) or not os.path.isdir(tree_dir):
+    basedir = os.path.normpath(basedir)
+    if not (tree_dir == basedir or tree_dir.startswith(os.path.join(basedir, ""))) or not os.path.isdir(tree_dir):
         return False
     baked = {}
     size = 0

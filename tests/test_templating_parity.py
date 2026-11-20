@@ -462,6 +462,38 @@ def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_p
     assert dest.read_text() == "value=2"
 
 
+def test_looped_src_directly_under_playbook_dir_is_baked_not_the_role_tree(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {names: [conf]}
+  roles: [a]
+""", {
+        "roles/a/tasks/main.yml": """
+- template:
+    src: "{{ playbook_dir }}/{{ item }}.j2"
+    dest: %s/out-{{ item }}
+  loop: "{{ names }}"
+""" % str(tmp_path),
+        "roles/a/templates/conf.j2": "unrelated",
+        "conf.j2": "value={{ 1 + 1 }}",
+    })
+    dest = tmp_path / "out-conf"
+    expected = _ansible(playbook, tmp_path)
+    assert dest.read_text() == "value=2"
+    dest.unlink()
+    src, _ = compile_playbook(str(playbook))
+    (tmp_path / "conf.j2").unlink()
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, text=True,
+    )
+    assert _summary(proc.stdout + "\n" + proc.stderr) == expected
+    assert dest.read_text() == "value=2"
+
+
 def test_absolute_dynamic_src_tree_over_the_size_limit_is_not_baked(tmp_path, monkeypatch):
     from ansiroll import loader
 
@@ -570,6 +602,20 @@ def test_vars_derived_from_playbook_dir_ignore_a_set_fact_override(tmp_path):
     - debug: msg="container={{ cfg.path.startswith('/other') }}"
 """)
     assert msgs == ["task=False", "block=False", "play=False", "container=False"]
+
+
+def test_vars_derived_from_playbook_dir_ignore_an_override_in_the_same_mapping(tmp_path):
+    msgs, _recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: msg="task={{ source_dir.startswith('/other') }}"
+      vars: {playbook_dir: /other, source_dir: "{{ playbook_dir }}/templates"}
+    - block:
+        - debug: msg="block={{ block_dir.startswith('/other') }}"
+      vars: {playbook_dir: /other, block_dir: "{{ playbook_dir }}/templates"}
+""")
+    assert msgs == ["task=False", "block=False"]
 
 
 def test_frozen_vars_are_templated_once(tmp_path):

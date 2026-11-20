@@ -1769,6 +1769,7 @@ class Runtime:
         d = d or {}
         base = dict(ctx)
         base.update(d)
+        self._pin_magic_vars(base)
         out = {}
         legacy = _legacy_non_native(base)
         for k, v in d.items():
