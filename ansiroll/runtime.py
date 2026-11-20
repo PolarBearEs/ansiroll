@@ -368,6 +368,21 @@ class _UnsupportedLookup(Exception):
     """No built-in implementation for this lookup plugin name."""
 
 
+def _ansible_boolean(value):
+    """ansible.module_utils.parsing.convert_bool.boolean(value, strict=False)."""
+    if isinstance(value, bool):
+        return value
+    normalized = value
+    if isinstance(value, bytes):
+        normalized = value.decode("utf-8", "surrogateescape")
+    if isinstance(normalized, str):
+        normalized = normalized.lower().strip()
+    try:
+        return normalized in ("y", "yes", "on", "1", "true", "t", 1, 1.0)
+    except TypeError:
+        return False
+
+
 def _to_bool(value):
     if isinstance(value, bool):
         return value
@@ -960,6 +975,7 @@ class _LazyTplDict(dict):
             return self._ctx
         ctx = dict(self._ctx)
         ctx.update(self._rt.vars)
+        self._rt._pin_magic_vars(ctx)
         return ctx
 
     def __getitem__(self, k):
@@ -1020,6 +1036,7 @@ class _LazyTplList(list):
             return self._ctx
         ctx = dict(self._ctx)
         ctx.update(self._rt.vars)
+        self._rt._pin_magic_vars(ctx)
         return ctx
 
     def __getitem__(self, i):
@@ -1631,6 +1648,7 @@ class Runtime:
         }
         self.extra_vars = dict(extra_vars or {})
         self._play_var_templates = {}
+        self._playbook_dir = None
         self._runtime_var_overrides = set(self.extra_vars)
         # The controller passes its nonpersistent fact cache separately from
         # the flattened host snapshot. Those values (set_fact/register) outrank
@@ -1686,12 +1704,18 @@ class Runtime:
         for o in overlays:
             if o:
                 d.update(o)
+        self._pin_magic_vars(d)
         d.setdefault("omit", _OMIT)
         if "hostvars" not in d:
             d["hostvars"] = {self.host: dict(d)}
         if "vars" not in d:
             d["vars"] = _vars_snapshot(d)
         return d
+
+    def _pin_magic_vars(self, ctx):
+        # Ansible ranks playbook_dir above play, block and task vars, set_fact and registers.
+        if self._playbook_dir:
+            ctx["playbook_dir"] = self._playbook_dir
 
     def _store_register(self, task, result):
         name = task.get("register")
@@ -1745,6 +1769,7 @@ class Runtime:
         d = d or {}
         base = dict(ctx)
         base.update(d)
+        self._pin_magic_vars(base)
         out = {}
         legacy = _legacy_non_native(base)
         for k, v in d.items():
@@ -2002,6 +2027,8 @@ class Runtime:
     # ---- execution -------------------------------------------------------
     def run_play(self, play, defer_handlers=False, initial_notified=None):
         invocation_check_mode = self.check_mode
+        self._playbook_dir = play.get("playbook_dir")
+        self._pin_magic_vars(self.vars)
         play_check_mode = play.get("check_mode")
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):
@@ -2050,8 +2077,7 @@ class Runtime:
         # Extra-vars have the highest Ansible precedence; play vars must not
         # overwrite values injected via -e.
         self.vars.update(self.extra_vars)
-        if play.get("playbook_dir"):
-            self.vars["playbook_dir"] = play["playbook_dir"]
+        self._pin_magic_vars(self.vars)
         try:
             self.run_nodes(play.get("tasks", []), {}, play.get("become", False))
         except TaskFailed as ex:
@@ -2066,16 +2092,39 @@ class Runtime:
         self.check_mode = invocation_check_mode
 
     def run_nodes(self, nodes, overlay, become=False):
-        for node in nodes:
-            self.run_node(node, overlay, become)
+        # Each suspended generator resumes after its child sequence. Advancing
+        # one at a time keeps dynamic include and block depth off the call stack.
+        stack = [self._node_steps(nodes, overlay, become)]
+        failure = None
+        while stack:
+            frame = stack[-1]
+            try:
+                if failure is None:
+                    child = next(frame)
+                else:
+                    # Resume at the yield so enclosing blocks can handle failure.
+                    child = frame.throw(failure)
+            except StopIteration:
+                stack.pop()
+                failure = None
+            except TaskFailed as ex:
+                stack.pop()
+                failure = ex
+            else:
+                stack.append(child)
+                failure = None
+        if failure is not None:
+            raise failure
 
-    def run_node(self, node, overlay, become=False):
-        if node.get("type") == "block":
-            self.run_block(node, overlay, become)
-        elif node.get("type") == "include":
-            self.run_include(node, overlay, become)
-        else:
-            self.run_task(node, overlay, become)
+    def _node_steps(self, nodes, overlay, become):
+        for node in nodes:
+            kind = node.get("type")
+            if kind == "block":
+                yield from self._block_steps(node, overlay, become)
+            elif kind == "include":
+                yield from self._include_steps(node, overlay, become)
+            else:
+                self.run_task(node, overlay, become)
 
     def _when_of(self, node):
         own = node.get("when") or []
@@ -2083,11 +2132,18 @@ class Runtime:
             return own
         return self._inherited_when + list(own)
 
-    def run_include(self, node, overlay, become=False):
-        """Run a compile-time-expanded include_tasks or include_role."""
+    def _include_steps(self, node, overlay, become):
+        """Run a compile-time-expanded include_tasks or include_role, once per loop item if looped."""
         base_ctx = self._task_ctx(node, overlay)
         self.emit_start(node)
         b = bool(node.get("become")) or become
+        targets = self.__dict__.setdefault("_include_targets", {})
+        if node.get("include_id"):
+            targets[node["include_id"]] = node.get("tasks", [])
+        tasks = node.get("tasks", [])
+        if node.get("tasks_ref"):
+            # Recursive include: run the enclosing include's expansion again.
+            tasks = targets.get(node["tasks_ref"], tasks)
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
         if items is not None and not items:
             result = {"changed": False, "skipped": True, "results": [],
@@ -2107,36 +2163,39 @@ class Runtime:
             return
         scope = dict(overlay)
         scope.update(self.template_vars(node.get("vars"), base_ctx))
-        loop = node.get("loop")
+        tally_ok = node.get("tally_include_ok", True)
         if items is None:
             self.emit(node, "ok", {"changed": False, "include": node.get("file")})
-            self._tally("ok")
-            self.run_nodes(node.get("tasks", []), scope, b)
+            if tally_ok:
+                self._tally("ok")
+            yield self._node_steps(tasks, scope, b)
             return
         for i, it in enumerate(items):
             item_scope = dict(scope)
             item_scope.update(self._loop_item_vars(node, items, i, base_ctx))
             self.emit(node, "ok", {"changed": False, "include": node.get("file"),
                                    "item": it}, item=it, is_item=True)
-            self._tally("ok")
-            self.run_nodes(node.get("tasks", []), item_scope, b)
+            if tally_ok:
+                self._tally("ok")
+            yield self._node_steps(tasks, item_scope, b)
 
-    def run_block(self, block, overlay, become=False):
+    def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
         scope.update(self.template_vars(block.get("vars"), self.ctx(overlay)))
+        # Frames run strictly nested, so the block's conditions stay in force while its children are on the stack.
         inherited = self._inherited_when
         self._inherited_when = self._when_of(block)
         try:
-            self._run_block_body(block, scope, become)
+            yield from self._block_body_steps(block, scope, become)
         finally:
             self._inherited_when = inherited
 
-    def _run_block_body(self, block, scope, become):
+    def _block_body_steps(self, block, scope, become):
         b_become = bool(block.get("become")) or become
         failed_exc = None
         try:
             try:
-                self.run_nodes(block.get("block", []), scope, b_become)
+                yield self._node_steps(block.get("block", []), scope, b_become)
             except TaskFailed as ex:
                 rescue = block.get("rescue") or []
                 if not rescue:
@@ -2144,12 +2203,12 @@ class Runtime:
                 self._tally("rescued")
                 scope["ansible_failed_task"] = ex.task
                 scope["ansible_failed_result"] = ex.result
-                self.run_nodes(rescue, scope, b_become)
+                yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
             failed_exc = ex
         if block.get("always"):
             try:
-                self.run_nodes(block["always"], scope, b_become)
+                yield self._node_steps(block["always"], scope, b_become)
             except TaskFailed:
                 # If always replaces a pending block/rescue failure, preserve
                 # the original count before propagating the new failure.
@@ -2180,9 +2239,11 @@ class Runtime:
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
+        self._pin_magic_vars(ctx)
         ctx.update(self.template_vars(task.get("vars"), ctx))
         if task.get("role_magic"):
             ctx.update(task["role_magic"])
+        self._pin_magic_vars(ctx)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -2210,9 +2271,10 @@ class Runtime:
             return
         for _ in range(3):
             ctx = dict(self.vars)
+            self._pin_magic_vars(ctx)
             changed = False
             for key, raw in self._play_var_templates.items():
-                if key in self._runtime_var_overrides:
+                if key in self._runtime_var_overrides or (key == "playbook_dir" and self._playbook_dir):
                     continue
                 rendered = self.templater.render_string(raw, ctx)
                 try:
@@ -2714,13 +2776,55 @@ class Runtime:
                 identities[identity] = identities.get(identity, 0) + 1
         return res
 
+    @staticmethod
+    def _baked_source_key(task, src):
+        if isinstance(src, str) and os.path.isabs(src):
+            # Dynamic absolute sources are baked with repeated separators collapsed.
+            if src not in (task.get("_baked") or {}):
+                collapsed = re.sub(r"/+", "/", src)
+                if collapsed in (task.get("_baked") or {}):
+                    return collapsed
+            return src
+        # Role trees are baked under paths relative to files/ or templates/.
+        if not task.get("_baked_tree") or not isinstance(src, str):
+            return src
+        parts = src.split("/")
+        if parts[-1] in ("", ".", ".."):
+            return src
+        if ".." in parts:
+            # Relative Ansible source paths traverse the controller's actual
+            # directories. A missing or unbaked component can't be canceled.
+            directories = set(task.get("_baked_tree_dirs") or ())
+            aliases = task.get("_baked_tree_aliases") or {}
+            prefix = []
+            for part in parts[:-1]:
+                if part in ("", "."):
+                    continue
+                if part == "..":
+                    if not prefix:
+                        return src
+                    prefix.pop()
+                else:
+                    prefix.append(part)
+                    directory = "/".join(prefix)
+                    if directory in aliases:
+                        target = aliases[directory]
+                        prefix = [] if target == "." else target.split("/")
+                    elif directory not in directories:
+                        return src
+            if "/".join(prefix + [parts[-1]]) not in (task.get("_baked") or {}):
+                return src
+        # Ansible checks the original relative path, then normalizes it when reading.
+        return os.path.normpath(src)
+
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
         name = str(task.get("action") or "").split(".")[-1]
-        if name != "unarchive" or _boolean(args.get("remote_src", False)):
+        if name != "unarchive" or _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
-        marker = (task.get("_baked") or {}).get(src)
+        key = self._baked_source_key(task, src)
+        marker = (task.get("_baked") or {}).get(key)
         if marker is None:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
         return self._asset_bytes(marker)
@@ -2893,6 +2997,15 @@ class Runtime:
             }
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
+        if (name == "copy" and isinstance(args, dict)
+                and args.get("src") is not None and args.get("content") is None
+                and args.get("dest")
+                and _ansible_boolean(args.get("remote_src", False))):
+            # The copy action plugin (after its argument checks and the
+            # content branch) hands remote_src copies straight to the copy
+            # module, which reads src on the target.
+            return self.run_module(
+                task["action"], _fail_on_undef(_strip_omit(args)), become=become)
         if name in ("template", "copy"):
             return self._run_file_action(name, task, args, ctx, become)
         if name == "assert":
@@ -3144,8 +3257,9 @@ class Runtime:
         else:
             if src is None:
                 return {"failed": True, "changed": False, "msg": "%s: src is required" % name}
-            raw = baked.get(src)
-            meta = (task.get("_baked_meta") or {}).get(src) or {}
+            key = self._baked_source_key(task, src)
+            raw = baked.get(key)
+            meta = (task.get("_baked_meta") or {}).get(key) or {}
             if raw is None and self.controller_source_fn:
                 try:
                     fetched = self.controller_source_fn(src)
