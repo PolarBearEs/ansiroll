@@ -129,29 +129,43 @@ def _cmd_compile_stdout(args, restore_stdout):
         if manifest_path is None:
             return 2
         args.manifest = manifest_path
+    use_caller_stream = restore_stdout and (stdout is not sys.__stdout__ or stdout_fd != 1)
     with _compile_diagnostics_to_stderr(restore_stdout) as saved_stdout:
-        if stdout_fd != 1:
-            return _cmd_compile(args, write_source=stdout.write, stdout_fd=stdout_fd)
-
-        def write_source(source):
+        compiled = _compile_source(args)
+        if compiled is None:
+            return 2
+        source, manifest = compiled
+        if args.manifest:
+            # Duplicating stdout may have made a /dev/fd path resolve to it.
+            destination_fd = saved_stdout.fileno() if stdout_fd == 1 else stdout_fd
+            manifest_path = args.manifest
+            if destination_fd is not None:
+                manifest_path = _stdout_manifest_path(manifest_path, destination_fd)
+                if manifest_path is None:
+                    return 2
+            _write_manifest(manifest_path, manifest)
+        if not use_caller_stream:
             saved_stdout.write(source.encode("utf-8"))
 
-        return _cmd_compile(args, write_source=write_source, stdout_fd=saved_stdout.fileno())
+    if use_caller_stream:
+        stdout.write(source)
+    _report_compiled(args.playbook, "stdout", manifest)
+    return 0
 
 
-def _cmd_compile(args, write_source=None, stdout_fd=None):
+def _compile_source(args):
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
         sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
-        return 2
+        return None
     try:
-        source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
-                                            vault_password_file=args.vault_password_file,
-                                            extra_vars=extra_vars,
-                                            tree_shake=args.tree_shake,
-                                            freeze_playbook_vars=args.freeze_playbook_vars,
-                                            freeze_vars=args.freeze_var)
+        return compile_playbook(args.playbook, python_interpreter=args.interpreter,
+                                vault_password_file=args.vault_password_file,
+                                extra_vars=extra_vars,
+                                tree_shake=args.tree_shake,
+                                freeze_playbook_vars=args.freeze_playbook_vars,
+                                freeze_vars=args.freeze_var)
     except Exception as ex:
         if not isinstance(ex, (ValueError,) + _ansible_errors()):
             raise
@@ -159,28 +173,33 @@ def _cmd_compile(args, write_source=None, stdout_fd=None):
         if not message.startswith("ansiroll: "):
             message = "ansiroll: " + message
         sys.stderr.write(message + "\n")
+        return None
+
+
+def _cmd_compile(args):
+    compiled = _compile_source(args)
+    if compiled is None:
         return 2
-    if write_source is None:
-        with open(args.output, "w") as fh:
-            fh.write(source)
-        os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
+    source, manifest = compiled
+    with open(args.output, "w") as fh:
+        fh.write(source)
+    os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
-        manifest_path = args.manifest
-        if stdout_fd is not None:
-            # Duplicating stdout may have made a /dev/fd path resolve to it.
-            manifest_path = _stdout_manifest_path(manifest_path, stdout_fd)
-            if manifest_path is None:
-                return 2
-        with open(manifest_path, "w") as fh:
-            json.dump(manifest, fh, indent=2)
-    if write_source is not None:
-        write_source(source)
+        _write_manifest(args.manifest, manifest)
+    _report_compiled(args.playbook, args.output, manifest)
+    return 0
+
+
+def _write_manifest(path, manifest):
+    with open(path, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+
+
+def _report_compiled(playbook, destination, manifest):
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
-        % (args.playbook, "stdout" if write_source is not None else args.output, len(manifest["modules"]),
-           len(manifest["fallback_tasks"]))
+        % (playbook, destination, len(manifest["modules"]), len(manifest["fallback_tasks"]))
     )
-    return 0
 
 
 def _ansible_errors():

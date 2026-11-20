@@ -53,23 +53,33 @@ def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
     compile(result.stdout, "<stdout>", "exec")
 
 
-def test_callable_compile_writes_to_the_callers_stdout(monkeypatch, capfdbinary):
+@pytest.mark.parametrize("forward_to_fd", [False, True])
+def test_callable_compile_writes_to_the_callers_stdout(monkeypatch, capfdbinary, forward_to_fd):
     manifest = {"modules": [], "fallback_tasks": []}
 
     def compile_playbook(*args, **kwargs):
         print("compiler diagnostic")
         return "print('olá')\n", manifest
 
+    class Tee(StringIO):
+        def fileno(self):
+            return 1
+
+        def write(self, text):
+            os.write(self.fileno(), text.encode("utf-8"))
+            return super().write(text)
+
     monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
-    output = StringIO()
+    output = Tee() if forward_to_fd else StringIO()
 
     with redirect_stdout(output):
         assert cli.main(["compile", "play.yml", "-o", "-"]) == 0
         print("caller after compile")
 
-    assert output.getvalue() == "print('olá')\ncaller after compile\n"
+    expected = "print('olá')\ncaller after compile\n"
+    assert output.getvalue() == expected
     captured = capfdbinary.readouterr()
-    assert captured.out == b""
+    assert captured.out == (expected.encode("utf-8") if forward_to_fd else b"")
     assert b"compiler diagnostic\n" in captured.err
 
 
