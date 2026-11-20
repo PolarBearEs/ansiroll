@@ -347,6 +347,7 @@ class StrategyModule(StrategyBase):
     def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
         host_failed = False
         seen = set()
+        included_vars_by_task = {}
         last_frame = time.monotonic()
         while True:
             frame = chan.recv()
@@ -373,7 +374,11 @@ class StrategyModule(StrategyBase):
                                  result_frame.get("task") or result_frame.get("action"),
                                  detail))
                 self._emit_provenance_frame(host, result_frame)
-                self._emit_frame(host, result_frame, task_map, seen, templar)
+                task_key = result_frame.get("runtime_id") or result_frame.get("uuid")
+                definitions = None
+                if not result_frame.get("is_item"):
+                    definitions = included_vars_by_task.pop(task_key, None)
+                self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
             elif t == "delegate":
@@ -381,7 +386,7 @@ class StrategyModule(StrategyBase):
                 chan.send({"t": "delegate_result",
                            "result": self._run_delegated(
                                frame, host, hv, templar, become_pass,
-                               task_map, play_context
+                               task_map, play_context, included_vars_by_task
                            )})
                 self._profile("%s delegate +%.3fs %s"
                               % (host.name, time.monotonic() - delegate_started,
@@ -445,14 +450,41 @@ class StrategyModule(StrategyBase):
         self._emit_provenance(provenance)
 
     def _run_delegated(self, frame, host, hv, templar, become_pass,
-                       task_map=None, play_context=None):
+                       task_map=None, play_context=None, included_vars_by_task=None):
         """Execute a delegated / controller-coupled task on the correct host and
         return its raw module result (the agent re-emits the framed result)."""
         action = str(frame.get("action") or "").rsplit(".", 1)[-1]
         if action in ("add_host", "group_by"):
             return self._run_inventory_action(action, frame, host, hv)
         if action == "include_vars":
-            return self._run_include_vars(frame)
+            result = self._run_include_vars(frame)
+            facts = result.pop("ansible_facts", None)
+            if facts is not None:
+                from ansiroll.loader import _tag_untrusted
+
+                # Scalar values stringified for JSON have no template provenance.
+                result["_ansiroll_included_vars"] = json.dumps(
+                    _tag_untrusted(facts),
+                    default=lambda value: {"__ansiroll_unsafe__": str(value)},
+                )
+                # Keep the loader's tagged values until the register is replayed.
+                task_key = frame.get("runtime_id") or frame.get("uuid")
+                task = (task_map or {}).get(task_key)
+                task_action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+                if (included_vars_by_task is not None and task_action == "include_vars"
+                        and _register_names(task)):
+                    definitions = included_vars_by_task.setdefault(task_key, [])
+                    result["_ansiroll_included_vars_reference"] = len(definitions)
+                    definitions.append(facts)
+                # Match Ansible's include_vars layer for later plays and hosts.
+                run_once = getattr(task, "run_once", None)
+                if isinstance(run_once, str):
+                    run_once = self._t(templar, run_once)
+                hosts = self._run_hosts if _truthy(run_once) else (host,)
+                for target in hosts:
+                    for key, value in facts.items():
+                        self._variable_manager.set_host_variable(target.name, key, value)
+            return result
         if action == "set_fact":
             args = dict(frame.get("args") or {})
             cacheable = bool(args.pop("cacheable", False))
@@ -589,9 +621,14 @@ class StrategyModule(StrategyBase):
             return {"failed": True, "changed": False,
                     "msg": "Could not find or access '%s'" % fname}
         try:
-            data = self._loader.load_from_file(path) or {}
+            try:
+                data = self._loader.load_from_file(path, cache="none", trusted_as_template=True)
+            except TypeError:  # Older Ansible uses AnsibleUnsafeText for !unsafe.
+                data = self._loader.load_from_file(path)
         except Exception as ex:
             return {"failed": True, "changed": False, "msg": str(ex)}
+        if data is None:
+            data = {}
         if not isinstance(data, dict):
             return {"failed": True, "changed": False,
                     "msg": "%s must be stored as a dictionary/hash" % path}
@@ -658,11 +695,16 @@ class StrategyModule(StrategyBase):
                 host.name, group_info
             )
         except ImportError:
-            self._inventory.add_dynamic_group(host, result)
+            if hasattr(self._inventory, "add_dynamic_group"):
+                self._inventory.add_dynamic_group(host, result)
+            else:
+                self._add_group(host, result)
         # group_by can make new group_vars and group_names visible immediately
-        # to later tasks in the same play. Refresh only values that changed from
-        # the host snapshot shipped to the agent, preserving agent-side facts.
+        # to later tasks in the same play. Compare against the last snapshot
+        # sent to the agent, including trust that survives serialization.
         try:
+            from ansiroll.loader import _tag_untrusted
+
             updated = self._variable_manager.get_vars(host=host, play=self._cur_play)
             delta = {}
             nonpersistent = getattr(
@@ -672,13 +714,17 @@ class StrategyModule(StrategyBase):
                 if name in ("hostvars", "vars") or name in nonpersistent:
                     continue
                 try:
-                    changed = name not in hv or hv[name] != value
+                    changed = (name not in hv or hv[name] != value
+                               or _tag_untrusted(hv[name], template_syntax_only=True)
+                               != _tag_untrusted(value, template_syntax_only=True))
                 except Exception:
                     changed = name not in hv
                 if changed:
                     delta[name] = value
             if delta:
-                result["_ansiroll_vars"] = delta
+                refreshed = json.loads(_json_blob(delta))
+                result["_ansiroll_vars"] = refreshed
+                hv.update({name: delta[name] for name in refreshed})
         except Exception:
             pass
         return result
@@ -914,7 +960,8 @@ class StrategyModule(StrategyBase):
         self._tqm.send_callback("v2_playbook_on_task_start", task, is_conditional=False)
         return True
 
-    def _emit_frame(self, host, frame, task_map, seen, templar=None):
+    def _emit_frame(self, host, frame, task_map, seen, templar=None,
+                    included_vars=None):
         task_key = frame.get("runtime_id") or frame.get("uuid")
         task = task_map.get(task_key)
         if task is None:
@@ -932,15 +979,21 @@ class StrategyModule(StrategyBase):
         # survive into subsequent plays (each play runs a fresh agent).
         try:
             registers = _register_names(task)
+            action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+            registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action == "include_vars" and included_vars:
+                    registered_result = _restore_included_vars(
+                        result_data, included_vars, frame.get("included_vars_references"),
+                    )
                 self._variable_manager.set_nonpersistent_facts(
-                    host.name, {reg: dict(result_data) for reg in registers}
+                    host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = result_data.get("ansible_facts")
-            is_set_fact = (
-                str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
-                == "set_fact"
-            )
+            if action == "include_vars":
+                # The controller has already stored the original tagged values.
+                facts = None
+            is_set_fact = action == "set_fact"
             cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
             if isinstance(facts, dict):
                 # Match StrategyBase: cacheable set_fact results populate the
@@ -968,7 +1021,7 @@ class StrategyModule(StrategyBase):
                     if registers:
                         self._variable_manager.set_nonpersistent_facts(
                             other.name,
-                            {reg: dict(result_data) for reg in registers},
+                            {reg: dict(registered_result) for reg in registers},
                         )
                     if isinstance(facts, dict):
                         if not is_set_fact or cacheable:
@@ -1089,6 +1142,24 @@ class StrategyModule(StrategyBase):
             if task is None:
                 break
             guard += 1
+
+
+def _restore_included_vars(result, definitions, references):
+    """Restore controller-loaded facts only in the registered copy of a result."""
+    if not isinstance(references, dict):
+        return result
+    looped = isinstance(result.get("results"), list)
+    entries = result["results"] if looped else [result]
+    restored = []
+    for index, entry in enumerate(entries):
+        reference = references.get(str(index))
+        if (type(reference) is int and 0 <= reference < len(definitions)
+                and isinstance(entry, dict) and "ansible_facts" in entry):
+            entry = dict(entry, ansible_facts=definitions[reference])
+        restored.append(entry)
+    if looped:
+        return dict(result, results=restored)
+    return restored[0]
 
 
 def _register_names(task):
@@ -1214,6 +1285,8 @@ def _extra_vars(variable_manager):
 
 
 def _json_blob(values):
+    from ansiroll.loader import _tag_untrusted
+
     # hostvars/vars are live controller objects that stringify uselessly; the
     # agent synthesizes ``vars``. Materialize hostvars without their recursive
     # magic members so cross-host templates remain available to delegated
@@ -1224,12 +1297,15 @@ def _json_blob(values):
         snapshot = _hostvars_snapshot(hostvars)
         if snapshot:
             values["hostvars"] = snapshot
+    # Keep literal template-looking data tagged across the JSON boundary.
+    # Other host values also serve as connection metadata and identifiers.
     try:
-        return json.dumps(values, default=str)
+        return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
     except Exception:
         safe = {}
         for k, v in (values or {}).items():
             try:
+                v = _tag_untrusted(v, template_syntax_only=True)
                 json.dumps(v, default=str)
                 safe[k] = v
             except Exception:

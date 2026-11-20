@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from ansiroll.runtime import Runtime, UntrustedConditional, _parse_output
+from ansiroll.runtime import (
+    ConditionalError, Runtime, UntrustedConditional, _parse_output,
+)
 
 
 def _task(uuid, name, special, **kw):
@@ -403,15 +405,12 @@ def test_play_vars_can_read_baked_controller_config():
     assert by_name(frames, "check config")[0]["status"] == "ok"
 
 
-@pytest.mark.parametrize(
-    ("core_2_20_or_newer", "expected_when_enabled"),
-    [(False, False), (True, True)],
-)
+@pytest.mark.parametrize("core_2_19_or_newer", [False, True])
 def test_broken_conditional_config_controls_string_truthiness(
-        monkeypatch, core_2_20_or_newer, expected_when_enabled):
+        monkeypatch, core_2_19_or_newer):
     monkeypatch.setattr(
         "ansiroll.runtime._core_at_least",
-        lambda *_version: core_2_20_or_newer,
+        lambda *_version: core_2_19_or_newer,
     )
     rt = Runtime({}, "", {"inventory_hostname": "h"})
     disabled = rt.ctx({
@@ -425,8 +424,13 @@ def test_broken_conditional_config_controls_string_truthiness(
         }
     })
 
-    assert rt.when(["'broken static'"], disabled) is False
-    assert rt.when(["'broken static'"], enabled) is expected_when_enabled
+    if core_2_19_or_newer:
+        # ansible-core 2.19+ fails the task on a non-boolean conditional.
+        with pytest.raises(ConditionalError, match="must have a boolean"):
+            rt.when(["'broken static'"], disabled)
+    else:
+        assert rt.when(["'broken static'"], disabled) is True
+    assert rt.when(["'broken static'"], enabled) is True
 
 
 def test_unused_undefined_play_var_does_not_fail_empty_tag_selected_play():
@@ -639,13 +643,25 @@ def test_debug_fails_when_rendered_argument_contains_captured_undefined():
     assert "missing" in frames[0]["result"]["msg"]
 
 
-def test_debug_does_not_force_nested_undefined_in_mapping():
-    task = _task("1", "lazy debug", "debug", args={"msg": "{{ nested }}"})
-    _rt, frames = run([task], host_vars={
+@pytest.mark.parametrize("modern", [False, True])
+def test_debug_finalizes_nested_undefined_before_reporting(monkeypatch, modern):
+    monkeypatch.setattr("ansiroll.runtime._core_at_least", lambda *_: modern)
+    tasks = [
+        _task("1", "message", "debug", args={"msg": "{{ nested }}"},
+              ignore_errors=True),
+        _task("2", "diagnostic", "debug", args={"var": "nested"}),
+    ]
+    _rt, frames = run(tasks, host_vars={
         "inventory_hostname": "h",
-        "nested": {"unused": "{{ missing }}"},
+        "nested": {"values": ("{{ missing }}", "{{ also_missing }}")},
     })
-    assert frames[0]["status"] == "ok"
+    assert frames[0]["status"] == "failed"
+    assert "'missing' is undefined" in frames[0]["result"]["msg"]
+    assert frames[1]["status"] == "ok"
+    assert frames[1]["result"]["nested"] == ({
+        "values": ["<< error 1 - 'missing' is undefined >>",
+                   "<< error 2 - 'also_missing' is undefined >>"]
+    } if modern else "VARIABLE IS NOT DEFINED!")
 
 
 def test_delegated_debug_remains_a_runtime_special_action():
@@ -1057,7 +1073,8 @@ def test_async_poll_zero_starts_without_sync_run(monkeypatch):
     task["special"] = None
     rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
 
-    def async_run(action, args, become=False):
+    def async_run(action, args, become=False, async_val=0, ctx=None, options=None):
+        assert async_val == 2000
         return {
             "changed": True,
             "ansible_job_id": "123.456",
@@ -1394,6 +1411,7 @@ def test_become_worker_authenticates_without_writing_password_to_protocol(monkey
 
     monkeypatch.setattr("ansiroll.runtime.subprocess.run", fake_run)
     monkeypatch.setattr("ansiroll.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("ansiroll.runtime._WorkerStderr", lambda proc: None)
     rt = Runtime(
         {}, "", {"inventory_hostname": "h"}, become_password="secret-password"
     )
@@ -1440,6 +1458,7 @@ def test_same_uid_become_uses_the_normal_worker(monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("ansiroll.runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("ansiroll.runtime._WorkerStderr", lambda proc: None)
     monkeypatch.setattr(
         "ansiroll.runtime.subprocess.run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected sudo")),

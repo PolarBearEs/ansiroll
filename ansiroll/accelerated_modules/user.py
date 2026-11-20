@@ -8,6 +8,8 @@ import pwd
 import shutil
 import subprocess
 
+from . import _stdin
+
 
 _ALLOWED = frozenset((
     "name", "state", "group", "groups", "append", "uid", "shell",
@@ -84,7 +86,7 @@ def _execute(command, environment):
     if environment:
         process_environment.update(
             {str(key): str(value) for key, value in environment.items()})
-    process = subprocess.Popen(
+    process = _stdin.popen(
         [executable] + [str(value) for value in command[1:]],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

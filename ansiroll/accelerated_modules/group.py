@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 
+from . import _stdin
+
 
 _ALLOWED = frozenset(("name", "state", "gid", "system"))
 
@@ -61,7 +63,7 @@ def run(args, check_mode=False, shell=False, environment=None, options=None):
         if environment:
             process_environment.update(
                 {str(key): str(value) for key, value in environment.items()})
-        process = subprocess.Popen(
+        process = _stdin.popen(
             [executable] + command[1:],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
