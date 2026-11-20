@@ -1134,9 +1134,10 @@ class _PlayVarView(dict):
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
-        if key != "vars":
-            return self.scope[key]
-        return value
+        if key == "vars":
+            return value
+        value = self.scope[key]
+        return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -2378,6 +2379,10 @@ class Runtime:
         tally_ok = node.get("tally_include_ok", True)
         looped = items is not None
         invocation_params = node.get("include_params", node.get("vars")) or {}
+        handlers = node.get("handlers") or []
+        # Ansible loads the handlers from all invocations of a role loop
+        # before it schedules the first invocation's tasks.
+        deferred_scopes = [] if looped and handlers else None
         for i, item in enumerate(items if looped else [None]):
             result = {"changed": False, "include": node.get("file")}
             loop_vars = {}
@@ -2398,7 +2403,12 @@ class Runtime:
             self.emit(node, "ok", result, item=item, is_item=looped)
             if tally_ok:
                 self._tally("ok")
-            self._add_handlers(node.get("handlers", []), scope, b)
+            self._add_handlers(handlers, scope, b)
+            if deferred_scopes is None:
+                yield self._node_steps(tasks, scope, b)
+            else:
+                deferred_scopes.append(scope)
+        for scope in deferred_scopes or ():
             yield self._node_steps(tasks, scope, b)
 
     def _block_steps(self, block, overlay, become):

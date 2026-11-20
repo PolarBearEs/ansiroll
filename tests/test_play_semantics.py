@@ -496,6 +496,27 @@ def test_mapping_copies_resolve_deferred_play_vars_on_modern_core(tmp_path, mode
     assert _summary(result.stdout)[0] == [json.dumps("True True True True True True True")]
 
 
+def test_role_alias_resolves_in_vars_with_a_deferred_play_var(tmp_path):
+    if CORE_VERSION < (2, 19):
+        pytest.skip("legacy Ansible exposes raw values in vars mapping copies")
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              vars:
+                play_alias: "{{ source }}"
+                source: sample
+              roles: [r]
+        """,
+        "roles/r/vars/main.yml": 'role_alias: "{{ source }}"\n',
+        "roles/r/tasks/main.yml": """
+            - debug:
+                msg: "{{ play_alias }} {{ role_alias }} {{ vars.role_alias }} {{ dict(vars).role_alias }}"
+        """,
+    })
+    assert messages == ['"sample sample sample sample"']
+
+
 @pytest.mark.parametrize("mode", ["linear", "standalone", "strategy"])
 def test_deferred_play_vars_keep_literal_mapping_values(tmp_path, mode):
     _write(tmp_path, {"pb.yml": """
@@ -606,11 +627,12 @@ def test_include_tasks_handler_runs_its_body(tmp_path):
                 - include_role: {name: r}
                 - debug: {msg: notifying}
                   changed_when: true
-                  notify: [expanded handler, skipped handler]
+                  notify: ["r : expanded handler", expanded topic, skipped handler]
         """,
         "roles/r/handlers/main.yml": """
             - name: expanded handler
               include_tasks: handler.yml
+              listen: expanded topic
               vars: {handler_message: included}
             - name: skipped handler
               include_tasks: handler.yml
@@ -620,6 +642,30 @@ def test_include_tasks_handler_runs_its_body(tmp_path):
     })
     assert messages == ['"notifying"', '"included"']
     assert recap[4] == "1"
+
+
+def test_role_loop_registers_later_handlers_before_first_body(tmp_path):
+    messages, _ = check(tmp_path, {
+        "pb.yml": """
+            - hosts: localhost
+              gather_facts: false
+              tasks:
+                - include_role: {name: r}
+                  loop: [first, second]
+                  loop_control: {loop_var: invocation}
+        """,
+        "roles/r/tasks/main.yml": """
+            - debug: msg="{{ invocation }}"
+              changed_when: true
+              notify: run second
+              when: invocation == 'first'
+        """,
+        "roles/r/handlers/main.yml": """
+            - name: "run {{ invocation }}"
+              debug: msg="handler {{ invocation }}"
+        """,
+    })
+    assert messages == ['"first"', '"handler second"']
 
 
 def test_legacy_child_handler_preserves_unsafe_play_role_defaults(tmp_path):

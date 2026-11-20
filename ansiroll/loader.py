@@ -657,6 +657,8 @@ def _convert_handlers(blocks, actions, basedir, includes):
             if node and node.get("uuid") not in seen:
                 seen.add(node.get("uuid"))
                 node["handler_block"] = block_index
+                if node.get("type") == "include":
+                    node.update(_handler_match(handler))
                 handlers.append(node)
     return handlers
 
