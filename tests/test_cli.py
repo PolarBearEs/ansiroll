@@ -50,7 +50,8 @@ def test_compile_stdout_is_utf8_with_a_different_stdout_encoding(tmp_path):
 
 
 @pytest.mark.parametrize("compile_fails", [False, True])
-def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails):
+@pytest.mark.parametrize("invocation", ["entrypoint", "implicit_args", "explicit_args"])
+def test_compile_flushes_buffered_diagnostics_to_stderr(compile_fails, invocation):
     script = r"""
 import atexit
 import ctypes
@@ -63,28 +64,40 @@ puts.argtypes = [ctypes.c_char_p]
 def compile_playbook(*args, **kwargs):
     sys.__stdout__.write("buffered diagnostic\n")
     puts(b"native diagnostic")
-    atexit.register(puts, b"native shutdown diagnostic")
+    if invocation == "entrypoint":
+        atexit.register(puts, b"native shutdown diagnostic")
     if compile_fails == "True":
         raise ValueError("compile failed")
     return "print('ok')\n", {"modules": [], "fallback_tasks": []}
 
 cli.compile_playbook = compile_playbook
-compile_fails = sys.argv[1]
-sys.argv[1:] = ["compile", "play.yml", "-o", "-"]
-raise SystemExit(cli.main())
+compile_fails, invocation = sys.argv[1:]
+args = ["compile", "play.yml", "-o", "-"]
+sys.argv[1:] = args
+if invocation == "entrypoint":
+    raise SystemExit(cli.entrypoint())
+puts(b"caller before compile")
+result = cli.main(args) if invocation == "explicit_args" else cli.main()
+print("caller after compile")
+raise SystemExit(result)
 """
     env = dict(os.environ)
     env.pop("PYTHONUNBUFFERED", None)
 
     result = subprocess.run(
-        [sys.executable, "-c", script, str(compile_fails)], capture_output=True, env=env,
+        [sys.executable, "-c", script, str(compile_fails), invocation],
+        capture_output=True, env=env,
     )
 
     assert result.returncode == (2 if compile_fails else 0), result.stderr
-    assert result.stdout == (b"" if compile_fails else b"print('ok')\n")
+    source = b"" if compile_fails else b"print('ok')\n"
+    if invocation == "entrypoint":
+        assert result.stdout == source
+        assert b"native shutdown diagnostic\n" in result.stderr
+    else:
+        assert result.stdout == b"caller before compile\n" + source + b"caller after compile\n"
     assert b"buffered diagnostic\n" in result.stderr
     assert b"native diagnostic\n" in result.stderr
-    assert b"native shutdown diagnostic\n" in result.stderr
 
 
 def test_compile_rejects_manifest_that_points_to_stdout(monkeypatch, capfdbinary):
@@ -96,6 +109,26 @@ def test_compile_rejects_manifest_that_points_to_stdout(monkeypatch, capfdbinary
     captured = capfdbinary.readouterr()
     assert captured.out == b""
     assert b"manifest path points to stdout" in captured.err
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires procfs file descriptors")
+def test_compile_rejects_manifest_that_points_to_saved_stdout():
+    script = """
+import os
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *args, **kwargs: ("pass", {"modules": [], "fallback_tasks": []})
+next_fd = os.dup(1)
+os.close(next_fd)
+sys.argv[1:] = ["compile", "play.yml", "-o", "-", "-m", "/proc/self/fd/%d" % next_fd]
+raise SystemExit(cli.entrypoint())
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True)
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert b"manifest path points to stdout" in result.stderr
 
 
 @pytest.mark.parametrize("manifest_path", [os.devnull, "/dev/stdout"])

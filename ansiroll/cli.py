@@ -15,6 +15,14 @@ from .compiler import compile_playbook
 
 
 def main(argv=None):
+    return _main(argv, restore_stdout=True)
+
+
+def entrypoint():
+    return _main(None, restore_stdout=False)
+
+
+def _main(argv, *, restore_stdout):
     parser = argparse.ArgumentParser(prog="ansiroll", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -49,7 +57,7 @@ def main(argv=None):
 
     if args.command == "compile":
         if args.output == "-":
-            return _cmd_compile_stdout(args, restore_stdout=argv is not None)
+            return _cmd_compile_stdout(args, restore_stdout=restore_stdout)
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -64,6 +72,12 @@ def _compile_diagnostics_to_stderr(restore_stdout):
     original_stdout = sys.__stdout__
     if original_stdout is not None and original_stdout is not stdout:
         original_stdout.flush()
+    if restore_stdout:
+        from ctypes import CDLL
+
+        # Drain the caller's existing C stdio output before redirecting fd 1.
+        flush_native = CDLL(None).fflush
+        flush_native(None)
     with os.fdopen(os.dup(1), "wb") as saved_stdout:
         os.dup2(2, 1)
         try:
@@ -77,25 +91,31 @@ def _compile_diagnostics_to_stderr(restore_stdout):
                     stdout.flush()
                     if original_stdout is not None and original_stdout is not stdout:
                         original_stdout.flush()
+                    flush_native(None)
                 finally:
                     os.dup2(saved_stdout.fileno(), 1)
 
 
-def _manifest_aliases_stdout(path):
+def _stdout_manifest_path(path, stdout_fd):
     try:
         manifest_stat = os.stat(path)
     except FileNotFoundError:
-        return False
-    return os.path.samestat(manifest_stat, os.fstat(1))
+        return path
+    if not os.path.samestat(manifest_stat, os.fstat(stdout_fd)):
+        return path
+    if os.path.samefile(path, os.devnull):
+        # A path such as /dev/stdout would point to stderr after redirection.
+        return os.devnull
+    sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % path)
+    return None
 
 
 def _cmd_compile_stdout(args, restore_stdout):
-    if args.manifest and _manifest_aliases_stdout(args.manifest):
-        if not os.path.samefile(args.manifest, os.devnull):
-            sys.stderr.write("ansiroll: manifest path points to stdout: %s\n" % args.manifest)
+    if args.manifest:
+        manifest_path = _stdout_manifest_path(args.manifest, 1)
+        if manifest_path is None:
             return 2
-        # A path such as /dev/stdout would point to stderr after redirection.
-        args.manifest = os.devnull
+        args.manifest = manifest_path
     with _compile_diagnostics_to_stderr(restore_stdout) as stdout:
         return _cmd_compile(args, stdout=stdout)
 
@@ -126,7 +146,13 @@ def _cmd_compile(args, stdout=None):
             fh.write(source)
         os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
-        with open(args.manifest, "w") as fh:
+        manifest_path = args.manifest
+        if stdout is not None:
+            # Duplicating stdout may have made a /dev/fd path resolve to it.
+            manifest_path = _stdout_manifest_path(manifest_path, stdout.fileno())
+            if manifest_path is None:
+                return 2
+        with open(manifest_path, "w") as fh:
             json.dump(manifest, fh, indent=2)
     if stdout is not None:
         stdout.write(source.encode("utf-8"))
@@ -199,4 +225,4 @@ def _cmd_run(args):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entrypoint())
