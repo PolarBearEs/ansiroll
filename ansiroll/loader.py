@@ -165,30 +165,27 @@ def _make_rewriting_loader(DataLoader):
     return RewritingDataLoader()
 
 
+_TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+
+
 def _rewrite_includes(data):
     # Rewrite in place: ansible-core's parsed containers carry origin tags
     # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies.
-    if isinstance(data, list):
-        for index, item in enumerate(data):
-            data[index] = _rewrite_includes(item)
+    # must not be replaced by plain copies. Only task lists are touched, since
+    # vars files go through this loader too.
+    if not isinstance(data, list):
         return data
-    if isinstance(data, dict):
-        rename = "include" in data and isinstance(data.get("include"), str)
-        if rename:
-            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in data)
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for k in _TASK_LIST_KEYS:
+            _rewrite_includes(item.get(k))
+        if "include" in item and isinstance(item.get("include"), str):
+            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
-            items = list(data.items())
-            data.clear()
-            for k, v in items:
-                if k == "include":
-                    data[new_key] = v
-                else:
-                    data[k] = _rewrite_includes(v)
-        else:
-            for k in list(data):
-                data[k] = _rewrite_includes(data[k])
-        return data
+            items = [(new_key if k == "include" else k, v) for k, v in item.items()]
+            item.clear()
+            item.update(items)
     return data
 
 
@@ -1544,6 +1541,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
     baked = {}
+    meta = {}
     directories = set()
     aliases = {}
     skipped = []
@@ -1567,11 +1565,14 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 try:
                     with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
                         baked[rel] = fh.read()
+                    st = os.stat(full)
                 except OSError:
                     continue
+                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid}
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
     for directory in list(directories):
