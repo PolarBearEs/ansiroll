@@ -36,6 +36,34 @@ def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
 
 
+@pytest.mark.parametrize("version,resolve", [("2.18.20", False), ("2.19.15", True)])
+def test_play_var_mapping_iteration_only_resolves_consumed_values(monkeypatch, version, resolve):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    called = []
+
+    def measure(value):
+        called.append(value)
+        return value
+
+    rt.templater.env.globals["measure"] = measure
+    values = {
+        "first": "{{ measure('first') }}",
+        "second": "{{ measure('second') }}",
+    }
+    prepared = rt.template_vars(values, {}, dynamic=True)
+
+    expected = "first" if resolve else values["first"]
+    assert rt.template("{{ vars.items() | first }}", prepared) == ("first", expected)
+    assert called == (["first"] if resolve else [])
+    assert rt.template("{{ vars.values() | first }}", prepared) == expected
+    assert called == (["first", "first"] if resolve else [])
+    assert rt.template("{{ (vars | dict2items | first).value }}", prepared) == expected
+    assert called == (["first", "first", "first", "second"] if resolve else [])
+
+
 def test_debug_and_set_fact_register():
     tasks = [
         _task("1", "sf", "set_fact", args={"foo": "{{ 1 + 1 }}"}),
@@ -44,6 +72,163 @@ def test_debug_and_set_fact_register():
     rt, frames = run(tasks)
     assert by_name(frames, "show")[0]["result"]["msg"] == "foo is 2"
     assert rt.stats["ok"] == 2
+
+
+def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.20.1")
+    rt = Runtime({}, "", {})
+    calls = []
+    rt.templater.env.globals["measure"] = lambda: calls.append("value") or "sample"
+    prepared = rt.template_vars({"alias": "{{ measure() }}", "nested": {"leaf": "{{ alias }}"}},
+                                {}, dynamic=True)
+
+    assert rt.template("{{ [alias, nested.leaf] }}", prepared) == ["sample", "sample"]
+    assert calls == ["value"]
+    assert rt.template("{{ vars == dict(vars) and dict(**vars).alias == 'sample' }}", prepared)
+    assert "{{ measure() }}" not in rt.template("{{ vars | string }}", prepared)
+
+    cycle = rt.template_vars({"alias": "{{ nested.leaf }}", "nested": {"leaf": "{{ alias }}"}},
+                             {}, dynamic=True)
+    with pytest.raises(Exception, match="Recursive loop"):
+        str(rt.template("{{ alias }}", cycle))
+
+
+def test_rescue_variables_use_the_current_failure():
+    failed = _task("new", "Current failure", "fail", args={"msg": "current"})
+    report = _task("show", "Report", "debug", args={"msg": "{{ ansible_failed_result.msg }}"})
+    block = {"type": "block", "block": [failed], "rescue": [report], "always": [report]}
+    seed = _task("seed", "Seed", "set_fact", args={"ansible_failed_result": {"msg": "old"}})
+
+    _, frames = run([seed, block])
+
+    assert [frame["result"]["msg"] for frame in by_name(frames, "Report")] == ["current", "current"]
+
+
+def test_ordinary_facts_do_not_overwrite_play_aliases(monkeypatch):
+    rt = Runtime({}, "", {})
+    monkeypatch.setattr(rt, "run_module", lambda *args, **kwargs: {
+        "ansible_facts": {"ansible_distribution": "Facts"}, "changed": False,
+    })
+    frames = []
+    rt.on_result = frames.append
+    rt.run_play({"tasks": [
+        _task("setup", "Gather", None, action="ansible.builtin.setup"),
+        _task("show", "Use {{ ansible_distribution }}", "debug",
+              args={"msg": "{{ ansible_distribution }}"}),
+    ], "vars": {"ansible_distribution": "{{ replacement }}", "replacement": "Play"}})
+
+    assert by_name(frames, "Use Play")[0]["result"]["msg"] == "Play"
+    assert rt.vars["ansible_facts"]["distribution"] == "Facts"
+    rt.run_play({"tasks": [
+        _task("later", "Use {{ ansible_distribution }}", "debug", args={"msg": "{{ ansible_distribution }}"})
+    ]})
+    assert by_name(frames, "Use Facts")[0]["result"]["msg"] == "Facts"
+
+
+def test_task_names_render_role_parameters_and_keep_text_type():
+    rt = Runtime({}, "", {})
+    assert rt._node_name({"name": "Deploy {{ region }}", "role_params": {"region": "west"}}) == "Deploy west"
+    assert rt._node_name({"name": "{{ 0 }}"}) == "0"
+    assert rt._node_name({"name": "{{ 42 }}"}) == "42"
+    assert rt._node_name({"name": "{{ true }}"}) == "True"
+    assert rt._node_name({"name": "{{ none }}"}) == "None"
+
+
+def test_start_and_result_share_one_rendered_task_name():
+    rt = Runtime({}, "", {})
+    sequence = iter([1, 2])
+    rt.templater._strict_env.globals["next_name"] = lambda: next(sequence)
+    starts = []
+    results = []
+    rt.on_task_start = starts.append
+    rt.on_result = results.append
+    rt.run_play({"tasks": [_task("one", "{{ next_name() }}", "debug", when=[False])]})
+    assert starts[0]["task"] == results[0]["task"] == "1"
+    assert next(sequence) == 2
+
+
+def test_looped_include_keeps_its_name_after_children_start():
+    rt = Runtime({}, "", {})
+    sequence = iter([1, 2])
+    rt.templater._strict_env.globals["next_name"] = lambda: next(sequence)
+    starts = []
+    results = []
+    rt.on_task_start = starts.append
+    rt.on_result = results.append
+    include = {"type": "include", "uuid": "include", "name": "{{ next_name() }}",
+               "loop": ["a", "b"], "tasks": [_task("child", "Child", "debug")]}
+    rt.run_play({"tasks": [include]})
+    assert [frame["task"] for frame in results if frame["uuid"] == "include"] == ["1", "1"]
+    assert starts[0]["task"] == "1"
+    assert next(sequence) == 2
+
+
+def test_legacy_vars_items_and_values_are_sized(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.18.10")
+    rt = Runtime({}, "", {})
+    values = rt.template_vars({"source": "sample", "alias": "{{ source }}"}, {}, dynamic=True)
+    assert rt.template("{{ vars.items() | length }}", values) == 2
+    assert rt.template("{{ vars.values() | length }}", values) == 2
+    assert rt.template("{{ (vars.items() | list)[1][1] | type_debug }}", values) == "str"
+
+
+def test_delegated_template_alias_uses_agent_filters():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["local_filter"] = lambda value: value.upper()
+    values = rt.template_vars({
+        "source": "play",
+        "alias": "{{ source | local_filter }}",
+        "nested": {"value": "{{ source | local_filter }}", "literal": "{{ '{{ untouched }}' }}"},
+        "sequence": ["{{ source | local_filter }}"],
+    }, {}, dynamic=True)
+    values["source"] = "task"
+    sent = _delegate_vars(values, rt.templater)
+    assert sent["alias"] == "TASK"
+    assert sent["nested"] == {"value": "TASK", "literal": {"__ansiroll_unsafe__": "{{ untouched }}"}}
+    assert sent["sequence"] == ["TASK"]
+
+
+def test_delegation_resolves_selected_action_variables():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    values = rt.template_vars({
+        "ansible_rsync_path": "{{ rsync_binary }}",
+        "rsync_binary": "/usr/bin/rsync",
+        "unused": "{{ rsync_binary }}",
+    }, {}, dynamic=True)
+    sent = _delegate_vars(values, rt.templater, {"ansible_rsync_path"})
+    assert sent["ansible_rsync_path"] == "/usr/bin/rsync"
+    assert sent["unused"] == "{{ rsync_binary }}"
+
+
+@pytest.mark.parametrize("controller_snapshot", [False, True])
+def test_play_alias_can_read_shadowed_inventory_value(controller_snapshot):
+    frames = []
+    host_vars = {"inventory_hostname": "h", "foo": "inventory_value"}
+    if controller_snapshot:
+        host_vars["hostvars"] = {"h": {"foo": "inventory_value"}}
+    rt = Runtime({}, "", host_vars, on_result=frames.append)
+    rt.run_play({"vars": {"foo": "{{ hostvars[inventory_hostname].foo }}"},
+                 "tasks": [_task("read", "Read", "debug", args={"msg": "{{ foo }}"})]})
+    assert frames[0]["result"]["msg"] == "inventory_value"
+
+
+def test_overridden_include_var_does_not_eagerly_consume_its_lookup():
+    rt = Runtime({}, "", {})
+    calls = []
+    rt.templater.env.globals["measure"] = lambda: calls.append("read") or True
+    include = {"type": "include", "vars": {"enabled": "{{ measure() }}"}, "when": ["enabled"]}
+    ctx = rt._task_ctx(include, {})
+    assert calls == []
+    assert rt._task_gate(include, ctx)[0] is None
+    assert calls == ["read"]
 
 
 def test_debug_result_is_always_visible_to_ansible_callbacks():

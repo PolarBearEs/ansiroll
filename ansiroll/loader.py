@@ -907,12 +907,17 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),
         "role_vars": _tag_untrusted(role_vars),
+        "role_params": _tag_untrusted(_role_params(task)),
         "become": bool(task.become),
         "tasks": tasks,
     }
-    if action == "include_role" and tuple(map(int, _fact_schema().split("."))) < (2, 17):
-        # Older linear strategies do not count successful role includes in ok.
-        node["tally_include_ok"] = False
+    if action == "include_role":
+        # The runtime overlay already has the enclosing invocations' evaluated
+        # parameters and live loop bindings. Preserve this role's own params.
+        node["include_params"] = _tag_untrusted(task.copy(exclude_parent=True).get_include_params())
+        if _core_version() < (2, 17):
+            # Older linear strategies do not count successful role includes in ok.
+            node["tally_include_ok"] = False
     if include_id is not None:
         node["include_id"] = include_id
     if ref is not None:
@@ -1089,13 +1094,14 @@ def _template_include_filename(task, value, includes):
 
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
-    include_scope = _include_scope(task)
+    task_vars, include_params = _include_scope(task)
+    role_params = _role_params(task)
     variables = {}
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
-                  *include_scope, extra_vars):
+                  task_vars, role_params, include_params, extra_vars):
         variables = combine_vars(variables, layer)
     # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
-    above_vars_files = set(role_vars).union(*include_scope)
+    above_vars_files = set(role_vars).union(task_vars, role_params, include_params)
 
     loop_names = set()
     parent = task
@@ -1187,7 +1193,11 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
         try:
             role = Role.load(ri, play, parent_role=parent_role,
                              from_files=from_files or None, from_include=True)
-            blocks = role.compile(play)
+            if _core_version() >= (2, 15):
+                dep_chain = role.get_dep_chain()
+            else:
+                dep_chain = list(parent_role.get_parents()) + [parent_role] if parent_role else []
+            blocks = role.compile(play, dep_chain=dep_chain)
         except Exception:
             return None
         includes.record_writes(blocks)
@@ -1310,6 +1320,7 @@ def _convert_task(task, actions, basedir):
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)
         "role_vars": _tag_untrusted(role_vars),          # above play vars, below block/task vars
+        "role_params": _tag_untrusted(_role_params(task)),  # above set_fact/register
         "role_magic": _role_magic(task),
         "notify": _as_list(task.notify),
         "special": _special_of(action),
@@ -1865,18 +1876,33 @@ def _role_vars(task):
         return {}, {}
     defaults, rvars = {}, {}
     try:
-        defaults = dict(role.get_default_vars() or {})
+        defaults = dict(role.get_default_vars(dep_chain=task.get_dep_chain()) or {})
     except Exception:
         pass
     try:
         # Dependency roles inherit the including role's parameters, while
         # their own vars still take precedence over the parent's role vars.
         for parent in (getattr(role, "_parents", None) or []):
-            rvars.update(parent.get_vars(include_params=True) or {})
-        rvars.update(role.get_vars(include_params=True) or {})
+            rvars.update(parent.get_vars(include_params=False) or {})
+        rvars.update(role.get_vars(include_params=False) or {})
     except Exception:
         pass
     return defaults, rvars
+
+
+def _role_params(task):
+    """Role params ({role: x, var: value}) for a role task.
+
+    VariableManager.get_vars merges them after the set_fact/register cache
+    (ansible/vars/manager.py: "role params"), unlike role vars.
+    """
+    role = getattr(task, "_role", None)
+    if role is None:
+        return {}
+    try:
+        return dict(role.get_role_params(task.get_dep_chain()) or {})
+    except Exception:
+        return {}
 
 
 def _clean_args(args):
