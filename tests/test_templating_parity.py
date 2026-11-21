@@ -321,6 +321,19 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
         assert os.path.dirname(foreign) not in sys.path
 
 
+def test_modern_launcher_accepts_pip_entrypoint(tmp_path):
+    from tests import _stock_playbook_flags
+
+    script = tmp_path / "ansible-playbook"
+    script.write_text(
+        "#!/usr/bin/python3\nimport sys\nfrom ansible.cli.playbook import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        "    sys.exit(main())\n"
+    )
+    assert _stock_playbook_flags(str(script)) == ()
+
+
 def test_modern_launcher_rejects_recorded_wrapper_initialization(tmp_path, monkeypatch):
     import tests
 

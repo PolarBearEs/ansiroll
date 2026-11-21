@@ -373,6 +373,10 @@ def _stock_playbook_flags(script):
         "if __name__ == '__main__':\n"
         "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
         "    sys.exit(main())\n",
+        "import sys\nfrom ansible.cli.playbook import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        "    sys.exit(main())\n",
     )
     try:
         with tokenize.open(script) as launcher:
