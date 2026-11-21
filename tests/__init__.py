@@ -67,32 +67,9 @@ def _ansible_version_fields(command, candidate, diagnostics):
     return dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
 
 
-def _matches_legacy_interpreter(source):
-    import shlex
-    import shutil
-
-    shebang = source.splitlines()[0] if source else ""
-    if not shebang.startswith("#!"):
-        return False
-    try:
-        command = shlex.split(shebang[2:])
-    except ValueError:
-        return False
-    if not command:
-        return False
-    interpreter = command[0]
-    if os.path.basename(interpreter) == "env":
-        interpreter = shutil.which(command[1]) if len(command) == 2 else None
-    elif len(command) != 1:
-        return False
-    if not interpreter or not os.path.isabs(interpreter):
-        return False
-    try:
-        return (os.path.realpath(os.path.dirname(interpreter)) ==
-                os.path.realpath(os.path.dirname(sys.executable))
-                and os.path.samefile(interpreter, sys.executable))
-    except OSError:
-        return False
+def _launcher_body(source):
+    # Installed scripts replace the package stub's interpreter line.
+    return source.partition("\n")[2] if source.startswith("#!") else source
 
 
 def _legacy_python_launcher(path, filename, package, diagnostics, associated):
@@ -109,12 +86,26 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: cannot replay a non-Python launcher's initialization" % path)
         return None
 
-    if not associated:
-        # A process that already pinned Ansible cannot establish whether the
-        # launcher belongs to that installation. Check its native startup first.
-        if not _matches_legacy_interpreter(source):
-            diagnostics.append("%s: launcher does not name pytest's Python interpreter" % path)
+    # The selected Ansible installation ships its own release's launcher.
+    # A native --version probe alone can report the correct package even
+    # when the script itself came from a different release.
+    stub = os.path.join(package, "cli", "scripts", "ansible_cli_stub.py")
+    try:
+        with tokenize.open(stub) as expected:
+            if _launcher_body(source) != _launcher_body(expected.read()):
+                diagnostics.append("%s: launcher differs from the selected Ansible release" % path)
+                return None
+    except FileNotFoundError:
+        if not associated:
+            diagnostics.append("%s: selected Ansible has no launcher source to verify this script" % path)
             return None
+    except (OSError, SyntaxError, UnicodeError) as ex:
+        diagnostics.append("%s: %s" % (stub, ex))
+        return None
+
+    if not associated:
+        # Check the script's native import before replaying it with pytest's
+        # interpreter. A system-installed script can pass both probes.
         fields = _ansible_version_fields([path], path, diagnostics)
         installed = fields.get("ansible python module location", "")
         if not installed or os.path.realpath(installed) != package:

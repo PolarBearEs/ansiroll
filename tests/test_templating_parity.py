@@ -112,6 +112,36 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
     assert "cannot replay a non-Python launcher's initialization" in diagnostics[0]
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale):
+    import tests
+
+    package = tmp_path / "ansible"
+    scripts = package / "cli" / "scripts"
+    scripts.mkdir(parents=True)
+    stub = scripts / "ansible_cli_stub.py"
+    stub.write_text("#!/usr/bin/env python\nstart_expected_release()\n")
+    launcher = tmp_path / "ansible-playbook"
+    startup = "start_stale_release()" if stale else "start_expected_release()"
+    launcher.write_text("#!/usr/bin/python3\n" + startup + "\n")
+    probes = []
+
+    def version(command, candidate, diagnostics):
+        probes.append(command)
+        return {"ansible python module location": str(package)}
+
+    monkeypatch.setattr(tests, "_ansible_version_fields", version)
+    diagnostics = []
+    found = tests._legacy_python_launcher(
+        str(launcher), str(package / "__init__.py"), str(package), diagnostics, associated=False)
+    if stale:
+        assert found is None and not probes
+        assert "differs from the selected Ansible release" in diagnostics[0]
+    else:
+        assert found == str(launcher)
+        assert [probe[0] for probe in probes] == [str(launcher), sys.executable]
+
+
 def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):
     checkout = tmp_path / "checkout"
     package = checkout / "ansible"
