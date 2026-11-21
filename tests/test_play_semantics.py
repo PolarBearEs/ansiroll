@@ -1020,6 +1020,92 @@ def test_strategy_skips_filtered_setup(tmp_path, monkeypatch):
     assert expected == (['"AFTER_SETUP"', '"NEXT_PLAY"'], ("2", "0", "0", "0", "0", "0", "0"))
 
 
+@pytest.mark.parametrize("fast_facts", ["0", "1"])
+def test_implicit_setup_honors_play_gather_options(tmp_path, monkeypatch, fast_facts):
+    monkeypatch.setenv("ANSIROLL_FAST_FACTS", fast_facts)
+    msgs, _ = check(tmp_path, {
+        "facts/example.fact": '{"marker": "custom facts directory"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          gather_timeout: 10
+          fact_path: "{{ playbook_dir }}/facts"
+          tasks:
+            - debug:
+                msg: "{{ ansible_facts.distribution is defined }} / {{ ansible_local.example.marker }}"
+        """,
+    })
+    assert msgs == ['"False / custom facts directory"']
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="requires omit support on play keywords")
+@pytest.mark.parametrize("subset, expected", [
+    ('"{{ omit }}"', True),
+    ("['!all', '!min', '{{ omit }}']", False),
+])
+def test_implicit_setup_ignores_omitted_gather_options(tmp_path, subset, expected):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: SUBSET
+          gather_timeout: "{{ omit }}"
+          tasks:
+            - debug:
+                msg: "distribution defined: {{ ansible_facts.distribution is defined }}"
+    """.replace("SUBSET", subset)})
+    assert msgs == ['"distribution defined: %s"' % expected]
+
+
+def test_compile_implicit_setup_falsey_options_follow_core_version(tmp_path):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_timeout: 0
+          fact_path: ''
+    """})
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    options = plays[0]["gather_options"]
+    expected = {} if CORE_VERSION < (2, 13) else {"gather_timeout": 0, "fact_path": ""}
+    assert {key: value for key, value in options.items() if key != "gather_subset"} == expected
+
+
+@pytest.mark.skipif(CORE_VERSION >= (2, 18), reason="requires legacy gather subset configuration")
+def test_legacy_implicit_setup_omitted_subset_uses_controller_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_GATHER_SUBSET", "!all,!min")
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ omit }}"
+          tasks:
+            - debug:
+                msg: "distribution defined: {{ ansible_facts.distribution is defined }}"
+    """})
+    assert msgs == ['"distribution defined: False"']
+
+
+def test_implicit_setup_vars_see_runtime_extra_vars(tmp_path, monkeypatch):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ vars.requested_subset }}"
+          vars:
+            requested_subset: [all]
+          tasks:
+            - debug:
+                msg: "distribution defined: {{ ansible_facts.distribution is defined }}"
+    """})
+    extra_vars = json.dumps({"requested_subset": ["!all", "!min"]})
+    args = ["-e", extra_vars]
+    expected = _ansible(tmp_path, args)
+    assert expected[0] == ['"distribution defined: False"']
+    assert _ansible(tmp_path, args, "ansiroll.core.ansiroll") == expected
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra_vars)
+    assert _standalone(tmp_path, []) == expected
+
+
 def test_setup_failure_uses_play_ignore_context_and_displays_result(tmp_path, monkeypatch):
     _reject_setup_become(tmp_path, monkeypatch)
     ignore = 'ignore_errors: "{{ ignore_setup_error }}"\n  vars: {ignore_setup_error: true}'

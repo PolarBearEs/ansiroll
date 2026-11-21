@@ -2345,7 +2345,9 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         if play.get("gather_facts") and not gather_cached:
-            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
+            setup_vars = dict(self.vars)
+            setup_vars.update(play.get("vars") or {})
+            setup_ctx = self.ctx(base=self._layered_ctx(setup_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -2353,6 +2355,7 @@ class Runtime:
                 fact_schema=play.get("fact_schema"),
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
+                options=play.get("gather_options"), option_defaults=play.get("gather_option_defaults"),
             )
             if not gathered:
                 self.failed = True
@@ -4271,7 +4274,8 @@ class Runtime:
 
     # ---- facts -----------------------------------------------------------
     def gather_facts(self, environment=None, become=False, become_user=None,
-                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False):
+                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
+                     options=None, option_defaults=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -4297,8 +4301,22 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
+            rendered_options = _fail_on_undef(self.template(options or {}, ctx, strict=True))
+            for key, value in (option_defaults or {}).items():
+                if rendered_options.get(key) == _OMIT:
+                    rendered_options[key] = value
+            setup_args = {key: value for key, value in _strip_omit(rendered_options).items()
+                          if value is not None}
+            if not _core_at_least(2, 13) and not setup_args.get("gather_timeout"):
+                setup_args.pop("gather_timeout", None)
+            subset = setup_args.get("gather_subset")
+            if isinstance(subset, (list, tuple)) and _core_at_least(2, 19):
+                setup_args["gather_subset"] = [name for name in subset if name != _OMIT]
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
-            if fast_facts in ("1", "true", "yes", "on"):
+            # Older controllers supply these setup defaults as play options.
+            default_options = {"gather_subset": ["all"], "gather_timeout": 10}
+            if fast_facts in ("1", "true", "yes", "on") and all(
+                    value == default_options.get(key) for key, value in setup_args.items()):
                 from ansiroll.accelerated_modules import facts
                 from ansiroll.accelerated_modules.environment import module_environment
                 started = time.monotonic()
@@ -4321,10 +4339,10 @@ class Runtime:
                     res["_ansiroll_profile"] = fact_profile
                 if res.get("_ansiroll_fallback"):
                     provenance = {"mode": "real-ansiballz"}
-                    res = self.run_module("ansible.builtin.setup", {}, become=become)
+                    res = self.run_module("ansible.builtin.setup", setup_args, become=become)
             else:
                 provenance = {"mode": "real-ansiballz"}
-                res = self.run_module("ansible.builtin.setup", {}, become=become)
+                res = self.run_module("ansible.builtin.setup", setup_args, become=become)
         except Exception as ex:
             provenance = {"mode": "native-agent"}
             res = {"failed": True, "changed": False,

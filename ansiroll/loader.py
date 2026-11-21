@@ -254,11 +254,29 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
     core_version = _core_version()
+    gather_options = {}
+    for option in ("gather_subset", "gather_timeout", "fact_path"):
+        value = getattr(play, option, None)
+        if value is None:
+            continue
+        # Pre-2.13 play iterators omit falsey timeout and fact path values.
+        if core_version < (2, 13) and option != "gather_subset" and not value:
+            continue
+        gather_options[option] = value
+    # Before 2.18, omitting these play fields restores the controller default.
+    gather_option_defaults = {
+        key: value for key, value in (
+            ("gather_subset", getattr(C, "DEFAULT_GATHER_SUBSET", None)),
+            ("gather_timeout", getattr(C, "DEFAULT_GATHER_TIMEOUT", None)),
+        ) if key in gather_options and value is not None
+    }
     result = {
         "name": play.name or "",
         "hosts": hosts,
         "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
+        "gather_options": _tag_untrusted(gather_options),
+        "gather_option_defaults": gather_option_defaults,
         "smart_gathering": gather_facts is None and C.DEFAULT_GATHERING == "smart",
         "gather_when": _conditions(getattr(play, "_included_conditional", None)),
         "gather_no_log": getattr(play, "no_log", False),
