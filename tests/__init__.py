@@ -211,12 +211,12 @@ def _is_python_interpreter(executable):
 
 
 def _python_environment(executable):
-    # Resolve directory aliases without following the Python symlink out of
-    # its virtual environment. CPython checks both directories for the config.
-    directory = os.path.realpath(os.path.dirname(os.path.abspath(executable)))
+    # CPython checks the executable's original directory and its parent.
+    # Resolve the environment root only after finding the configuration.
+    directory = os.path.dirname(os.path.abspath(executable))
     for parent in (directory, os.path.dirname(directory)):
         if os.path.isfile(os.path.join(parent, "pyvenv.cfg")):
-            return parent
+            return os.path.realpath(parent)
     return None
 
 
@@ -321,6 +321,13 @@ def _legacy_python_launcher(path, package, diagnostics, associated):
         diagnostics.append("%s: launcher shebang cannot be replayed" % path)
         return None
 
+    matching_python = associated or (
+        source.startswith("#!") and _launcher_body_and_flags(source, match_script=path)[0] is not None
+    )
+    if flags and not matching_python:
+        diagnostics.append("%s: cannot replay flags from a different Python interpreter" % path)
+        return None
+
     # The selected Ansible installation ships its own release's launcher.
     stub = os.path.join(package, "cli", "scripts", "ansible_cli_stub.py")
     try:
@@ -328,14 +335,14 @@ def _legacy_python_launcher(path, package, diagnostics, associated):
             if body == _launcher_body(expected.read()):
                 # The pinned process will execute the same startup code; a
                 # separate --version run cannot add evidence of provenance.
-                return path, flags
+                return path, flags, matching_python
         diagnostics.append("%s: launcher differs from the selected Ansible release" % path)
         return None
     except FileNotFoundError:
         # An install record or source checkout already associates this script
         # with the pinned package. Replay verifies the package before startup.
         if associated:
-            return path, flags
+            return path, flags, matching_python
         diagnostics.append("%s: selected Ansible has no launcher source to verify this script" % path)
         return None
     except (OSError, SyntaxError, UnicodeError) as ex:
@@ -486,13 +493,19 @@ def _select_playbook_launcher(filename, version):
     )
     diagnostics = []
     seen = set()
+    fallback = None
     for script, associated in candidates:
         if script and script not in seen and os.path.isfile(script):
             seen.add(script)
             verified = _legacy_python_launcher(script, package, diagnostics, associated)
             if verified:
-                python_script, flags = verified
-                return python_script, flags, True
+                python_script, flags, matching_python = verified
+                if matching_python:
+                    return python_script, flags, True
+                if fallback is None:
+                    fallback = python_script, flags, True
+    if fallback is not None:
+        return fallback
     detail = "\n" + "\n".join(diagnostics) if diagnostics else ""
     raise FileNotFoundError("ansible-playbook script not found for %s%s" % (package, detail))
 

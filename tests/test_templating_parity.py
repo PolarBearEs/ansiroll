@@ -267,7 +267,7 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
 
     def verify_legacy(script, package, diagnostics, associated):
         assert package == ansible_package and associated
-        return script, ()
+        return script, (), True
 
     seen = []
     cli = ModuleType("ansible.cli")
@@ -382,6 +382,36 @@ def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, mon
     assert _stock_playbook_flags(script, str(tmp_path), match_python=True) is None
     script.write_text(f"#!{selected} -s\n{body}")
     assert _stock_playbook_flags(script, str(tmp_path), match_python=True) == ("-s",)
+    alias = tmp_path / "alias" / "bin"
+    alias.parent.mkdir()
+    alias.symlink_to(selected.parent, target_is_directory=True)
+    script.write_text(f"#!{alias / 'python3'} -s\n{body}")
+    assert _stock_playbook_flags(script, str(tmp_path), match_python=True) is None
+
+
+@pytest.mark.parametrize("has_matching_python", [False, True])
+def test_legacy_launcher_prefers_matching_python_and_ignores_foreign_flags(tmp_path, monkeypatch, has_matching_python):
+    import tests
+
+    package = tmp_path / "ansible"
+    stub = package / "cli" / "scripts" / "ansible_cli_stub.py"
+    stub.parent.mkdir(parents=True)
+    body = "start_expected_release()\n"
+    stub.write_text(f"#!/usr/bin/env python\n{body}")
+    selected = tmp_path / "selected" / "python3"
+    monkeypatch.setattr(sys, "executable", str(selected))
+    launches = []
+    for name, interpreter in [("foreign-flags", "/other/bin/python3 -s"),
+                              ("foreign-plain", "/other/bin/python3"), ("matching", selected)]:
+        script = tmp_path / name / "ansible-playbook"
+        script.parent.mkdir()
+        script.write_text(f"#!{interpreter}\n{body}")
+        launches.append(str(script))
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
+    candidates = launches if has_matching_python else launches[:2]
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(candidates))
+    expected = launches[2] if has_matching_python else launches[1]
+    assert tests._select_playbook_launcher(str(package / "__init__.py"), "2.12.10") == (expected, (), True)
 
 
 def test_modern_launcher_accepts_pip_entrypoint(tmp_path):
@@ -598,7 +628,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, st
         assert found is None
         assert "differs from the selected Ansible release" in diagnostics[0]
     else:
-        assert found == (str(launcher), ())
+        assert found is not None and found[:2] == (str(launcher), ())
 
 
 @pytest.mark.parametrize("interpreter", [
