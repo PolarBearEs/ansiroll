@@ -153,6 +153,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
     "#!/bin/sh\n'''exec' \"/path with spaces/python3\" \"$0\" \"$@\"\n' '''\n",
     ("#!/bin/sh\n'''exec' /workspace/team@2/" + "long-component/" * 8
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team,2=parity:linux#1/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])
 def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale, prefix):
@@ -184,11 +186,20 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
         assert not probes
 
 
-def test_launcher_body_keeps_unrecognized_shell_initialization():
+@pytest.mark.parametrize("interpreter", [
+    "ANSIBLE_CONFIG=/custom /usr/bin/python3",
+    "/workspace/$TEAM/bin/python3",
+    "/workspace/{old,new}/bin/python3",
+    "/workspace/team[12]/bin/python3",
+    "/workspace/team?2/bin/python3",
+    "/workspace/team*2/bin/python3",
+    "/workspace/team;other/bin/python3",
+])
+def test_launcher_body_keeps_unrecognized_shell_initialization(interpreter):
     from tests import _launcher_body
 
     wrapper = (
-        "#!/bin/sh\n'''exec' ANSIBLE_CONFIG=/custom /usr/bin/python3 \"$0\" \"$@\"\n"
+        f"#!/bin/sh\n'''exec' {interpreter} \"$0\" \"$@\"\n"
         "' '''\nstart_expected_release()\n"
     )
     assert _launcher_body(wrapper) == wrapper

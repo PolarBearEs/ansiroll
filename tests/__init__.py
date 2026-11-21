@@ -110,7 +110,12 @@ def _launcher_body(source):
     elif re.fullmatch(r"'/[^']*'(?:\"'\"'[^']*')*", interpreter):
         # uv joins single-quoted pieces with a double-quoted apostrophe.
         name = os.path.basename(interpreter[1:-1].replace("'\"'\"'", "'"))
-    elif re.fullmatch(r'(?:"/[^"$\x60\\]+"|/[\w./+@-]+)', interpreter):
+    elif (
+        re.fullmatch(r'"/[^"$\x60\\]+"', interpreter)
+        # An absolute unquoted word can contain literal punctuation. Keep
+        # shell operators, quoting, substitutions and expansions out.
+        or re.fullmatch(r"""/[^\s\x00-\x1f\x7f'"`$\\|&;<>()*?\[{}]+""", interpreter)
+    ):
         name = os.path.basename(interpreter.strip('"'))
     else:
         return source
