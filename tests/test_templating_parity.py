@@ -294,24 +294,36 @@ def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(
 @pytest.mark.skipif(not os.path.isfile("/bin/sh"), reason="requires a POSIX shell")
 @pytest.mark.parametrize("dirname", ["team[12]", "team*", "team?"])
 @pytest.mark.parametrize("alternative_exists", [True, False])
-def test_legacy_launcher_checks_whether_pathname_patterns_stay_literal(dirname, alternative_exists):
-    from pathlib import Path
-    from tempfile import TemporaryDirectory
+def test_shell_probe_checks_whether_pathname_patterns_stay_literal(tmp_path, monkeypatch, dirname, alternative_exists):
+    from tests import _shell_preserves_path_pattern
 
-    from tests import _launcher_body
+    monkeypatch.chdir(tmp_path)
+    executable = tmp_path / dirname / "python3"
+    executable.parent.mkdir()
+    executable.touch()
+    if alternative_exists:
+        alternative = tmp_path / "team1" / "python3"
+        alternative.parent.mkdir()
+        alternative.touch()
+    assert _shell_preserves_path_pattern(f"{dirname}/python3") is not alternative_exists
 
-    # Only the test's directory name should contain shell syntax.
-    with TemporaryDirectory(prefix="ansiroll-launcher-", dir="/tmp") as root:
-        executable = Path(root, dirname, "python3")
-        executable.parent.mkdir()
-        executable.touch()
-        if alternative_exists:
-            alternative = Path(root, "team1", "python3")
-            alternative.parent.mkdir()
-            alternative.touch()
-        body = "start_expected_release()\n"
-        wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
-        assert _launcher_body(wrapper) == (wrapper if alternative_exists else body)
+
+@pytest.mark.parametrize("stays_literal", [True, False])
+def test_legacy_launcher_uses_the_shell_probe_for_pathname_patterns(monkeypatch, stays_literal):
+    import tests
+
+    executable = "/workspace/team[12]/venv/bin/python3"
+    probes = []
+
+    def check_pattern(path):
+        probes.append(path)
+        return stays_literal
+
+    monkeypatch.setattr(tests, "_shell_preserves_path_pattern", check_pattern)
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
+    assert tests._launcher_body(wrapper) == (body if stays_literal else wrapper)
+    assert probes == [executable]
 
 
 @pytest.mark.parametrize("stub_available", [True, False])
