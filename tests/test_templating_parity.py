@@ -151,6 +151,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
     "#!/bin/sh\n'''exec' '/path with spaces/python3' \"$0\" \"$@\"\n' '''\n",
     "#!/bin/sh\n'''exec' '/user'\"'\"'s env/python3' \"$0\" \"$@\"\n' '''\n",
     "#!/bin/sh\n'''exec' \"/path with spaces/python3\" \"$0\" \"$@\"\n' '''\n",
+    ("#!/bin/sh\n'''exec' /workspace/team@2/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])
 def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale, prefix):

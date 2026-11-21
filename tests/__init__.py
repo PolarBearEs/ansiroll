@@ -110,7 +110,7 @@ def _launcher_body(source):
     elif re.fullmatch(r"'/[^']*'(?:\"'\"'[^']*')*", interpreter):
         # uv joins single-quoted pieces with a double-quoted apostrophe.
         name = os.path.basename(interpreter[1:-1].replace("'\"'\"'", "'"))
-    elif re.fullmatch(r'(?:"/[^"$\x60\\]+"|/[\w./+-]+)', interpreter):
+    elif re.fullmatch(r'(?:"/[^"$\x60\\]+"|/[\w./+@-]+)', interpreter):
         name = os.path.basename(interpreter.strip('"'))
     else:
         return source
