@@ -209,13 +209,11 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
     elif alias == "hardlink":
         os.link(output, manifest)
     else:
-        if not hasattr(os, "O_PATH"):
-            pytest.skip("requires metadata-only file descriptors")
         manifest.write_text("{}")
         open_fd = os.open
 
         def replace_manifest(path, flags, *args, **kwargs):
-            if path == str(manifest):
+            if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY:
                 manifest.unlink()
                 manifest.symlink_to(output)
             return open_fd(path, flags, *args, **kwargs)
@@ -248,8 +246,10 @@ def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp
             path = str(output)
         return stat_path(path, *args, **kwargs)
 
-    def aliasing_open(path, *args, **kwargs):
-        return open_fd(str(output) if path == str(alias) else path, *args, **kwargs)
+    def aliasing_open(path, flags, *args, **kwargs):
+        if path == str(alias) and flags & getattr(os, "O_PATH", 0):
+            raise OSError(errno.EMFILE, "metadata open cannot allocate a descriptor", path)
+        return open_fd(str(output) if path == str(alias) else path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", aliasing_stat)
     monkeypatch.setattr(os, "open", aliasing_open)
@@ -424,9 +424,13 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
     assert json.loads(manifest.read_text()) == data
 
 
-def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_path):
+@pytest.mark.parametrize("through_symlinks", [False, True])
+def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_path, through_symlinks):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
+    if through_symlinks:
+        output.symlink_to(tmp_path / "actual.py")
+        manifest.symlink_to(tmp_path / "actual.json")
     data = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
     open_fd, fdopen = os.open, os.fdopen
@@ -670,17 +674,15 @@ def test_file_compile_does_not_connect_manifest_fifo_when_python_fails(monkeypat
     fifo = tmp_path / "waiting-fifo" if swap else manifest
     os.mkfifo(fifo)
     if swap:
-        if not hasattr(os, "O_PATH"):
-            pytest.skip("requires metadata-only file descriptors")
         manifest.write_text("{}")
-        open_fd = os.open
+        stat_path = os.stat
 
-        def replace_with_fifo(path, flags, *args, **kwargs):
-            if path == str(manifest) and flags & os.O_PATH and fifo.exists():
+        def replace_with_fifo(path, *args, **kwargs):
+            if path == str(manifest) and output.exists() and fifo.exists():
                 os.replace(fifo, manifest)
-            return open_fd(path, flags, *args, **kwargs)
+            return stat_path(path, *args, **kwargs)
 
-        monkeypatch.setattr(os, "open", replace_with_fifo)
+        monkeypatch.setattr(os, "stat", replace_with_fifo)
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
 
     def fail_chmod(*args, **kwargs):

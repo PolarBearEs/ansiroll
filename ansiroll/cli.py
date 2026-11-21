@@ -181,6 +181,11 @@ def _open_compile_destination(path, validate):
                     ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS
                 ):
                     raise
+                # A dangling symlink can lead to a newly created file even
+                # though the exclusive open of the symlink returned EEXIST.
+                if os.fstat(fd).st_size == 0:
+                    yield writer
+                    return
                 original_error = ex
                 reference = _pin_for_truncate(path, fd, ex)
                 stack.callback(os.close, reference)
@@ -250,16 +255,7 @@ def _check_file_destinations(output_path, manifest_path):
 
 def _check_manifest_path(path, output_stat):
     try:
-        if hasattr(os, "O_PATH"):
-            # Metadata-only handles don't connect to FIFO readers, even if
-            # the destination changes while we're checking it.
-            fd = os.open(path, os.O_PATH)
-            try:
-                manifest_stat = os.fstat(fd)
-            finally:
-                os.close(fd)
-        else:
-            manifest_stat = os.stat(path)
+        manifest_stat = os.stat(path)
     except OSError:
         return
     if _same_stream(output_stat, manifest_stat):
