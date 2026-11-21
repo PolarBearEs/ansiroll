@@ -275,6 +275,28 @@ def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatc
     assert not manifest.exists()
 
 
+@pytest.mark.parametrize("case_insensitive", [False, True])
+def test_file_compile_checks_missing_case_variants_in_destination_directory(monkeypatch, tmp_path, case_insensitive):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "COMPILED.py"
+    real_stat = os.stat
+
+    def folded_stat(path, *args, **kwargs):
+        if case_insensitive and isinstance(path, str) and path.endswith("COMPILED.py"):
+            path = path[:-len("COMPILED.py")] + "compiled.py"
+        return real_stat(path, *args, **kwargs)
+
+    def compile_playbook(*args, **kwargs):
+        assert not case_insensitive, "expected alias to be found before compilation"
+        return "pass\n", {"modules": [], "fallback_tasks": []}
+
+    monkeypatch.setattr(os, "stat", folded_stat)
+    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+    result = cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+    assert result == (2 if case_insensitive else 0)
+    assert set(tmp_path.iterdir()) == (set() if case_insensitive else {output, manifest})
+
+
 def test_file_compile_preserves_symlink_path_lookup(monkeypatch, tmp_path):
     target = tmp_path / "target.py"
     target.write_text("# existing contents\n")
@@ -409,6 +431,37 @@ def test_file_compile_writes_to_current_manifest_after_replacement(monkeypatch, 
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest_path)]) == 0
     assert json.loads(prior_path.read_text()) == {"previous": True}
     assert json.loads(manifest_path.read_text()) == manifest
+
+
+@pytest.mark.parametrize("during_open", [False, True])
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+def test_file_compile_detects_manifest_redirected_to_missing_output(monkeypatch, tmp_path, during_open):
+    output = tmp_path / "compiled.py"
+    saved = tmp_path / "saved.py"
+    manifest = tmp_path / "manifest.json"
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    fchmod = os.fchmod
+    open_fd = os.open
+
+    def remove_output(fd, mode):
+        fchmod(fd, mode)
+        output.rename(saved)
+        if not during_open:
+            manifest.symlink_to(output)
+
+    def redirect_manifest(path, flags, *args, **kwargs):
+        if during_open and path == str(manifest) and flags & os.O_WRONLY:
+            manifest.symlink_to(output)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fchmod", remove_output)
+    monkeypatch.setattr(os, "open", redirect_manifest)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
+    assert saved.read_text() == "pass\n"
+    if during_open:
+        assert output.read_bytes() == b""
+    else:
+        assert not output.exists()
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")

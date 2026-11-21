@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from contextlib import redirect_stdout
 
 from .compiler import compile_playbook
@@ -120,7 +121,27 @@ def _missing_destination(path):
     if name:
         directory = os.stat(parent)
         if stat.S_ISDIR(directory.st_mode):
-            return directory.st_dev, directory.st_ino, os.path.normcase(name)
+            return (directory.st_dev, directory.st_ino), parent, name
+
+
+def _same_missing_destination(output, manifest):
+    if output is None or manifest is None or output[0] != manifest[0]:
+        return False
+    _, parent, output_name = output
+    _, _, manifest_name = manifest
+    if os.path.normcase(output_name) == os.path.normcase(manifest_name):
+        return True
+    output_folded = unicodedata.normalize("NFC", output_name).casefold()
+    manifest_folded = unicodedata.normalize("NFC", manifest_name).casefold()
+    if output_folded != manifest_folded:
+        return False
+
+    # The OS family alone doesn't tell us how this directory compares names.
+    # Ask the actual filesystem with the requested spellings and a unique prefix.
+    with tempfile.NamedTemporaryFile(prefix=".ansiroll-", suffix=output_name, dir=parent) as probe:
+        alias = probe.name[:-len(output_name)] + manifest_name
+        alias_stat = _stat_if_present(alias)
+        return alias_stat is not None and os.path.samestat(os.fstat(probe.fileno()), alias_stat)
 
 
 def _check_file_destinations(output_path, manifest_path):
@@ -128,8 +149,8 @@ def _check_file_destinations(output_path, manifest_path):
         output_stat = _stat_if_present(output_path)
         manifest_stat = _stat_if_present(manifest_path)
         if output_stat is None and manifest_stat is None:
-            output = _missing_destination(output_path)
-            if output is not None and output == _missing_destination(manifest_path):
+            if _same_missing_destination(
+                    _missing_destination(output_path), _missing_destination(manifest_path)):
                 raise ValueError("manifest path points to compiled output: %s" % manifest_path)
     except OSError:
         # The normal write path reports destination errors in output order.
@@ -178,9 +199,12 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
         else:
             os.chmod(output_path, mode)
     # Reopen the current pathname after Python output succeeds.
+    _check_file_destinations(output_path, manifest_path)
     with os.fdopen(os.open(manifest_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as manifest_file:
         manifest_stat = os.fstat(manifest_file.fileno())
-        if _same_stream(output_stat, manifest_stat):
+        current_output = _stat_if_present(output_path)
+        if (_same_stream(output_stat, manifest_stat)
+                or current_output is not None and _same_stream(current_output, manifest_stat)):
             raise ValueError("manifest path points to compiled output: %s" % manifest_path)
         if stat.S_ISREG(manifest_stat.st_mode):
             manifest_file.truncate(0)
