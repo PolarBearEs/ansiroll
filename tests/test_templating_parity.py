@@ -124,7 +124,7 @@ def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatc
     package = foreign / "ansible"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("raise RuntimeError('wrong Ansible selected')\n")
-    monkeypatch.setenv("PYTHONPATH", str(foreign))
+    monkeypatch.setenv("PYTHONPATH", str(foreign), prepend=os.pathsep)
     playbook = _write(tmp_path, "- hosts: localhost\n  gather_facts: false\n")
     output = tmp_path / "compiled.py"
     result = subprocess.run(
