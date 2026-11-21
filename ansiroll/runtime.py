@@ -2606,11 +2606,16 @@ class Runtime:
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
         play_vars = dict(play.get("vars") or {})
+        scope = play.get("gather_scope") or {}
+        merge = (before_setup or bool(scope)) and self._gather_hash_merge()
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if base is None:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+            if scope:
+                base = _f_combine(scope.get("role_defaults"), base, scope.get("magic"), recursive=merge)
         for entry in play.get("deferred_vars_files") or ():
-            ctx = self.ctx(play_vars, self.extra_vars, base=base)
+            variables = _f_combine(base, play_vars, self.extra_vars, recursive=merge)
+            ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             for raw in entry["names"]:
                 try:
@@ -2642,7 +2647,10 @@ class Runtime:
                     if isinstance(data, dict):
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
                     for value in data:
-                        play_vars.update(value)
+                        if merge:
+                            play_vars = _f_combine(play_vars, value, recursive=True)
+                        else:
+                            play_vars.update(value)
                     break
             else:
                 if before_setup:
@@ -2655,6 +2663,10 @@ class Runtime:
                                  % (item,))
         return play_vars
 
+    def _gather_hash_merge(self):
+        config = self.vars.get("__ansiroll_controller_config") or {}
+        return config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
+
     def _gather_contexts(self, play):
         setup_vars = dict(self.vars)
         scope = play.get("gather_scope")
@@ -2664,23 +2676,26 @@ class Runtime:
 
         defaults = scope["role_defaults"]
         exports = scope["role_exports"]
+        magic = scope.get("magic") or {}
+        merge = self._gather_hash_merge()
         # Core validates gather_subset and gather_timeout with play-only vars.
         play_base = dict(defaults)
         for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
             play_base[key] = self.vars[key]
-        play_vars = dict(play_base)
-        play_vars.update(self._with_deferred_vars_files(play, base=play_base, before_setup=True))
-        play_vars.update(exports)
-        play_vars.update(self.extra_vars)
+        play_base.update(magic)
+        play_files = self._with_deferred_vars_files(play, base=play_base, before_setup=True)
+        play_vars = _f_combine(play_base, play_files, exports, self.extra_vars, magic, recursive=merge)
         play_ctx = self.ctx(base=play_vars)
 
         # The implicit setup task resolves fact_path with host and task vars.
-        setup_vars = dict(defaults)
-        setup_vars.update(self.vars)
-        setup_vars.update(self._with_deferred_vars_files(play, before_setup=True))
-        setup_vars.update(exports)
-        self._layered_ctx(setup_vars)
+        host_file_vars = {key: value for key, value in self.vars.items()
+                          if key not in self._set_fact_overrides and key not in self._include_vars_layer}
+        file_base = _f_combine(defaults, host_file_vars, magic, recursive=merge)
+        setup_files = self._with_deferred_vars_files(play, base=file_base, before_setup=True)
+        setup_vars = _f_combine(defaults, self.vars, setup_files, exports, self._include_vars_layer,
+                                self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
         setup_vars["ansible_search_path"] = scope["search_path"]
+        setup_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
         return self.ctx(base=setup_vars), play_ctx
 
     def _task_ctx(self, task, overlay):

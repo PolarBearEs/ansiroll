@@ -1175,6 +1175,33 @@ def test_standalone_setup_subset_uses_baked_controller_environment(tmp_path, mon
     assert _summary(result.stdout) == expected
 
 
+def test_implicit_setup_uses_play_name_role_vars_and_search_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    msgs, _ = check(tmp_path, {
+        "roles/scope/defaults/main.yml": "fact_profile: custom\nprofile: {subset: ['!all', '!min', local]}\n",
+        "roles/scope/tasks/main.yml": "[]\n",
+        "vars/custom.yml": "facts_dir: actual-facts\n",
+        "files/facts-dir.txt": str(tmp_path) + "\n",
+        "facts-dir.txt": str(tmp_path / "wrong-directory") + "\n",
+        "actual-facts/example.fact": '{"marker": "role-selected facts"}',
+        "pb.yml": """
+        - name: select facts
+          hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ profile.subset if ansible_play_name == 'select facts' else ['all'] }}"
+          fact_path: "{{ lookup('file', 'facts-dir.txt') ~ '/' ~ facts_dir }}"
+          vars_files: ['vars/{{ fact_profile }}.yml']
+          vars:
+            profile: {timeout: 10}
+          roles: [scope]
+          tasks:
+            - debug:
+                msg: "{{ ansible_facts.distribution is defined }} / {{ ansible_local.example.marker }}"
+        """,
+    })
+    assert msgs == ['"False / role-selected facts"']
+
+
 def test_implicit_setup_fact_path_uses_controller_task_vars(tmp_path):
     _write(tmp_path, {
         "location.yml": "facts_dir: actual-facts\n",

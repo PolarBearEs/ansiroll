@@ -305,17 +305,28 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
 
         defaults = {}
         exports = {}
+        # Core 2.16.3 replaced the play-level config gate with per-role visibility.
+        uses_role_public = _core_version(include_patch=True) >= (2, 16, 3)
+        private_role_vars = not uses_role_public and C.DEFAULT_PRIVATE_ROLE_VARS
         export_args = {"only_exports": True} if core_version >= (2, 15) else {}
         for role in play.roles:
-            if core_version >= (2, 16) and not role.public:
+            if uses_role_public and not role.public:
+                continue
+            if not uses_role_public and core_version >= (2, 15) and (private_role_vars or not role.static):
                 continue
             defaults = combine_vars(defaults, role.get_default_vars())
-            if core_version >= (2, 16) or not C.DEFAULT_PRIVATE_ROLE_VARS:
+            if not private_role_vars:
                 exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
+        magic_args = {"include_delegate_to": False} if core_version < (2, 15) else {}
+        magic = manager._get_magic_variables(play, None, None, False, **magic_args)
+        names = ("ansible_play_name", "ansible_playbook_python", "ansible_config_file", "role_names",
+                 "ansible_play_role_names", "ansible_role_names", "ansible_dependent_role_names")
         result["gather_scope"] = {
             "role_defaults": _tag_untrusted(defaults),
             "role_exports": _tag_untrusted(exports),
-            "search_path": list(getattr(play, "get_search_path", lambda: [])()) or [basedir],
+            "magic": _tag_untrusted({key: magic[key] for key in names if key in magic}),
+            "search_path": _raw_search_path(play, basedir),
+            "search_dirs": _search_dirs(play, basedir, "files"),
         }
     names = _controller_env_names(result)
     if names:

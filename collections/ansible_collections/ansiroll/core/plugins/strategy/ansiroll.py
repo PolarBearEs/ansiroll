@@ -342,13 +342,13 @@ class StrategyModule(StrategyBase):
             chan.send_blob(agent_source)  # frame 1: the agent source
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
-                host, chan, task_map, hv, templar, become_pass, play_context)
+                host, chan, task_map, hv, templar, become_pass, play_context, gather_facts)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
         finally:
             chan.close()
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, gather_facts):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -404,10 +404,13 @@ class StrategyModule(StrategyBase):
             elif t == "gather_args":
                 if gather_reply is None:
                     gather_reply = {"t": "gather_args_result"}
-                    try:
-                        gather_reply["args"] = self._gather_args(host, task_map["__gather_facts__"])
-                    except Exception as ex:
-                        gather_reply["error"] = str(ex)
+                    if gather_facts:
+                        try:
+                            gather_reply["args"] = self._gather_args(host, task_map["__gather_facts__"])
+                        except Exception as ex:
+                            gather_reply["error"] = str(ex)
+                    else:
+                        gather_reply["error"] = "fact gathering was skipped for this host"
                 chan.send(gather_reply)
             elif t == "warning":
                 display.warning(frame["message"])
@@ -429,6 +432,11 @@ class StrategyModule(StrategyBase):
             search_path.append(basedir)
         variables["ansible_search_path"] = search_path
         templar = self._mk_templar(variables)
+        if task.when:
+            resolve = getattr(task, "_resolve_conditional", None)
+            allowed = resolve(task.when, variables) if resolve else task.evaluate_conditional(templar, variables)
+            if not allowed:
+                raise AnsibleError("fact gathering condition was false for this host")
         args = templar.template(task.args)
         omit = variables.get("omit")
         return {key: value for key, value in args.items() if value is not None and value != omit}
