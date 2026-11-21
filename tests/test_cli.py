@@ -287,6 +287,7 @@ def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatc
 def test_file_compile_checks_missing_case_variants_in_destination_directory(
         monkeypatch, tmp_path, case_insensitive, names, long_name):
     monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
+    monkeypatch.setattr(cli, "_can_remove_case_probe", lambda directory: True)
     if not case_insensitive:
         with tempfile.NamedTemporaryFile(prefix="case-check-", dir=tmp_path) as probe:
             if (tmp_path / os.path.basename(probe.name).upper()).exists():
@@ -294,6 +295,7 @@ def test_file_compile_checks_missing_case_variants_in_destination_directory(
     parent = tmp_path / "elsewhere"
     child = parent / "child"
     child.mkdir(parents=True)
+    parent.chmod(0o755)
     link = tmp_path / "link"
     link.symlink_to(child, target_is_directory=True)
     output_name, manifest_name = names
@@ -537,6 +539,26 @@ def test_case_probe_skips_directories_without_verified_cleanup(monkeypatch, tmp_
     assert not cli._same_missing_destination(
         (identity, str(tmp_path), "compiled.py"), (identity, str(tmp_path), "COMPILED.py"))
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="requires POSIX directory permissions")
+@pytest.mark.parametrize("mode, allowed", [(0o755, True), (0o770, False), (0o777, False), (0o1777, True)])
+def test_case_probe_skips_directories_where_the_entry_could_be_replaced(monkeypatch, tmp_path, mode, allowed):
+    tmp_path.chmod(mode)
+    info = tmp_path.stat()
+    identity = (info.st_dev, info.st_ino)
+    monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
+    monkeypatch.setattr(cli, "_can_remove_case_probe", lambda directory: True)
+    probes = []
+
+    def probe(directory, output_name, manifest_name):
+        probes.append((output_name, manifest_name))
+        return True
+
+    monkeypatch.setattr(cli, "_probe_names_at", probe)
+    assert cli._same_missing_destination(
+        (identity, str(tmp_path), "compiled.py"), (identity, str(tmp_path), "COMPILED.py")) is allowed
+    assert probes == ([("compiled.py", "COMPILED.py")] if allowed else [])
 
 
 @pytest.mark.parametrize("destination", ["output", "manifest"])

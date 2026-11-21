@@ -242,8 +242,13 @@ def _same_missing_destination(output, manifest):
     directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         info = os.fstat(directory)
-        return ((info.st_dev, info.st_ino) == output[0] and _can_remove_case_probe(directory)
-                and _probe_names_at(directory, output_name, manifest_name))
+        if (info.st_dev, info.st_ino) != output[0] or info.st_uid not in (0, os.geteuid()):
+            return False
+        shared = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        if shared and not info.st_mode & stat.S_ISVTX:
+            # Other users could replace the temporary directory entry.
+            return False
+        return _can_remove_case_probe(directory) and _probe_names_at(directory, output_name, manifest_name)
     finally:
         os.close(directory)
 
@@ -252,7 +257,7 @@ def _probe_names_at(directory, output_name, manifest_name):
     probe_name = ".ansiroll-" + secrets.token_hex(8)
     os.mkdir(probe_name, mode=0o700, dir_fd=directory)
     try:
-        probe = os.open(probe_name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=directory)
+        probe = os.open(probe_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
         try:
             first = os.open(output_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=probe)
             try:
