@@ -1152,6 +1152,29 @@ def test_implicit_setup_subset_uses_public_role_defaults_before_host_facts(tmp_p
     assert msgs == ['"distribution defined: False"']
 
 
+def test_standalone_setup_subset_uses_baked_controller_environment(tmp_path, monkeypatch):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ lookup('env', 'ANSIROLL_SETUP_SUBSET').split(',') }}"
+          tasks:
+            - debug:
+                msg: "distribution defined: {{ ansible_facts.distribution is defined }}"
+    """})
+    monkeypatch.setenv("ANSIROLL_SETUP_SUBSET", "!all,!min")
+    expected = _ansible(tmp_path, [])
+    assert expected[0] == ['"distribution defined: False"']
+    output = tmp_path / "out.py"
+    subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", str(output)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, check=True,
+    )
+    monkeypatch.delenv("ANSIROLL_SETUP_SUBSET")
+    result = subprocess.run([sys.executable, str(output)], cwd=str(tmp_path), env=_env(),
+                            capture_output=True, text=True, check=True)
+    assert _summary(result.stdout) == expected
+
+
 def test_implicit_setup_fact_path_uses_controller_task_vars(tmp_path):
     _write(tmp_path, {
         "location.yml": "facts_dir: actual-facts\n",

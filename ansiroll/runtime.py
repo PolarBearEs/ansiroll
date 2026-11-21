@@ -2665,8 +2665,11 @@ class Runtime:
         defaults = scope["role_defaults"]
         exports = scope["role_exports"]
         # Core validates gather_subset and gather_timeout with play-only vars.
-        play_vars = dict(defaults)
-        play_vars.update(self._with_deferred_vars_files(play, base=defaults, before_setup=True))
+        play_base = dict(defaults)
+        for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
+            play_base[key] = self.vars[key]
+        play_vars = dict(play_base)
+        play_vars.update(self._with_deferred_vars_files(play, base=play_base, before_setup=True))
         play_vars.update(exports)
         play_vars.update(self.extra_vars)
         play_ctx = self.ctx(base=play_vars)
