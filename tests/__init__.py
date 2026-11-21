@@ -260,15 +260,21 @@ def _launcher_body(source):
 
 def _launcher_body_and_flags(source):
     shebang, newline, code = source.partition("\n")
-    flag = re.fullmatch(
-        r"#![ \t]*(/[^ \t]+|/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)[ \t]+-(sP|Ps|s|P)[ \t]*",
+    match = re.fullmatch(
+        r"#![ \t]*(?:(?P<env>/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)|(?P<direct>/[^ \t]+))"
+        r"(?P<flags>(?:[ \t]+-(?:sP|Ps|s|P))+)[ \t]*",
         shebang,
     )
-    header_source = f"#!{flag[1]}{newline}{code}" if flag else source
-    body = _launcher_body(header_source)
-    if header_source.startswith("#!") and body == header_source:
+    flags = ()
+    if match:
+        options = match["flags"].split()
+        if len(options) > 1 and not match["env"]:
+            return None, ()
+        flags = tuple(dict.fromkeys(f"-{option}" for token in options for option in token[1:]))
+        source = f"#!{match['env'] or match['direct']}{newline}{code}"
+    body = _launcher_body(source)
+    if source.startswith("#!") and body == source:
         return None, ()
-    flags = tuple(f"-{option}" for option in flag[2]) if flag else ()
     return body, flags
 
 
@@ -357,7 +363,7 @@ def _path_playbook_launchers():
                 yield script
 
 
-def _stock_playbook_flags(script):
+def _stock_playbook_flags(script, package):
     # These stock wrappers only dispatch to main(). A custom wrapper may
     # change the environment or CLI arguments before invoking Ansible.
     bodies = (
@@ -389,6 +395,13 @@ def _stock_playbook_flags(script):
         return None
     if any(parsed == ast.dump(ast.parse(body)) for body in bodies):
         return flags
+    # A source checkout can expose cli/playbook.py itself as its launcher.
+    try:
+        with tokenize.open(os.path.join(package, "cli", "playbook.py")) as module:
+            if parsed == ast.dump(ast.parse(module.read())):
+                return flags
+    except (OSError, SyntaxError, UnicodeError):
+        pass
     return None
 
 
@@ -399,7 +412,7 @@ def _matching_path_launcher(package):
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
     for script in _path_playbook_launchers():
-        flags = _stock_playbook_flags(script)
+        flags = _stock_playbook_flags(script, package)
         if flags is None:
             continue
         fields = _ansible_version_fields([script], script, diagnostics, env=env)
@@ -430,7 +443,7 @@ def _run_ansible_playbook(filename, version):
         if script is None:
             script, flags = _matching_path_launcher(package)
         else:
-            flags = _stock_playbook_flags(script)
+            flags = _stock_playbook_flags(script, package)
             if flags is None:
                 raise RuntimeError(f"launcher initialization cannot be replayed: {script}")
         if _needs_launcher_flags(flags):

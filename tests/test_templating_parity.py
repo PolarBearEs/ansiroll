@@ -331,7 +331,21 @@ def test_modern_launcher_accepts_pip_entrypoint(tmp_path):
         "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
         "    sys.exit(main())\n"
     )
-    assert _stock_playbook_flags(str(script)) == ()
+    assert _stock_playbook_flags(str(script), str(tmp_path / "ansible")) == ()
+
+
+@pytest.mark.parametrize("customized", [False, True])
+def test_modern_launcher_recognizes_the_pinned_source_module(tmp_path, customized):
+    from tests import _stock_playbook_flags
+
+    package = tmp_path / "ansible"
+    module = package / "cli" / "playbook.py"
+    module.parent.mkdir(parents=True)
+    source = "#!/usr/bin/env python3\ndef main():\n    pass\nif __name__ == '__main__':\n    main()\n"
+    module.write_text(source)
+    script = tmp_path / "ansible-playbook"
+    script.write_text(source + ("set_custom_config()\n" if customized else ""))
+    assert _stock_playbook_flags(str(script), str(package)) == (None if customized else ())
 
 
 def test_modern_launcher_rejects_recorded_wrapper_initialization(tmp_path, monkeypatch):
@@ -358,7 +372,7 @@ def test_version_probe_parses_empty_fields(monkeypatch):
 
 @pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
 @pytest.mark.parametrize("no_user_site", [False, True])
-@pytest.mark.parametrize("safe_path", [None, "environment", "shebang"])
+@pytest.mark.parametrize("safe_path", [None, "environment", "shebang", "env-shebang"])
 def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, no_user_site, safe_path):
     from tests import _reference_python
 
@@ -382,7 +396,10 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     bin_dir.mkdir()
     (bin_dir / "parity_legacy_dependency.py").write_text("SOURCE = 'launcher'\n")
     options = ("s" if no_user_site else "") + ("P" if safe_path == "shebang" else "")
-    shebang = f"#!/usr/bin/python3 -{options}" if options else "#!/usr/bin/env python"
+    if safe_path == "env-shebang":
+        shebang = "#!/usr/bin/env -S python3 -s -P" if no_user_site else "#!/usr/bin/env -S python3 -P"
+    else:
+        shebang = f"#!/usr/bin/python3 -{options}" if options else "#!/usr/bin/env python"
     legacy_body = (
         "import os, sys, ansible\n"
         f"assert ansible.SOURCE == {source!r}, ansible.SOURCE\n"
