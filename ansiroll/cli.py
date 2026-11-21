@@ -128,6 +128,10 @@ def _open_compile_destination(path, validate):
             original_error = ex
             reference = _pin_for_truncate(path, path, ex)
             stack.callback(os.close, reference)
+            # A failed create-open hasn't established permission to replace
+            # someone else's file. The pathname may have changed since then.
+            if os.fstat(reference).st_uid != os.geteuid():
+                raise
         else:
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
@@ -226,22 +230,24 @@ def _check_manifest_path(path, output_stat):
 
 
 def _pin_output_inode(path, output_fd, output_stat):
-    flags = getattr(os, "O_NONBLOCK", 0)
+    candidates = []
     if sys.platform == "linux":
-        paths = ("/proc/self/fd/%d" % output_fd, path)
-    else:
-        paths = (path,)
-    modes = (os.O_RDONLY, os.O_PATH) if hasattr(os, "O_PATH") else (os.O_RDONLY,)
-    for candidate in paths:
-        for mode in modes:
-            try:
-                reference = os.open(candidate, flags | mode)
-            except OSError:
-                continue
-            if os.path.samestat(output_stat, os.fstat(reference)):
-                return reference
-            os.close(reference)
-            break
+        linked_fd = "/proc/self/fd/%d" % output_fd
+        candidates.append((linked_fd, os.O_RDONLY | os.O_NONBLOCK))
+        if hasattr(os, "O_PATH"):
+            candidates.append((linked_fd, os.O_PATH))
+    if hasattr(os, "O_PATH"):
+        # A replacement may be a FIFO. Inspect it without opening a reader.
+        candidates.append((path, os.O_PATH))
+
+    for candidate, flags in candidates:
+        try:
+            reference = os.open(candidate, flags)
+        except OSError:
+            continue
+        if os.path.samestat(output_stat, os.fstat(reference)):
+            return reference
+        os.close(reference)
     return None
 
 

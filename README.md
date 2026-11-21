@@ -51,9 +51,10 @@ only reveals an alias when creating a file, the compiler rejects it before
 writing data and may leave an empty output file.
 
 When overwriting files on a filesystem that requires truncation at open time,
-the compiler uses Linux `/proc/self/fd` to reopen the validated file. If that
-interface is unavailable, compile to local staging files and copy the outputs
-to the intended destinations.
+the compiler uses Linux `/proc/self/fd` to reopen the validated file. If the
+initial create-open fails, this retry requires a file owned by the compiler's
+effective user. If the safe reopen is unavailable, compile to local staging
+files and copy the outputs to the intended destinations.
 
 Use `-o -` to stream the generated Python directly to the interpreter. In Bash,
 `pipefail` makes the pipeline report a compiler failure even if Python exits

@@ -472,6 +472,71 @@ def test_compile_leaves_permission_denials_unchanged(monkeypatch, tmp_path, dest
     assert target.read_text() == before
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+def test_compile_rejects_truncating_retry_for_a_foreign_file(monkeypatch, tmp_path, destination):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    output.write_text("previous Python")
+    manifest.write_text("previous manifest")
+    target = output if destination == "output" else manifest
+    prior = target.read_text()
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    open_fd, fstat = os.open, os.fstat
+    pinned = None
+    failed_create_open = False
+
+    def open_replacement(path, flags, *args, **kwargs):
+        nonlocal pinned, failed_create_open
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
+            failed_create_open = True
+            raise PermissionError(errno.EPERM, "create-open permission not established", path)
+        assert not flags & os.O_TRUNC
+        fd = open_fd(path, flags, *args, **kwargs)
+        if failed_create_open and path == str(target) and flags & os.O_PATH:
+            pinned = fd
+        return fd
+
+    def foreign_owner(fd):
+        if fd == pinned:
+            fields = list(fstat(fd))
+            fields[stat.ST_UID] = os.geteuid() + 1
+            return os.stat_result(fields)
+        return fstat(fd)
+
+    monkeypatch.setattr(os, "open", open_replacement)
+    monkeypatch.setattr(os, "fstat", foreign_owner)
+    with pytest.raises(PermissionError, match="create-open permission not established"):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+    assert pinned is not None
+    assert target.read_text() == prior
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_PATH"), reason="requires Linux FIFOs")
+@pytest.mark.parametrize("metadata_available", [True, False])
+def test_output_inode_fallback_does_not_open_replacement_fifo(monkeypatch, tmp_path, metadata_available):
+    output = tmp_path / "compiled.py"
+    open_fd, metadata = os.open, os.O_PATH
+    with output.open("w") as file:
+        original = os.fstat(file.fileno())
+        output.unlink()
+        os.mkfifo(output)
+        inspected = []
+
+        def open_without_procfs(path, flags, *args, **kwargs):
+            if str(path).startswith("/proc/self/fd/"):
+                raise FileNotFoundError(errno.ENOENT, "procfs unavailable", path)
+            assert path == str(output) and flags == metadata
+            inspected.append(path)
+            return open_fd(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", open_without_procfs)
+        if not metadata_available:
+            monkeypatch.delattr(os, "O_PATH")
+        assert cli._pin_output_inode(str(output), file.fileno(), original) is None
+        assert inspected == ([str(output)] if metadata_available else [])
+
+
 def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
