@@ -285,6 +285,27 @@ def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(
     assert tests._launcher_body(wrapper) == (body if literal_braces else wrapper)
 
 
+@pytest.mark.skipif(not os.path.isfile("/bin/sh"), reason="requires a POSIX shell")
+@pytest.mark.parametrize("dirname", ["team[12]", "team*", "team?"])
+@pytest.mark.parametrize("alternative_exists", [True, False])
+def test_legacy_launcher_checks_whether_pathname_patterns_stay_literal(
+    tmp_path, monkeypatch, dirname, alternative_exists,
+):
+    from tests import _launcher_body
+
+    executable = tmp_path / dirname / "python3"
+    executable.parent.mkdir()
+    executable.touch()
+    monkeypatch.setattr(sys, "executable", str(executable))
+    if alternative_exists:
+        alternative = tmp_path / "team1" / "python3"
+        alternative.parent.mkdir()
+        alternative.touch()
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
+    assert _launcher_body(wrapper) == (wrapper if alternative_exists else body)
+
+
 @pytest.mark.parametrize("stub_available", [True, False])
 @pytest.mark.parametrize("shebang", [
     "#!/usr/bin/env -S ANSIBLE_CONFIG=/custom/ansible.cfg python3",

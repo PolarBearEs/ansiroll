@@ -137,6 +137,22 @@ def _shell_preserves_braces():
     return result.returncode == 0 and result.stdout == "{ansiroll_a,ansiroll_b}\n{1..2}\n"
 
 
+def _shell_preserves_path_pattern(path):
+    import subprocess
+
+    # Pass the path as an argument to fixed shell code. Expand only its
+    # pathname pattern, without evaluating it as a command or splitting it.
+    try:
+        result = subprocess.run(
+            ["/bin/sh", "-c", 'IFS=; literal=$1; set -- $literal; [ "$#" -eq 1 ] && [ "$1" = "$literal" ]',
+             "ansiroll-launcher-check", path],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _is_python_interpreter(executable):
     import re
 
@@ -181,13 +197,16 @@ def _launcher_body(source):
         executable = interpreter[1:-1].replace("'\"'\"'", "'")
     elif re.fullmatch(r'"/[^"$\x60\\]+"', interpreter):
         executable = interpreter[1:-1]
-    elif (
-        # Shell token delimiters are ASCII. Unicode spaces can be literal
-        # filename characters, like punctuation that has no shell meaning.
-        re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?]+""", interpreter)
-        and not _has_bracket_glob(interpreter)
-    ):
+    # Shell token delimiters are ASCII. Unicode spaces can be literal
+    # filename characters, like punctuation that has no shell meaning.
+    elif re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()]+""", interpreter):
         if _has_brace_expansion(interpreter) and not _shell_preserves_braces():
+            return source
+        has_path_pattern = "*" in interpreter or "?" in interpreter or _has_bracket_glob(interpreter)
+        if has_path_pattern and not (
+            os.path.realpath(interpreter) == os.path.realpath(sys.executable)
+            and _shell_preserves_path_pattern(interpreter)
+        ):
             return source
         executable = interpreter
     else:
