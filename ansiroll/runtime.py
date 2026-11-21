@@ -1148,6 +1148,7 @@ class _PlayVarScope(dict):
         self.strict = strict
         self.resolving = set()
         self.resolved = {}
+        self.resolved_snapshot = {}
         view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
         snapshot = ctx.get("vars")
         self["vars"] = view(snapshot if isinstance(snapshot, _LoopVarsSnapshot) else _vars_snapshot(ctx), self)
@@ -1191,10 +1192,13 @@ class _PlayVarView(dict):
         if key == "vars":
             return value
         if not self._loop_snapshot:
-            value = self.scope[key]
-        elif isinstance(value, _PlayVarTemplate):
-            value = str(value)
-        return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
+            return self.scope.templater.resolve_variable(key, self.scope[key], self.scope, strict=self.scope.strict)
+        if key not in self.scope.resolved_snapshot:
+            if isinstance(value, _PlayVarTemplate):
+                value = str(value)
+            resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
+            self.scope.resolved_snapshot[key] = resolved
+        return self.scope.resolved_snapshot[key]
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1497,6 +1501,7 @@ class _Templater:
         self._expr_cache = {}
         self._template_cache = {}
         self._current_ctx = {}
+        self._untrusted_task_interpolation = None
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -1654,7 +1659,11 @@ class _Templater:
                 return _captured("Recursive loop detected in template: %s" % value)
             self._resolving.append(marker)
             try:
-                return self.render_string(value, ctx, strict=strict)
+                result = self.render_string(value, ctx, strict=strict)
+                if (self._untrusted_task_interpolation is False and isinstance(value, _TaskVarTemplate)
+                        and _contains_untrusted_condition_value(result)):
+                    self._untrusted_task_interpolation = True
+                return result
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
@@ -1662,6 +1671,18 @@ class _Templater:
         if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot):
             return _lazy_wrap(value, self._runtime, ctx)
         return value
+
+    def render_conditional_template(self, text, ctx, strict=False):
+        # A rendered alias can lose its marker when combined with literal text.
+        previous = self._untrusted_task_interpolation
+        self._untrusted_task_interpolation = False
+        try:
+            result = self.render_string(text, ctx, strict=strict)
+            if self._untrusted_task_interpolation:
+                raise UntrustedConditional("Encountered untrusted template or expression.")
+            return result
+        finally:
+            self._untrusted_task_interpolation = previous
 
     def _play_var_scope(self, ctx, strict):
         if isinstance(ctx, _PlayVarScope):
@@ -2131,7 +2152,7 @@ class Runtime:
                 raise UntrustedConditional(
                     "Encountered untrusted template or expression."
                 )
-            result = self.templater.render_string(cond, ctx, strict=strict_vars)
+            result = self.templater.render_conditional_template(cond, ctx, strict=strict_vars)
             # Assert accepts an indirected list of expressions (for
             # example `that: "{{ expression_list }}"`). Evaluate the
             # resolved members as conditions rather than treating the

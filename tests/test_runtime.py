@@ -243,6 +243,36 @@ def test_loop_task_magic_vars_keep_original_values_when_facts_change():
     assert rt.template("{{ alias }}", ctx) == "0 / 1 / second"
 
 
+def test_loop_task_magic_vars_cache_captured_alias_during_render():
+    rt = Runtime({}, "", {})
+    readings = iter([1, 2])
+    rt.templater.env.globals["next_reading"] = lambda: next(readings)
+    rt.vars.update(rt.template_vars({"alias": "{{ next_reading() }}"}, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=["sample"], vars={"unused": True})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    assert rt.template("{{ vars.alias }} / {{ vars.alias }}", ctx) == "1 / 1"
+    assert rt.template("{{ vars.alias }}", ctx) == 2
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_loop_task_conditional_interpolation_preserves_alias_trust(unsafe):
+    from ansiroll.runtime import UntrustedConditional
+
+    rt = Runtime({}, "", {})
+    value = {"__ansiroll_unsafe__": "sample"} if unsafe else "sample"
+    task = _task("task", "Task", None, loop=["sample"],
+                 vars={"source": value, "alias": "{{ source }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    condition = {"__ansiroll_trusted_condition__": "'{{ alias }}' == item"}
+    if unsafe:
+        with pytest.raises(UntrustedConditional):
+            rt.when([condition], ctx)
+    else:
+        assert rt.when([condition], ctx)
+
+
 @pytest.mark.parametrize("controller_snapshot", [False, True])
 def test_play_alias_can_read_shadowed_inventory_value(controller_snapshot):
     frames = []
