@@ -53,15 +53,17 @@ def _run_ansible_playbook():
     from importlib import metadata
 
     import ansible
-    from ansible.cli import playbook
+    from ansible.release import __version__
 
-    # Import the CLI in the child, with its own standard streams.
-    if hasattr(playbook, "main"):
+    if tuple(map(int, __version__.split(".")[:2])) >= (2, 13):
+        from ansible.cli import playbook
+
         playbook.main()
         return
 
-    # Older releases install a Python script with no module entry point.
-    package = os.path.dirname(os.path.realpath(ansible.__file__))
+    # Older releases install a script. Importing the CLI before exec would
+    # leave its controller temp directory behind.
+    package = os.path.realpath(os.path.dirname(ansible.__file__))
     for name in ("ansible-core", "ansible-base", "ansible"):
         try:
             distribution = metadata.distribution(name)
