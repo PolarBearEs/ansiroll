@@ -115,7 +115,7 @@ _TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
 
 @contextmanager
 def _open_compile_destination(path, validate):
-    with ExitStack() as stack:
+    with ExitStack() as stack, ExitStack() as initial_pin:
         # A failed create-open gives us no fd. Capture the existing inode
         # before trying it so a retry cannot truncate a replacement file.
         reference = None
@@ -125,10 +125,29 @@ def _open_compile_destination(path, validate):
             except OSError:
                 pass
             else:
-                stack.callback(os.close, reference)
+                initial_pin.callback(os.close, reference)
 
+        flags = os.O_WRONLY | os.O_CREAT
+        created = False
+        released_for_emfile = False
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
+            if reference is None:
+                try:
+                    fd = os.open(path, flags | os.O_EXCL, 0o666)
+                except FileExistsError:
+                    fd = os.open(path, flags, 0o666)
+                else:
+                    created = True
+            else:
+                try:
+                    fd = os.open(path, flags, 0o666)
+                except OSError as ex:
+                    if ex.errno != errno.EMFILE:
+                        raise
+                    initial_pin.close()
+                    reference = None
+                    released_for_emfile = True
+                    fd = os.open(path, flags, 0o666)
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
             # check on the initial O_CREAT open in a sticky directory.
@@ -148,16 +167,19 @@ def _open_compile_destination(path, validate):
                 validate(current)
                 raise original_error
         else:
+            initial_pin.close()
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
             validate(info)
-            if not stat.S_ISREG(info.st_mode):
+            if created or not stat.S_ISREG(info.st_mode):
                 yield writer
                 return
             try:
                 writer.truncate(0)
             except OSError as ex:
-                if ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                if released_for_emfile or (
+                    ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS
+                ):
                     raise
                 original_error = ex
                 reference = _pin_for_truncate(path, fd, ex)

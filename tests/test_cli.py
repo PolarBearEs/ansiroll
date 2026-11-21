@@ -424,6 +424,71 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
     assert json.loads(manifest.read_text()) == data
 
 
+def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
+    open_fd, fdopen = os.open, os.fdopen
+
+    def without_procfs(path, flags, *args):
+        if str(path).startswith("/proc/self/fd/"):
+            raise FileNotFoundError(errno.ENOENT, "procfs unavailable", path)
+        return open_fd(path, flags, *args)
+
+    def sequential_writer(fd, mode):
+        file = fdopen(fd, mode)
+
+        def truncate(size):
+            raise OSError(errno.EOPNOTSUPP, "standalone truncation unavailable")
+
+        file.truncate = truncate
+        return file
+
+    monkeypatch.setattr(os, "open", without_procfs)
+    monkeypatch.setattr(os, "fdopen", sequential_writer)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
+    assert output.read_text() == "pass\n"
+    assert json.loads(manifest.read_text()) == data
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+def test_compile_releases_optional_pin_when_write_open_hits_emfile(monkeypatch, tmp_path, destination):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    target = output if destination == "output" else manifest
+    target.write_text("longer prior contents")
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
+    open_fd = os.open
+    reference = None
+    attempts = 0
+
+    def with_one_free_slot(path, flags, *args):
+        nonlocal reference, attempts
+        if path == str(target) and flags & os.O_PATH:
+            reference = open_fd(path, flags, *args)
+            return reference
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
+            attempts += 1
+            assert not flags & os.O_TRUNC
+            assert reference is not None
+            if attempts == 1:
+                os.fstat(reference)
+                raise OSError(errno.EMFILE, "too many open files", path)
+            with pytest.raises(OSError) as error:
+                os.fstat(reference)
+            assert error.value.errno == errno.EBADF
+        return open_fd(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", with_one_free_slot)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
+    assert attempts == 2
+    assert output.read_text() == "pass\n"
+    assert json.loads(manifest.read_text()) == data
+
+
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
 def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_path):
     output = tmp_path / "stdout"
@@ -686,7 +751,7 @@ def test_file_compile_detects_manifest_redirected_to_missing_output(monkeypatch,
             manifest.symlink_to(output)
 
     def redirect_manifest(path, flags, *args, **kwargs):
-        if during_open and path == str(manifest) and flags & os.O_WRONLY:
+        if during_open and path == str(manifest) and flags & os.O_WRONLY and not manifest.is_symlink():
             manifest.symlink_to(output)
         return open_fd(path, flags, *args, **kwargs)
 
