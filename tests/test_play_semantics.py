@@ -1202,6 +1202,86 @@ def test_implicit_setup_uses_play_name_role_vars_and_search_dirs(tmp_path, monke
     assert msgs == ['"False / role-selected facts"']
 
 
+def test_implicit_setup_preserves_vars_file_order_in_play_scope(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "vars/early.yml": "requested_subset: [all]\n",
+        "vars/final.yml": "requested_subset: ['!all', '!min']\n",
+        "files/setup-switch.txt": "enabled\n",
+        "setup-switch.txt": "disabled\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ requested_subset if ansible_version.major == 2 and lookup('file', 'setup-switch.txt') == 'enabled' else ['all'] }}"
+          vars_files: ['vars/{{ setup_profile }}.yml', vars/final.yml]
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    extra = json.dumps({"setup_profile": "early"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+def test_invalid_gather_keyword_aborts_before_ignore_errors(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          ignore_errors: true
+          gather_subset: "{{ nonexistent_subset }}"
+          tasks:
+            - debug: {msg: reached_after_invalid_setup}
+    """})
+    assert _ansible_run(tmp_path, []).returncode != 0
+    result = _standalone_run(tmp_path, [])
+    assert result.returncode != 0
+    assert "nonexistent_subset" in result.stderr
+    assert "reached_after_invalid_setup" not in result.stdout
+
+
+def test_setup_vars_file_can_read_shadowed_inventory_selector(tmp_path):
+    messages, _ = check(tmp_path, {
+        "group_vars/all.yml": "setup_profile: inventory\n",
+        "vars/inventory.yml": "facts_dir: actual-facts\n",
+        "actual-facts/example.fact": '{"marker": "inventory selected"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - set_fact: {setup_profile: wrong}
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          vars_files: ['vars/{{ setup_profile }}.yml']
+          fact_path: "{{ playbook_dir }}/{{ facts_dir }}"
+          tasks:
+            - debug: {msg: "marker={{ ansible_local.example.marker }}"}
+        """,
+    }, strategy=False)
+    assert messages == ['"marker=inventory selected"']
+
+
+def test_strategy_setup_uses_controller_skip_result(tmp_path):
+    _write(tmp_path, {
+        "pb.yml": """
+        - import_playbook: child.yml
+          when: ansible_search_path is not defined
+        """,
+        "child.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min']
+          tasks:
+            - debug: {msg: skipped}
+        """,
+    })
+    expected = _ansible_run(tmp_path, [])
+    actual = _ansible_run(tmp_path, [], "ansiroll.core.ansiroll")
+    assert expected.returncode == actual.returncode == 0
+    assert _summary(expected.stdout) == _summary(actual.stdout)
+
+
 def test_implicit_setup_fact_path_uses_controller_task_vars(tmp_path):
     _write(tmp_path, {
         "location.yml": "facts_dir: actual-facts\n",

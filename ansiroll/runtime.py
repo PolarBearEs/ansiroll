@@ -407,12 +407,16 @@ class MissingHandler(Exception):
     """A changed task requested a handler that has not been loaded."""
 
 
-class VarsFilesError(Exception):
-    """A vars_files failure, which aborts the whole run in Ansible; rc is ansible-playbook's exit code."""
+class PlayConfigurationError(Exception):
+    """A play-level failure that aborts the run with Ansible's exit status."""
 
     def __init__(self, message, rc=1):
         Exception.__init__(self, message)
         self.rc = rc
+
+
+class VarsFilesError(PlayConfigurationError):
+    """The play's vars files could not be loaded."""
 
 
 class ConditionalError(Exception):
@@ -1874,6 +1878,7 @@ class Runtime:
                  host_var_overrides=None, native_only=False):
         self.modules = modules
         self._initial_host_vars = dict(host_vars or {})
+        self._gather_inventory_vars = self._initial_host_vars
         self.vars = dict(self._initial_host_vars)
         self.python = python or sys.executable
         self.check_mode = check_mode
@@ -2347,6 +2352,16 @@ class Runtime:
                          and saved_facts.get("_ansible_facts_gathered"))
         if play.get("gather_facts") and not gather_cached:
             setup_ctx, gather_play_ctx = self._gather_contexts(play)
+            setup_options = play.get("gather_options") or {}
+            play_options = None
+            if self.gather_args_fn is None and setup_options:
+                play_options = {key: value for key, value in setup_options.items() if key != "fact_path"}
+                try:
+                    play_options = self._setup_args(play_options, play.get("gather_option_defaults"),
+                                                    setup_ctx, gather_play_ctx)
+                except (ValueError, TypeError, jinja2.UndefinedError) as ex:
+                    raise PlayConfigurationError("invalid play fact gathering options: %s" % ex)
+                setup_options = {"fact_path": setup_options["fact_path"]} if "fact_path" in setup_options else {}
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -2354,8 +2369,7 @@ class Runtime:
                 fact_schema=play.get("fact_schema"),
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
-                options=play.get("gather_options"), option_defaults=play.get("gather_option_defaults"),
-                play_ctx=gather_play_ctx,
+                options=setup_options, play_options=play_options,
             )
             if not gathered:
                 self.failed = True
@@ -2605,15 +2619,20 @@ class Runtime:
     def _with_deferred_vars_files(self, play, base=None, before_setup=False):
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
-        play_vars = dict(play.get("vars") or {})
         scope = play.get("gather_scope") or {}
+        play_vars = dict(scope.get("base_vars", play.get("vars")) or {})
         merge = (before_setup or bool(scope)) and self._gather_hash_merge()
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if base is None:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
             if scope:
-                base = _f_combine(scope.get("role_defaults"), base, scope.get("magic"), recursive=merge)
-        for entry in play.get("deferred_vars_files") or ():
+                base = {key: value for key, value in base.items() if key not in self._include_vars_layer}
+                base = _f_combine(scope.get("role_defaults"), self._gather_inventory_vars,
+                                  self._module_fact_layer, base, scope.get("magic"), recursive=merge)
+        for entry in scope.get("vars_files", play.get("deferred_vars_files")) or ():
+            if "values" in entry:
+                play_vars = _f_combine(play_vars, *entry["values"], recursive=merge)
+                continue
             variables = _f_combine(base, play_vars, self.extra_vars, recursive=merge)
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
@@ -2685,12 +2704,14 @@ class Runtime:
         play_base.update(magic)
         play_files = self._with_deferred_vars_files(play, base=play_base, before_setup=True)
         play_vars = _f_combine(play_base, play_files, exports, self.extra_vars, magic, recursive=merge)
+        play_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
         play_ctx = self.ctx(base=play_vars)
 
         # The implicit setup task resolves fact_path with host and task vars.
         host_file_vars = {key: value for key, value in self.vars.items()
                           if key not in self._set_fact_overrides and key not in self._include_vars_layer}
-        file_base = _f_combine(defaults, host_file_vars, magic, recursive=merge)
+        file_base = _f_combine(defaults, self._gather_inventory_vars, self._module_fact_layer,
+                               host_file_vars, magic, recursive=merge)
         setup_files = self._with_deferred_vars_files(play, base=file_base, before_setup=True)
         setup_vars = _f_combine(defaults, self.vars, setup_files, exports, self._include_vars_layer,
                                 self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
@@ -4322,8 +4343,6 @@ class Runtime:
 
     # ---- facts -----------------------------------------------------------
     def _setup_args(self, options, option_defaults, ctx, play_ctx):
-        if self.gather_args_fn is not None and options:
-            return self.gather_args_fn()
         rendered = {}
         for key, value in (options or {}).items():
             option_ctx = (play_ctx or ctx) if key in ("gather_subset", "gather_timeout") else ctx
@@ -4345,7 +4364,7 @@ class Runtime:
 
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     options=None, option_defaults=None, play_ctx=None):
+                     options=None, play_options=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -4353,6 +4372,18 @@ class Runtime:
         if ctx is None:
             ctx = self.ctx()
         self.emit_start(node)
+        controller_setup = self.gather_args_fn is not None and bool(options)
+        controller_error = None
+        if controller_setup:
+            node["when"] = None
+            try:
+                setup_args = self.gather_args_fn()
+                if setup_args is None:
+                    self.emit(node, "skipped", self._conditional_skip())
+                    self._tally("skipped")
+                    return True
+            except Exception as ex:
+                controller_error = ex
         blocked, ignore = self._task_gate(node, ctx)
         if blocked is not None:
             self.emit(node, _status_of(blocked), blocked, ignored=ignore)
@@ -4371,7 +4402,11 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            setup_args = self._setup_args(options, option_defaults, ctx, play_ctx)
+            if controller_error is not None:
+                raise controller_error
+            if not controller_setup:
+                setup_args = dict(play_options or {})
+                setup_args.update(self._setup_args(options, None, ctx, None))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             # Older controllers supply these setup defaults as play options.
             default_options = {"gather_subset": ["all"], "gather_timeout": 10}
@@ -4879,6 +4914,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     host_var_overrides = {}
     include_vars_layer = {}
     module_fact_layer = {}
+    gather_inventory_vars = host_vars or {}
     for play in plays:
         if failed:
             # A host that failed is removed from the rest of the playbook.
@@ -4896,6 +4932,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      native_only=native_only)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
+        rt._gather_inventory_vars = gather_inventory_vars
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
@@ -4903,7 +4940,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         except MissingHandler as ex:
             sys.stderr.write("ERROR: %s\n" % ex)
             return 1
-        except VarsFilesError as ex:
+        except PlayConfigurationError as ex:
             sys.stderr.write("[ERROR]: %s\n" % ex)
             return ex.rc
         finally:

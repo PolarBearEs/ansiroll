@@ -2443,8 +2443,8 @@ def test_strategy_rejects_gather_requests_for_skipped_hosts(tmp_path, gather_fac
     replies = []
     chan = SimpleNamespace(recv=lambda: next(messages), send=replies.append)
     plugin._pump(SimpleNamespace(name="host"), chan, {"__gather_facts__": task}, {}, None, None, None, gather_facts)
-    reason = "fact gathering condition was false for this host" if gather_facts else "fact gathering was skipped for this host"
-    assert replies == [{"t": "gather_args_result", "error": reason}]
+    outcome = {"args": None} if gather_facts else {"error": "fact gathering was skipped for this host"}
+    assert replies == [dict(outcome, t="gather_args_result")]
 
 
 def test_strategy_extra_vars_helper_preserves_json_booleans():

@@ -203,7 +203,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files)
+    ordered_vars_files = [] if gather_facts is None else None
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -319,8 +320,16 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
         magic_args = {"include_delegate_to": False} if core_version < (2, 15) else {}
         magic = manager._get_magic_variables(play, None, None, False, **magic_args)
+        from ansible.release import __version__
+
+        full_version = __version__.split()[0]
+        parts = (full_version.split(".") + ["0", "0", "0"])[:3]
+        magic["ansible_version"] = dict(
+            zip(("major", "minor", "revision"), (int(part) if part.isdigit() else part or 0 for part in parts)),
+            string=__version__.strip(), full=full_version,
+        )
         names = ("ansible_play_name", "ansible_playbook_python", "ansible_config_file", "role_names",
-                 "ansible_play_role_names", "ansible_role_names", "ansible_dependent_role_names")
+                 "ansible_play_role_names", "ansible_role_names", "ansible_dependent_role_names", "ansible_version")
         result["gather_scope"] = {
             "role_defaults": _tag_untrusted(defaults),
             "role_exports": _tag_untrusted(exports),
@@ -328,6 +337,13 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             "search_path": _raw_search_path(play, basedir),
             "search_dirs": _search_dirs(play, basedir, "files"),
         }
+        if unresolved_vars_files:
+            deferred = iter(result["deferred_vars_files"])
+            result["gather_scope"].update({
+                "base_vars": _tag_untrusted(dict(play.vars or {})),
+                "vars_files": [next(deferred) if entry is None else _tag_untrusted(entry)
+                               for entry in ordered_vars_files],
+            })
     names = _controller_env_names(result)
     if names:
         result["controller_env"] = {
@@ -423,7 +439,7 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -446,6 +462,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
                 if filename is None:
                     if unresolved is not None:
                         unresolved.append(entry)
+                    if ordered is not None:
+                        ordered.append(None)
                     break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
@@ -457,9 +475,11 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
             except AnsibleFileNotFound:
                 # Like Ansible: only a missing file moves on to the next candidate.
                 continue
-            for item in _as_list(loaded) or []:
-                if isinstance(item, dict):
-                    out = combine_vars(out, item)
+            values = [item for item in _as_list(loaded) if isinstance(item, dict)]
+            for item in values:
+                out = combine_vars(out, item)
+            if ordered is not None:
+                ordered.append({"values": values})
             break
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars

@@ -436,7 +436,7 @@ class StrategyModule(StrategyBase):
             resolve = getattr(task, "_resolve_conditional", None)
             allowed = resolve(task.when, variables) if resolve else task.evaluate_conditional(templar, variables)
             if not allowed:
-                raise AnsibleError("fact gathering condition was false for this host")
+                return None
         args = templar.template(task.args)
         omit = variables.get("omit")
         return {key: value for key, value in args.items() if value is not None and value != omit}
