@@ -122,6 +122,21 @@ def _has_brace_expansion(path):
     return False
 
 
+def _shell_preserves_braces():
+    import subprocess
+
+    # Probe the trampoline's shell with fixed words. Never run the launcher
+    # or pass its interpreter path to the shell for parsing.
+    try:
+        result = subprocess.run(
+            ["/bin/sh", "-c", 'printf "%s\\n" {ansiroll_a,ansiroll_b} {1..2}'],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout == "{ansiroll_a,ansiroll_b}\n{1..2}\n"
+
+
 def _launcher_body(source):
     import re
 
@@ -154,8 +169,11 @@ def _launcher_body(source):
         # filename characters, like punctuation that has no shell meaning.
         re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?]+""", interpreter)
         and not _has_bracket_glob(interpreter)
-        and not _has_brace_expansion(interpreter)
     ):
+        if _has_brace_expansion(interpreter) and not (
+            os.path.realpath(interpreter) == os.path.realpath(sys.executable) and _shell_preserves_braces()
+        ):
+            return source
         executable = interpreter
     else:
         return source

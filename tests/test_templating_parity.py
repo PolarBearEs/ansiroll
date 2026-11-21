@@ -267,6 +267,18 @@ def test_launcher_body_accepts_the_current_interpreter_under_a_custom_name(tmp_p
     assert _launcher_body(wrapper) == body
 
 
+@pytest.mark.parametrize("literal_braces", [True, False])
+def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(monkeypatch, literal_braces):
+    import tests
+
+    executable = "/workspace/team{dev,prod}/" + "long-component/" * 8 + "venv/bin/python3"
+    monkeypatch.setattr(sys, "executable", executable)
+    monkeypatch.setattr(tests, "_shell_preserves_braces", lambda: literal_braces)
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
+    assert tests._launcher_body(wrapper) == (body if literal_braces else wrapper)
+
+
 def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):
     checkout = tmp_path / "checkout"
     package = checkout / "ansible"
