@@ -6,8 +6,9 @@ import sys
 
 # The playbook directory can contain an unrelated tests.py.
 _BOOTSTRAP = (
-    "import sys; _implicit_cwd = sys.path[:1] == ['']; "
+    "import runpy, sys; _implicit_cwd = sys.path[:1] == ['']; "
     "sys.path[:1] = [] if _implicit_cwd else sys.path[:1]; "
+    "_parity_bootstrap = runpy.run_path(sys.argv.pop(1), run_name='_ansiroll_parity_bootstrap'); "
 )
 _ANSIBLE_MODULE_ALIASES = {
     "ansible.compat.selectors": "selectors",
@@ -17,23 +18,25 @@ _ANSIBLE_MODULE_ALIASES = {
 _ANSIBLE_SIX = "ansible.module_utils.six"
 
 
-def _reference_python(code, *arguments):
-    import ansible
+def _reference_python(code, filename=None):
+    if filename is None:
+        import ansible
 
-    return [sys.executable, "-c", _BOOTSTRAP + code, os.path.abspath(ansible.__file__), *arguments]
+        filename = ansible.__file__
+
+    return [sys.executable, "-c", _BOOTSTRAP + code, os.path.abspath(__file__), os.path.abspath(filename)]
 
 
 def ansible_playbook_command():
-    return _reference_python("from tests import _run_ansible_playbook; _run_ansible_playbook(sys.argv.pop(1))")
+    return _reference_python("_parity_bootstrap['_run_ansible_playbook'](sys.argv.pop(1))")
 
 
 def ansiroll_compile_command():
     return _reference_python(
-        "import os, runpy; filename, bootstrap = sys.argv[1:3]; del sys.argv[1:3]; "
-        "load_ansible = runpy.run_path(bootstrap, run_name='_ansiroll_parity_bootstrap')['_load_reference_ansible']; "
+        "import os; "
         "sys.path[:0] = [os.getcwd()] if _implicit_cwd else []; "
-        "load_ansible(filename); runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)",
-        os.path.abspath(__file__),
+        "_parity_bootstrap['_load_reference_ansible'](sys.argv.pop(1)); "
+        "runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)"
     ) + ["compile"]
 
 
@@ -268,9 +271,12 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: %s" % (stub, ex))
         return None
 
-    probe = (_BOOTSTRAP + "from tests import _load_reference_ansible, _run_legacy_playbook; "
-             "_load_reference_ansible(sys.argv.pop(1)); _run_legacy_playbook(sys.argv.pop(1))")
-    fields = _ansible_version_fields([sys.executable, "-c", probe, filename, path], path, diagnostics)
+    probe = _reference_python(
+        "_parity_bootstrap['_load_reference_ansible'](sys.argv.pop(1)); "
+        "_parity_bootstrap['_run_legacy_playbook'](sys.argv.pop(1))",
+        filename,
+    )
+    fields = _ansible_version_fields(probe + [path], path, diagnostics)
     installed = fields.get("ansible python module location", "")
     if installed and os.path.realpath(installed) == package:
         return path

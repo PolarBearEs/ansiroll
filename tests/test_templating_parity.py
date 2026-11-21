@@ -109,7 +109,7 @@ def test_reference_bootstrap_preserves_playbook_local_imports(tmp_path, monkeypa
     (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local tests module')\n")
     (tmp_path / "parity_playbook_helper.py").write_text("SOURCE = 'playbook'\n")
     command = _reference_python(
-        "from tests import _load_reference_ansible; _load_reference_ansible(sys.argv.pop(1)); "
+        "_parity_bootstrap['_load_reference_ansible'](sys.argv.pop(1)); "
         "from parity_playbook_helper import SOURCE; print(SOURCE)"
     )
     result = subprocess.run(
@@ -243,12 +243,19 @@ def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatc
     assert output.is_file()
 
 
-def test_subprocess_compile_imports_playbook_local_filter_helpers(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reference", [False, True])
+def test_parity_subprocess_imports_playbook_local_filter_helpers(tmp_path, monkeypatch, reference):
     dependencies = tmp_path / "dependencies"
     dependencies.mkdir()
     monkeypatch.setenv("PYTHONPATH", str(dependencies), prepend=os.pathsep)
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
+    filter_imports = ""
+    if reference:
+        filter_imports = (
+            "import sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n"
+        )
     playbook = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -257,7 +264,7 @@ def test_subprocess_compile_imports_playbook_local_filter_helpers(tmp_path, monk
 """, {
         "tests.py": "def task_file(name):\n    return name + '.yml'\n",
         "filter_plugins/parity_filters.py": (
-            "from tests import task_file\n"
+            filter_imports + "from tests import task_file\n"
             "class FilterModule:\n"
             "    def filters(self):\n"
             "        return {'parity_task_file': task_file}\n"
@@ -265,12 +272,18 @@ def test_subprocess_compile_imports_playbook_local_filter_helpers(tmp_path, monk
         "included.yml": "- debug: msg=selected-from-playbook\n",
     })
     output = tmp_path / "compiled.py"
+    if reference:
+        command = ansible_playbook_command() + ["-i", "localhost,", str(playbook)]
+    else:
+        command = ansiroll_compile_command() + [str(playbook), "-o", str(output)]
     result = subprocess.run(
-        ansiroll_compile_command() + [str(playbook), "-o", str(output)],
-        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=30,
+        command, cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert output.is_file()
+    if reference:
+        assert "selected-from-playbook" in result.stdout
+    else:
+        assert output.is_file()
 
 
 def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
