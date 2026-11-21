@@ -293,7 +293,7 @@ def _launcher_body_and_flags(source):
     return body, flags
 
 
-def _legacy_python_launcher(path, filename, package, diagnostics, associated):
+def _legacy_python_launcher(path, package, diagnostics, associated):
     try:
         with tokenize.open(path) as script:
             source = script.read()
@@ -323,19 +323,15 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: launcher differs from the selected Ansible release" % path)
         return None
     except FileNotFoundError:
-        if not associated:
-            diagnostics.append("%s: selected Ansible has no launcher source to verify this script" % path)
-            return None
+        # An install record or source checkout already associates this script
+        # with the pinned package. Replay verifies the package before startup.
+        if associated:
+            return path, flags
+        diagnostics.append("%s: selected Ansible has no launcher source to verify this script" % path)
+        return None
     except (OSError, SyntaxError, UnicodeError) as ex:
         diagnostics.append("%s: %s" % (stub, ex))
         return None
-
-    probe = _playbook_replay_command(filename, path, flags)
-    fields = _ansible_version_fields(probe, path, diagnostics)
-    installed = fields.get("ansible python module location", "")
-    if installed and os.path.realpath(installed) == package:
-        return path, flags
-    return None
 
 
 def _installed_playbook_launchers(package):
@@ -415,13 +411,14 @@ def _stock_playbook_flags(script, package):
     return None
 
 
-def _matching_path_launcher(package):
+def _matching_path_launcher(package, environment_script):
     diagnostics = []
     env = dict(os.environ)
     # An inherited path could make a foreign launcher import the pinned package.
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
-    for script in _path_playbook_launchers():
+    path_launchers = (script for script in _path_playbook_launchers() if script != environment_script)
+    for script in chain((environment_script,), path_launchers):
         flags = _stock_playbook_flags(script, package)
         if flags is None:
             continue
@@ -451,7 +448,7 @@ def _select_playbook_launcher(filename, version):
         # The CLI looks for sibling helpers next to argv[0] before PATH.
         script = next((script for script in installed_launchers if os.path.isfile(script)), None)
         if script is None:
-            script, flags = _matching_path_launcher(package)
+            script, flags = _matching_path_launcher(package, environment_script)
         else:
             flags = _stock_playbook_flags(script, package)
             if flags is None:
@@ -469,7 +466,7 @@ def _select_playbook_launcher(filename, version):
     for script, associated in candidates:
         if script and script not in seen and os.path.isfile(script):
             seen.add(script)
-            verified = _legacy_python_launcher(script, filename, package, diagnostics, associated)
+            verified = _legacy_python_launcher(script, package, diagnostics, associated)
             if verified:
                 python_script, flags = verified
                 return python_script, flags, True

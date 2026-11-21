@@ -265,7 +265,7 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
         yield SimpleNamespace(files=[launcher], locate_file=lambda entry: tmp_path / entry)
         pytest.fail("searched later distributions after selecting the pinned launcher")
 
-    def verify_legacy(script, filename, package, diagnostics, associated):
+    def verify_legacy(script, package, diagnostics, associated):
         assert package == ansible_package and associated
         return script, ()
 
@@ -288,8 +288,8 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     assert seen == [str(tmp_path / launcher), "--version"]
 
 
-@pytest.mark.parametrize("has_match", [False, True])
-def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monkeypatch, has_match):
+@pytest.mark.parametrize("match_location", [None, "path", "sibling"])
+def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, match_location):
     from types import ModuleType, SimpleNamespace
 
     import tests
@@ -316,12 +316,14 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
 
     cli = ModuleType("ansible.cli")
     cli.playbook = SimpleNamespace(main=lambda: seen.append(sys.argv[0]))
-    monkeypatch.setattr(sys, "executable", os.path.join(os.path.dirname(foreign), "python"))
+    sibling = matching if match_location == "sibling" else foreign
+    monkeypatch.setattr(sys, "executable", os.path.join(os.path.dirname(sibling), "python"))
     monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setattr(sys, "path", sys.path[:])
     monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
-    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([wrapper, foreign] + ([matching] if has_match else [])))
+    path = [wrapper, foreign, matching] if match_location == "path" else [wrapper, foreign]
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(path))
     monkeypatch.setattr(tests, "_ansible_version_fields", version_fields)
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
@@ -329,7 +331,9 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
     script, flags, legacy = tests._select_playbook_launcher(filename, "2.14.18")
     assert not flags and not legacy
     tests._run_modern_playbook(filename, script)
-    if has_match:
+    if match_location == "sibling":
+        assert seen == [matching, matching]
+    elif match_location == "path":
         assert seen == [foreign, matching, matching]
     else:
         assert seen == [foreign, os.path.join(package, "cli", "playbook.py")]
@@ -440,6 +444,8 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
         "import os\n"
         "key = 'ANSIROLL_TEST_SITECUSTOMIZE'\n"
         "os.environ[key] = str(int(os.environ.get(key, '0')) + 1)\n"
+        "with open('startup.log', 'a') as log:\n"
+        "    log.write('sitecustomize\\n')\n"
     )
     monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
     command = _reference_playbook_command(str(package / "__init__.py"), version)
@@ -450,6 +456,7 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     assert result.returncode == 0, result.stderr
     expected = f"ansible python module location = {package}" if version == "2.12.10" else source
     assert result.stdout.strip() == expected
+    assert (tmp_path / "startup.log").read_text().splitlines() == ["sitecustomize"]
 
 
 def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatch):
@@ -517,7 +524,7 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
     wrapper = tmp_path / "ansible-playbook"
     wrapper.write_text("#!/bin/sh\nexport ANSIBLE_CONFIG=/some/config\nexec ansible-playbook \"$@\"\n")
     diagnostics = []
-    assert _legacy_python_launcher(str(wrapper), "", "", diagnostics, associated=True) is None
+    assert _legacy_python_launcher(str(wrapper), "", diagnostics, associated=True) is None
     assert "cannot replay a non-Python launcher's initialization" in diagnostics[0]
 
 
@@ -561,7 +568,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     monkeypatch.setattr(tests, "_ansible_version_fields", version)
     diagnostics = []
     found = tests._legacy_python_launcher(
-        str(launcher), str(package / "__init__.py"), str(package), diagnostics, associated=False)
+        str(launcher), str(package), diagnostics, associated=False)
     if stale:
         assert found is None and not probes
         assert "differs from the selected Ansible release" in diagnostics[0]
@@ -677,7 +684,7 @@ def test_legacy_launcher_rejects_shebang_settings_before_replay(
     launcher.write_text(shebang + "\nstart_expected_release()\n")
     monkeypatch.setattr(tests, "_ansible_version_fields", lambda *args: pytest.fail("unsupported launcher ran"))
     diagnostics = []
-    assert tests._legacy_python_launcher(str(launcher), "", str(package), diagnostics, associated=True) is None
+    assert tests._legacy_python_launcher(str(launcher), str(package), diagnostics, associated=True) is None
     assert "launcher shebang cannot be replayed" in diagnostics[0]
 
 
