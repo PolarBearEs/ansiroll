@@ -27,13 +27,14 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install project and test dependencies
-        run: pip install -e ".[test]" "ansible-core==2.21.*"
+        run: pip install -e ".[test]" "ansible-core==2.21.*" pytest-xdist
       - name: Run branch coverage
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}/collections
           ANSIBLE_DEPRECATION_WARNINGS: "False"
         run: >-
           pytest
+          -n 2
           --cov=ansiroll
           --cov-report=term-missing
           --cov-report=xml
@@ -78,7 +79,7 @@ jobs:
       - name: Install ansible + test deps
         run: |
           python -m pip install --upgrade pip
-          pip install "${{ matrix.ansible }}" jinja2 packaging pytest
+          pip install "${{ matrix.ansible }}" jinja2 packaging pytest pytest-xdist
           pip install -e . --no-deps
       - name: Show versions
         run: |
@@ -88,7 +89,7 @@ jobs:
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}/collections
           ANSIBLE_DEPRECATION_WARNINGS: "False"
-        run: pytest -q
+        run: pytest -n 2 -q
 
   # Compare against each release's own linear strategy using integration
   # targets from the matching ansible/ansible tag. Maintained 2.20 is the full
