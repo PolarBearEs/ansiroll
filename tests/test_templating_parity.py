@@ -259,23 +259,36 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     monkeypatch.setattr(metadata, "distributions", distributions)
     monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
+    monkeypatch.setattr(sys, "path", sys.path[:])
     monkeypatch.setenv("PATH", "")
     tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"), version)
     assert seen == [str(tmp_path / launcher), "--version"]
 
 
-def test_legacy_launcher_imports_sibling_dependencies_before_pinning_ansible(tmp_path, monkeypatch):
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+@pytest.mark.parametrize("safe_path", [False, True])
+def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, safe_path):
     from tests import _reference_python
 
+    if safe_path and not hasattr(sys.flags, "safe_path"):
+        pytest.skip("Python does not support safe-path mode")
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    if safe_path:
+        monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    source = "inherited" if safe_path else "launcher"
     package = tmp_path / "lib" / "ansible"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("from parity_legacy_dependency import SOURCE\n")
+    (package / "cli").mkdir()
+    (package / "cli" / "playbook.py").write_text(
+        "import ansible\ndef main():\n    print(ansible.SOURCE)\n"
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "parity_legacy_dependency.py").write_text("SOURCE = 'launcher'\n")
     (bin_dir / "ansible-playbook").write_text(
         "#!/usr/bin/env python\nimport os, ansible\n"
-        "assert ansible.SOURCE == 'launcher', ansible.SOURCE\n"
+        f"assert ansible.SOURCE == {source!r}, ansible.SOURCE\n"
         "print('ansible python module location = ' + os.path.dirname(ansible.__file__))\n"
     )
     (tmp_path / "parity_legacy_dependency.py").write_text("SOURCE = 'inherited'\n")
@@ -285,10 +298,11 @@ def test_legacy_launcher_imports_sibling_dependencies_before_pinning_ansible(tmp
         str(package / "__init__.py"),
     )
     result = subprocess.run(
-        command + ["2.12.10", "--version"], cwd=tmp_path, env=_env(),
+        command + [version, "--version"], cwd=tmp_path, env=_env(),
         capture_output=True, text=True, timeout=30, check=True,
     )
-    assert result.stdout.strip() == f"ansible python module location = {package}"
+    expected = f"ansible python module location = {package}" if version == "2.12.10" else source
+    assert result.stdout.strip() == expected
 
 
 def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatch):

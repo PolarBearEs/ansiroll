@@ -103,12 +103,17 @@ def _load_reference_ansible(filename):
     return actual
 
 
+def _set_playbook_launcher(script):
+    # Match direct execution of the launcher, including sibling imports.
+    if not getattr(sys.flags, "safe_path", False):
+        sys.path.insert(0, os.path.dirname(os.path.realpath(script)))
+    sys.argv[0] = script
+
+
 def _run_legacy_playbook(filename, script):
     import runpy
 
-    # Match direct execution of the launcher, including sibling imports.
-    sys.path.insert(0, os.path.dirname(os.path.realpath(script)))
-    sys.argv[0] = script
+    _set_playbook_launcher(script)
     _load_reference_ansible(filename)
     runpy.run_path(script, run_name="__main__")
 
@@ -320,9 +325,10 @@ def _run_ansible_playbook(filename, version):
     installed_launchers = _installed_playbook_launchers(package)
     environment_script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
     if tuple(map(int, version.split(".")[:2])) >= (2, 13):
-        _load_reference_ansible(filename)
         # The CLI looks for sibling helpers next to argv[0] before PATH.
-        sys.argv[0] = next((script for script in installed_launchers if os.path.isfile(script)), environment_script)
+        script = next((script for script in installed_launchers if os.path.isfile(script)), environment_script)
+        _set_playbook_launcher(script)
+        _load_reference_ansible(filename)
         from ansible.cli import playbook
 
         playbook.main()
