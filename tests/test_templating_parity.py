@@ -120,13 +120,16 @@ def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path
 
 
 def test_reference_bootstrap_accepts_ansible_stdlib_selectors_alias(tmp_path):
+    import ansible
+
     command = (
-        "import ansible, selectors, sys; from tests import _load_reference_ansible; "
+        "import selectors, sys; from tests import _load_reference_ansible; "
+        "_load_reference_ansible(sys.argv[1]); "
         "sys.modules['ansible.module_utils.compat.selectors'] = selectors; "
-        "_load_reference_ansible(ansible.__file__)"
+        "_load_reference_ansible(sys.argv[1])"
     )
     subprocess.run(
-        [sys.executable, "-c", command], cwd=tmp_path, env=_env(),
+        [sys.executable, "-c", command, os.path.abspath(ansible.__file__)], cwd=tmp_path, env=_env(),
         capture_output=True, text=True, timeout=10, check=True,
     )
 
@@ -135,10 +138,9 @@ def test_reference_bootstrap_accepts_ansible_stdlib_selectors_alias(tmp_path):
 def test_reference_playbook_sets_argv_to_the_matching_installed_launcher(tmp_path, monkeypatch):
     from importlib import metadata
     from pathlib import Path
-    from types import SimpleNamespace
+    from types import ModuleType, SimpleNamespace
 
     import tests
-    from ansible.cli import playbook
 
     launcher = Path("bin/ansible-playbook")
     (tmp_path / launcher).parent.mkdir()
@@ -151,9 +153,11 @@ def test_reference_playbook_sets_argv_to_the_matching_installed_launcher(tmp_pat
         return SimpleNamespace(files=[launcher], locate_file=lambda entry: tmp_path / entry)
 
     seen = []
+    cli = ModuleType("ansible.cli")
+    cli.playbook = SimpleNamespace(main=lambda: seen.extend(sys.argv))
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: ansible_package)
     monkeypatch.setattr(metadata, "distribution", distribution)
-    monkeypatch.setattr(playbook, "main", lambda: seen.extend(sys.argv))
+    monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setenv("PATH", "")
     tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"))
@@ -290,21 +294,24 @@ def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(
 @pytest.mark.skipif(not os.path.isfile("/bin/sh"), reason="requires a POSIX shell")
 @pytest.mark.parametrize("dirname", ["team[12]", "team*", "team?"])
 @pytest.mark.parametrize("alternative_exists", [True, False])
-def test_legacy_launcher_checks_whether_pathname_patterns_stay_literal(
-    tmp_path, dirname, alternative_exists,
-):
+def test_legacy_launcher_checks_whether_pathname_patterns_stay_literal(dirname, alternative_exists):
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
     from tests import _launcher_body
 
-    executable = tmp_path / dirname / "python3"
-    executable.parent.mkdir()
-    executable.touch()
-    if alternative_exists:
-        alternative = tmp_path / "team1" / "python3"
-        alternative.parent.mkdir()
-        alternative.touch()
-    body = "start_expected_release()\n"
-    wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
-    assert _launcher_body(wrapper) == (wrapper if alternative_exists else body)
+    # Only the test's directory name should contain shell syntax.
+    with TemporaryDirectory(prefix="ansiroll-launcher-", dir="/tmp") as root:
+        executable = Path(root, dirname, "python3")
+        executable.parent.mkdir()
+        executable.touch()
+        if alternative_exists:
+            alternative = Path(root, "team1", "python3")
+            alternative.parent.mkdir()
+            alternative.touch()
+        body = "start_expected_release()\n"
+        wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
+        assert _launcher_body(wrapper) == (wrapper if alternative_exists else body)
 
 
 @pytest.mark.parametrize("stub_available", [True, False])
