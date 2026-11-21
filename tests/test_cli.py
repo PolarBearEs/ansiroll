@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import stat
@@ -307,13 +308,16 @@ def test_file_compile_checks_missing_case_variants_in_destination_directory(
     probes = []
 
     def folded_stat(path, *args, **kwargs):
-        if isinstance(path, str):
-            folder, filename = os.path.split(path)
-            if os.path.basename(folder).startswith(".ansiroll-") and filename == manifest_name:
-                probes.append(folder)
-                assert os.path.samestat(real_stat(os.path.dirname(folder)), parent_stat)
-                if case_insensitive:
-                    path = os.path.join(folder, output_name)
+        directory = kwargs.get("dir_fd")
+        if directory is not None and path == manifest_name:
+            probes.append(directory)
+            assert os.path.samestat(real_stat("..", dir_fd=directory), parent_stat)
+            if case_insensitive:
+                path = output_name
+        elif isinstance(path, str) and ".ansiroll-" in path:
+            # Simulate a full path that becomes too long as soon as a
+            # temporary directory component is added.
+            raise OSError(errno.ENAMETOOLONG, "probe exceeds the pathname limit", path)
         return real_stat(path, *args, **kwargs)
 
     def compile_playbook(*args, **kwargs):
@@ -532,25 +536,46 @@ def test_file_compile_holds_output_inode_until_manifest_open(monkeypatch, tmp_pa
         os.fstat(next(iter(output_references)))
 
 
-@pytest.mark.skipif(os.name != "posix", reason="requires direct script execution")
-def test_file_compile_releases_output_writer_before_opening_manifest(monkeypatch, tmp_path):
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+def test_file_compile_writes_manifest_after_output_parent_becomes_a_file(monkeypatch, tmp_path):
+    parent = tmp_path / "output"
+    parent.mkdir()
+    moved = tmp_path / "moved"
+    output = parent / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
+    fchmod = os.fchmod
+
+    def move_parent(fd, mode):
+        fchmod(fd, mode)
+        parent.rename(moved)
+        parent.touch()
+
+    monkeypatch.setattr(os, "fchmod", move_parent)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
+    assert json.loads(manifest.read_text()) == data
+    assert (moved / output.name).read_text() == "pass\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+def test_file_compile_releases_output_writer_before_setting_execute_bits(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     seen = []
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: (
         "#!/bin/sh\nexit 0\n", {"modules": [], "fallback_tasks": []},
     ))
-    open_fd = os.open
+    fchmod = os.fchmod
 
-    def run_output_before_opening_manifest(path, flags, *args, **kwargs):
-        if path == str(manifest) and flags & os.O_WRONLY:
-            subprocess.run([str(output)], capture_output=True, check=True, timeout=5)
-            seen.append(path)
-        return open_fd(path, flags, *args, **kwargs)
+    def run_output_as_soon_as_executable(fd, mode):
+        fchmod(fd, mode)
+        subprocess.run([str(output)], capture_output=True, check=True, timeout=5)
+        seen.append(output)
 
-    monkeypatch.setattr(os, "open", run_output_before_opening_manifest)
+    monkeypatch.setattr(os, "fchmod", run_output_as_soon_as_executable)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
-    assert seen == [str(manifest)]
+    assert seen == [output]
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")

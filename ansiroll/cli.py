@@ -6,6 +6,7 @@ import argparse
 import errno
 import json
 import os
+import secrets
 import stat
 import subprocess
 import sys
@@ -131,9 +132,25 @@ def _same_missing_destination(output, manifest):
     if output_name == manifest_name:
         return True
 
-    # A child directory inherits the destination filesystem's naming rules.
-    # Use the full requested names so filesystem folding and component
-    # length limits apply to the probe exactly as they do to the outputs.
+    # Probe full names in a child of the destination directory. This covers
+    # inherited case rules; aliases allocated on creation are checked again
+    # through the opened output descriptor.
+    directory = None
+    if os.name == "posix":
+        access = getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
+        try:
+            directory = os.open(parent, access | os.O_DIRECTORY)
+        except PermissionError:
+            # A writable, searchable directory may still forbid listing.
+            pass
+    if directory is not None:
+        try:
+            info = os.fstat(directory)
+            return (info.st_dev, info.st_ino) == output[0] and _probe_names_at(
+                directory, output_name, manifest_name)
+        finally:
+            os.close(directory)
+
     parent = os.path.realpath(parent)
     info = os.stat(parent)
     if (info.st_dev, info.st_ino) != output[0]:
@@ -142,6 +159,28 @@ def _same_missing_destination(output, manifest):
         with open(os.path.join(probe, output_name), "xb") as first:
             other = _stat_if_present(os.path.join(probe, manifest_name))
             return other is not None and os.path.samestat(os.fstat(first.fileno()), other)
+
+
+def _probe_names_at(directory, output_name, manifest_name):
+    probe_name = ".ansiroll-" + secrets.token_hex(8)
+    os.mkdir(probe_name, mode=0o700, dir_fd=directory)
+    try:
+        probe = os.open(probe_name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=directory)
+        try:
+            first = os.open(output_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=probe)
+            try:
+                try:
+                    other = os.stat(manifest_name, dir_fd=probe)
+                except FileNotFoundError:
+                    return False
+                return os.path.samestat(os.fstat(first), other)
+            finally:
+                os.close(first)
+                os.unlink(output_name, dir_fd=probe)
+        finally:
+            os.close(probe)
+    finally:
+        os.rmdir(probe_name, dir_fd=directory)
 
 
 def _check_file_destinations(output_path, manifest_path):
@@ -178,22 +217,41 @@ def _check_manifest_path(path, output_stat):
 
 
 def _pin_output_inode(path, output_fd, output_stat):
-    # A writable duplicate would cause ETXTBSY if the manifest consumer
-    # runs the generated script before it connects to the manifest FIFO.
-    flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NONBLOCK", 0)
+    flags = getattr(os, "O_NONBLOCK", 0)
     if sys.platform == "linux":
         paths = ("/proc/self/fd/%d" % output_fd, path)
     else:
         paths = (path,)
+    modes = (os.O_RDONLY, os.O_PATH) if hasattr(os, "O_PATH") else (os.O_RDONLY,)
     for candidate in paths:
-        try:
-            reference = os.open(candidate, flags)
-        except OSError:
-            continue
-        if os.path.samestat(output_stat, os.fstat(reference)):
-            return reference
-        os.close(reference)
+        for mode in modes:
+            try:
+                reference = os.open(candidate, flags | mode)
+            except OSError:
+                continue
+            if os.path.samestat(output_stat, os.fstat(reference)):
+                return reference
+            os.close(reference)
+            break
     return None
+
+
+def _make_output_executable(path, reference, output_stat, mode):
+    if reference is not None and hasattr(os, "fchmod"):
+        try:
+            os.fchmod(reference, mode)
+            return
+        except OSError as ex:
+            if ex.errno != errno.EBADF or not hasattr(os, "O_PATH"):
+                raise
+            # An O_PATH descriptor pins even a write-only file. Linux chmod
+            # can follow its procfs link without reopening it for writing.
+            if os.path.exists("/proc/self/fd"):
+                os.chmod("/proc/self/fd/%d" % reference, mode)
+                return
+    if not os.path.samestat(output_stat, os.stat(path)):
+        raise OSError(errno.ESTALE, "output path changed before setting permissions", path)
+    os.chmod(path, mode)
 
 
 def _write_compile_files(output_path, manifest_path, source, manifest):
@@ -206,6 +264,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
     # Paths can change during compilation or between the check and open.
     _check_file_destinations(output_path, manifest_path)
     with ExitStack() as output_reference:
+        reference = None
         with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
             output_stat = os.fstat(output.fileno())
             _check_manifest_path(manifest_path, output_stat)
@@ -217,16 +276,16 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             output.write(source)
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
-            if hasattr(os, "fchmod"):
-                os.fchmod(output.fileno(), mode)
-            else:
-                os.chmod(output_path, mode)
+        _make_output_executable(output_path, reference, output_stat, mode)
 
         # Reopen the current pathname after Python output succeeds.
         _check_file_destinations(output_path, manifest_path)
         with os.fdopen(os.open(manifest_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as manifest_file:
             manifest_stat = os.fstat(manifest_file.fileno())
-            current_output = _stat_if_present(output_path)
+            try:
+                current_output = os.stat(output_path)
+            except OSError:
+                current_output = None
             if (_same_stream(output_stat, manifest_stat)
                     or current_output is not None and _same_stream(current_output, manifest_stat)):
                 raise ValueError("manifest path points to compiled output: %s" % manifest_path)
