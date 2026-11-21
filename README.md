@@ -46,6 +46,11 @@ python3 -m ansiroll.cli compile playbook.yml -o compiled.py -m compiled.json
 ANSIROLL_HOST=myhost python3 compiled.py
 ```
 
+When overwriting files on a filesystem that requires truncation at open time,
+the compiler uses Linux `/proc/self/fd` to reopen the validated file. If that
+interface is unavailable, compile to local staging files and copy the outputs
+to the intended destinations.
+
 Use `-o -` to stream the generated Python directly to the interpreter. In Bash,
 `pipefail` makes the pipeline report a compiler failure even if Python exits
 successfully.

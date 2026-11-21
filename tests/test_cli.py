@@ -501,14 +501,65 @@ def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_
     assert manifest.read_text() == "previous manifest"
 
 
-@pytest.mark.parametrize("filesystem, allowed", [("ext4", True), ("fuse.mountpoint-s3", False), ("9p", False)])
-def test_case_probe_requires_supported_filesystem(monkeypatch, filesystem, allowed):
+@pytest.mark.parametrize("filesystem, allowed", [(b"ext4", True), (b"fuse.mountpoint-s3", False), (b"9p", False)])
+def test_case_probe_reads_mountinfo_without_decoding_paths(monkeypatch, filesystem, allowed):
     import io
 
     monkeypatch.setattr(cli.sys, "platform", "linux")
-    monkeypatch.setattr("builtins.open", lambda path: io.StringIO(
-        "11 22 8:16 / / rw - " + filesystem + " source rw\n"))
+
+    def mountinfo(path, mode):
+        assert path == "/proc/self/mountinfo" and mode == "rb"
+        return io.BytesIO(b"10 20 9:1 / /other-\xff rw - ext4 source rw\n"
+                          b"11 22 8:16 / / rw - " + filesystem + b" source rw\n")
+
+    monkeypatch.setattr("builtins.open", mountinfo)
     assert cli._supports_case_probe(os.makedev(8, 16)) is allowed
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux inode flags")
+@pytest.mark.parametrize("flags", [0x20, None])
+def test_case_probe_skips_directories_without_verified_cleanup(monkeypatch, tmp_path, flags):
+    import fcntl
+    import struct
+
+    info = tmp_path.stat()
+    identity = (info.st_dev, info.st_ino)
+    monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
+
+    def get_flags(fd, request, out):
+        assert os.path.samestat(info, os.fstat(fd))
+        if flags is None:
+            raise OSError(errno.ENOTTY, "flags unavailable")
+        struct.pack_into("I", out, 0, flags)
+
+    monkeypatch.setattr(fcntl, "ioctl", get_flags)
+    monkeypatch.setattr(cli, "_probe_names_at", lambda *args: pytest.fail("unsafe probe"))
+    assert not cli._same_missing_destination(
+        (identity, str(tmp_path), "compiled.py"), (identity, str(tmp_path), "COMPILED.py"))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+def test_compile_leaves_permission_denials_unchanged(monkeypatch, tmp_path, destination):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    output.write_text("previous Python")
+    manifest.write_text("previous manifest")
+    target = output if destination == "output" else manifest
+    before = target.read_text()
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    open_fd = os.open
+
+    def deny_write(path, flags, *args, **kwargs):
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
+            raise PermissionError(errno.EACCES, "write denied", path)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_write)
+    monkeypatch.setattr(cli, "_pin_for_truncate", lambda *args: pytest.fail("permission denial retried"))
+    with pytest.raises(PermissionError, match="write denied"):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+    assert target.read_text() == before
 
 
 def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):

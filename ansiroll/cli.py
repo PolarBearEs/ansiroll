@@ -113,12 +113,19 @@ def _open_truncated_destination(path, reference, original_error):
     return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
 
 
+_TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
+
+
 @contextmanager
 def _open_compile_destination(path, validate):
     with ExitStack() as stack:
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
         except OSError as ex:
+            # Preserve EACCES, including the kernel's protected_regular
+            # check on the initial O_CREAT open in a sticky directory.
+            if ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                raise
             original_error = ex
             reference = _pin_for_truncate(path, path, ex)
             stack.callback(os.close, reference)
@@ -132,6 +139,8 @@ def _open_compile_destination(path, validate):
             try:
                 writer.truncate(0)
             except OSError as ex:
+                if ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                    raise
                 original_error = ex
                 reference = _pin_for_truncate(path, "/proc/self/fd/%d" % fd, ex)
                 stack.callback(os.close, reference)
@@ -187,18 +196,34 @@ def _missing_destination(path):
 def _supports_case_probe(device):
     if sys.platform != "linux":
         return False
-    device_id = "%d:%d" % (os.major(device), os.minor(device))
+    device_id = b"%d:%d" % (os.major(device), os.minor(device))
     # These filesystems inherit per-directory casefold flags and support
     # removing the probe. Other mounts can still be checked after opening.
     try:
-        with open("/proc/self/mountinfo") as table:
+        with open("/proc/self/mountinfo", "rb") as table:
             for line in table:
-                mount, _, details = line.partition(" - ")
-                if mount.split()[2] == device_id and details.split()[0] in ("ext4", "f2fs", "tmpfs"):
+                mount, _, details = line.partition(b" - ")
+                if mount.split()[2] == device_id and details.split()[0] in (b"ext4", b"f2fs", b"tmpfs"):
                     return True
     except OSError:
         pass
     return False
+
+
+def _can_remove_case_probe(directory):
+    import fcntl
+    import struct
+
+    # Linux FS_IOC_GETFLAGS is encoded as _IOR('f', 1, long), but
+    # returns a C int. A failed query leaves cleanup unverified.
+    flags = bytearray(struct.calcsize("l"))
+    fs_ioc_getflags = 0x80006601 | (len(flags) << 16)
+    try:
+        fcntl.ioctl(directory, fs_ioc_getflags, flags)
+    except OSError:
+        return False
+    fs_append_fl = 0x20
+    return not (struct.unpack_from("I", flags)[0] & fs_append_fl)
 
 
 def _same_missing_destination(output, manifest):
@@ -214,30 +239,13 @@ def _same_missing_destination(output, manifest):
     # Probe full names in a child of the destination directory. This covers
     # inherited case rules; aliases allocated on creation are checked again
     # through the opened output descriptor.
-    directory = None
-    if os.name == "posix":
-        access = getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
-        try:
-            directory = os.open(parent, access | os.O_DIRECTORY)
-        except PermissionError:
-            # A writable, searchable directory may still forbid listing.
-            pass
-    if directory is not None:
-        try:
-            info = os.fstat(directory)
-            return (info.st_dev, info.st_ino) == output[0] and _probe_names_at(
-                directory, output_name, manifest_name)
-        finally:
-            os.close(directory)
-
-    parent = os.path.realpath(parent)
-    info = os.stat(parent)
-    if (info.st_dev, info.st_ino) != output[0]:
-        return False
-    with tempfile.TemporaryDirectory(prefix=".ansiroll-", dir=parent) as probe:
-        with open(os.path.join(probe, output_name), "xb") as first:
-            other = _stat_if_present(os.path.join(probe, manifest_name))
-            return other is not None and os.path.samestat(os.fstat(first.fileno()), other)
+    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        info = os.fstat(directory)
+        return ((info.st_dev, info.st_ino) == output[0] and _can_remove_case_probe(directory)
+                and _probe_names_at(directory, output_name, manifest_name))
+    finally:
+        os.close(directory)
 
 
 def _probe_names_at(directory, output_name, manifest_name):
