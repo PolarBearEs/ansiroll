@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import tokenize
-from importlib import metadata, util
+from importlib import util
 from itertools import chain
 
 
@@ -20,7 +20,9 @@ _BOOTSTRAP = (
     "_extensions = os.path.join(sys.base_exec_prefix, 'DLLs') if os.name == 'nt' "
     "else os.path.join(_stdlib, 'lib-dynload'); "
     "sys.path[:0] = [_stdlib, _extensions]; "
-    "import csv, runpy; "
+    "import runpy; "
+)
+_LOAD_BOOTSTRAP = (
     "_parity_bootstrap = runpy.run_path(sys.argv.pop(1), run_name='_ansiroll_parity_bootstrap'); "
     "sys.path[:] = _reference_path; "
 )
@@ -32,19 +34,30 @@ _ANSIBLE_MODULE_ALIASES = {
 _ANSIBLE_SIX = "ansible.module_utils.six"
 
 
-def _reference_python(code, filename=None):
+def _reference_python(code, filename=None, *, discover=False):
     if filename is None:
         import ansible
 
         filename = ansible.__file__
 
-    return [sys.executable, "-c", _BOOTSTRAP + code, os.path.abspath(__file__), os.path.abspath(filename)]
+    imports = "import csv; from importlib import metadata; " if discover else ""
+    # Discovery must not run user startup hooks before it reads the shebang.
+    flags = ["-s"] if discover else []
+    return [sys.executable, *flags, "-c", _BOOTSTRAP + imports + _LOAD_BOOTSTRAP + code,
+            os.path.abspath(__file__), os.path.abspath(filename)]
 
 
 def ansible_playbook_command():
     from ansible.release import __version__
 
-    return _reference_python("_parity_bootstrap['_run_ansible_playbook'](sys.argv.pop(1), sys.argv.pop(1))") + [__version__]
+    return _reference_playbook_command(None, __version__)
+
+
+def _reference_playbook_command(filename, version):
+    return _reference_python(
+        "_parity_bootstrap['_run_ansible_playbook'](sys.argv.pop(1), sys.argv.pop(1))",
+        filename, discover=True,
+    ) + [version]
 
 
 def ansiroll_compile_command():
@@ -134,8 +147,6 @@ def _playbook_replay_command(filename, script, flags, *, legacy=True):
     )
     if getattr(sys.flags, "safe_path", False) and "-P" not in flags:
         flags = (*flags, "-P")
-    if sys.flags.no_user_site and "-s" not in flags:
-        flags = (*flags, "-s")
     command[1:1] = flags
     return command + [script]
 
@@ -278,13 +289,6 @@ def _launcher_body_and_flags(source):
     return body, flags
 
 
-def _needs_launcher_flags(flags):
-    if "-P" in flags and not hasattr(sys.flags, "safe_path"):
-        raise RuntimeError("the selected Python cannot reproduce the launcher's -P flag")
-    return (("-s" in flags and not sys.flags.no_user_site)
-            or ("-P" in flags and not getattr(sys.flags, "safe_path", False)))
-
-
 def _legacy_python_launcher(path, filename, package, diagnostics, associated):
     try:
         with tokenize.open(path) as script:
@@ -331,6 +335,8 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
 
 
 def _installed_playbook_launchers(package):
+    from importlib import metadata
+
     # The pinned package may be outside the subprocess's import path.
     search_path = list(dict.fromkeys([*sys.path, os.path.dirname(package)]))
     for name in ("ansible-core", "ansible-base", "ansible"):
@@ -423,7 +429,7 @@ def _matching_path_launcher(package):
 
 
 def _run_modern_playbook(filename, script):
-    if script is not None:
+    if script:
         _set_playbook_launcher(script)
     else:
         sys.argv[0] = os.path.join(os.path.dirname(filename), "cli", "playbook.py")
@@ -433,7 +439,7 @@ def _run_modern_playbook(filename, script):
     playbook.main()
 
 
-def _run_ansible_playbook(filename, version):
+def _select_playbook_launcher(filename, version):
     package = os.path.realpath(os.path.dirname(filename))
     installed_launchers = _installed_playbook_launchers(package)
     environment_script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
@@ -446,11 +452,7 @@ def _run_ansible_playbook(filename, version):
             flags = _stock_playbook_flags(script, package)
             if flags is None:
                 raise RuntimeError(f"launcher initialization cannot be replayed: {script}")
-        if _needs_launcher_flags(flags):
-            command = _playbook_replay_command(filename, script, flags, legacy=False)
-            os.execv(command[0], [*command, *sys.argv[1:]])
-        _run_modern_playbook(filename, script)
-        return
+        return script or "", flags, False
 
     # Older releases install a script instead of a module entry point.
     candidates = chain(
@@ -466,10 +468,14 @@ def _run_ansible_playbook(filename, version):
             verified = _legacy_python_launcher(script, filename, package, diagnostics, associated)
             if verified:
                 python_script, flags = verified
-                if _needs_launcher_flags(flags):
-                    command = _playbook_replay_command(filename, python_script, flags)
-                    os.execv(command[0], [*command, *sys.argv[1:]])
-                _run_legacy_playbook(filename, python_script)
-                return
+                return python_script, flags, True
     detail = "\n" + "\n".join(diagnostics) if diagnostics else ""
     raise FileNotFoundError("ansible-playbook script not found for %s%s" % (package, detail))
+
+
+def _run_ansible_playbook(filename, version):
+    script, flags, legacy = _select_playbook_launcher(filename, version)
+    if "-P" in flags and not hasattr(sys.flags, "safe_path"):
+        raise RuntimeError("the selected Python cannot reproduce the launcher's -P flag")
+    command = _playbook_replay_command(filename, script, flags, legacy=legacy)
+    os.execv(command[0], [*command, *sys.argv[1:]])
