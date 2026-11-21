@@ -113,7 +113,12 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
 
 
 @pytest.mark.parametrize("stale", [False, True])
-def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale):
+@pytest.mark.parametrize("prefix", [
+    "#!/usr/bin/python3\n",
+    "#!/bin/sh\n'''exec' \"/path with spaces/python3\" \"$0\" \"$@\"\n' '''\n",
+    "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
+])
+def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale, prefix):
     import tests
 
     package = tmp_path / "ansible"
@@ -123,7 +128,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     stub.write_text("#!/usr/bin/env python\nstart_expected_release()\n")
     launcher = tmp_path / "ansible-playbook"
     startup = "start_stale_release()" if stale else "start_expected_release()"
-    launcher.write_text("#!/usr/bin/python3\n" + startup + "\n")
+    launcher.write_text(prefix + startup + "\n")
     probes = []
 
     def version(command, candidate, diagnostics):
@@ -140,6 +145,16 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     else:
         assert found == str(launcher)
         assert [probe[0] for probe in probes] == [str(launcher), sys.executable]
+
+
+def test_launcher_body_keeps_unrecognized_shell_initialization():
+    from tests import _launcher_body
+
+    wrapper = (
+        "#!/bin/sh\n'''exec' ANSIBLE_CONFIG=/custom /usr/bin/python3 \"$0\" \"$@\"\n"
+        "' '''\nstart_expected_release()\n"
+    )
+    assert _launcher_body(wrapper) == wrapper
 
 
 def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):

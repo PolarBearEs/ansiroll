@@ -68,8 +68,31 @@ def _ansible_version_fields(command, candidate, diagnostics):
 
 
 def _launcher_body(source):
-    # Installed scripts replace the package stub's interpreter line.
-    return source.partition("\n")[2] if source.startswith("#!") else source
+    import re
+
+    if not source.startswith("#!"):
+        return source
+    shebang, _, body = source.partition("\n")
+    if shebang != "#!/bin/sh":
+        return body
+
+    # uv relocatable scripts and long Python shebangs use a shell/Python
+    # trampoline that only chooses the interpreter.
+    command, _, remaining = body.partition("\n")
+    prefix, suffix = "'''exec' ", ' "$0" "$@"'
+    if not (command.startswith(prefix) and command.endswith(suffix) and remaining.startswith("' '''\n")):
+        return source
+    interpreter = command[len(prefix):-len(suffix)]
+    relocatable = '"$(dirname -- "$(realpath -- "$0")")"/'
+    if interpreter.startswith(relocatable):
+        name = interpreter[len(relocatable):]
+        if re.fullmatch(r"'(?:python|pypy)[0-9.]*'", name):
+            return remaining.partition("\n")[2]
+    elif re.fullmatch(r'(?:"/[^"$\x60\\]+"|/[\w./+-]+)', interpreter):
+        name = os.path.basename(interpreter.strip('"'))
+        if re.fullmatch(r"(?:python|pypy)[0-9.]*", name):
+            return remaining.partition("\n")[2]
+    return source
 
 
 def _legacy_python_launcher(path, filename, package, diagnostics, associated):
