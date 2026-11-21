@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -89,15 +89,54 @@ def _manifest_for_stdout(path, stdout_fd):
     raise ValueError("manifest path points to stdout: %s" % path)
 
 
+def _open_pinned_manifest(path, validate, original_error):
+    if not hasattr(os, "O_PATH"):
+        raise original_error
+    try:
+        target = os.open(path, os.O_PATH)
+    except OSError:
+        raise original_error
+    try:
+        info = os.fstat(target)
+        validate(info)
+        if not stat.S_ISREG(info.st_mode):
+            raise original_error
+        # Some filesystems only support replacement when opened with O_TRUNC.
+        # Reopen the validated inode, even if the pathname has since changed.
+        try:
+            return os.open("/proc/self/fd/%d" % target, os.O_WRONLY | os.O_TRUNC)
+        except OSError:
+            raise original_error
+    finally:
+        os.close(target)
+
+
+@contextmanager
+def _open_manifest(path, validate):
+    needs_truncate = True
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
+    except OSError as ex:
+        fd = _open_pinned_manifest(path, validate, ex)
+        needs_truncate = False
+
+    with os.fdopen(fd, "w") as fh:
+        if needs_truncate:
+            info = os.fstat(fh.fileno())
+            validate(info)
+            if stat.S_ISREG(info.st_mode):
+                fh.truncate(0)
+        yield fh
+
+
 def _write_stdout_manifest(path, manifest, stdout_fd):
     path = _manifest_for_stdout(path, stdout_fd)
-    # Validate the actual destination before truncating or writing anything.
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
-        manifest_stat = os.fstat(fh.fileno())
-        if _same_stream(manifest_stat, os.fstat(stdout_fd)) and not _discard_stream(manifest_stat):
+
+    def validate(info):
+        if _same_stream(info, os.fstat(stdout_fd)) and not _discard_stream(info):
             raise ValueError("manifest path points to stdout: %s" % path)
-        if stat.S_ISREG(manifest_stat.st_mode):
-            fh.truncate(0)
+
+    with _open_manifest(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
 
 
@@ -281,19 +320,18 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
         _make_output_executable(output_path, reference, output_stat, mode)
 
-        # Reopen the current pathname after Python output succeeds.
-        _check_file_destinations(output_path, manifest_path)
-        with os.fdopen(os.open(manifest_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as manifest_file:
-            manifest_stat = os.fstat(manifest_file.fileno())
+        def validate_manifest(info):
             try:
                 current_output = os.stat(output_path)
             except OSError:
                 current_output = None
-            if (_same_stream(output_stat, manifest_stat)
-                    or current_output is not None and _same_stream(current_output, manifest_stat)):
+            if (_same_stream(output_stat, info)
+                    or current_output is not None and _same_stream(current_output, info)):
                 raise ValueError("manifest path points to compiled output: %s" % manifest_path)
-            if stat.S_ISREG(manifest_stat.st_mode):
-                manifest_file.truncate(0)
+
+        # Reopen the current pathname after Python output succeeds.
+        _check_file_destinations(output_path, manifest_path)
+        with _open_manifest(manifest_path, validate_manifest) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
 

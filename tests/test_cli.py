@@ -363,6 +363,61 @@ def test_file_compile_distinguishes_same_named_unlinked_files(monkeypatch, tmp_p
             assert json.load(manifest_file) == manifest
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
+                    reason="requires reopening a metadata-only descriptor")
+@pytest.mark.parametrize("mode", ["stdout", "file"])
+@pytest.mark.parametrize("redirect", [None, "before validation", "after validation"])
+def test_manifest_overwrite_can_truncate_only_the_validated_inode(monkeypatch, tmp_path, mode, redirect):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    saved = tmp_path / "saved.json"
+    manifest.write_text("previous manifest")
+    source = "pass\n"
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: (source, data))
+    open_fd = os.open
+    truncated = []
+
+    def replace_path():
+        manifest.rename(saved)
+        manifest.symlink_to(output)
+
+    def require_truncate(path, flags, *args, **kwargs):
+        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+            assert not flags & os.O_TRUNC
+            if redirect == "before validation":
+                replace_path()
+            raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC at open time", path)
+        if str(path).startswith("/proc/self/fd/") and flags & os.O_TRUNC:
+            truncated.append(path)
+            if redirect == "after validation":
+                replace_path()
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", require_truncate)
+    if mode == "stdout":
+        with output.open("w") as stream:
+            stream.write(source)
+            stream.flush()
+            if redirect == "before validation":
+                with pytest.raises(ValueError, match="manifest path points to stdout"):
+                    cli._write_stdout_manifest(str(manifest), data, stream.fileno())
+            else:
+                cli._write_stdout_manifest(str(manifest), data, stream.fileno())
+    else:
+        result = cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+        assert result == (2 if redirect == "before validation" else 0)
+
+    assert output.read_text() == source
+    if redirect == "before validation":
+        assert not truncated
+        assert saved.read_text() == "previous manifest"
+    else:
+        assert len(truncated) == 1
+        written = saved if redirect == "after validation" else manifest
+        assert json.loads(written.read_text()) == data
+
+
 def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
