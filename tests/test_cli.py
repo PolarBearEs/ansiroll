@@ -208,6 +208,8 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
     elif alias == "hardlink":
         os.link(output, manifest)
     else:
+        if not hasattr(os, "O_PATH"):
+            pytest.skip("requires metadata-only file descriptors")
         manifest.write_text("{}")
         open_fd = os.open
 
@@ -237,16 +239,40 @@ def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp
     alias = tmp_path / "manifest.json"
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
     stat_path = os.stat
+    open_fd = os.open
 
     def aliasing_stat(path, *args, **kwargs):
         if path == str(alias):
             path = str(output)
         return stat_path(path, *args, **kwargs)
 
+    def aliasing_open(path, *args, **kwargs):
+        return open_fd(str(output) if path == str(alias) else path, *args, **kwargs)
+
     monkeypatch.setattr(os, "stat", aliasing_stat)
+    monkeypatch.setattr(os, "open", aliasing_open)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(alias)]) == 2
     assert output.read_bytes() == b""
     assert not alias.exists()
+
+
+def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatch, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    real_stat = os.stat
+
+    def aliasing_stat(path, *args, **kwargs):
+        return real_stat(str(first) if path == str(second) else path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", aliasing_stat)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: pytest.fail("aliases should fail before compilation"))
+    output = first / "compiled.py"
+    manifest = second / "compiled.py"
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
+    assert not output.exists()
+    assert not manifest.exists()
 
 
 def test_file_compile_preserves_symlink_path_lookup(monkeypatch, tmp_path):
@@ -308,21 +334,35 @@ def test_file_compile_writes_python_before_reporting_manifest_open_error(monkeyp
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
-def test_file_compile_does_not_connect_manifest_fifo_when_python_fails(monkeypatch, tmp_path):
+@pytest.mark.parametrize("swap", [False, True])
+def test_file_compile_does_not_connect_manifest_fifo_when_python_fails(monkeypatch, tmp_path, swap):
     import select
 
     if not hasattr(select, "poll"):
         pytest.skip("requires poll")
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
-    os.mkfifo(manifest)
+    fifo = tmp_path / "waiting-fifo" if swap else manifest
+    os.mkfifo(fifo)
+    if swap:
+        if not hasattr(os, "O_PATH"):
+            pytest.skip("requires metadata-only file descriptors")
+        manifest.write_text("{}")
+        open_fd = os.open
+
+        def replace_with_fifo(path, flags, *args, **kwargs):
+            if path == str(manifest) and flags & os.O_PATH:
+                os.replace(fifo, manifest)
+            return open_fd(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", replace_with_fifo)
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
 
     def fail_chmod(*args, **kwargs):
         raise PermissionError("could not make output executable")
 
     monkeypatch.setattr(os, "fchmod", fail_chmod)
-    with os.fdopen(os.open(manifest, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
+    with os.fdopen(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
         poller = select.poll()
         poller.register(reader, select.POLLHUP)
         with pytest.raises(PermissionError, match="could not make output executable"):
@@ -340,7 +380,7 @@ def test_file_compile_never_writes_manifest_through_replaced_deferred_fifo(monke
     open_fd = os.open
 
     def replace_fifo_on_blocking_open(path, flags, *args, **kwargs):
-        if path == str(manifest) and not (flags & os.O_NONBLOCK):
+        if path == str(manifest) and (flags & os.O_ACCMODE) == os.O_WRONLY:
             manifest.unlink()
             manifest.symlink_to(output)
         return open_fd(path, flags, *args, **kwargs)
@@ -348,6 +388,27 @@ def test_file_compile_never_writes_manifest_through_replaced_deferred_fifo(monke
     monkeypatch.setattr(os, "open", replace_fifo_on_blocking_open)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
     assert output.read_text() == "pass\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+def test_file_compile_writes_to_current_manifest_after_replacement(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    manifest_path = tmp_path / "manifest.json"
+    prior_path = tmp_path / "previous.json"
+    manifest_path.write_text('{"previous": true}')
+    manifest = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
+    fchmod = os.fchmod
+
+    def replace_manifest(fd, mode):
+        fchmod(fd, mode)
+        os.replace(manifest_path, prior_path)
+        manifest_path.write_text('{}')
+
+    monkeypatch.setattr(os, "fchmod", replace_manifest)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest_path)]) == 0
+    assert json.loads(prior_path.read_text()) == {"previous": True}
+    assert json.loads(manifest_path.read_text()) == manifest
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")

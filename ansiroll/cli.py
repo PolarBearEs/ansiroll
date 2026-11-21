@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack, redirect_stdout
+from contextlib import redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -117,8 +117,10 @@ def _missing_destination(path):
         return
     parent, name = os.path.split(path)
     parent = parent or os.curdir
-    if name and os.path.isdir(parent):
-        return os.path.normcase(os.path.join(os.path.realpath(parent), name))
+    if name:
+        directory = os.stat(parent)
+        if stat.S_ISDIR(directory.st_mode):
+            return directory.st_dev, directory.st_ino, os.path.normcase(name)
 
 
 def _check_file_destinations(output_path, manifest_path):
@@ -138,30 +140,20 @@ def _check_file_destinations(output_path, manifest_path):
 
 def _check_manifest_path(path, output_stat):
     try:
-        manifest_stat = os.stat(path)
+        if hasattr(os, "O_PATH"):
+            # Metadata-only handles don't connect to FIFO readers, even if
+            # the destination changes while we're checking it.
+            fd = os.open(path, os.O_PATH)
+            try:
+                manifest_stat = os.fstat(fd)
+            finally:
+                os.close(fd)
+        else:
+            manifest_stat = os.stat(path)
     except OSError:
         return
     if _same_stream(output_stat, manifest_stat):
         raise ValueError("manifest path points to compiled output: %s" % path)
-    return manifest_stat
-
-
-def _open_file_manifest(stack, path, output_stat, *, preflight=False):
-    nonblocking = getattr(os, "O_NONBLOCK", 0) if preflight else 0
-    flags = os.O_WRONLY | (nonblocking if preflight else os.O_CREAT)
-    try:
-        stream = stack.enter_context(os.fdopen(os.open(path, flags, 0o666), "w"))
-    except OSError:
-        # Creation, a blocking FIFO open, and ordinary manifest errors all
-        # belong after Python output. Preflight only detects existing aliases.
-        if preflight:
-            return None
-        raise
-    if _same_stream(output_stat, os.fstat(stream.fileno())):
-        raise ValueError("manifest path points to compiled output: %s" % path)
-    if nonblocking:
-        os.set_blocking(stream.fileno(), True)
-    return stream
 
 
 def _write_compile_files(output_path, manifest_path, source, manifest):
@@ -173,26 +165,24 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
 
     # Paths can change during compilation or between the check and open.
     _check_file_destinations(output_path, manifest_path)
-    with ExitStack() as stack:
-        with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
-            output_stat = os.fstat(output.fileno())
-            manifest_stat = _check_manifest_path(manifest_path, output_stat)
-            manifest_file = None
-            # Connecting a waiting FIFO reader would send EOF if Python fails.
-            if manifest_stat is not None and not stat.S_ISFIFO(manifest_stat.st_mode):
-                manifest_file = _open_file_manifest(stack, manifest_path, output_stat, preflight=True)
-            if stat.S_ISREG(output_stat.st_mode):
-                output.truncate(0)
-            output.write(source)
-            output.flush()
-            mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
-            if hasattr(os, "fchmod"):
-                os.fchmod(output.fileno(), mode)
-            else:
-                os.chmod(output_path, mode)
-        if manifest_file is None:
-            manifest_file = _open_file_manifest(stack, manifest_path, output_stat)
-        if stat.S_ISREG(os.fstat(manifest_file.fileno()).st_mode):
+    with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
+        output_stat = os.fstat(output.fileno())
+        _check_manifest_path(manifest_path, output_stat)
+        if stat.S_ISREG(output_stat.st_mode):
+            output.truncate(0)
+        output.write(source)
+        output.flush()
+        mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
+        if hasattr(os, "fchmod"):
+            os.fchmod(output.fileno(), mode)
+        else:
+            os.chmod(output_path, mode)
+    # Reopen the current pathname after Python output succeeds.
+    with os.fdopen(os.open(manifest_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as manifest_file:
+        manifest_stat = os.fstat(manifest_file.fileno())
+        if _same_stream(output_stat, manifest_stat):
+            raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+        if stat.S_ISREG(manifest_stat.st_mode):
             manifest_file.truncate(0)
         json.dump(manifest, manifest_file, indent=2)
 
