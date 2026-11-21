@@ -148,6 +148,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
 @pytest.mark.parametrize("stale", [False, True])
 @pytest.mark.parametrize("prefix", [
     "#!/usr/bin/python3\n",
+    "#!/bin/sh\n'''exec' '/path with spaces/python3' \"$0\" \"$@\"\n' '''\n",
+    "#!/bin/sh\n'''exec' '/user'\"'\"'s env/python3' \"$0\" \"$@\"\n' '''\n",
     "#!/bin/sh\n'''exec' \"/path with spaces/python3\" \"$0\" \"$@\"\n' '''\n",
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])

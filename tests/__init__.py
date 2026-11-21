@@ -103,13 +103,19 @@ def _launcher_body(source):
     interpreter = command[len(prefix):-len(suffix)]
     relocatable = '"$(dirname -- "$(realpath -- "$0")")"/'
     if interpreter.startswith(relocatable):
-        name = interpreter[len(relocatable):]
-        if re.fullmatch(r"'(?:python|pypy)[0-9.]*'", name):
-            return remaining.partition("\n")[2]
+        target = interpreter[len(relocatable):]
+        if not re.fullmatch(r"'[^']+'", target):
+            return source
+        name = target[1:-1]
+    elif re.fullmatch(r"'/[^']*'(?:\"'\"'[^']*')*", interpreter):
+        # uv joins single-quoted pieces with a double-quoted apostrophe.
+        name = os.path.basename(interpreter[1:-1].replace("'\"'\"'", "'"))
     elif re.fullmatch(r'(?:"/[^"$\x60\\]+"|/[\w./+-]+)', interpreter):
         name = os.path.basename(interpreter.strip('"'))
-        if re.fullmatch(r"(?:python|pypy)[0-9.]*", name):
-            return remaining.partition("\n")[2]
+    else:
+        return source
+    if re.fullmatch(r"(?:python|pypy)[0-9.]*", name):
+        return remaining.partition("\n")[2]
     return source
 
 
