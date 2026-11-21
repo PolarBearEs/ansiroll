@@ -303,8 +303,9 @@ def _make_output_executable(path, reference, output_stat, mode):
             # can follow its procfs link without reopening it for writing.
             try:
                 os.chmod("/proc/self/fd/%d" % reference, mode)
-            except (FileNotFoundError, NotADirectoryError, PermissionError):
-                pass
+            except OSError as ex:
+                if ex.errno not in (errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.EPERM, errno.ELOOP):
+                    raise
             else:
                 return
     if not os.path.samestat(output_stat, os.stat(path)):

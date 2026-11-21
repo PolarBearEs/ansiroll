@@ -915,7 +915,7 @@ def test_file_compile_writes_manifest_after_output_parent_becomes_a_file(monkeyp
 
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
-@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError])
+@pytest.mark.parametrize("failure", [errno.ENOENT, errno.EACCES, errno.ELOOP])
 def test_file_compile_falls_back_when_procfs_reference_is_unavailable(monkeypatch, tmp_path, failure):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
@@ -928,7 +928,7 @@ def test_file_compile_falls_back_when_procfs_reference_is_unavailable(monkeypatc
 
     def unavailable_link(path, mode):
         if os.fspath(path).startswith("/proc/self/fd/"):
-            raise failure("descriptor link unavailable")
+            raise OSError(failure, "descriptor link unavailable", path)
         chmod(path, mode)
 
     monkeypatch.setattr(cli, "_pin_output_inode", pin_output)
