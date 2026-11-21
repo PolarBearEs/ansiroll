@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from tests import ansible_playbook_command, parity_pythonpath
+from tests import ansible_playbook_command, ansiroll_compile_command, parity_pythonpath
 
 pytest.importorskip("ansible")
 
@@ -102,6 +102,39 @@ def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path
     assert __version__ in result.stdout
 
 
+def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path):
+    expected = tmp_path / "expected" / "ansible" / "__init__.py"
+    foreign = tmp_path / "foreign" / "ansible" / "release.py"
+    command = (
+        "import sys, types; from tests import _load_reference_ansible; "
+        "module = types.ModuleType('ansible.release'); module.__file__ = sys.argv[2]; "
+        "sys.modules[module.__name__] = module; _load_reference_ansible(sys.argv[1])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command, str(expected), str(foreign)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "cached ansible.release" in result.stderr
+    assert str(foreign) in result.stderr and str(expected.parent) in result.stderr
+
+
+def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatch):
+    foreign = tmp_path / "foreign"
+    package = foreign / "ansible"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("raise RuntimeError('wrong Ansible selected')\n")
+    monkeypatch.setenv("PYTHONPATH", str(foreign))
+    playbook = _write(tmp_path, "- hosts: localhost\n  gather_facts: false\n")
+    output = tmp_path / "compiled.py"
+    result = subprocess.run(
+        ansiroll_compile_command() + [str(playbook), "-o", str(output)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.is_file()
+
+
 def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
     from tests import _legacy_python_launcher
 
@@ -144,7 +177,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
         assert "differs from the selected Ansible release" in diagnostics[0]
     else:
         assert found == str(launcher)
-        assert [probe[0] for probe in probes] == [str(launcher), sys.executable]
+        assert not probes
 
 
 def test_launcher_body_keeps_unrecognized_shell_initialization():
@@ -1561,7 +1594,7 @@ def test_broken_conditional_policy_is_baked(tmp_path, enabled):
     )
     script = tmp_path / "compiled.py"
     subprocess.run(
-        [sys.executable, "-m", "ansiroll.cli", "compile", str(path), "-o",
+        ansiroll_compile_command() + [str(path), "-o",
          str(script), "--tree-shake"], cwd=tmp_path, env=env,
         capture_output=True, text=True, check=True,
     )

@@ -8,11 +8,21 @@ import sys
 _BOOTSTRAP = "import sys; sys.path[:1] = [] if sys.path[:1] == [''] else sys.path[:1]; "
 
 
-def ansible_playbook_command():
+def _reference_python(code):
     import ansible
 
-    run = _BOOTSTRAP + "from tests import _run_ansible_playbook; _run_ansible_playbook(sys.argv.pop(1))"
-    return [sys.executable, "-c", run, os.path.abspath(ansible.__file__)]
+    return [sys.executable, "-c", _BOOTSTRAP + code, os.path.abspath(ansible.__file__)]
+
+
+def ansible_playbook_command():
+    return _reference_python("from tests import _run_ansible_playbook; _run_ansible_playbook(sys.argv.pop(1))")
+
+
+def ansiroll_compile_command():
+    return _reference_python(
+        "import runpy; from tests import _load_reference_ansible; "
+        "_load_reference_ansible(sys.argv.pop(1)); runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)"
+    ) + ["compile"]
 
 
 def parity_pythonpath(root):
@@ -25,6 +35,14 @@ def _load_reference_ansible(filename):
     from importlib import util
 
     expected = os.path.realpath(os.path.dirname(filename))
+    for name, module in tuple(sys.modules.items()):
+        if name == "ansible" or name.startswith("ansible."):
+            origin = getattr(module, "__file__", None) or getattr(getattr(module, "__spec__", None), "origin", None)
+            if origin and origin not in ("built-in", "frozen"):
+                directory = os.path.realpath(os.path.dirname(origin))
+                if directory != expected and not directory.startswith(expected + os.sep):
+                    raise RuntimeError("cached %s came from %s, expected Ansible from %s" % (name, origin, expected))
+
     spec = util.find_spec("ansible")
     if spec is None or not spec.origin or os.path.realpath(os.path.dirname(spec.origin)) != expected:
         # Pin only Ansible. A checkout added by pytest need not change the
@@ -115,9 +133,12 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
     stub = os.path.join(package, "cli", "scripts", "ansible_cli_stub.py")
     try:
         with tokenize.open(stub) as expected:
-            if _launcher_body(source) != _launcher_body(expected.read()):
-                diagnostics.append("%s: launcher differs from the selected Ansible release" % path)
-                return None
+            if _launcher_body(source) == _launcher_body(expected.read()):
+                # The pinned process will execute the same startup code; a
+                # separate --version run cannot add evidence of provenance.
+                return path
+        diagnostics.append("%s: launcher differs from the selected Ansible release" % path)
+        return None
     except FileNotFoundError:
         if not associated:
             diagnostics.append("%s: selected Ansible has no launcher source to verify this script" % path)
@@ -125,15 +146,6 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
     except (OSError, SyntaxError, UnicodeError) as ex:
         diagnostics.append("%s: %s" % (stub, ex))
         return None
-
-    if not associated:
-        # Check the script's native import before replaying it with pytest's
-        # interpreter. A system-installed script can pass both probes.
-        fields = _ansible_version_fields([path], path, diagnostics)
-        installed = fields.get("ansible python module location", "")
-        if not installed or os.path.realpath(installed) != package:
-            diagnostics.append("%s: launcher did not report the expected Ansible package" % path)
-            return None
 
     probe = (_BOOTSTRAP + "from tests import _load_reference_ansible, _run_legacy_playbook; "
              "_load_reference_ansible(sys.argv.pop(1)); _run_legacy_playbook(sys.argv.pop(1))")

@@ -16,7 +16,7 @@ import textwrap
 import pytest
 from packaging.version import Version
 
-from tests import ansible_playbook_command, parity_pythonpath
+from tests import ansible_playbook_command, ansiroll_compile_command, parity_pythonpath
 from tests.run_official_suite import parse_task_trace
 
 pytest.importorskip("ansible")
@@ -77,7 +77,7 @@ def _ansible(base, args, strategy=None):
 def _standalone_run(base, args, compile_args=()):
     out_py = os.path.join(str(base), "out.py")
     comp = subprocess.run(
-        [sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", out_py]
+        ansiroll_compile_command() + ["pb.yml", "-o", out_py]
         + list(args) + list(compile_args),
         cwd=str(base), env=_env(), capture_output=True, text=True,
     )
