@@ -244,6 +244,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     "/workspace/{old{draft},new}/bin/python3",
     "/workspace/team{-1..+3..+2}/bin/python3",
     "/workspace/team[12]/bin/python3",
+    "/workspace/team[^]/bin/python3",
     "/workspace/team[]]/bin/python3",
     "/workspace/team?2/bin/python3",
     "/workspace/team*2/bin/python3",
@@ -253,6 +254,7 @@ def test_launcher_body_keeps_unrecognized_shell_initialization(monkeypatch, inte
     import tests
 
     monkeypatch.setattr(tests, "_shell_preserves_braces", lambda: False)
+    monkeypatch.setattr(tests, "_shell_preserves_path_pattern", lambda path: False)
     wrapper = (
         f"#!/bin/sh\n'''exec' {interpreter} \"$0\" \"$@\"\n"
         "' '''\nstart_expected_release()\n"
@@ -289,14 +291,13 @@ def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(
 @pytest.mark.parametrize("dirname", ["team[12]", "team*", "team?"])
 @pytest.mark.parametrize("alternative_exists", [True, False])
 def test_legacy_launcher_checks_whether_pathname_patterns_stay_literal(
-    tmp_path, monkeypatch, dirname, alternative_exists,
+    tmp_path, dirname, alternative_exists,
 ):
     from tests import _launcher_body
 
     executable = tmp_path / dirname / "python3"
     executable.parent.mkdir()
     executable.touch()
-    monkeypatch.setattr(sys, "executable", str(executable))
     if alternative_exists:
         alternative = tmp_path / "team1" / "python3"
         alternative.parent.mkdir()

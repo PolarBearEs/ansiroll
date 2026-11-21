@@ -90,18 +90,6 @@ def _ansible_version_fields(command, candidate, diagnostics):
     return dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
 
 
-def _has_bracket_glob(path):
-    import re
-
-    for component in path.split("/"):
-        # An initial ] in a bracket expression, including after negation,
-        # represents a literal. A later ] must close the expression.
-        for opening in re.finditer(r"\[[!^]?\]?", component):
-            if "]" in component[opening.end():]:
-                return True
-    return False
-
-
 def _has_brace_expansion(path):
     import re
 
@@ -202,11 +190,7 @@ def _launcher_body(source):
     elif re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()]+""", interpreter):
         if _has_brace_expansion(interpreter) and not _shell_preserves_braces():
             return source
-        has_path_pattern = "*" in interpreter or "?" in interpreter or _has_bracket_glob(interpreter)
-        if has_path_pattern and not (
-            os.path.realpath(interpreter) == os.path.realpath(sys.executable)
-            and _shell_preserves_path_pattern(interpreter)
-        ):
+        if any(char in interpreter for char in "*?[") and not _shell_preserves_path_pattern(interpreter):
             return source
         executable = interpreter
     else:
