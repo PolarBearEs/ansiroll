@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -88,16 +88,274 @@ def _manifest_for_stdout(path, stdout_fd):
     raise ValueError("manifest path points to stdout: %s" % path)
 
 
+def _truncation_unavailable(path, original_error):
+    return OSError(original_error.errno, "safe truncating reopen requires /proc/self/fd", path)
+
+
+def _pin_for_truncate(path, fd, original_error):
+    if not hasattr(os, "O_PATH"):
+        raise _truncation_unavailable(path, original_error) from original_error
+    try:
+        return os.open("/proc/self/fd/%d" % fd, os.O_PATH)
+    except OSError as ex:
+        raise _truncation_unavailable(path, original_error) from ex
+
+
+def _open_truncated_destination(path, reference, original_error):
+    fd_path = "/proc/self/fd/%d" % reference
+    try:
+        os.stat(fd_path)
+    except OSError as ex:
+        raise _truncation_unavailable(path, original_error) from ex
+    return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
+
+
+_TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
+
+
+@contextmanager
+def _open_compile_destination(path, validate, *, release_output=None):
+    with ExitStack() as stack, ExitStack() as initial_pin:
+        # A failed create-open gives us no fd. Capture the existing inode
+        # before trying it so a retry cannot truncate a replacement file.
+        reference = None
+        if hasattr(os, "O_PATH"):
+            try:
+                reference = os.open(path, os.O_PATH)
+            except OSError:
+                pass
+            else:
+                initial_pin.callback(os.close, reference)
+
+        flags = os.O_WRONLY | os.O_CREAT
+        created = False
+        released_for_emfile = False
+        try:
+            try:
+                if reference is None:
+                    try:
+                        fd = os.open(path, flags | os.O_EXCL, 0o666)
+                    except FileExistsError:
+                        fd = os.open(path, flags, 0o666)
+                    else:
+                        created = True
+                else:
+                    fd = os.open(path, flags, 0o666)
+            except OSError as ex:
+                if ex.errno != errno.EMFILE or (reference is None and release_output is None):
+                    raise
+                if release_output is None:
+                    initial_pin.close()
+                    reference = None
+                else:
+                    # Retain the manifest pin, when available, for a safe
+                    # truncating reopen after releasing the output pin.
+                    if reference is not None:
+                        validate(os.fstat(reference))
+                    release_output()
+                released_for_emfile = reference is None
+                fd = os.open(path, flags, 0o666)
+        except OSError as ex:
+            # Preserve EACCES, including the kernel's protected_regular
+            # check on the initial O_CREAT open in a sticky directory.
+            if ex.errno not in _TRUNCATING_RETRY_ERRORS or reference is None:
+                raise
+            original_error = ex
+            # A failed create-open hasn't established permission to replace
+            # someone else's file.
+            info = os.fstat(reference)
+            if info.st_uid != os.geteuid():
+                raise
+            try:
+                current = os.stat(path)
+            except OSError:
+                raise original_error
+            if not os.path.samestat(info, current):
+                validate(current)
+                raise original_error
+        else:
+            initial_pin.close()
+            writer = stack.enter_context(os.fdopen(fd, "w"))
+            info = os.fstat(fd)
+            validate(info)
+            if created or not stat.S_ISREG(info.st_mode):
+                yield writer
+                return
+            try:
+                writer.truncate(0)
+            except OSError as ex:
+                if ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                    raise
+                # An empty file can be written through the current handle
+                # without truncating it or opening another descriptor.
+                if os.fstat(fd).st_size == 0:
+                    yield writer
+                    return
+                if released_for_emfile:
+                    raise
+                original_error = ex
+                reference = _pin_for_truncate(path, fd, ex)
+                stack.callback(os.close, reference)
+                writer.close()
+            else:
+                yield writer
+                return
+
+        # Reopen the validated inode even if its pathname has since changed.
+        info = os.fstat(reference)
+        validate(info)
+        if not stat.S_ISREG(info.st_mode):
+            raise original_error
+        fd = _open_truncated_destination(path, reference, original_error)
+        with os.fdopen(fd, "w") as writer:
+            yield writer
+
+
 def _write_stdout_manifest(path, manifest, stdout_fd):
     path = _manifest_for_stdout(path, stdout_fd)
-    # Validate the actual destination before truncating or writing anything.
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
-        manifest_stat = os.fstat(fh.fileno())
-        if _same_stream(manifest_stat, os.fstat(stdout_fd)) and not _discard_stream(manifest_stat):
+
+    def validate(info):
+        if _same_stream(info, os.fstat(stdout_fd)) and not _discard_stream(info):
             raise ValueError("manifest path points to stdout: %s" % path)
-        if stat.S_ISREG(manifest_stat.st_mode):
-            fh.truncate(0)
+
+    with _open_compile_destination(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
+
+
+def _stat_if_present(path):
+    try:
+        return os.stat(path)
+    except FileNotFoundError:
+        return
+
+
+def _missing_destination(path):
+    # Follow the final symlink without collapsing an unresolved component.
+    for _ in range(40):
+        if not os.path.islink(path):
+            break
+        path = os.path.join(os.path.dirname(path), os.readlink(path))
+    else:
+        return
+    parent, name = os.path.split(path)
+    parent = parent or os.curdir
+    if name:
+        directory = os.stat(parent)
+        if stat.S_ISDIR(directory.st_mode):
+            return directory.st_dev, directory.st_ino, name
+
+
+def _check_file_destinations(output_path, manifest_path):
+    try:
+        output_stat = _stat_if_present(output_path)
+        manifest_stat = _stat_if_present(manifest_path)
+        if output_stat is None and manifest_stat is None:
+            output = _missing_destination(output_path)
+            if output is not None and output == _missing_destination(manifest_path):
+                raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+    except OSError:
+        # The normal write path reports destination errors in output order.
+        return
+    if output_stat is not None and manifest_stat is not None and _same_stream(output_stat, manifest_stat):
+        raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+
+
+def _check_manifest_path(path, output_stat):
+    try:
+        manifest_stat = os.stat(path)
+    except OSError:
+        return
+    if _same_stream(output_stat, manifest_stat):
+        raise ValueError("manifest path points to compiled output: %s" % path)
+
+
+def _pin_output_inode(path, output_fd, output_stat):
+    candidates = []
+    if sys.platform == "linux":
+        linked_fd = "/proc/self/fd/%d" % output_fd
+        if hasattr(os, "O_PATH"):
+            # A read-open can wait on remote storage even with O_NONBLOCK.
+            candidates.append((linked_fd, os.O_PATH))
+        candidates.append((linked_fd, os.O_RDONLY | os.O_NONBLOCK))
+    if hasattr(os, "O_PATH"):
+        # A replacement may be a FIFO. Inspect it without opening a reader.
+        candidates.append((path, os.O_PATH))
+
+    for candidate, flags in candidates:
+        try:
+            reference = os.open(candidate, flags)
+        except OSError:
+            continue
+        if os.path.samestat(output_stat, os.fstat(reference)):
+            return reference
+        os.close(reference)
+    return None
+
+
+def _make_output_executable(path, reference, output_stat, mode):
+    if reference is not None and hasattr(os, "fchmod"):
+        try:
+            os.fchmod(reference, mode)
+            return
+        except OSError as ex:
+            if ex.errno != errno.EBADF or not hasattr(os, "O_PATH"):
+                raise
+            # An O_PATH descriptor pins even a write-only file. Linux chmod
+            # can follow its procfs link without reopening it for writing.
+            try:
+                os.chmod("/proc/self/fd/%d" % reference, mode)
+            except OSError as ex:
+                if ex.errno not in (errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.EPERM, errno.ELOOP):
+                    raise
+            else:
+                return
+    if not os.path.samestat(output_stat, os.stat(path)):
+        raise OSError(errno.ESTALE, "output path changed before setting permissions", path)
+    os.chmod(path, mode)
+
+
+def _write_compile_files(output_path, manifest_path, source, manifest):
+    if not manifest_path:
+        with open(output_path, "w") as output:
+            output.write(source)
+        os.chmod(output_path, os.stat(output_path).st_mode | stat.S_IEXEC | stat.S_IXGRP)
+        return
+
+    # Paths can change during compilation or between the check and open.
+    _check_file_destinations(output_path, manifest_path)
+
+    def validate_output(info):
+        _check_manifest_path(manifest_path, info)
+
+    with ExitStack() as output_reference:
+        reference = None
+        with _open_compile_destination(output_path, validate_output) as output:
+            output_stat = os.fstat(output.fileno())
+            if stat.S_ISREG(output_stat.st_mode):
+                reference = _pin_output_inode(output_path, output.fileno(), output_stat)
+                if reference is not None:
+                    output_reference.callback(os.close, reference)
+            output.write(source)
+            output.flush()
+            mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
+        _make_output_executable(output_path, reference, output_stat, mode)
+
+        def validate_manifest(info):
+            try:
+                current_output = os.stat(output_path)
+            except OSError:
+                current_output = None
+            if (_same_stream(output_stat, info)
+                    or current_output is not None and _same_stream(current_output, info)):
+                raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+
+        # Reopen the current pathname after Python output succeeds.
+        _check_file_destinations(output_path, manifest_path)
+        release_output = output_reference.close if reference is not None else None
+        with _open_compile_destination(
+            manifest_path, validate_manifest, release_output=release_output,
+        ) as manifest_file:
+            json.dump(manifest, manifest_file, indent=2)
 
 
 def _cmd_compile_stdout(args):
@@ -146,6 +404,12 @@ def _prepare_compile_stderr():
 
 
 def _cmd_compile(args, stdout=None):
+    if stdout is None and args.manifest:
+        try:
+            _check_file_destinations(args.output, args.manifest)
+        except ValueError as ex:
+            sys.stderr.write("ansiroll: %s\n" % ex)
+            return 2
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
@@ -167,16 +431,14 @@ def _cmd_compile(args, stdout=None):
         sys.stderr.write(message + "\n")
         return 2
     if stdout is None:
-        with open(args.output, "w") as fh:
-            fh.write(source)
-        os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
-    if args.manifest:
-        if stdout is not None:
+        try:
+            _write_compile_files(args.output, args.manifest, source, manifest)
+        except ValueError as ex:
+            sys.stderr.write("ansiroll: %s\n" % ex)
+            return 2
+    else:
+        if args.manifest:
             _write_stdout_manifest(args.manifest, manifest, stdout.fileno())
-        else:
-            with open(args.manifest, "w") as fh:
-                json.dump(manifest, fh, indent=2)
-    if stdout is not None:
         stdout.write(source.encode("utf-8"))
         stdout.flush()
     sys.stderr.write(
