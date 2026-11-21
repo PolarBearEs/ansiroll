@@ -131,29 +131,30 @@ def _open_compile_destination(path, validate, *, release_output=None):
         created = False
         released_for_emfile = False
         try:
-            if reference is None:
-                try:
-                    fd = os.open(path, flags | os.O_EXCL, 0o666)
-                except FileExistsError:
-                    fd = os.open(path, flags, 0o666)
-                else:
-                    created = True
-            else:
-                try:
-                    fd = os.open(path, flags, 0o666)
-                except OSError as ex:
-                    if ex.errno != errno.EMFILE:
-                        raise
-                    if release_output is None:
-                        initial_pin.close()
-                        reference = None
-                        released_for_emfile = True
+            try:
+                if reference is None:
+                    try:
+                        fd = os.open(path, flags | os.O_EXCL, 0o666)
+                    except FileExistsError:
+                        fd = os.open(path, flags, 0o666)
                     else:
-                        # Keep the manifest inode pinned for a possible
-                        # truncating reopen after releasing the output pin.
-                        validate(os.fstat(reference))
-                        release_output()
+                        created = True
+                else:
                     fd = os.open(path, flags, 0o666)
+            except OSError as ex:
+                if ex.errno != errno.EMFILE or (reference is None and release_output is None):
+                    raise
+                if release_output is None:
+                    initial_pin.close()
+                    reference = None
+                else:
+                    # Retain the manifest pin, when available, for a safe
+                    # truncating reopen after releasing the output pin.
+                    if reference is not None:
+                        validate(os.fstat(reference))
+                    release_output()
+                released_for_emfile = reference is None
+                fd = os.open(path, flags, 0o666)
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
             # check on the initial O_CREAT open in a sticky directory.

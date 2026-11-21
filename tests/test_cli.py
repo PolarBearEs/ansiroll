@@ -513,7 +513,8 @@ def test_compile_releases_optional_pin_when_write_open_hits_emfile(
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
                     reason="requires reopening a metadata-only descriptor")
-def test_manifest_truncating_reopen_can_release_output_pin(monkeypatch, tmp_path):
+@pytest.mark.parametrize("manifest_pin_available", [True, False])
+def test_manifest_open_can_release_output_pin(monkeypatch, tmp_path, manifest_pin_available):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     manifest.write_text("previous manifest with trailing content")
@@ -530,31 +531,36 @@ def test_manifest_truncating_reopen_can_release_output_pin(monkeypatch, tmp_path
         assert output_pin is not None
         return output_pin
 
-    def require_truncate_with_two_slots(path, flags, *args, **kwargs):
+    def open_with_limited_descriptors(path, flags, *args, **kwargs):
         nonlocal manifest_pin, attempts
         if path == str(manifest) and flags & os.O_PATH:
+            if not manifest_pin_available:
+                raise OSError(errno.EMFILE, "no slot for the manifest pin", path)
             manifest_pin = open_fd(path, flags, *args, **kwargs)
             return manifest_pin
         if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
             attempts += 1
-            assert output_pin is not None and manifest_pin is not None
-            assert os.path.samestat(os.fstat(manifest_pin), manifest.stat())
+            assert output_pin is not None
+            if manifest_pin_available:
+                assert manifest_pin is not None
+                assert os.path.samestat(os.fstat(manifest_pin), manifest.stat())
             if attempts == 1:
                 assert os.path.samestat(os.fstat(output_pin), output.stat())
                 raise OSError(errno.EMFILE, "no free descriptor slots", path)
             with pytest.raises(OSError) as error:
                 os.fstat(output_pin)
             assert error.value.errno == errno.EBADF
-            raise OSError(errno.EPERM, "filesystem requires O_TRUNC", path)
+            if manifest_pin_available:
+                raise OSError(errno.EPERM, "filesystem requires O_TRUNC", path)
         if str(path).startswith("/proc/self/fd/") and flags & os.O_TRUNC:
             reopened.append(path)
         return open_fd(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(cli, "_pin_output_inode", track_output_pin)
-    monkeypatch.setattr(os, "open", require_truncate_with_two_slots)
+    monkeypatch.setattr(os, "open", open_with_limited_descriptors)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert attempts == 2
-    assert reopened == [f"/proc/self/fd/{manifest_pin}"]
+    assert reopened == ([f"/proc/self/fd/{manifest_pin}"] if manifest_pin_available else [])
     assert output.read_text() == "pass\n"
     assert json.loads(manifest.read_text()) == data
 
