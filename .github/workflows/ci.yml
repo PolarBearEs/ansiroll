@@ -19,7 +19,9 @@ jobs:
       - run: pip install -e . --no-deps
       - run: pytest tests/test_filters.py tests/test_runtime.py -q
 
+  # The coverage run also serves as the full pytest run on Ansible 2.21.
   coverage:
+    needs: unit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +55,7 @@ jobs:
   # Full suite across ansible-core versions. Embedding + compilation + the
   # strategy parity tests run against each ansible release.
   matrix:
+    needs: unit
     # Python 3.9 is not published for Ubuntu 26.04 runners.
     runs-on: ${{ matrix.python == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
@@ -66,7 +69,6 @@ jobs:
           - { python: "3.12", ansible: "ansible-core==2.18.*", experimental: false }
           - { python: "3.13", ansible: "ansible-core==2.19.*", experimental: false }
           - { python: "3.13", ansible: "ansible-core==2.20.*", experimental: false }
-          - { python: "3.13", ansible: "ansible-core==2.21.*", experimental: false }
           # Oldest supported target; harder to install on modern CI, so allow failure.
           - { python: "3.9", ansible: "ansible-base==2.10.17", experimental: true }
     continue-on-error: ${{ matrix.experimental }}
@@ -91,58 +93,25 @@ jobs:
           ANSIBLE_DEPRECATION_WARNINGS: "False"
         run: pytest -n 2 -q
 
-  # Compare against each release's own linear strategy using integration
-  # targets from the matching ansible/ansible tag. Maintained 2.20 is the full
-  # reference suite; adjacent releases use the portable set; EOL releases use
-  # stable smoke targets whose entry points predate the portable set.
-  upstream-parity:
+  # Share runner setup for host and Docker parity. Keep the two full 2.20
+  # suites parallel because each takes several minutes on its own.
+  parity:
+    needs: unit
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { series: "2.10", profile: "smoke", experimental: true }
-          - { series: "2.12", profile: "smoke", experimental: false }
-          - { series: "2.14", profile: "smoke", experimental: false }
-          - { series: "2.16", profile: "smoke", experimental: false }
-          - { series: "2.18", profile: "smoke", experimental: false }
-          - { series: "2.19", profile: "portable", experimental: false }
-          - { series: "2.20", profile: "full", experimental: false }
-          - { series: "2.21", profile: "portable", experimental: false }
+          - { series: "2.10", host_profile: "smoke", docker_profile: "smoke", experimental: true }
+          - { series: "2.12", host_profile: "smoke", docker_profile: "smoke", experimental: false }
+          - { series: "2.14", host_profile: "smoke", docker_profile: "smoke", experimental: false }
+          - { series: "2.16", host_profile: "smoke", docker_profile: "smoke", experimental: false }
+          - { series: "2.18", host_profile: "smoke", docker_profile: "smoke", experimental: false }
+          - { series: "2.19", host_profile: "portable", docker_profile: "smoke", experimental: false }
+          - { series: "2.20", docker_profile: "full", experimental: false }
+          - { series: "2.21", host_profile: "portable", docker_profile: "smoke", experimental: false }
     continue-on-error: ${{ matrix.experimental }}
-    name: "upstream parity ${{ matrix.series }} (${{ matrix.profile }})"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-      - name: Run matching upstream integration targets
-        run: >-
-          python tests/run_version_matrix.py "${{ matrix.series }}"
-          --profile "${{ matrix.profile }}" --skip-repo-tests
-
-  # Run complete upstream targets through their native ansible-test harness.
-  # Both the linear reference and injected Ansiroll execution get separate,
-  # fresh Docker controllers; the runner compares rc, every recap and task trace.
-  ansible-test-parity:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { series: "2.10", profile: "smoke", experimental: true }
-          - { series: "2.12", profile: "smoke", experimental: false }
-          - { series: "2.14", profile: "smoke", experimental: false }
-          - { series: "2.16", profile: "smoke", experimental: false }
-          - { series: "2.18", profile: "smoke", experimental: false }
-          - { series: "2.19", profile: "smoke", experimental: false }
-          - { series: "2.20", profile: "full", experimental: false }
-          - { series: "2.21", profile: "smoke", experimental: false }
-    continue-on-error: ${{ matrix.experimental }}
-    name: "ansible-test Docker parity ${{ matrix.series }} (${{ matrix.profile }})"
+    name: "Ansible parity ${{ matrix.series }}"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -152,14 +121,37 @@ jobs:
         with:
           enable-cache: true
       - name: Run linear and Ansiroll in fresh ansible-test containers
+        id: docker-parity
         run: >-
           python tests/run_ansible_test_suite.py "${{ matrix.series }}"
-          --profile "${{ matrix.profile }}"
+          --profile "${{ matrix.docker_profile }}"
+          --root "${{ runner.temp }}/docker-parity"
+      - name: Run matching upstream integration targets on the host
+        if: ${{ !cancelled() && matrix.host_profile && (steps.docker-parity.outcome == 'success' || steps.docker-parity.outcome == 'failure') }}
+        run: >-
+          python tests/run_version_matrix.py "${{ matrix.series }}"
+          --profile "${{ matrix.host_profile }}" --skip-repo-tests
+
+  upstream-parity-full:
+    needs: unit
+    runs-on: ubuntu-latest
+    name: "upstream parity 2.20 (full)"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Run matching upstream integration targets
+        run: python tests/run_version_matrix.py 2.20 --profile full --skip-repo-tests
 
   # Prove selected semantics are implemented by the shipped agent itself.
   # Unlike hybrid parity, this lane rejects core-linear, controller and
   # delegation fallback and verifies machine-readable provenance is emitted.
   ansible-test-native-parity:
+    needs: unit
     runs-on: ubuntu-latest
     name: "ansible-test native-only parity 2.20"
     steps:
