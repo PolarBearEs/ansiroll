@@ -101,16 +101,22 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
 
 
 def _check_file_destinations(output_path, manifest_path):
-    message = "manifest path points to compiled output: %s" % manifest_path
     if os.path.normcase(os.path.realpath(output_path)) == os.path.normcase(os.path.realpath(manifest_path)):
-        raise ValueError(message)
+        raise ValueError("manifest path points to compiled output: %s" % manifest_path)
     try:
-        manifest_stat = os.stat(manifest_path)
         output_stat = os.stat(output_path)
     except FileNotFoundError:
         return
+    _check_manifest_path(manifest_path, output_stat)
+
+
+def _check_manifest_path(path, output_stat):
+    try:
+        manifest_stat = os.stat(path)
+    except FileNotFoundError:
+        return
     if _same_stream(output_stat, manifest_stat):
-        raise ValueError(message)
+        raise ValueError("manifest path points to compiled output: %s" % path)
 
 
 def _open_file_manifest(stack, path, output_stat, *, preflight=False):
@@ -131,19 +137,6 @@ def _open_file_manifest(stack, path, output_stat, *, preflight=False):
     return stream
 
 
-def _open_compile_output(path):
-    try:
-        return os.open(path, os.O_WRONLY), None
-    except FileNotFoundError:
-        # Preserve the behavior of opening an output through a dangling symlink.
-        if os.path.islink(path):
-            path = os.path.realpath(path)
-        try:
-            return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666), path
-        except FileExistsError:
-            return os.open(path, os.O_WRONLY), None
-
-
 def _write_compile_files(output_path, manifest_path, source, manifest):
     if not manifest_path:
         with open(output_path, "w") as output:
@@ -153,37 +146,26 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
 
     # Paths can change during compilation or between the check and open.
     _check_file_destinations(output_path, manifest_path)
-    output_fd, created_path = _open_compile_output(output_path)
-    output_stat = os.fstat(output_fd)
-    try:
-        with ExitStack() as stack:
-            with os.fdopen(output_fd, "w") as output:
-                manifest_file = _open_file_manifest(stack, manifest_path, output_stat, preflight=True)
-                if manifest_file is None:
-                    _check_file_destinations(output_path, manifest_path)
-                if stat.S_ISREG(output_stat.st_mode):
-                    output.truncate(0)
-                output.write(source)
-                output.flush()
-                mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
-                if hasattr(os, "fchmod"):
-                    os.fchmod(output.fileno(), mode)
-                else:
-                    os.chmod(output_path, mode)
+    with ExitStack() as stack:
+        with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
+            output_stat = os.fstat(output.fileno())
+            manifest_file = _open_file_manifest(stack, manifest_path, output_stat, preflight=True)
             if manifest_file is None:
-                manifest_file = _open_file_manifest(stack, manifest_path, output_stat)
-            if stat.S_ISREG(os.fstat(manifest_file.fileno()).st_mode):
-                manifest_file.truncate(0)
-            json.dump(manifest, manifest_file, indent=2)
-    except ValueError:
-        if created_path is not None:
-            try:
-                current = os.stat(created_path, follow_symlinks=False)
-                if os.path.samestat(current, output_stat) and current.st_size == 0:
-                    os.unlink(created_path)
-            except FileNotFoundError:
-                pass
-        raise
+                _check_manifest_path(manifest_path, output_stat)
+            if stat.S_ISREG(output_stat.st_mode):
+                output.truncate(0)
+            output.write(source)
+            output.flush()
+            mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
+            if hasattr(os, "fchmod"):
+                os.fchmod(output.fileno(), mode)
+            else:
+                os.chmod(output_path, mode)
+        if manifest_file is None:
+            manifest_file = _open_file_manifest(stack, manifest_path, output_stat)
+        if stat.S_ISREG(os.fstat(manifest_file.fileno()).st_mode):
+            manifest_file.truncate(0)
+        json.dump(manifest, manifest_file, indent=2)
 
 
 def _cmd_compile_stdout(args):

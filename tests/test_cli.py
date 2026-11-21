@@ -237,21 +237,35 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
         assert output.read_text() == original
 
 
-def test_file_compile_removes_new_output_when_filesystem_aliases_names(monkeypatch, tmp_path):
+def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
-    alias = tmp_path / "COMPILED.py"
+    alias = tmp_path / "manifest.json"
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
     open_fd = os.open
 
-    def case_insensitive_open(path, flags, *args, **kwargs):
+    def aliasing_open(path, flags, *args, **kwargs):
         if path == str(alias):
             path = str(output)
         return open_fd(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", case_insensitive_open)
+    monkeypatch.setattr(os, "open", aliasing_open)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(alias)]) == 2
-    assert not output.exists()
+    assert output.read_bytes() == b""
     assert not alias.exists()
+
+
+def test_file_compile_preserves_symlink_path_lookup(monkeypatch, tmp_path):
+    target = tmp_path / "target.py"
+    target.write_text("# existing contents\n")
+    output = tmp_path / "compiled.py"
+    output.symlink_to("missing/../target.py")
+    manifest = tmp_path / "manifest.json"
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+
+    with pytest.raises(FileNotFoundError):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+    assert target.read_text() == "# existing contents\n"
+    assert not manifest.exists()
 
 
 def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):
@@ -266,6 +280,26 @@ def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monk
     with pytest.raises(PermissionError, match="could not make output executable"):
         cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
     assert not manifest.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_file_compile_never_writes_manifest_through_replaced_deferred_fifo(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    output.write_text("# existing output\n")
+    manifest = tmp_path / "manifest.json"
+    os.mkfifo(manifest)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    open_fd = os.open
+
+    def replace_fifo_on_blocking_open(path, flags, *args, **kwargs):
+        if path == str(manifest) and not (flags & os.O_NONBLOCK):
+            manifest.unlink()
+            manifest.symlink_to(output)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_fifo_on_blocking_open)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
+    assert output.read_text() == "pass\n"
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
