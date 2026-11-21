@@ -100,19 +100,39 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
         json.dump(manifest, fh, indent=2)
 
 
+def _stat_if_present(path):
+    try:
+        return os.stat(path)
+    except FileNotFoundError:
+        return
+
+
+def _missing_destination(path):
+    # Follow the final symlink without collapsing an unresolved component.
+    for _ in range(40):
+        if not os.path.islink(path):
+            break
+        path = os.path.join(os.path.dirname(path), os.readlink(path))
+    else:
+        return
+    parent, name = os.path.split(path)
+    parent = parent or os.curdir
+    if name and os.path.isdir(parent):
+        return os.path.normcase(os.path.join(os.path.realpath(parent), name))
+
+
 def _check_file_destinations(output_path, manifest_path):
     try:
-        output_stat = os.stat(output_path)
-        manifest_stat = os.stat(manifest_path)
-    except FileNotFoundError:
-        # Absent destinations have no file identity to compare yet.
-        if os.path.normcase(os.path.realpath(output_path)) == os.path.normcase(os.path.realpath(manifest_path)):
-            raise ValueError("manifest path points to compiled output: %s" % manifest_path)
-        return
+        output_stat = _stat_if_present(output_path)
+        manifest_stat = _stat_if_present(manifest_path)
+        if output_stat is None and manifest_stat is None:
+            output = _missing_destination(output_path)
+            if output is not None and output == _missing_destination(manifest_path):
+                raise ValueError("manifest path points to compiled output: %s" % manifest_path)
     except OSError:
         # The normal write path reports destination errors in output order.
         return
-    if _same_stream(output_stat, manifest_stat):
+    if output_stat is not None and manifest_stat is not None and _same_stream(output_stat, manifest_stat):
         raise ValueError("manifest path points to compiled output: %s" % manifest_path)
 
 
@@ -123,6 +143,7 @@ def _check_manifest_path(path, output_stat):
         return
     if _same_stream(output_stat, manifest_stat):
         raise ValueError("manifest path points to compiled output: %s" % path)
+    return manifest_stat
 
 
 def _open_file_manifest(stack, path, output_stat, *, preflight=False):
@@ -155,9 +176,11 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
     with ExitStack() as stack:
         with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
             output_stat = os.fstat(output.fileno())
-            manifest_file = _open_file_manifest(stack, manifest_path, output_stat, preflight=True)
-            if manifest_file is None:
-                _check_manifest_path(manifest_path, output_stat)
+            manifest_stat = _check_manifest_path(manifest_path, output_stat)
+            manifest_file = None
+            # Connecting a waiting FIFO reader would send EOF if Python fails.
+            if manifest_stat is not None and not stat.S_ISFIFO(manifest_stat.st_mode):
+                manifest_file = _open_file_manifest(stack, manifest_path, output_stat, preflight=True)
             if stat.S_ISREG(output_stat.st_mode):
                 output.truncate(0)
             output.write(source)

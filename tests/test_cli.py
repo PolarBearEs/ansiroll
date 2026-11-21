@@ -194,26 +194,21 @@ def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys, with_mani
         assert manifest_path.read_text() == json.dumps(manifest, indent=2)
 
 
-@pytest.mark.parametrize("alias", ["missing", "same", "symlink", "hardlink", "replaced", "fifo_replaced"])
+@pytest.mark.parametrize("alias", ["missing", "dangling", "same", "symlink", "hardlink", "replaced"])
 def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alias):
     output = tmp_path / "compiled.py"
     original = "# existing output\n"
-    if alias != "missing":
+    if alias not in ("missing", "dangling"):
         output.write_text(original)
     manifest = tmp_path / "manifest.json"
     if alias in ("missing", "same"):
         manifest = output
-    elif alias == "symlink":
+    elif alias in ("dangling", "symlink"):
         manifest.symlink_to(output)
     elif alias == "hardlink":
         os.link(output, manifest)
     else:
-        if alias == "fifo_replaced":
-            if not hasattr(os, "mkfifo"):
-                pytest.skip("requires named pipes")
-            os.mkfifo(manifest)
-        else:
-            manifest.write_text("{}")
+        manifest.write_text("{}")
         open_fd = os.open
 
         def replace_manifest(path, flags, *args, **kwargs):
@@ -225,13 +220,13 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
         monkeypatch.setattr(os, "open", replace_manifest)
 
     def compile_playbook(*args, **kwargs):
-        assert alias in ("replaced", "fifo_replaced"), "expected alias to be rejected before compiling"
+        assert alias == "replaced", "expected alias to be rejected before compiling"
         return "pass\n", {"modules": [], "fallback_tasks": []}
 
     monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
     assert "manifest path points to compiled output" in capsys.readouterr().err
-    if alias == "missing":
+    if alias in ("missing", "dangling"):
         assert not output.exists()
     else:
         assert output.read_text() == original
@@ -241,14 +236,14 @@ def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp
     output = tmp_path / "compiled.py"
     alias = tmp_path / "manifest.json"
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
-    open_fd = os.open
+    stat_path = os.stat
 
-    def aliasing_open(path, flags, *args, **kwargs):
+    def aliasing_stat(path, *args, **kwargs):
         if path == str(alias):
             path = str(output)
-        return open_fd(path, flags, *args, **kwargs)
+        return stat_path(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", aliasing_open)
+    monkeypatch.setattr(os, "stat", aliasing_stat)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(alias)]) == 2
     assert output.read_bytes() == b""
     assert not alias.exists()
@@ -298,14 +293,41 @@ def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monk
     assert not manifest.exists()
 
 
-def test_file_compile_writes_python_before_reporting_manifest_open_error(monkeypatch, tmp_path):
+@pytest.mark.parametrize("manifest_path, error", [
+    (".", IsADirectoryError),
+    ("missing/../compiled.py", FileNotFoundError),
+])
+def test_file_compile_writes_python_before_reporting_manifest_open_error(monkeypatch, tmp_path, manifest_path, error):
     output = tmp_path / "compiled.py"
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
 
-    with pytest.raises(IsADirectoryError):
-        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(tmp_path)])
+    with pytest.raises(error):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(tmp_path / manifest_path)])
     assert output.read_text() == "pass\n"
     assert output.stat().st_mode & stat.S_IEXEC
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_file_compile_does_not_connect_manifest_fifo_when_python_fails(monkeypatch, tmp_path):
+    import select
+
+    if not hasattr(select, "poll"):
+        pytest.skip("requires poll")
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    os.mkfifo(manifest)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+
+    def fail_chmod(*args, **kwargs):
+        raise PermissionError("could not make output executable")
+
+    monkeypatch.setattr(os, "fchmod", fail_chmod)
+    with os.fdopen(os.open(manifest, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
+        poller = select.poll()
+        poller.register(reader, select.POLLHUP)
+        with pytest.raises(PermissionError, match="could not make output executable"):
+            cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+        assert poller.poll(0) == []
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
