@@ -1309,7 +1309,8 @@ def test_fast_facts_are_separately_opt_in(monkeypatch):
     assert rt.vars["ansible_kernel"] == "official"
 
 
-def test_fast_facts_are_absorbed_without_setup_worker(monkeypatch):
+@pytest.mark.parametrize("options", [None, {"gather_subset": ["all"], "gather_timeout": 10}])
+def test_fast_facts_are_absorbed_without_setup_worker(monkeypatch, options):
     from ansiroll.accelerated_modules import facts
 
     monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")
@@ -1322,7 +1323,7 @@ def test_fast_facts_are_absorbed_without_setup_worker(monkeypatch):
         rt, "run_module",
         lambda *_args, **_kwargs: pytest.fail("official setup should not run"),
     )
-    rt.gather_facts()
+    rt.gather_facts(options=options)
     assert rt.vars["ansible_kernel"] == "fast"
     assert rt.vars["ansible_facts"]["kernel"] == "fast"
 
@@ -1337,13 +1338,39 @@ def test_fast_facts_fall_back_to_official_setup(monkeypatch):
     calls = []
     monkeypatch.setattr(
         rt, "run_module",
-        lambda action, args, become=False: calls.append(action) or {
+        lambda action, args, become=False: calls.append((action, args)) or {
             "changed": False, "ansible_facts": {"ansible_kernel": "official"},
         },
     )
-    rt.gather_facts()
-    assert calls == ["ansible.builtin.setup"]
+    options = {"gather_subset": ["all"], "gather_timeout": 10}
+    rt.gather_facts(options=options)
+    assert calls == [("ansible.builtin.setup", options)]
     assert rt.vars["ansible_kernel"] == "official"
+
+
+@pytest.mark.parametrize("value, expected", [(0, {}), ("0", {}), (2.5, {"gather_timeout": 2})])
+def test_legacy_setup_validates_rendered_timeout_before_the_iterator_gate(monkeypatch, value, expected):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.12")
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+    rt = Runtime({}, "", {"inventory_hostname": "h", "time_limit": value})
+    calls = []
+
+    def run_module(action, args, become=False):
+        calls.append((action, args))
+        return {"changed": False, "ansible_facts": {}}
+
+    monkeypatch.setattr(rt, "run_module", run_module)
+    assert rt.gather_facts(options={"gather_timeout": "{{ time_limit }}"})
+    assert calls == [("ansible.builtin.setup", expected)]
+
+
+def test_implicit_setup_treats_scalar_subset_as_one_selector():
+    rt = Runtime({}, "", {"inventory_hostname": "h"})
+    assert rt._setup_args({"gather_subset": "network,virtual"}, None, rt.ctx(), None) == {
+        "gather_subset": ["network,virtual"],
+    }
 
 
 def test_async_poll_zero_starts_without_sync_run(monkeypatch):

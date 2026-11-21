@@ -2425,6 +2425,28 @@ def test_strategy_injects_fast_facts_into_remote_agent(monkeypatch):
     assert "_INJECTED_FAST_FACTS = True" in header
 
 
+@pytest.mark.parametrize("gather_facts", [False, True])
+def test_strategy_rejects_gather_requests_for_skipped_hosts(tmp_path, gather_facts):
+    strategy = _load_strategy_module()
+    plugin = strategy.StrategyModule.__new__(strategy.StrategyModule)
+    plugin._cur_play = None
+    plugin._variable_manager = SimpleNamespace(get_vars=lambda **_: {})
+    plugin._loader = SimpleNamespace(get_basedir=lambda: str(tmp_path))
+
+    def template(_args):
+        pytest.fail("skipped setup must not resolve arguments on the controller")
+
+    plugin._mk_templar = lambda _vars: SimpleNamespace(template=template)
+    task = SimpleNamespace(when=[False], get_search_path=lambda: [],
+                           _resolve_conditional=lambda _when, _vars: False)
+    messages = iter([{"t": "gather_args"}, {"t": "done"}])
+    replies = []
+    chan = SimpleNamespace(recv=lambda: next(messages), send=replies.append)
+    plugin._pump(SimpleNamespace(name="host"), chan, {"__gather_facts__": task}, {}, None, None, None, gather_facts)
+    outcome = {"args": None} if gather_facts else {"error": "fact gathering was skipped for this host"}
+    assert replies == [dict(outcome, t="gather_args_result")]
+
+
 def test_strategy_extra_vars_helper_preserves_json_booleans():
     strategy = _load_strategy_module()
 
