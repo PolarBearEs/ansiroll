@@ -232,12 +232,16 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
     rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
     task = _task("sync", "Synchronize", None, loop=["sample"], vars={
         "ansible_ssh_common_args": "-o HostKeyAlias={{ item | agent_filter }}",
+        "ansible_ssh_private_key_file": "/keys/{{ item | agent_filter }}",
+        "ansible_private_key_file": "/other-keys/{{ item | agent_filter }}",
         "unused": "{{ unexpected_lookup() }}",
     })
     ctx = rt._task_ctx(task, {})
     ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
     sent = _delegate_vars(ctx, rt.templater, _SYNCHRONIZE_VARS)
     assert sent["ansible_ssh_common_args"] == "-o HostKeyAlias=SAMPLE"
+    assert sent["ansible_ssh_private_key_file"] == "/keys/SAMPLE"
+    assert sent["ansible_private_key_file"] == "/other-keys/SAMPLE"
     assert sent["unused"] == "{{ unexpected_lookup() }}"
 
 
@@ -298,6 +302,48 @@ def test_loop_task_conditional_accepts_boolean_computed_from_unsafe_data(flag, e
     })
     ctx = rt._task_ctx(task, {})
     assert rt.when([{"__ansiroll_trusted_condition__": "{{ enabled }}"}], ctx) is expected
+
+
+@pytest.mark.parametrize("alias, access", [
+    ({"expression": "'prefix-{{ item }}' == 'prefix-sample'"}, "alias.expression"),
+    (["'prefix-{{ item }}' == 'prefix-sample'"], "alias[0]"),
+    ({"expressions": ["'prefix-{{ item }}' == 'prefix-sample'"]}, "alias.expressions[0]"),
+])
+def test_loop_task_container_members_keep_unsafe_interpolation_marker(alias, access):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": alias})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = rt.template({"__ansiroll_unsafe__": "sample"}, {})
+    condition = {"__ansiroll_trusted_condition__": "{{ " + access + " }} and true"}
+    with pytest.raises(UntrustedConditional):
+        rt.when([condition], ctx)
+
+
+@pytest.mark.parametrize("alias, expected", [
+    ("{{ [flag == 'yes'] }}", True),
+    ("{{ [flag == 'no'] }}", False),
+    (["{{ flag == 'yes' }}"], True),
+    (["{{ flag == 'no' }}"], False),
+])
+def test_loop_task_assertion_accepts_lists_of_computed_booleans(alias, expected):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["yes"], vars={
+        "flag": {"__ansiroll_unsafe__": "yes"},
+        "alias": alias,
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None) is expected
+
+
+def test_loop_task_assertion_rejects_lazy_list_of_untrusted_expressions():
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["yes"], vars={
+        "flag": {"__ansiroll_unsafe__": "yes"},
+        "alias": ["'{{ flag }}' == 'yes'"],
+    })
+    ctx = rt._task_ctx(task, {})
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
 
 
 def test_legacy_loop_task_vars_iteration_exposes_plain_strings(monkeypatch):

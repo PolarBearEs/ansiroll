@@ -381,16 +381,16 @@ def _debug_var_value(value):
     return replace(value)
 
 
-def _contains_untrusted_condition_value(value):
-    if isinstance(value, _UntrustedConditionValue):
+def _condition_contains_string(value, string_type):
+    if isinstance(value, string_type):
         return True
     if isinstance(value, dict):
         return any(
-            _contains_untrusted_condition_value(item)
+            _condition_contains_string(item, string_type)
             for item in value.values()
         )
     if isinstance(value, (list, tuple)):
-        return any(_contains_untrusted_condition_value(item) for item in value)
+        return any(_condition_contains_string(item, string_type) for item in value)
     return False
 
 
@@ -1025,20 +1025,22 @@ def _query(name, *args, **kwargs):
     return _lookup_values(name, args, kwargs, ctx)
 
 
-def _lazy_container(value, rt, ctx, dynamic=False, origin=None):
+def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
     if isinstance(value, dict):
-        return _LazyTplDict(value, rt, ctx, dynamic, origin)
+        return _LazyTplDict(value, rt, ctx, dynamic, origin, task_vars)
     if isinstance(value, list):
-        return _LazyTplList(value, rt, ctx, dynamic, origin)
+        return _LazyTplList(value, rt, ctx, dynamic, origin, task_vars)
     return value
 
 
-def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
+def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
     if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
-        # Play containers resolve their members in the task's context.
-        return _lazy_container(value._raw, rt, ctx)
+        # Dynamic containers resolve their members in the task's context.
+        return _lazy_container(value._raw, rt, ctx, task_vars=value._task_vars)
     if isinstance(value, _UntrustedConditionValue):
         return rt.templater._observe_untrusted(value)
+    if task_vars and type(value) is str and _looks_templated(value):
+        value = _TaskVarTemplate(value)
     if isinstance(value, (str, tuple)):
         if getattr(rt, "_strict_var_resolution", False):
             return rt.template(value, ctx, strict=True)
@@ -1047,13 +1049,13 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
         return rt.templater._observe_untrusted(_UntrustedConditionValue(value["__ansiroll_unsafe__"]))
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_vault__"}:
         return value
-    return _lazy_container(value, rt, ctx, dynamic, origin)
+    return _lazy_container(value, rt, ctx, dynamic, origin, task_vars)
 
 
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False, origin=None):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
         dict.__init__(self, raw)
         self._raw = raw
         self._rt = rt
@@ -1061,6 +1063,7 @@ class _LazyTplDict(dict):
         # The context this view tree was created under; children share it.
         self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
+        self._task_vars = task_vars
 
     def _render_ctx(self):
         if not self._dynamic:
@@ -1073,7 +1076,7 @@ class _LazyTplDict(dict):
     def __getitem__(self, k):
         return _lazy_wrap(
             dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic,
-            self._origin)
+            self._origin, self._task_vars)
 
     def get(self, k, default=None):
         try:
@@ -1251,13 +1254,14 @@ class _ModernPlayVarView(_PlayVarView):
 class _LazyTplList(list):
     """A vars list whose items render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False, origin=None):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
         list.__init__(self, raw)
         self._raw = raw
         self._rt = rt
         self._ctx = ctx
         self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
+        self._task_vars = task_vars
 
     def _render_ctx(self):
         if not self._dynamic:
@@ -1272,16 +1276,16 @@ class _LazyTplList(list):
         if isinstance(i, slice):
             return [
                 _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic,
-                           self._origin)
+                           self._origin, self._task_vars)
                 for x in v
             ]
         return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
-                          self._origin)
+                          self._origin, self._task_vars)
 
     def __iter__(self):
         for v in list.__iter__(self):
             yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
-                             self._origin)
+                             self._origin, self._task_vars)
 
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
@@ -1688,9 +1692,11 @@ class _Templater:
         self._untrusted_task_interpolation = False
         try:
             result = self.render_string(text, ctx, strict=strict)
-            # Unsafe text must not become a second expression. A computed
-            # boolean can be used directly without interpreting it again.
-            if self._untrusted_task_interpolation and isinstance(result, (str, list, tuple)):
+            # Resolve lazy members while tracking is still active. Computed
+            # booleans, including assertion lists, need no expression parsing.
+            if isinstance(result, (list, tuple)):
+                result = _mark_unsafe(result)
+            if self._untrusted_task_interpolation and _condition_contains_string(result, str):
                 raise UntrustedConditional("Encountered untrusted template or expression.")
             return result
         finally:
@@ -1719,7 +1725,7 @@ class _Templater:
         try:
             result = self._render_string(text, ctx, strict)
             if (self._rendering_task_alias and isinstance(text, _TaskVarTemplate)
-                    and _contains_untrusted_condition_value(result)):
+                    and _condition_contains_string(result, _UntrustedConditionValue)):
                 self._untrusted_task_interpolation = True
         finally:
             self._rendering_task_alias = rendering_alias
@@ -2094,7 +2100,7 @@ class Runtime:
             elif isinstance(v, dict) and set(v.keys()) == {"__ansiroll_unsafe__"}:
                 out[k] = _UntrustedConditionValue(v["__ansiroll_unsafe__"])
             else:
-                out[k] = _lazy_container(v, self, base, dynamic or defer)
+                out[k] = _lazy_container(v, self, base, dynamic or defer, task_vars=defer)
         return out
 
     @contextmanager
@@ -2166,7 +2172,7 @@ class Runtime:
                     name in ctx
                     and (
                         name in self._untrusted_runtime_vars
-                        or _contains_untrusted_condition_value(ctx[name])
+                        or _condition_contains_string(ctx[name], _UntrustedConditionValue)
                     )
                     for name in referenced):
                 raise UntrustedConditional(
@@ -5104,6 +5110,7 @@ def _delegate_template_value(value):
 _SYNCHRONIZE_VARS = frozenset((
     "ansible_rsync_path", "ansible_port", "ansible_ssh_pass", "ansible_password",
     "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
+    "ansible_ssh_private_key_file", "ansible_private_key_file",
 ))
 
 
