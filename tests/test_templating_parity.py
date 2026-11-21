@@ -43,9 +43,9 @@ def _env():
     return env
 
 
-def _summary(text):
+def _summary(text, stderr=""):
     recap = RECAP_RE.search(text)
-    assert recap, text
+    assert recap, text + stderr
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
@@ -56,9 +56,9 @@ def _ansible(playbook, cwd, strategy=None):
     proc = subprocess.run(
         ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
          "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
-        cwd=str(cwd), env=env, capture_output=True, text=True,
+        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
-    return _summary(proc.stdout)
+    return _summary(proc.stdout, proc.stderr)
 
 
 def _ansiroll(playbook, cwd):
@@ -91,6 +91,28 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
         actual = _ansiroll(path, tmp_path)
     assert actual == expected
     return expected
+
+
+def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    package = checkout / "ansible"
+    package.mkdir(parents=True)
+    init = package / "__init__.py"
+    init.write_text("from parity_dependency import SOURCE\n")
+    (checkout / "parity_dependency.py").write_text("SOURCE = 'checkout'\n")
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    (dependencies / "parity_dependency.py").write_text("SOURCE = 'inherited'\n")
+    monkeypatch.setenv("PYTHONPATH", str(dependencies))
+
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; from tests import _load_reference_ansible; "
+         "_load_reference_ansible(sys.argv[1]); import ansible; print(ansible.SOURCE)",
+         str(init)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert result.stdout.strip() == "inherited"
 
 
 def test_untrusted_data_is_not_templated_again(tmp_path):

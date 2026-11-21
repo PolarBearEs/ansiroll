@@ -53,9 +53,9 @@ def _write(base, files):
             fh.write(textwrap.dedent(text).lstrip("\n"))
 
 
-def _summary(text):
+def _summary(text, stderr=""):
     recap = RECAP_RE.search(text)
-    assert recap, "no recap found in:\n%s" % text
+    assert recap, "no recap found in:\n%s%s" % (text, stderr)
     return MSG_RE.findall(text), recap.groups()
 
 
@@ -70,7 +70,8 @@ def _ansible_run(base, args, strategy=None):
 
 
 def _ansible(base, args, strategy=None):
-    return _summary(_ansible_run(base, args, strategy).stdout)
+    result = _ansible_run(base, args, strategy)
+    return _summary(result.stdout, result.stderr)
 
 
 def _standalone_run(base, args, compile_args=()):
