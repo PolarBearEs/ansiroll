@@ -119,6 +119,47 @@ def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path
     assert str(foreign) in result.stderr and str(expected.parent) in result.stderr
 
 
+def test_reference_bootstrap_accepts_ansible_stdlib_selectors_alias(tmp_path):
+    command = (
+        "import ansible, selectors, sys; from tests import _load_reference_ansible; "
+        "sys.modules['ansible.module_utils.compat.selectors'] = selectors; "
+        "_load_reference_ansible(ansible.__file__)"
+    )
+    subprocess.run(
+        [sys.executable, "-c", command], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.13"), reason="requires the playbook module entry point")
+def test_reference_playbook_sets_argv_to_the_matching_installed_launcher(tmp_path, monkeypatch):
+    from importlib import metadata
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import tests
+    from ansible.cli import playbook
+
+    launcher = Path("bin/ansible-playbook")
+    (tmp_path / launcher).parent.mkdir()
+    (tmp_path / launcher).touch()
+    ansible_package = str(tmp_path / "ansible")
+
+    def distribution(name):
+        if name != "ansible-core":
+            raise metadata.PackageNotFoundError(name)
+        return SimpleNamespace(files=[launcher], locate_file=lambda entry: tmp_path / entry)
+
+    seen = []
+    monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: ansible_package)
+    monkeypatch.setattr(metadata, "distribution", distribution)
+    monkeypatch.setattr(playbook, "main", lambda: seen.extend(sys.argv))
+    monkeypatch.setattr(sys, "argv", ["-c", "--version"])
+    monkeypatch.setenv("PATH", "")
+    tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"))
+    assert seen == [str(tmp_path / launcher), "--version"]
+
+
 def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatch):
     foreign = tmp_path / "foreign"
     package = foreign / "ansible"
@@ -156,6 +197,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
     ("#!/bin/sh\n'''exec' /workspace/team,2=parity:linux#1/" + "long-component/" * 8
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     ("#!/bin/sh\n'''exec' /workspace/team\u3000two/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team[draft/" + "long-component/" * 8
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])
@@ -195,6 +238,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     "/workspace/$TEAM/bin/python3",
     "/workspace/{old,new}/bin/python3",
     "/workspace/team[12]/bin/python3",
+    "/workspace/team[]]/bin/python3",
     "/workspace/team?2/bin/python3",
     "/workspace/team*2/bin/python3",
     "/workspace/team;other/bin/python3",

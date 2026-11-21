@@ -37,6 +37,11 @@ def _load_reference_ansible(filename):
     expected = os.path.realpath(os.path.dirname(filename))
     for name, module in tuple(sys.modules.items()):
         if name == "ansible" or name.startswith("ansible."):
+            # Ansible 2.14 aliases the standard-library module under its
+            # compatibility namespace when the executor is imported.
+            if (name == "ansible.module_utils.compat.selectors"
+                    and module is not None and module is sys.modules.get("selectors")):
+                continue
             origin = getattr(module, "__file__", None) or getattr(getattr(module, "__spec__", None), "origin", None)
             if origin and origin not in ("built-in", "frozen"):
                 directory = os.path.realpath(os.path.dirname(origin))
@@ -85,6 +90,18 @@ def _ansible_version_fields(command, candidate, diagnostics):
     return dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
 
 
+def _has_bracket_glob(path):
+    import re
+
+    for component in path.split("/"):
+        # An initial ] in a bracket expression, including after negation,
+        # represents a literal. A later ] must close the expression.
+        for opening in re.finditer(r"\[[!^]?\]?", component):
+            if "]" in component[opening.end():]:
+                return True
+    return False
+
+
 def _launcher_body(source):
     import re
 
@@ -114,7 +131,8 @@ def _launcher_body(source):
         re.fullmatch(r'"/[^"$\x60\\]+"', interpreter)
         # Shell token delimiters are ASCII. Unicode spaces can be literal
         # filename characters, like punctuation that has no shell meaning.
-        or re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?\[{}]+""", interpreter)
+        or (re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?{}]+""", interpreter)
+            and not _has_bracket_glob(interpreter))
     ):
         name = os.path.basename(interpreter.strip('"'))
     else:
@@ -174,13 +192,6 @@ def _run_ansible_playbook(filename):
     package = _load_reference_ansible(filename)
     from ansible.release import __version__
 
-    if tuple(map(int, __version__.split(".")[:2])) >= (2, 13):
-        from ansible.cli import playbook
-
-        playbook.main()
-        return
-
-    # Older releases install a script instead of a module entry point.
     candidates = []
     for name in ("ansible-core", "ansible-base", "ansible"):
         try:
@@ -197,7 +208,17 @@ def _run_ansible_playbook(filename):
     library = os.path.dirname(package)
     if os.path.basename(library) == "lib":
         candidates.append((os.path.join(os.path.dirname(library), "bin", "ansible-playbook"), True))
-    candidates.append((os.path.join(os.path.dirname(sys.executable), "ansible-playbook"), False))
+    environment_script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
+    if tuple(map(int, __version__.split(".")[:2])) >= (2, 13):
+        # The CLI looks for sibling helpers next to argv[0] before PATH.
+        sys.argv[0] = next((script for script, _ in candidates if os.path.isfile(script)), environment_script)
+        from ansible.cli import playbook
+
+        playbook.main()
+        return
+
+    # Older releases install a script instead of a module entry point.
+    candidates.append((environment_script, False))
     candidates.extend((shutil.which("ansible-playbook", path=directory or os.curdir), False)
                       for directory in os.get_exec_path())
     diagnostics = []
