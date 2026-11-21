@@ -221,16 +221,24 @@ def test_delegated_loop_task_alias_uses_agent_filters():
 
 
 def test_delegated_synchronize_loop_sends_rendered_ssh_options():
-    from ansiroll.runtime import _delegate_vars
+    from ansiroll.runtime import _SYNCHRONIZE_VARS, _delegate_vars
 
     rt = Runtime({}, "", {})
     rt.templater.env.filters["agent_filter"] = str.upper
-    task = _task("sync", "Synchronize", None, loop=["sample"],
-                 vars={"ansible_ssh_common_args": "-o HostKeyAlias={{ item | agent_filter }}"})
+
+    def unexpected_lookup():
+        pytest.fail("unused synchronize alias was rendered")
+
+    rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
+    task = _task("sync", "Synchronize", None, loop=["sample"], vars={
+        "ansible_ssh_common_args": "-o HostKeyAlias={{ item | agent_filter }}",
+        "unused": "{{ unexpected_lookup() }}",
+    })
     ctx = rt._task_ctx(task, {})
     ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
-    sent = _delegate_vars(ctx, rt.templater, {"ansible_rsync_path"})
+    sent = _delegate_vars(ctx, rt.templater, _SYNCHRONIZE_VARS)
     assert sent["ansible_ssh_common_args"] == "-o HostKeyAlias=SAMPLE"
+    assert sent["unused"] == "{{ unexpected_lookup() }}"
 
 
 def test_loop_task_magic_vars_keep_original_values_when_facts_change():
@@ -279,6 +287,29 @@ def test_loop_task_conditional_interpolation_preserves_alias_trust(unsafe, alias
             rt.when([condition], ctx)
     else:
         assert rt.when([condition], ctx)
+
+
+@pytest.mark.parametrize("flag, expected", [("yes", True), ("no", False)])
+def test_loop_task_conditional_accepts_boolean_computed_from_unsafe_data(flag, expected):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=[flag], vars={
+        "flag": {"__ansiroll_unsafe__": flag},
+        "enabled": "{{ flag == 'yes' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ enabled }}"}], ctx) is expected
+
+
+def test_legacy_loop_task_vars_iteration_exposes_plain_strings(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.18.20")
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item | upper }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    assert rt.template("{{ vars.alias }}", ctx) == "SAMPLE"
+    scope = rt.templater._play_var_scope(ctx, strict=False)
+    assert type(dict(scope["vars"].items())["alias"]) is str
+    assert any(type(value) is str and value == "{{ item | upper }}" for value in scope["vars"].values())
 
 
 @pytest.mark.parametrize("controller_snapshot", [False, True])

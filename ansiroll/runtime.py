@@ -1181,11 +1181,15 @@ class _PlayVarView(dict):
 
     def __init__(self, snapshot, scope, loop_snapshot=False):
         super().__init__(snapshot)
-        if not _core_at_least(2, 19):
-            self.update({key: str(value) for key, value in snapshot.items()
-                         if isinstance(value, _PlayVarTemplate)})
         self.scope = scope
         self._loop_snapshot = loop_snapshot or isinstance(snapshot, _LoopVarsSnapshot)
+        self._task_templates = {}
+        if not _core_at_least(2, 19):
+            for key, value in snapshot.items():
+                if isinstance(value, _TaskVarTemplate) and self._loop_snapshot:
+                    self._task_templates[key] = value
+                if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
+                    self[key] = str(value)
         if "vars" in snapshot:
             self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
 
@@ -1196,6 +1200,7 @@ class _PlayVarView(dict):
         if not self._loop_snapshot:
             return self.scope.templater.resolve_variable(key, self.scope[key], self.scope, strict=self.scope.strict)
         if key not in self.scope.resolved_snapshot:
+            value = self._task_templates.get(key, value)
             if isinstance(value, _PlayVarTemplate):
                 value = str(value)
             resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
@@ -1683,7 +1688,9 @@ class _Templater:
         self._untrusted_task_interpolation = False
         try:
             result = self.render_string(text, ctx, strict=strict)
-            if self._untrusted_task_interpolation:
+            # Unsafe text must not become a second expression. A computed
+            # boolean can be used directly without interpreting it again.
+            if self._untrusted_task_interpolation and isinstance(result, (str, list, tuple)):
                 raise UntrustedConditional("Encountered untrusted template or expression.")
             return result
         finally:
@@ -5094,6 +5101,12 @@ def _delegate_template_value(value):
     return value
 
 
+_SYNCHRONIZE_VARS = frozenset((
+    "ansible_rsync_path", "ansible_port", "ansible_ssh_pass", "ansible_password",
+    "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
+))
+
+
 def _delegate_vars(ctx, templater=None, resolve_keys=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
@@ -5102,8 +5115,7 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None):
         if key == "vars":
             continue
         try:
-            if templater is not None and (
-                    resolve_keys is None or key in resolve_keys or isinstance(value, _TaskVarTemplate)):
+            if templater is not None and (resolve_keys is None or key in resolve_keys):
                 if isinstance(value, _PlayVarTemplate):
                     value = scope[key]
                     if resolve_keys is None:
@@ -5191,8 +5203,7 @@ def agent_main():
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = None
             if action == "synchronize":
-                resolve_keys = {"ansible_rsync_path", "ansible_port", "ansible_ssh_pass",
-                                "ansible_password", "ansible_user"}
+                resolve_keys = _SYNCHRONIZE_VARS
             _chan_send(resp_fd, {"t": "delegate", "uuid": task.get("uuid"),
                                  "runtime_id": task.get("runtime_id"),
                                  "action": task.get("action"), "args": args,
