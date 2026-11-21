@@ -32,7 +32,9 @@ def _reference_python(code, filename=None):
 
 
 def ansible_playbook_command():
-    return _reference_python("_parity_bootstrap['_run_ansible_playbook'](sys.argv.pop(1))")
+    from ansible.release import __version__
+
+    return _reference_python("_parity_bootstrap['_run_ansible_playbook'](sys.argv.pop(1), sys.argv.pop(1))") + [__version__]
 
 
 def ansiroll_compile_command():
@@ -101,12 +103,13 @@ def _load_reference_ansible(filename):
     return actual
 
 
-def _run_legacy_playbook(script):
+def _run_legacy_playbook(filename, script):
     import runpy
 
     # Match direct execution of the launcher, including sibling imports.
     sys.path.insert(0, os.path.dirname(os.path.realpath(script)))
     sys.argv[0] = script
+    _load_reference_ansible(filename)
     runpy.run_path(script, run_name="__main__")
 
 
@@ -275,8 +278,7 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         return None
 
     probe = _reference_python(
-        "_parity_bootstrap['_load_reference_ansible'](sys.argv.pop(1)); "
-        "_parity_bootstrap['_run_legacy_playbook'](sys.argv.pop(1))",
+        "_parity_bootstrap['_run_legacy_playbook'](sys.argv.pop(1), sys.argv.pop(1))",
         filename,
     )
     fields = _ansible_version_fields(probe + [path], path, diagnostics)
@@ -310,16 +312,15 @@ def _installed_playbook_launchers(package):
         yield os.path.join(os.path.dirname(library), "bin", "ansible-playbook")
 
 
-def _run_ansible_playbook(filename):
+def _run_ansible_playbook(filename, version):
     import shutil
     from itertools import chain
 
-    package = _load_reference_ansible(filename)
-    from ansible.release import __version__
-
+    package = os.path.realpath(os.path.dirname(filename))
     installed_launchers = _installed_playbook_launchers(package)
     environment_script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
-    if tuple(map(int, __version__.split(".")[:2])) >= (2, 13):
+    if tuple(map(int, version.split(".")[:2])) >= (2, 13):
+        _load_reference_ansible(filename)
         # The CLI looks for sibling helpers next to argv[0] before PATH.
         sys.argv[0] = next((script for script in installed_launchers if os.path.isfile(script)), environment_script)
         from ansible.cli import playbook
@@ -341,7 +342,7 @@ def _run_ansible_playbook(filename):
             seen.add(script)
             python_script = _legacy_python_launcher(script, filename, package, diagnostics, associated)
             if python_script:
-                _run_legacy_playbook(python_script)
+                _run_legacy_playbook(filename, python_script)
                 return
     detail = "\n" + "\n".join(diagnostics) if diagnostics else ""
     raise FileNotFoundError("ansible-playbook script not found for %s%s" % (package, detail))

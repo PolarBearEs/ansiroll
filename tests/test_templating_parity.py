@@ -232,7 +232,6 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     from types import ModuleType, SimpleNamespace
 
     import tests
-    from ansible import release
 
     launcher = Path("bin/ansible-playbook")
     (tmp_path / launcher).parent.mkdir()
@@ -256,14 +255,40 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     cli.playbook = SimpleNamespace(main=lambda: seen.extend(sys.argv))
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: ansible_package)
     monkeypatch.setattr(tests, "_legacy_python_launcher", verify_legacy)
-    monkeypatch.setattr(tests, "_run_legacy_playbook", lambda script: seen.extend([script, *sys.argv[1:]]))
+    monkeypatch.setattr(tests, "_run_legacy_playbook", lambda filename, script: seen.extend([script, *sys.argv[1:]]))
     monkeypatch.setattr(metadata, "distributions", distributions)
-    monkeypatch.setattr(release, "__version__", version)
     monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setenv("PATH", "")
-    tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"))
+    tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"), version)
     assert seen == [str(tmp_path / launcher), "--version"]
+
+
+def test_legacy_launcher_imports_sibling_dependencies_before_pinning_ansible(tmp_path, monkeypatch):
+    from tests import _reference_python
+
+    package = tmp_path / "lib" / "ansible"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("from parity_legacy_dependency import SOURCE\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "parity_legacy_dependency.py").write_text("SOURCE = 'launcher'\n")
+    (bin_dir / "ansible-playbook").write_text(
+        "#!/usr/bin/env python\nimport os, ansible\n"
+        "assert ansible.SOURCE == 'launcher', ansible.SOURCE\n"
+        "print('ansible python module location = ' + os.path.dirname(ansible.__file__))\n"
+    )
+    (tmp_path / "parity_legacy_dependency.py").write_text("SOURCE = 'inherited'\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+    command = _reference_python(
+        "_parity_bootstrap['_run_ansible_playbook'](sys.argv.pop(1), sys.argv.pop(1))",
+        str(package / "__init__.py"),
+    )
+    result = subprocess.run(
+        command + ["2.12.10", "--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert result.stdout.strip() == f"ansible python module location = {package}"
 
 
 def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatch):
