@@ -31,8 +31,8 @@ def ansiroll_compile_command():
 
 
 def parity_pythonpath(root):
-    inherited = os.environ.get("PYTHONPATH")
-    return root if inherited is None else os.pathsep.join([root, inherited])
+    # The empty fallback adds the playbook directory after the repository.
+    return os.pathsep.join([root, os.environ.get("PYTHONPATH", "")])
 
 
 def _is_ansible_compatibility_alias(name, module):

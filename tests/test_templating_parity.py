@@ -102,6 +102,22 @@ def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path
     assert __version__ in result.stdout
 
 
+def test_reference_bootstrap_preserves_playbook_local_imports(tmp_path, monkeypatch):
+    from tests import _reference_python
+
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local tests module')\n")
+    (tmp_path / "parity_playbook_helper.py").write_text("SOURCE = 'playbook'\n")
+    command = _reference_python(
+        "from tests import _load_reference_ansible; _load_reference_ansible(sys.argv.pop(1)); "
+        "from parity_playbook_helper import SOURCE; print(SOURCE)"
+    )
+    result = subprocess.run(
+        command, cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert result.stdout.strip() == "playbook"
+
+
 def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path):
     expected = tmp_path / "expected" / "ansible" / "__init__.py"
     foreign = tmp_path / "foreign" / "ansible" / "release.py"
