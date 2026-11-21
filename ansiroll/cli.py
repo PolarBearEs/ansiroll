@@ -63,78 +63,29 @@ def main(argv=None, *, _standalone=False):
     parser.error("unknown command")
 
 
+def _same_stream(first, second):
+    return os.path.samestat(first, second) or (
+        stat.S_ISCHR(first.st_mode) and stat.S_ISCHR(second.st_mode)
+        and first.st_rdev == second.st_rdev
+    )
+
+
+def _discard_stream(stream):
+    return stat.S_ISCHR(stream.st_mode) and _same_stream(stream, os.stat(os.devnull))
+
+
 def _manifest_for_stdout(path, stdout_fd):
     if not path:
         return path
     try:
-        aliases_stdout = os.path.samestat(os.stat(path), os.fstat(stdout_fd))
+        manifest_stat = os.stat(path)
     except FileNotFoundError:
         return path
-    if not aliases_stdout:
+    if not _same_stream(manifest_stat, os.fstat(stdout_fd)):
         return path
-    if os.path.samefile(path, os.devnull):
+    if _discard_stream(manifest_stat):
         return os.devnull
     raise ValueError("manifest path points to stdout: %s" % path)
-
-
-def _pty_slave_name(fd):
-    if hasattr(os, "ptsname"):
-        try:
-            return os.ptsname(fd)
-        except OSError:
-            return None
-    from ctypes import CDLL, c_char_p
-
-    ptsname = getattr(CDLL(None), "ptsname", None)
-    if ptsname is not None:
-        ptsname.restype = c_char_p
-        return ptsname(fd)
-    return None
-
-
-def _terminal_endpoint(fd):
-    peer = _pty_slave_name(fd)
-    if peer:
-        try:
-            return True, os.stat(peer).st_rdev
-        except OSError:
-            return True, None
-
-    device = os.fstat(fd).st_rdev
-    try:
-        if device != os.stat(os.ctermid()).st_rdev:
-            return False, device
-    except (AttributeError, OSError):
-        return False, device
-
-    # Linux reports the controlling terminal's device as tty_nr in procfs.
-    try:
-        with open("/proc/self/stat") as proc_stat:
-            tty_nr = proc_stat.read().rsplit(")", 1)[1].split()[4]
-        return False, (int(tty_nr) & 0xFFFFFFFF) or None
-    except (OSError, IndexError, ValueError):
-        return False, None
-
-
-def _streams_overlap(stdout_fd, other_fd):
-    if not (os.isatty(stdout_fd) and os.isatty(other_fd)):
-        return os.path.samestat(os.fstat(stdout_fd), os.fstat(other_fd))
-
-    stdout_master, stdout_device = _terminal_endpoint(stdout_fd)
-    other_master, other_device = _terminal_endpoint(other_fd)
-    if stdout_device is None or other_device is None:
-        return True
-    if stdout_device != other_device:
-        return False
-    if stdout_master == other_master:
-        return True
-    if stdout_master:
-        return False
-
-    # Input sent to the master can echo back alongside output from the slave.
-    import termios
-
-    return bool(termios.tcgetattr(stdout_fd)[3] & (termios.ECHO | termios.ECHONL))
 
 
 def _write_stdout_manifest(path, manifest, stdout_fd):
@@ -142,8 +93,7 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
     # Validate the actual destination before truncating or writing anything.
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
         manifest_stat = os.fstat(fh.fileno())
-        if (_streams_overlap(stdout_fd, fh.fileno())
-                and not os.path.samestat(manifest_stat, os.stat(os.devnull))):
+        if _same_stream(manifest_stat, os.fstat(stdout_fd)) and not _discard_stream(manifest_stat):
             raise ValueError("manifest path points to stdout: %s" % path)
         if stat.S_ISREG(manifest_stat.st_mode):
             fh.truncate(0)
@@ -154,9 +104,9 @@ def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
         _prepare_compile_stderr()
-        stream_mode = stdout_stat.st_mode
-        if ((stat.S_ISFIFO(stream_mode) or stat.S_ISREG(stream_mode)
-             or stat.S_ISSOCK(stream_mode) or os.isatty(1)) and _streams_overlap(1, 2)):
+        if os.isatty(1):
+            raise ValueError("compile -o - requires redirected output: redirect stdout to a pipe or file")
+        if _same_stream(stdout_stat, os.fstat(2)) and not _discard_stream(stdout_stat):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:

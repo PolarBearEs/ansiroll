@@ -55,6 +55,9 @@ set -o pipefail
 python3 -m ansiroll.cli compile playbook.yml -o - | python3 -
 ```
 
+Keep stdout and stderr separate. Send stdout to a pipe or file because a terminal
+can transform the generated source.
+
 Configure any Python startup hooks, such as `sitecustomize`, to send their
 messages to stderr so they cannot add text to the pipeline before Ansiroll runs.
 When Ansiroll and Ansible are installed in the interpreter's environment, use
