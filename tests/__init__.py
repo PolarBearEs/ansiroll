@@ -4,11 +4,15 @@ import os
 import sys
 
 
-# The playbook directory can contain an unrelated tests.py.
+# Keep playbook-local modules out of the bootstrap's imports.
 _BOOTSTRAP = (
-    "import runpy, sys; _implicit_cwd = sys.path[:1] == ['']; "
+    "import sys; _implicit_cwd = sys.path[:1] == ['']; "
     "sys.path[:1] = [] if _implicit_cwd else sys.path[:1]; "
+    "import os; _playbook_cwd = os.getcwd(); _reference_path = sys.path[:]; "
+    "sys.path[:] = [entry for entry in _reference_path if entry not in ('', _playbook_cwd)]; "
+    "import runpy; "
     "_parity_bootstrap = runpy.run_path(sys.argv.pop(1), run_name='_ansiroll_parity_bootstrap'); "
+    "sys.path[:] = _reference_path; "
 )
 _ANSIBLE_MODULE_ALIASES = {
     "ansible.compat.selectors": "selectors",
@@ -33,8 +37,7 @@ def ansible_playbook_command():
 
 def ansiroll_compile_command():
     return _reference_python(
-        "import os; "
-        "sys.path[:0] = [os.getcwd()] if _implicit_cwd else []; "
+        "sys.path[:0] = [_playbook_cwd] if _implicit_cwd else []; "
         "_parity_bootstrap['_load_reference_ansible'](sys.argv.pop(1)); "
         "runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)"
     ) + ["compile"]
@@ -290,7 +293,12 @@ def _installed_playbook_launchers(package):
     search_path = list(dict.fromkeys([*sys.path, os.path.dirname(package)]))
     for name in ("ansible-core", "ansible-base", "ansible"):
         for distribution in metadata.distributions(name=name, path=search_path):
-            if os.path.realpath(distribution.locate_file("ansible")) != package:
+            try:
+                location = os.fspath(distribution.locate_file("ansible"))
+            except TypeError:
+                # Archive metadata cannot identify a filesystem launcher.
+                continue
+            if os.path.realpath(location) != package:
                 continue
             for entry in distribution.files or ():
                 if entry.name == "ansible-playbook" and "ansible_test" not in entry.parts:

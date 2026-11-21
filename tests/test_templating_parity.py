@@ -102,6 +102,33 @@ def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path
     assert __version__ in result.stdout
 
 
+def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch):
+    (tmp_path / "runpy.py").write_text("raise RuntimeError('unexpected playbook-local runpy')\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+    command = ansible_playbook_command()
+    if sys.version_info >= (3, 11):
+        command[1:1] = ["-X", "frozen_modules=off"]
+    result = subprocess.run(
+        command + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
+def test_reference_launcher_ignores_archived_distribution_metadata(tmp_path, monkeypatch):
+    from zipfile import ZipFile
+
+    archive = tmp_path / "foreign.zip"
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("ansible_core-0.0.dist-info/METADATA", "Name: ansible-core\nVersion: 0.0\n")
+    monkeypatch.setenv("PYTHONPATH", str(archive), prepend=os.pathsep)
+    result = subprocess.run(
+        ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
 def test_reference_bootstrap_preserves_playbook_local_imports(tmp_path, monkeypatch):
     from tests import _reference_python
 
