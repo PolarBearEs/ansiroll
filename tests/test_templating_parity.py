@@ -155,6 +155,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     ("#!/bin/sh\n'''exec' /workspace/team,2=parity:linux#1/" + "long-component/" * 8
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team\u3000two/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])
 def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale, prefix):
@@ -188,6 +190,8 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
 
 @pytest.mark.parametrize("interpreter", [
     "ANSIBLE_CONFIG=/custom /usr/bin/python3",
+    "/workspace/team two/bin/python3",
+    "/workspace/team\ttwo/bin/python3",
     "/workspace/$TEAM/bin/python3",
     "/workspace/{old,new}/bin/python3",
     "/workspace/team[12]/bin/python3",

@@ -112,9 +112,9 @@ def _launcher_body(source):
         name = os.path.basename(interpreter[1:-1].replace("'\"'\"'", "'"))
     elif (
         re.fullmatch(r'"/[^"$\x60\\]+"', interpreter)
-        # An absolute unquoted word can contain literal punctuation. Keep
-        # shell operators, quoting, substitutions and expansions out.
-        or re.fullmatch(r"""/[^\s\x00-\x1f\x7f'"`$\\|&;<>()*?\[{}]+""", interpreter)
+        # Shell token delimiters are ASCII. Unicode spaces can be literal
+        # filename characters, like punctuation that has no shell meaning.
+        or re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?\[{}]+""", interpreter)
     ):
         name = os.path.basename(interpreter.strip('"'))
     else:
