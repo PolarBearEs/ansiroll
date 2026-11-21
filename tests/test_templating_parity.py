@@ -102,14 +102,24 @@ def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path
     assert __version__ in result.stdout
 
 
-def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch):
-    (tmp_path / "runpy.py").write_text("raise RuntimeError('unexpected playbook-local runpy')\n")
-    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+@pytest.mark.parametrize("symlinked_path", [False, True])
+def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, symlinked_path):
+    playbook_dir = tmp_path / "playbook"
+    playbook_dir.mkdir()
+    (playbook_dir / "runpy.py").write_text("raise RuntimeError('unexpected playbook-local runpy')\n")
+    import_path = playbook_dir
+    if symlinked_path:
+        import_path = tmp_path / "playbook-link"
+        try:
+            import_path.symlink_to(playbook_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+    monkeypatch.setenv("PYTHONPATH", str(import_path), prepend=os.pathsep)
     command = ansible_playbook_command()
     if sys.version_info >= (3, 11):
         command[1:1] = ["-X", "frozen_modules=off"]
     result = subprocess.run(
-        command + ["--version"], cwd=tmp_path, env=_env(),
+        command + ["--version"], cwd=playbook_dir, env=_env(),
         capture_output=True, text=True, timeout=30, check=True,
     )
     assert __version__ in result.stdout
