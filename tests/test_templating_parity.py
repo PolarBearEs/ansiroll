@@ -200,6 +200,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
     ("#!/bin/sh\n'''exec' /workspace/team[draft/" + "long-component/" * 8
      + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team{draft}/" + "long-component/" * 8
+     + "venv/bin/python3.10d \"$0\" \"$@\"\n' '''\n"),
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])
 def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale, prefix):
@@ -237,6 +239,8 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     "/workspace/team\ttwo/bin/python3",
     "/workspace/$TEAM/bin/python3",
     "/workspace/{old,new}/bin/python3",
+    "/workspace/{old{draft},new}/bin/python3",
+    "/workspace/team{-1..+3..+2}/bin/python3",
     "/workspace/team[12]/bin/python3",
     "/workspace/team[]]/bin/python3",
     "/workspace/team?2/bin/python3",
@@ -251,6 +255,16 @@ def test_launcher_body_keeps_unrecognized_shell_initialization(interpreter):
         "' '''\nstart_expected_release()\n"
     )
     assert _launcher_body(wrapper) == wrapper
+
+
+def test_launcher_body_accepts_the_current_interpreter_under_a_custom_name(tmp_path, monkeypatch):
+    from tests import _launcher_body
+
+    executable = tmp_path / "custom-cpython"
+    monkeypatch.setattr(sys, "executable", str(executable))
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' '{executable}' \"$0\" \"$@\"\n' '''\n{body}"
+    assert _launcher_body(wrapper) == body
 
 
 def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):

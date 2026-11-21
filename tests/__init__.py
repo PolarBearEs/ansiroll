@@ -102,6 +102,26 @@ def _has_bracket_glob(path):
     return False
 
 
+def _has_brace_expansion(path):
+    import re
+
+    braces = []
+    for token in re.finditer(r"[{},]", path):
+        char = token.group()
+        if char == "{":
+            braces.append((token.end(), False))
+        elif braces and char == ",":
+            braces[-1] = (braces[-1][0], True)
+        elif braces:
+            start, has_comma = braces.pop()
+            if has_comma or re.fullmatch(
+                r"(?:[+-]?[0-9]+\.\.[+-]?[0-9]+|[A-Za-z]\.\.[A-Za-z])(?:\.\.[+-]?[0-9]+)?",
+                path[start:token.start()],
+            ):
+                return True
+    return False
+
+
 def _launcher_body(source):
     import re
 
@@ -123,21 +143,26 @@ def _launcher_body(source):
         target = interpreter[len(relocatable):]
         if not re.fullmatch(r"'[^']+'", target):
             return source
-        name = target[1:-1]
+        executable = target[1:-1]
     elif re.fullmatch(r"'/[^']*'(?:\"'\"'[^']*')*", interpreter):
         # uv joins single-quoted pieces with a double-quoted apostrophe.
-        name = os.path.basename(interpreter[1:-1].replace("'\"'\"'", "'"))
+        executable = interpreter[1:-1].replace("'\"'\"'", "'")
+    elif re.fullmatch(r'"/[^"$\x60\\]+"', interpreter):
+        executable = interpreter[1:-1]
     elif (
-        re.fullmatch(r'"/[^"$\x60\\]+"', interpreter)
         # Shell token delimiters are ASCII. Unicode spaces can be literal
         # filename characters, like punctuation that has no shell meaning.
-        or (re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?{}]+""", interpreter)
-            and not _has_bracket_glob(interpreter))
+        re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?]+""", interpreter)
+        and not _has_bracket_glob(interpreter)
+        and not _has_brace_expansion(interpreter)
     ):
-        name = os.path.basename(interpreter.strip('"'))
+        executable = interpreter
     else:
         return source
-    if re.fullmatch(r"(?:python|pypy)[0-9.]*", name):
+    if (
+        re.fullmatch(r"(?:python|pypy)[0-9.]*t?d?", os.path.basename(executable))
+        or (os.path.isabs(executable) and os.path.realpath(executable) == os.path.realpath(sys.executable))
+    ):
         return remaining.partition("\n")[2]
     return source
 
