@@ -320,7 +320,8 @@ def test_loop_task_condition_rejects_text_derived_from_registered_result(referen
         rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
 
 
-def test_loop_task_conditional_reads_only_used_alias_mapping_members():
+@pytest.mark.parametrize("reference", ["alias", "settings"])
+def test_loop_task_conditional_reads_only_used_mapping_members(reference):
     rt = Runtime({}, "", {})
 
     def unexpected_lookup():
@@ -336,8 +337,8 @@ def test_loop_task_conditional_reads_only_used_alias_mapping_members():
         "alias": "{{ settings }}",
     })
     ctx = rt._task_ctx(task, {})
-    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias.enabled }}"}], ctx)
-    condition = {"__ansiroll_trusted_condition__": "'{{ alias.text }}' == 'sample'"}
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ " + reference + ".enabled }}"}], ctx)
+    condition = {"__ansiroll_trusted_condition__": "'{{ " + reference + ".text }}' == 'sample'"}
     with pytest.raises(UntrustedConditional):
         rt.when([condition], ctx)
 

@@ -384,6 +384,10 @@ def _debug_var_value(value):
 def _condition_contains_string(value, string_type):
     if isinstance(value, string_type):
         return True
+    if isinstance(value, (_LazyTplDict, _LazyTplList)):
+        # The condition renderer observes members it actually accesses,
+        # after the current loop item has been bound.
+        return False
     if isinstance(value, dict):
         return any(
             _condition_contains_string(item, string_type)
