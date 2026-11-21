@@ -79,11 +79,13 @@ def _run_ansible_playbook():
 
     # Source checkouts may expose ansible through PYTHONPATH without a record.
     source_root = os.path.dirname(os.path.dirname(package))
-    for script in (
+    candidates = [
         os.path.join(source_root, "bin", "ansible-playbook"),
         os.path.join(os.path.dirname(sys.executable), "ansible-playbook"),
-        shutil.which("ansible-playbook"),
-    ):
+    ]
+    candidates.extend(shutil.which("ansible-playbook", path=directory or os.curdir)
+                      for directory in os.get_exec_path())
+    for script in dict.fromkeys(candidates):
         if script and os.path.isfile(script):
             python_script = _legacy_python_launcher(script, package)
             if python_script:
