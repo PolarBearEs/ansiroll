@@ -1224,20 +1224,91 @@ def test_implicit_setup_preserves_vars_file_order_in_play_scope(tmp_path, monkey
     assert _standalone(tmp_path, []) == expected
 
 
-def test_invalid_gather_keyword_aborts_before_ignore_errors(tmp_path):
-    _write(tmp_path, {"pb.yml": """
-        - hosts: localhost
-          gather_facts: true
-          ignore_errors: true
-          gather_subset: "{{ nonexistent_subset }}"
-          tasks:
-            - debug: {msg: reached_after_invalid_setup}
-    """})
+@pytest.mark.parametrize("gather_facts", ["true", "false", "cached"])
+@pytest.mark.parametrize("keyword, value, error_text", [
+    ("gather_subset", '"{{ nonexistent_subset }}"', "nonexistent_subset"),
+    ("gather_subset", "[all, 1]", "gather_subset"),
+    pytest.param("gather_timeout", "2.5", "gather_timeout", marks=pytest.mark.skipif(
+        CORE_VERSION < (2, 18), reason="older Core truncates floating timeouts")),
+])
+def test_invalid_gather_keyword_aborts_before_ignore_errors(
+        tmp_path, monkeypatch, gather_facts, keyword, value, error_text):
+    first_play = ""
+    if gather_facts == "cached":
+        monkeypatch.setenv("ANSIBLE_GATHERING", "smart")
+        first_play = "- hosts: localhost\n  gather_facts: true\n  gather_subset: ['!all', '!min']\n"
+        gather_facts = "true"
+    _write(tmp_path, {"pb.yml": first_play + f"""
+- hosts: localhost
+  gather_facts: {gather_facts}
+  ignore_errors: true
+  {keyword}: {value}
+  tasks:
+    - debug: {{msg: reached_after_invalid_setup}}
+"""})
     assert _ansible_run(tmp_path, []).returncode != 0
     result = _standalone_run(tmp_path, [])
     assert result.returncode != 0
-    assert "nonexistent_subset" in result.stderr
+    assert error_text in result.stderr
     assert "reached_after_invalid_setup" not in result.stdout
+
+
+def test_setup_ignores_previous_play_vars(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "roles/scope/defaults/main.yml": "facts_dir: correct-facts\n",
+        "roles/scope/tasks/main.yml": "[]\n",
+        "correct-facts/example.fact": '{"marker": "role default"}',
+        "wrong-facts/example.fact": '{"marker": "previous play"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            facts_dir: wrong-facts
+          tasks:
+            - debug: {msg: "{{ facts_dir }}"}
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ facts_dir }}"
+          roles: [scope]
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    })
+    assert msgs == ['"wrong-facts"', '"role default"']
+
+
+def test_setup_reselects_vars_file_with_runtime_extra_vars(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "vars/dev.yml": "requested_subset: [all]\n",
+        "vars/prod.yml": "requested_subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ requested_subset }}"
+          vars_files: ['vars/{{ setup_profile }}.yml']
+          vars:
+            setup_profile: dev
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    extra = json.dumps({"setup_profile": "prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+def test_setup_keywords_see_check_and_diff_mode(tmp_path):
+    msgs, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ ['all'] if ansible_check_mode or ansible_diff_mode else ['!all', '!min'] }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """})
+    assert msgs == ['"distribution defined: False"']
 
 
 def test_setup_vars_file_can_read_shadowed_inventory_selector(tmp_path):

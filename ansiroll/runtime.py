@@ -17,6 +17,7 @@ installed Jinja2.
 
 import datetime as _dt
 import base64
+import decimal
 import json
 import os
 import struct
@@ -2350,18 +2351,22 @@ class Runtime:
         saved_facts = self.vars.get("ansible_facts")
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
-        if play.get("gather_facts") and not gather_cached:
-            setup_ctx, gather_play_ctx = self._gather_contexts(play)
-            setup_options = play.get("gather_options") or {}
-            play_options = None
-            if self.gather_args_fn is None and setup_options:
-                play_options = {key: value for key, value in setup_options.items() if key != "fact_path"}
+        run_setup = play.get("gather_facts") and not gather_cached
+        setup_options = play.get("gather_options") or {}
+        play_keywords = {}
+        if self.gather_args_fn is None:
+            play_keywords = {key: value for key, value in setup_options.items() if key != "fact_path"}
+            setup_options = {key: value for key, value in setup_options.items() if key == "fact_path"}
+        play_options = None
+        if run_setup or play_keywords:
+            setup_ctx, gather_play_ctx = self._gather_contexts(play, invocation_check_mode, run_setup)
+            if play_keywords:
                 try:
-                    play_options = self._setup_args(play_options, play.get("gather_option_defaults"),
+                    play_options = self._setup_args(play_keywords, play.get("gather_option_defaults"),
                                                     setup_ctx, gather_play_ctx)
-                except (ValueError, TypeError, jinja2.UndefinedError) as ex:
+                except (ValueError, TypeError, jinja2.UndefinedError, decimal.DecimalException) as ex:
                     raise PlayConfigurationError("invalid play fact gathering options: %s" % ex)
-                setup_options = {"fact_path": setup_options["fact_path"]} if "fact_path" in setup_options else {}
+        if run_setup:
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -2624,11 +2629,12 @@ class Runtime:
         merge = (before_setup or bool(scope)) and self._gather_hash_merge()
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if base is None:
-            base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
             if scope:
-                base = {key: value for key, value in base.items() if key not in self._include_vars_layer}
-                base = _f_combine(scope.get("role_defaults"), self._gather_inventory_vars,
-                                  self._module_fact_layer, base, scope.get("magic"), recursive=merge)
+                magic = dict(scope.get("magic") or {}, ansible_check_mode=bool(self.check_mode),
+                             ansible_diff_mode=bool(self.diff_mode))
+                base = self._gather_host_base(scope, magic, merge)
+            else:
+                base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in scope.get("vars_files", play.get("deferred_vars_files")) or ():
             if "values" in entry:
                 play_vars = _f_combine(play_vars, *entry["values"], recursive=merge)
@@ -2686,7 +2692,16 @@ class Runtime:
         config = self.vars.get("__ansiroll_controller_config") or {}
         return config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
 
-    def _gather_contexts(self, play):
+    def _gather_host_base(self, scope, magic, merge):
+        facts = dict(self._module_fact_layer)
+        if facts:
+            facts["ansible_facts"] = _normalized_facts(facts)
+        controller = {key: self.vars[key] for key in
+                      ("__ansiroll_controller_env", "__ansiroll_controller_config")}
+        return _f_combine(scope["role_defaults"], self._gather_inventory_vars, facts,
+                          controller, magic, recursive=merge)
+
+    def _gather_contexts(self, play, invocation_check_mode, run_setup):
         setup_vars = dict(self.vars)
         scope = play.get("gather_scope")
         if not scope:
@@ -2695,7 +2710,8 @@ class Runtime:
 
         defaults = scope["role_defaults"]
         exports = scope["role_exports"]
-        magic = scope.get("magic") or {}
+        magic = dict(scope.get("magic") or {}, ansible_check_mode=bool(invocation_check_mode),
+                     ansible_diff_mode=bool(self.diff_mode))
         merge = self._gather_hash_merge()
         # Core validates gather_subset and gather_timeout with play-only vars.
         play_base = dict(defaults)
@@ -2707,13 +2723,13 @@ class Runtime:
         play_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
         play_ctx = self.ctx(base=play_vars)
 
+        if not run_setup:
+            return None, play_ctx
+
         # The implicit setup task resolves fact_path with host and task vars.
-        host_file_vars = {key: value for key, value in self.vars.items()
-                          if key not in self._set_fact_overrides and key not in self._include_vars_layer}
-        file_base = _f_combine(defaults, self._gather_inventory_vars, self._module_fact_layer,
-                               host_file_vars, magic, recursive=merge)
-        setup_files = self._with_deferred_vars_files(play, base=file_base, before_setup=True)
-        setup_vars = _f_combine(defaults, self.vars, setup_files, exports, self._include_vars_layer,
+        host_base = self._gather_host_base(scope, magic, merge)
+        setup_files = self._with_deferred_vars_files(play, base=host_base, before_setup=True)
+        setup_vars = _f_combine(host_base, setup_files, exports, self._include_vars_layer,
                                 self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
         setup_vars["ansible_search_path"] = scope["search_path"]
         setup_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
@@ -4351,15 +4367,25 @@ class Runtime:
             if rendered.get(key) == _OMIT:
                 rendered[key] = value
         args = {key: value for key, value in _strip_omit(rendered).items() if value is not None}
-        if "gather_timeout" in args and not _core_at_least(2, 18):
-            args["gather_timeout"] = int(args["gather_timeout"])
+        if "gather_timeout" in args:
+            timeout = args["gather_timeout"]
+            if not _core_at_least(2, 18):
+                args["gather_timeout"] = int(timeout)
+            elif not isinstance(timeout, int):
+                parsed = decimal.Decimal(timeout)
+                if not parsed.is_finite() or parsed != parsed.to_integral_value():
+                    raise ValueError("gather_timeout must be an integer")
+                args["gather_timeout"] = int(parsed)
         if not _core_at_least(2, 13) and not args.get("gather_timeout"):
             args.pop("gather_timeout", None)
         subset = args.get("gather_subset")
-        if isinstance(subset, str):
-            args["gather_subset"] = [subset]
-        elif isinstance(subset, (list, tuple)) and _core_at_least(2, 19):
-            args["gather_subset"] = [name for name in subset if name != _OMIT]
+        if subset is not None:
+            subset = subset if isinstance(subset, list) else [subset]
+            if _core_at_least(2, 19):
+                subset = [name for name in subset if name != _OMIT]
+            if any(not isinstance(name, str) for name in subset):
+                raise ValueError("gather_subset must contain only strings")
+            args["gather_subset"] = subset
         return args
 
     def gather_facts(self, environment=None, become=False, become_user=None,

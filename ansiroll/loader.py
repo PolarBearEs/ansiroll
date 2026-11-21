@@ -261,7 +261,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         if value is None:
             continue
         # Pre-2.13 play iterators omit falsey timeout and fact path values.
-        if core_version < (2, 13) and option != "gather_subset" and not value:
+        if core_version < (2, 13) and (
+                (option == "gather_timeout" and isinstance(value, (int, float)) and value == 0)
+                or (option == "fact_path" and not value)):
             continue
         gather_options[option] = value
     # Before 2.18, omitting these play fields restores the controller default.
@@ -300,7 +302,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
-    if gather and gather_facts is None and any(
+    if gather_facts is None and any(
             _is_templated(item) for value in gather_options.values() for item in _as_list(value)):
         from ansible.utils.vars import combine_vars
 
@@ -337,12 +339,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             "search_path": _raw_search_path(play, basedir),
             "search_dirs": _search_dirs(play, basedir, "files"),
         }
-        if unresolved_vars_files:
-            deferred = iter(result["deferred_vars_files"])
+        if any("selector" in entry for entry in ordered_vars_files):
+            gather_vars_files = []
+            for entry in ordered_vars_files:
+                if "selector" not in entry:
+                    gather_vars_files.append(_tag_untrusted(entry))
+                    continue
+                bundled, = _deferred_vars_files(play, basedir, [entry["selector"]])
+                if "path" in entry:
+                    bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
+                gather_vars_files.append(bundled)
             result["gather_scope"].update({
                 "base_vars": _tag_untrusted(dict(play.vars or {})),
-                "vars_files": [next(deferred) if entry is None else _tag_untrusted(entry)
-                               for entry in ordered_vars_files],
+                "vars_files": gather_vars_files,
             })
     names = _controller_env_names(result)
     if names:
@@ -451,19 +460,19 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
     out = dict(play.vars or {})
     use_search_stack = _core_version() >= (2, 12)
     for entry in _as_list(getattr(play, "vars_files", None)):
+        record = {}
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
             raw = filename
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
+                record["selector"] = entry
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
                 if filename is None:
                     if unresolved is not None:
                         unresolved.append(entry)
-                    if ordered is not None:
-                        ordered.append(None)
                     break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
@@ -479,8 +488,12 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
             for item in values:
                 out = combine_vars(out, item)
             if ordered is not None:
-                ordered.append({"values": values})
+                record["values"] = values
+                if "selector" in record:
+                    record["path"] = os.path.normpath(os.path.join(basedir, path))
             break
+        if ordered is not None and record:
+            ordered.append(record)
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
     # and unrelated inventory state are not baked into every play.
