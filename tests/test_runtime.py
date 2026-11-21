@@ -338,10 +338,11 @@ def test_loop_task_condition_rejects_text_derived_from_registered_result(referen
         rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
 
 
-def test_loop_items_keep_provenance_of_registered_list():
+@pytest.mark.parametrize("loop", ["{{ previous.stdout_lines }}", "{{ previous.data | list }}"])
+def test_loop_items_keep_provenance_of_registered_collections(loop):
     rt = Runtime({}, "", {})
-    rt._store_register({"register": "previous"}, {"stdout_lines": ["sample"]})
-    task = _task("task", "Task", None, loop="{{ previous.stdout_lines }}", vars={
+    rt._store_register({"register": "previous"}, {"stdout_lines": ["sample"], "data": {"sample": True}})
+    task = _task("task", "Task", None, loop=loop, vars={
         "alias": "'{{ item }}' == 'sample'",
     })
     ctx = rt._task_ctx(task, {})
@@ -363,6 +364,23 @@ def test_loop_alias_keeps_provenance_of_current_result(keyword, monkeypatch):
                for frame in frames)
 
 
+@pytest.mark.parametrize("keyword, expected", [
+    ("changed_when", "changed"),
+    ("failed_when", "ok"),
+    ("until", "ok"),
+    ("loop_break_when", "ok"),
+])
+def test_boolean_condition_can_read_current_registered_result(keyword, expected, monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    expected_msg = "unmatched" if keyword == "failed_when" else "sample"
+    condition = {"__ansiroll_trusted_condition__": "{{ result.msg == '" + expected_msg + "' }}"}
+    task = _task("task", "Task", "debug", loop=["sample"], register="result",
+                 args={"msg": "sample"}, **{keyword: [condition]})
+    _rt, frames = run([task])
+    assert any(frame["status"] == expected for frame in frames)
+    assert all(frame["status"] != "failed" for frame in frames)
+
+
 def test_loop_alias_reads_trusted_replacement_of_a_register():
     tasks = [
         _task("produce", "Produce", "debug", args={"msg": "initial"}, register="value"),
@@ -381,6 +399,30 @@ def test_loop_assertion_tracks_trust_for_each_expression(second, trusted):
     rt._store_register({"register": "result"}, {"stdout": "1"})
     task = _task("task", "Task", None, loop=[1], vars={
         "alias": "{{ [result.stdout == '1', " + second + "] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    condition = {"__ansiroll_trusted_condition__": "{{ alias }}"}
+    if trusted:
+        assert rt.when([condition], ctx, keyword=None)
+    else:
+        with pytest.raises(UntrustedConditional):
+            rt.when([condition], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("composition", [
+    "[result.stdout == '1'] + checks",
+    "checks + [result.stdout == '1']",
+    "([result.stdout == '1'] + checks) + ['item is number']",
+])
+@pytest.mark.parametrize("trusted", [True, False])
+def test_loop_assertion_tracks_members_through_list_composition(composition, trusted):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    values = ["item == 1"] if trusted else ["item == {{ result.stdout }}"]
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": values,
+        "alias": "{{ " + composition + " }}",
     })
     ctx = rt._task_ctx(task, {})
     ctx["item"] = 1

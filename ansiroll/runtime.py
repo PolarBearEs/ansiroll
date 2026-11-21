@@ -179,6 +179,10 @@ _NO_TEMPLATE = (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue)
 class _RegisteredResult(dict):
     """A module result bound to its task's register."""
 
+    def __init__(self, data, current):
+        super().__init__(data)
+        self.current = current
+
 
 class _IncludedVars(dict):
     """Controller-loaded include_vars definitions carried in a task result."""
@@ -221,7 +225,8 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             # Lazy views render on access; plain containers are read raw.
             items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
             for key, item in items:
-                out[_mark_unsafe(key, _seen)] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text)
+                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text)
+                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text)
             return out
         if isinstance(value, list):
             out = []
@@ -234,9 +239,10 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
     return value
 
 
-def _registered_result(task, result):
+def _registered_result(task, result, current=True):
     include_vars = (task.get("action") or "").rsplit(".", 1)[-1] == "include_vars"
-    return _RegisteredResult(_mark_unsafe(result, preserve_included_vars=include_vars, condition_text=True))
+    return _RegisteredResult(
+        _mark_unsafe(result, preserve_included_vars=include_vars, condition_text=True), current)
 
 
 def _decode_frozen_value(value):
@@ -1777,41 +1783,61 @@ class _Templater:
                     else result)
         return result
 
+    def _conditional_member(self, env, node):
+        nodes = jinja2.nodes
+        assignment = nodes.Assign(nodes.Name("result", "store"), node, lineno=1)
+        template = env.from_string(nodes.Template([assignment], lineno=1))
+        expression = jinja2.environment.TemplateExpression(template, False)
+
+        def evaluate(ctx):
+            previous = self._untrusted_task_interpolation
+            self._untrusted_task_interpolation = False
+            try:
+                value = expression(**ctx)
+                if self._untrusted_task_interpolation and isinstance(value, (str, list, tuple)):
+                    value = _mark_unsafe(value, condition_text=True)
+                return value
+            finally:
+                # A boolean's inputs don't taint the expression in a sibling.
+                self._untrusted_task_interpolation = previous
+
+        return evaluate
+
+    def _conditional_collection(self, env, node):
+        nodes = jinja2.nodes
+        if isinstance(node, (nodes.List, nodes.Tuple)):
+            collection = tuple if isinstance(node, nodes.Tuple) else list
+            members = [self._conditional_collection(env, item) or self._conditional_member(env, item)
+                       for item in node.items]
+            return lambda ctx: collection(member(ctx) for member in members)
+        if isinstance(node, nodes.Add):
+            left = self._conditional_collection(env, node.left)
+            right = self._conditional_collection(env, node.right)
+            if left or right:
+                left = left or self._conditional_member(env, node.left)
+                right = right or self._conditional_member(env, node.right)
+                return lambda ctx: left(ctx) + right(ctx)
+        return None
+
     def _conditional_list(self, text, env, ctx, strict):
         key = (text, strict)
         if key not in self._condition_list_cache:
             nodes = jinja2.nodes
             parsed = env.parse(text)
-            expressions = None
+            evaluate = None
             if len(parsed.body) == 1 and isinstance(parsed.body[0], nodes.Output):
                 output = parsed.body[0].nodes
-                if len(output) == 1 and isinstance(output[0], (nodes.List, nodes.Tuple)):
-                    members = []
-                    for item in output[0].items:
-                        assignment = nodes.Assign(nodes.Name("result", "store"), item, lineno=1)
-                        template = env.from_string(nodes.Template([assignment], lineno=1))
-                        members.append(jinja2.environment.TemplateExpression(template, False))
-                    expressions = (tuple if isinstance(output[0], nodes.Tuple) else list, members)
-            self._condition_list_cache[key] = expressions
-        expressions = self._condition_list_cache[key]
-        if expressions is None:
+                if len(output) == 1:
+                    evaluate = self._conditional_collection(env, output[0])
+            self._condition_list_cache[key] = evaluate
+        evaluate = self._condition_list_cache[key]
+        if evaluate is None:
             return None
 
-        # A boolean member's inputs don't taint a separate expression.
-        collection, members = expressions
-        values = []
-        previous = self._untrusted_task_interpolation
-        try:
-            for member in members:
-                self._untrusted_task_interpolation = False
-                value = member(**ctx)
-                if self._untrusted_task_interpolation and isinstance(value, str):
-                    value = _UntrustedConditionValue(value)
-                values.append(value)
-        finally:
-            self._untrusted_task_interpolation = previous or _condition_contains_string(
-                values, _UntrustedConditionValue)
-        return collection(values)
+        result = evaluate(ctx)
+        if _condition_contains_string(result, _UntrustedConditionValue):
+            self._untrusted_task_interpolation = True
+        return result
 
     def _render_string(self, text, ctx, strict=False):
         env = self._strict_env if strict else self.env
@@ -1825,7 +1851,7 @@ class _Templater:
             expr = stripped[2:-2].strip()
             expr_key = (expr, True) if strict else expr
             try:
-                if self._untrusted_task_interpolation is not None and expr.startswith(("[", "(")):
+                if self._untrusted_task_interpolation is not None and (expr.startswith(("[", "(")) or "+" in expr):
                     sequence = self._conditional_list(stripped, env, ctx, strict)
                     if sequence is not None:
                         return sequence
@@ -2104,7 +2130,7 @@ class Runtime:
     def _store_register(self, task, result):
         name = task.get("register")
         if name:
-            self.vars[name] = _registered_result(task, result)
+            self.vars[name] = _registered_result(task, result, current=False)
             # Registered vars live in the nonpersistent fact cache, like
             # set_fact: they outrank play/role/block/task vars.
             self._set_fact_overrides[name] = self.vars[name]
@@ -2235,8 +2261,8 @@ class Runtime:
             if any(
                     name in ctx
                     and (
-                        isinstance(ctx[name], _RegisteredResult)
-                        or _condition_contains_string(ctx[name], _UntrustedConditionValue)
+                        (not ctx[name].current if isinstance(ctx[name], _RegisteredResult)
+                         else _condition_contains_string(ctx[name], _UntrustedConditionValue))
                     )
                     for name in referenced):
                 raise UntrustedConditional(
