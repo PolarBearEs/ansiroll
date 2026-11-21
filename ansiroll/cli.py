@@ -6,12 +6,10 @@ import argparse
 import errno
 import json
 import os
-import secrets
 import stat
 import subprocess
 import sys
 import tempfile
-import unicodedata
 from contextlib import ExitStack, redirect_stdout
 
 from .compiler import compile_playbook
@@ -130,42 +128,20 @@ def _same_missing_destination(output, manifest):
         return False
     _, parent, output_name = output
     _, _, manifest_name = manifest
-    if os.path.normcase(output_name) == os.path.normcase(manifest_name):
+    if output_name == manifest_name:
         return True
-    output_folded = unicodedata.normalize("NFC", output_name).casefold()
-    manifest_folded = unicodedata.normalize("NFC", manifest_name).casefold()
-    if output_folded != manifest_folded:
+
+    # A child directory inherits the destination filesystem's naming rules.
+    # Use the full requested names so filesystem folding and component
+    # length limits apply to the probe exactly as they do to the outputs.
+    parent = os.path.realpath(parent)
+    info = os.stat(parent)
+    if (info.st_dev, info.st_ino) != output[0]:
         return False
-
-    # Use the destination directory's actual case rules. ASCII spellings only
-    # need a short case pair even when both requested names are at NAME_MAX.
-    if os.name == "nt":
-        return False
-    directory = os.open(parent, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY)
-    try:
-        info = os.fstat(directory)
-        if (info.st_dev, info.st_ino) != output[0]:
-            return False
-        if output_name.isascii() and manifest_name.isascii():
-            return _case_probe(directory, "a", "A")
-        return _case_probe(directory, output_name, manifest_name)
-    finally:
-        os.close(directory)
-
-
-def _case_probe(directory, name, alternate):
-    prefix = ".ansiroll-" + secrets.token_hex(4)
-    name = prefix + name
-    probe = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
-    try:
-        try:
-            alias_stat = os.stat(prefix + alternate, dir_fd=directory)
-        except FileNotFoundError:
-            return False
-        return os.path.samestat(os.fstat(probe), alias_stat)
-    finally:
-        os.close(probe)
-        os.unlink(name, dir_fd=directory)
+    with tempfile.TemporaryDirectory(prefix=".ansiroll-", dir=parent) as probe:
+        with open(os.path.join(probe, output_name), "xb") as first:
+            other = _stat_if_present(os.path.join(probe, manifest_name))
+            return other is not None and os.path.samestat(os.fstat(first.fileno()), other)
 
 
 def _check_file_destinations(output_path, manifest_path):
@@ -201,6 +177,25 @@ def _check_manifest_path(path, output_stat):
         raise ValueError("manifest path points to compiled output: %s" % path)
 
 
+def _pin_output_inode(path, output_fd, output_stat):
+    # A writable duplicate would cause ETXTBSY if the manifest consumer
+    # runs the generated script before it connects to the manifest FIFO.
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_NONBLOCK", 0)
+    if sys.platform == "linux":
+        paths = ("/proc/self/fd/%d" % output_fd, path)
+    else:
+        paths = (path,)
+    for candidate in paths:
+        try:
+            reference = os.open(candidate, flags)
+        except OSError:
+            continue
+        if os.path.samestat(output_stat, os.fstat(reference)):
+            return reference
+        os.close(reference)
+    return None
+
+
 def _write_compile_files(output_path, manifest_path, source, manifest):
     if not manifest_path:
         with open(output_path, "w") as output:
@@ -216,9 +211,9 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             _check_manifest_path(manifest_path, output_stat)
             if stat.S_ISREG(output_stat.st_mode):
                 output.truncate(0)
-                # Keep this inode from being recycled after closing the writer.
-                # A FIFO writer must close before a sequential reader can move on.
-                output_reference.callback(os.close, os.dup(output.fileno()))
+                reference = _pin_output_inode(output_path, output.fileno(), output_stat)
+                if reference is not None:
+                    output_reference.callback(os.close, reference)
             output.write(source)
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
