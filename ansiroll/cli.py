@@ -6,12 +6,13 @@ import argparse
 import errno
 import json
 import os
+import secrets
 import stat
 import subprocess
 import sys
 import tempfile
 import unicodedata
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -136,12 +137,35 @@ def _same_missing_destination(output, manifest):
     if output_folded != manifest_folded:
         return False
 
-    # The OS family alone doesn't tell us how this directory compares names.
-    # Ask the actual filesystem with the requested spellings and a unique prefix.
-    with tempfile.NamedTemporaryFile(prefix=".ansiroll-", suffix=output_name, dir=parent) as probe:
-        alias = probe.name[:-len(output_name)] + manifest_name
-        alias_stat = _stat_if_present(alias)
-        return alias_stat is not None and os.path.samestat(os.fstat(probe.fileno()), alias_stat)
+    # Use the destination directory's actual case rules. ASCII spellings only
+    # need a short case pair even when both requested names are at NAME_MAX.
+    if os.name == "nt":
+        return False
+    directory = os.open(parent, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY)
+    try:
+        info = os.fstat(directory)
+        if (info.st_dev, info.st_ino) != output[0]:
+            return False
+        if output_name.isascii() and manifest_name.isascii():
+            return _case_probe(directory, "a", "A")
+        return _case_probe(directory, output_name, manifest_name)
+    finally:
+        os.close(directory)
+
+
+def _case_probe(directory, name, alternate):
+    prefix = ".ansiroll-" + secrets.token_hex(4)
+    name = prefix + name
+    probe = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+    try:
+        try:
+            alias_stat = os.stat(prefix + alternate, dir_fd=directory)
+        except FileNotFoundError:
+            return False
+        return os.path.samestat(os.fstat(probe), alias_stat)
+    finally:
+        os.close(probe)
+        os.unlink(name, dir_fd=directory)
 
 
 def _check_file_destinations(output_path, manifest_path):
@@ -186,29 +210,34 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
 
     # Paths can change during compilation or between the check and open.
     _check_file_destinations(output_path, manifest_path)
-    with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
-        output_stat = os.fstat(output.fileno())
-        _check_manifest_path(manifest_path, output_stat)
-        if stat.S_ISREG(output_stat.st_mode):
-            output.truncate(0)
-        output.write(source)
-        output.flush()
-        mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
-        if hasattr(os, "fchmod"):
-            os.fchmod(output.fileno(), mode)
-        else:
-            os.chmod(output_path, mode)
-    # Reopen the current pathname after Python output succeeds.
-    _check_file_destinations(output_path, manifest_path)
-    with os.fdopen(os.open(manifest_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as manifest_file:
-        manifest_stat = os.fstat(manifest_file.fileno())
-        current_output = _stat_if_present(output_path)
-        if (_same_stream(output_stat, manifest_stat)
-                or current_output is not None and _same_stream(current_output, manifest_stat)):
-            raise ValueError("manifest path points to compiled output: %s" % manifest_path)
-        if stat.S_ISREG(manifest_stat.st_mode):
-            manifest_file.truncate(0)
-        json.dump(manifest, manifest_file, indent=2)
+    with ExitStack() as output_reference:
+        with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
+            output_stat = os.fstat(output.fileno())
+            _check_manifest_path(manifest_path, output_stat)
+            if stat.S_ISREG(output_stat.st_mode):
+                output.truncate(0)
+                # Keep this inode from being recycled after closing the writer.
+                # A FIFO writer must close before a sequential reader can move on.
+                output_reference.callback(os.close, os.dup(output.fileno()))
+            output.write(source)
+            output.flush()
+            mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
+            if hasattr(os, "fchmod"):
+                os.fchmod(output.fileno(), mode)
+            else:
+                os.chmod(output_path, mode)
+
+        # Reopen the current pathname after Python output succeeds.
+        _check_file_destinations(output_path, manifest_path)
+        with os.fdopen(os.open(manifest_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as manifest_file:
+            manifest_stat = os.fstat(manifest_file.fileno())
+            current_output = _stat_if_present(output_path)
+            if (_same_stream(output_stat, manifest_stat)
+                    or current_output is not None and _same_stream(current_output, manifest_stat)):
+                raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+            if stat.S_ISREG(manifest_stat.st_mode):
+                manifest_file.truncate(0)
+            json.dump(manifest, manifest_file, indent=2)
 
 
 def _cmd_compile_stdout(args):

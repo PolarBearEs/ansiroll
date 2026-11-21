@@ -3,6 +3,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 from argparse import Namespace
 
 import pytest
@@ -276,14 +277,33 @@ def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatc
 
 
 @pytest.mark.parametrize("case_insensitive", [False, True])
-def test_file_compile_checks_missing_case_variants_in_destination_directory(monkeypatch, tmp_path, case_insensitive):
-    output = tmp_path / "compiled.py"
-    manifest = tmp_path / "COMPILED.py"
+@pytest.mark.parametrize("long_name", [False, True])
+def test_file_compile_checks_missing_case_variants_in_destination_directory(
+        monkeypatch, tmp_path, case_insensitive, long_name):
+    if not case_insensitive:
+        with tempfile.NamedTemporaryFile(prefix="case-check-", dir=tmp_path) as probe:
+            if (tmp_path / os.path.basename(probe.name).upper()).exists():
+                pytest.skip("requires a case-sensitive directory")
+    parent = tmp_path / "elsewhere"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(child, target_is_directory=True)
+    output_name = "compiled.py"
+    if long_name:
+        limit = os.pathconf(parent, "PC_NAME_MAX")
+        output_name = output_name.rjust(limit, "x")
+    output = link / ".." / output_name
+    manifest = parent / output_name.upper()
     real_stat = os.stat
+    parent_stat = parent.stat()
 
     def folded_stat(path, *args, **kwargs):
-        if case_insensitive and isinstance(path, str) and path.endswith("COMPILED.py"):
-            path = path[:-len("COMPILED.py")] + "compiled.py"
+        directory = kwargs.get("dir_fd")
+        if directory is not None and path.startswith(".ansiroll-"):
+            assert os.path.samestat(os.fstat(directory), parent_stat)
+            if case_insensitive and path.endswith("A"):
+                path = path[:-1] + "a"
         return real_stat(path, *args, **kwargs)
 
     def compile_playbook(*args, **kwargs):
@@ -294,7 +314,8 @@ def test_file_compile_checks_missing_case_variants_in_destination_directory(monk
     monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
     result = cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
     assert result == (2 if case_insensitive else 0)
-    assert set(tmp_path.iterdir()) == (set() if case_insensitive else {output, manifest})
+    expected = {child} if case_insensitive else {child, parent / output_name, manifest}
+    assert set(parent.iterdir()) == expected
 
 
 def test_file_compile_preserves_symlink_path_lookup(monkeypatch, tmp_path):
@@ -462,6 +483,41 @@ def test_file_compile_detects_manifest_redirected_to_missing_output(monkeypatch,
         assert output.read_bytes() == b""
     else:
         assert not output.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+def test_file_compile_holds_output_inode_until_manifest_open(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
+    fchmod, open_fd, dup = os.fchmod, os.open, os.dup
+    output_references = {}
+
+    def remember_duplicate(fd):
+        duplicate = dup(fd)
+        output_references[duplicate] = os.fstat(fd)
+        return duplicate
+
+    def remove_output(fd, mode):
+        fchmod(fd, mode)
+        output.unlink()
+
+    def check_output_reference(path, flags, *args, **kwargs):
+        if path == str(manifest_path) and flags & os.O_WRONLY:
+            assert not output.exists()
+            assert len(output_references) == 1
+            duplicate, expected = next(iter(output_references.items()))
+            assert os.path.samestat(os.fstat(duplicate), expected)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "dup", remember_duplicate)
+    monkeypatch.setattr(os, "fchmod", remove_output)
+    monkeypatch.setattr(os, "open", check_output_reference)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest_path)]) == 0
+    assert json.loads(manifest_path.read_text()) == manifest
+    with pytest.raises(OSError):
+        os.fstat(next(iter(output_references)))
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
