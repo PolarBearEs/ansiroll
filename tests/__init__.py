@@ -31,7 +31,7 @@ def _run_ansible_playbook():
         if os.path.realpath(distribution.locate_file("ansible")) != package:
             continue
         for entry in distribution.files or ():
-            if entry.name == "ansible-playbook":
+            if entry.name == "ansible-playbook" and "ansible_test" not in entry.parts:
                 script = distribution.locate_file(entry)
                 if script.is_file():
                     runpy.run_path(str(script), run_name="__main__")
