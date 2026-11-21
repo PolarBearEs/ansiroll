@@ -1,5 +1,6 @@
 """Ansiroll test package."""
 
+import ast
 import os
 import re
 import shutil
@@ -15,7 +16,10 @@ _BOOTSTRAP = (
     "import sys; _implicit_cwd = sys.path[:1] == ['']; "
     "sys.path[:1] = [] if _implicit_cwd else sys.path[:1]; "
     "import os; _playbook_cwd = os.getcwd(); _reference_path = sys.path[:]; "
-    "sys.path.insert(0, os.path.dirname(os.__file__)); "
+    "_stdlib = os.path.dirname(os.__file__); "
+    "_extensions = os.path.join(sys.base_exec_prefix, 'DLLs') if os.name == 'nt' "
+    "else os.path.join(_stdlib, 'lib-dynload'); "
+    "sys.path[:0] = [_stdlib, _extensions]; "
     "import csv, runpy; "
     "_parity_bootstrap = runpy.run_path(sys.argv.pop(1), run_name='_ansiroll_parity_bootstrap'); "
     "sys.path[:] = _reference_path; "
@@ -122,6 +126,15 @@ def _run_legacy_playbook(filename, script):
     runpy.run_path(script, run_name="__main__")
 
 
+def _legacy_replay_command(filename, script, flags):
+    command = _reference_python(
+        "_parity_bootstrap['_run_legacy_playbook'](sys.argv.pop(1), sys.argv.pop(1))",
+        filename,
+    )
+    command[1:1] = [*flags, *(["-P"] if getattr(sys.flags, "safe_path", False) else [])]
+    return command + [script]
+
+
 def _ansible_version_fields(command, candidate, diagnostics):
     try:
         result = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=10)
@@ -132,7 +145,12 @@ def _ansible_version_fields(command, candidate, diagnostics):
         detail = result.stderr.strip() or result.stdout.strip() or "exit status %d" % result.returncode
         diagnostics.append("%s: %s" % (candidate, detail[-2000:]))
         return {}
-    return dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
+    fields = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" = ")
+        if separator:
+            fields[key.strip()] = value.strip()
+    return fields
 
 
 def _has_brace_expansion(path):
@@ -247,8 +265,12 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: cannot replay a non-Python launcher's initialization" % path)
         return None
 
-    body = _launcher_body(source)
-    if source.startswith("#!") and body == source:
+    shebang, newline, code = source.partition("\n")
+    flag = re.fullmatch(r"#![ \t]*(/[^ \t]+|/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)[ \t]+-s[ \t]*", shebang)
+    header_source = f"#!{flag[1]}{newline}{code}" if flag else source
+    flags = ("-s",) if flag else ()
+    body = _launcher_body(header_source)
+    if header_source.startswith("#!") and body == header_source:
         diagnostics.append("%s: launcher shebang cannot be replayed" % path)
         return None
 
@@ -261,7 +283,7 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
             if body == _launcher_body(expected.read()):
                 # The pinned process will execute the same startup code; a
                 # separate --version run cannot add evidence of provenance.
-                return path
+                return path, flags
         diagnostics.append("%s: launcher differs from the selected Ansible release" % path)
         return None
     except FileNotFoundError:
@@ -272,14 +294,11 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: %s" % (stub, ex))
         return None
 
-    probe = _reference_python(
-        "_parity_bootstrap['_run_legacy_playbook'](sys.argv.pop(1), sys.argv.pop(1))",
-        filename,
-    )
-    fields = _ansible_version_fields(probe + [path], path, diagnostics)
+    probe = _legacy_replay_command(filename, path, flags)
+    fields = _ansible_version_fields(probe, path, diagnostics)
     installed = fields.get("ansible python module location", "")
     if installed and os.path.realpath(installed) == package:
-        return path
+        return path, flags
     return None
 
 
@@ -316,9 +335,40 @@ def _path_playbook_launchers():
                 yield script
 
 
+def _is_stock_playbook_entrypoint(script):
+    # These stock wrappers only dispatch to main(). A custom wrapper may
+    # change the environment or CLI arguments before invoking Ansible.
+    bodies = (
+        "from ansible.cli.playbook import main\nmain()\n",
+        "import sys\nfrom ansible.cli.playbook import main\n"
+        "if __name__ == '__main__':\n"
+        "    if sys.argv[0].endswith('-script.pyw'):\n"
+        "        sys.argv[0] = sys.argv[0][:-11]\n"
+        "    elif sys.argv[0].endswith('.exe'):\n"
+        "        sys.argv[0] = sys.argv[0][:-4]\n"
+        "    sys.exit(main())\n",
+        "import re\nimport sys\nfrom ansible.cli.playbook import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+        "    sys.exit(main())\n",
+    )
+    try:
+        with tokenize.open(script) as launcher:
+            source = launcher.read()
+        body = _launcher_body(source)
+        if source.startswith("#!") and body == source:
+            return False
+        parsed = ast.dump(ast.parse(body))
+    except (OSError, SyntaxError, UnicodeError):
+        return False
+    return any(parsed == ast.dump(ast.parse(body)) for body in bodies)
+
+
 def _matching_path_launcher(package):
     diagnostics = []
     for script in _path_playbook_launchers():
+        if not _is_stock_playbook_entrypoint(script):
+            continue
         fields = _ansible_version_fields([script], script, diagnostics)
         installed = fields.get("ansible python module location", "")
         if installed and os.path.realpath(installed) == package:
@@ -353,8 +403,12 @@ def _run_ansible_playbook(filename, version):
     for script, associated in candidates:
         if script and script not in seen and os.path.isfile(script):
             seen.add(script)
-            python_script = _legacy_python_launcher(script, filename, package, diagnostics, associated)
-            if python_script:
+            verified = _legacy_python_launcher(script, filename, package, diagnostics, associated)
+            if verified:
+                python_script, flags = verified
+                if flags and not sys.flags.no_user_site:
+                    command = _legacy_replay_command(filename, python_script, flags)
+                    os.execv(command[0], [*command, *sys.argv[1:]])
                 _run_legacy_playbook(filename, python_script)
                 return
     detail = "\n" + "\n".join(diagnostics) if diagnostics else ""

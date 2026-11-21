@@ -127,8 +127,9 @@ def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, shadow_pat
     assert __version__ in result.stdout
 
 
-def test_reference_launcher_discovery_uses_stdlib_csv(tmp_path, monkeypatch):
-    (tmp_path / "csv.py").write_text("raise RuntimeError('unexpected playbook-local csv')\n")
+@pytest.mark.parametrize("module", ["csv", "_csv"])
+def test_reference_launcher_discovery_uses_stdlib_csv(tmp_path, monkeypatch, module):
+    (tmp_path / f"{module}.py").write_text("raise RuntimeError('unexpected playbook-local CSV module')\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
     result = subprocess.run(
         ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
@@ -258,7 +259,7 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
 
     def verify_legacy(script, filename, package, diagnostics, associated):
         assert package == ansible_package and associated
-        return script
+        return script, ()
 
     seen = []
     cli = ModuleType("ansible.cli")
@@ -283,7 +284,15 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
     package = str(tmp_path / "ansible")
     foreign = str(tmp_path / "foreign" / "bin" / "ansible-playbook")
     matching = str(tmp_path / "matching" / "bin" / "ansible-playbook")
+    wrapper = str(tmp_path / "wrapper" / "bin" / "ansible-playbook")
     seen = []
+    for path in (foreign, matching, wrapper):
+        os.makedirs(os.path.dirname(path))
+        source = "#!/usr/bin/env python3\nfrom ansible.cli.playbook import main\nmain()\n"
+        if path == wrapper:
+            source = source.replace("main()\n", "import os\nos.environ['ANSIBLE_CONFIG'] = '/other.cfg'\nmain()\n")
+        with open(path, "w") as script:
+            script.write(source)
 
     def version_fields(command, candidate, diagnostics):
         assert command == [candidate]
@@ -297,21 +306,34 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setattr(sys, "path", sys.path[:])
     monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
-    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([foreign, matching]))
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([wrapper, foreign, matching]))
     monkeypatch.setattr(tests, "_ansible_version_fields", version_fields)
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
     tests._run_ansible_playbook(os.path.join(package, "__init__.py"), "2.14.18")
     assert seen == [foreign, matching, matching]
 
 
-@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+def test_version_probe_parses_empty_fields(monkeypatch):
+    import tests
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        [], 0, "  config file = \n  ansible python module location = /installed/ansible\n",
+    ))
+    assert tests._ansible_version_fields(["ansible-playbook"], "ansible-playbook", []) == {
+        "config file": "",
+        "ansible python module location": "/installed/ansible",
+    }
+
+
+@pytest.mark.parametrize("version, no_user_site", [("2.12.10", False), ("2.12.10", True), ("2.14.18", False)])
 @pytest.mark.parametrize("safe_path", [False, True])
-def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, safe_path):
+def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, no_user_site, safe_path):
     from tests import _reference_python
 
     if safe_path and not hasattr(sys.flags, "safe_path"):
         pytest.skip("Python does not support safe-path mode")
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     if safe_path:
         monkeypatch.setenv("PYTHONSAFEPATH", "1")
     source = "inherited" if safe_path else "launcher"
@@ -325,9 +347,11 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "parity_legacy_dependency.py").write_text("SOURCE = 'launcher'\n")
+    shebang = "#!/usr/bin/python3 -s" if no_user_site else "#!/usr/bin/env python"
     (bin_dir / "ansible-playbook").write_text(
-        "#!/usr/bin/env python\nimport os, ansible\n"
+        f"{shebang}\nimport os, sys, ansible\n"
         f"assert ansible.SOURCE == {source!r}, ansible.SOURCE\n"
+        f"assert not {no_user_site!r} or sys.flags.no_user_site\n"
         "print('ansible python module location = ' + os.path.dirname(ansible.__file__))\n"
     )
     (tmp_path / "parity_legacy_dependency.py").write_text("SOURCE = 'inherited'\n")
@@ -458,7 +482,7 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
         assert found is None and not probes
         assert "differs from the selected Ansible release" in diagnostics[0]
     else:
-        assert found == str(launcher)
+        assert found == (str(launcher), ())
         assert not probes
 
 
