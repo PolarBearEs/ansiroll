@@ -194,7 +194,7 @@ def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys, with_mani
         assert manifest_path.read_text() == json.dumps(manifest, indent=2)
 
 
-@pytest.mark.parametrize("alias", ["missing", "same", "symlink", "hardlink", "replaced"])
+@pytest.mark.parametrize("alias", ["missing", "same", "symlink", "hardlink", "replaced", "fifo_replaced"])
 def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alias):
     output = tmp_path / "compiled.py"
     original = "# existing output\n"
@@ -208,7 +208,12 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
     elif alias == "hardlink":
         os.link(output, manifest)
     else:
-        manifest.write_text("{}")
+        if alias == "fifo_replaced":
+            if not hasattr(os, "mkfifo"):
+                pytest.skip("requires named pipes")
+            os.mkfifo(manifest)
+        else:
+            manifest.write_text("{}")
         open_fd = os.open
 
         def replace_manifest(path, flags, *args, **kwargs):
@@ -220,7 +225,7 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
         monkeypatch.setattr(os, "open", replace_manifest)
 
     def compile_playbook(*args, **kwargs):
-        assert alias == "replaced", "expected alias to be rejected before compiling"
+        assert alias in ("replaced", "fifo_replaced"), "expected alias to be rejected before compiling"
         return "pass\n", {"modules": [], "fallback_tasks": []}
 
     monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
@@ -230,6 +235,37 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
         assert not output.exists()
     else:
         assert output.read_text() == original
+
+
+def test_file_compile_removes_new_output_when_filesystem_aliases_names(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    alias = tmp_path / "COMPILED.py"
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    open_fd = os.open
+
+    def case_insensitive_open(path, flags, *args, **kwargs):
+        if path == str(alias):
+            path = str(output)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", case_insensitive_open)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(alias)]) == 2
+    assert not output.exists()
+    assert not alias.exists()
+
+
+def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+
+    def fail_chmod(*args, **kwargs):
+        raise PermissionError("could not make output executable")
+
+    monkeypatch.setattr(os, "fchmod" if hasattr(os, "fchmod") else "chmod", fail_chmod)
+    with pytest.raises(PermissionError, match="could not make output executable"):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+    assert not manifest.exists()
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
