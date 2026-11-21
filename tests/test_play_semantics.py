@@ -653,9 +653,26 @@ def test_loop_task_alias_preserves_magic_vars_snapshot(tmp_path):
     messages, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
+          vars: {unrelated: "{{ 1 }}"}
           tasks:
             - debug: {msg: "{{ item }} / {{ task_alias }}"}
               vars: {task_alias: "{{ vars.item | default('missing') }}"}
+              loop: [alpha, beta]
+            - debug: {msg: "{{ item }} / {{ task_alias }}"}
+              vars: {item: original, task_alias: "{{ vars.item }}"}
+              loop: [alpha, beta]
+    """})
+    assert messages == ['"alpha / missing"', '"beta / missing"', '"alpha / original"', '"beta / original"']
+
+
+def test_loop_task_alias_stays_out_of_hostvars(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - debug:
+                msg: "{{ task_alias }} / {{ hostvars[inventory_hostname].task_alias | default('missing') }}"
+              vars: {task_alias: "{{ item }}"}
               loop: [alpha, beta]
     """})
     assert messages == ['"alpha / missing"', '"beta / missing"']
