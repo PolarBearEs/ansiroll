@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+from tests import ansible_playbook_command
+
 pytest.importorskip("ansible")
 
 from ansible import constants as C  # noqa: E402
@@ -52,7 +54,7 @@ def _ansible(playbook, cwd, strategy=None):
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", "-c", "local",
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
          "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True,
     )
@@ -1230,7 +1232,7 @@ def test_break_when_error_fails_the_item(tmp_path):
     script = tmp_path / "compiled.py"
     script.write_text(src)
     commands = [
-        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(path)],
         [sys.executable, str(script)],
     ]
     for command in commands:
@@ -1317,7 +1319,7 @@ def test_debug_nested_undefined_survives_generated_result_reporting(tmp_path):
 """)
     script = tmp_path / "compiled.py"
     script.write_text(compile_playbook(str(path))[0])
-    ansible = ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)]
+    ansible = ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(path)]
     modern = Version(__version__) >= Version("2.19")
     runs = [(ansible, _env()), ([sys.executable, str(script)], _env())]
     if modern:
@@ -1468,7 +1470,7 @@ def test_broken_conditional_policy_is_baked(tmp_path, enabled):
 """)
     env = dict(_env(), ANSIBLE_ALLOW_BROKEN_CONDITIONALS=str(enabled))
     expected = subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(path)],
         cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
     )
     script = tmp_path / "compiled.py"
