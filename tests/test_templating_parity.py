@@ -361,7 +361,8 @@ def test_legacy_launcher_rejects_shebang_settings_before_replay(
     assert "launcher shebang cannot be replayed" in diagnostics[0]
 
 
-def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):
+@pytest.mark.parametrize("relative_path", [False, True])
+def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch, relative_path):
     checkout = tmp_path / "checkout"
     package = checkout / "ansible"
     package.mkdir(parents=True)
@@ -371,7 +372,7 @@ def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, m
     dependencies = tmp_path / "dependencies"
     dependencies.mkdir()
     (dependencies / "parity_dependency.py").write_text("SOURCE = 'inherited'\n")
-    monkeypatch.setenv("PYTHONPATH", str(dependencies))
+    monkeypatch.setenv("PYTHONPATH", dependencies.name if relative_path else str(dependencies))
 
     result = subprocess.run(
         [sys.executable, "-c",

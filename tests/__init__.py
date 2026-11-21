@@ -27,8 +27,7 @@ def ansiroll_compile_command():
 
 def parity_pythonpath(root):
     inherited = os.environ.get("PYTHONPATH")
-    entries = [] if inherited is None else [os.path.abspath(path) for path in inherited.split(os.pathsep)]
-    return os.pathsep.join([root] + entries)
+    return root if inherited is None else os.pathsep.join([root, inherited])
 
 
 def _load_reference_ansible(filename):
