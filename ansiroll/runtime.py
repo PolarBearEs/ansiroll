@@ -176,6 +176,10 @@ class _UnsafeText(str):
 _NO_TEMPLATE = (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue)
 
 
+class _RegisteredResult(dict):
+    """A module result bound to its task's register."""
+
+
 class _IncludedVars(dict):
     """Controller-loaded include_vars definitions carried in a task result."""
 
@@ -194,11 +198,13 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _mark_unsafe(value, _seen=None, preserve_included_vars=False):
+def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
     if preserve_included_vars and isinstance(value, _IncludedVars):
         return value
     if isinstance(value, str):
+        if condition_text and not isinstance(value, _TrustedAsTemplateValue):
+            return _UntrustedConditionValue(value)
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             return _UnsafeText(value)
         return value
@@ -215,17 +221,22 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False):
             # Lazy views render on access; plain containers are read raw.
             items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
             for key, item in items:
-                out[_mark_unsafe(key, _seen)] = _mark_unsafe(item, _seen, preserve_included_vars)
+                out[_mark_unsafe(key, _seen)] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text)
             return out
         if isinstance(value, list):
             out = []
             _seen[id(value)] = (value, out)
             items = (iter(value) if isinstance(value, _LazyTplList)
                      else list.__iter__(value))
-            out.extend(_mark_unsafe(v, _seen, preserve_included_vars) for v in items)
+            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text) for v in items)
             return out
-        return tuple(_mark_unsafe(v, _seen, preserve_included_vars) for v in value)
+        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text) for v in value)
     return value
+
+
+def _registered_result(task, result):
+    include_vars = (task.get("action") or "").rsplit(".", 1)[-1] == "include_vars"
+    return _RegisteredResult(_mark_unsafe(result, preserve_included_vars=include_vars, condition_text=True))
 
 
 def _decode_frozen_value(value):
@@ -316,7 +327,7 @@ def _override_ctx(task, res, ctx, template=None):
                 existing if isinstance(existing, dict) else {}, namespaced,
                 recursive=config.get("DEFAULT_HASH_BEHAVIOUR") == "merge")
     if task.get("register"):
-        ectx[task["register"]] = res
+        ectx[task["register"]] = _registered_result(task, res)
     return ectx
 
 
@@ -1190,12 +1201,12 @@ class _PlayVarView(dict):
         super().__init__(snapshot)
         self.scope = scope
         self._loop_snapshot = loop_snapshot or isinstance(snapshot, _LoopVarsSnapshot)
-        self._task_templates = {}
+        self._templates = {}
         if not _core_at_least(2, 19):
             for key, value in snapshot.items():
-                if isinstance(value, _TaskVarTemplate) and self._loop_snapshot:
-                    self._task_templates[key] = value
                 if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
+                    if self._loop_snapshot:
+                        self._templates[key] = value
                     self[key] = str(value)
         if "vars" in snapshot:
             self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
@@ -1207,12 +1218,15 @@ class _PlayVarView(dict):
         if not self._loop_snapshot:
             return self.scope.templater.resolve_variable(key, self.scope[key], self.scope, strict=self.scope.strict)
         if key not in self.scope.resolved_snapshot:
-            value = self._task_templates.get(key, value)
-            if isinstance(value, _PlayVarTemplate):
-                value = str(value)
-            resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
+            value = self._templates.get(key, value)
+            if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
+                resolved = self.scope[key]
+            else:
+                if isinstance(value, _PlayVarTemplate):
+                    value = str(value)
+                resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
             self.scope.resolved_snapshot[key] = resolved
-        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[key], key)
+        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[key])
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1514,10 +1528,10 @@ class _Templater:
 
     def __init__(self):
         self._expr_cache = {}
+        self._condition_list_cache = {}
         self._template_cache = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
-        self._rendering_task_alias = False
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -1669,7 +1683,7 @@ class _Templater:
 
     def resolve_variable(self, key, value, ctx, strict=False):
         """Template a variable's trusted value when a template references it."""
-        self._observe_untrusted(value, key)
+        self._observe_untrusted(value)
         if type(value) in (str, _TaskVarTemplate) and _looks_templated(value):
             marker = (key, value)
             if marker in self._resolving:
@@ -1682,15 +1696,12 @@ class _Templater:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
             return _lazy_wrap(value, value._rt, ctx)
-        if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot):
+        if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot, _RegisteredResult):
             return _lazy_wrap(value, self._runtime, ctx)
         return value
 
-    def _observe_untrusted(self, value, key=None):
-        if self._untrusted_task_interpolation is not None and (
-                isinstance(value, _UntrustedConditionValue)
-                or (self._rendering_task_alias and self._runtime is not None
-                    and key in self._runtime._untrusted_runtime_vars)):
+    def _observe_untrusted(self, value):
+        if self._untrusted_task_interpolation is not None and isinstance(value, _UntrustedConditionValue):
             self._untrusted_task_interpolation = True
         return value
 
@@ -1728,21 +1739,23 @@ class _Templater:
         previous = self._current_ctx
         scope = ctx.get("vars")
         self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
-        rendering_alias = self._rendering_task_alias
         previous_interpolation = self._untrusted_task_interpolation
-        task_alias = previous_interpolation is not None and isinstance(text, _TaskVarTemplate)
-        self._rendering_task_alias = rendering_alias or task_alias
+        alias = previous_interpolation is not None and isinstance(text, (_TaskVarTemplate, _PlayVarTemplate))
+        if alias:
+            self._untrusted_task_interpolation = False
         try:
             result = self._render_string(text, ctx, strict)
-            if task_alias:
+            if alias:
                 if isinstance(result, bool):
-                    # This alias contributes a boolean, even in a larger
-                    # expression. Keep any earlier unsafe text contribution.
-                    self._untrusted_task_interpolation = previous_interpolation
+                    self._untrusted_task_interpolation = False
+                elif self._untrusted_task_interpolation and isinstance(result, str):
+                    # A later read of a cached alias must preserve the marker.
+                    result = _UntrustedConditionValue(result)
                 else:
                     self._observe_untrusted(result)
         finally:
-            self._rendering_task_alias = rendering_alias
+            if alias:
+                self._untrusted_task_interpolation |= previous_interpolation
             # A nested render (a lazily templated variable, a lookup term)
             # must not leave its context behind for the outer template.
             self._current_ctx = previous
@@ -1764,6 +1777,42 @@ class _Templater:
                     else result)
         return result
 
+    def _conditional_list(self, text, env, ctx, strict):
+        key = (text, strict)
+        if key not in self._condition_list_cache:
+            nodes = jinja2.nodes
+            parsed = env.parse(text)
+            expressions = None
+            if len(parsed.body) == 1 and isinstance(parsed.body[0], nodes.Output):
+                output = parsed.body[0].nodes
+                if len(output) == 1 and isinstance(output[0], (nodes.List, nodes.Tuple)):
+                    members = []
+                    for item in output[0].items:
+                        assignment = nodes.Assign(nodes.Name("result", "store"), item, lineno=1)
+                        template = env.from_string(nodes.Template([assignment], lineno=1))
+                        members.append(jinja2.environment.TemplateExpression(template, False))
+                    expressions = (tuple if isinstance(output[0], nodes.Tuple) else list, members)
+            self._condition_list_cache[key] = expressions
+        expressions = self._condition_list_cache[key]
+        if expressions is None:
+            return None
+
+        # A boolean member's inputs don't taint a separate expression.
+        collection, members = expressions
+        values = []
+        previous = self._untrusted_task_interpolation
+        try:
+            for member in members:
+                self._untrusted_task_interpolation = False
+                value = member(**ctx)
+                if self._untrusted_task_interpolation and isinstance(value, str):
+                    value = _UntrustedConditionValue(value)
+                values.append(value)
+        finally:
+            self._untrusted_task_interpolation = previous or _condition_contains_string(
+                values, _UntrustedConditionValue)
+        return collection(values)
+
     def _render_string(self, text, ctx, strict=False):
         env = self._strict_env if strict else self.env
         template_key = (text, strict)
@@ -1776,6 +1825,10 @@ class _Templater:
             expr = stripped[2:-2].strip()
             expr_key = (expr, True) if strict else expr
             try:
+                if self._untrusted_task_interpolation is not None and expr.startswith(("[", "(")):
+                    sequence = self._conditional_list(stripped, env, ctx, strict)
+                    if sequence is not None:
+                        return sequence
                 compiled = self._expr_cache.get(expr_key)
                 if compiled is None:
                     compiled = env.compile_expression(expr, undefined_to_none=False)
@@ -1977,7 +2030,6 @@ class Runtime:
         self._include_vars_layer = {}
         self._play_var_names = set()
         self._module_fact_layer = {}
-        self._untrusted_runtime_vars = set()
         self._facts_gathered = False
         self.native_only = bool(native_only)
         self._task_provenance = {}
@@ -2052,9 +2104,7 @@ class Runtime:
     def _store_register(self, task, result):
         name = task.get("register")
         if name:
-            include_vars = task.get("action", "").rsplit(".", 1)[-1] == "include_vars"
-            self.vars[name] = _mark_unsafe(result, preserve_included_vars=include_vars)
-            self._untrusted_runtime_vars.add(name)
+            self.vars[name] = _registered_result(task, result)
             # Registered vars live in the nonpersistent fact cache, like
             # set_fact: they outrank play/role/block/task vars.
             self._set_fact_overrides[name] = self.vars[name]
@@ -2185,7 +2235,7 @@ class Runtime:
             if any(
                     name in ctx
                     and (
-                        name in self._untrusted_runtime_vars
+                        isinstance(ctx[name], _RegisteredResult)
                         or _condition_contains_string(ctx[name], _UntrustedConditionValue)
                     )
                     for name in referenced):
@@ -2558,7 +2608,8 @@ class Runtime:
                 if node.get("loop_break_when"):
                     break_ctx = dict(ctx)
                     if node.get("register"):
-                        break_ctx[node["register"]] = blocked if blocked is not None else result
+                        break_ctx[node["register"]] = _registered_result(
+                            node, blocked if blocked is not None else result)
                     try:
                         stop = self.when(node["loop_break_when"], break_ctx, keyword="break_when")
                     except ConditionalError as ex:
@@ -2988,7 +3039,7 @@ class Runtime:
             if bw:
                 bctx = dict(ctx)
                 if task.get("register"):
-                    bctx[task["register"]] = res
+                    bctx[task["register"]] = _registered_result(task, res)
                 try:
                     stop = self.when(bw, bctx, keyword="break_when")
                 except ConditionalError as ex:
@@ -3154,7 +3205,7 @@ class Runtime:
             if res.pop("_ansiroll_unknown_outcome", False) or attempts <= 1:
                 return res
             if task.get("register"):
-                attempt_ctx[task["register"]] = res
+                attempt_ctx[task["register"]] = _registered_result(task, res)
             # 2.16+: without `until` the default condition is `not failed`.
             if until:
                 try:
@@ -3471,6 +3522,8 @@ class Runtime:
             # TaskExecutor evaluates failed_when only when changed_when
             # succeeded.
             if fw is not None and not changed_when_failed:
+                if cw is not None and task.get("register"):
+                    ctx[task["register"]]["changed"] = res["changed"]
                 try:
                     fw_result = self.when(fw if isinstance(fw, list) else [fw], ctx, strict=True)
                 except UntrustedConditional:
@@ -4171,8 +4224,7 @@ class Runtime:
         if isinstance(facts, _IncludedVars):
             self._include_vars_layer.update(facts)
             for key, value in facts.items():
-                if (key not in self.extra_vars and key not in self._set_fact_overrides
-                        and key not in self._untrusted_runtime_vars):
+                if key not in self.extra_vars and key not in self._set_fact_overrides:
                     self.vars[key] = value
         elif isinstance(facts, dict):
             # Facts are module output: never templated (Ansible marks them unsafe).
@@ -5125,6 +5177,7 @@ _SYNCHRONIZE_VARS = frozenset((
     "ansible_connection", "ansible_rsync_path", "ansible_port", "ansible_ssh_pass", "ansible_password",
     "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
     "ansible_ssh_private_key_file", "ansible_private_key_file",
+    "ansible_ssh_port", "ansible_ssh_user", "ansible_ssh_password",
 ))
 
 
