@@ -155,24 +155,6 @@ def _playbook_replay_command(filename, script, flags, *, legacy=True):
     return command + [script]
 
 
-def _ansible_version_fields(command, candidate, diagnostics, *, env=None):
-    try:
-        result = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=10, env=env)
-    except (OSError, subprocess.TimeoutExpired) as ex:
-        diagnostics.append("%s: %s" % (candidate, ex))
-        return {}
-    if result.returncode:
-        detail = result.stderr.strip() or result.stdout.strip() or "exit status %d" % result.returncode
-        diagnostics.append("%s: %s" % (candidate, detail[-2000:]))
-        return {}
-    fields = {}
-    for line in result.stdout.splitlines():
-        key, separator, value = line.partition(" = ")
-        if separator:
-            fields[key.strip()] = value.strip()
-    return fields
-
-
 def _has_brace_expansion(path):
     braces = []
     for token in re.finditer(r"[{},]", path):
@@ -311,8 +293,6 @@ def _legacy_python_launcher(path, package, diagnostics, associated):
         return None
 
     # The selected Ansible installation ships its own release's launcher.
-    # A native --version probe alone can report the correct package even
-    # when the script itself came from a different release.
     stub = os.path.join(package, "cli", "scripts", "ansible_cli_stub.py")
     try:
         with tokenize.open(stub) as expected:
@@ -411,21 +391,29 @@ def _stock_playbook_flags(script, package):
     return None
 
 
+def _launcher_installation_matches(script, package):
+    directory = os.path.dirname(os.path.realpath(script))
+    prefix, scripts_dir = os.path.split(directory)
+    if scripts_dir.lower() == "scripts":
+        sites = [os.path.join(prefix, "Lib", "site-packages")]
+    elif scripts_dir == "bin":
+        # Debian's distro packages use an unversioned python3 directory.
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        sites = [os.path.join(prefix, lib, version, "site-packages") for lib in ("lib", "lib64")]
+        sites.extend(os.path.join(prefix, "lib", name, "dist-packages") for name in (version, "python3"))
+    else:
+        return False
+    return any(os.path.realpath(os.path.join(site, "ansible")) == package for site in sites)
+
+
 def _matching_path_launcher(package, environment_script):
-    diagnostics = []
-    env = dict(os.environ)
-    # An inherited path could make a foreign launcher import the pinned package.
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
+    # Check package ownership without starting another Python interpreter.
     path_launchers = (script for script in _path_playbook_launchers() if script != environment_script)
     for script in chain((environment_script,), path_launchers):
-        flags = _stock_playbook_flags(script, package)
-        if flags is None:
-            continue
-        fields = _ansible_version_fields([script], script, diagnostics, env=env)
-        installed = fields.get("ansible python module location", "")
-        if installed and os.path.realpath(installed) == package:
-            return script, flags
+        if _launcher_installation_matches(script, package):
+            flags = _stock_playbook_flags(script, package)
+            if flags is not None:
+                return script, flags
     return None, ()
 
 

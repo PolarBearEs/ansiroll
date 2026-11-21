@@ -294,25 +294,20 @@ def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, 
 
     import tests
 
-    package = str(tmp_path / "ansible")
+    package_dir = tmp_path / "matching" / "lib" / "python3" / "dist-packages" / "ansible"
+    package_dir.mkdir(parents=True)
+    package = str(package_dir)
     foreign = str(tmp_path / "foreign" / "bin" / "ansible-playbook")
     matching = str(tmp_path / "matching" / "bin" / "ansible-playbook")
-    wrapper = str(tmp_path / "wrapper" / "bin" / "ansible-playbook")
+    wrapper = str(tmp_path / "matching" / "bin" / "custom-ansible-playbook")
     seen = []
     for path in (foreign, matching, wrapper):
-        os.makedirs(os.path.dirname(path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         source = "#!/usr/bin/env python3\nfrom ansible.cli.playbook import main\nmain()\n"
         if path == wrapper:
             source = source.replace("main()\n", "import os\nos.environ['ANSIBLE_CONFIG'] = '/other.cfg'\nmain()\n")
         with open(path, "w") as script:
             script.write(source)
-
-    def version_fields(command, candidate, diagnostics, *, env):
-        assert command == [candidate]
-        assert "PYTHONPATH" not in env and "PYTHONHOME" not in env
-        seen.append(candidate)
-        location = package if candidate == matching else str(tmp_path / "foreign" / "ansible")
-        return {"ansible python module location": location}
 
     cli = ModuleType("ansible.cli")
     cli.playbook = SimpleNamespace(main=lambda: seen.append(sys.argv[0]))
@@ -324,19 +319,17 @@ def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, 
     monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
     path = [wrapper, foreign, matching] if match_location == "path" else [wrapper, foreign]
     monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(path))
-    monkeypatch.setattr(tests, "_ansible_version_fields", version_fields)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("launcher was probed"))
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     filename = os.path.join(package, "__init__.py")
     script, flags, legacy = tests._select_playbook_launcher(filename, "2.14.18")
     assert not flags and not legacy
     tests._run_modern_playbook(filename, script)
-    if match_location == "sibling":
-        assert seen == [matching, matching]
-    elif match_location == "path":
-        assert seen == [foreign, matching, matching]
+    if match_location:
+        assert seen == [matching]
     else:
-        assert seen == [foreign, os.path.join(package, "cli", "playbook.py")]
+        assert seen == [os.path.join(package, "cli", "playbook.py")]
         assert os.path.dirname(foreign) not in sys.path
 
 
@@ -375,18 +368,6 @@ def test_modern_launcher_rejects_recorded_wrapper_initialization(tmp_path, monke
     monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter([str(wrapper)]))
     with pytest.raises(RuntimeError, match="launcher initialization cannot be replayed"):
         tests._select_playbook_launcher(str(tmp_path / "ansible" / "__init__.py"), "2.14.18")
-
-
-def test_version_probe_parses_empty_fields(monkeypatch):
-    import tests
-
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
-        [], 0, "  config file = \n  ansible python module location = /installed/ansible\n",
-    ))
-    assert tests._ansible_version_fields(["ansible-playbook"], "ansible-playbook", []) == {
-        "config file": "",
-        "ansible python module location": "/installed/ansible",
-    }
 
 
 @pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
@@ -548,7 +529,7 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
      + "venv/bin/python3.10d \"$0\" \"$@\"\n' '''\n"),
     "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
 ])
-def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, monkeypatch, stale, prefix):
+def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, stale, prefix):
     import tests
 
     package = tmp_path / "ansible"
@@ -559,22 +540,14 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     launcher = tmp_path / "ansible-playbook"
     startup = "start_stale_release()" if stale else "start_expected_release()"
     launcher.write_text(prefix + startup + "\n")
-    probes = []
-
-    def version(command, candidate, diagnostics):
-        probes.append(command)
-        return {"ansible python module location": str(package)}
-
-    monkeypatch.setattr(tests, "_ansible_version_fields", version)
     diagnostics = []
     found = tests._legacy_python_launcher(
         str(launcher), str(package), diagnostics, associated=False)
     if stale:
-        assert found is None and not probes
+        assert found is None
         assert "differs from the selected Ansible release" in diagnostics[0]
     else:
         assert found == (str(launcher), ())
-        assert not probes
 
 
 @pytest.mark.parametrize("interpreter", [
@@ -671,7 +644,7 @@ def test_legacy_launcher_uses_the_shell_probe_for_pathname_patterns(monkeypatch,
     "#!/usr/bin/python3 -I",
 ])
 def test_legacy_launcher_rejects_shebang_settings_before_replay(
-    tmp_path, monkeypatch, stub_available, shebang,
+    tmp_path, stub_available, shebang,
 ):
     import tests
 
@@ -682,7 +655,6 @@ def test_legacy_launcher_rejects_shebang_settings_before_replay(
         (scripts / "ansible_cli_stub.py").write_text("#!/usr/bin/env python\nstart_expected_release()\n")
     launcher = tmp_path / "ansible-playbook"
     launcher.write_text(shebang + "\nstart_expected_release()\n")
-    monkeypatch.setattr(tests, "_ansible_version_fields", lambda *args: pytest.fail("unsupported launcher ran"))
     diagnostics = []
     assert tests._legacy_python_launcher(str(launcher), str(package), diagnostics, associated=True) is None
     assert "launcher shebang cannot be replayed" in diagnostics[0]
