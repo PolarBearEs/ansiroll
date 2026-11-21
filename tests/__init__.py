@@ -10,6 +10,7 @@ def ansible_playbook_command():
 
 def _run_ansible_playbook():
     import runpy
+    import shutil
     from importlib import metadata
 
     import ansible
@@ -36,5 +37,14 @@ def _run_ansible_playbook():
                     runpy.run_path(str(script), run_name="__main__")
                     return
 
-    script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
-    runpy.run_path(script, run_name="__main__")
+    # Source checkouts may expose ansible through PYTHONPATH without a record.
+    source_root = os.path.dirname(os.path.dirname(package))
+    for script in (
+        os.path.join(source_root, "bin", "ansible-playbook"),
+        os.path.join(os.path.dirname(sys.executable), "ansible-playbook"),
+        shutil.which("ansible-playbook"),
+    ):
+        if script and os.path.isfile(script):
+            runpy.run_path(script, run_name="__main__")
+            return
+    raise FileNotFoundError("ansible-playbook script not found for %s" % package)
