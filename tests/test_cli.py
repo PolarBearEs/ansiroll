@@ -4,7 +4,6 @@ import os
 import stat
 import subprocess
 import sys
-import tempfile
 from argparse import Namespace
 
 import pytest
@@ -236,9 +235,10 @@ def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alia
         assert output.read_text() == original
 
 
-def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp_path):
+@pytest.mark.parametrize("manifest_name", ["manifest.json", "COMPILED.py"])
+def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp_path, manifest_name):
     output = tmp_path / "compiled.py"
-    alias = tmp_path / "manifest.json"
+    alias = tmp_path / manifest_name
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
     stat_path = os.stat
     open_fd = os.open
@@ -253,9 +253,10 @@ def test_file_compile_rejects_aliases_detected_only_when_opened(monkeypatch, tmp
 
     monkeypatch.setattr(os, "stat", aliasing_stat)
     monkeypatch.setattr(os, "open", aliasing_open)
+    monkeypatch.setattr(os, "mkdir", lambda *args, **kwargs: pytest.fail("preflight created a probe directory"))
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(alias)]) == 2
     assert output.read_bytes() == b""
-    assert not alias.exists()
+    assert list(tmp_path.iterdir()) == [output]
 
 
 def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatch, tmp_path):
@@ -275,65 +276,6 @@ def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatc
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
     assert not output.exists()
     assert not manifest.exists()
-
-
-@pytest.mark.parametrize("case_insensitive", [False, True])
-@pytest.mark.parametrize("names, long_name", [
-    (("compiled.py", "COMPILED.py"), False),
-    (("compiled.py", "COMPILED.py"), True),
-    (("résumé.py", "RÉSUMÉ.py"), True),
-    (("compiled.py", "compil\u200ded.py"), False),
-])
-def test_file_compile_checks_missing_case_variants_in_destination_directory(
-        monkeypatch, tmp_path, case_insensitive, names, long_name):
-    monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
-    monkeypatch.setattr(cli, "_can_remove_case_probe", lambda directory: True)
-    if not case_insensitive:
-        with tempfile.NamedTemporaryFile(prefix="case-check-", dir=tmp_path) as probe:
-            if (tmp_path / os.path.basename(probe.name).upper()).exists():
-                pytest.skip("requires a case-sensitive directory")
-    parent = tmp_path / "elsewhere"
-    child = parent / "child"
-    child.mkdir(parents=True)
-    parent.chmod(0o755)
-    link = tmp_path / "link"
-    link.symlink_to(child, target_is_directory=True)
-    output_name, manifest_name = names
-    if long_name:
-        limit = os.pathconf(parent, "PC_NAME_MAX")
-        padding = "x" * (limit - len(os.fsencode(output_name)))
-        output_name = padding + output_name
-        manifest_name = padding + manifest_name
-    output = link / ".." / output_name
-    manifest = parent / manifest_name
-    real_stat = os.stat
-    parent_stat = parent.stat()
-    probes = []
-
-    def folded_stat(path, *args, **kwargs):
-        directory = kwargs.get("dir_fd")
-        if directory is not None and path == manifest_name:
-            probes.append(directory)
-            assert os.path.samestat(real_stat("..", dir_fd=directory), parent_stat)
-            if case_insensitive:
-                path = output_name
-        elif isinstance(path, str) and ".ansiroll-" in path:
-            # Simulate a full path that becomes too long as soon as a
-            # temporary directory component is added.
-            raise OSError(errno.ENAMETOOLONG, "probe exceeds the pathname limit", path)
-        return real_stat(path, *args, **kwargs)
-
-    def compile_playbook(*args, **kwargs):
-        assert not case_insensitive, "expected alias to be found before compilation"
-        return "pass\n", {"modules": [], "fallback_tasks": []}
-
-    monkeypatch.setattr(os, "stat", folded_stat)
-    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
-    result = cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
-    assert result == (2 if case_insensitive else 0)
-    assert probes
-    expected = {child} if case_insensitive else {child, parent / output_name, manifest}
-    assert set(parent.iterdir()) == expected
 
 
 def test_file_compile_preserves_symlink_path_lookup(monkeypatch, tmp_path):
@@ -424,8 +366,12 @@ def test_manifest_overwrite_can_truncate_only_the_validated_inode(monkeypatch, t
 @pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
                     reason="requires reopening a metadata-only descriptor")
 @pytest.mark.parametrize("destination", ["output", "manifest"])
-@pytest.mark.parametrize("failure", ["open", "truncate"])
-def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_path, destination, failure):
+@pytest.mark.parametrize("failure, error", [
+    ("open", errno.EPERM),
+    ("truncate", errno.EINVAL),
+    ("truncate", errno.ENOSYS),
+])
+def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_path, destination, failure, error):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     files = {"output": output, "manifest": manifest}
@@ -442,7 +388,7 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
         nonlocal append_fd
         target = path == str(files[destination]) and flags & os.O_ACCMODE == os.O_WRONLY
         if target and failure == "open":
-            raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
+            raise OSError(error, "filesystem requires O_TRUNC", path)
         fd = open_fd(path, flags, *args, **kwargs)
         if target:
             append_fd = fd
@@ -461,7 +407,7 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
             self.file.close()
 
         def truncate(self, size):
-            raise OSError(errno.EINVAL, "append-only handle")
+            raise OSError(error, "handle does not support standalone truncation")
 
         def close(self):
             self.file.close()
@@ -501,64 +447,6 @@ def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_
         with pytest.raises(PermissionError, match="safe truncating reopen requires /proc/self/fd"):
             cli._write_stdout_manifest(str(manifest), {}, stream.fileno())
     assert manifest.read_text() == "previous manifest"
-
-
-@pytest.mark.parametrize("filesystem, allowed", [(b"ext4", True), (b"fuse.mountpoint-s3", False), (b"9p", False)])
-def test_case_probe_reads_mountinfo_without_decoding_paths(monkeypatch, filesystem, allowed):
-    import io
-
-    monkeypatch.setattr(cli.sys, "platform", "linux")
-
-    def mountinfo(path, mode):
-        assert path == "/proc/self/mountinfo" and mode == "rb"
-        return io.BytesIO(b"10 20 9:1 / /other-\xff rw - ext4 source rw\n"
-                          b"11 22 8:16 / / rw - " + filesystem + b" source rw\n")
-
-    monkeypatch.setattr("builtins.open", mountinfo)
-    assert cli._supports_case_probe(os.makedev(8, 16)) is allowed
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux inode flags")
-@pytest.mark.parametrize("flags", [0x20, None])
-def test_case_probe_skips_directories_without_verified_cleanup(monkeypatch, tmp_path, flags):
-    import fcntl
-    import struct
-
-    info = tmp_path.stat()
-    identity = (info.st_dev, info.st_ino)
-    monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
-
-    def get_flags(fd, request, out):
-        assert os.path.samestat(info, os.fstat(fd))
-        if flags is None:
-            raise OSError(errno.ENOTTY, "flags unavailable")
-        struct.pack_into("I", out, 0, flags)
-
-    monkeypatch.setattr(fcntl, "ioctl", get_flags)
-    monkeypatch.setattr(cli, "_probe_names_at", lambda *args: pytest.fail("unsafe probe"))
-    assert not cli._same_missing_destination(
-        (identity, str(tmp_path), "compiled.py"), (identity, str(tmp_path), "COMPILED.py"))
-    assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.skipif(not hasattr(os, "geteuid"), reason="requires POSIX directory permissions")
-@pytest.mark.parametrize("mode, allowed", [(0o755, True), (0o770, False), (0o777, False), (0o1777, True)])
-def test_case_probe_skips_directories_where_the_entry_could_be_replaced(monkeypatch, tmp_path, mode, allowed):
-    tmp_path.chmod(mode)
-    info = tmp_path.stat()
-    identity = (info.st_dev, info.st_ino)
-    monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
-    monkeypatch.setattr(cli, "_can_remove_case_probe", lambda directory: True)
-    probes = []
-
-    def probe(directory, output_name, manifest_name):
-        probes.append((output_name, manifest_name))
-        return True
-
-    monkeypatch.setattr(cli, "_probe_names_at", probe)
-    assert cli._same_missing_destination(
-        (identity, str(tmp_path), "compiled.py"), (identity, str(tmp_path), "COMPILED.py")) is allowed
-    assert probes == ([("compiled.py", "COMPILED.py")] if allowed else [])
 
 
 @pytest.mark.parametrize("destination", ["output", "manifest"])

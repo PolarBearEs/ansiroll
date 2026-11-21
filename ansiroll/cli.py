@@ -6,7 +6,6 @@ import argparse
 import errno
 import json
 import os
-import secrets
 import stat
 import subprocess
 import sys
@@ -139,7 +138,7 @@ def _open_compile_destination(path, validate):
             try:
                 writer.truncate(0)
             except OSError as ex:
-                if ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                if ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS:
                     raise
                 original_error = ex
                 reference = _pin_for_truncate(path, "/proc/self/fd/%d" % fd, ex)
@@ -190,89 +189,7 @@ def _missing_destination(path):
     if name:
         directory = os.stat(parent)
         if stat.S_ISDIR(directory.st_mode):
-            return (directory.st_dev, directory.st_ino), parent, name
-
-
-def _supports_case_probe(device):
-    if sys.platform != "linux":
-        return False
-    device_id = b"%d:%d" % (os.major(device), os.minor(device))
-    # These filesystems inherit per-directory casefold flags and support
-    # removing the probe. Other mounts can still be checked after opening.
-    try:
-        with open("/proc/self/mountinfo", "rb") as table:
-            for line in table:
-                mount, _, details = line.partition(b" - ")
-                if mount.split()[2] == device_id and details.split()[0] in (b"ext4", b"f2fs", b"tmpfs"):
-                    return True
-    except OSError:
-        pass
-    return False
-
-
-def _can_remove_case_probe(directory):
-    import fcntl
-    import struct
-
-    # Linux FS_IOC_GETFLAGS is encoded as _IOR('f', 1, long), but
-    # returns a C int. A failed query leaves cleanup unverified.
-    flags = bytearray(struct.calcsize("l"))
-    fs_ioc_getflags = 0x80006601 | (len(flags) << 16)
-    try:
-        fcntl.ioctl(directory, fs_ioc_getflags, flags)
-    except OSError:
-        return False
-    fs_append_fl = 0x20
-    return not (struct.unpack_from("I", flags)[0] & fs_append_fl)
-
-
-def _same_missing_destination(output, manifest):
-    if output is None or manifest is None or output[0] != manifest[0]:
-        return False
-    _, parent, output_name = output
-    _, _, manifest_name = manifest
-    if output_name == manifest_name:
-        return True
-    if not _supports_case_probe(output[0][0]):
-        return False
-
-    # Probe full names in a child of the destination directory. This covers
-    # inherited case rules; aliases allocated on creation are checked again
-    # through the opened output descriptor.
-    directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        info = os.fstat(directory)
-        if (info.st_dev, info.st_ino) != output[0] or info.st_uid not in (0, os.geteuid()):
-            return False
-        shared = info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        if shared and not info.st_mode & stat.S_ISVTX:
-            # Other users could replace the temporary directory entry.
-            return False
-        return _can_remove_case_probe(directory) and _probe_names_at(directory, output_name, manifest_name)
-    finally:
-        os.close(directory)
-
-
-def _probe_names_at(directory, output_name, manifest_name):
-    probe_name = ".ansiroll-" + secrets.token_hex(8)
-    os.mkdir(probe_name, mode=0o700, dir_fd=directory)
-    try:
-        probe = os.open(probe_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-        try:
-            first = os.open(output_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=probe)
-            try:
-                try:
-                    other = os.stat(manifest_name, dir_fd=probe)
-                except FileNotFoundError:
-                    return False
-                return os.path.samestat(os.fstat(first), other)
-            finally:
-                os.close(first)
-                os.unlink(output_name, dir_fd=probe)
-        finally:
-            os.close(probe)
-    finally:
-        os.rmdir(probe_name, dir_fd=directory)
+            return directory.st_dev, directory.st_ino, name
 
 
 def _check_file_destinations(output_path, manifest_path):
@@ -280,8 +197,8 @@ def _check_file_destinations(output_path, manifest_path):
         output_stat = _stat_if_present(output_path)
         manifest_stat = _stat_if_present(manifest_path)
         if output_stat is None and manifest_stat is None:
-            if _same_missing_destination(
-                    _missing_destination(output_path), _missing_destination(manifest_path)):
+            output = _missing_destination(output_path)
+            if output is not None and output == _missing_destination(manifest_path):
                 raise ValueError("manifest path points to compiled output: %s" % manifest_path)
     except OSError:
         # The normal write path reports destination errors in output order.
