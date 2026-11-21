@@ -27,6 +27,7 @@ import time
 import hashlib
 import re
 import shlex
+from collections.abc import KeysView
 from contextlib import contextmanager
 from itertools import groupby
 from numbers import Number
@@ -1105,20 +1106,28 @@ class _LazyTplDict(dict):
         except KeyError:
             return default
 
+    def keys(self):
+        if self._rt.templater._untrusted_task_interpolation is None:
+            return dict.keys(self)
+        return KeysView(self)
+
     def items(self):
-        return [(k, self[k]) for k in dict.keys(self)]
+        return [(k, self[k]) for k in self]
 
     def values(self):
         return [self[k] for k in dict.keys(self)]
 
     def copy(self):
-        return {k: self[k] for k in dict.keys(self)}
+        return {k: self[k] for k in self}
 
     def __iter__(self):
         # Overriding __iter__ makes dict(view) and {**view} read through
         # __getitem__ instead of the raw storage on Python 3.6+ (Ansible's
         # _AnsibleLazyTemplateDict does the same).
-        return dict.__iter__(self)
+        keys = dict.__iter__(self)
+        if self._rt.templater._untrusted_task_interpolation is None:
+            return keys
+        return (self._rt.templater._observe_untrusted(key) for key in keys)
 
     def __repr__(self):
         # str()/repr() inside a template shows the rendered values.
@@ -1210,7 +1219,9 @@ class _LookupVars(dict):
         self.templater = templater
 
     def __getitem__(self, key):
-        value = dict.__getitem__(self, key)
+        return self._resolve(key, dict.__getitem__(self, key))
+
+    def _resolve(self, key, value):
         if isinstance(value, _TaskVarTemplate):
             return self.templater.resolve_variable(key, value, self.ctx)
         return self.templater._observe_untrusted(value)
@@ -1220,6 +1231,20 @@ class _LookupVars(dict):
 
     def get(self, key, default=None):
         return self[key] if key in self else default
+
+    def pop(self, key, *default):
+        if key in self:
+            return self._resolve(key, dict.pop(self, key, *default))
+        return dict.pop(self, key, *default)
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        return key, self._resolve(key, value)
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        return dict.setdefault(self, key, default)
 
     def items(self):
         return [(key, self[key]) for key in self]
@@ -1822,12 +1847,15 @@ class _Templater:
         return result
 
     def _conditional_member(self, env, node):
-        nodes = jinja2.nodes
-        assignment = nodes.Assign(nodes.Name("result", "store"), node, lineno=1)
-        template = env.from_string(nodes.Template([assignment], lineno=1))
-        expression = jinja2.environment.TemplateExpression(template, False)
+        expression = None
 
         def evaluate(ctx):
+            nonlocal expression
+            if expression is None:
+                nodes = jinja2.nodes
+                assignment = nodes.Assign(nodes.Name("result", "store"), node, lineno=1)
+                template = env.from_string(nodes.Template([assignment], lineno=1))
+                expression = jinja2.environment.TemplateExpression(template, False)
             previous = self._untrusted_task_interpolation
             self._untrusted_task_interpolation = False
             try:
@@ -5256,6 +5284,10 @@ _SYNCHRONIZE_VARS = frozenset((
     "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
     "ansible_ssh_private_key_file", "ansible_private_key_file",
     "ansible_ssh_port", "ansible_ssh_user", "ansible_ssh_password",
+    "ansible_become", "ansible_become_method", "ansible_become_user", "ansible_become_password",
+    "ansible_become_pass", "ansible_become_exe", "ansible_become_flags",
+    "ansible_sudo_user", "ansible_sudo_exe", "ansible_sudo_flags", "ansible_sudo_pass", "ansible_sudo_chdir",
+    "ansible_su_user", "ansible_su_exe", "ansible_su_flags", "ansible_su_pass", "ansible_su_prompt_l10n",
 ))
 
 

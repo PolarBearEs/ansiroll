@@ -237,6 +237,9 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
         "ansible_ssh_port": "{{ 2201 }}",
         "ansible_ssh_user": "{{ item | agent_filter }}",
         "ansible_ssh_password": "{{ item | reverse | join }}",
+        "ansible_become": "{{ item == 'sample' }}",
+        "ansible_become_user": "{{ item | agent_filter }}",
+        "ansible_sudo_flags": "-H -u {{ item }}",
         "ansible_private_key_file": "/other-keys/{{ item | agent_filter }}",
         "unused": "{{ unexpected_lookup() }}",
     })
@@ -249,6 +252,9 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
     assert sent["ansible_ssh_port"] == 2201
     assert sent["ansible_ssh_user"] == "SAMPLE"
     assert sent["ansible_ssh_password"] == "elpmas"
+    assert sent["ansible_become"] is True
+    assert sent["ansible_become_user"] == "SAMPLE"
+    assert sent["ansible_sudo_flags"] == "-H -u sample"
     assert sent["ansible_private_key_file"] == "/other-keys/SAMPLE"
     assert sent["unused"] == "{{ unexpected_lookup() }}"
 
@@ -350,6 +356,19 @@ def test_loop_items_keep_provenance_of_registered_collections(loop):
     ctx.update(rt._loop_item_vars(task, items, 0, ctx))
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
+
+
+@pytest.mark.parametrize("keys", ["result.data", "result.data.keys()", "result.data.items() | map('first')"])
+def test_conditional_rendering_tracks_registered_mapping_keys(keys):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": {"sample": True}})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ (" + keys + " | list | first) ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
 
 
 def test_boolean_loop_conditions_read_only_the_selected_values():
@@ -465,7 +484,8 @@ def test_loop_assertion_members_share_resolved_task_aliases():
 
 
 @pytest.mark.parametrize("take_branch", [True, False])
-def test_loop_assertion_tracks_only_members_of_selected_branch(take_branch):
+@pytest.mark.parametrize("unselected", ["[unexpected_lookup()]", "[item | missing_branch_filter]"])
+def test_loop_assertion_tracks_only_members_of_selected_branch(take_branch, unselected):
     rt = Runtime({}, "", {})
     rt._store_register({"register": "result"}, {"msg": "sample"})
 
@@ -474,7 +494,7 @@ def test_loop_assertion_tracks_only_members_of_selected_branch(take_branch):
 
     rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
     selected = "[result.msg == 'sample', check]"
-    alternate = "[unexpected_lookup()]"
+    alternate = unselected
     if not take_branch:
         selected, alternate = alternate, selected
     task = _task("task", "Task", None, loop=[1], vars={
@@ -499,6 +519,35 @@ def test_custom_lookup_resolves_deferred_task_alias_with_current_loop_item(acces
     ctx = rt._task_ctx(task, {})
     ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
     assert rt.template("{{ lookup('read_alias') }}", ctx) == "SAMPLE"
+
+
+@pytest.mark.parametrize("method", ["pop", "popitem", "setdefault"])
+def test_custom_lookup_mapping_mutations_resolve_existing_aliases(method):
+    rt = Runtime({}, "", {})
+
+    def read_alias(terms, variables, **kwargs):
+        if method == "setdefault":
+            value = variables.setdefault("alias", "fallback")
+            assert "alias" in variables
+            assert variables.setdefault("missing", "fallback") == "fallback"
+        elif method == "popitem":
+            for key in list(variables):
+                if key != "alias":
+                    del variables[key]
+            key, value = variables.popitem()
+            assert key == "alias" and not variables
+        else:
+            value = variables.pop("alias")
+            assert "alias" not in variables
+            assert variables.pop("missing", "fallback") == "fallback"
+        return [value]
+
+    rt.templater._lookup_loaded["read_alias"] = read_alias
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item | upper }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert rt.template("{{ lookup('read_alias') }}", ctx) == "SAMPLE"
+    assert "alias" in ctx
 
 
 def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():
