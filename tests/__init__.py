@@ -8,6 +8,31 @@ def ansible_playbook_command():
     return [sys.executable, "-c", "from tests import _run_ansible_playbook; _run_ansible_playbook()"]
 
 
+def _legacy_python_launcher(path, package):
+    import subprocess
+    import tokenize
+
+    try:
+        with tokenize.open(path) as script:
+            compile(script.read(), path, "exec")
+    except (SyntaxError, UnicodeError):
+        # A shell or native launcher can report the Python script it invokes.
+        try:
+            result = subprocess.run([path, "--version"], capture_output=True, text=True)
+        except OSError:
+            return None
+        if result.returncode:
+            return None
+        fields = dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
+        script = fields.get("executable location", "")
+        installed = fields.get("ansible python module location", "")
+        if (installed and os.path.realpath(installed) == package and os.path.isabs(script)
+                and os.path.realpath(script) != os.path.realpath(path) and os.path.isfile(script)):
+            return script
+        return None
+    return path
+
+
 def _run_ansible_playbook():
     import runpy
     import shutil
@@ -45,6 +70,8 @@ def _run_ansible_playbook():
         shutil.which("ansible-playbook"),
     ):
         if script and os.path.isfile(script):
-            runpy.run_path(script, run_name="__main__")
-            return
+            python_script = _legacy_python_launcher(script, package)
+            if python_script:
+                runpy.run_path(python_script, run_name="__main__")
+                return
     raise FileNotFoundError("ansible-playbook script not found for %s" % package)
