@@ -294,8 +294,9 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
         with open(path, "w") as script:
             script.write(source)
 
-    def version_fields(command, candidate, diagnostics):
+    def version_fields(command, candidate, diagnostics, *, env):
         assert command == [candidate]
+        assert "PYTHONPATH" not in env and "PYTHONHOME" not in env
         seen.append(candidate)
         location = package if candidate == matching else str(tmp_path / "foreign" / "ansible")
         return {"ansible python module location": location}
@@ -309,6 +310,7 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
     monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([wrapper, foreign, matching]))
     monkeypatch.setattr(tests, "_ansible_version_fields", version_fields)
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     tests._run_ansible_playbook(os.path.join(package, "__init__.py"), "2.14.18")
     assert seen == [foreign, matching, matching]
 
@@ -325,7 +327,8 @@ def test_version_probe_parses_empty_fields(monkeypatch):
     }
 
 
-@pytest.mark.parametrize("version, no_user_site", [("2.12.10", False), ("2.12.10", True), ("2.14.18", False)])
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+@pytest.mark.parametrize("no_user_site", [False, True])
 @pytest.mark.parametrize("safe_path", [False, True])
 def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, no_user_site, safe_path):
     from tests import _reference_python
@@ -342,7 +345,9 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     (package / "__init__.py").write_text("from parity_legacy_dependency import SOURCE\n")
     (package / "cli").mkdir()
     (package / "cli" / "playbook.py").write_text(
-        "import ansible\ndef main():\n    print(ansible.SOURCE)\n"
+        "import ansible, sys\ndef main():\n"
+        f"    assert not {no_user_site!r} or sys.flags.no_user_site\n"
+        "    print(ansible.SOURCE)\n"
     )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

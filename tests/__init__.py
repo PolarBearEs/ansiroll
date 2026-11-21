@@ -126,18 +126,19 @@ def _run_legacy_playbook(filename, script):
     runpy.run_path(script, run_name="__main__")
 
 
-def _legacy_replay_command(filename, script, flags):
+def _playbook_replay_command(filename, script, flags, *, legacy=True):
+    runner = "_run_legacy_playbook" if legacy else "_run_modern_playbook"
     command = _reference_python(
-        "_parity_bootstrap['_run_legacy_playbook'](sys.argv.pop(1), sys.argv.pop(1))",
+        f"_parity_bootstrap[{runner!r}](sys.argv.pop(1), sys.argv.pop(1))",
         filename,
     )
     command[1:1] = [*flags, *(["-P"] if getattr(sys.flags, "safe_path", False) else [])]
     return command + [script]
 
 
-def _ansible_version_fields(command, candidate, diagnostics):
+def _ansible_version_fields(command, candidate, diagnostics, *, env=None):
     try:
-        result = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=10, env=env)
     except (OSError, subprocess.TimeoutExpired) as ex:
         diagnostics.append("%s: %s" % (candidate, ex))
         return {}
@@ -253,6 +254,16 @@ def _launcher_body(source):
     return source
 
 
+def _launcher_body_and_flags(source):
+    shebang, newline, code = source.partition("\n")
+    flag = re.fullmatch(r"#![ \t]*(/[^ \t]+|/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)[ \t]+-s[ \t]*", shebang)
+    header_source = f"#!{flag[1]}{newline}{code}" if flag else source
+    body = _launcher_body(header_source)
+    if header_source.startswith("#!") and body == header_source:
+        return None, ()
+    return body, ("-s",) if flag else ()
+
+
 def _legacy_python_launcher(path, filename, package, diagnostics, associated):
     try:
         with tokenize.open(path) as script:
@@ -265,12 +276,8 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: cannot replay a non-Python launcher's initialization" % path)
         return None
 
-    shebang, newline, code = source.partition("\n")
-    flag = re.fullmatch(r"#![ \t]*(/[^ \t]+|/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)[ \t]+-s[ \t]*", shebang)
-    header_source = f"#!{flag[1]}{newline}{code}" if flag else source
-    flags = ("-s",) if flag else ()
-    body = _launcher_body(header_source)
-    if header_source.startswith("#!") and body == header_source:
+    body, flags = _launcher_body_and_flags(source)
+    if body is None:
         diagnostics.append("%s: launcher shebang cannot be replayed" % path)
         return None
 
@@ -294,7 +301,7 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: %s" % (stub, ex))
         return None
 
-    probe = _legacy_replay_command(filename, path, flags)
+    probe = _playbook_replay_command(filename, path, flags)
     fields = _ansible_version_fields(probe, path, diagnostics)
     installed = fields.get("ansible python module location", "")
     if installed and os.path.realpath(installed) == package:
@@ -355,8 +362,8 @@ def _is_stock_playbook_entrypoint(script):
     try:
         with tokenize.open(script) as launcher:
             source = launcher.read()
-        body = _launcher_body(source)
-        if source.startswith("#!") and body == source:
+        body, _ = _launcher_body_and_flags(source)
+        if body is None:
             return False
         parsed = ast.dump(ast.parse(body))
     except (OSError, SyntaxError, UnicodeError):
@@ -366,14 +373,26 @@ def _is_stock_playbook_entrypoint(script):
 
 def _matching_path_launcher(package):
     diagnostics = []
+    env = dict(os.environ)
+    # An inherited path could make a foreign launcher import the pinned package.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
     for script in _path_playbook_launchers():
         if not _is_stock_playbook_entrypoint(script):
             continue
-        fields = _ansible_version_fields([script], script, diagnostics)
+        fields = _ansible_version_fields([script], script, diagnostics, env=env)
         installed = fields.get("ansible python module location", "")
         if installed and os.path.realpath(installed) == package:
             return script
     return None
+
+
+def _run_modern_playbook(filename, script):
+    _set_playbook_launcher(script)
+    _load_reference_ansible(filename)
+    from ansible.cli import playbook
+
+    playbook.main()
 
 
 def _run_ansible_playbook(filename, version):
@@ -384,12 +403,16 @@ def _run_ansible_playbook(filename, version):
         # The CLI looks for sibling helpers next to argv[0] before PATH.
         script = next((script for script in installed_launchers if os.path.isfile(script)), None)
         if script is None:
-            script = _matching_path_launcher(package) or environment_script
-        _set_playbook_launcher(script)
-        _load_reference_ansible(filename)
-        from ansible.cli import playbook
-
-        playbook.main()
+            script = _matching_path_launcher(package)
+        if script is not None:
+            with tokenize.open(script) as launcher:
+                body, flags = _launcher_body_and_flags(launcher.read())
+            if body is None:
+                raise RuntimeError(f"launcher shebang cannot be replayed: {script}")
+            if flags and not sys.flags.no_user_site:
+                command = _playbook_replay_command(filename, script, flags, legacy=False)
+                os.execv(command[0], [*command, *sys.argv[1:]])
+        _run_modern_playbook(filename, script or environment_script)
         return
 
     # Older releases install a script instead of a module entry point.
@@ -407,7 +430,7 @@ def _run_ansible_playbook(filename, version):
             if verified:
                 python_script, flags = verified
                 if flags and not sys.flags.no_user_site:
-                    command = _legacy_replay_command(filename, python_script, flags)
+                    command = _playbook_replay_command(filename, python_script, flags)
                     os.execv(command[0], [*command, *sys.argv[1:]])
                 _run_legacy_playbook(filename, python_script)
                 return
