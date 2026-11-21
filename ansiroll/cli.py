@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -100,6 +100,103 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
         json.dump(manifest, fh, indent=2)
 
 
+def _stat_if_present(path):
+    try:
+        return os.stat(path)
+    except FileNotFoundError:
+        return
+
+
+def _missing_destination(path):
+    # Follow the final symlink without collapsing an unresolved component.
+    for _ in range(40):
+        if not os.path.islink(path):
+            break
+        path = os.path.join(os.path.dirname(path), os.readlink(path))
+    else:
+        return
+    parent, name = os.path.split(path)
+    parent = parent or os.curdir
+    if name and os.path.isdir(parent):
+        return os.path.normcase(os.path.join(os.path.realpath(parent), name))
+
+
+def _check_file_destinations(output_path, manifest_path):
+    try:
+        output_stat = _stat_if_present(output_path)
+        manifest_stat = _stat_if_present(manifest_path)
+        if output_stat is None and manifest_stat is None:
+            output = _missing_destination(output_path)
+            if output is not None and output == _missing_destination(manifest_path):
+                raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+    except OSError:
+        # The normal write path reports destination errors in output order.
+        return
+    if output_stat is not None and manifest_stat is not None and _same_stream(output_stat, manifest_stat):
+        raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+
+
+def _check_manifest_path(path, output_stat):
+    try:
+        manifest_stat = os.stat(path)
+    except OSError:
+        return
+    if _same_stream(output_stat, manifest_stat):
+        raise ValueError("manifest path points to compiled output: %s" % path)
+    return manifest_stat
+
+
+def _open_file_manifest(stack, path, output_stat, *, preflight=False):
+    nonblocking = getattr(os, "O_NONBLOCK", 0) if preflight else 0
+    flags = os.O_WRONLY | (nonblocking if preflight else os.O_CREAT)
+    try:
+        stream = stack.enter_context(os.fdopen(os.open(path, flags, 0o666), "w"))
+    except OSError:
+        # Creation, a blocking FIFO open, and ordinary manifest errors all
+        # belong after Python output. Preflight only detects existing aliases.
+        if preflight:
+            return None
+        raise
+    if _same_stream(output_stat, os.fstat(stream.fileno())):
+        raise ValueError("manifest path points to compiled output: %s" % path)
+    if nonblocking:
+        os.set_blocking(stream.fileno(), True)
+    return stream
+
+
+def _write_compile_files(output_path, manifest_path, source, manifest):
+    if not manifest_path:
+        with open(output_path, "w") as output:
+            output.write(source)
+        os.chmod(output_path, os.stat(output_path).st_mode | stat.S_IEXEC | stat.S_IXGRP)
+        return
+
+    # Paths can change during compilation or between the check and open.
+    _check_file_destinations(output_path, manifest_path)
+    with ExitStack() as stack:
+        with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
+            output_stat = os.fstat(output.fileno())
+            manifest_stat = _check_manifest_path(manifest_path, output_stat)
+            manifest_file = None
+            # Connecting a waiting FIFO reader would send EOF if Python fails.
+            if manifest_stat is not None and not stat.S_ISFIFO(manifest_stat.st_mode):
+                manifest_file = _open_file_manifest(stack, manifest_path, output_stat, preflight=True)
+            if stat.S_ISREG(output_stat.st_mode):
+                output.truncate(0)
+            output.write(source)
+            output.flush()
+            mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
+            if hasattr(os, "fchmod"):
+                os.fchmod(output.fileno(), mode)
+            else:
+                os.chmod(output_path, mode)
+        if manifest_file is None:
+            manifest_file = _open_file_manifest(stack, manifest_path, output_stat)
+        if stat.S_ISREG(os.fstat(manifest_file.fileno()).st_mode):
+            manifest_file.truncate(0)
+        json.dump(manifest, manifest_file, indent=2)
+
+
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
@@ -146,6 +243,12 @@ def _prepare_compile_stderr():
 
 
 def _cmd_compile(args, stdout=None):
+    if stdout is None and args.manifest:
+        try:
+            _check_file_destinations(args.output, args.manifest)
+        except ValueError as ex:
+            sys.stderr.write("ansiroll: %s\n" % ex)
+            return 2
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
@@ -167,16 +270,14 @@ def _cmd_compile(args, stdout=None):
         sys.stderr.write(message + "\n")
         return 2
     if stdout is None:
-        with open(args.output, "w") as fh:
-            fh.write(source)
-        os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
-    if args.manifest:
-        if stdout is not None:
+        try:
+            _write_compile_files(args.output, args.manifest, source, manifest)
+        except ValueError as ex:
+            sys.stderr.write("ansiroll: %s\n" % ex)
+            return 2
+    else:
+        if args.manifest:
             _write_stdout_manifest(args.manifest, manifest, stdout.fileno())
-        else:
-            with open(args.manifest, "w") as fh:
-                json.dump(manifest, fh, indent=2)
-    if stdout is not None:
         stdout.write(source.encode("utf-8"))
         stdout.flush()
     sys.stderr.write(
