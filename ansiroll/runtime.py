@@ -1131,6 +1131,14 @@ class _PlayVarTemplate(str):
     """Source of a top-level play variable, resolved in the consuming context."""
 
 
+class _TaskVarTemplate(str):
+    """Source of a task variable that may need a loop binding."""
+
+
+class _LoopVarsSnapshot(dict):
+    """The task's magic vars mapping before its loop bindings were applied."""
+
+
 class _PlayVarScope(dict):
     """Cache referenced play templates for a single Jinja evaluation."""
 
@@ -1141,7 +1149,8 @@ class _PlayVarScope(dict):
         self.resolving = set()
         self.resolved = {}
         view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
-        self["vars"] = view(_vars_snapshot(ctx), self)
+        snapshot = ctx.get("vars")
+        self["vars"] = view(snapshot if isinstance(snapshot, _LoopVarsSnapshot) else _vars_snapshot(ctx), self)
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
@@ -1167,20 +1176,24 @@ class _PlayVarScope(dict):
 class _PlayVarView(dict):
     """The finite public vars mapping for a lazy play-variable scope."""
 
-    def __init__(self, snapshot, scope):
+    def __init__(self, snapshot, scope, loop_snapshot=False):
         super().__init__(snapshot)
         if not _core_at_least(2, 19):
             self.update({key: str(value) for key, value in snapshot.items()
                          if isinstance(value, _PlayVarTemplate)})
         self.scope = scope
+        self._loop_snapshot = loop_snapshot or isinstance(snapshot, _LoopVarsSnapshot)
         if "vars" in snapshot:
-            self["vars"] = type(self)(snapshot["vars"], scope)
+            self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
         if key == "vars":
             return value
-        value = self.scope[key]
+        if not self._loop_snapshot:
+            value = self.scope[key]
+        elif isinstance(value, _PlayVarTemplate):
+            value = str(value)
         return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
 
     def get(self, key, default=None):
@@ -1635,7 +1648,7 @@ class _Templater:
 
     def resolve_variable(self, key, value, ctx, strict=False):
         """Template a variable's trusted value when a template references it."""
-        if type(value) is str and ("{{" in value or "{%" in value):
+        if type(value) in (str, _TaskVarTemplate) and _looks_templated(value):
             marker = (key, value)
             if marker in self._resolving:
                 return _captured("Recursive loop detected in template: %s" % value)
@@ -1646,7 +1659,7 @@ class _Templater:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
             return _lazy_wrap(value, value._rt, ctx)
-        if self._runtime is not None and type(value) in (dict, list):
+        if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot):
             return _lazy_wrap(value, self._runtime, ctx)
         return value
 
@@ -2016,10 +2029,13 @@ class Runtime:
             return out
         return value
 
-    def template_vars(self, d, ctx, dynamic=False, higher_vars=None):
-        """Prepare variables with lazy containers and deferred play templates.
+    def template_vars(self, d, ctx, dynamic=False, higher_vars=None, defer=False):
+        """Prepare variables with lazy containers and optional deferred templates.
+
         Legacy non-native templating also keeps scalar sources so its raw
-        single-variable type check sees the original value."""
+        single-variable type check sees the original value. Loop task scalars
+        can stay raw without creating a play-vars view.
+        """
         d = d or {}
         base = dict(ctx)
         base.update(d)
@@ -2030,12 +2046,14 @@ class Runtime:
         for k, v in d.items():
             if isinstance(v, str) and dynamic and ("{{" in v or "{%" in v):
                 out[k] = _PlayVarTemplate(v)
-            elif isinstance(v, str) and not legacy:
+            elif defer and type(v) is str and _looks_templated(v):
+                out[k] = _TaskVarTemplate(v)
+            elif isinstance(v, str) and not (legacy or defer):
                 out[k] = self.templater.render_string(v, base)
             elif isinstance(v, dict) and set(v.keys()) == {"__ansiroll_unsafe__"}:
                 out[k] = _UntrustedConditionValue(v["__ansiroll_unsafe__"])
             else:
-                out[k] = _lazy_container(v, self, base, dynamic)
+                out[k] = _lazy_container(v, self, base, dynamic or defer)
         return out
 
     @contextmanager
@@ -2666,7 +2684,10 @@ class Runtime:
         ctx.pop(_INCLUDE_PARAMS_KEY, None)
         task_vars = {key: value for key, value in (task.get("vars") or {}).items()
                      if key not in higher_vars}
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars))
+        # A loop expression can use task vars, and later uses can see the
+        # loop bindings. Keep templates live until they are actually read.
+        looped = task.get("type") != "include" and task.get("loop") is not None
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -2682,7 +2703,7 @@ class Runtime:
         for key, value in ctx.items():
             if key in ("hostvars", "vars"):
                 continue
-            if isinstance(value, _PlayVarTemplate) or (
+            if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
                 # A play alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
@@ -2693,8 +2714,11 @@ class Runtime:
             current[key] = value
         hostvars[self.host] = current
         ctx["hostvars"] = hostvars
-        if "vars" not in ctx:
-            ctx["vars"] = _vars_snapshot(ctx)
+        loop_snapshot = looped and bool(task_vars)
+        play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
+        if "vars" not in ctx or play_magic:
+            snapshot = _vars_snapshot(ctx)
+            ctx["vars"] = _LoopVarsSnapshot(snapshot) if loop_snapshot else snapshot
         return ctx
 
     def run_task(self, task, overlay, become=False):
@@ -5044,12 +5068,14 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None):
         if key == "vars":
             continue
         try:
-            if templater is not None and (resolve_keys is None or key in resolve_keys):
+            if templater is not None and (
+                    resolve_keys is None or key in resolve_keys or isinstance(value, _TaskVarTemplate)):
                 if isinstance(value, _PlayVarTemplate):
                     value = scope[key]
                     if resolve_keys is None:
                         value = _delegate_template_value(value)
-                elif isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
+                elif isinstance(value, _TaskVarTemplate) or (
+                        isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
                     value = templater.resolve_variable(key, value, scope)
                     if resolve_keys is None:
                         value = _delegate_template_value(value)

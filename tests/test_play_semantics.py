@@ -24,7 +24,7 @@ from ansible.release import __version__
 CORE_VERSION = tuple(map(int, re.match(r"^(\d+)\.(\d+)", __version__).groups()))
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MSG_RE = re.compile(r'^\s+"msg": (.*)$', re.M)
+MSG_RE = re.compile(r'^\s+"msg": (.*?),?$', re.M)
 RECAP_RE = re.compile(
     r"ok=(\d+)\s+changed=(\d+)\s+unreachable=(\d+)\s+failed=(\d+)\s+"
     r"skipped=(\d+)\s+rescued=(\d+)\s+ignored=(\d+)"
@@ -616,6 +616,81 @@ def test_task_aliases_see_role_parameter_and_include_precedence(tmp_path):
         "roles/r/tasks/site.yml": "- debug: {msg: INCLUDE_FILE}",
     })
     assert messages == ['"param param"', '"INCLUDE_FILE"', '"ROLE_FILE"']
+
+
+def test_loop_task_alias_resolves_play_alias_per_item(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars: {play_alias: "{{ item }}"}
+          tasks:
+            - debug: {msg: "{{ task_alias }}"}
+              vars: {task_alias: "{{ play_alias }}"}
+              loop: [alpha, beta]
+    """})
+    assert messages == ['"alpha"', '"beta"']
+
+
+def test_loop_task_vars_resolve_for_loop_expression_and_item_condition(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - debug: {msg: "selected={{ labels.selected }}"}
+              vars:
+                choices: [alpha, beta, gamma]
+                entries: "{{ choices }}"
+                labels: {selected: "{{ entry }}-{{ position }}"}
+                selected: "{{ entry != 'beta' }}"
+              loop: "{{ entries }}"
+              loop_control: {loop_var: entry, index_var: position}
+              when: selected | bool
+    """})
+    assert messages == ['"selected=alpha-0"', '"selected=gamma-2"']
+
+
+def test_loop_task_alias_preserves_magic_vars_snapshot(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars: {unrelated: "{{ 1 }}"}
+          tasks:
+            - debug: {msg: "{{ item }} / {{ task_alias }}"}
+              vars: {task_alias: "{{ vars.item | default('missing') }}"}
+              loop: [alpha, beta]
+            - debug: {msg: "{{ item }} / {{ task_alias }}"}
+              vars: {item: original, task_alias: "{{ vars.item }}"}
+              loop: [alpha, beta]
+    """})
+    assert messages == ['"alpha / missing"', '"beta / missing"', '"alpha / original"', '"beta / original"']
+
+
+def test_loop_task_alias_stays_out_of_hostvars(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - debug:
+                msg: "{{ task_alias }} / {{ hostvars[inventory_hostname].task_alias | default('missing') }}"
+              vars: {task_alias: "{{ item }}"}
+              loop: [alpha, beta]
+    """})
+    assert messages == ['"alpha / missing"', '"beta / missing"']
+
+
+def test_loop_task_user_vars_mapping_does_not_replace_play_magic(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars: {play_label: play, unrelated_alias: "{{ 1 }}"}
+          tasks:
+            - debug: {msg: "{{ vars.play_label }} / {{ item }} / {{ item_snapshot }}"}
+              vars:
+                vars: {custom: x}
+                item_snapshot: "{{ vars.item | default('missing') }}"
+              loop: [alpha, beta]
+    """})
+    assert messages == ['"play / alpha / missing"', '"play / beta / missing"']
 
 
 def test_include_tasks_handler_runs_its_body(tmp_path):

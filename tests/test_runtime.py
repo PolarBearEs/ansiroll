@@ -208,6 +208,41 @@ def test_delegation_resolves_selected_action_variables():
     assert sent["unused"] == "{{ rsync_binary }}"
 
 
+def test_delegated_loop_task_alias_uses_agent_filters():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["agent_filter"] = str.upper
+    task = _task("template", "Template", None, loop=["sample"],
+                 vars={"alias": "{{ item | agent_filter }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert _delegate_vars(ctx, rt.templater)["alias"] == "SAMPLE"
+
+
+def test_delegated_synchronize_loop_sends_rendered_ssh_options():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["agent_filter"] = str.upper
+    task = _task("sync", "Synchronize", None, loop=["sample"],
+                 vars={"ansible_ssh_common_args": "-o HostKeyAlias={{ item | agent_filter }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    sent = _delegate_vars(ctx, rt.templater, {"ansible_rsync_path"})
+    assert sent["ansible_ssh_common_args"] == "-o HostKeyAlias=SAMPLE"
+
+
+def test_loop_task_magic_vars_keep_original_values_when_facts_change():
+    rt = Runtime({}, "", {"counter": 0})
+    rt.vars.update(rt.template_vars({"play_alias": "{{ 1 }}"}, {}, dynamic=True))
+    task = _task("increment", "Increment", None, loop=["first", "second"],
+                 vars={"alias": "{{ vars.counter }} / {{ counter }} / {{ item }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(item="second", counter=1)
+    assert rt.template("{{ alias }}", ctx) == "0 / 1 / second"
+
+
 @pytest.mark.parametrize("controller_snapshot", [False, True])
 def test_play_alias_can_read_shadowed_inventory_value(controller_snapshot):
     frames = []
