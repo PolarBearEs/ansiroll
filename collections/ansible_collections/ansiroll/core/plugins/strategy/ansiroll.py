@@ -212,7 +212,7 @@ class StrategyModule(StrategyBase):
 
     # ---- compilation -----------------------------------------------------
     def _compile(self, play, play_vars, gather_task):
-        from ansiroll.loader import _conditions, _convert_play
+        from ansiroll.loader import _conditions, _convert_play, _tag_untrusted
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
 
@@ -225,6 +225,7 @@ class StrategyModule(StrategyBase):
         if gather_task is not None:
             play_node["gather_when"] = _conditions(gather_task.when)
             play_node["gather_no_log"] = gather_task.no_log
+            play_node["gather_options"] = _tag_untrusted(gather_task.args)
 
         embedder = ModuleEmbedder()
         modules = {}
@@ -351,6 +352,7 @@ class StrategyModule(StrategyBase):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
+        gather_reply = None
         last_frame = time.monotonic()
         while True:
             frame = chan.recv()
@@ -399,6 +401,14 @@ class StrategyModule(StrategyBase):
                     "t": "source_result",
                     "source": self._read_controller_source(frame.get("path")),
                 })
+            elif t == "gather_args":
+                if gather_reply is None:
+                    gather_reply = {"t": "gather_args_result"}
+                    try:
+                        gather_reply["args"] = self._gather_args(host, task_map["__gather_facts__"])
+                    except Exception as ex:
+                        gather_reply["error"] = str(ex)
+                chan.send(gather_reply)
             elif t == "warning":
                 display.warning(frame["message"])
             elif t == "error":
@@ -410,6 +420,18 @@ class StrategyModule(StrategyBase):
                 break
             last_frame = now
         return host_failed
+
+    def _gather_args(self, host, task):
+        variables = self._variable_manager.get_vars(play=self._cur_play, host=host, task=task)
+        search_path = task.get_search_path()
+        basedir = self._loader.get_basedir()
+        if basedir not in search_path:
+            search_path.append(basedir)
+        variables["ansible_search_path"] = search_path
+        templar = self._mk_templar(variables)
+        args = templar.template(task.args)
+        omit = variables.get("omit")
+        return {key: value for key, value in args.items() if value is not None and value != omit}
 
     @staticmethod
     def _read_controller_source(path):

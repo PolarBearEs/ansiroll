@@ -299,6 +299,24 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
+    if gather and gather_facts is None and any(
+            _is_templated(item) for value in gather_options.values() for item in _as_list(value)):
+        from ansible.utils.vars import combine_vars
+
+        defaults = {}
+        exports = {}
+        export_args = {"only_exports": True} if core_version >= (2, 15) else {}
+        for role in play.roles:
+            if core_version >= (2, 16) and not role.public:
+                continue
+            defaults = combine_vars(defaults, role.get_default_vars())
+            if core_version >= (2, 16) or not C.DEFAULT_PRIVATE_ROLE_VARS:
+                exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
+        result["gather_scope"] = {
+            "role_defaults": _tag_untrusted(defaults),
+            "role_exports": _tag_untrusted(exports),
+            "search_path": list(getattr(play, "get_search_path", lambda: [])()) or [basedir],
+        }
     names = _controller_env_names(result)
     if names:
         result["controller_env"] = {

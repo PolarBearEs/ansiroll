@@ -1921,6 +1921,7 @@ class Runtime:
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
+        self.gather_args_fn = None    # resolve native setup arguments on the controller
         self.on_task_start = None
         self._started_task_name = (None, None)
         self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
@@ -2345,9 +2346,7 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         if play.get("gather_facts") and not gather_cached:
-            setup_vars = dict(self.vars)
-            setup_vars.update(play.get("vars") or {})
-            setup_ctx = self.ctx(base=self._layered_ctx(setup_vars))
+            setup_ctx, gather_play_ctx = self._gather_contexts(play)
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -2356,6 +2355,7 @@ class Runtime:
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 options=play.get("gather_options"), option_defaults=play.get("gather_option_defaults"),
+                play_ctx=gather_play_ctx,
             )
             if not gathered:
                 self.failed = True
@@ -2602,12 +2602,13 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _with_deferred_vars_files(self, play):
+    def _with_deferred_vars_files(self, play, base=None, before_setup=False):
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
         play_vars = dict(play.get("vars") or {})
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
-        base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        if base is None:
+            base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in play.get("deferred_vars_files") or ():
             ctx = self.ctx(play_vars, self.extra_vars, base=base)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
@@ -2615,6 +2616,8 @@ class Runtime:
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
+                    if before_setup:
+                        break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
                                              "vars_files item %r: %s" % (item, ex))
@@ -2642,6 +2645,8 @@ class Runtime:
                         play_vars.update(value)
                     break
             else:
+                if before_setup:
+                    continue
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
                 if not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))
@@ -2649,6 +2654,31 @@ class Runtime:
                 sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                  % (item,))
         return play_vars
+
+    def _gather_contexts(self, play):
+        setup_vars = dict(self.vars)
+        scope = play.get("gather_scope")
+        if not scope:
+            setup_vars.update(play.get("vars") or {})
+            return self.ctx(base=self._layered_ctx(setup_vars)), None
+
+        defaults = scope["role_defaults"]
+        exports = scope["role_exports"]
+        # Core validates gather_subset and gather_timeout with play-only vars.
+        play_vars = dict(defaults)
+        play_vars.update(self._with_deferred_vars_files(play, base=defaults, before_setup=True))
+        play_vars.update(exports)
+        play_vars.update(self.extra_vars)
+        play_ctx = self.ctx(base=play_vars)
+
+        # The implicit setup task resolves fact_path with host and task vars.
+        setup_vars = dict(defaults)
+        setup_vars.update(self.vars)
+        setup_vars.update(self._with_deferred_vars_files(play, before_setup=True))
+        setup_vars.update(exports)
+        self._layered_ctx(setup_vars)
+        setup_vars["ansible_search_path"] = scope["search_path"]
+        return self.ctx(base=setup_vars), play_ctx
 
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < host vars/facts/play vars
@@ -4273,9 +4303,31 @@ class Runtime:
             self._flushing = False
 
     # ---- facts -----------------------------------------------------------
+    def _setup_args(self, options, option_defaults, ctx, play_ctx):
+        if self.gather_args_fn is not None and options:
+            return self.gather_args_fn()
+        rendered = {}
+        for key, value in (options or {}).items():
+            option_ctx = (play_ctx or ctx) if key in ("gather_subset", "gather_timeout") else ctx
+            rendered[key] = _fail_on_undef(self.template(value, option_ctx, strict=True))
+        for key, value in (option_defaults or {}).items():
+            if rendered.get(key) == _OMIT:
+                rendered[key] = value
+        args = {key: value for key, value in _strip_omit(rendered).items() if value is not None}
+        if "gather_timeout" in args and not _core_at_least(2, 18):
+            args["gather_timeout"] = int(args["gather_timeout"])
+        if not _core_at_least(2, 13) and not args.get("gather_timeout"):
+            args.pop("gather_timeout", None)
+        subset = args.get("gather_subset")
+        if isinstance(subset, str):
+            args["gather_subset"] = [subset]
+        elif isinstance(subset, (list, tuple)) and _core_at_least(2, 19):
+            args["gather_subset"] = [name for name in subset if name != _OMIT]
+        return args
+
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     options=None, option_defaults=None):
+                     options=None, option_defaults=None, play_ctx=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -4301,17 +4353,7 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            rendered_options = _fail_on_undef(self.template(options or {}, ctx, strict=True))
-            for key, value in (option_defaults or {}).items():
-                if rendered_options.get(key) == _OMIT:
-                    rendered_options[key] = value
-            setup_args = {key: value for key, value in _strip_omit(rendered_options).items()
-                          if value is not None}
-            if not _core_at_least(2, 13) and not setup_args.get("gather_timeout"):
-                setup_args.pop("gather_timeout", None)
-            subset = setup_args.get("gather_subset")
-            if isinstance(subset, (list, tuple)) and _core_at_least(2, 19):
-                setup_args["gather_subset"] = [name for name in subset if name != _OMIT]
+            setup_args = self._setup_args(options, option_defaults, ctx, play_ctx)
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             # Older controllers supply these setup defaults as play options.
             default_options = {"gather_subset": ["all"], "gather_timeout": 10}
@@ -5141,6 +5183,17 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
+
+    def _controller_gather_args():
+        _chan_send(resp_fd, {"t": "gather_args"})
+        reply = _chan_recv()
+        if not reply or reply.get("t") != "gather_args_result":
+            raise RuntimeError("ansiroll: controller did not return setup arguments")
+        if reply.get("error"):
+            raise RuntimeError(reply["error"])
+        return reply["args"]
+
+    rt.gather_args_fn = _controller_gather_args
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
             # Only the agent has the play's bundled filters and lookup plugins.

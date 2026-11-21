@@ -1348,12 +1348,13 @@ def test_fast_facts_fall_back_to_official_setup(monkeypatch):
     assert rt.vars["ansible_kernel"] == "official"
 
 
-def test_legacy_setup_omits_rendered_zero_timeout(monkeypatch):
+@pytest.mark.parametrize("value, expected", [(0, {}), ("0", {}), (2.5, {"gather_timeout": 2})])
+def test_legacy_setup_validates_rendered_timeout_before_the_iterator_gate(monkeypatch, value, expected):
     from ansiroll import runtime
 
     monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.12")
     monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
-    rt = Runtime({}, "", {"inventory_hostname": "h", "time_limit": 0})
+    rt = Runtime({}, "", {"inventory_hostname": "h", "time_limit": value})
     calls = []
 
     def run_module(action, args, become=False):
@@ -1362,7 +1363,14 @@ def test_legacy_setup_omits_rendered_zero_timeout(monkeypatch):
 
     monkeypatch.setattr(rt, "run_module", run_module)
     assert rt.gather_facts(options={"gather_timeout": "{{ time_limit }}"})
-    assert calls == [("ansible.builtin.setup", {})]
+    assert calls == [("ansible.builtin.setup", expected)]
+
+
+def test_implicit_setup_treats_scalar_subset_as_one_selector():
+    rt = Runtime({}, "", {"inventory_hostname": "h"})
+    assert rt._setup_args({"gather_subset": "network,virtual"}, None, rt.ctx(), None) == {
+        "gather_subset": ["network,virtual"],
+    }
 
 
 def test_async_poll_zero_starts_without_sync_run(monkeypatch):

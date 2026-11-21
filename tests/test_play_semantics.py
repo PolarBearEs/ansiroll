@@ -1106,6 +1106,78 @@ def test_implicit_setup_vars_see_runtime_extra_vars(tmp_path, monkeypatch):
     assert _standalone(tmp_path, []) == expected
 
 
+def test_implicit_setup_find_vars_files_before_gathering(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "vars/custom.yml": "facts_dir: custom-facts\n",
+        "custom-facts/example.fact": '{"marker": "from vars file"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          vars_files: ['vars/{{ fact_profile }}.yml']
+          fact_path: "{{ ansible_search_path[-1] }}/{{ facts_dir }}"
+          tasks:
+            - debug:
+                msg: "marker={{ ansible_local.example.marker }}"
+        """,
+    })
+    extra_vars = json.dumps({"fact_profile": "custom"})
+    args = ["-e", extra_vars]
+    expected = _ansible(tmp_path, args)
+    assert expected[0] == ['"marker=from vars file"']
+    assert _ansible(tmp_path, args, "ansiroll.core.ansiroll") == expected
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra_vars)
+    assert _standalone(tmp_path, []) == expected
+
+
+def test_implicit_setup_subset_uses_public_role_defaults_before_host_facts(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "roles/defaults/defaults/main.yml": "requested_subset: ['!all', '!min']\n",
+        "roles/defaults/tasks/main.yml": "[]\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - set_fact:
+                requested_subset: [all]
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ requested_subset }}"
+          roles: [defaults]
+          tasks:
+            - debug:
+                msg: "distribution defined: {{ ansible_facts.distribution is defined }}"
+        """,
+    })
+    assert msgs == ['"distribution defined: False"']
+
+
+def test_implicit_setup_fact_path_uses_controller_task_vars(tmp_path):
+    _write(tmp_path, {
+        "location.yml": "facts_dir: actual-facts\n",
+        "location.txt": str(tmp_path) + "\n",
+        "actual-facts/example.fact": '{"marker": "controller value"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - include_vars: location.yml
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          vars:
+            facts_dir: wrong-facts
+          fact_path: "{{ lookup('file', playbook_dir + '/location.txt') }}/{{ facts_dir }}"
+          tasks:
+            - debug:
+                msg: "marker={{ ansible_local.example.marker }}"
+        """,
+    })
+    expected = _ansible(tmp_path, [])
+    assert expected[0] == ['"marker=controller value"']
+    assert _ansible(tmp_path, [], "ansiroll.core.ansiroll") == expected
+
+
 def test_setup_failure_uses_play_ignore_context_and_displays_result(tmp_path, monkeypatch):
     _reject_setup_become(tmp_path, monkeypatch)
     ignore = 'ignore_errors: "{{ ignore_setup_error }}"\n  vars: {ignore_setup_error: true}'
