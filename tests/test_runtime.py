@@ -352,6 +352,20 @@ def test_loop_items_keep_provenance_of_registered_collections(loop):
         rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
 
 
+def test_boolean_loop_conditions_read_only_the_selected_values():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "previous"}, {"stdout_lines": ["sample"]})
+    task = _task("task", "Task", None, loop="{{ previous.stdout_lines }}", vars={"label": "sample"})
+    ctx = rt._task_ctx(task, {})
+    items = rt._resolve_loop(task["loop"], ctx)
+    ctx.update(rt._loop_item_vars(task, items, 0, ctx))
+
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ vars.label == 'sample' }}"}], ctx)
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ item == 'sample' }}"}], ctx)
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ item }}' == 'sample'"}], ctx)
+
+
 @pytest.mark.parametrize("keyword", ["changed_when", "failed_when", "until", "loop_break_when"])
 def test_loop_alias_keeps_provenance_of_current_result(keyword, monkeypatch):
     monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
@@ -432,6 +446,59 @@ def test_loop_assertion_tracks_members_through_list_composition(composition, tru
     else:
         with pytest.raises(UntrustedConditional):
             rt.when([condition], ctx, keyword=None)
+
+
+def test_loop_assertion_members_share_resolved_task_aliases():
+    rt = Runtime({}, "", {})
+    reads = []
+
+    def next_reading():
+        reads.append(True)
+        return len(reads)
+
+    rt.templater.env.globals["next_reading"] = next_reading
+    task = _task("task", "Task", None, loop=[1], vars={"alias": "{{ next_reading() }}"})
+    ctx = rt._task_ctx(task, {})
+    cond = {"__ansiroll_trusted_condition__": "{{ [alias == 1, alias == 1] }}"}
+    assert rt.when([cond], ctx, keyword=None)
+    assert reads == [True]
+
+
+@pytest.mark.parametrize("take_branch", [True, False])
+def test_loop_assertion_tracks_only_members_of_selected_branch(take_branch):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"msg": "sample"})
+
+    def unexpected_lookup():
+        pytest.fail("an unselected assertion branch was rendered")
+
+    rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
+    selected = "[result.msg == 'sample', check]"
+    alternate = "[unexpected_lookup()]"
+    if not take_branch:
+        selected, alternate = alternate, selected
+    task = _task("task", "Task", None, loop=[1], vars={
+        "take_branch": take_branch,
+        "check": "item == 1",
+        "alias": "{{ " + selected + " if take_branch else " + alternate + " }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("access", [lambda values: values["alias"], lambda values: values.get("alias")])
+def test_custom_lookup_resolves_deferred_task_alias_with_current_loop_item(access):
+    rt = Runtime({}, "", {})
+
+    def read_alias(terms, variables, **kwargs):
+        return [access(variables)]
+
+    rt.templater._lookup_loaded["read_alias"] = read_alias
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item | upper }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert rt.template("{{ lookup('read_alias') }}", ctx) == "SAMPLE"
 
 
 def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():

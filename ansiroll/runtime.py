@@ -1174,6 +1174,7 @@ class _PlayVarScope(dict):
         self.strict = strict
         self.resolving = set()
         self.resolved = {}
+        self.resolved_task = {}
         self.resolved_snapshot = {}
         view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
         snapshot = ctx.get("vars")
@@ -1198,6 +1199,36 @@ class _PlayVarScope(dict):
 
     def get(self, key, default=None):
         return self[key] if key in self else default
+
+
+class _LookupVars(dict):
+    """Lookup plugin variables with deferred task aliases resolved on access."""
+
+    def __init__(self, ctx, templater):
+        super().__init__(ctx)
+        self.ctx = ctx
+        self.templater = templater
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if isinstance(value, _TaskVarTemplate):
+            return self.templater.resolve_variable(key, value, self.ctx)
+        return self.templater._observe_untrusted(value)
+
+    def __iter__(self):
+        return dict.__iter__(self)
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def items(self):
+        return [(key, self[key]) for key in self]
+
+    def values(self):
+        return [self[key] for key in self]
+
+    def copy(self):
+        return dict(self.items())
 
 
 class _PlayVarView(dict):
@@ -1662,9 +1693,8 @@ class _Templater:
         """Run a baked lookup plugin; errors come back captured."""
         if name in self._lookup_loaded:
             try:
-                return list(self._lookup_loaded[name](list(args),
-                                                      dict(self._current_ctx or {}),
-                                                      **kwargs))
+                variables = _LookupVars(self._current_ctx or {}, self)
+                return list(self._lookup_loaded[name](list(args), variables, **kwargs))
             except Exception as e:
                 return _captured("lookup plugin '%s' failed: %s" % (name, e))
         if name in self._lookup_errors:
@@ -1691,12 +1721,20 @@ class _Templater:
         """Template a variable's trusted value when a template references it."""
         self._observe_untrusted(value)
         if type(value) in (str, _TaskVarTemplate) and _looks_templated(value):
+            cache = None
+            if isinstance(ctx, _PlayVarScope) and isinstance(value, _TaskVarTemplate):
+                cache = ctx.resolved_task
+            cache_key = (key, id(value))
+            if cache is not None and cache_key in cache:
+                return self._observe_untrusted(cache[cache_key])
             marker = (key, value)
             if marker in self._resolving:
                 return _captured("Recursive loop detected in template: %s" % value)
             self._resolving.append(marker)
             try:
                 result = self.render_string(value, ctx, strict=strict)
+                if cache is not None:
+                    cache[cache_key] = result
                 return self._observe_untrusted(result)
             finally:
                 self._resolving.pop()
@@ -1817,6 +1855,14 @@ class _Templater:
                 left = left or self._conditional_member(env, node.left)
                 right = right or self._conditional_member(env, node.right)
                 return lambda ctx: left(ctx) + right(ctx)
+        if isinstance(node, nodes.CondExpr) and node.expr2 is not None:
+            selected = self._conditional_collection(env, node.expr1)
+            alternate = self._conditional_collection(env, node.expr2)
+            if selected or alternate:
+                test = self._conditional_member(env, node.test)
+                selected = selected or self._conditional_member(env, node.expr1)
+                alternate = alternate or self._conditional_member(env, node.expr2)
+                return lambda ctx: selected(ctx) if test(ctx) else alternate(ctx)
         return None
 
     def _conditional_list(self, text, env, ctx, strict):
@@ -1851,7 +1897,7 @@ class _Templater:
             expr = stripped[2:-2].strip()
             expr_key = (expr, True) if strict else expr
             try:
-                if self._untrusted_task_interpolation is not None and (expr.startswith(("[", "(")) or "+" in expr):
+                if self._untrusted_task_interpolation is not None and ("[" in expr or "(" in expr or "+" in expr):
                     sequence = self._conditional_list(stripped, env, ctx, strict)
                     if sequence is not None:
                         return sequence
@@ -2251,23 +2297,8 @@ class Runtime:
                 raise UntrustedConditional(
                     "Conditional %r is an untrusted template or expression and "
                     "cannot be evaluated." % cond)
-            try:
-                from jinja2 import meta as jinja_meta
-                referenced = jinja_meta.find_undeclared_variables(
-                    self.templater.env.parse(cond)
-                )
-            except Exception:
-                referenced = ()
-            if any(
-                    name in ctx
-                    and (
-                        (not ctx[name].current if isinstance(ctx[name], _RegisteredResult)
-                         else _condition_contains_string(ctx[name], _UntrustedConditionValue))
-                    )
-                    for name in referenced):
-                raise UntrustedConditional(
-                    "Encountered untrusted template or expression."
-                )
+            if self._direct_previous_register(cond, ctx):
+                raise UntrustedConditional("Encountered untrusted template or expression.")
             result = self.templater.render_conditional_template(cond, ctx, strict=strict_vars)
             # Assert accepts an indirected list of expressions (for
             # example `that: "{{ expression_list }}"`). Evaluate the
@@ -2316,6 +2347,27 @@ class Runtime:
             raise RuntimeError(
                 "The conditional check %r failed: the expression is undefined" % cond)
         return self._condition_truth(result, modern, allow_broken)
+
+    def _direct_previous_register(self, condition, ctx):
+        # Preserve the rejection of a register used as the entire condition.
+        # Comparisons and other expressions use the renderer's value tracking.
+        if not any(isinstance(value, _RegisteredResult) and not value.current for value in ctx.values()):
+            return False
+        nodes = jinja2.nodes
+        try:
+            parsed = self.templater.env.parse(condition.strip())
+        except jinja2.TemplateError:
+            return False
+        if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output):
+            return False
+        output = parsed.body[0].nodes
+        if len(output) != 1:
+            return False
+        reference = output[0]
+        while isinstance(reference, (nodes.Getattr, nodes.Getitem)):
+            reference = reference.node
+        value = dict.get(ctx, reference.name) if isinstance(reference, nodes.Name) else None
+        return isinstance(value, _RegisteredResult) and not value.current
 
     def _condition_truth(self, result, modern, allow_broken):
         if isinstance(result, bool):
