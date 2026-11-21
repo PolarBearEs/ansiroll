@@ -170,20 +170,105 @@ raise SystemExit(cli.entrypoint())
     assert result.stderr == b""
 
 
-def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("with_manifest", [False, True])
+def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys, with_manifest):
     manifest = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
     output = tmp_path / "compiled.py"
-    output.touch()
+    output.write_text("# previous output with a longer line\n")
     output.chmod(0o640)
+    args = ["compile", "play.yml", "-o", str(output)]
+    if with_manifest:
+        manifest_path = tmp_path / "manifest.json"
+        manifest_path.write_text(" " * 100)
+        args.extend(["-m", str(manifest_path)])
 
-    assert cli.main(["compile", "play.yml", "-o", str(output)]) == 0
+    assert cli.main(args) == 0
 
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "ansiroll: compiled play.yml -> %s" % output in captured.err
     assert output.read_text() == "pass\n"
     assert stat.S_IMODE(output.stat().st_mode) == 0o750
+    if with_manifest:
+        assert manifest_path.read_text() == json.dumps(manifest, indent=2)
+
+
+@pytest.mark.parametrize("alias", ["missing", "same", "symlink", "hardlink", "replaced"])
+def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alias):
+    output = tmp_path / "compiled.py"
+    original = "# existing output\n"
+    if alias != "missing":
+        output.write_text(original)
+    manifest = tmp_path / "manifest.json"
+    if alias in ("missing", "same"):
+        manifest = output
+    elif alias == "symlink":
+        manifest.symlink_to(output)
+    elif alias == "hardlink":
+        os.link(output, manifest)
+    else:
+        manifest.write_text("{}")
+        open_fd = os.open
+
+        def replace_manifest(path, flags, *args, **kwargs):
+            if path == str(manifest):
+                manifest.unlink()
+                manifest.symlink_to(output)
+            return open_fd(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", replace_manifest)
+
+    def compile_playbook(*args, **kwargs):
+        assert alias == "replaced", "expected alias to be rejected before compiling"
+        return "pass\n", {"modules": [], "fallback_tasks": []}
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
+    assert "manifest path points to compiled output" in capsys.readouterr().err
+    if alias == "missing":
+        assert not output.exists()
+    else:
+        assert output.read_text() == original
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_file_compile_streams_to_sequential_fifos(tmp_path):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    os.mkfifo(output)
+    os.mkfifo(manifest)
+    args = [str(output), str(manifest)]
+    read_script = """
+import sys
+from pathlib import Path
+
+for path in sys.argv[1:]:
+    sys.stdout.write(Path(path).read_text())
+"""
+    compile_script = """
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **k: ('pass\\n', {'modules': [], 'fallback_tasks': []})
+raise SystemExit(cli.main(['compile', 'play.yml', '-o', sys.argv[1], '-m', sys.argv[2]]))
+"""
+    reader = subprocess.Popen(
+        [sys.executable, "-c", read_script, *args],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        subprocess.run(
+            [sys.executable, "-c", compile_script, *args],
+            capture_output=True, check=True, timeout=10,
+        )
+        received, _ = reader.communicate(timeout=10)
+    finally:
+        if reader.poll() is None:
+            reader.kill()
+            reader.communicate()
+    assert reader.returncode == 0
+    assert received == "pass\n" + json.dumps({"modules": [], "fallback_tasks": []}, indent=2)
 
 
 def test_run_streams_compiled_source_without_creating_a_file(monkeypatch):
