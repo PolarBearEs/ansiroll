@@ -132,7 +132,11 @@ def _playbook_replay_command(filename, script, flags, *, legacy=True):
         f"_parity_bootstrap[{runner!r}](sys.argv.pop(1), sys.argv.pop(1))",
         filename,
     )
-    command[1:1] = [*flags, *(["-P"] if getattr(sys.flags, "safe_path", False) else [])]
+    if getattr(sys.flags, "safe_path", False) and "-P" not in flags:
+        flags = (*flags, "-P")
+    if sys.flags.no_user_site and "-s" not in flags:
+        flags = (*flags, "-s")
+    command[1:1] = flags
     return command + [script]
 
 
@@ -256,12 +260,23 @@ def _launcher_body(source):
 
 def _launcher_body_and_flags(source):
     shebang, newline, code = source.partition("\n")
-    flag = re.fullmatch(r"#![ \t]*(/[^ \t]+|/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)[ \t]+-s[ \t]*", shebang)
+    flag = re.fullmatch(
+        r"#![ \t]*(/[^ \t]+|/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)[ \t]+-(sP|Ps|s|P)[ \t]*",
+        shebang,
+    )
     header_source = f"#!{flag[1]}{newline}{code}" if flag else source
     body = _launcher_body(header_source)
     if header_source.startswith("#!") and body == header_source:
         return None, ()
-    return body, ("-s",) if flag else ()
+    flags = tuple(f"-{option}" for option in flag[2]) if flag else ()
+    return body, flags
+
+
+def _needs_launcher_flags(flags):
+    if "-P" in flags and not hasattr(sys.flags, "safe_path"):
+        raise RuntimeError("the selected Python cannot reproduce the launcher's -P flag")
+    return (("-s" in flags and not sys.flags.no_user_site)
+            or ("-P" in flags and not getattr(sys.flags, "safe_path", False)))
 
 
 def _legacy_python_launcher(path, filename, package, diagnostics, associated):
@@ -342,7 +357,7 @@ def _path_playbook_launchers():
                 yield script
 
 
-def _is_stock_playbook_entrypoint(script):
+def _stock_playbook_flags(script):
     # These stock wrappers only dispatch to main(). A custom wrapper may
     # change the environment or CLI arguments before invoking Ansible.
     bodies = (
@@ -362,13 +377,15 @@ def _is_stock_playbook_entrypoint(script):
     try:
         with tokenize.open(script) as launcher:
             source = launcher.read()
-        body, _ = _launcher_body_and_flags(source)
+        body, flags = _launcher_body_and_flags(source)
         if body is None:
-            return False
+            return None
         parsed = ast.dump(ast.parse(body))
     except (OSError, SyntaxError, UnicodeError):
-        return False
-    return any(parsed == ast.dump(ast.parse(body)) for body in bodies)
+        return None
+    if any(parsed == ast.dump(ast.parse(body)) for body in bodies):
+        return flags
+    return None
 
 
 def _matching_path_launcher(package):
@@ -378,17 +395,21 @@ def _matching_path_launcher(package):
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
     for script in _path_playbook_launchers():
-        if not _is_stock_playbook_entrypoint(script):
+        flags = _stock_playbook_flags(script)
+        if flags is None:
             continue
         fields = _ansible_version_fields([script], script, diagnostics, env=env)
         installed = fields.get("ansible python module location", "")
         if installed and os.path.realpath(installed) == package:
-            return script
-    return None
+            return script, flags
+    return None, ()
 
 
 def _run_modern_playbook(filename, script):
-    _set_playbook_launcher(script)
+    if script is not None:
+        _set_playbook_launcher(script)
+    else:
+        sys.argv[0] = os.path.join(os.path.dirname(filename), "cli", "playbook.py")
     _load_reference_ansible(filename)
     from ansible.cli import playbook
 
@@ -403,16 +424,15 @@ def _run_ansible_playbook(filename, version):
         # The CLI looks for sibling helpers next to argv[0] before PATH.
         script = next((script for script in installed_launchers if os.path.isfile(script)), None)
         if script is None:
-            script = _matching_path_launcher(package)
-        if script is not None:
-            with tokenize.open(script) as launcher:
-                body, flags = _launcher_body_and_flags(launcher.read())
-            if body is None:
-                raise RuntimeError(f"launcher shebang cannot be replayed: {script}")
-            if flags and not sys.flags.no_user_site:
-                command = _playbook_replay_command(filename, script, flags, legacy=False)
-                os.execv(command[0], [*command, *sys.argv[1:]])
-        _run_modern_playbook(filename, script or environment_script)
+            script, flags = _matching_path_launcher(package)
+        else:
+            flags = _stock_playbook_flags(script)
+            if flags is None:
+                raise RuntimeError(f"launcher initialization cannot be replayed: {script}")
+        if _needs_launcher_flags(flags):
+            command = _playbook_replay_command(filename, script, flags, legacy=False)
+            os.execv(command[0], [*command, *sys.argv[1:]])
+        _run_modern_playbook(filename, script)
         return
 
     # Older releases install a script instead of a module entry point.
@@ -429,7 +449,7 @@ def _run_ansible_playbook(filename, version):
             verified = _legacy_python_launcher(script, filename, package, diagnostics, associated)
             if verified:
                 python_script, flags = verified
-                if flags and not sys.flags.no_user_site:
+                if _needs_launcher_flags(flags):
                     command = _playbook_replay_command(filename, python_script, flags)
                     os.execv(command[0], [*command, *sys.argv[1:]])
                 _run_legacy_playbook(filename, python_script)

@@ -246,7 +246,7 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
 
     launcher = Path("bin/ansible-playbook")
     (tmp_path / launcher).parent.mkdir()
-    (tmp_path / launcher).touch()
+    (tmp_path / launcher).write_text("#!/usr/bin/env python3\nfrom ansible.cli.playbook import main\nmain()\n")
     ansible_package = str(tmp_path / "ansible")
 
     def distributions(name, path):
@@ -276,7 +276,8 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     assert seen == [str(tmp_path / launcher), "--version"]
 
 
-def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("has_match", [False, True])
+def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monkeypatch, has_match):
     from types import ModuleType, SimpleNamespace
 
     import tests
@@ -303,16 +304,31 @@ def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monk
 
     cli = ModuleType("ansible.cli")
     cli.playbook = SimpleNamespace(main=lambda: seen.append(sys.argv[0]))
+    monkeypatch.setattr(sys, "executable", os.path.join(os.path.dirname(foreign), "python"))
     monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setattr(sys, "path", sys.path[:])
     monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
-    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([wrapper, foreign, matching]))
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([wrapper, foreign] + ([matching] if has_match else [])))
     monkeypatch.setattr(tests, "_ansible_version_fields", version_fields)
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     tests._run_ansible_playbook(os.path.join(package, "__init__.py"), "2.14.18")
-    assert seen == [foreign, matching, matching]
+    if has_match:
+        assert seen == [foreign, matching, matching]
+    else:
+        assert seen == [foreign, os.path.join(package, "cli", "playbook.py")]
+        assert os.path.dirname(foreign) not in sys.path
+
+
+def test_modern_launcher_rejects_recorded_wrapper_initialization(tmp_path, monkeypatch):
+    import tests
+
+    wrapper = tmp_path / "ansible-playbook"
+    wrapper.write_text("#!/usr/bin/env python3\nimport os\nos.environ['ANSIBLE_CONFIG'] = '/other.cfg'\n")
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter([str(wrapper)]))
+    with pytest.raises(RuntimeError, match="launcher initialization cannot be replayed"):
+        tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"), "2.14.18")
 
 
 def test_version_probe_parses_empty_fields(monkeypatch):
@@ -329,7 +345,7 @@ def test_version_probe_parses_empty_fields(monkeypatch):
 
 @pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
 @pytest.mark.parametrize("no_user_site", [False, True])
-@pytest.mark.parametrize("safe_path", [False, True])
+@pytest.mark.parametrize("safe_path", [None, "environment", "shebang"])
 def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, no_user_site, safe_path):
     from tests import _reference_python
 
@@ -337,7 +353,7 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
         pytest.skip("Python does not support safe-path mode")
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
-    if safe_path:
+    if safe_path == "environment":
         monkeypatch.setenv("PYTHONSAFEPATH", "1")
     source = "inherited" if safe_path else "launcher"
     package = tmp_path / "lib" / "ansible"
@@ -352,13 +368,16 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "parity_legacy_dependency.py").write_text("SOURCE = 'launcher'\n")
-    shebang = "#!/usr/bin/python3 -s" if no_user_site else "#!/usr/bin/env python"
-    (bin_dir / "ansible-playbook").write_text(
-        f"{shebang}\nimport os, sys, ansible\n"
+    options = ("s" if no_user_site else "") + ("P" if safe_path == "shebang" else "")
+    shebang = f"#!/usr/bin/python3 -{options}" if options else "#!/usr/bin/env python"
+    legacy_body = (
+        "import os, sys, ansible\n"
         f"assert ansible.SOURCE == {source!r}, ansible.SOURCE\n"
         f"assert not {no_user_site!r} or sys.flags.no_user_site\n"
         "print('ansible python module location = ' + os.path.dirname(ansible.__file__))\n"
     )
+    body = legacy_body if version == "2.12.10" else "from ansible.cli.playbook import main\nmain()\n"
+    (bin_dir / "ansible-playbook").write_text(f"{shebang}\n{body}")
     (tmp_path / "parity_legacy_dependency.py").write_text("SOURCE = 'inherited'\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
     command = _reference_python(
