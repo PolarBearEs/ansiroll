@@ -288,7 +288,7 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     assert seen == [str(tmp_path / launcher), "--version"]
 
 
-@pytest.mark.parametrize("match_location", [None, "path", "sibling"])
+@pytest.mark.parametrize("match_location", [None, "path", "sibling", "wrong-python"])
 def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, match_location):
     from types import ModuleType, SimpleNamespace
 
@@ -300,10 +300,13 @@ def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, 
     foreign = str(tmp_path / "foreign" / "bin" / "ansible-playbook")
     matching = str(tmp_path / "matching" / "bin" / "ansible-playbook")
     wrapper = str(tmp_path / "matching" / "bin" / "custom-ansible-playbook")
+    sibling = matching if match_location == "sibling" else foreign
+    selected_python = os.path.join(os.path.dirname(sibling), "python")
     seen = []
     for path in (foreign, matching, wrapper):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        source = "#!/usr/bin/env python3\nfrom ansible.cli.playbook import main\nmain()\n"
+        interpreter = "/other/bin/python3 -P" if path == matching and match_location == "wrong-python" else selected_python
+        source = f"#!{interpreter}\nfrom ansible.cli.playbook import main\nmain()\n"
         if path == wrapper:
             source = source.replace("main()\n", "import os\nos.environ['ANSIBLE_CONFIG'] = '/other.cfg'\nmain()\n")
         with open(path, "w") as script:
@@ -311,13 +314,12 @@ def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, 
 
     cli = ModuleType("ansible.cli")
     cli.playbook = SimpleNamespace(main=lambda: seen.append(sys.argv[0]))
-    sibling = matching if match_location == "sibling" else foreign
-    monkeypatch.setattr(sys, "executable", os.path.join(os.path.dirname(sibling), "python"))
+    monkeypatch.setattr(sys, "executable", selected_python)
     monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setattr(sys, "path", sys.path[:])
     monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
-    path = [wrapper, foreign, matching] if match_location == "path" else [wrapper, foreign]
+    path = [wrapper, foreign, matching] if match_location in ("path", "wrong-python") else [wrapper, foreign]
     monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(path))
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("launcher was probed"))
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
@@ -326,11 +328,28 @@ def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, 
     script, flags, legacy = tests._select_playbook_launcher(filename, "2.14.18")
     assert not flags and not legacy
     tests._run_modern_playbook(filename, script)
-    if match_location:
+    if match_location in ("path", "sibling"):
         assert seen == [matching]
     else:
         assert seen == [os.path.join(package, "cli", "playbook.py")]
         assert os.path.dirname(foreign) not in sys.path
+
+
+def test_fallback_installation_uses_python_abi_in_package_path(tmp_path, monkeypatch):
+    import sysconfig
+
+    from tests import _launcher_installation_matches
+
+    package = tmp_path / "lib" / "python3.14t" / "site-packages" / "ansible"
+    package.mkdir(parents=True)
+
+    def install_path(kind, vars):
+        assert kind in ("purelib", "platlib")
+        assert vars == {"base": str(tmp_path), "platbase": str(tmp_path)}
+        return str(package.parent)
+
+    monkeypatch.setattr(sysconfig, "get_path", install_path)
+    assert _launcher_installation_matches(tmp_path / "bin" / "ansible-playbook", str(package))
 
 
 def test_modern_launcher_accepts_pip_entrypoint(tmp_path):

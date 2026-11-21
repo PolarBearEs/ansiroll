@@ -45,7 +45,10 @@ def _reference_python(code, filename=None, *, discover=False):
         # Supply pytest's package search paths without executing site hooks
         # in the interpreter that selects the launcher.
         paths = [os.path.abspath(path) for path in sys.path if isinstance(path, str)]
-        imports = f"import csv; from importlib import metadata; _reference_path.extend({paths!r}); "
+        imports = (
+            "import csv, sysconfig; from importlib import metadata; sysconfig.get_config_vars(); "
+            f"_reference_path.extend({paths!r}); "
+        )
     flags = ["-S"] if discover else []
     return [sys.executable, *flags, "-c", _BOOTSTRAP + imports + _LOAD_BOOTSTRAP + code,
             os.path.abspath(__file__), os.path.abspath(filename)]
@@ -207,7 +210,11 @@ def _is_python_interpreter(executable):
     )
 
 
-def _launcher_body(source):
+def _selected_python_matches(executable):
+    return executable is not None and os.path.realpath(executable) == os.path.realpath(sys.executable)
+
+
+def _launcher_body(source, *, match_script=None):
     if not source.startswith("#!"):
         return source
     shebang, _, body = source.partition("\n")
@@ -217,8 +224,12 @@ def _launcher_body(source):
         # interpreter flags or environment changes made by the launcher.
         env_python = re.fullmatch(r"/(?:usr/)?bin/env[ \t]+(?:-S[ \t]+)?([^/ \t]+)", command)
         if env_python and _is_python_interpreter(env_python[1]):
+            if match_script is not None and not _selected_python_matches(shutil.which(env_python[1])):
+                return source
             return body
         if re.fullmatch(r"/[^ \x00-\x1f\x7f]+", command) and _is_python_interpreter(command):
+            if match_script is not None and not _selected_python_matches(command):
+                return source
             return body
         return source
 
@@ -251,11 +262,15 @@ def _launcher_body(source):
     else:
         return source
     if _is_python_interpreter(executable):
+        if match_script is not None:
+            interpreter_path = os.path.join(os.path.dirname(os.path.realpath(match_script)), executable)
+            if not _selected_python_matches(interpreter_path):
+                return source
         return remaining.partition("\n")[2]
     return source
 
 
-def _launcher_body_and_flags(source):
+def _launcher_body_and_flags(source, *, match_script=None):
     shebang, newline, code = source.partition("\n")
     match = re.fullmatch(
         r"#![ \t]*(?:(?P<env>/(?:usr/)?bin/env[ \t]+-S[ \t]+[^ \t]+)|(?P<direct>/[^ \t]+))"
@@ -269,7 +284,7 @@ def _launcher_body_and_flags(source):
             return None, ()
         flags = tuple(dict.fromkeys(f"-{option}" for token in options for option in token[1:]))
         source = f"#!{match['env'] or match['direct']}{newline}{code}"
-    body = _launcher_body(source)
+    body = _launcher_body(source, match_script=match_script)
     if source.startswith("#!") and body == source:
         return None, ()
     return body, flags
@@ -349,7 +364,7 @@ def _path_playbook_launchers():
                 yield script
 
 
-def _stock_playbook_flags(script, package):
+def _stock_playbook_flags(script, package, *, match_python=False):
     # These stock wrappers only dispatch to main(). A custom wrapper may
     # change the environment or CLI arguments before invoking Ansible.
     bodies = (
@@ -373,7 +388,9 @@ def _stock_playbook_flags(script, package):
     try:
         with tokenize.open(script) as launcher:
             source = launcher.read()
-        body, flags = _launcher_body_and_flags(source)
+        if match_python and not source.startswith("#!"):
+            return None
+        body, flags = _launcher_body_and_flags(source, match_script=script if match_python else None)
         if body is None:
             return None
         parsed = ast.dump(ast.parse(body))
@@ -392,17 +409,18 @@ def _stock_playbook_flags(script, package):
 
 
 def _launcher_installation_matches(script, package):
+    import sysconfig
+
     directory = os.path.dirname(os.path.realpath(script))
     prefix, scripts_dir = os.path.split(directory)
-    if scripts_dir.lower() == "scripts":
-        sites = [os.path.join(prefix, "Lib", "site-packages")]
-    elif scripts_dir == "bin":
+    if scripts_dir.lower() not in ("bin", "scripts"):
+        return False
+    prefix_vars = {"base": prefix, "platbase": prefix}
+    sites = [sysconfig.get_path(kind, vars=prefix_vars.copy()) for kind in ("purelib", "platlib")]
+    if scripts_dir == "bin":
         # Debian's distro packages use an unversioned python3 directory.
         version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        sites = [os.path.join(prefix, lib, version, "site-packages") for lib in ("lib", "lib64")]
         sites.extend(os.path.join(prefix, "lib", name, "dist-packages") for name in (version, "python3"))
-    else:
-        return False
     return any(os.path.realpath(os.path.join(site, "ansible")) == package for site in sites)
 
 
@@ -411,7 +429,7 @@ def _matching_path_launcher(package, environment_script):
     path_launchers = (script for script in _path_playbook_launchers() if script != environment_script)
     for script in chain((environment_script,), path_launchers):
         if _launcher_installation_matches(script, package):
-            flags = _stock_playbook_flags(script, package)
+            flags = _stock_playbook_flags(script, package, match_python=True)
             if flags is not None:
                 return script, flags
     return None, ()
