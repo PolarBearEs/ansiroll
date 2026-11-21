@@ -243,12 +243,15 @@ def test_loop_task_magic_vars_keep_original_values_when_facts_change():
     assert rt.template("{{ alias }}", ctx) == "0 / 1 / second"
 
 
-def test_loop_task_magic_vars_cache_captured_alias_during_render():
+@pytest.mark.parametrize("play_alias", [False, True])
+def test_loop_task_magic_vars_cache_captured_alias_during_render(play_alias):
     rt = Runtime({}, "", {})
     readings = iter([1, 2])
     rt.templater.env.globals["next_reading"] = lambda: next(readings)
-    rt.vars.update(rt.template_vars({"alias": "{{ next_reading() }}"}, {}, dynamic=True))
-    task = _task("task", "Task", None, loop=["sample"], vars={"unused": True})
+    variables = {"alias": "{{ next_reading() }}"}
+    if play_alias:
+        rt.vars.update(rt.template_vars(variables, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=["sample"], vars={} if play_alias else variables)
     ctx = rt._task_ctx(task, {})
     ctx["item"] = "sample"
     assert rt.template("{{ vars.alias }} / {{ vars.alias }}", ctx) == "1 / 1"
@@ -256,15 +259,20 @@ def test_loop_task_magic_vars_cache_captured_alias_during_render():
 
 
 @pytest.mark.parametrize("unsafe", [False, True])
-def test_loop_task_conditional_interpolation_preserves_alias_trust(unsafe):
+@pytest.mark.parametrize("alias, expected", [
+    ("{{ source }}", "sample"),
+    ("prefix-{{ source }}", "prefix-sample"),
+    ("{{ 'prefix-' ~ nested.source }}", "prefix-sample"),
+])
+def test_loop_task_conditional_interpolation_preserves_alias_trust(unsafe, alias, expected):
     from ansiroll.runtime import UntrustedConditional
 
     rt = Runtime({}, "", {})
     value = {"__ansiroll_unsafe__": "sample"} if unsafe else "sample"
-    task = _task("task", "Task", None, loop=["sample"],
-                 vars={"source": value, "alias": "{{ source }}"})
+    task = _task("task", "Task", None, loop=[expected],
+                 vars={"source": value, "nested": {"source": value}, "alias": alias})
     ctx = rt._task_ctx(task, {})
-    ctx["item"] = "sample"
+    ctx["item"] = expected
     condition = {"__ansiroll_trusted_condition__": "'{{ alias }}' == item"}
     if unsafe:
         with pytest.raises(UntrustedConditional):

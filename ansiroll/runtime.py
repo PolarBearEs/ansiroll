@@ -1037,12 +1037,14 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None):
     if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
         # Play containers resolve their members in the task's context.
         return _lazy_container(value._raw, rt, ctx)
+    if isinstance(value, _UntrustedConditionValue):
+        return rt.templater._observe_untrusted(value)
     if isinstance(value, (str, tuple)):
         if getattr(rt, "_strict_var_resolution", False):
             return rt.template(value, ctx, strict=True)
         return rt.template(value, ctx)
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_unsafe__"}:
-        return _UntrustedConditionValue(value["__ansiroll_unsafe__"])
+        return rt.templater._observe_untrusted(_UntrustedConditionValue(value["__ansiroll_unsafe__"]))
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_vault__"}:
         return value
     return _lazy_container(value, rt, ctx, dynamic, origin)
@@ -1502,6 +1504,7 @@ class _Templater:
         self._template_cache = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
+        self._rendering_task_alias = False
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -1660,16 +1663,18 @@ class _Templater:
             self._resolving.append(marker)
             try:
                 result = self.render_string(value, ctx, strict=strict)
-                if (self._untrusted_task_interpolation is False and isinstance(value, _TaskVarTemplate)
-                        and _contains_untrusted_condition_value(result)):
-                    self._untrusted_task_interpolation = True
-                return result
+                return self._observe_untrusted(result)
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
             return _lazy_wrap(value, value._rt, ctx)
         if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot):
             return _lazy_wrap(value, self._runtime, ctx)
+        return self._observe_untrusted(value)
+
+    def _observe_untrusted(self, value):
+        if self._rendering_task_alias and isinstance(value, _UntrustedConditionValue):
+            self._untrusted_task_interpolation = True
         return value
 
     def render_conditional_template(self, text, ctx, strict=False):
@@ -1687,7 +1692,8 @@ class _Templater:
     def _play_var_scope(self, ctx, strict):
         if isinstance(ctx, _PlayVarScope):
             return ctx
-        if any(isinstance(value, _PlayVarTemplate) for value in ctx.values()):
+        if (isinstance(ctx.get("vars"), _LoopVarsSnapshot)
+                or any(isinstance(value, _PlayVarTemplate) for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
@@ -1700,9 +1706,16 @@ class _Templater:
         previous = self._current_ctx
         scope = ctx.get("vars")
         self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
+        rendering_alias = self._rendering_task_alias
+        self._rendering_task_alias = rendering_alias or (
+            self._untrusted_task_interpolation is not None and isinstance(text, _TaskVarTemplate))
         try:
             result = self._render_string(text, ctx, strict)
+            if (self._rendering_task_alias and isinstance(text, _TaskVarTemplate)
+                    and _contains_untrusted_condition_value(result)):
+                self._untrusted_task_interpolation = True
         finally:
+            self._rendering_task_alias = rendering_alias
             # A nested render (a lazily templated variable, a lookup term)
             # must not leave its context behind for the outer template.
             self._current_ctx = previous
