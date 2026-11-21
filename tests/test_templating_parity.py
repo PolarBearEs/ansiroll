@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from tests import ansible_playbook_command
+from tests import ansible_playbook_command, parity_pythonpath
 
 pytest.importorskip("ansible")
 
@@ -35,7 +35,7 @@ MSG_RE = re.compile(r'^\s*"msg": (".*"),?\s*$', re.M)
 
 def _env():
     env = dict(os.environ)
-    env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = parity_pythonpath(ROOT)
     env["ANSIBLE_COLLECTIONS_PATH"] = os.path.join(ROOT, "collections")
     env["ANSIBLE_DEPRECATION_WARNINGS"] = "False"
     env["ANSIBLE_NOCOLOR"] = "1"

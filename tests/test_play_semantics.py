@@ -16,7 +16,7 @@ import textwrap
 import pytest
 from packaging.version import Version
 
-from tests import ansible_playbook_command
+from tests import ansible_playbook_command, parity_pythonpath
 from tests.run_official_suite import parse_task_trace
 
 pytest.importorskip("ansible")
@@ -34,7 +34,7 @@ RECAP_RE = re.compile(
 
 def _env():
     env = dict(os.environ)
-    env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = parity_pythonpath(ROOT)
     env["ANSIBLE_COLLECTIONS_PATH"] = os.path.join(ROOT, "collections")
     env["ANSIBLE_DEPRECATION_WARNINGS"] = "False"
     env["ANSIBLE_NOCOLOR"] = "1"

@@ -8,8 +8,25 @@ def ansible_playbook_command():
     return [sys.executable, "-c", "from tests import _run_ansible_playbook; _run_ansible_playbook()"]
 
 
-def _legacy_python_launcher(path, package):
+def parity_pythonpath(root):
+    inherited = os.environ.get("PYTHONPATH")
+    entries = [] if inherited is None else [os.path.abspath(path) for path in inherited.split(os.pathsep)]
+    return os.pathsep.join([root] + entries)
+
+
+def _ansible_version_fields(command):
     import subprocess
+
+    try:
+        result = subprocess.run(command + ["--version"], capture_output=True, text=True)
+    except OSError:
+        return {}
+    if result.returncode:
+        return {}
+    return dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
+
+
+def _legacy_python_launcher(path, package):
     import tokenize
 
     try:
@@ -17,20 +34,18 @@ def _legacy_python_launcher(path, package):
             compile(script.read(), path, "exec")
     except (SyntaxError, UnicodeError):
         # A shell or native launcher can report the Python script it invokes.
-        try:
-            result = subprocess.run([path, "--version"], capture_output=True, text=True)
-        except OSError:
-            return None
-        if result.returncode:
-            return None
-        fields = dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
+        fields = _ansible_version_fields([path])
         script = fields.get("executable location", "")
-        installed = fields.get("ansible python module location", "")
-        if (installed and os.path.realpath(installed) == package and os.path.isabs(script)
-                and os.path.realpath(script) != os.path.realpath(path) and os.path.isfile(script)):
-            return script
-        return None
-    return path
+        if not (os.path.isabs(script) and os.path.realpath(script) != os.path.realpath(path)
+                and os.path.isfile(script)):
+            return None
+        path = script
+
+    fields = _ansible_version_fields([sys.executable, path])
+    installed = fields.get("ansible python module location", "")
+    if installed and os.path.realpath(installed) == package:
+        return path
+    return None
 
 
 def _run_ansible_playbook():
