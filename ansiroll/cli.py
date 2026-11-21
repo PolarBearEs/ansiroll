@@ -246,8 +246,11 @@ def _make_output_executable(path, reference, output_stat, mode):
                 raise
             # An O_PATH descriptor pins even a write-only file. Linux chmod
             # can follow its procfs link without reopening it for writing.
-            if os.path.exists("/proc/self/fd"):
+            try:
                 os.chmod("/proc/self/fd/%d" % reference, mode)
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                pass
+            else:
                 return
     if not os.path.samestat(output_stat, os.stat(path)):
         raise OSError(errno.ESTALE, "output path changed before setting permissions", path)

@@ -558,8 +558,34 @@ def test_file_compile_writes_manifest_after_output_parent_becomes_a_file(monkeyp
     assert (moved / output.name).read_text() == "pass\n"
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
+@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError])
+def test_file_compile_falls_back_when_procfs_reference_is_unavailable(monkeypatch, tmp_path, failure):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
+    chmod, open_fd = os.chmod, os.open
+
+    def pin_output(path, fd, info):
+        return open_fd(path, os.O_PATH)
+
+    def unavailable_link(path, mode):
+        if os.fspath(path).startswith("/proc/self/fd/"):
+            raise failure("descriptor link unavailable")
+        chmod(path, mode)
+
+    monkeypatch.setattr(cli, "_pin_output_inode", pin_output)
+    monkeypatch.setattr(os, "chmod", unavailable_link)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
+    assert output.stat().st_mode & stat.S_IEXEC
+    assert json.loads(manifest.read_text()) == data
+
+
 @pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
 def test_file_compile_releases_output_writer_before_setting_execute_bits(monkeypatch, tmp_path):
+    if os.statvfs(tmp_path).f_flag & getattr(os, "ST_NOEXEC", 0):
+        pytest.skip("temporary directory is on a noexec mount")
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     seen = []
