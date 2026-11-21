@@ -210,8 +210,22 @@ def _is_python_interpreter(executable):
     )
 
 
+def _python_environment(executable):
+    # Resolve directory aliases without following the Python symlink out of
+    # its virtual environment. CPython checks both directories for the config.
+    directory = os.path.realpath(os.path.dirname(os.path.abspath(executable)))
+    for parent in (directory, os.path.dirname(directory)):
+        if os.path.isfile(os.path.join(parent, "pyvenv.cfg")):
+            return parent
+    return None
+
+
 def _selected_python_matches(executable):
-    return executable is not None and os.path.realpath(executable) == os.path.realpath(sys.executable)
+    return (
+        executable is not None
+        and os.path.realpath(executable) == os.path.realpath(sys.executable)
+        and _python_environment(executable) == _python_environment(sys.executable)
+    )
 
 
 def _launcher_body(source, *, match_script=None):
@@ -416,7 +430,10 @@ def _launcher_installation_matches(script, package):
     if scripts_dir.lower() not in ("bin", "scripts"):
         return False
     prefix_vars = {"base": prefix, "platbase": prefix}
-    sites = [sysconfig.get_path(kind, vars=prefix_vars.copy()) for kind in ("purelib", "platlib")]
+    scheme = {}
+    if os.path.isfile(os.path.join(prefix, "pyvenv.cfg")) and "venv" in sysconfig.get_scheme_names():
+        scheme = {"scheme": "venv"}
+    sites = [sysconfig.get_path(kind, vars=prefix_vars.copy(), **scheme) for kind in ("purelib", "platlib")]
     if scripts_dir == "bin":
         # Debian's distro packages use an unversioned python3 directory.
         version = f"python{sys.version_info.major}.{sys.version_info.minor}"

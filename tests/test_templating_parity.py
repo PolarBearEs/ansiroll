@@ -335,21 +335,53 @@ def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, 
         assert os.path.dirname(foreign) not in sys.path
 
 
-def test_fallback_installation_uses_python_abi_in_package_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("venv", [False, True])
+def test_fallback_installation_uses_the_candidate_scheme_and_abi(tmp_path, monkeypatch, venv):
     import sysconfig
 
     from tests import _launcher_installation_matches
 
     package = tmp_path / "lib" / "python3.14t" / "site-packages" / "ansible"
     package.mkdir(parents=True)
+    if venv:
+        (tmp_path / "pyvenv.cfg").touch()
 
-    def install_path(kind, vars):
+    def install_path(kind, vars, **kwargs):
         assert kind in ("purelib", "platlib")
         assert vars == {"base": str(tmp_path), "platbase": str(tmp_path)}
+        assert kwargs == ({"scheme": "venv"} if venv else {})
         return str(package.parent)
 
+    monkeypatch.setattr(sysconfig, "get_scheme_names", lambda: ("posix_local", "venv"))
     monkeypatch.setattr(sysconfig, "get_path", install_path)
     assert _launcher_installation_matches(tmp_path / "bin" / "ansible-playbook", str(package))
+
+
+def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, monkeypatch):
+    from tests import _stock_playbook_flags
+
+    system = tmp_path / "system" / "bin" / "python3"
+    system.parent.mkdir(parents=True)
+    system.touch()
+    executables = []
+    for name in ("selected", "foreign"):
+        root = tmp_path / name
+        executable = root / "bin" / "python3"
+        executable.parent.mkdir(parents=True)
+        (root / "pyvenv.cfg").touch()
+        try:
+            executable.symlink_to(system)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+        executables.append(executable)
+    selected, foreign = executables
+    monkeypatch.setattr(sys, "executable", str(selected))
+    script = selected.with_name("ansible-playbook")
+    body = "from ansible.cli.playbook import main\nmain()\n"
+    script.write_text(f"#!{foreign} -s\n{body}")
+    assert _stock_playbook_flags(script, str(tmp_path), match_python=True) is None
+    script.write_text(f"#!{selected} -s\n{body}")
+    assert _stock_playbook_flags(script, str(tmp_path), match_python=True) == ("-s",)
 
 
 def test_modern_launcher_accepts_pip_entrypoint(tmp_path):
