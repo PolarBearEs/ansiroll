@@ -237,6 +237,9 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
         "ansible_ssh_port": "{{ 2201 }}",
         "ansible_ssh_user": "{{ item | agent_filter }}",
         "ansible_ssh_password": "{{ item | reverse | join }}",
+        "ansible_ssh_timeout": "{{ 10 }}",
+        "ansible_ssh_retries": "{{ 2 }}",
+        "ansible_ssh_use_tty": "{{ item != 'sample' }}",
         "ansible_podman_executable": "/usr/bin/{{ item | agent_filter }}",
         "ansible_podman_extra_args": "--name {{ item | agent_filter }}",
         "ansible_become": "{{ item == 'sample' }}",
@@ -254,6 +257,9 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
     assert sent["ansible_ssh_port"] == 2201
     assert sent["ansible_ssh_user"] == "SAMPLE"
     assert sent["ansible_ssh_password"] == "elpmas"
+    assert sent["ansible_ssh_timeout"] == 10
+    assert sent["ansible_ssh_retries"] == 2
+    assert sent["ansible_ssh_use_tty"] is False
     assert sent["ansible_podman_executable"] == "/usr/bin/SAMPLE"
     assert sent["ansible_podman_extra_args"] == "--name SAMPLE"
     assert sent["ansible_become"] is True
@@ -385,6 +391,23 @@ def test_conditional_rendering_tracks_registered_mapping_keys(keys):
 def test_conditional_rendering_tracks_marked_mapping_mutations(expression):
     rt = Runtime({}, "", {})
     rt._store_register({"register": "result"}, {"data": {"sample": "sample"}})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ " + expression + " ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", [
+    "result.data.pop()",
+    "result.data.copy()[0]",
+    "result.nested.pop().value",
+])
+def test_conditional_rendering_tracks_marked_list_reads(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": ["sample"], "nested": [{"value": "sample"}]})
     task = _task("task", "Task", None, loop=["sample"], vars={
         "alias": "{{ " + expression + " ~ ' value' }}",
     })
@@ -584,6 +607,40 @@ def test_loop_assertion_observes_cached_play_alias_marker_on_each_read():
     ctx["item"] = 1
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "{{ checks }}"}], ctx, keyword=None)
+
+
+def test_loop_snapshot_preserves_provenance_when_a_play_alias_is_shadowed():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    rt.vars.update(rt.template_vars({"entry": "entry == {{ result.stdout }}"}, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=[1], loop_var="entry", vars={
+        "checks": "{{ [vars.entry == 'entry == 1', vars.entry ~ ' and true'] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, [1], 0, ctx))
+    assert ctx["entry"] == 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ checks }}"}], ctx, keyword=None)
+
+
+def test_conditional_assertion_materializes_iterator_from_selected_branch():
+    rt = Runtime({}, "", {})
+    condition = {"__ansiroll_trusted_condition__": "{{ [false] if false else [true] | map('bool') }}"}
+    assert rt.when([condition], rt.ctx(), keyword=None)
+
+
+def test_conditional_list_does_not_replay_branch_that_returns_none():
+    rt = Runtime({}, "", {})
+    reads = []
+
+    def choose_branch():
+        reads.append(True)
+        return len(reads) > 1
+
+    rt.templater.env.globals["choose_branch"] = choose_branch
+    assert rt.templater.render_conditional_template(
+        "{{ [true] if choose_branch() else none }}", rt.ctx()) is None
+    assert reads == [True]
 
 
 def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():

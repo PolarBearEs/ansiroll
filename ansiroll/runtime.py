@@ -150,6 +150,7 @@ class _Omit(str):
 
 
 _OMIT = _Omit("__omit_place_holder__ansiroll")
+_NO_CONDITIONAL_LIST = object()
 
 
 class _UnsafeTemplate(str):
@@ -1074,6 +1075,13 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
     return _lazy_container(value, rt, ctx, dynamic, origin, task_vars)
 
 
+def _observe_container_value(value, rt, render_ctx):
+    templater = rt.templater
+    if templater._untrusted_task_interpolation is not None and type(value) in (dict, list):
+        return _lazy_container(value, rt, render_ctx())
+    return templater._observe_untrusted(value)
+
+
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
@@ -1106,24 +1114,19 @@ class _LazyTplDict(dict):
         except KeyError:
             return default
 
-    def _observe_returned(self, value):
-        templater = self._rt.templater
-        if templater._untrusted_task_interpolation is not None and type(value) in (dict, list):
-            return _lazy_container(value, self._rt, self._render_ctx())
-        return templater._observe_untrusted(value)
-
     def pop(self, key, *default):
         if key in self:
-            return self._observe_returned(dict.pop(self, key, *default))
+            return _observe_container_value(dict.pop(self, key, *default), self._rt, self._render_ctx)
         return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return self._rt.templater._observe_untrusted(key), self._observe_returned(value)
+        return (self._rt.templater._observe_untrusted(key),
+                _observe_container_value(value, self._rt, self._render_ctx))
 
     def setdefault(self, key, default=None):
         if key in self:
-            return self._observe_returned(dict.__getitem__(self, key))
+            return _observe_container_value(dict.__getitem__(self, key), self._rt, self._render_ctx)
         return dict.setdefault(self, key, default)
 
     def keys(self):
@@ -1304,8 +1307,6 @@ class _PlayVarView(dict):
             if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
                 resolved = self.scope[key]
             else:
-                if isinstance(value, _PlayVarTemplate):
-                    value = str(value)
                 resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
             self.scope.resolved_snapshot[key] = resolved
         return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[key])
@@ -1386,6 +1387,13 @@ class _LazyTplList(list):
         for v in list.__iter__(self):
             yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
                              self._origin, self._task_vars)
+
+    def pop(self, index=-1):
+        return _observe_container_value(list.pop(self, index), self._rt, self._render_ctx)
+
+    def copy(self):
+        values = list.copy(self)
+        return _observe_container_value(values, self._rt, self._render_ctx)
 
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
@@ -1765,7 +1773,7 @@ class _Templater:
     def resolve_variable(self, key, value, ctx, strict=False):
         """Template a variable's trusted value when a template references it."""
         self._observe_untrusted(value)
-        if type(value) in (str, _TaskVarTemplate) and _looks_templated(value):
+        if type(value) in (str, _TaskVarTemplate, _PlayVarTemplate) and _looks_templated(value):
             cache = None
             if isinstance(ctx, _PlayVarScope) and isinstance(value, _TaskVarTemplate):
                 cache = ctx.resolved_task
@@ -1879,7 +1887,7 @@ class _Templater:
             previous = self._untrusted_task_interpolation
             self._untrusted_task_interpolation = False
             try:
-                value = expression(**ctx)
+                value = _concretize(expression(**ctx))
                 if self._untrusted_task_interpolation and isinstance(value, (str, list, tuple)):
                     value = _mark_unsafe(value, condition_text=True)
                 return value
@@ -1926,9 +1934,9 @@ class _Templater:
             self._condition_list_cache[key] = evaluate
         evaluate = self._condition_list_cache[key]
         if evaluate is None:
-            return None
+            return _NO_CONDITIONAL_LIST
 
-        result = evaluate(ctx)
+        result = _concretize(evaluate(ctx))
         if _condition_contains_string(result, _UntrustedConditionValue):
             self._untrusted_task_interpolation = True
         return result
@@ -1947,7 +1955,7 @@ class _Templater:
             try:
                 if self._untrusted_task_interpolation is not None and ("[" in expr or "(" in expr or "+" in expr):
                     sequence = self._conditional_list(stripped, env, ctx, strict)
-                    if sequence is not None:
+                    if sequence is not _NO_CONDITIONAL_LIST:
                         return sequence
                 compiled = self._expr_cache.get(expr_key)
                 if compiled is None:
@@ -5304,6 +5312,9 @@ _SYNCHRONIZE_VARS = frozenset((
     "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
     "ansible_ssh_private_key_file", "ansible_private_key_file",
     "ansible_ssh_port", "ansible_ssh_user", "ansible_ssh_password",
+    "ansible_ssh_timeout", "ansible_ssh_retries", "ansible_ssh_verbosity",
+    "ansible_host_key_checking", "ansible_ssh_host_key_checking", "ansible_pipelining",
+    "ansible_ssh_pipelining", "ansible_sftp_batch_mode", "ansible_ssh_use_tty",
     "ansible_podman_executable", "ansible_podman_extra_args",
     "ansible_become", "ansible_become_method", "ansible_become_user", "ansible_become_password",
     "ansible_become_pass", "ansible_become_exe", "ansible_become_flags",
