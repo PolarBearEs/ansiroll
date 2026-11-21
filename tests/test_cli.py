@@ -501,10 +501,60 @@ def test_compile_releases_optional_pin_when_write_open_hits_emfile(
             file.truncate = truncate
         return file
 
+    # There is no spare descriptor to pin the output while its writer is open.
+    monkeypatch.setattr(cli, "_pin_output_inode", lambda *args: None)
     monkeypatch.setattr(os, "open", with_one_free_slot)
     monkeypatch.setattr(os, "fdopen", with_optional_truncate)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert attempts == 2
+    assert output.read_text() == "pass\n"
+    assert json.loads(manifest.read_text()) == data
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
+                    reason="requires reopening a metadata-only descriptor")
+def test_manifest_truncating_reopen_can_release_output_pin(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("previous manifest with trailing content")
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
+    open_fd, pin_output = os.open, cli._pin_output_inode
+    output_pin = manifest_pin = None
+    attempts = 0
+    reopened = []
+
+    def track_output_pin(*args):
+        nonlocal output_pin
+        output_pin = pin_output(*args)
+        assert output_pin is not None
+        return output_pin
+
+    def require_truncate_with_two_slots(path, flags, *args, **kwargs):
+        nonlocal manifest_pin, attempts
+        if path == str(manifest) and flags & os.O_PATH:
+            manifest_pin = open_fd(path, flags, *args, **kwargs)
+            return manifest_pin
+        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+            attempts += 1
+            assert output_pin is not None and manifest_pin is not None
+            assert os.path.samestat(os.fstat(manifest_pin), manifest.stat())
+            if attempts == 1:
+                assert os.path.samestat(os.fstat(output_pin), output.stat())
+                raise OSError(errno.EMFILE, "no free descriptor slots", path)
+            with pytest.raises(OSError) as error:
+                os.fstat(output_pin)
+            assert error.value.errno == errno.EBADF
+            raise OSError(errno.EPERM, "filesystem requires O_TRUNC", path)
+        if str(path).startswith("/proc/self/fd/") and flags & os.O_TRUNC:
+            reopened.append(path)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_pin_output_inode", track_output_pin)
+    monkeypatch.setattr(os, "open", require_truncate_with_two_slots)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
+    assert attempts == 2
+    assert reopened == [f"/proc/self/fd/{manifest_pin}"]
     assert output.read_text() == "pass\n"
     assert json.loads(manifest.read_text()) == data
 

@@ -114,7 +114,7 @@ _TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
 
 
 @contextmanager
-def _open_compile_destination(path, validate):
+def _open_compile_destination(path, validate, *, release_output=None):
     with ExitStack() as stack, ExitStack() as initial_pin:
         # A failed create-open gives us no fd. Capture the existing inode
         # before trying it so a retry cannot truncate a replacement file.
@@ -144,9 +144,15 @@ def _open_compile_destination(path, validate):
                 except OSError as ex:
                     if ex.errno != errno.EMFILE:
                         raise
-                    initial_pin.close()
-                    reference = None
-                    released_for_emfile = True
+                    if release_output is None:
+                        initial_pin.close()
+                        reference = None
+                        released_for_emfile = True
+                    else:
+                        # Keep the manifest inode pinned for a possible
+                        # truncating reopen after releasing the output pin.
+                        validate(os.fstat(reference))
+                        release_output()
                     fd = os.open(path, flags, 0o666)
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
@@ -342,7 +348,10 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
 
         # Reopen the current pathname after Python output succeeds.
         _check_file_destinations(output_path, manifest_path)
-        with _open_compile_destination(manifest_path, validate_manifest) as manifest_file:
+        release_output = output_reference.close if reference is not None else None
+        with _open_compile_destination(
+            manifest_path, validate_manifest, release_output=release_output,
+        ) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
 
