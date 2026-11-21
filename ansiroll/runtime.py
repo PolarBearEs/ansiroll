@@ -2718,9 +2718,11 @@ class Runtime:
             current[key] = value
         hostvars[self.host] = current
         ctx["hostvars"] = hostvars
-        if "vars" not in ctx:
+        loop_snapshot = looped and bool(task_vars)
+        play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
+        if "vars" not in ctx or play_magic:
             snapshot = _vars_snapshot(ctx)
-            ctx["vars"] = _LoopVarsSnapshot(snapshot, ()) if looped and task_vars else snapshot
+            ctx["vars"] = _LoopVarsSnapshot(snapshot, ()) if loop_snapshot else snapshot
         return ctx
 
     def run_task(self, task, overlay, become=False):

@@ -682,13 +682,15 @@ def test_loop_task_user_vars_mapping_does_not_replace_play_magic(tmp_path):
     messages, _ = check(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: false
-          vars: {play_alias: "{{ 'play' }}"}
+          vars: {play_label: play, unrelated_alias: "{{ 1 }}"}
           tasks:
-            - debug: {msg: "{{ vars.play_alias }} / {{ item }}"}
-              vars: {vars: {custom: x}}
+            - debug: {msg: "{{ vars.play_label }} / {{ item }} / {{ item_snapshot }}"}
+              vars:
+                vars: {custom: x}
+                item_snapshot: "{{ vars.item | default('missing') }}"
               loop: [alpha, beta]
     """})
-    assert messages == ['"play / alpha"', '"play / beta"']
+    assert messages == ['"play / alpha / missing"', '"play / beta / missing"']
 
 
 def test_include_tasks_handler_runs_its_body(tmp_path):
