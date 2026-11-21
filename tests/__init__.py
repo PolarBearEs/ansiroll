@@ -17,10 +17,10 @@ _ANSIBLE_MODULE_ALIASES = {
 _ANSIBLE_SIX = "ansible.module_utils.six"
 
 
-def _reference_python(code):
+def _reference_python(code, *arguments):
     import ansible
 
-    return [sys.executable, "-c", _BOOTSTRAP + code, os.path.abspath(ansible.__file__)]
+    return [sys.executable, "-c", _BOOTSTRAP + code, os.path.abspath(ansible.__file__), *arguments]
 
 
 def ansible_playbook_command():
@@ -29,9 +29,11 @@ def ansible_playbook_command():
 
 def ansiroll_compile_command():
     return _reference_python(
-        "import os, runpy; from tests import _load_reference_ansible; "
+        "import os, runpy; filename, bootstrap = sys.argv[1:3]; del sys.argv[1:3]; "
+        "load_ansible = runpy.run_path(bootstrap, run_name='_ansiroll_parity_bootstrap')['_load_reference_ansible']; "
         "sys.path[:0] = [os.getcwd()] if _implicit_cwd else []; "
-        "_load_reference_ansible(sys.argv.pop(1)); runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)"
+        "load_ansible(filename); runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)",
+        os.path.abspath(__file__),
     ) + ["compile"]
 
 

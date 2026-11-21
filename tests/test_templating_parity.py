@@ -246,7 +246,7 @@ def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatc
 def test_subprocess_compile_imports_playbook_local_filter_helpers(tmp_path, monkeypatch):
     dependencies = tmp_path / "dependencies"
     dependencies.mkdir()
-    monkeypatch.setenv("PYTHONPATH", str(dependencies))
+    monkeypatch.setenv("PYTHONPATH", str(dependencies), prepend=os.pathsep)
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
     playbook = _write(tmp_path, """
@@ -255,10 +255,9 @@ def test_subprocess_compile_imports_playbook_local_filter_helpers(tmp_path, monk
   tasks:
     - import_tasks: "{{ 'included' | parity_task_file }}"
 """, {
-        "tests.py": "raise RuntimeError('unexpected playbook-local tests module')\n",
-        "parity_playbook_helper.py": "def task_file(name):\n    return name + '.yml'\n",
+        "tests.py": "def task_file(name):\n    return name + '.yml'\n",
         "filter_plugins/parity_filters.py": (
-            "from parity_playbook_helper import task_file\n"
+            "from tests import task_file\n"
             "class FilterModule:\n"
             "    def filters(self):\n"
             "        return {'parity_task_file': task_file}\n"
