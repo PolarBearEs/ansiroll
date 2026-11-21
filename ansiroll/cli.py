@@ -3,23 +3,29 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 
 from .compiler import compile_playbook
 
 
-def main(argv=None):
+def entrypoint():
+    return main(_standalone=True)
+
+
+def main(argv=None, *, _standalone=False):
     parser = argparse.ArgumentParser(prog="ansiroll", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     pc = sub.add_parser("compile", help="Compile a playbook to a single .py file")
     pc.add_argument("playbook")
-    pc.add_argument("-o", "--output", required=True, help="output .py path")
+    pc.add_argument("-o", "--output", required=True, help="output .py path (use - for stdout)")
     pc.add_argument("-m", "--manifest", help="optional manifest .json path")
     pc.add_argument("--interpreter", default="/usr/bin/python3",
                     help="target python interpreter path (default: /usr/bin/python3)")
@@ -47,13 +53,99 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "compile":
+        if args.output == "-":
+            if not _standalone:
+                parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
+            return _cmd_compile_stdout(args)
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
     parser.error("unknown command")
 
 
-def _cmd_compile(args):
+def _same_stream(first, second):
+    return os.path.samestat(first, second) or (
+        stat.S_ISCHR(first.st_mode) and stat.S_ISCHR(second.st_mode)
+        and first.st_rdev == second.st_rdev
+    )
+
+
+def _discard_stream(stream):
+    return stat.S_ISCHR(stream.st_mode) and _same_stream(stream, os.stat(os.devnull))
+
+
+def _manifest_for_stdout(path, stdout_fd):
+    if not path:
+        return path
+    try:
+        manifest_stat = os.stat(path)
+    except FileNotFoundError:
+        return path
+    if not _same_stream(manifest_stat, os.fstat(stdout_fd)):
+        return path
+    if _discard_stream(manifest_stat):
+        return os.devnull
+    raise ValueError("manifest path points to stdout: %s" % path)
+
+
+def _write_stdout_manifest(path, manifest, stdout_fd):
+    path = _manifest_for_stdout(path, stdout_fd)
+    # Validate the actual destination before truncating or writing anything.
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as fh:
+        manifest_stat = os.fstat(fh.fileno())
+        if _same_stream(manifest_stat, os.fstat(stdout_fd)) and not _discard_stream(manifest_stat):
+            raise ValueError("manifest path points to stdout: %s" % path)
+        if stat.S_ISREG(manifest_stat.st_mode):
+            fh.truncate(0)
+        json.dump(manifest, fh, indent=2)
+
+
+def _cmd_compile_stdout(args):
+    try:
+        stdout_stat = os.fstat(1)
+        _prepare_compile_stderr()
+        if os.isatty(1):
+            raise ValueError("compile -o - requires redirected output: redirect stdout to a pipe or file")
+        if _same_stream(stdout_stat, os.fstat(2)) and not _discard_stream(stdout_stat):
+            raise ValueError("compile -o - requires separate stdout and stderr streams")
+        args.manifest = _manifest_for_stdout(args.manifest, 1)
+        with os.fdopen(os.dup(1), "wb") as stdout:
+            # Keep inherited stdout and native buffers on stderr through CLI exit.
+            os.dup2(2, 1)
+            sys.stdout.flush()
+            with redirect_stdout(sys.stderr):
+                return _cmd_compile(args, stdout)
+    except ValueError as ex:
+        sys.stderr.write("ansiroll: %s\n" % ex)
+        return 2
+
+
+def _prepare_compile_stderr():
+    try:
+        os.fstat(2)
+        if os.name != "posix":
+            return
+        from fcntl import F_GETFL, fcntl
+
+        if (fcntl(2, F_GETFL) & os.O_ACCMODE) != os.O_RDONLY:
+            return
+    except OSError as ex:
+        if ex.errno != errno.EBADF:
+            raise
+    # A closed stderr can be reused by interpreter startup for a read-only file.
+    sink = os.open(os.devnull, os.O_WRONLY)
+    if sink == 2:
+        os.set_inheritable(2, True)
+    else:
+        try:
+            os.dup2(sink, 2)
+        finally:
+            os.close(sink)
+    if sys.stderr is None:
+        sys.stderr = open(2, "w", closefd=False, errors="backslashreplace")
+
+
+def _cmd_compile(args, stdout=None):
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
@@ -74,15 +166,22 @@ def _cmd_compile(args):
             message = "ansiroll: " + message
         sys.stderr.write(message + "\n")
         return 2
-    with open(args.output, "w") as fh:
-        fh.write(source)
-    os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
+    if stdout is None:
+        with open(args.output, "w") as fh:
+            fh.write(source)
+        os.chmod(args.output, os.stat(args.output).st_mode | stat.S_IEXEC | stat.S_IXGRP)
     if args.manifest:
-        with open(args.manifest, "w") as fh:
-            json.dump(manifest, fh, indent=2)
+        if stdout is not None:
+            _write_stdout_manifest(args.manifest, manifest, stdout.fileno())
+        else:
+            with open(args.manifest, "w") as fh:
+                json.dump(manifest, fh, indent=2)
+    if stdout is not None:
+        stdout.write(source.encode("utf-8"))
+        stdout.flush()
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
-        % (args.playbook, args.output, len(manifest["modules"]),
+        % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),
            len(manifest["fallback_tasks"]))
     )
     return 0
@@ -149,4 +248,4 @@ def _cmd_run(args):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(entrypoint())

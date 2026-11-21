@@ -49,7 +49,7 @@ line-length = 120
 select = ["F401", "F821", "F841"]
 
 [project.scripts]
-ansiroll = "ansiroll.cli:main"
+ansiroll = "ansiroll.cli:entrypoint"
 
 [tool.setuptools.packages.find]
 include = ["ansiroll*"]
