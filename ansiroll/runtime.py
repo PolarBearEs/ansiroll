@@ -1106,6 +1106,26 @@ class _LazyTplDict(dict):
         except KeyError:
             return default
 
+    def _observe_returned(self, value):
+        templater = self._rt.templater
+        if templater._untrusted_task_interpolation is not None and type(value) in (dict, list):
+            return _lazy_container(value, self._rt, self._render_ctx())
+        return templater._observe_untrusted(value)
+
+    def pop(self, key, *default):
+        if key in self:
+            return self._observe_returned(dict.pop(self, key, *default))
+        return dict.pop(self, key, *default)
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        return self._rt.templater._observe_untrusted(key), self._observe_returned(value)
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self._observe_returned(dict.__getitem__(self, key))
+        return dict.setdefault(self, key, default)
+
     def keys(self):
         if self._rt.templater._untrusted_task_interpolation is None:
             return dict.keys(self)
@@ -1204,7 +1224,7 @@ class _PlayVarScope(dict):
                     value, self, strict=self.strict)
             finally:
                 self.resolving.remove(key)
-        return self.resolved[key]
+        return self.templater._observe_untrusted(self.resolved[key])
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -5284,6 +5304,7 @@ _SYNCHRONIZE_VARS = frozenset((
     "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
     "ansible_ssh_private_key_file", "ansible_private_key_file",
     "ansible_ssh_port", "ansible_ssh_user", "ansible_ssh_password",
+    "ansible_podman_executable", "ansible_podman_extra_args",
     "ansible_become", "ansible_become_method", "ansible_become_user", "ansible_become_password",
     "ansible_become_pass", "ansible_become_exe", "ansible_become_flags",
     "ansible_sudo_user", "ansible_sudo_exe", "ansible_sudo_flags", "ansible_sudo_pass", "ansible_sudo_chdir",

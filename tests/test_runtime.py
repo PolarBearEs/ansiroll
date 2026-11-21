@@ -237,6 +237,8 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
         "ansible_ssh_port": "{{ 2201 }}",
         "ansible_ssh_user": "{{ item | agent_filter }}",
         "ansible_ssh_password": "{{ item | reverse | join }}",
+        "ansible_podman_executable": "/usr/bin/{{ item | agent_filter }}",
+        "ansible_podman_extra_args": "--name {{ item | agent_filter }}",
         "ansible_become": "{{ item == 'sample' }}",
         "ansible_become_user": "{{ item | agent_filter }}",
         "ansible_sudo_flags": "-H -u {{ item }}",
@@ -252,6 +254,8 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
     assert sent["ansible_ssh_port"] == 2201
     assert sent["ansible_ssh_user"] == "SAMPLE"
     assert sent["ansible_ssh_password"] == "elpmas"
+    assert sent["ansible_podman_executable"] == "/usr/bin/SAMPLE"
+    assert sent["ansible_podman_extra_args"] == "--name SAMPLE"
     assert sent["ansible_become"] is True
     assert sent["ansible_become_user"] == "SAMPLE"
     assert sent["ansible_sudo_flags"] == "-H -u sample"
@@ -364,6 +368,25 @@ def test_conditional_rendering_tracks_registered_mapping_keys(keys):
     rt._store_register({"register": "result"}, {"data": {"sample": True}})
     task = _task("task", "Task", None, loop=["sample"], vars={
         "alias": "{{ (" + keys + " | list | first) ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", [
+    "result.data.pop('sample')",
+    "result.data.setdefault('sample', 'fallback')",
+    "result.data.popitem()[0]",
+    "result.data.popitem()[1]",
+    "result.pop('data').sample",
+])
+def test_conditional_rendering_tracks_marked_mapping_mutations(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": {"sample": "sample"}})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ " + expression + " ~ ' value' }}",
     })
     ctx = rt._task_ctx(task, {})
     ctx["item"] = "sample"
@@ -548,6 +571,19 @@ def test_custom_lookup_mapping_mutations_resolve_existing_aliases(method):
     ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
     assert rt.template("{{ lookup('read_alias') }}", ctx) == "SAMPLE"
     assert "alias" in ctx
+
+
+def test_loop_assertion_observes_cached_play_alias_marker_on_each_read():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    rt.vars.update(rt.template_vars({"play_alias": "item == {{ result.stdout }}"}, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": "{{ [play_alias == 'item == 1', play_alias ~ ' and true'] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ checks }}"}], ctx, keyword=None)
 
 
 def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():
