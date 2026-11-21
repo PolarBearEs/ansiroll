@@ -4,14 +4,12 @@ import os
 import sys
 
 
-# Keep playbook-local modules out of the bootstrap's imports.
+# Prefer the standard library during bootstrap, then restore the caller's paths.
 _BOOTSTRAP = (
     "import sys; _implicit_cwd = sys.path[:1] == ['']; "
     "sys.path[:1] = [] if _implicit_cwd else sys.path[:1]; "
     "import os; _playbook_cwd = os.getcwd(); _reference_path = sys.path[:]; "
-    "_resolved_cwd = os.path.normcase(os.path.realpath(_playbook_cwd)); "
-    "sys.path[:] = [entry for entry in _reference_path if not isinstance(entry, str) "
-    "or os.path.normcase(os.path.realpath(entry)) != _resolved_cwd]; "
+    "sys.path.insert(0, os.path.dirname(os.__file__)); "
     "import runpy; "
     "_parity_bootstrap = runpy.run_path(sys.argv.pop(1), run_name='_ansiroll_parity_bootstrap'); "
     "sys.path[:] = _reference_path; "

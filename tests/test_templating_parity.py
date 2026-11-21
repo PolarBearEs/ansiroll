@@ -102,13 +102,15 @@ def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path
     assert __version__ in result.stdout
 
 
-@pytest.mark.parametrize("symlinked_path", [False, True])
-def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, symlinked_path):
+@pytest.mark.parametrize("shadow_path", ["playbook", "symlink", "inherited"])
+def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, shadow_path):
     playbook_dir = tmp_path / "playbook"
     playbook_dir.mkdir()
-    (playbook_dir / "runpy.py").write_text("raise RuntimeError('unexpected playbook-local runpy')\n")
-    import_path = playbook_dir
-    if symlinked_path:
+    shadow_dir = tmp_path / "dependencies" if shadow_path == "inherited" else playbook_dir
+    shadow_dir.mkdir(exist_ok=True)
+    (shadow_dir / "runpy.py").write_text("raise RuntimeError('unexpected runpy from PYTHONPATH')\n")
+    import_path = shadow_dir
+    if shadow_path == "symlink":
         import_path = tmp_path / "playbook-link"
         try:
             import_path.symlink_to(playbook_dir, target_is_directory=True)
