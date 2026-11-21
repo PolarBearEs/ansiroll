@@ -89,44 +89,65 @@ def _manifest_for_stdout(path, stdout_fd):
     raise ValueError("manifest path points to stdout: %s" % path)
 
 
-def _open_pinned_manifest(path, validate, original_error):
+def _truncation_unavailable(path, original_error):
+    return OSError(original_error.errno, "safe truncating reopen requires /proc/self/fd", path)
+
+
+def _pin_for_truncate(path, target, original_error):
     if not hasattr(os, "O_PATH"):
-        raise original_error
+        raise _truncation_unavailable(path, original_error) from original_error
     try:
-        target = os.open(path, os.O_PATH)
-    except OSError:
-        raise original_error
+        return os.open(target, os.O_PATH)
+    except OSError as ex:
+        if target != path:
+            raise _truncation_unavailable(path, original_error) from ex
+        raise original_error from ex
+
+
+def _open_truncated_destination(path, reference, original_error):
+    fd_path = "/proc/self/fd/%d" % reference
     try:
-        info = os.fstat(target)
-        validate(info)
-        if not stat.S_ISREG(info.st_mode):
-            raise original_error
-        # Some filesystems only support replacement when opened with O_TRUNC.
-        # Reopen the validated inode, even if the pathname has since changed.
-        try:
-            return os.open("/proc/self/fd/%d" % target, os.O_WRONLY | os.O_TRUNC)
-        except OSError:
-            raise original_error
-    finally:
-        os.close(target)
+        os.stat(fd_path)
+    except OSError as ex:
+        raise _truncation_unavailable(path, original_error) from ex
+    return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
 
 
 @contextmanager
-def _open_manifest(path, validate):
-    needs_truncate = True
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
-    except OSError as ex:
-        fd = _open_pinned_manifest(path, validate, ex)
-        needs_truncate = False
-
-    with os.fdopen(fd, "w") as fh:
-        if needs_truncate:
-            info = os.fstat(fh.fileno())
+def _open_compile_destination(path, validate):
+    with ExitStack() as stack:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
+        except OSError as ex:
+            original_error = ex
+            reference = _pin_for_truncate(path, path, ex)
+            stack.callback(os.close, reference)
+        else:
+            writer = stack.enter_context(os.fdopen(fd, "w"))
+            info = os.fstat(fd)
             validate(info)
-            if stat.S_ISREG(info.st_mode):
-                fh.truncate(0)
-        yield fh
+            if not stat.S_ISREG(info.st_mode):
+                yield writer
+                return
+            try:
+                writer.truncate(0)
+            except OSError as ex:
+                original_error = ex
+                reference = _pin_for_truncate(path, "/proc/self/fd/%d" % fd, ex)
+                stack.callback(os.close, reference)
+                writer.close()
+            else:
+                yield writer
+                return
+
+        # Reopen the validated inode even if its pathname has since changed.
+        info = os.fstat(reference)
+        validate(info)
+        if not stat.S_ISREG(info.st_mode):
+            raise original_error
+        fd = _open_truncated_destination(path, reference, original_error)
+        with os.fdopen(fd, "w") as writer:
+            yield writer
 
 
 def _write_stdout_manifest(path, manifest, stdout_fd):
@@ -136,7 +157,7 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
         if _same_stream(info, os.fstat(stdout_fd)) and not _discard_stream(info):
             raise ValueError("manifest path points to stdout: %s" % path)
 
-    with _open_manifest(path, validate) as fh:
+    with _open_compile_destination(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
 
 
@@ -163,6 +184,23 @@ def _missing_destination(path):
             return (directory.st_dev, directory.st_ino), parent, name
 
 
+def _supports_case_probe(device):
+    if sys.platform != "linux":
+        return False
+    device_id = "%d:%d" % (os.major(device), os.minor(device))
+    # These filesystems inherit per-directory casefold flags and support
+    # removing the probe. Other mounts can still be checked after opening.
+    try:
+        with open("/proc/self/mountinfo") as table:
+            for line in table:
+                mount, _, details = line.partition(" - ")
+                if mount.split()[2] == device_id and details.split()[0] in ("ext4", "f2fs", "tmpfs"):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _same_missing_destination(output, manifest):
     if output is None or manifest is None or output[0] != manifest[0]:
         return False
@@ -170,6 +208,8 @@ def _same_missing_destination(output, manifest):
     _, _, manifest_name = manifest
     if output_name == manifest_name:
         return True
+    if not _supports_case_probe(output[0][0]):
+        return False
 
     # Probe full names in a child of the destination directory. This covers
     # inherited case rules; aliases allocated on creation are checked again
@@ -305,13 +345,15 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
 
     # Paths can change during compilation or between the check and open.
     _check_file_destinations(output_path, manifest_path)
+
+    def validate_output(info):
+        _check_manifest_path(manifest_path, info)
+
     with ExitStack() as output_reference:
         reference = None
-        with os.fdopen(os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o666), "w") as output:
+        with _open_compile_destination(output_path, validate_output) as output:
             output_stat = os.fstat(output.fileno())
-            _check_manifest_path(manifest_path, output_stat)
             if stat.S_ISREG(output_stat.st_mode):
-                output.truncate(0)
                 reference = _pin_output_inode(output_path, output.fileno(), output_stat)
                 if reference is not None:
                     output_reference.callback(os.close, reference)
@@ -331,7 +373,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
 
         # Reopen the current pathname after Python output succeeds.
         _check_file_destinations(output_path, manifest_path)
-        with _open_manifest(manifest_path, validate_manifest) as manifest_file:
+        with _open_compile_destination(manifest_path, validate_manifest) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
 

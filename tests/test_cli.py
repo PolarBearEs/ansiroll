@@ -286,6 +286,7 @@ def test_file_compile_checks_identity_of_missing_destinations_parents(monkeypatc
 ])
 def test_file_compile_checks_missing_case_variants_in_destination_directory(
         monkeypatch, tmp_path, case_insensitive, names, long_name):
+    monkeypatch.setattr(cli, "_supports_case_probe", lambda device: True)
     if not case_insensitive:
         with tempfile.NamedTemporaryFile(prefix="case-check-", dir=tmp_path) as probe:
             if (tmp_path / os.path.basename(probe.name).upper()).exists():
@@ -416,6 +417,98 @@ def test_manifest_overwrite_can_truncate_only_the_validated_inode(monkeypatch, t
         assert len(truncated) == 1
         written = saved if redirect == "after validation" else manifest
         assert json.loads(written.read_text()) == data
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
+                    reason="requires reopening a metadata-only descriptor")
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+@pytest.mark.parametrize("failure", ["open", "truncate"])
+def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_path, destination, failure):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    files = {"output": output, "manifest": manifest}
+    for path in files.values():
+        path.write_text("old content")
+    source = "pass\n"
+    data = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: (source, data))
+    open_fd, fdopen = os.open, os.fdopen
+    append_fd = None
+    reopened = []
+
+    def open_append_only(path, flags, *args, **kwargs):
+        nonlocal append_fd
+        target = path == str(files[destination]) and flags & os.O_ACCMODE == os.O_WRONLY
+        if target and failure == "open":
+            raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
+        fd = open_fd(path, flags, *args, **kwargs)
+        if target:
+            append_fd = fd
+        if str(path).startswith("/proc/self/fd/") and flags & os.O_TRUNC:
+            reopened.append(path)
+        return fd
+
+    class AppendOnly:
+        def __init__(self, file):
+            self.file = file
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.file.close()
+
+        def truncate(self, size):
+            raise OSError(errno.EINVAL, "append-only handle")
+
+        def close(self):
+            self.file.close()
+
+    def wrap_append_handle(fd, mode):
+        file = fdopen(fd, mode)
+        return AppendOnly(file) if fd == append_fd and not reopened else file
+
+    monkeypatch.setattr(os, "open", open_append_only)
+    monkeypatch.setattr(os, "fdopen", wrap_append_handle)
+    assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
+    assert len(reopened) == 1
+    assert output.read_text() == source
+    assert json.loads(manifest.read_text()) == data
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
+def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_path):
+    output = tmp_path / "stdout"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("previous manifest")
+    open_fd, stat_path = os.open, os.stat
+
+    def require_truncate(path, flags, *args, **kwargs):
+        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+            raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
+        return open_fd(path, flags, *args, **kwargs)
+
+    def stat_without_procfs(path, *args, **kwargs):
+        if str(path).startswith("/proc/self/fd/"):
+            raise FileNotFoundError(errno.ENOENT, "procfs unavailable", path)
+        return stat_path(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", require_truncate)
+    monkeypatch.setattr(os, "stat", stat_without_procfs)
+    with output.open("w") as stream:
+        with pytest.raises(PermissionError, match="safe truncating reopen requires /proc/self/fd"):
+            cli._write_stdout_manifest(str(manifest), {}, stream.fileno())
+    assert manifest.read_text() == "previous manifest"
+
+
+@pytest.mark.parametrize("filesystem, allowed", [("ext4", True), ("fuse.mountpoint-s3", False), ("9p", False)])
+def test_case_probe_requires_supported_filesystem(monkeypatch, filesystem, allowed):
+    import io
+
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr("builtins.open", lambda path: io.StringIO(
+        "11 22 8:16 / / rw - " + filesystem + " source rw\n"))
+    assert cli._supports_case_probe(os.makedev(8, 16)) is allowed
 
 
 def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):
