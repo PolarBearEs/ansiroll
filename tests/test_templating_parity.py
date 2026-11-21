@@ -189,6 +189,8 @@ def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
 @pytest.mark.parametrize("stale", [False, True])
 @pytest.mark.parametrize("prefix", [
     "#!/usr/bin/python3\n",
+    "#! /usr/bin/env python3\n",
+    "#!/usr/bin/env -S python3\n",
     "#!/bin/sh\n'''exec' '/path with spaces/python3' \"$0\" \"$@\"\n' '''\n",
     "#!/bin/sh\n'''exec' '/user'\"'\"'s env/python3' \"$0\" \"$@\"\n' '''\n",
     "#!/bin/sh\n'''exec' \"/path with spaces/python3\" \"$0\" \"$@\"\n' '''\n",
@@ -247,14 +249,15 @@ def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, mo
     "/workspace/team*2/bin/python3",
     "/workspace/team;other/bin/python3",
 ])
-def test_launcher_body_keeps_unrecognized_shell_initialization(interpreter):
-    from tests import _launcher_body
+def test_launcher_body_keeps_unrecognized_shell_initialization(monkeypatch, interpreter):
+    import tests
 
+    monkeypatch.setattr(tests, "_shell_preserves_braces", lambda: False)
     wrapper = (
         f"#!/bin/sh\n'''exec' {interpreter} \"$0\" \"$@\"\n"
         "' '''\nstart_expected_release()\n"
     )
-    assert _launcher_body(wrapper) == wrapper
+    assert tests._launcher_body(wrapper) == wrapper
 
 
 def test_launcher_body_accepts_the_current_interpreter_under_a_custom_name(tmp_path, monkeypatch):
@@ -268,15 +271,42 @@ def test_launcher_body_accepts_the_current_interpreter_under_a_custom_name(tmp_p
 
 
 @pytest.mark.parametrize("literal_braces", [True, False])
-def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(monkeypatch, literal_braces):
+@pytest.mark.parametrize("matching_python", [True, False])
+def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(
+    monkeypatch, literal_braces, matching_python,
+):
     import tests
 
     executable = "/workspace/team{dev,prod}/" + "long-component/" * 8 + "venv/bin/python3"
-    monkeypatch.setattr(sys, "executable", executable)
+    monkeypatch.setattr(sys, "executable", executable if matching_python else "/other/bin/python3")
     monkeypatch.setattr(tests, "_shell_preserves_braces", lambda: literal_braces)
     body = "start_expected_release()\n"
     wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
     assert tests._launcher_body(wrapper) == (body if literal_braces else wrapper)
+
+
+@pytest.mark.parametrize("stub_available", [True, False])
+@pytest.mark.parametrize("shebang", [
+    "#!/usr/bin/env -S ANSIBLE_CONFIG=/custom/ansible.cfg python3",
+    "#!/usr/bin/env -S python3 -I",
+    "#!/usr/bin/python3 -I",
+])
+def test_legacy_launcher_rejects_shebang_settings_before_replay(
+    tmp_path, monkeypatch, stub_available, shebang,
+):
+    import tests
+
+    package = tmp_path / "ansible"
+    if stub_available:
+        scripts = package / "cli" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "ansible_cli_stub.py").write_text("#!/usr/bin/env python\nstart_expected_release()\n")
+    launcher = tmp_path / "ansible-playbook"
+    launcher.write_text(shebang + "\nstart_expected_release()\n")
+    monkeypatch.setattr(tests, "_ansible_version_fields", lambda *args: pytest.fail("unsupported launcher ran"))
+    diagnostics = []
+    assert tests._legacy_python_launcher(str(launcher), "", str(package), diagnostics, associated=True) is None
+    assert "launcher shebang cannot be replayed" in diagnostics[0]
 
 
 def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):

@@ -137,14 +137,31 @@ def _shell_preserves_braces():
     return result.returncode == 0 and result.stdout == "{ansiroll_a,ansiroll_b}\n{1..2}\n"
 
 
+def _is_python_interpreter(executable):
+    import re
+
+    return (
+        re.fullmatch(r"(?:python|pypy)[0-9.]*t?d?", os.path.basename(executable)) is not None
+        or (os.path.isabs(executable) and os.path.realpath(executable) == os.path.realpath(sys.executable))
+    )
+
+
 def _launcher_body(source):
     import re
 
     if not source.startswith("#!"):
         return source
     shebang, _, body = source.partition("\n")
-    if shebang != "#!/bin/sh":
-        return body
+    command = shebang[2:].strip(" \t")
+    if command != "/bin/sh":
+        # Direct shebangs may choose Python, but replay cannot reproduce
+        # interpreter flags or environment changes made by the launcher.
+        env_python = re.fullmatch(r"/(?:usr/)?bin/env[ \t]+(?:-S[ \t]+)?([^/ \t]+)", command)
+        if env_python and _is_python_interpreter(env_python[1]):
+            return body
+        if re.fullmatch(r"/[^ \x00-\x1f\x7f]+", command) and _is_python_interpreter(command):
+            return body
+        return source
 
     # uv relocatable scripts and long Python shebangs use a shell/Python
     # trampoline that only chooses the interpreter.
@@ -170,17 +187,12 @@ def _launcher_body(source):
         re.fullmatch(r"""/[^ \x00-\x1f\x7f'"`$\\|&;<>()*?]+""", interpreter)
         and not _has_bracket_glob(interpreter)
     ):
-        if _has_brace_expansion(interpreter) and not (
-            os.path.realpath(interpreter) == os.path.realpath(sys.executable) and _shell_preserves_braces()
-        ):
+        if _has_brace_expansion(interpreter) and not _shell_preserves_braces():
             return source
         executable = interpreter
     else:
         return source
-    if (
-        re.fullmatch(r"(?:python|pypy)[0-9.]*t?d?", os.path.basename(executable))
-        or (os.path.isabs(executable) and os.path.realpath(executable) == os.path.realpath(sys.executable))
-    ):
+    if _is_python_interpreter(executable):
         return remaining.partition("\n")[2]
     return source
 
@@ -199,13 +211,18 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
         diagnostics.append("%s: cannot replay a non-Python launcher's initialization" % path)
         return None
 
+    body = _launcher_body(source)
+    if source.startswith("#!") and body == source:
+        diagnostics.append("%s: launcher shebang cannot be replayed" % path)
+        return None
+
     # The selected Ansible installation ships its own release's launcher.
     # A native --version probe alone can report the correct package even
     # when the script itself came from a different release.
     stub = os.path.join(package, "cli", "scripts", "ansible_cli_stub.py")
     try:
         with tokenize.open(stub) as expected:
-            if _launcher_body(source) == _launcher_body(expected.read()):
+            if body == _launcher_body(expected.read()):
                 # The pinned process will execute the same startup code; a
                 # separate --version run cannot add evidence of provenance.
                 return path
