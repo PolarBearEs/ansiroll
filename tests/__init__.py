@@ -248,42 +248,49 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
     return None
 
 
-def _run_ansible_playbook(filename):
-    import shutil
+def _installed_playbook_launchers(package):
     from importlib import metadata
 
-    package = _load_reference_ansible(filename)
-    from ansible.release import __version__
-
-    candidates = []
+    # The pinned package may be outside the subprocess's import path.
+    search_path = list(dict.fromkeys([*sys.path, os.path.dirname(package)]))
     for name in ("ansible-core", "ansible-base", "ansible"):
-        try:
-            distribution = metadata.distribution(name)
-        except metadata.PackageNotFoundError:
-            continue
-        if os.path.realpath(distribution.locate_file("ansible")) != package:
-            continue
-        for entry in distribution.files or ():
-            if entry.name == "ansible-playbook" and "ansible_test" not in entry.parts:
-                candidates.append((str(distribution.locate_file(entry)), True))
+        for distribution in metadata.distributions(name=name, path=search_path):
+            if os.path.realpath(distribution.locate_file("ansible")) != package:
+                continue
+            for entry in distribution.files or ():
+                if entry.name == "ansible-playbook" and "ansible_test" not in entry.parts:
+                    yield str(distribution.locate_file(entry))
 
     # Source checkouts may expose ansible through PYTHONPATH without a record.
     library = os.path.dirname(package)
     if os.path.basename(library) == "lib":
-        candidates.append((os.path.join(os.path.dirname(library), "bin", "ansible-playbook"), True))
+        yield os.path.join(os.path.dirname(library), "bin", "ansible-playbook")
+
+
+def _run_ansible_playbook(filename):
+    import shutil
+    from itertools import chain
+
+    package = _load_reference_ansible(filename)
+    from ansible.release import __version__
+
+    installed_launchers = _installed_playbook_launchers(package)
     environment_script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
     if tuple(map(int, __version__.split(".")[:2])) >= (2, 13):
         # The CLI looks for sibling helpers next to argv[0] before PATH.
-        sys.argv[0] = next((script for script, _ in candidates if os.path.isfile(script)), environment_script)
+        sys.argv[0] = next((script for script in installed_launchers if os.path.isfile(script)), environment_script)
         from ansible.cli import playbook
 
         playbook.main()
         return
 
     # Older releases install a script instead of a module entry point.
-    candidates.append((environment_script, False))
-    candidates.extend((shutil.which("ansible-playbook", path=directory or os.curdir), False)
-                      for directory in os.get_exec_path())
+    candidates = chain(
+        ((script, True) for script in installed_launchers),
+        [(environment_script, False)],
+        ((shutil.which("ansible-playbook", path=directory or os.curdir), False)
+         for directory in os.get_exec_path()),
+    )
     diagnostics = []
     seen = set()
     for script, associated in candidates:

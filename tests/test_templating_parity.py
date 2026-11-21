@@ -134,29 +134,40 @@ def test_reference_bootstrap_accepts_ansible_stdlib_selectors_alias(tmp_path):
     )
 
 
-@pytest.mark.skipif(Version(__version__) < Version("2.13"), reason="requires the playbook module entry point")
-def test_reference_playbook_sets_argv_to_the_matching_installed_launcher(tmp_path, monkeypatch):
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_path, monkeypatch, version):
     from importlib import metadata
     from pathlib import Path
     from types import ModuleType, SimpleNamespace
 
     import tests
+    from ansible import release
 
     launcher = Path("bin/ansible-playbook")
     (tmp_path / launcher).parent.mkdir()
     (tmp_path / launcher).touch()
     ansible_package = str(tmp_path / "ansible")
 
-    def distribution(name):
-        if name != "ansible-core":
-            raise metadata.PackageNotFoundError(name)
-        return SimpleNamespace(files=[launcher], locate_file=lambda entry: tmp_path / entry)
+    def distributions(name, path):
+        assert name == "ansible-core"
+        assert str(tmp_path) in path
+        # Its records must not be accessed, because it is a different install.
+        yield SimpleNamespace(locate_file=lambda entry: tmp_path / "foreign" / entry)
+        yield SimpleNamespace(files=[launcher], locate_file=lambda entry: tmp_path / entry)
+        pytest.fail("searched later distributions after selecting the pinned launcher")
+
+    def verify_legacy(script, filename, package, diagnostics, associated):
+        assert package == ansible_package and associated
+        return script
 
     seen = []
     cli = ModuleType("ansible.cli")
     cli.playbook = SimpleNamespace(main=lambda: seen.extend(sys.argv))
     monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: ansible_package)
-    monkeypatch.setattr(metadata, "distribution", distribution)
+    monkeypatch.setattr(tests, "_legacy_python_launcher", verify_legacy)
+    monkeypatch.setattr(tests, "_run_legacy_playbook", lambda script: seen.extend([script, *sys.argv[1:]]))
+    monkeypatch.setattr(metadata, "distributions", distributions)
+    monkeypatch.setattr(release, "__version__", version)
     monkeypatch.setitem(sys.modules, "ansible.cli", cli)
     monkeypatch.setattr(sys, "argv", ["-c", "--version"])
     monkeypatch.setenv("PATH", "")
