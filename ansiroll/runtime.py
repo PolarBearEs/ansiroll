@@ -2016,10 +2016,13 @@ class Runtime:
             return out
         return value
 
-    def template_vars(self, d, ctx, dynamic=False, higher_vars=None):
-        """Prepare variables with lazy containers and deferred play templates.
+    def template_vars(self, d, ctx, dynamic=False, higher_vars=None, defer=False):
+        """Prepare variables with lazy containers and optional deferred templates.
+
         Legacy non-native templating also keeps scalar sources so its raw
-        single-variable type check sees the original value."""
+        single-variable type check sees the original value. Loop task scalars
+        can stay raw without creating a play-vars view.
+        """
         d = d or {}
         base = dict(ctx)
         base.update(d)
@@ -2030,12 +2033,12 @@ class Runtime:
         for k, v in d.items():
             if isinstance(v, str) and dynamic and ("{{" in v or "{%" in v):
                 out[k] = _PlayVarTemplate(v)
-            elif isinstance(v, str) and not legacy:
+            elif isinstance(v, str) and not (legacy or defer):
                 out[k] = self.templater.render_string(v, base)
             elif isinstance(v, dict) and set(v.keys()) == {"__ansiroll_unsafe__"}:
                 out[k] = _UntrustedConditionValue(v["__ansiroll_unsafe__"])
             else:
-                out[k] = _lazy_container(v, self, base, dynamic)
+                out[k] = _lazy_container(v, self, base, dynamic or defer)
         return out
 
     @contextmanager
@@ -2666,7 +2669,10 @@ class Runtime:
         ctx.pop(_INCLUDE_PARAMS_KEY, None)
         task_vars = {key: value for key, value in (task.get("vars") or {}).items()
                      if key not in higher_vars}
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars))
+        # A loop expression can use task vars, and later uses can see the
+        # loop bindings. Keep templates live until they are actually read.
+        looped = task.get("type") != "include" and task.get("loop") is not None
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
