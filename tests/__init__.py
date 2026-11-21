@@ -5,8 +5,12 @@ import sys
 
 
 # The playbook directory can contain an unrelated tests.py.
-_BOOTSTRAP = "import sys; sys.path[:1] = [] if sys.path[:1] == [''] else sys.path[:1]; "
+_BOOTSTRAP = (
+    "import sys; _implicit_cwd = sys.path[:1] == ['']; "
+    "sys.path[:1] = [] if _implicit_cwd else sys.path[:1]; "
+)
 _ANSIBLE_MODULE_ALIASES = {
+    "ansible.compat.selectors": "selectors",
     "ansible.module_utils.compat.selectors": "selectors",
     "ansible.module_utils.distro": "distro",
 }
@@ -25,7 +29,8 @@ def ansible_playbook_command():
 
 def ansiroll_compile_command():
     return _reference_python(
-        "import runpy; from tests import _load_reference_ansible; "
+        "import os, runpy; from tests import _load_reference_ansible; "
+        "sys.path[:0] = [os.getcwd()] if _implicit_cwd else []; "
         "_load_reference_ansible(sys.argv.pop(1)); runpy.run_module('ansiroll.cli', run_name='__main__', alter_sys=True)"
     ) + ["compile"]
 

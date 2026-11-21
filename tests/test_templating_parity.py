@@ -136,6 +136,7 @@ def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path
 
 
 @pytest.mark.parametrize("alias, external", [
+    ("ansible.compat.selectors", "selectors"),
     ("ansible.module_utils.compat.selectors", "selectors"),
     ("ansible.module_utils.distro", "distro"),
 ])
@@ -233,6 +234,37 @@ def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatc
     (package / "__init__.py").write_text("raise RuntimeError('wrong Ansible selected')\n")
     monkeypatch.setenv("PYTHONPATH", str(foreign), prepend=os.pathsep)
     playbook = _write(tmp_path, "- hosts: localhost\n  gather_facts: false\n")
+    output = tmp_path / "compiled.py"
+    result = subprocess.run(
+        ansiroll_compile_command() + [str(playbook), "-o", str(output)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.is_file()
+
+
+def test_subprocess_compile_imports_playbook_local_filter_helpers(tmp_path, monkeypatch):
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(dependencies))
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - import_tasks: "{{ 'included' | parity_task_file }}"
+""", {
+        "tests.py": "raise RuntimeError('unexpected playbook-local tests module')\n",
+        "parity_playbook_helper.py": "def task_file(name):\n    return name + '.yml'\n",
+        "filter_plugins/parity_filters.py": (
+            "from parity_playbook_helper import task_file\n"
+            "class FilterModule:\n"
+            "    def filters(self):\n"
+            "        return {'parity_task_file': task_file}\n"
+        ),
+        "included.yml": "- debug: msg=selected-from-playbook\n",
+    })
     output = tmp_path / "compiled.py"
     result = subprocess.run(
         ansiroll_compile_command() + [str(playbook), "-o", str(output)],
