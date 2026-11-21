@@ -1138,10 +1138,6 @@ class _TaskVarTemplate(str):
 class _LoopVarsSnapshot(dict):
     """The task's magic vars mapping before its loop bindings were applied."""
 
-    def __init__(self, values, bindings):
-        super().__init__(values)
-        self.bindings = bindings
-
 
 class _PlayVarScope(dict):
     """Cache referenced play templates for a single Jinja evaluation."""
@@ -1180,21 +1176,21 @@ class _PlayVarScope(dict):
 class _PlayVarView(dict):
     """The finite public vars mapping for a lazy play-variable scope."""
 
-    def __init__(self, snapshot, scope, loop_bindings=()):
+    def __init__(self, snapshot, scope, loop_snapshot=False):
         super().__init__(snapshot)
         if not _core_at_least(2, 19):
             self.update({key: str(value) for key, value in snapshot.items()
                          if isinstance(value, _PlayVarTemplate)})
         self.scope = scope
-        self._loop_bindings = getattr(snapshot, "bindings", loop_bindings)
+        self._loop_snapshot = loop_snapshot or isinstance(snapshot, _LoopVarsSnapshot)
         if "vars" in snapshot:
-            self["vars"] = type(self)(snapshot["vars"], scope, self._loop_bindings)
+            self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
 
     def __getitem__(self, key):
         value = dict.__getitem__(self, key)
         if key == "vars":
             return value
-        if key not in self._loop_bindings:
+        if not self._loop_snapshot:
             value = self.scope[key]
         elif isinstance(value, _PlayVarTemplate):
             value = str(value)
@@ -2722,7 +2718,7 @@ class Runtime:
         play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
         if "vars" not in ctx or play_magic:
             snapshot = _vars_snapshot(ctx)
-            ctx["vars"] = _LoopVarsSnapshot(snapshot, ()) if loop_snapshot else snapshot
+            ctx["vars"] = _LoopVarsSnapshot(snapshot) if loop_snapshot else snapshot
         return ctx
 
     def run_task(self, task, overlay, become=False):
@@ -2900,10 +2896,7 @@ class Runtime:
         failed_items_ignored = True
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
-            bindings = self._loop_item_vars(task, items, i, base_ctx)
-            ctx.update(bindings)
-            if isinstance(ctx.get("vars"), _LoopVarsSnapshot):
-                ctx["vars"] = _LoopVarsSnapshot(ctx["vars"], bindings)
+            ctx.update(self._loop_item_vars(task, items, i, base_ctx))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
             res, ignore = self._task_gate(task, ctx)
@@ -5075,7 +5068,8 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None):
         if key == "vars":
             continue
         try:
-            if templater is not None and (resolve_keys is None or key in resolve_keys):
+            if templater is not None and (
+                    resolve_keys is None or key in resolve_keys or isinstance(value, _TaskVarTemplate)):
                 if isinstance(value, _PlayVarTemplate):
                     value = scope[key]
                     if resolve_keys is None:
