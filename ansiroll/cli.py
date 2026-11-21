@@ -177,15 +177,15 @@ def _open_compile_destination(path, validate):
             try:
                 writer.truncate(0)
             except OSError as ex:
-                if released_for_emfile or (
-                    ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS
-                ):
+                if ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS:
                     raise
-                # A dangling symlink can lead to a newly created file even
-                # though the exclusive open of the symlink returned EEXIST.
+                # An empty file can be written through the current handle
+                # without truncating it or opening another descriptor.
                 if os.fstat(fd).st_size == 0:
                     yield writer
                     return
+                if released_for_emfile:
+                    raise
                 original_error = ex
                 reference = _pin_for_truncate(path, fd, ex)
                 stack.callback(os.close, reference)

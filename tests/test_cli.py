@@ -458,19 +458,23 @@ def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
 @pytest.mark.parametrize("destination", ["output", "manifest"])
-def test_compile_releases_optional_pin_when_write_open_hits_emfile(monkeypatch, tmp_path, destination):
+@pytest.mark.parametrize("unsupported_truncate", [False, True])
+def test_compile_releases_optional_pin_when_write_open_hits_emfile(
+    monkeypatch, tmp_path, destination, unsupported_truncate,
+):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     target = output if destination == "output" else manifest
-    target.write_text("longer prior contents")
+    target.write_text("" if unsupported_truncate else "longer prior contents")
     data = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
-    open_fd = os.open
+    open_fd, fdopen = os.open, os.fdopen
     reference = None
+    writer_fd = None
     attempts = 0
 
     def with_one_free_slot(path, flags, *args):
-        nonlocal reference, attempts
+        nonlocal reference, writer_fd, attempts
         if path == str(target) and flags & os.O_PATH:
             reference = open_fd(path, flags, *args)
             return reference
@@ -484,9 +488,21 @@ def test_compile_releases_optional_pin_when_write_open_hits_emfile(monkeypatch, 
             with pytest.raises(OSError) as error:
                 os.fstat(reference)
             assert error.value.errno == errno.EBADF
+            writer_fd = open_fd(path, flags, *args)
+            return writer_fd
         return open_fd(path, flags, *args)
 
+    def with_optional_truncate(fd, mode):
+        file = fdopen(fd, mode)
+        if unsupported_truncate and fd == writer_fd:
+            def truncate(size):
+                raise OSError(errno.EOPNOTSUPP, "standalone truncation unavailable")
+
+            file.truncate = truncate
+        return file
+
     monkeypatch.setattr(os, "open", with_one_free_slot)
+    monkeypatch.setattr(os, "fdopen", with_optional_truncate)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert attempts == 2
     assert output.read_text() == "pass\n"
