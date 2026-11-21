@@ -208,6 +208,18 @@ def test_delegation_resolves_selected_action_variables():
     assert sent["unused"] == "{{ rsync_binary }}"
 
 
+def test_delegated_loop_task_alias_uses_agent_filters():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["agent_filter"] = str.upper
+    task = _task("template", "Template", None, loop=["sample"],
+                 vars={"alias": "{{ item | agent_filter }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert _delegate_vars(ctx, rt.templater)["alias"] == "SAMPLE"
+
+
 @pytest.mark.parametrize("controller_snapshot", [False, True])
 def test_play_alias_can_read_shadowed_inventory_value(controller_snapshot):
     frames = []

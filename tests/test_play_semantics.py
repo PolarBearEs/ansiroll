@@ -678,6 +678,19 @@ def test_loop_task_alias_stays_out_of_hostvars(tmp_path):
     assert messages == ['"alpha / missing"', '"beta / missing"']
 
 
+def test_loop_task_user_vars_mapping_does_not_replace_play_magic(tmp_path):
+    messages, _ = check(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars: {play_alias: "{{ 'play' }}"}
+          tasks:
+            - debug: {msg: "{{ vars.play_alias }} / {{ item }}"}
+              vars: {vars: {custom: x}}
+              loop: [alpha, beta]
+    """})
+    assert messages == ['"play / alpha"', '"play / beta"']
+
+
 def test_include_tasks_handler_runs_its_body(tmp_path):
     messages, recap = check(tmp_path, {
         "pb.yml": """
