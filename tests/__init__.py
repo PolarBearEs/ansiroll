@@ -4,10 +4,14 @@ import os
 import sys
 
 
+# The playbook directory can contain an unrelated tests.py.
+_BOOTSTRAP = "import sys; sys.path[:1] = [] if sys.path[:1] == [''] else sys.path[:1]; "
+
+
 def ansible_playbook_command():
     import ansible
 
-    run = "import sys; from tests import _run_ansible_playbook; _run_ansible_playbook(sys.argv.pop(1))"
+    run = _BOOTSTRAP + "from tests import _run_ansible_playbook; _run_ansible_playbook(sys.argv.pop(1))"
     return [sys.executable, "-c", run, os.path.abspath(ansible.__file__)]
 
 
@@ -43,7 +47,7 @@ def _run_legacy_playbook(script):
     import runpy
 
     # Match direct execution of the launcher, including sibling imports.
-    sys.path[0] = os.path.dirname(os.path.realpath(script))
+    sys.path.insert(0, os.path.dirname(os.path.realpath(script)))
     sys.argv[0] = script
     runpy.run_path(script, run_name="__main__")
 
@@ -63,25 +67,61 @@ def _ansible_version_fields(command, candidate, diagnostics):
     return dict(line.strip().split(" = ", 1) for line in result.stdout.splitlines() if " = " in line)
 
 
-def _legacy_python_launcher(path, filename, package, diagnostics):
+def _matches_legacy_interpreter(source):
+    import shlex
+    import shutil
+
+    shebang = source.splitlines()[0] if source else ""
+    if not shebang.startswith("#!"):
+        return False
+    try:
+        command = shlex.split(shebang[2:])
+    except ValueError:
+        return False
+    if not command:
+        return False
+    interpreter = command[0]
+    if os.path.basename(interpreter) == "env":
+        interpreter = shutil.which(command[1]) if len(command) == 2 else None
+    elif len(command) != 1:
+        return False
+    if not interpreter or not os.path.isabs(interpreter):
+        return False
+    try:
+        return (os.path.realpath(os.path.dirname(interpreter)) ==
+                os.path.realpath(os.path.dirname(sys.executable))
+                and os.path.samefile(interpreter, sys.executable))
+    except OSError:
+        return False
+
+
+def _legacy_python_launcher(path, filename, package, diagnostics, associated):
     import tokenize
 
     try:
         with tokenize.open(path) as script:
-            compile(script.read(), path, "exec")
+            source = script.read()
+        compile(source, path, "exec")
     except OSError as ex:
         diagnostics.append("%s: %s" % (path, ex))
         return None
     except (SyntaxError, UnicodeError):
-        # A shell or native launcher can report the Python script it invokes.
-        fields = _ansible_version_fields([path], path, diagnostics)
-        script = fields.get("executable location", "")
-        if not (os.path.isabs(script) and os.path.realpath(script) != os.path.realpath(path)
-                and os.path.isfile(script)):
-            return None
-        path = script
+        diagnostics.append("%s: cannot replay a non-Python launcher's initialization" % path)
+        return None
 
-    probe = ("import sys; from tests import _load_reference_ansible, _run_legacy_playbook; "
+    if not associated:
+        # A process that already pinned Ansible cannot establish whether the
+        # launcher belongs to that installation. Check its native startup first.
+        if not _matches_legacy_interpreter(source):
+            diagnostics.append("%s: launcher does not name pytest's Python interpreter" % path)
+            return None
+        fields = _ansible_version_fields([path], path, diagnostics)
+        installed = fields.get("ansible python module location", "")
+        if not installed or os.path.realpath(installed) != package:
+            diagnostics.append("%s: launcher did not report the expected Ansible package" % path)
+            return None
+
+    probe = (_BOOTSTRAP + "from tests import _load_reference_ansible, _run_legacy_playbook; "
              "_load_reference_ansible(sys.argv.pop(1)); _run_legacy_playbook(sys.argv.pop(1))")
     fields = _ansible_version_fields([sys.executable, "-c", probe, filename, path], path, diagnostics)
     installed = fields.get("ansible python module location", "")
@@ -114,20 +154,21 @@ def _run_ansible_playbook(filename):
             continue
         for entry in distribution.files or ():
             if entry.name == "ansible-playbook" and "ansible_test" not in entry.parts:
-                candidates.append(str(distribution.locate_file(entry)))
+                candidates.append((str(distribution.locate_file(entry)), True))
 
     # Source checkouts may expose ansible through PYTHONPATH without a record.
-    source_root = os.path.dirname(os.path.dirname(package))
-    candidates.extend((
-        os.path.join(source_root, "bin", "ansible-playbook"),
-        os.path.join(os.path.dirname(sys.executable), "ansible-playbook"),
-    ))
-    candidates.extend(shutil.which("ansible-playbook", path=directory or os.curdir)
+    library = os.path.dirname(package)
+    if os.path.basename(library) == "lib":
+        candidates.append((os.path.join(os.path.dirname(library), "bin", "ansible-playbook"), True))
+    candidates.append((os.path.join(os.path.dirname(sys.executable), "ansible-playbook"), False))
+    candidates.extend((shutil.which("ansible-playbook", path=directory or os.curdir), False)
                       for directory in os.get_exec_path())
     diagnostics = []
-    for script in dict.fromkeys(candidates):
-        if script and os.path.isfile(script):
-            python_script = _legacy_python_launcher(script, filename, package, diagnostics)
+    seen = set()
+    for script, associated in candidates:
+        if script and script not in seen and os.path.isfile(script):
+            seen.add(script)
+            python_script = _legacy_python_launcher(script, filename, package, diagnostics, associated)
             if python_script:
                 _run_legacy_playbook(python_script)
                 return

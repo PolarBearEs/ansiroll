@@ -93,6 +93,25 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
     return expected
 
 
+def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
+    (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local import')\n")
+    result = subprocess.run(
+        ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
+def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
+    from tests import _legacy_python_launcher
+
+    wrapper = tmp_path / "ansible-playbook"
+    wrapper.write_text("#!/bin/sh\nexport ANSIBLE_CONFIG=/some/config\nexec ansible-playbook \"$@\"\n")
+    diagnostics = []
+    assert _legacy_python_launcher(str(wrapper), "", "", diagnostics, associated=True) is None
+    assert "cannot replay a non-Python launcher's initialization" in diagnostics[0]
+
+
 def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch):
     checkout = tmp_path / "checkout"
     package = checkout / "ansible"
