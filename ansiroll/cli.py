@@ -101,19 +101,25 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
 
 
 def _check_file_destinations(output_path, manifest_path):
-    if os.path.normcase(os.path.realpath(output_path)) == os.path.normcase(os.path.realpath(manifest_path)):
-        raise ValueError("manifest path points to compiled output: %s" % manifest_path)
     try:
         output_stat = os.stat(output_path)
+        manifest_stat = os.stat(manifest_path)
     except FileNotFoundError:
+        # Absent destinations have no file identity to compare yet.
+        if os.path.normcase(os.path.realpath(output_path)) == os.path.normcase(os.path.realpath(manifest_path)):
+            raise ValueError("manifest path points to compiled output: %s" % manifest_path)
         return
-    _check_manifest_path(manifest_path, output_stat)
+    except OSError:
+        # The normal write path reports destination errors in output order.
+        return
+    if _same_stream(output_stat, manifest_stat):
+        raise ValueError("manifest path points to compiled output: %s" % manifest_path)
 
 
 def _check_manifest_path(path, output_stat):
     try:
         manifest_stat = os.stat(path)
-    except FileNotFoundError:
+    except OSError:
         return
     if _same_stream(output_stat, manifest_stat):
         raise ValueError("manifest path points to compiled output: %s" % path)
@@ -124,10 +130,10 @@ def _open_file_manifest(stack, path, output_stat, *, preflight=False):
     flags = os.O_WRONLY | (nonblocking if preflight else os.O_CREAT)
     try:
         stream = stack.enter_context(os.fdopen(os.open(path, flags, 0o666), "w"))
-    except OSError as ex:
-        # A missing manifest is created after Python is written. A FIFO with
-        # no reader can also wait until the Python writer has closed.
-        if preflight and ex.errno in (errno.ENOENT, errno.ENXIO):
+    except OSError:
+        # Creation, a blocking FIFO open, and ordinary manifest errors all
+        # belong after Python output. Preflight only detects existing aliases.
+        if preflight:
             return None
         raise
     if _same_stream(output_stat, os.fstat(stream.fileno())):

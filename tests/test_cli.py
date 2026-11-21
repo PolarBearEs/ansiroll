@@ -268,6 +268,22 @@ def test_file_compile_preserves_symlink_path_lookup(monkeypatch, tmp_path):
     assert not manifest.exists()
 
 
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires Linux procfs descriptors")
+def test_file_compile_distinguishes_same_named_unlinked_files(monkeypatch, tmp_path):
+    manifest = {"modules": [], "fallback_tasks": []}
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
+    backing_path = tmp_path / "unlinked"
+    with backing_path.open("w+b") as output:
+        backing_path.unlink()
+        with backing_path.open("w+b") as manifest_file:
+            backing_path.unlink()
+            output_path = "/proc/self/fd/%s" % output.fileno()
+            manifest_path = "/proc/self/fd/%s" % manifest_file.fileno()
+            assert cli.main(["compile", "play.yml", "-o", output_path, "-m", manifest_path]) == 0
+            assert output.read() == b"pass\n"
+            assert json.load(manifest_file) == manifest
+
+
 def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
@@ -280,6 +296,16 @@ def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monk
     with pytest.raises(PermissionError, match="could not make output executable"):
         cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
     assert not manifest.exists()
+
+
+def test_file_compile_writes_python_before_reporting_manifest_open_error(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+
+    with pytest.raises(IsADirectoryError):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(tmp_path)])
+    assert output.read_text() == "pass\n"
+    assert output.stat().st_mode & stat.S_IEXEC
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
