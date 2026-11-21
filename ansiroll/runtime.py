@@ -1208,7 +1208,7 @@ class _PlayVarView(dict):
                 value = str(value)
             resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
             self.scope.resolved_snapshot[key] = resolved
-        return self.scope.resolved_snapshot[key]
+        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[key], key)
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1665,6 +1665,7 @@ class _Templater:
 
     def resolve_variable(self, key, value, ctx, strict=False):
         """Template a variable's trusted value when a template references it."""
+        self._observe_untrusted(value, key)
         if type(value) in (str, _TaskVarTemplate) and _looks_templated(value):
             marker = (key, value)
             if marker in self._resolving:
@@ -1679,10 +1680,13 @@ class _Templater:
             return _lazy_wrap(value, value._rt, ctx)
         if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot):
             return _lazy_wrap(value, self._runtime, ctx)
-        return self._observe_untrusted(value)
+        return value
 
-    def _observe_untrusted(self, value):
-        if self._rendering_task_alias and isinstance(value, _UntrustedConditionValue):
+    def _observe_untrusted(self, value, key=None):
+        if self._untrusted_task_interpolation is not None and (
+                isinstance(value, _UntrustedConditionValue)
+                or (self._rendering_task_alias and self._runtime is not None
+                    and key in self._runtime._untrusted_runtime_vars)):
             self._untrusted_task_interpolation = True
         return value
 
@@ -1696,7 +1700,8 @@ class _Templater:
             # booleans, including assertion lists, need no expression parsing.
             if isinstance(result, (list, tuple)):
                 result = _mark_unsafe(result)
-            if self._untrusted_task_interpolation and _condition_contains_string(result, str):
+            if (self._untrusted_task_interpolation and isinstance(result, (str, list, tuple))
+                    and _condition_contains_string(result, str)):
                 raise UntrustedConditional("Encountered untrusted template or expression.")
             return result
         finally:
@@ -1720,13 +1725,18 @@ class _Templater:
         scope = ctx.get("vars")
         self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
         rendering_alias = self._rendering_task_alias
-        self._rendering_task_alias = rendering_alias or (
-            self._untrusted_task_interpolation is not None and isinstance(text, _TaskVarTemplate))
+        previous_interpolation = self._untrusted_task_interpolation
+        task_alias = previous_interpolation is not None and isinstance(text, _TaskVarTemplate)
+        self._rendering_task_alias = rendering_alias or task_alias
         try:
             result = self._render_string(text, ctx, strict)
-            if (self._rendering_task_alias and isinstance(text, _TaskVarTemplate)
-                    and _condition_contains_string(result, _UntrustedConditionValue)):
-                self._untrusted_task_interpolation = True
+            if task_alias:
+                if isinstance(result, bool):
+                    # This alias contributes a boolean, even in a larger
+                    # expression. Keep any earlier unsafe text contribution.
+                    self._untrusted_task_interpolation = previous_interpolation
+                else:
+                    self._observe_untrusted(result)
         finally:
             self._rendering_task_alias = rendering_alias
             # A nested render (a lazily templated variable, a lookup term)
@@ -5108,7 +5118,7 @@ def _delegate_template_value(value):
 
 
 _SYNCHRONIZE_VARS = frozenset((
-    "ansible_rsync_path", "ansible_port", "ansible_ssh_pass", "ansible_password",
+    "ansible_connection", "ansible_rsync_path", "ansible_port", "ansible_ssh_pass", "ansible_password",
     "ansible_user", "ansible_ssh_args", "ansible_ssh_common_args", "ansible_ssh_extra_args",
     "ansible_ssh_private_key_file", "ansible_private_key_file",
 ))

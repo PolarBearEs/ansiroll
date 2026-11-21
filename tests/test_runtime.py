@@ -231,6 +231,7 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
 
     rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
     task = _task("sync", "Synchronize", None, loop=["sample"], vars={
+        "ansible_connection": "{{ item | lower }}",
         "ansible_ssh_common_args": "-o HostKeyAlias={{ item | agent_filter }}",
         "ansible_ssh_private_key_file": "/keys/{{ item | agent_filter }}",
         "ansible_private_key_file": "/other-keys/{{ item | agent_filter }}",
@@ -239,6 +240,7 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
     ctx = rt._task_ctx(task, {})
     ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
     sent = _delegate_vars(ctx, rt.templater, _SYNCHRONIZE_VARS)
+    assert sent["ansible_connection"] == "sample"
     assert sent["ansible_ssh_common_args"] == "-o HostKeyAlias=SAMPLE"
     assert sent["ansible_ssh_private_key_file"] == "/keys/SAMPLE"
     assert sent["ansible_private_key_file"] == "/other-keys/SAMPLE"
@@ -294,14 +296,50 @@ def test_loop_task_conditional_interpolation_preserves_alias_trust(unsafe, alias
 
 
 @pytest.mark.parametrize("flag, expected", [("yes", True), ("no", False)])
-def test_loop_task_conditional_accepts_boolean_computed_from_unsafe_data(flag, expected):
+@pytest.mark.parametrize("condition", ["{{ enabled }}", "{{ enabled }} and true"])
+def test_loop_task_conditional_accepts_boolean_computed_from_unsafe_data(flag, expected, condition):
     rt = Runtime({}, "", {})
     task = _task("task", "Task", None, loop=[flag], vars={
         "flag": {"__ansiroll_unsafe__": flag},
         "enabled": "{{ flag == 'yes' }}",
     })
     ctx = rt._task_ctx(task, {})
-    assert rt.when([{"__ansiroll_trusted_condition__": "{{ enabled }}"}], ctx) is expected
+    assert rt.when([{"__ansiroll_trusted_condition__": condition}], ctx) is expected
+
+
+@pytest.mark.parametrize("reference", ["previous.stdout", "vars.previous.stdout"])
+def test_loop_task_condition_rejects_text_derived_from_registered_result(reference):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "previous"}, {"stdout": "sample"})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "'{{ " + reference + " }}' == '{{ item }}'",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
+
+
+def test_loop_task_conditional_reads_only_used_alias_mapping_members():
+    rt = Runtime({}, "", {})
+
+    def unexpected_lookup():
+        pytest.fail("an unused mapping member was rendered")
+
+    rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "settings": {
+            "enabled": True,
+            "unused": "{{ unexpected_lookup() }}",
+            "text": {"__ansiroll_unsafe__": "sample"},
+        },
+        "alias": "{{ settings }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias.enabled }}"}], ctx)
+    condition = {"__ansiroll_trusted_condition__": "'{{ alias.text }}' == 'sample'"}
+    with pytest.raises(UntrustedConditional):
+        rt.when([condition], ctx)
 
 
 @pytest.mark.parametrize("alias, access", [
