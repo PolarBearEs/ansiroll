@@ -127,6 +127,16 @@ def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, shadow_pat
     assert __version__ in result.stdout
 
 
+def test_reference_launcher_discovery_uses_stdlib_csv(tmp_path, monkeypatch):
+    (tmp_path / "csv.py").write_text("raise RuntimeError('unexpected playbook-local csv')\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+    result = subprocess.run(
+        ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
 def test_reference_launcher_ignores_archived_distribution_metadata(tmp_path, monkeypatch):
     from zipfile import ZipFile
 
@@ -263,6 +273,35 @@ def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_p
     monkeypatch.setenv("PATH", "")
     tests._run_ansible_playbook(str(tmp_path / "ansible" / "__init__.py"), version)
     assert seen == [str(tmp_path / launcher), "--version"]
+
+
+def test_modern_launcher_falls_back_to_matching_path_installation(tmp_path, monkeypatch):
+    from types import ModuleType, SimpleNamespace
+
+    import tests
+
+    package = str(tmp_path / "ansible")
+    foreign = str(tmp_path / "foreign" / "bin" / "ansible-playbook")
+    matching = str(tmp_path / "matching" / "bin" / "ansible-playbook")
+    seen = []
+
+    def version_fields(command, candidate, diagnostics):
+        assert command == [candidate]
+        seen.append(candidate)
+        location = package if candidate == matching else str(tmp_path / "foreign" / "ansible")
+        return {"ansible python module location": location}
+
+    cli = ModuleType("ansible.cli")
+    cli.playbook = SimpleNamespace(main=lambda: seen.append(sys.argv[0]))
+    monkeypatch.setitem(sys.modules, "ansible.cli", cli)
+    monkeypatch.setattr(sys, "argv", ["-c", "--version"])
+    monkeypatch.setattr(sys, "path", sys.path[:])
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter([foreign, matching]))
+    monkeypatch.setattr(tests, "_ansible_version_fields", version_fields)
+    monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
+    tests._run_ansible_playbook(os.path.join(package, "__init__.py"), "2.14.18")
+    assert seen == [foreign, matching, matching]
 
 
 @pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])

@@ -1,7 +1,13 @@
 """Ansiroll test package."""
 
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tokenize
+from importlib import metadata, util
+from itertools import chain
 
 
 # Prefer the standard library during bootstrap, then restore the caller's paths.
@@ -10,7 +16,7 @@ _BOOTSTRAP = (
     "sys.path[:1] = [] if _implicit_cwd else sys.path[:1]; "
     "import os; _playbook_cwd = os.getcwd(); _reference_path = sys.path[:]; "
     "sys.path.insert(0, os.path.dirname(os.__file__)); "
-    "import runpy; "
+    "import csv, runpy; "
     "_parity_bootstrap = runpy.run_path(sys.argv.pop(1), run_name='_ansiroll_parity_bootstrap'); "
     "sys.path[:] = _reference_path; "
 )
@@ -72,8 +78,6 @@ def _is_ansible_compatibility_alias(name, module):
 
 
 def _load_reference_ansible(filename):
-    from importlib import util
-
     expected = os.path.realpath(os.path.dirname(filename))
     for name, module in tuple(sys.modules.items()):
         if name == "ansible" or name.startswith("ansible."):
@@ -119,8 +123,6 @@ def _run_legacy_playbook(filename, script):
 
 
 def _ansible_version_fields(command, candidate, diagnostics):
-    import subprocess
-
     try:
         result = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as ex:
@@ -134,8 +136,6 @@ def _ansible_version_fields(command, candidate, diagnostics):
 
 
 def _has_brace_expansion(path):
-    import re
-
     braces = []
     for token in re.finditer(r"[{},]", path):
         char = token.group()
@@ -154,8 +154,6 @@ def _has_brace_expansion(path):
 
 
 def _shell_preserves_braces():
-    import subprocess
-
     # Probe the trampoline's shell with fixed words. Never run the launcher
     # or pass its interpreter path to the shell for parsing.
     try:
@@ -169,8 +167,6 @@ def _shell_preserves_braces():
 
 
 def _shell_preserves_path_pattern(path):
-    import subprocess
-
     # Pass the path as an argument to fixed shell code. Expand only its
     # pathname pattern, without evaluating it as a command or splitting it.
     try:
@@ -185,8 +181,6 @@ def _shell_preserves_path_pattern(path):
 
 
 def _is_python_interpreter(executable):
-    import re
-
     return (
         re.fullmatch(r"(?:python|pypy)[0-9.]*t?d?", os.path.basename(executable)) is not None
         or (os.path.isabs(executable) and os.path.realpath(executable) == os.path.realpath(sys.executable))
@@ -194,8 +188,6 @@ def _is_python_interpreter(executable):
 
 
 def _launcher_body(source):
-    import re
-
     if not source.startswith("#!"):
         return source
     shebang, _, body = source.partition("\n")
@@ -244,8 +236,6 @@ def _launcher_body(source):
 
 
 def _legacy_python_launcher(path, filename, package, diagnostics, associated):
-    import tokenize
-
     try:
         with tokenize.open(path) as script:
             source = script.read()
@@ -294,8 +284,6 @@ def _legacy_python_launcher(path, filename, package, diagnostics, associated):
 
 
 def _installed_playbook_launchers(package):
-    from importlib import metadata
-
     # The pinned package may be outside the subprocess's import path.
     search_path = list(dict.fromkeys([*sys.path, os.path.dirname(package)]))
     for name in ("ansible-core", "ansible-base", "ansible"):
@@ -317,16 +305,36 @@ def _installed_playbook_launchers(package):
         yield os.path.join(os.path.dirname(library), "bin", "ansible-playbook")
 
 
-def _run_ansible_playbook(filename, version):
-    import shutil
-    from itertools import chain
+def _path_playbook_launchers():
+    seen = set()
+    for directory in os.get_exec_path():
+        script = shutil.which("ansible-playbook", path=directory or os.curdir)
+        if script:
+            script = os.path.abspath(script)
+            if script not in seen:
+                seen.add(script)
+                yield script
 
+
+def _matching_path_launcher(package):
+    diagnostics = []
+    for script in _path_playbook_launchers():
+        fields = _ansible_version_fields([script], script, diagnostics)
+        installed = fields.get("ansible python module location", "")
+        if installed and os.path.realpath(installed) == package:
+            return script
+    return None
+
+
+def _run_ansible_playbook(filename, version):
     package = os.path.realpath(os.path.dirname(filename))
     installed_launchers = _installed_playbook_launchers(package)
     environment_script = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
     if tuple(map(int, version.split(".")[:2])) >= (2, 13):
         # The CLI looks for sibling helpers next to argv[0] before PATH.
-        script = next((script for script in installed_launchers if os.path.isfile(script)), environment_script)
+        script = next((script for script in installed_launchers if os.path.isfile(script)), None)
+        if script is None:
+            script = _matching_path_launcher(package) or environment_script
         _set_playbook_launcher(script)
         _load_reference_ansible(filename)
         from ansible.cli import playbook
@@ -338,8 +346,7 @@ def _run_ansible_playbook(filename, version):
     candidates = chain(
         ((script, True) for script in installed_launchers),
         [(environment_script, False)],
-        ((shutil.which("ansible-playbook", path=directory or os.curdir), False)
-         for directory in os.get_exec_path()),
+        ((script, False) for script in _path_playbook_launchers()),
     )
     diagnostics = []
     seen = set()
