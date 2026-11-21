@@ -466,7 +466,7 @@ def test_compile_leaves_permission_denials_unchanged(monkeypatch, tmp_path, dest
         return open_fd(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", deny_write)
-    monkeypatch.setattr(cli, "_pin_for_truncate", lambda *args: pytest.fail("permission denial retried"))
+    monkeypatch.setattr(cli, "_open_truncated_destination", lambda *args: pytest.fail("permission denial retried"))
     with pytest.raises(PermissionError, match="write denied"):
         cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
     assert target.read_text() == before
@@ -484,16 +484,14 @@ def test_compile_rejects_truncating_retry_for_a_foreign_file(monkeypatch, tmp_pa
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
     open_fd, fstat = os.open, os.fstat
     pinned = None
-    failed_create_open = False
 
     def open_replacement(path, flags, *args, **kwargs):
-        nonlocal pinned, failed_create_open
+        nonlocal pinned
         if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
-            failed_create_open = True
             raise PermissionError(errno.EPERM, "create-open permission not established", path)
         assert not flags & os.O_TRUNC
         fd = open_fd(path, flags, *args, **kwargs)
-        if failed_create_open and path == str(target) and flags & os.O_PATH:
+        if path == str(target) and flags & os.O_PATH:
             pinned = fd
         return fd
 
@@ -510,6 +508,36 @@ def test_compile_rejects_truncating_retry_for_a_foreign_file(monkeypatch, tmp_pa
         cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
     assert pinned is not None
     assert target.read_text() == prior
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+@pytest.mark.parametrize("existed", [False, True])
+def test_compile_does_not_retry_truncation_on_a_replacement(monkeypatch, tmp_path, destination, existed):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    target = output if destination == "output" else manifest
+    saved = tmp_path / "saved"
+    if existed:
+        target.write_text("original file")
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    open_fd = os.open
+
+    def replace_on_create_open(path, flags, *args, **kwargs):
+        assert not flags & os.O_TRUNC
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
+            if existed:
+                target.rename(saved)
+            target.write_text("replacement file")
+            raise PermissionError(errno.EPERM, "create-open failed", path)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_on_create_open)
+    with pytest.raises(PermissionError, match="create-open failed"):
+        cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
+    assert target.read_text() == "replacement file"
+    if existed:
+        assert saved.read_text() == "original file"
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_PATH"), reason="requires Linux FIFOs")
@@ -545,7 +573,7 @@ def test_file_compile_defers_manifest_creation_until_python_output_succeeds(monk
     def fail_chmod(*args, **kwargs):
         raise PermissionError("could not make output executable")
 
-    monkeypatch.setattr(os, "fchmod" if hasattr(os, "fchmod") else "chmod", fail_chmod)
+    monkeypatch.setattr(cli, "_make_output_executable", fail_chmod)
     with pytest.raises(PermissionError, match="could not make output executable"):
         cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)])
     assert not manifest.exists()
@@ -583,7 +611,7 @@ def test_file_compile_does_not_connect_manifest_fifo_when_python_fails(monkeypat
         open_fd = os.open
 
         def replace_with_fifo(path, flags, *args, **kwargs):
-            if path == str(manifest) and flags & os.O_PATH:
+            if path == str(manifest) and flags & os.O_PATH and fifo.exists():
                 os.replace(fifo, manifest)
             return open_fd(path, flags, *args, **kwargs)
 
@@ -593,7 +621,7 @@ def test_file_compile_does_not_connect_manifest_fifo_when_python_fails(monkeypat
     def fail_chmod(*args, **kwargs):
         raise PermissionError("could not make output executable")
 
-    monkeypatch.setattr(os, "fchmod", fail_chmod)
+    monkeypatch.setattr(cli, "_make_output_executable", fail_chmod)
     with os.fdopen(os.open(fifo, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
         poller = select.poll()
         poller.register(reader, select.POLLHUP)
@@ -622,7 +650,6 @@ def test_file_compile_never_writes_manifest_through_replaced_deferred_fifo(monke
     assert output.read_text() == "pass\n"
 
 
-@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
 def test_file_compile_writes_to_current_manifest_after_replacement(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest_path = tmp_path / "manifest.json"
@@ -630,31 +657,30 @@ def test_file_compile_writes_to_current_manifest_after_replacement(monkeypatch, 
     manifest_path.write_text('{"previous": true}')
     manifest = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
-    fchmod = os.fchmod
+    make_executable = cli._make_output_executable
 
-    def replace_manifest(fd, mode):
-        fchmod(fd, mode)
+    def replace_manifest(*args):
+        make_executable(*args)
         os.replace(manifest_path, prior_path)
         manifest_path.write_text('{}')
 
-    monkeypatch.setattr(os, "fchmod", replace_manifest)
+    monkeypatch.setattr(cli, "_make_output_executable", replace_manifest)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest_path)]) == 0
     assert json.loads(prior_path.read_text()) == {"previous": True}
     assert json.loads(manifest_path.read_text()) == manifest
 
 
 @pytest.mark.parametrize("during_open", [False, True])
-@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
 def test_file_compile_detects_manifest_redirected_to_missing_output(monkeypatch, tmp_path, during_open):
     output = tmp_path / "compiled.py"
     saved = tmp_path / "saved.py"
     manifest = tmp_path / "manifest.json"
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
-    fchmod = os.fchmod
+    make_executable = cli._make_output_executable
     open_fd = os.open
 
-    def remove_output(fd, mode):
-        fchmod(fd, mode)
+    def remove_output(*args):
+        make_executable(*args)
         output.rename(saved)
         if not during_open:
             manifest.symlink_to(output)
@@ -664,7 +690,7 @@ def test_file_compile_detects_manifest_redirected_to_missing_output(monkeypatch,
             manifest.symlink_to(output)
         return open_fd(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(os, "fchmod", remove_output)
+    monkeypatch.setattr(cli, "_make_output_executable", remove_output)
     monkeypatch.setattr(os, "open", redirect_manifest)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 2
     assert saved.read_text() == "pass\n"
@@ -674,13 +700,14 @@ def test_file_compile_detects_manifest_redirected_to_missing_output(monkeypatch,
         assert not output.exists()
 
 
-@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="requires procfs descriptor links")
 def test_file_compile_holds_output_inode_until_manifest_open(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest_path = tmp_path / "manifest.json"
     manifest = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", manifest))
-    fchmod, open_fd, pin = os.fchmod, os.open, cli._pin_output_inode
+    make_executable = cli._make_output_executable
+    open_fd, pin = os.open, cli._pin_output_inode
     output_references = {}
 
     def remember_reference(path, fd, info):
@@ -689,8 +716,8 @@ def test_file_compile_holds_output_inode_until_manifest_open(monkeypatch, tmp_pa
         output_references[reference] = os.fstat(fd)
         return reference
 
-    def remove_output(fd, mode):
-        fchmod(fd, mode)
+    def remove_output(*args):
+        make_executable(*args)
         output.unlink()
 
     def check_output_reference(path, flags, *args, **kwargs):
@@ -702,7 +729,7 @@ def test_file_compile_holds_output_inode_until_manifest_open(monkeypatch, tmp_pa
         return open_fd(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(cli, "_pin_output_inode", remember_reference)
-    monkeypatch.setattr(os, "fchmod", remove_output)
+    monkeypatch.setattr(cli, "_make_output_executable", remove_output)
     monkeypatch.setattr(os, "open", check_output_reference)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest_path)]) == 0
     assert json.loads(manifest_path.read_text()) == manifest
@@ -710,7 +737,6 @@ def test_file_compile_holds_output_inode_until_manifest_open(monkeypatch, tmp_pa
         os.fstat(next(iter(output_references)))
 
 
-@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
 def test_file_compile_writes_manifest_after_output_parent_becomes_a_file(monkeypatch, tmp_path):
     parent = tmp_path / "output"
     parent.mkdir()
@@ -719,14 +745,14 @@ def test_file_compile_writes_manifest_after_output_parent_becomes_a_file(monkeyp
     manifest = tmp_path / "manifest.json"
     data = {"modules": [], "fallback_tasks": []}
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", data))
-    fchmod = os.fchmod
+    make_executable = cli._make_output_executable
 
-    def move_parent(fd, mode):
-        fchmod(fd, mode)
+    def move_parent(*args):
+        make_executable(*args)
         parent.rename(moved)
         parent.touch()
 
-    monkeypatch.setattr(os, "fchmod", move_parent)
+    monkeypatch.setattr(cli, "_make_output_executable", move_parent)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert json.loads(manifest.read_text()) == data
     assert (moved / output.name).read_text() == "pass\n"
@@ -756,7 +782,7 @@ def test_file_compile_falls_back_when_procfs_reference_is_unavailable(monkeypatc
     assert json.loads(manifest.read_text()) == data
 
 
-@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires descriptor-based chmod")
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX executable files")
 def test_file_compile_releases_output_writer_before_setting_execute_bits(monkeypatch, tmp_path):
     if os.statvfs(tmp_path).f_flag & getattr(os, "ST_NOEXEC", 0):
         pytest.skip("temporary directory is on a noexec mount")
@@ -766,14 +792,14 @@ def test_file_compile_releases_output_writer_before_setting_execute_bits(monkeyp
     monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: (
         "#!/bin/sh\nexit 0\n", {"modules": [], "fallback_tasks": []},
     ))
-    fchmod = os.fchmod
+    make_executable = cli._make_output_executable
 
-    def run_output_as_soon_as_executable(fd, mode):
-        fchmod(fd, mode)
+    def run_output_as_soon_as_executable(*args):
+        make_executable(*args)
         subprocess.run([str(output)], capture_output=True, check=True, timeout=5)
         seen.append(output)
 
-    monkeypatch.setattr(os, "fchmod", run_output_as_soon_as_executable)
+    monkeypatch.setattr(cli, "_make_output_executable", run_output_as_soon_as_executable)
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert seen == [output]
 

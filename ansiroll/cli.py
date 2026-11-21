@@ -92,15 +92,13 @@ def _truncation_unavailable(path, original_error):
     return OSError(original_error.errno, "safe truncating reopen requires /proc/self/fd", path)
 
 
-def _pin_for_truncate(path, target, original_error):
+def _pin_for_truncate(path, fd, original_error):
     if not hasattr(os, "O_PATH"):
         raise _truncation_unavailable(path, original_error) from original_error
     try:
-        return os.open(target, os.O_PATH)
+        return os.open("/proc/self/fd/%d" % fd, os.O_PATH)
     except OSError as ex:
-        if target != path:
-            raise _truncation_unavailable(path, original_error) from ex
-        raise original_error from ex
+        raise _truncation_unavailable(path, original_error) from ex
 
 
 def _open_truncated_destination(path, reference, original_error):
@@ -118,20 +116,37 @@ _TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
 @contextmanager
 def _open_compile_destination(path, validate):
     with ExitStack() as stack:
+        # A failed create-open gives us no fd. Capture the existing inode
+        # before trying it so a retry cannot truncate a replacement file.
+        reference = None
+        if hasattr(os, "O_PATH"):
+            try:
+                reference = os.open(path, os.O_PATH)
+            except OSError:
+                pass
+            else:
+                stack.callback(os.close, reference)
+
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
             # check on the initial O_CREAT open in a sticky directory.
-            if ex.errno not in _TRUNCATING_RETRY_ERRORS:
+            if ex.errno not in _TRUNCATING_RETRY_ERRORS or reference is None:
                 raise
             original_error = ex
-            reference = _pin_for_truncate(path, path, ex)
-            stack.callback(os.close, reference)
             # A failed create-open hasn't established permission to replace
-            # someone else's file. The pathname may have changed since then.
-            if os.fstat(reference).st_uid != os.geteuid():
+            # someone else's file.
+            info = os.fstat(reference)
+            if info.st_uid != os.geteuid():
                 raise
+            try:
+                current = os.stat(path)
+            except OSError:
+                raise original_error
+            if not os.path.samestat(info, current):
+                validate(current)
+                raise original_error
         else:
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
@@ -145,7 +160,7 @@ def _open_compile_destination(path, validate):
                 if ex.errno != errno.ENOSYS and ex.errno not in _TRUNCATING_RETRY_ERRORS:
                     raise
                 original_error = ex
-                reference = _pin_for_truncate(path, "/proc/self/fd/%d" % fd, ex)
+                reference = _pin_for_truncate(path, fd, ex)
                 stack.callback(os.close, reference)
                 writer.close()
             else:
