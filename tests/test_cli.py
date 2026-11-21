@@ -675,6 +675,29 @@ def test_compile_does_not_retry_truncation_on_a_replacement(monkeypatch, tmp_pat
         assert saved.read_text() == "original file"
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
+                    reason="requires reopening a metadata-only descriptor")
+def test_pin_output_inode_uses_metadata_before_opening_a_reader(monkeypatch, tmp_path):
+    output = tmp_path / "compiled.py"
+    open_fd = os.open
+    with output.open("w") as writer:
+        writer_fd = writer.fileno()
+        original = os.fstat(writer_fd)
+
+        def metadata_only(path, flags):
+            assert path == f"/proc/self/fd/{writer_fd}"
+            assert flags == os.O_PATH
+            return open_fd(path, flags)
+
+        monkeypatch.setattr(os, "open", metadata_only)
+        reference = cli._pin_output_inode(str(output), writer_fd, original)
+        assert reference is not None
+        try:
+            assert os.path.samestat(original, os.fstat(reference))
+        finally:
+            os.close(reference)
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_PATH"), reason="requires Linux FIFOs")
 @pytest.mark.parametrize("metadata_available", [True, False])
 def test_output_inode_fallback_does_not_open_replacement_fifo(monkeypatch, tmp_path, metadata_available):

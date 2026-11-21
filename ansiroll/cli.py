@@ -272,9 +272,10 @@ def _pin_output_inode(path, output_fd, output_stat):
     candidates = []
     if sys.platform == "linux":
         linked_fd = "/proc/self/fd/%d" % output_fd
-        candidates.append((linked_fd, os.O_RDONLY | os.O_NONBLOCK))
         if hasattr(os, "O_PATH"):
+            # A read-open can wait on remote storage even with O_NONBLOCK.
             candidates.append((linked_fd, os.O_PATH))
+        candidates.append((linked_fd, os.O_RDONLY | os.O_NONBLOCK))
     if hasattr(os, "O_PATH"):
         # A replacement may be a FIFO. Inspect it without opening a reader.
         candidates.append((path, os.O_PATH))
