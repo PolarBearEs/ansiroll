@@ -119,17 +119,24 @@ def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path
     assert str(foreign) in result.stderr and str(expected.parent) in result.stderr
 
 
-def test_reference_bootstrap_accepts_ansible_stdlib_selectors_alias(tmp_path):
+@pytest.mark.parametrize("alias, external", [
+    ("ansible.module_utils.compat.selectors", "selectors"),
+    ("ansible.module_utils.distro", "distro"),
+])
+def test_reference_bootstrap_accepts_ansible_compatibility_aliases(tmp_path, alias, external):
     import ansible
 
     command = (
-        "import selectors, sys; from tests import _load_reference_ansible; "
+        "import selectors, sys, types; from tests import _load_reference_ansible; "
         "_load_reference_ansible(sys.argv[1]); "
-        "sys.modules['ansible.module_utils.compat.selectors'] = selectors; "
+        "module = sys.modules.get(sys.argv[3]) or types.ModuleType(sys.argv[3]); "
+        "module.__file__ = getattr(module, '__file__', selectors.__file__); "
+        "sys.modules[sys.argv[2]] = sys.modules[sys.argv[3]] = module; "
         "_load_reference_ansible(sys.argv[1])"
     )
     subprocess.run(
-        [sys.executable, "-c", command, os.path.abspath(ansible.__file__)], cwd=tmp_path, env=_env(),
+        [sys.executable, "-c", command, os.path.abspath(ansible.__file__), alias, external],
+        cwd=tmp_path, env=_env(),
         capture_output=True, text=True, timeout=10, check=True,
     )
 

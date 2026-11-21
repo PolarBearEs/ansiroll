@@ -6,6 +6,10 @@ import sys
 
 # The playbook directory can contain an unrelated tests.py.
 _BOOTSTRAP = "import sys; sys.path[:1] = [] if sys.path[:1] == [''] else sys.path[:1]; "
+_ANSIBLE_MODULE_ALIASES = {
+    "ansible.module_utils.compat.selectors": "selectors",
+    "ansible.module_utils.distro": "distro",
+}
 
 
 def _reference_python(code):
@@ -36,10 +40,9 @@ def _load_reference_ansible(filename):
     expected = os.path.realpath(os.path.dirname(filename))
     for name, module in tuple(sys.modules.items()):
         if name == "ansible" or name.startswith("ansible."):
-            # Ansible 2.14 aliases the standard-library module under its
-            # compatibility namespace when the executor is imported.
-            if (name == "ansible.module_utils.compat.selectors"
-                    and module is not None and module is sys.modules.get("selectors")):
+            # Compatibility modules can alias an already imported dependency.
+            original_name = _ANSIBLE_MODULE_ALIASES.get(name)
+            if original_name and module is not None and module is sys.modules.get(original_name):
                 continue
             origin = getattr(module, "__file__", None) or getattr(getattr(module, "__spec__", None), "origin", None)
             if origin and origin not in ("built-in", "frozen"):
