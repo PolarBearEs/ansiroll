@@ -10,6 +10,7 @@ _ANSIBLE_MODULE_ALIASES = {
     "ansible.module_utils.compat.selectors": "selectors",
     "ansible.module_utils.distro": "distro",
 }
+_ANSIBLE_SIX = "ansible.module_utils.six"
 
 
 def _reference_python(code):
@@ -34,20 +35,39 @@ def parity_pythonpath(root):
     return root if inherited is None else os.pathsep.join([root, inherited])
 
 
+def _is_ansible_compatibility_alias(name, module):
+    if module is None:
+        return False
+    original_name = _ANSIBLE_MODULE_ALIASES.get(name)
+    if original_name:
+        return module is sys.modules.get(original_name)
+    if not name.startswith(_ANSIBLE_SIX + ".moves."):
+        return False
+
+    # Six itself is subject to the origin check. Its registered move must
+    # point to this same loaded module. Do not resolve the alias via the
+    # import system, which could just return the current cached value.
+    six = sys.modules.get(_ANSIBLE_SIX)
+    importer = getattr(six, "_importer", None)
+    moved_module = getattr(six, "MovedModule", None)
+    if importer is None or moved_module is None:
+        return False
+    move = importer.known_modules.get(name)
+    return isinstance(move, moved_module) and module is sys.modules.get(move.mod)
+
+
 def _load_reference_ansible(filename):
     from importlib import util
 
     expected = os.path.realpath(os.path.dirname(filename))
     for name, module in tuple(sys.modules.items()):
         if name == "ansible" or name.startswith("ansible."):
-            # Compatibility modules can alias an already imported dependency.
-            original_name = _ANSIBLE_MODULE_ALIASES.get(name)
-            if original_name and module is not None and module is sys.modules.get(original_name):
-                continue
             origin = getattr(module, "__file__", None) or getattr(getattr(module, "__spec__", None), "origin", None)
             if origin and origin not in ("built-in", "frozen"):
                 directory = os.path.realpath(os.path.dirname(origin))
                 if directory != expected and not directory.startswith(expected + os.sep):
+                    if _is_ansible_compatibility_alias(name, module):
+                        continue
                     raise RuntimeError("cached %s came from %s, expected Ansible from %s" % (name, origin, expected))
 
     spec = util.find_spec("ansible")

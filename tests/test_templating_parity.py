@@ -141,6 +141,34 @@ def test_reference_bootstrap_accepts_ansible_compatibility_aliases(tmp_path, ali
     )
 
 
+@pytest.mark.parametrize("replace_alias", [False, True])
+def test_reference_bootstrap_verifies_six_alias_identity(tmp_path, replace_alias):
+    import ansible
+    from pathlib import Path
+
+    if not Path(ansible.__file__).with_name("module_utils").joinpath("six", "__init__.py").is_file():
+        pytest.skip("Ansible does not ship vendored six")
+    alias = "ansible.module_utils.six.moves.http_cookiejar"
+    command = (
+        "import http.cookiejar, importlib, sys, types; from tests import _load_reference_ansible; "
+        "_load_reference_ansible(sys.argv[1]); "
+        "module = importlib.import_module(sys.argv[2]); assert module is http.cookiejar; "
+        "foreign = types.ModuleType(sys.argv[2]); foreign.__file__ = module.__file__; "
+        "sys.modules[sys.argv[2]] = foreign if sys.argv[3] == 'replace' else module; "
+        "_load_reference_ansible(sys.argv[1])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command, os.path.abspath(ansible.__file__), alias,
+         "replace" if replace_alias else "keep"],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10,
+    )
+    if replace_alias:
+        assert result.returncode != 0
+        assert f"cached {alias} came from" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
 def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_path, monkeypatch, version):
     from importlib import metadata
