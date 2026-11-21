@@ -49,7 +49,6 @@ def _legacy_python_launcher(path, package):
 
 
 def _run_ansible_playbook():
-    import runpy
     import shutil
     from importlib import metadata
 
@@ -74,8 +73,7 @@ def _run_ansible_playbook():
             if entry.name == "ansible-playbook" and "ansible_test" not in entry.parts:
                 script = distribution.locate_file(entry)
                 if script.is_file():
-                    runpy.run_path(str(script), run_name="__main__")
-                    return
+                    os.execv(sys.executable, [sys.executable, str(script)] + sys.argv[1:])
 
     # Source checkouts may expose ansible through PYTHONPATH without a record.
     source_root = os.path.dirname(os.path.dirname(package))
@@ -87,6 +85,5 @@ def _run_ansible_playbook():
         if script and os.path.isfile(script):
             python_script = _legacy_python_launcher(script, package)
             if python_script:
-                runpy.run_path(python_script, run_name="__main__")
-                return
+                os.execv(sys.executable, [sys.executable, python_script] + sys.argv[1:])
     raise FileNotFoundError("ansible-playbook script not found for %s" % package)
