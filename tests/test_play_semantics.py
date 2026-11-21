@@ -16,7 +16,7 @@ import textwrap
 import pytest
 from packaging.version import Version
 
-from tests import ansible_playbook_executable
+from tests import ansible_playbook_command
 from tests.run_official_suite import parse_task_trace
 
 pytest.importorskip("ansible")
@@ -64,7 +64,7 @@ def _ansible_run(base, args, strategy=None):
     if strategy:
         env["ANSIBLE_STRATEGY"] = strategy
     return subprocess.run(
-        [ansible_playbook_executable(), "-i", "localhost,", "-c", "local", "pb.yml"] + list(args),
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "pb.yml"] + list(args),
         cwd=str(base), env=env, capture_output=True, text=True, timeout=120,
     )
 
