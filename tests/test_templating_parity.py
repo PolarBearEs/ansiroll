@@ -129,13 +129,21 @@ def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, shadow_pat
 
 @pytest.mark.parametrize("module", ["csv", "_csv"])
 def test_reference_launcher_discovery_uses_stdlib_csv(tmp_path, monkeypatch, module):
+    from tests import _reference_python
+
     (tmp_path / f"{module}.py").write_text("raise RuntimeError('unexpected playbook-local CSV module')\n")
     monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
-    result = subprocess.run(
-        ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
-        capture_output=True, text=True, timeout=30, check=True,
+    command = _reference_python(
+        "script, _, _ = _parity_bootstrap['_select_playbook_launcher'](sys.argv.pop(1), sys.argv.pop(1)); "
+        "print(script)",
+        discover=True,
     )
-    assert __version__ in result.stdout
+    result = subprocess.run(
+        command + [__version__], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not result.stdout.strip() or os.path.isfile(result.stdout.strip())
 
 
 def test_reference_launcher_ignores_archived_distribution_metadata(tmp_path, monkeypatch):
@@ -390,6 +398,7 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     monkeypatch.delenv("ANSIROLL_TEST_USERCUSTOMIZE", raising=False)
+    monkeypatch.delenv("ANSIROLL_TEST_SITECUSTOMIZE", raising=False)
     if safe_path == "environment":
         monkeypatch.setenv("PYTHONSAFEPATH", "1")
     source = "inherited" if safe_path else "launcher"
@@ -400,6 +409,7 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
         "assert csv.PARITY_TEST_MODULE\n"
         f"assert bool(sys.flags.no_user_site) is {no_user_site!r}\n"
         "assert ('ANSIROLL_TEST_USERCUSTOMIZE' in os.environ) is bool(site.ENABLE_USER_SITE)\n"
+        "assert os.environ['ANSIROLL_TEST_SITECUSTOMIZE'] == '1'\n"
     )
     (package / "cli").mkdir()
     (package / "cli" / "playbook.py").write_text(
@@ -426,6 +436,11 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     (tmp_path / "parity_legacy_dependency.py").write_text("SOURCE = 'inherited'\n")
     (tmp_path / "csv.py").write_text("PARITY_TEST_MODULE = True\n")
     (tmp_path / "usercustomize.py").write_text("import os\nos.environ['ANSIROLL_TEST_USERCUSTOMIZE'] = '1'\n")
+    (tmp_path / "sitecustomize.py").write_text(
+        "import os\n"
+        "key = 'ANSIROLL_TEST_SITECUSTOMIZE'\n"
+        "os.environ[key] = str(int(os.environ.get(key, '0')) + 1)\n"
+    )
     monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
     command = _reference_playbook_command(str(package / "__init__.py"), version)
     result = subprocess.run(

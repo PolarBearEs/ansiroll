@@ -40,9 +40,13 @@ def _reference_python(code, filename=None, *, discover=False):
 
         filename = ansible.__file__
 
-    imports = "import csv; from importlib import metadata; " if discover else ""
-    # Discovery must not run user startup hooks before it reads the shebang.
-    flags = ["-s"] if discover else []
+    imports = ""
+    if discover:
+        # Supply pytest's package search paths without executing site hooks
+        # in the interpreter that selects the launcher.
+        paths = [os.path.abspath(path) for path in sys.path if isinstance(path, str)]
+        imports = f"import csv; from importlib import metadata; _reference_path.extend({paths!r}); "
+    flags = ["-S"] if discover else []
     return [sys.executable, *flags, "-c", _BOOTSTRAP + imports + _LOAD_BOOTSTRAP + code,
             os.path.abspath(__file__), os.path.abspath(filename)]
 
