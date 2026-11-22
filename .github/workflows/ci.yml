@@ -28,7 +28,8 @@ jobs:
           python-version: "3.12"
       - run: pip install jinja2 packaging pytest
       - run: pip install -e . --no-deps
-      - run: pytest tests/test_filters.py tests/test_runtime.py -q
+      - name: Test runtime without Ansible
+        run: pytest tests/test_filters.py tests/test_runtime.py -q
 
   # The coverage run also serves as the full pytest run on Ansible 2.21.
   coverage:
@@ -44,7 +45,7 @@ jobs:
           python-version: "3.13"
       - name: Install project and test dependencies
         run: pip install -e ".[test]" "ansible-core==2.21.*" pytest-xdist
-      - name: Run branch coverage
+      - name: Test and measure branch coverage
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}/collections
           ANSIBLE_DEPRECATION_WARNINGS: "False"
@@ -104,7 +105,7 @@ jobs:
         run: |
           python --version
           python -c "import ansible; print('ansible', ansible.__version__)"
-      - name: Run tests
+      - name: Test supported Ansible release
         env:
           ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}/collections
           ANSIBLE_DEPRECATION_WARNINGS: "False"
@@ -140,13 +141,13 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: ${{ github.event_name == 'push' }}
-      - name: Run linear and Ansiroll in fresh ansible-test containers
+      - name: Test linear and Ansiroll in fresh ansible-test containers
         id: docker-parity
         run: >-
           python tests/run_ansible_test_suite.py "${{ matrix.series }}"
           --profile "${{ matrix.docker_profile }}"
           --root "${{ runner.temp }}/docker-parity"
-      - name: Run matching upstream integration targets on the host
+      - name: Test matching upstream integration targets on the host
         if: ${{ !cancelled() && matrix.host_profile && (steps.docker-parity.outcome == 'success' || steps.docker-parity.outcome == 'failure') }}
         run: >-
           python tests/run_version_matrix.py "${{ matrix.series }}"
@@ -167,7 +168,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: ${{ github.event_name == 'push' }}
-      - name: Run matching upstream integration targets
+      - name: Test matching upstream integration targets
         run: python tests/run_version_matrix.py 2.20 --profile full --skip-repo-tests
 
   # Prove selected semantics are implemented by the shipped agent itself.
@@ -188,7 +189,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: ${{ github.event_name == 'push' }}
-      - name: Run native-only parity with execution provenance
+      - name: Test native-only parity with execution provenance
         run: >-
           python tests/run_ansible_test_suite.py 2.20
           --profile native --native-only --provenance
