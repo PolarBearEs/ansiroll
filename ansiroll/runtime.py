@@ -5487,18 +5487,27 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_value(value):
-    """Read lazy members once, leaving undefined mapping keys absent."""
+def _delegate_fallback_value(value, undefined, path=()):
+    """Read lazy members once and record undefined list indices without shifting them."""
     if isinstance(value, dict):
         resolved = {}
         for key in value:
             try:
-                resolved[key] = _delegate_fallback_value(value[key])
+                wire_key = key if isinstance(key, str) else next(iter(json.loads(json.dumps({key: None}))))
+                resolved[key] = _delegate_fallback_value(value[key], undefined, (*path, wire_key))
             except jinja2.UndefinedError:
                 continue
         return resolved
     if isinstance(value, (list, tuple)):
-        return [_delegate_fallback_value(item) for item in value]
+        resolved = []
+        for index in range(len(value)):
+            member = (*path, index)
+            try:
+                resolved.append(_delegate_fallback_value(value[index], undefined, member))
+            except jinja2.UndefinedError:
+                undefined.append(member)
+                resolved.append(None)
+        return resolved
     return _fail_on_undef(value)
 
 
@@ -5531,7 +5540,12 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *,
                     try:
                         rendered = (scope[key] if isinstance(original, _PlayVarTemplate)
                                     else templater.resolve_variable(key, original, scope))
-                        play_fallbacks[key] = json.loads(json.dumps(_delegate_fallback_value(rendered), default=str))
+                        undefined = []
+                        captured = _delegate_fallback_value(rendered, undefined)
+                        play_fallbacks[key] = {
+                            "value": json.loads(json.dumps(captured, default=str)),
+                            "undefined": undefined,
+                        }
                     except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
                         pass
             if templater is not None and (resolve_keys is None or key in resolve_keys):
@@ -5640,7 +5654,9 @@ def agent_main():
             if deferred:
                 frame["deferred_vars"] = deferred
             if play_fallbacks:
-                frame["play_var_fallbacks"] = play_fallbacks
+                frame["play_var_fallbacks"] = {key: entry["value"] for key, entry in play_fallbacks.items()}
+                frame["play_var_undefined"] = {key: entry["undefined"] for key, entry in play_fallbacks.items()
+                                               if entry["undefined"]}
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":

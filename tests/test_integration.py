@@ -2054,6 +2054,8 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_MIRROR: "{{ sync_alias.value ~ '-' ~ ansible_delegated_vars['localhost']['mirror'] }}"
               SYNC_LIST: "{{ sync_list[0] }}"
               SYNC_FILE: "{{ file_options.label }}"
+              SYNC_FILE_LIST: "{{ file_options.labels[0] ~ '-' ~ file_options.labels[2] }}"
+              SYNC_FILE_MISSING: "{{ file_options.labels[1] is defined }}"
               SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
               SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
               SYNC_FLAG: "{{ true }}"
@@ -2073,6 +2075,7 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
     "names": ["/vars/{{ inventory_hostname }}.yml"],
     "files": {"/vars/localhost.yml": [{"file_options": {
         "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
+        "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
     }}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
@@ -2128,6 +2131,7 @@ runtime.agent_main()
         {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
                          "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
                          "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
+                         "SYNC_FILE_LIST": "RELEASE-tail", "SYNC_FILE_MISSING": False,
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")

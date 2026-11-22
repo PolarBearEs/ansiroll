@@ -559,6 +559,7 @@ class StrategyModule(StrategyBase):
                 # alias. Values supplied only by the agent remain data.
                 sources = {"task": task.get_vars(), "play": hv or {}}
                 play_fallbacks = frame.get("play_var_fallbacks") or {}
+                play_undefined = frame.get("play_var_undefined") or {}
                 for name, scope in deferred.items():
                     if name not in job_vars:
                         continue
@@ -570,7 +571,11 @@ class StrategyModule(StrategyBase):
                         if tagged_source == value:
                             job_vars[name] = source
                             continue
-                    job_vars[name] = wrap_var(play_fallbacks.get(name, value) if scope == "play" else value)
+                    if scope == "play" and name in play_fallbacks:
+                        job_vars[name] = self._restore_play_fallback(wrap_var(play_fallbacks[name]),
+                                                                    play_undefined.get(name, ()))
+                    else:
+                        job_vars[name] = wrap_var(value)
 
             class _QuietQueue:
                 @staticmethod
@@ -590,6 +595,25 @@ class StrategyModule(StrategyBase):
                 "msg": "ansiroll: controller action %s failed: %s"
                        % (frame.get("action"), ex),
             }
+
+    @staticmethod
+    def _restore_play_fallback(value, undefined):
+        if not undefined:
+            return value
+        try:
+            from ansible._internal._templating._jinja_common import UndefinedMarker
+        except ImportError:
+            from jinja2 import StrictUndefined
+
+            missing = StrictUndefined(hint="Undefined element in a delegated play variable")
+        else:
+            missing = UndefinedMarker(hint="Undefined element in a delegated play variable", _no_template_source=True)
+        for path in undefined:
+            container = value
+            for key in path[:-1]:
+                container = container[key]
+            container[path[-1]] = missing
+        return value
 
     def _run_local_template(self, frame, become_pass):
         """Render a runtime-created controller file through the in-memory runtime."""

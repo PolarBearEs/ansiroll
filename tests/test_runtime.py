@@ -224,7 +224,7 @@ def test_delegated_play_fallback_renders_each_member_once():
     deferred = {}
     fallbacks = {}
     _delegate_vars(values, rt.templater, set(), deferred, play_fallbacks=fallbacks)
-    assert fallbacks == {"settings": {"label": "ready"}}
+    assert fallbacks == {"settings": {"value": {"label": "ready"}, "undefined": []}}
     assert calls == [True]
 
 
