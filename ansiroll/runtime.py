@@ -299,15 +299,7 @@ def _override_ctx(task, res, ctx, template=None):
         if clean_action:
             ectx.update(facts)
         elif config.get("INJECT_FACTS_AS_VARS", True):
-            restricted = set(config.get("ansiroll_restricted_facts", ("inventory_hostname",)))
-            prefixes = tuple(config.get("ansiroll_connection_fact_prefixes", ()))
-            ectx.update({key: _without_internal_fact_keys(value) for key, value in facts.items()
-                         if key.startswith("ansible_ssh_host_key_")
-                         or (key not in restricted
-                             and not key.startswith(("_ansible_", "ansible_become_"))
-                             and not re.match(r"^ansible_.*_interpreter$", key)
-                             and (not key.startswith(prefixes)
-                                  or key.endswith(("_bridge", "_gwbridge"))))})
+            ectx.update(_injected_module_facts(facts, config))
         if not clean_action or (modern_facts and res.get("_ansible_facts_cacheable")):
             existing = ctx.get("ansible_facts")
             namespaced = _normalized_facts(facts, preserve_local=True)
@@ -319,6 +311,17 @@ def _override_ctx(task, res, ctx, template=None):
     if task.get("register"):
         ectx[task["register"]] = res
     return ectx
+
+
+def _injected_module_facts(facts, config):
+    restricted = set(config.get("ansiroll_restricted_facts", ("inventory_hostname",)))
+    prefixes = tuple(config.get("ansiroll_connection_fact_prefixes", ()))
+    return {key: _without_internal_fact_keys(value) for key, value in facts.items()
+            if key.startswith("ansible_ssh_host_key_")
+            or (key not in restricted
+                and not key.startswith(("_ansible_", "ansible_become_"))
+                and not re.match(r"^ansible_.*_interpreter$", key)
+                and (not key.startswith(prefixes) or key.endswith(("_bridge", "_gwbridge"))))}
 
 
 def _without_internal_fact_keys(value):
@@ -2637,8 +2640,13 @@ class Runtime:
             else:
                 base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in scope.get("vars_files", play.get("deferred_vars_files")) or ():
-            if "values" in entry:
-                play_vars = _f_combine(play_vars, *entry["values"], recursive=merge)
+            values = entry.get("values")
+            if not before_setup and "compile_path" in entry:
+                # Task paths can already be embedded using the compile-time values.
+                # Reselect those files only when resolving implicit setup options.
+                values = entry["files"][entry["compile_path"]]
+            if values is not None:
+                play_vars = _f_combine(play_vars, *values, recursive=merge)
                 continue
             variables = _f_combine(base, play_vars, self.extra_vars, recursive=merge)
             if scope:
@@ -2697,10 +2705,15 @@ class Runtime:
         return config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
 
     def _gather_host_base(self, scope, magic, merge):
-        facts = dict(self._module_fact_layer)
-        facts["ansible_facts"] = _normalized_facts(facts)
         controller = {key: self.vars[key] for key in
                       ("__ansiroll_controller_env", "__ansiroll_controller_config")}
+        config = controller["__ansiroll_controller_config"]
+        cached = self._module_fact_layer
+        if config.get("INJECT_FACTS_AS_VARS", True):
+            facts = _injected_module_facts(cached, config)
+        else:
+            facts = {"ansible_local": cached.get("ansible_local", {})}
+        facts["ansible_facts"] = _normalized_facts(cached, preserve_local=True)
         return _f_combine(scope["role_defaults"], self._gather_inventory_vars, facts,
                           controller, magic, recursive=merge)
 

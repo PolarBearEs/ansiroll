@@ -228,6 +228,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 continue
             bundled, = _deferred_vars_files(play, basedir, [entry["selector"]])
             if "path" in entry:
+                bundled["compile_path"] = entry["path"]
                 bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
             gather_vars_files.append(bundled)
     hosts = play.hosts
@@ -245,7 +246,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
     includes.incomplete = bool(unresolved_vars_files)
-    includes.reselectable_vars = _vars_file_variable_names(gather_vars_files)
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -580,16 +580,12 @@ def _bundled_vars_file(play, path):
                     "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
                     % path}
     try:
-        loaded = _load_vars_file(play, path)
-        if isinstance(loaded, dict) or loaded is None:
-            return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
-        preprocess_vars(loaded)
+
+        return _tag_untrusted(preprocess_vars(_load_vars_file(play, path)) or [])
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
-    return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
-            "a mapping" % path}
 
 
 def _vars_file_variable_names(entries):
@@ -930,7 +926,6 @@ class _IncludeVariables:
         self.resolved_template = False
         # A vars file whose name is only known at runtime may redefine any play var.
         self.incomplete = False
-        self.reselectable_vars = set()
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -1265,8 +1260,7 @@ def _template_include_filename(task, value, includes):
     def is_runtime(name):
         if name in loop_names:
             return True
-        if ((includes.incomplete or name in includes.reselectable_vars)
-                and name not in extra_vars and name not in above_vars_files
+        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):
