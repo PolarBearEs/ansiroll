@@ -1347,7 +1347,8 @@ def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
     assert msgs == ['"default path"']
 
 
-def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path):
+@pytest.mark.parametrize("fallback", ["", " | default('missing')"])
+def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, fallback):
     _write(tmp_path, {
         "files/profile.txt": "minimal\n",
         "vars/minimal.yml": "subset: ['!all', '!min']\n",
@@ -1355,10 +1356,10 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path):
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
-          vars_files: ["vars/{{ lookup('file', playbook_dir ~ '/files/profile.txt') }}.yml"]
+          vars_files: ["vars/{{ lookup('file', playbook_dir ~ '/files/profile.txt')%s }}.yml"]
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % fallback,
     })
     output = tmp_path / "out.py"
     subprocess.run(
@@ -1379,7 +1380,10 @@ def test_setup_fact_path_uses_standalone_inventory_magic(tmp_path, monkeypatch):
         - hosts: localhost
           gather_facts: true
           gather_subset: ['!all', '!min', local]
-          fact_path: "{{ playbook_dir }}/{{ inventory_hostname_short if group_names is defined else 'missing' }}"
+          fact_path: >-
+            {{ playbook_dir }}/{{ inventory_hostname_short
+            if group_names is defined and ansible_play_hosts_all == [inventory_hostname]
+            and ansible_play_hosts == ansible_play_batch and play_hosts == ansible_play_batch else 'missing' }}
           tasks:
             - debug: {msg: "{{ ansible_local.example.marker }}"}
         """,

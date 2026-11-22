@@ -1305,3 +1305,28 @@ def test_deferred_vars_files_name_with_leading_template_fails_to_compile(tmp_pat
 """})
     with pytest.raises(ValueError, match="starts with a template"):
         compile_playbook(str(tmp_path / "pb.yml"))
+
+
+def test_gather_vars_files_records_an_unreadable_alternate(tmp_path, monkeypatch):
+    from ansiroll import loader
+
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_subset: "{{ subset }}"
+  vars:
+    profile: dev
+  vars_files: ["vars/{{ profile }}.yml"]
+  tasks: []
+""", "vars/dev.yml": "subset: [all]\n", "vars/prod.yml": "subset: [min]\n"})
+    unreadable = tmp_path / "vars/prod.yml"
+
+    def open_candidate(path, *args, **kwargs):
+        if os.fspath(path) == str(unreadable):
+            raise PermissionError("test permission denied")
+        return open(path, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "open", open_candidate, raising=False)
+    plays, _ = loader.parse_playbook(str(tmp_path / "pb.yml"))
+    entry, = plays[0]["gather_scope"]["vars_files"]
+    assert entry["files"][entry["compile_path"]] == [{"subset": ["all"]}]
+    assert "test permission denied" in entry["files"][str(unreadable)]["__ansiroll_vars_file_error__"]

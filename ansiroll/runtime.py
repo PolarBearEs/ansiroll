@@ -944,8 +944,14 @@ def _lookup_values(name, args, kwargs, ctx=None):
                     if os.path.exists(cand):
                         path = cand
                         break
-            with open(path) as f:
-                text = f.read()
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except FileNotFoundError:
+                missing = (ctx or {}).get("__ansiroll_missing_file_lookups")
+                if missing is not None:
+                    missing.append(path)
+                raise
             if lstrip:
                 text = text.lstrip()
             if rstrip:
@@ -2358,6 +2364,9 @@ class Runtime:
         scope = play.get("gather_scope") or {}
         gather_magic = dict(scope.get("magic") or {}, ansible_check_mode=bool(invocation_check_mode),
                             ansible_diff_mode=bool(self.diff_mode))
+        if scope:
+            for name in ("ansible_play_hosts_all", "ansible_play_hosts", "ansible_play_batch", "play_hosts"):
+                gather_magic[name] = self._gather_inventory_vars.get(name, [self.host])
         setup_options = play.get("gather_options") or {}
         play_keywords = {}
         if self.gather_args_fn is None:
@@ -2658,16 +2667,16 @@ class Runtime:
                 variables["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
+            baked = entry["files"].get(entry.get("compile_path")) if before_setup else None
+            missing_lookups = []
+            if baked is not None:
+                ctx["__ansiroll_missing_file_lookups"] = missing_lookups
+            selected = None
             for raw in entry["names"]:
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
                     if before_setup:
-                        if "compile_path" in entry:
-                            # A deployed runner may no longer have the controller
-                            # input needed to reproduce a compile-time selector.
-                            values = entry["files"][entry["compile_path"]]
-                            play_vars = _f_combine(play_vars, *values, recursive=merge)
                         break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
@@ -2689,24 +2698,23 @@ class Runtime:
                         candidates.append(os.path.join(d, name))
                 found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
                 if found:
-                    data = entry["files"][found[0]]
-                    if isinstance(data, dict):
-                        raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    for value in data:
-                        if merge:
-                            play_vars = _f_combine(play_vars, value, recursive=True)
-                        else:
-                            play_vars.update(value)
+                    selected = entry["files"][found[0]]
+                    if isinstance(selected, dict):
+                        raise VarsFilesError(selected["__ansiroll_vars_file_error__"], selected.get("rc", 1))
                     break
             else:
-                if before_setup:
-                    continue
-                # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
-                if not _core_at_least(2, 15):
-                    raise VarsFilesError("vars file %s was not found" % (item,))
-                # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
-                sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
-                                 % (item,))
+                if not before_setup:
+                    # Before 2.15, a missing file was fatal by default.
+                    if not _core_at_least(2, 15):
+                        raise VarsFilesError("vars file %s was not found" % (item,))
+                    sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
+                                     % (item,))
+            if selected is None and missing_lookups:
+                # The compiled selection is still available when a deployed
+                # runner cannot open its controller-side selector input.
+                selected = baked
+            if selected is not None:
+                play_vars = _f_combine(play_vars, *selected, recursive=merge)
         return play_vars
 
     def _gather_hash_merge(self):

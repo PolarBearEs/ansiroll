@@ -576,16 +576,15 @@ def _bundled_vars_file(play, path, allow_lists=False):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
-    with open(path, "rb") as fh:
-        # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-        # select.
-        if b"$ANSIBLE_VAULT" in fh.read():
-            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                    % path}
     try:
         from ansible.vars.manager import preprocess_vars
 
+        with open(path, "rb") as fh:
+            # Whole-file and inline !vault values both carry the header.
+            if b"$ANSIBLE_VAULT" in fh.read():
+                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                        % path}
         loaded = _load_vars_file(play, path)
         if isinstance(loaded, dict) or loaded is None or allow_lists:
             return _tag_untrusted(preprocess_vars(loaded) or [])
