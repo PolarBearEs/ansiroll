@@ -572,8 +572,9 @@ def _selector_depends_only_on_lookup(selector):
                                                "ansible.legacy.file", "ansible.legacy.pipe")
                     and next(node.find_all(nodes.Call), None) is None)
         if isinstance(node, nodes.Filter):
-            return (node.name in ("lower", "upper", "trim", "first", "basename", "dirname")
-                    and not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs) and stable(node.node))
+            return (node.name in ("lower", "upper", "trim", "first", "basename", "dirname", "replace")
+                    and all(isinstance(arg, nodes.Const) for arg in node.args)
+                    and not (node.kwargs or node.dyn_args or node.dyn_kwargs) and stable(node.node))
         return isinstance(node, (nodes.Template, nodes.Output, nodes.TemplateData, nodes.Const, nodes.Concat)) and all(
             stable(child) for child in node.iter_child_nodes())
 
@@ -588,18 +589,31 @@ def _first_found_literal_dirs(selector):
     if parsed is None:
         return set()
     directories = set()
+
+    def add_literals(argument, *, paths=False):
+        constants = (argument,) if isinstance(argument, nodes.Const) else argument.find_all(nodes.Const)
+        for literal in constants:
+            if not isinstance(literal.value, str):
+                continue
+            for value in re.split("[,:;]" if paths else "[,;]", literal.value):
+                directory = os.path.normpath(value if paths else os.path.dirname(value))
+                if not os.path.isabs(directory) and directory.split(os.sep)[0] not in ("..", "~"):
+                    directories.add(directory)
+
     for call in parsed.find_all(nodes.Call):
         if (not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q")
                 or not call.args or not isinstance(call.args[0], nodes.Const)
                 or call.args[0].value not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")):
             continue
-        for argument in [*call.args[1:], *call.kwargs]:
-            constants = (argument,) if isinstance(argument, nodes.Const) else argument.find_all(nodes.Const)
-            for literal in constants:
-                if isinstance(literal.value, str) and "/" in literal.value:
-                    directory = os.path.normpath(os.path.dirname(literal.value))
-                    if not os.path.isabs(directory) and directory.split(os.sep)[0] not in ("..", "~"):
-                        directories.add(directory)
+        for argument in call.args[1:]:
+            add_literals(argument)
+            mappings = (argument,) if isinstance(argument, nodes.Dict) else argument.find_all(nodes.Dict)
+            for mapping in mappings:
+                for pair in mapping.items:
+                    if isinstance(pair.key, nodes.Const) and pair.key.value == "paths":
+                        add_literals(pair.value, paths=True)
+        for option in call.kwargs:
+            add_literals(option.value, paths=option.key == "paths")
     return directories
 
 

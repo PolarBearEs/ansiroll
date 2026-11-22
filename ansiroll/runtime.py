@@ -977,11 +977,12 @@ def _first_found_vars_file(args, options, ctx):
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name)
     selector = "__ansiroll_selector_files" in (ctx or {})
+    gather_lookup = selector or (ctx or {}).get("__ansiroll_gather_options", False)
     if (name in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")
             and selector):
         return _first_found_vars_file(args, kwargs, ctx)
     name = name.rsplit(".", 1)[-1]
-    if selector and name in ("file", "pipe"):
+    if gather_lookup and name in ("file", "pipe"):
         _fail_on_undef(args)
         _fail_on_undef(kwargs)
     if name == "vars":
@@ -1028,30 +1029,39 @@ def _lookup_values(name, args, kwargs, ctx=None):
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
                 if replay is not None:
                     return replay
-                if selector:
+                if gather_lookup:
                     raise _VarsFileLookupError("lookup plugin 'file' failed: %s" % error) from error
                 raise
             if lstrip:
                 text = text.lstrip()
             if rstrip:
-                text = text.rstrip() if selector else text.rstrip("\r\n")
+                text = text.rstrip() if gather_lookup else text.rstrip("\r\n")
             vals.append(text)
         return vals
     if name == "pipe":
         vals = []
         for a in args:
-            proc = subprocess.run(str(a), shell=True, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, universal_newlines=True)
+            try:
+                proc = subprocess.run(str(a), shell=True, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, universal_newlines=True,
+                                      encoding="utf-8" if gather_lookup else None)
+            except (OSError, UnicodeError) as error:
+                replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
+                if replay is not None:
+                    return replay
+                if gather_lookup:
+                    raise _VarsFileLookupError("lookup plugin 'pipe' failed: %s" % error) from error
+                raise
             if proc.returncode != 0:
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
                 if replay is not None:
                     return replay
                 message = "lookup plugin 'pipe' failed: command %r returned rc=%d: %s" % (
                     a, proc.returncode, proc.stderr.strip())
-                if selector:
+                if gather_lookup:
                     raise _VarsFileLookupError(message)
                 raise RuntimeError(message)
-            vals.append(proc.stdout.rstrip() if selector else proc.stdout.rstrip("\n"))
+            vals.append(proc.stdout.rstrip() if gather_lookup else proc.stdout.rstrip("\n"))
         return vals
     return _loop_lookup(name, list(args))
 
@@ -1112,6 +1122,9 @@ def _lookup(name, *args, **kwargs):
     wantlist = kwargs.pop("wantlist", False)
     vals = _lookup_values(name, args, kwargs, ctx)
     if wantlist:
+        return vals
+    if (not vals and _core_at_least(2, 19) and str(name).rsplit(".", 1)[-1] == "first_found"
+            and "__ansiroll_selector_files" in (ctx or {})):
         return vals
     if len(vals) == 1:
         return vals[0]
@@ -2788,6 +2801,8 @@ class Runtime:
                 except Exception as ex:
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
+                    if before_setup and _core_at_least(2, 19):
+                        raise VarsFilesError("vars_files selector %r must evaluate to a string" % raw)
                     continue
                 if name.startswith(os.path.sep):
                     candidates = [name]
@@ -2860,6 +2875,7 @@ class Runtime:
         play_vars = self._with_deferred_vars_files(play, magic, base=play_base, before_setup=True)
         play_vars = _f_combine(play_vars, exports, self.extra_vars, magic, recursive=merge)
         play_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
+        play_vars["__ansiroll_gather_options"] = True
         play_ctx = self.ctx(base=play_vars)
 
         if not run_setup:
@@ -2884,6 +2900,7 @@ class Runtime:
         setup_vars.setdefault("ansible_ssh_host", address)
         setup_vars["ansible_search_path"] = scope["search_path"]
         setup_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
+        setup_vars["__ansiroll_gather_options"] = True
         return self.ctx(base=setup_vars), play_ctx
 
     def _task_ctx(self, task, overlay):

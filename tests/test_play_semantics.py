@@ -1347,6 +1347,22 @@ def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
     assert msgs == ['"default path"']
 
 
+def test_setup_fact_path_trims_controller_file_lookup(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "files/profile.txt": "facts \n",
+        "facts/example.fact": '{"marker": "profile"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ lookup('file', playbook_dir ~ '/files/profile.txt') }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    }, strategy=False)
+    assert msgs == ['"profile"']
+
+
 @pytest.mark.parametrize("connection", ["local", "ansible.builtin.local"])
 def test_setup_fact_path_sees_effective_connection(tmp_path, monkeypatch, connection):
     _write(tmp_path, {
@@ -1399,14 +1415,20 @@ def test_setup_fact_path_sees_local_connection_user(tmp_path, monkeypatch, extra
 @pytest.mark.parametrize("selector", [
     "lookup('file', playbook_dir ~ '/files/profile.txt')",
     "lookup('file', playbook_dir ~ '/files/profile.txt') | lower",
+    "lookup('file', playbook_dir ~ '/files/profile.txt') | replace('_', '')",
     "lookup('file', playbook_dir ~ '/files/profile.txt') | default('missing')",
     "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote)",
     "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote) | default('missing')",
     "query('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote) | default(['missing']) | first",
 ])
 def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, selector):
+    profile = "minimal"
+    if selector.endswith("| lower"):
+        profile = "MINIMAL"
+    elif "| replace(" in selector:
+        profile = "mini_mal"
     _write(tmp_path, {
-        "files/profile.txt": "MINIMAL \n" if selector.endswith("| lower") else "minimal \n",
+        "files/profile.txt": profile + " \n",
         "vars/minimal.yml": "subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
@@ -1435,6 +1457,7 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
     "lookup('first_found', playbook_dir ~ '/vars/' ~ profile ~ '.yml')",
     "lookup('first_found', profile ~ '.yml')",
     "lookup('first_found', 'profiles/' ~ profile ~ '.yml')",
+    "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': ['profiles']})",
     "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
 ])
 def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector):
@@ -1488,6 +1511,42 @@ def test_setup_first_found_respects_missing_file_policy(tmp_path, monkeypatch, s
     assert (result.returncode == 0) == (native.returncode == 0) == skip
     if skip:
         assert _summary(result.stdout) == _summary(native.stdout)
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 19), reason="older Core coerces empty lookup results to text")
+def test_setup_rejects_empty_first_found_lookup_as_vars_file(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "files/dev.yml": "subset: [all]",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset | default(['!all', '!min']) }}"
+          vars: {profile: dev}
+          vars_files: ["{{ lookup('first_found', {'files': [profile ~ '.yml'], 'skip': true}) }}"]
+          tasks:
+            - debug: {msg: gathered}
+        """,
+    })
+    extra = json.dumps({"profile": "missing"})
+    assert _ansible_run(tmp_path, ["-e", extra]).returncode != 0
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    result = _standalone_run(tmp_path, [])
+    assert result.returncode != 0
+    assert "must evaluate to a string" in result.stderr
+
+
+def test_setup_pipe_honors_error_policy_for_invalid_utf8(monkeypatch):
+    import ansiroll.runtime as runtime
+
+    def invalid_utf8(*args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(runtime.subprocess, "run", invalid_utf8)
+    templater = runtime._Templater()
+    context = {"__ansiroll_selector_files": {}}
+    with pytest.raises(runtime._VarsFileLookupError, match="lookup plugin 'pipe' failed"):
+        templater.render_string("{{ lookup('pipe', 'cmd') | default('fallback') }}", context)
+    assert templater.render_string("{{ lookup('pipe', 'cmd', errors='ignore') }}", context) is None
 
 
 @pytest.mark.parametrize("errors", ["strict", "ignore"])
