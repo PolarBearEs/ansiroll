@@ -1351,6 +1351,8 @@ def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
     "lookup('file', playbook_dir ~ '/files/profile.txt')",
     "lookup('file', playbook_dir ~ '/files/profile.txt') | default('missing')",
     "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote)",
+    "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote) | default('missing')",
+    "query('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote) | default(['missing']) | first",
 ])
 def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, selector):
     _write(tmp_path, {
@@ -1514,14 +1516,14 @@ def test_strategy_setup_uses_controller_skip_result(tmp_path):
     assert _summary(expected.stdout) == _summary(actual.stdout)
 
 
-def test_strategy_setup_fact_path_uses_connection_address(tmp_path):
+def test_setup_fact_path_uses_connection_address(tmp_path):
     _write(tmp_path, {
         "localhost/example.fact": '{"marker": "connection address"}',
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
           gather_subset: ['!all', '!min', local]
-          fact_path: "{{ playbook_dir }}/{{ ansible_host }}"
+          fact_path: "{{ playbook_dir }}/{{ ansible_host if ansible_ssh_host == ansible_host else 'missing' }}"
           tasks:
             - debug: {msg: "{{ ansible_local.example.marker }}"}
         """,
@@ -1530,6 +1532,7 @@ def test_strategy_setup_fact_path_uses_connection_address(tmp_path):
     actual = _ansible_run(tmp_path, [], "ansiroll.core.ansiroll")
     assert expected.returncode == actual.returncode == 0, actual.stdout + actual.stderr
     assert _summary(actual.stdout) == _summary(expected.stdout)
+    assert _standalone(tmp_path, []) == _summary(expected.stdout)
     assert _summary(expected.stdout)[0] == ['"connection address"']
 
 

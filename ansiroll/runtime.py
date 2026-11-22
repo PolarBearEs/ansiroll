@@ -944,14 +944,8 @@ def _lookup_values(name, args, kwargs, ctx=None):
                     if os.path.exists(cand):
                         path = cand
                         break
-            try:
-                with open(path) as f:
-                    text = f.read()
-            except FileNotFoundError:
-                missing = (ctx or {}).get("__ansiroll_missing_file_lookups")
-                if missing is not None:
-                    missing.append(path)
-                raise
+            with open(path) as f:
+                text = f.read()
             if lstrip:
                 text = text.lstrip()
             if rstrip:
@@ -1554,13 +1548,13 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
-                return vals
+                return self._lookup_failure(vals)
             vals = _mark_unsafe(vals)
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
         except Exception as e:
-            return _captured(str(e))
+            return self._lookup_failure(_captured(str(e)))
 
     def _g_query(self, name, *a, **k):
         try:
@@ -1570,9 +1564,15 @@ class _Templater:
                 _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
-            return vals if _is_undef(vals) else _mark_unsafe(vals)
+            return self._lookup_failure(vals) if _is_undef(vals) else _mark_unsafe(vals)
         except Exception as e:
-            return _captured(str(e))
+            return self._lookup_failure(_captured(str(e)))
+
+    def _lookup_failure(self, error):
+        failures = (self._current_ctx or {}).get("__ansiroll_selector_lookup_failures")
+        if failures is not None:
+            failures.append(True)
+        return error
 
     def _template_lookup_arg(self, value):
         """Render template constants nested inside lookup terms/options."""
@@ -2668,9 +2668,9 @@ class Runtime:
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             baked = entry["files"].get(entry.get("compile_path")) if before_setup else None
-            missing_lookups = []
+            lookup_failures = []
             if baked is not None:
-                ctx["__ansiroll_missing_file_lookups"] = missing_lookups
+                ctx["__ansiroll_selector_lookup_failures"] = lookup_failures
             selected = None
             for raw in entry["names"]:
                 try:
@@ -2710,9 +2710,9 @@ class Runtime:
                         raise VarsFilesError("vars file %s was not found" % (item,))
                     sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                      % (item,))
-            if selected is None and missing_lookups:
-                # The compiled selection is still available when a deployed
-                # runner cannot open its controller-side selector input.
+            if selected is None and lookup_failures:
+                # Keep the compiled selection if its controller lookup cannot
+                # run on the deployed target, even if Jinja caught the error.
                 selected = baked
             if selected is not None:
                 play_vars = _f_combine(play_vars, *selected, recursive=merge)
@@ -2774,6 +2774,9 @@ class Runtime:
         setup_vars = self._with_deferred_vars_files(play, magic, base=host_base, before_setup=True)
         setup_vars = _f_combine(setup_vars, exports, self._include_vars_layer,
                                 self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
+        address = setup_vars.get("ansible_host") or setup_vars.get("ansible_ssh_host") or self.host
+        setup_vars.setdefault("ansible_host", address)
+        setup_vars.setdefault("ansible_ssh_host", address)
         setup_vars["ansible_search_path"] = scope["search_path"]
         setup_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
         return self.ctx(base=setup_vars), play_ctx
