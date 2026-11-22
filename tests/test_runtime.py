@@ -209,7 +209,7 @@ def test_delegation_resolves_selected_action_variables():
 
 
 def test_delegated_play_fallback_renders_each_member_once():
-    from ansiroll.runtime import _delegate_vars
+    from ansiroll.runtime import _delegate_vars, _resolve_delegated_play_var
 
     rt = Runtime({}, "", {})
     calls = []
@@ -222,20 +222,24 @@ def test_delegated_play_fallback_renders_each_member_once():
     values = rt.template_vars({"settings": {"label": "{{ label() }}", "optional": "{{ missing }}"}},
                               {}, dynamic=True)
     deferred = {}
-    fallbacks = {}
-    _delegate_vars(values, rt.templater, set(), deferred, play_fallbacks=fallbacks)
-    assert fallbacks == {"settings": {"value": {"label": "ready"}, "undefined": []}}
+    lazy_play = set()
+    _delegate_vars(values, rt.templater, set(), deferred, lazy_play=lazy_play)
+    assert lazy_play == {"settings"}
+    assert calls == []
+    assert _resolve_delegated_play_var("settings", values, rt.templater) == {
+        "value": {"label": "ready"}, "undefined": [],
+    }
     assert calls == [True]
 
 
 def test_delegated_play_fallback_discards_overwritten_undefined_paths():
-    from ansiroll.runtime import _delegate_vars
+    from ansiroll.runtime import _resolve_delegated_play_var
 
     rt = Runtime({}, "", {})
     values = rt.template_vars({"settings": {1: ["{{ missing }}"], "1": "winner"}}, {}, dynamic=True)
-    fallbacks = {}
-    _delegate_vars(values, rt.templater, set(), {}, play_fallbacks=fallbacks)
-    assert fallbacks == {"settings": {"value": {"1": "winner"}, "undefined": []}}
+    assert _resolve_delegated_play_var("settings", values, rt.templater) == {
+        "value": {"1": "winner"}, "undefined": [],
+    }
 
 
 def test_delegated_loop_task_alias_uses_agent_filters():

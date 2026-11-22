@@ -31,6 +31,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections.abc import Mapping, Sequence
 
 DOCUMENTATION = """
     name: ansiroll
@@ -60,6 +61,48 @@ except Exception:  # 2.21+ uses UnifiedTaskResult; older cores use TaskResult
         pass
 
 display = Display()
+
+
+class _DelegatedPlayVariables:
+    """Cache the agent's values for one controller task invocation."""
+
+    def __init__(self, load):
+        self._load = load
+        self.names = []
+        self.values = {}
+
+    def __getitem__(self, index):
+        if index not in self.values:
+            self.values[index] = self._load(*self.names[index])
+        return self.values[index]
+
+
+class _LegacyDelegatedCollection:
+    """Keep legacy Ansible from converting a lazy container to text."""
+
+    __UNSAFE__ = True
+
+    def __init__(self, bridge, index):
+        self._bridge = bridge
+        self._index = index
+
+    def __getitem__(self, key):
+        return self._bridge[self._index][key]
+
+    def __iter__(self):
+        return iter(self._bridge[self._index])
+
+    def __len__(self):
+        return len(self._bridge[self._index])
+
+
+class _LegacyDelegatedMapping(_LegacyDelegatedCollection, Mapping):
+    pass
+
+
+class _LegacyDelegatedSequence(_LegacyDelegatedCollection, Sequence):
+    pass
+
 
 class StrategyModule(StrategyBase):
 
@@ -352,6 +395,14 @@ class StrategyModule(StrategyBase):
         seen = set()
         included_vars_by_task = {}
         last_frame = time.monotonic()
+
+        def resolve_play_var(name):
+            chan.send({"t": "delegate_play_var", "name": name})
+            reply = chan.recv()
+            if not reply or reply.get("t") != "delegate_play_var_result":
+                raise RuntimeError("ansiroll: agent did not return a delegated play variable")
+            return reply.get("fallback")
+
         while True:
             frame = chan.recv()
             now = time.monotonic()
@@ -389,7 +440,7 @@ class StrategyModule(StrategyBase):
                 chan.send({"t": "delegate_result",
                            "result": self._run_delegated(
                                frame, host, hv, templar, become_pass,
-                               task_map, play_context, included_vars_by_task
+                               task_map, play_context, included_vars_by_task, resolve_play_var
                            )})
                 self._profile("%s delegate +%.3fs %s"
                               % (host.name, time.monotonic() - delegate_started,
@@ -454,7 +505,7 @@ class StrategyModule(StrategyBase):
         self._emit_provenance(provenance)
 
     def _run_delegated(self, frame, host, hv, templar, become_pass,
-                       task_map=None, play_context=None, included_vars_by_task=None):
+                       task_map=None, play_context=None, included_vars_by_task=None, resolve_play_var=None):
         """Execute a delegated / controller-coupled task on the correct host and
         return its raw module result (the agent re-emits the framed result)."""
         action = str(frame.get("action") or "").rsplit(".", 1)[-1]
@@ -499,7 +550,7 @@ class StrategyModule(StrategyBase):
             }
         if action == "synchronize":
             return self._run_native_controller_task(
-                frame, host, hv, task_map or {}, play_context)
+                frame, host, hv, task_map or {}, play_context, resolve_play_var)
         to = frame.get("to")
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
@@ -525,7 +576,7 @@ class StrategyModule(StrategyBase):
             rt.diff_mode = previous_diff
             rt.become_user = previous_become_user
 
-    def _run_native_controller_task(self, frame, host, hv, task_map, play_context):
+    def _run_native_controller_task(self, frame, host, hv, task_map, play_context, resolve_play_var=None):
         """Run an action-plugin task with Ansible's official TaskExecutor."""
         task = task_map.get(frame.get("runtime_id"))
         if task is None:
@@ -560,6 +611,20 @@ class StrategyModule(StrategyBase):
                 sources = {"task": task.get_vars(), "play": hv or {}}
                 play_fallbacks = frame.get("play_var_fallbacks") or {}
                 play_undefined = frame.get("play_var_undefined") or {}
+                lazy_play = set(frame.get("lazy_play_vars") or ()) if resolve_play_var else set()
+
+                def load_play_var(name, source):
+                    resolved = resolve_play_var(name)
+                    if resolved is None:
+                        return wrap_var(source)
+                    return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"])
+
+                bridge = _DelegatedPlayVariables(load_play_var)
+                try:
+                    from ansible.template import trust_as_template
+                except ImportError:
+                    trust_as_template = None
+
                 for name, scope in deferred.items():
                     if name not in job_vars:
                         continue
@@ -571,11 +636,25 @@ class StrategyModule(StrategyBase):
                         if tagged_source == value:
                             job_vars[name] = source
                             continue
-                    if scope == "play" and name in play_fallbacks:
+                    if scope == "play" and name in lazy_play:
+                        index = len(bridge.names)
+                        bridge.names.append((name, value))
+                        expression = "{{ __ansiroll_delegated_play_vars[%d] }}" % index
+                        if trust_as_template is not None:
+                            job_vars[name] = trust_as_template(expression)
+                        elif isinstance(value, dict):
+                            job_vars[name] = _LegacyDelegatedMapping(bridge, index)
+                        elif isinstance(value, list):
+                            job_vars[name] = _LegacyDelegatedSequence(bridge, index)
+                        else:
+                            job_vars[name] = expression
+                    elif scope == "play" and name in play_fallbacks:
                         job_vars[name] = self._restore_play_fallback(wrap_var(play_fallbacks[name]),
                                                                     play_undefined.get(name, ()))
                     else:
                         job_vars[name] = wrap_var(value)
+                if bridge.names:
+                    job_vars["__ansiroll_delegated_play_vars"] = bridge
 
             class _QuietQueue:
                 @staticmethod

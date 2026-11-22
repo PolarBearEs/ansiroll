@@ -5516,8 +5516,21 @@ def _delegate_fallback_value(value, undefined, path=()):
     return _fail_on_undef(value)
 
 
-def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *,
-                   controller_vars=None, play_fallbacks=None):
+def _resolve_delegated_play_var(name, ctx, templater):
+    """Materialize an agent-only alias after the controller asks for it."""
+    try:
+        original = ctx[name]
+        scope = templater._play_var_scope(ctx, strict=False)
+        rendered = (scope[name] if isinstance(original, _PlayVarTemplate)
+                    else templater.resolve_variable(name, original, scope))
+        undefined = []
+        value = _delegate_fallback_value(rendered, undefined)
+        return {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+    except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
+        return None
+
+
+def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
@@ -5526,7 +5539,6 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *,
             continue
         try:
             if deferred is not None and key not in resolve_keys:
-                original = value
                 if isinstance(value, _TaskVarTemplate):
                     deferred[key] = "task"
                 elif isinstance(value, _PlayVarTemplate):
@@ -5537,22 +5549,9 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *,
                 elif isinstance(value, _RegisteredResult) or (
                         isinstance(value, _NO_TEMPLATE) and _looks_templated(value)):
                     deferred[key] = "data"
-                if (play_fallbacks is not None and deferred.get(key) == "play"
+                if (lazy_play is not None and deferred.get(key) == "play"
                         and (controller_vars or {}).get(key) != value):
-                    # A vars_files selection made on the agent may be absent
-                    # from the controller's host snapshot. Preserve data for
-                    # that case in addition to the original template source.
-                    try:
-                        rendered = (scope[key] if isinstance(original, _PlayVarTemplate)
-                                    else templater.resolve_variable(key, original, scope))
-                        undefined = []
-                        captured = _delegate_fallback_value(rendered, undefined)
-                        play_fallbacks[key] = {
-                            "value": json.loads(json.dumps(captured, default=str)),
-                            "undefined": undefined,
-                        }
-                    except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
-                        pass
+                    lazy_play.add(key)
             if templater is not None and (resolve_keys is None or key in resolve_keys):
                 if isinstance(value, _PlayVarTemplate):
                     value = scope[key]
@@ -5641,13 +5640,13 @@ def agent_main():
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
             deferred = {} if resolve_keys is not None else None
-            play_fallbacks = {} if deferred is not None else None
+            lazy_play = set() if deferred is not None else None
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
                 "runtime_id": task.get("runtime_id"),
                 "action": task.get("action"), "args": args,
                 "vars": _delegate_vars(ctx, templater, resolve_keys, deferred,
-                                       controller_vars=g.get("_INJECTED_VARS"), play_fallbacks=play_fallbacks),
+                                       controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play),
                 "become": become, "to": task.get("delegate_to"),
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
@@ -5658,12 +5657,17 @@ def agent_main():
             }
             if deferred:
                 frame["deferred_vars"] = deferred
-            if play_fallbacks:
-                frame["play_var_fallbacks"] = {key: entry["value"] for key, entry in play_fallbacks.items()}
-                frame["play_var_undefined"] = {key: entry["undefined"] for key, entry in play_fallbacks.items()
-                                               if entry["undefined"]}
+            if lazy_play:
+                frame["lazy_play_vars"] = sorted(lazy_play)
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
+            while reply and reply.get("t") == "delegate_play_var":
+                name = reply.get("name")
+                fallback = None
+                if isinstance(name, str) and lazy_play and name in lazy_play:
+                    fallback = _resolve_delegated_play_var(name, ctx, rt.templater)
+                _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
+                reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":
                 return {"failed": True, "changed": False,
                         "msg": "ansiroll: controller did not return a delegate result"}
