@@ -905,6 +905,12 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _record_controller_lookup_failure(ctx):
+    failures = (ctx or {}).get("__ansiroll_selector_lookup_failures")
+    if failures is not None:
+        failures.append(True)
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name).rsplit(".", 1)[-1]
     if name == "vars":
@@ -944,8 +950,12 @@ def _lookup_values(name, args, kwargs, ctx=None):
                     if os.path.exists(cand):
                         path = cand
                         break
-            with open(path) as f:
-                text = f.read()
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except OSError:
+                _record_controller_lookup_failure(ctx)
+                raise
             if lstrip:
                 text = text.lstrip()
             if rstrip:
@@ -958,6 +968,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
             proc = subprocess.run(str(a), shell=True, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, universal_newlines=True)
             if proc.returncode != 0:
+                _record_controller_lookup_failure(ctx)
                 raise RuntimeError("lookup plugin 'pipe' failed: command %r returned "
                                    "rc=%d: %s" % (a, proc.returncode, proc.stderr.strip()))
             vals.append(proc.stdout.rstrip("\n"))
@@ -1548,13 +1559,13 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
-                return self._lookup_failure(vals)
+                return vals
             vals = _mark_unsafe(vals)
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
         except Exception as e:
-            return self._lookup_failure(_captured(str(e)))
+            return _captured(str(e))
 
     def _g_query(self, name, *a, **k):
         try:
@@ -1564,15 +1575,9 @@ class _Templater:
                 _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
-            return self._lookup_failure(vals) if _is_undef(vals) else _mark_unsafe(vals)
+            return vals if _is_undef(vals) else _mark_unsafe(vals)
         except Exception as e:
-            return self._lookup_failure(_captured(str(e)))
-
-    def _lookup_failure(self, error):
-        failures = (self._current_ctx or {}).get("__ansiroll_selector_lookup_failures")
-        if failures is not None:
-            failures.append(True)
-        return error
+            return _captured(str(e))
 
     def _template_lookup_arg(self, value):
         """Render template constants nested inside lookup terms/options."""
@@ -1626,6 +1631,8 @@ class _Templater:
                                                       dict(self._current_ctx or {}),
                                                       **kwargs))
             except Exception as e:
+                if isinstance(e, OSError):
+                    _record_controller_lookup_failure(self._current_ctx)
                 return _captured("lookup plugin '%s' failed: %s" % (name, e))
         if name in self._lookup_errors:
             return _captured("lookup plugin '%s' failed to load: %s"
@@ -2677,7 +2684,6 @@ class Runtime:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
                     if before_setup:
-                        selected = baked
                         break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "

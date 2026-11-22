@@ -1379,6 +1379,49 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
     assert _summary(result.stdout)[0] == ['"distribution defined: False"']
 
 
+@pytest.mark.parametrize("fallback", ["", " | default('missing')"])
+def test_setup_does_not_reuse_baked_vars_for_unset_runtime_profile(tmp_path, monkeypatch, fallback):
+    _write(tmp_path, {
+        "vars/configured.yml": "subset: [all]\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset | default(['!all', '!min']) }}"
+          vars:
+            profile: dev
+            selector_dev: configured
+          vars_files: ["vars/{{ lookup('vars', 'selector_' ~ profile)%s }}.yml"]
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % fallback,
+    })
+    assert _standalone(tmp_path, [])[0] == ['"distribution defined: True"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps({"profile": "unknown"}))
+    assert _standalone(tmp_path, [])[0] == ['"distribution defined: False"']
+
+
+def test_setup_embeds_ordered_role_magic(tmp_path):
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    files = {"roles/%s/tasks/main.yml" % role: "[]\n" for role in ("z", "a", "y", "b")}
+    files.update({
+        "roles/z/meta/main.yml": "dependencies: [y, b]\n",
+        "pb.yml": """
+        - hosts: localhost
+          roles: [z, a]
+          gather_subset: "{{ ['!all', '!min'] }}"
+        """,
+    })
+    _write(tmp_path, files)
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    runtime = Runtime({}, "", {})
+    magic = runtime.template(plays[0]["gather_scope"]["magic"], runtime.ctx())
+    assert magic["ansible_role_names"] == ["a", "b", "y", "z"]
+    assert magic["ansible_dependent_role_names"] == ["b", "y"]
+    assert magic["ansible_play_role_names"] == ["z", "a"]
+
+
 def test_setup_fact_path_uses_standalone_inventory_magic(tmp_path, monkeypatch):
     _write(tmp_path, {
         "localhost/example.fact": '{"marker": "host path"}',

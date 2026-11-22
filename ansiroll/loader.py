@@ -343,6 +343,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             zip(("major", "minor", "revision"), (int(part) if part.isdigit() else part or 0 for part in parts)),
             string=__version__.strip(), full=full_version,
         )
+        # Core builds these lists from sets. Play role names keep declaration order.
+        for key in ("ansible_role_names", "ansible_dependent_role_names"):
+            if key in magic:
+                magic[key] = sorted(magic[key])
         names = ("ansible_play_name", "ansible_playbook_python", "ansible_config_file", "role_names",
                  "ansible_play_role_names", "ansible_role_names", "ansible_dependent_role_names", "ansible_version")
         result["gather_scope"] = {
