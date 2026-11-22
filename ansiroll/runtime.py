@@ -1232,7 +1232,7 @@ class _PlayVarScope(dict):
                     value, self, strict=self.strict)
             finally:
                 self.resolving.remove(key)
-        return self.templater._resolved_alias(key, self.resolved[key])
+        return self.templater._observe_untrusted(self.resolved[key])
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1731,7 +1731,6 @@ class _Templater:
         self._template_cache = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
-        self._environment_aliases = None
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -1892,7 +1891,7 @@ class _Templater:
                 cache = ctx.resolved_task
             cache_key = (key, id(value))
             if cache is not None and cache_key in cache:
-                return self._resolved_alias(key, cache[cache_key])
+                return self._observe_untrusted(cache[cache_key])
             marker = (key, value)
             if marker in self._resolving:
                 return _captured("Recursive loop detected in template: %s" % value)
@@ -1901,7 +1900,7 @@ class _Templater:
                 result = self.render_string(value, ctx, strict=strict)
                 if cache is not None:
                     cache[cache_key] = result
-                return self._resolved_alias(key, result)
+                return self._observe_untrusted(result)
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
@@ -1917,11 +1916,6 @@ class _Templater:
         if self._untrusted_task_interpolation is not None and isinstance(value, _UntrustedConditionValue):
             self._untrusted_task_interpolation = True
         return value
-
-    def _resolved_alias(self, key, value):
-        if self._environment_aliases is not None and not _is_undef(value):
-            self._environment_aliases[key] = value
-        return self._observe_untrusted(value)
 
     def render_conditional_template(self, text, ctx, strict=False):
         # A rendered alias can lose its marker when combined with literal text.
@@ -3574,13 +3568,10 @@ class Runtime:
                     become_user = self.template(become_user, ctx)
                 self.become_user = _as_text(become_user)
             delegated = self.delegate_fn and (task.get("delegate_to") or task.get("fallback"))
-            env_parts = [] if delegated and task["action"].rsplit(".", 1)[-1] == "synchronize" else None
-            env_aliases = {} if env_parts is not None else None
-            self.templater._environment_aliases = env_aliases
-            try:
-                self._module_env = self._task_environment(task, ctx, env_parts)
-            finally:
-                self.templater._environment_aliases = None
+            if delegated and task["action"].rsplit(".", 1)[-1] == "synchronize":
+                self._module_env = None  # TaskExecutor has the delegated inventory context.
+            else:
+                self._module_env = self._task_environment(task, ctx)
             special = task.get("special")
             if special and (special == "debug"
                             or not (self.delegate_fn and task.get("delegate_to"))):
@@ -3610,11 +3601,7 @@ class Runtime:
                     args = _fail_on_undef(_strip_omit(
                         self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
-                    delegate_task = task
-                    if env_parts is not None:
-                        delegate_task = dict(task, _delegate_environment=env_parts,
-                                             _delegate_environment_aliases=env_aliases)
-                    res = self.delegate_fn(delegate_task, args, become, ctx)
+                    res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
                         # Preserve trust only for controller inventory metadata.
@@ -3769,51 +3756,31 @@ class Runtime:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
         return self._asset_bytes(marker)
 
-    def _task_environment(self, task, ctx, delegate_parts=None):
+    def _task_environment(self, task, ctx):
         """Resolve the `environment:` keyword to a flat {name: value} dict."""
         entries = task.get("environment")
         if not entries:
             return None
         env = {}
-        for source in entries:
-            if delegate_parts is not None:
-                # None keeps the original trusted entry on the controller.
-                delegate_parts.append(None)
-                if isinstance(source, dict) and set(source) == {"__ansiroll_unsafe__"}:
-                    continue
-            try:
-                entry = self.template(source, ctx) if isinstance(source, str) else source
-            except Exception:
-                if delegate_parts is None:
-                    raise
-                continue
-            if _is_undef(entry):
-                continue
-            if entry is None or entry == _OMIT:
-                if delegate_parts is not None:
-                    delegate_parts[-1] = {"rendered": {}, "unresolved": []}
+        for entry in entries:
+            if isinstance(entry, str):
+                entry = self.template(entry, ctx)
+            if _is_undef(entry) or entry is None or entry == _OMIT:
                 continue
             if not isinstance(entry, dict):
                 raise RuntimeError(
                     "environment entries must resolve to dictionaries, got %r" % (entry,))
-            resolved = {}
-            unresolved = []
             for k, v in entry.items():
                 try:
                     v = self.template(v, ctx)
-                    if delegate_parts is not None:
-                        _fail_on_undef(v)
                 except Exception:
-                    unresolved.append(k)
+                    # e.g. a play env referencing ansible_env during fact
+                    # gathering: Ansible skips that entry.
                     continue
-                if _is_undef(v):
-                    unresolved.append(k)
-                elif v != _OMIT:
-                    resolved[str(k)] = v
-            if delegate_parts is None:
-                env.update({key: _as_text(value) for key, value in resolved.items()})
-            elif isinstance(source, dict) or not unresolved:
-                delegate_parts[-1] = {"rendered": resolved, "unresolved": unresolved}
+                # Test Undefined first: comparing it to the omit sentinel can raise.
+                if _is_undef(v) or v == _OMIT:
+                    continue
+                env[str(k)] = _as_text(v)
         return env or None
 
     def _apply_overrides(self, task, res, ctx):
@@ -5520,14 +5487,25 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_vars(ctx, templater=None, resolve_keys=None):
+def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
     for key, value in (ctx or {}).items():
-        if key == "vars":
+        if key == "vars" or (deferred is not None and key == "omit"):
             continue
         try:
+            if deferred is not None and key not in resolve_keys:
+                if isinstance(value, _TaskVarTemplate):
+                    deferred[key] = "task"
+                elif isinstance(value, _PlayVarTemplate):
+                    deferred[key] = "play"
+                elif isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
+                    deferred[key] = "task" if value._task_vars else "play"
+                    value = value._raw
+                elif isinstance(value, _RegisteredResult) or (
+                        isinstance(value, _NO_TEMPLATE) and _looks_templated(value)):
+                    deferred[key] = "data"
             if templater is not None and (resolve_keys is None or key in resolve_keys):
                 if isinstance(value, _PlayVarTemplate):
                     value = scope[key]
@@ -5614,14 +5592,13 @@ def agent_main():
             # Synchronize also reads connection and executable vars directly.
             action = (task.get("action") or "").rsplit(".", 1)[-1]
             templater = rt.templater if action in ("template", "synchronize") else None
-            resolve_keys = None
-            if action == "synchronize":
-                resolve_keys = _SYNCHRONIZE_VARS
+            resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
+            deferred = {} if resolve_keys is not None else None
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
                 "runtime_id": task.get("runtime_id"),
                 "action": task.get("action"), "args": args,
-                "vars": _delegate_vars(ctx, templater, resolve_keys),
+                "vars": _delegate_vars(ctx, templater, resolve_keys, deferred),
                 "become": become, "to": task.get("delegate_to"),
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
@@ -5630,11 +5607,8 @@ def agent_main():
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),
             }
-            if action == "synchronize":
-                environment = task["_delegate_environment"]
-                frame["environment"] = environment
-                if any(part is None or part["unresolved"] for part in environment):
-                    frame["environment_aliases"] = _delegate_vars(task["_delegate_environment_aliases"])
+            if deferred:
+                frame["deferred_vars"] = deferred
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":

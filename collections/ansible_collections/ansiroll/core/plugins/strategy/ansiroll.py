@@ -537,9 +537,6 @@ class StrategyModule(StrategyBase):
             }
         try:
             concrete = task.copy()
-            if "environment" in frame:
-                concrete.squash()
-                self._set_delegated_environment(concrete, frame["environment"])
             concrete.args = _drop_omit_values(dict(frame.get("args") or {}))
             concrete.when = []
             concrete.loop = None
@@ -553,10 +550,26 @@ class StrategyModule(StrategyBase):
             concrete.failed_when = []
             job_vars = dict(hv or {})
             job_vars.update(frame.get("vars") or {})
-            if frame.get("environment_aliases"):
+            if deferred := frame.get("deferred_vars"):
                 from ansible.utils.unsafe_proxy import wrap_var
 
-                job_vars.update(wrap_var(frame["environment_aliases"]))
+                from ansiroll.loader import _tag_untrusted
+
+                # Restore the controller's tagged source for each deferred
+                # alias. Values supplied only by the agent remain data.
+                sources = {"task": task.get_vars(), "play": hv or {}}
+                for name, scope in deferred.items():
+                    if name not in job_vars:
+                        continue
+                    value = job_vars[name]
+                    source_vars = sources.get(scope, {})
+                    if name in source_vars:
+                        source = source_vars[name]
+                        tagged_source = json.loads(json.dumps(_tag_untrusted(source), default=str))
+                        if tagged_source == value:
+                            job_vars[name] = source
+                            continue
+                    job_vars[name] = wrap_var(value)
 
             class _QuietQueue:
                 @staticmethod
@@ -576,23 +589,6 @@ class StrategyModule(StrategyBase):
                 "msg": "ansiroll: controller action %s failed: %s"
                        % (frame.get("action"), ex),
             }
-
-    @staticmethod
-    def _set_delegated_environment(task, parts):
-        from ansible.utils.unsafe_proxy import wrap_var
-
-        original = task.environment
-        if not isinstance(original, list):
-            original = [original]
-        environment = []
-        for index, part in enumerate(parts):
-            if part is None:
-                environment.append(original[index])
-                continue
-            entry = {key: original[index][key] for key in part["unresolved"]}
-            entry.update(wrap_var(part["rendered"]))
-            environment.append(entry)
-        task.environment = environment
 
     def _run_local_template(self, frame, become_pass):
         """Render a runtime-created controller file through the in-memory runtime."""

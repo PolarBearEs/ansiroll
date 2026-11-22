@@ -2018,9 +2018,12 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
 
 
 def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch):
+    import copy
+
     from ansible.executor import task_executor
     from ansible.parsing.dataloader import DataLoader
     from ansible.playbook import Playbook
+    from ansible.release import __version__ as ansible_version
     from ansiroll.compat import make_templar
     from ansiroll.loader import _tag_untrusted
 
@@ -2028,18 +2031,30 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
     playbook = tmp_path / "play.yml"
     playbook.write_text("""
 - hosts: localhost
+  vars:
+    sync_play_value: "{{ 'PLAY' | lower }}"
   environment:
-    PLAY_VALUE: play
+    PLAY_VALUE: "{{ sync_play_value }}"
   tasks:
     - environment:
         SYNC_LABEL: "{{ ['RELEASE', 'PREVIEW'][sync_index] }}"
       block:
         - debug:
             msg: placeholder
+          vars:
+            sync_index: "{{ item }}"
+            sync_alias: {value: "{{ ['release', 'preview'][item] | upper }}"}
+            sync_list: ["{{ ['release', 'preview'][item] | upper }}"]
+            sync_loop_label: "{{ ['release', 'preview'][item] | upper }}"
+            unsafe_label: !unsafe "{{ item }}"
           environment:
             - SYNC_LITERAL: "{{ '{' ~ '{ placeholder }' ~ '}' }}"
-              SYNC_UNSAFE: !unsafe "{{ item }}"
-              SYNC_MIRROR: "{{ sync_alias ~ '-' ~ ansible_delegated_vars['localhost']['mirror'] }}"
+              SYNC_UNSAFE: "{{ unsafe_label }}"
+              SYNC_PRIOR: "{{ prior.msg }}"
+              SYNC_MIRROR: "{{ sync_alias.value ~ '-' ~ ansible_delegated_vars['localhost']['mirror'] }}"
+              SYNC_LIST: "{{ sync_list[0] }}"
+              SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
+              SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
               SYNC_FLAG: "{{ true }}"
               SYNC_EMPTY: "{{ none }}"
             - "{{ ansible_delegated_vars['localhost']['environment'] }}"
@@ -2052,11 +2067,13 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
 import json
 import sys
 from ansiroll import runtime
-runtime.PLAYS = [{"tasks": [{
+runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "tasks": [{
+    "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
+    "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},
+}, {
     "type": "task", "runtime_id": "sync", "name": "Synchronize",
     "action": "ansible.posix.synchronize", "fallback": True,
-    "loop": [0, 1], "vars": {"sync_index": "{{ item }}",
-                              "sync_alias": "{{ ['release', 'preview'][item] | upper }}"},
+    "loop": [0, 1], "vars": json.loads(sys.argv[2]),
     "environment": json.loads(sys.argv[1]),
 }]}]
 runtime.MODULES = {}
@@ -2065,7 +2082,10 @@ runtime.agent_main()
 """
     reply = b'{"t":"delegate_result","result":{"changed":false}}'
     serialized_environment = json.dumps(_tag_untrusted(original_environment, template_syntax_only=True))
-    result = subprocess.run([sys.executable, "-c", agent, serialized_environment],
+    serialized_vars = json.dumps(_tag_untrusted(original.get_vars()))
+    serialized_play_vars = json.dumps(_tag_untrusted(play.vars))
+    result = subprocess.run([sys.executable, "-c", agent, serialized_environment,
+                             serialized_vars, serialized_play_vars],
                             input=(len(reply).to_bytes(4, "big") + reply) * 2,
                             capture_output=True, timeout=15, check=True)
     stream = io.BytesIO(result.stdout)
@@ -2083,7 +2103,8 @@ runtime.agent_main()
         def run(self):
             templar = make_templar()
             templar.available_variables = dict(self.variables, ansible_delegated_vars={
-                "localhost": {"mirror": "controller", "environment": {"SYNC_WHOLE": "delegated"}},
+                "localhost": {"mirror": "controller", "mirrors": ["controller"],
+                              "environment": {"SYNC_WHOLE": "delegated"}},
             })
             environment = self.task._post_validate_environment(None, self.task.environment, templar)
             return {"environment": environment}
@@ -2093,13 +2114,21 @@ runtime.agent_main()
     strategy = strategy_type.__new__(strategy_type)
     strategy._loader = loader
     strategy._variable_manager = None
-    assert [strategy._run_native_controller_task(frame, None, {}, {"sync": original}, None)
+    empty = None if tuple(map(int, ansible_version.split(".")[:2])) >= (2, 19) else ""
+    assert [strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None)
             for frame in frames] == [
         {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
-                         "SYNC_UNSAFE": "{{ item }}", "SYNC_MIRROR": label + "-controller",
-                         "SYNC_FLAG": True, "SYNC_EMPTY": None, "SYNC_WHOLE": "delegated"}}
+                         "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
+                         "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label,
+                         "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
+                         "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")
     ]
+    assert all("omit" not in frame["vars"] for frame in frames)
+    frame = copy.deepcopy(frames[0])
+    frame["vars"]["sync_loop_label"] = "{{ 'other' | upper }}"
+    rendered = strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None)
+    assert rendered["environment"]["SYNC_MIRRORS"] == "{{ 'other' | upper }}-controller"
     assert original.environment == original_environment
 
 
