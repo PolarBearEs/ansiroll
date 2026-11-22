@@ -537,16 +537,15 @@ class StrategyModule(StrategyBase):
             }
         try:
             concrete = task.copy()
+            if "environment" in frame:
+                concrete.squash()
+                self._set_delegated_environment(concrete, frame["environment"])
             concrete.args = _drop_omit_values(dict(frame.get("args") or {}))
             concrete.when = []
             concrete.loop = None
             concrete.loop_with = None
             concrete.register = None
             concrete.notify = []
-            if "environment" in frame:
-                from ansible.utils.unsafe_proxy import wrap_var
-
-                concrete.environment = wrap_var(frame["environment"])
             # The agent applies the original retry policy around each controller call.
             concrete.retries = 0
             concrete.until = []
@@ -573,6 +572,23 @@ class StrategyModule(StrategyBase):
                 "msg": "ansiroll: controller action %s failed: %s"
                        % (frame.get("action"), ex),
             }
+
+    @staticmethod
+    def _set_delegated_environment(task, parts):
+        from ansible.utils.unsafe_proxy import wrap_var
+
+        original = task.environment
+        if not isinstance(original, list):
+            original = [original]
+        environment = []
+        for index, part in enumerate(parts):
+            if part is None:
+                environment.append(original[index])
+                continue
+            entry = {key: original[index][key] for key in part["unresolved"]}
+            entry.update(wrap_var(part["rendered"]))
+            environment.append(entry)
+        task.environment = environment
 
     def _run_local_template(self, frame, become_pass):
         """Render a runtime-created controller file through the in-memory runtime."""

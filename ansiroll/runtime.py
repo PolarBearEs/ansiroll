@@ -3567,12 +3567,14 @@ class Runtime:
                 if isinstance(become_user, str):
                     become_user = self.template(become_user, ctx)
                 self.become_user = _as_text(become_user)
-            self._module_env = self._task_environment(task, ctx)
+            delegated = self.delegate_fn and (task.get("delegate_to") or task.get("fallback"))
+            env_parts = [] if delegated and task["action"].rsplit(".", 1)[-1] == "synchronize" else None
+            self._module_env = self._task_environment(task, ctx, env_parts)
             special = task.get("special")
             if special and (special == "debug"
                             or not (self.delegate_fn and task.get("delegate_to"))):
                 res = self._run_special(special, task, ctx, become, args_cache)
-            elif self.delegate_fn and (task.get("delegate_to") or task.get("fallback")):
+            elif delegated:
                 # Run on the controller (or delegated host): template args here where
                 # the vars live, then hand the concrete call to the controller.
                 reason = (
@@ -3597,7 +3599,8 @@ class Runtime:
                     args = _fail_on_undef(_strip_omit(
                         self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
-                    res = self.delegate_fn(task, args, become, ctx)
+                    delegate_task = task if env_parts is None else dict(task, _delegate_environment=env_parts)
+                    res = self.delegate_fn(delegate_task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
                         # Preserve trust only for controller inventory metadata.
@@ -3752,32 +3755,48 @@ class Runtime:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
         return self._asset_bytes(marker)
 
-    def _task_environment(self, task, ctx):
+    def _task_environment(self, task, ctx, delegate_parts=None):
         """Resolve the `environment:` keyword to a flat {name: value} dict."""
         entries = task.get("environment")
         if not entries:
             return None
         env = {}
-        for entry in entries:
-            if isinstance(entry, str):
-                entry = self.template(entry, ctx)
-            if entry == _OMIT or _is_undef(entry) or entry is None:
+        for source in entries:
+            if delegate_parts is not None:
+                # None keeps the original trusted entry on the controller.
+                delegate_parts.append(None)
+                if isinstance(source, dict) and set(source) == {"__ansiroll_unsafe__"}:
+                    continue
+            try:
+                entry = self.template(source, ctx) if isinstance(source, str) else source
+            except Exception:
+                if delegate_parts is None:
+                    raise
+                continue
+            if _is_undef(entry):
+                continue
+            if entry is None or entry == _OMIT:
+                if delegate_parts is not None:
+                    delegate_parts[-1] = {"rendered": {}, "unresolved": []}
                 continue
             if not isinstance(entry, dict):
                 raise RuntimeError(
                     "environment entries must resolve to dictionaries, got %r" % (entry,))
+            resolved = {}
+            unresolved = []
             for k, v in entry.items():
                 try:
                     v = self.template(v, ctx)
                 except Exception:
-                    # e.g. a play env referencing ansible_env during fact
-                    # gathering: Ansible skips that entry.
+                    unresolved.append(k)
                     continue
-                # Test Undefined first: comparing a captured StrictUndefined to
-                # the omit sentinel raises before we can skip the entry.
-                if _is_undef(v) or v == _OMIT:
-                    continue
-                env[str(k)] = _as_text(v)
+                if _is_undef(v):
+                    unresolved.append(k)
+                elif v != _OMIT:
+                    resolved[str(k)] = _as_text(v)
+            env.update(resolved)
+            if delegate_parts is not None and (isinstance(source, dict) or not unresolved):
+                delegate_parts[-1] = {"rendered": resolved, "unresolved": unresolved}
         return env or None
 
     def _apply_overrides(self, task, res, ctx):
@@ -5595,7 +5614,7 @@ def agent_main():
                 "name": task.get("name"),
             }
             if action == "synchronize":
-                frame["environment"] = rt._module_env
+                frame["environment"] = task["_delegate_environment"]
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":

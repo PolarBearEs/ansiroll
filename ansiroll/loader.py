@@ -1469,6 +1469,8 @@ def _convert_task(task, actions, basedir):
     elif action in CONTROLLER_COUPLED:
         node["fallback"] = True
         node["fallback_reason"] = "controller-coupled action %s" % action
+        if action.rsplit(".", 1)[-1] == "synchronize":
+            node["environment"] = _tag_untrusted(node["environment"], template_syntax_only=True)
     elif node["special"] is None:
         actions.add(action)
     if node["special"] == "set_fact":

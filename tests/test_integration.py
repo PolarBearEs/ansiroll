@@ -2017,26 +2017,52 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
-def test_synchronize_round_trips_the_rendered_loop_environment(monkeypatch):
-    import copy
+def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch):
     from ansible.executor import task_executor
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
     from ansiroll.compat import make_templar
+    from ansiroll.loader import _tag_untrusted
 
+    make_templar()  # Initialize Ansible's collection loader before parsing.
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- hosts: localhost
+  environment:
+    PLAY_VALUE: play
+  tasks:
+    - environment:
+        SYNC_LABEL: "{{ ['RELEASE', 'PREVIEW'][sync_index] }}"
+      block:
+        - debug:
+            msg: placeholder
+          environment:
+            - SYNC_LITERAL: "{{ '{' ~ '{ placeholder }' ~ '}' }}"
+              SYNC_UNSAFE: !unsafe "{{ item }}"
+              SYNC_MIRROR: "{{ ansible_delegated_vars['localhost']['mirror'] }}"
+            - "{{ ansible_delegated_vars['localhost']['environment'] }}"
+""")
+    loader = DataLoader()
+    play, = Playbook.load(str(playbook), loader=loader).get_plays()
+    original, = play.tasks[0].block
+    original_environment = original.environment
     agent = """
+import json
+import sys
 from ansiroll import runtime
 runtime.PLAYS = [{"tasks": [{
     "type": "task", "runtime_id": "sync", "name": "Synchronize",
     "action": "ansible.posix.synchronize", "fallback": True,
-    "loop": ["release", "preview"], "vars": {"sync_label": "{{ item | upper }}"},
-    "environment": [{"SYNC_LABEL": "{{ sync_label }}",
-                     "SYNC_LITERAL": "{{ '{' ~ '{ placeholder }' ~ '}' }}"}],
+    "loop": [0, 1], "vars": {"sync_index": "{{ item }}"},
+    "environment": json.loads(sys.argv[1]),
 }]}]
 runtime.MODULES = {}
 runtime.ANSIBALLZ_CODE = ""
 runtime.agent_main()
 """
     reply = b'{"t":"delegate_result","result":{"changed":false}}'
-    result = subprocess.run([sys.executable, "-c", agent],
+    serialized_environment = json.dumps(_tag_untrusted(original_environment, template_syntax_only=True))
+    result = subprocess.run([sys.executable, "-c", agent, serialized_environment],
                             input=(len(reply).to_bytes(4, "big") + reply) * 2,
                             capture_output=True, timeout=15, check=True)
     stream = io.BytesIO(result.stdout)
@@ -2047,22 +2073,30 @@ runtime.agent_main()
             frames.append(frame)
 
     class Executor:
-        def __init__(self, host, task, *args):
+        def __init__(self, host, task, variables, *args):
             self.task = task
+            self.variables = variables
 
         def run(self):
-            return {"environment": make_templar().template(self.task.environment)}
+            templar = make_templar()
+            templar.available_variables = dict(self.variables, ansible_delegated_vars={
+                "localhost": {"mirror": "controller", "environment": {"SYNC_WHOLE": "delegated"}},
+            })
+            environment = self.task._post_validate_environment(None, self.task.environment, templar)
+            return {"environment": environment}
 
     monkeypatch.setattr(task_executor, "TaskExecutor", Executor)
-    strategy = SimpleNamespace(_loader=None, _variable_manager=None)
-    original = SimpleNamespace(environment={"SYNC_LABEL": "{{ sync_label }}"})
-    original.copy = lambda: copy.copy(original)
-    run = _load_strategy_module().StrategyModule._run_native_controller_task
-    assert [run(strategy, frame, None, {}, {"sync": original}, None) for frame in frames] == [
-        {"environment": {"SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}"}}
+    strategy_type = _load_strategy_module().StrategyModule
+    strategy = strategy_type.__new__(strategy_type)
+    strategy._loader = loader
+    strategy._variable_manager = None
+    assert [strategy._run_native_controller_task(frame, None, {}, {"sync": original}, None)
+            for frame in frames] == [
+        {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
+                         "SYNC_UNSAFE": "{{ item }}", "SYNC_MIRROR": "controller", "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")
     ]
-    assert original.environment == {"SYNC_LABEL": "{{ sync_label }}"}
+    assert original.environment == original_environment
 
 
 def test_gather_embeds_setup():
