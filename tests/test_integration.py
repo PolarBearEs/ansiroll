@@ -2053,6 +2053,7 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_PRIOR: "{{ prior.msg }}"
               SYNC_MIRROR: "{{ sync_alias.value ~ '-' ~ ansible_delegated_vars['localhost']['mirror'] }}"
               SYNC_LIST: "{{ sync_list[0] }}"
+              SYNC_FILE: "{{ file_options.label }}"
               SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
               SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
               SYNC_FLAG: "{{ true }}"
@@ -2067,7 +2068,11 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
 import json
 import sys
 from ansiroll import runtime
-runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "tasks": [{
+runtime._INJECTED_VARS = json.loads(sys.argv[3])
+runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
+    "names": ["/vars/{{ inventory_hostname }}.yml"],
+    "files": {"/vars/localhost.yml": [{"file_options": {"label": "{{ 'release' | upper }}"}}]},
+}], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
     "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},
 }, {
@@ -2078,6 +2083,7 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "tasks": [{
 }]}]
 runtime.MODULES = {}
 runtime.ANSIBALLZ_CODE = ""
+runtime._INJECTED_HOST = "localhost"
 runtime.agent_main()
 """
     reply = b'{"t":"delegate_result","result":{"changed":false}}'
@@ -2119,7 +2125,7 @@ runtime.agent_main()
             for frame in frames] == [
         {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
                          "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
-                         "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label,
+                         "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")

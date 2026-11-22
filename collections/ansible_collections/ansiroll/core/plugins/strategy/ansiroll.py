@@ -558,6 +558,7 @@ class StrategyModule(StrategyBase):
                 # Restore the controller's tagged source for each deferred
                 # alias. Values supplied only by the agent remain data.
                 sources = {"task": task.get_vars(), "play": hv or {}}
+                play_fallbacks = frame.get("play_var_fallbacks") or {}
                 for name, scope in deferred.items():
                     if name not in job_vars:
                         continue
@@ -569,7 +570,7 @@ class StrategyModule(StrategyBase):
                         if tagged_source == value:
                             job_vars[name] = source
                             continue
-                    job_vars[name] = wrap_var(value)
+                    job_vars[name] = wrap_var(play_fallbacks.get(name, value) if scope == "play" else value)
 
             class _QuietQueue:
                 @staticmethod
