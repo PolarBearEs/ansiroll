@@ -205,6 +205,31 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     unresolved_vars_files = []
     ordered_vars_files = [] if gather_facts is None else None
     play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
+    core_version = _core_version()
+    gather_options = {}
+    for option in ("gather_subset", "gather_timeout", "fact_path"):
+        value = getattr(play, option, None)
+        if value is None:
+            continue
+        # Pre-2.13 play iterators omit falsey timeout and fact path values.
+        if core_version < (2, 13) and (
+                (option == "gather_timeout" and isinstance(value, (int, float)) and value == 0)
+                or (option == "fact_path" and not value)):
+            continue
+        gather_options[option] = value
+    scoped_gather = gather_facts is None and any(
+        _is_templated(item) for value in gather_options.values() for item in _as_list(value)
+    )
+    gather_vars_files = []
+    if scoped_gather and any("selector" in entry for entry in ordered_vars_files):
+        for entry in ordered_vars_files:
+            if "selector" not in entry:
+                gather_vars_files.append(_tag_untrusted(entry))
+                continue
+            bundled, = _deferred_vars_files(play, basedir, [entry["selector"]])
+            if "path" in entry:
+                bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
+            gather_vars_files.append(bundled)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -220,6 +245,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
     includes.incomplete = bool(unresolved_vars_files)
+    includes.reselectable_vars = _vars_file_variable_names(gather_vars_files)
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -254,18 +280,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
-    core_version = _core_version()
-    gather_options = {}
-    for option in ("gather_subset", "gather_timeout", "fact_path"):
-        value = getattr(play, option, None)
-        if value is None:
-            continue
-        # Pre-2.13 play iterators omit falsey timeout and fact path values.
-        if core_version < (2, 13) and (
-                (option == "gather_timeout" and isinstance(value, (int, float)) and value == 0)
-                or (option == "fact_path" and not value)):
-            continue
-        gather_options[option] = value
     # Before 2.18, omitting these play fields restores the controller default.
     gather_option_defaults = {
         key: value for key, value in (
@@ -302,8 +316,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
-    if gather_facts is None and any(
-            _is_templated(item) for value in gather_options.values() for item in _as_list(value)):
+    if scoped_gather:
         from ansible.utils.vars import combine_vars
 
         defaults = {}
@@ -339,16 +352,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             "search_path": _raw_search_path(play, basedir),
             "search_dirs": _search_dirs(play, basedir, "files"),
         }
-        if any("selector" in entry for entry in ordered_vars_files):
-            gather_vars_files = []
-            for entry in ordered_vars_files:
-                if "selector" not in entry:
-                    gather_vars_files.append(_tag_untrusted(entry))
-                    continue
-                bundled, = _deferred_vars_files(play, basedir, [entry["selector"]])
-                if "path" in entry:
-                    bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
-                gather_vars_files.append(bundled)
+        if gather_vars_files:
             result["gather_scope"].update({
                 "base_vars": _tag_untrusted(dict(play.vars or {})),
                 "vars_files": gather_vars_files,
@@ -586,6 +590,16 @@ def _bundled_vars_file(play, path):
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
     return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
             "a mapping" % path}
+
+
+def _vars_file_variable_names(entries):
+    names = set()
+    for entry in entries:
+        for data in (entry.get("files") or {}).values():
+            if isinstance(data, list):
+                for item in data:
+                    names.update(item)
+    return names
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars):
@@ -916,6 +930,7 @@ class _IncludeVariables:
         self.resolved_template = False
         # A vars file whose name is only known at runtime may redefine any play var.
         self.incomplete = False
+        self.reselectable_vars = set()
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -1250,7 +1265,8 @@ def _template_include_filename(task, value, includes):
     def is_runtime(name):
         if name in loop_names:
             return True
-        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
+        if ((includes.incomplete or name in includes.reselectable_vars)
+                and name not in extra_vars and name not in above_vars_files
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):

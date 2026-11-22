@@ -28,6 +28,7 @@ from .loader import (
     _depends_on_vars,
     _loop_binding_names,
     _runtime_write_names,
+    _vars_file_variable_names,
     load_adjacent_group_vars,
     parse_playbook,
 )
@@ -271,11 +272,9 @@ def _shadowed_var_names(plays):
         ))
         names.update(_loop_shadowed_names(node))
     for play in plays:
-        for entry in play.get("deferred_vars_files") or ():
-            for data in entry["files"].values():
-                if isinstance(data, list):
-                    for item in data:
-                        names.update(item)
+        names.update(_vars_file_variable_names(play.get("deferred_vars_files") or ()))
+        scope = play.get("gather_scope") or {}
+        names.update(_vars_file_variable_names(scope.get("vars_files") or ()))
     return names
 
 

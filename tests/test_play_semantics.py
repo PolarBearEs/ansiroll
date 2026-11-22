@@ -1311,6 +1311,74 @@ def test_setup_keywords_see_check_and_diff_mode(tmp_path):
     assert msgs == ['"distribution defined: False"']
 
 
+def test_setup_vars_file_replay_uses_controller_search_path_and_magic(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "files/profile.txt": "facts-profile\n",
+        "vars/facts-profile.yml": "selected: controller\n",
+        "vars/shadowed.yml": "selected: extra-var\n",
+        "vars/checked.yml": "selected: play-check-mode\n",
+        "pb.yml": """
+        - name: actual play
+          hosts: localhost
+          check_mode: true
+          gather_facts: true
+          gather_subset: "{{ ['!all', '!min'] }}"
+          vars_files:
+            - "vars/{{ 'checked' if ansible_check_mode else lookup('file', 'profile.txt') if ansible_play_name == 'actual play' else 'shadowed' }}.yml"
+          tasks:
+            - debug: {msg: "{{ selected }}"}
+        """,
+    }, args=("-e", "ansible_play_name=shadowed"), strategy=False)
+    assert msgs == ['"controller"']
+
+
+def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "facts/example.fact": '{"marker": "default path"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ ansible_facts.get('profile', 'facts') }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    }, strategy=False)
+    assert msgs == ['"default path"']
+
+
+def test_setup_reselectable_vars_file_values_are_not_frozen_or_used_for_includes(tmp_path):
+    from ansiroll.compiler import _shadowed_var_names, _walk_play_nodes
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "vars/dev.yml": "task_file: dev.yml\nrequested_subset: ['!all', '!min']\n",
+        "vars/prod.yml": "task_file: prod.yml\nrequested_subset: [all]\n",
+        "dev.yml": "- debug: {msg: dev}\n",
+        "prod.yml": "- debug: {msg: prod}\n",
+        "stable.yml": "- debug: {msg: stable}\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ requested_subset }}"
+          vars:
+            profile: dev
+            stable_file: stable.yml
+          vars_files: ['vars/{{ profile }}.yml']
+          tasks:
+            - include_tasks: "{{ task_file }}"
+            - include_tasks: "{{ stable_file }}"
+        """,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "requested_subset" in _shadowed_var_names(plays)
+    nodes = list(_walk_play_nodes(plays))
+    assert any(node["action"].split(".")[-1] == "include_tasks" for node in nodes
+               if node["type"] == "task")
+    assert [node["args"]["msg"] for node in nodes
+            if node["type"] == "task" and node["action"].split(".")[-1] == "debug"] == ["stable"]
+
+
 def test_setup_vars_file_can_read_shadowed_inventory_selector(tmp_path):
     messages, _ = check(tmp_path, {
         "group_vars/all.yml": "setup_profile: inventory\n",

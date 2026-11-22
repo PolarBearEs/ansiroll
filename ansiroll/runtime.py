@@ -2352,6 +2352,9 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         run_setup = play.get("gather_facts") and not gather_cached
+        scope = play.get("gather_scope") or {}
+        gather_magic = dict(scope.get("magic") or {}, ansible_check_mode=bool(invocation_check_mode),
+                            ansible_diff_mode=bool(self.diff_mode))
         setup_options = play.get("gather_options") or {}
         play_keywords = {}
         if self.gather_args_fn is None:
@@ -2359,7 +2362,7 @@ class Runtime:
             setup_options = {key: value for key, value in setup_options.items() if key == "fact_path"}
         play_options = None
         if run_setup or play_keywords:
-            setup_ctx, gather_play_ctx = self._gather_contexts(play, invocation_check_mode, run_setup)
+            setup_ctx, gather_play_ctx = self._gather_contexts(play, gather_magic, run_setup)
             if play_keywords:
                 try:
                     play_options = self._setup_args(play_keywords, play.get("gather_option_defaults"),
@@ -2381,7 +2384,7 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        play_vars = self._with_deferred_vars_files(play)
+        play_vars = self._with_deferred_vars_files(play, gather_magic)
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -2621,7 +2624,7 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _with_deferred_vars_files(self, play, base=None, before_setup=False):
+    def _with_deferred_vars_files(self, play, gather_magic, base=None, before_setup=False):
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
         scope = play.get("gather_scope") or {}
@@ -2630,9 +2633,7 @@ class Runtime:
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if base is None:
             if scope:
-                magic = dict(scope.get("magic") or {}, ansible_check_mode=bool(self.check_mode),
-                             ansible_diff_mode=bool(self.diff_mode))
-                base = self._gather_host_base(scope, magic, merge)
+                base = self._gather_host_base(scope, gather_magic, merge)
             else:
                 base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in scope.get("vars_files", play.get("deferred_vars_files")) or ():
@@ -2640,6 +2641,9 @@ class Runtime:
                 play_vars = _f_combine(play_vars, *entry["values"], recursive=merge)
                 continue
             variables = _f_combine(base, play_vars, self.extra_vars, recursive=merge)
+            if scope:
+                variables = _f_combine(variables, gather_magic, recursive=merge)
+                variables["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             for raw in entry["names"]:
@@ -2694,14 +2698,13 @@ class Runtime:
 
     def _gather_host_base(self, scope, magic, merge):
         facts = dict(self._module_fact_layer)
-        if facts:
-            facts["ansible_facts"] = _normalized_facts(facts)
+        facts["ansible_facts"] = _normalized_facts(facts)
         controller = {key: self.vars[key] for key in
                       ("__ansiroll_controller_env", "__ansiroll_controller_config")}
         return _f_combine(scope["role_defaults"], self._gather_inventory_vars, facts,
                           controller, magic, recursive=merge)
 
-    def _gather_contexts(self, play, invocation_check_mode, run_setup):
+    def _gather_contexts(self, play, magic, run_setup):
         setup_vars = dict(self.vars)
         scope = play.get("gather_scope")
         if not scope:
@@ -2710,15 +2713,13 @@ class Runtime:
 
         defaults = scope["role_defaults"]
         exports = scope["role_exports"]
-        magic = dict(scope.get("magic") or {}, ansible_check_mode=bool(invocation_check_mode),
-                     ansible_diff_mode=bool(self.diff_mode))
         merge = self._gather_hash_merge()
         # Core validates gather_subset and gather_timeout with play-only vars.
         play_base = dict(defaults)
         for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
             play_base[key] = self.vars[key]
         play_base.update(magic)
-        play_files = self._with_deferred_vars_files(play, base=play_base, before_setup=True)
+        play_files = self._with_deferred_vars_files(play, magic, base=play_base, before_setup=True)
         play_vars = _f_combine(play_base, play_files, exports, self.extra_vars, magic, recursive=merge)
         play_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
         play_ctx = self.ctx(base=play_vars)
@@ -2728,7 +2729,7 @@ class Runtime:
 
         # The implicit setup task resolves fact_path with host and task vars.
         host_base = self._gather_host_base(scope, magic, merge)
-        setup_files = self._with_deferred_vars_files(play, base=host_base, before_setup=True)
+        setup_files = self._with_deferred_vars_files(play, magic, base=host_base, before_setup=True)
         setup_vars = _f_combine(host_base, setup_files, exports, self._include_vars_layer,
                                 self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
         setup_vars["ansible_search_path"] = scope["search_path"]
