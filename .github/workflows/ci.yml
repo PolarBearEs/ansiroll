@@ -9,6 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: >-
+    ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+    format('{0}', github.event.comment.user.id) == vars.AMP_CI_ACTOR_ID &&
+    startsWith(github.event.comment.body, 'Amp cleared ci.yml for ') &&
+    format('amp-ci-pr-{0}', github.event.issue.number) || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   reviewed-head:
     # issue_comment uses the default branch's workflow. Keep write permissions
@@ -35,13 +43,39 @@ jobs:
           pattern='^Amp cleared ci\.yml for ([a-f0-9]{40})\.$'
           [[ "$COMMENT" =~ $pattern ]] || exit 0
           head=${BASH_REMATCH[1]}
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
-          jq -e --arg head "$head" '.state == "open" and .head.sha == $head' <<< "$pr" >/dev/null || exit 0
-          merge=$(jq -er 'select(.mergeable == true) | .merge_commit_sha | strings' <<< "$pr")
+          api="repos/$GITHUB_REPOSITORY"
+          for attempt in 1 2 3 4 5; do
+            pr=$(gh api "$api/pulls/$PR")
+            jq -e --arg head "$head" '.state == "open" and .head.sha == $head' <<< "$pr" >/dev/null || exit 0
+            mergeable=$(jq -r '.mergeable' <<< "$pr")
+            if [[ "$mergeable" != null ]]; then
+              break
+            fi
+            if [[ "$attempt" != 5 ]]; then
+              sleep 2
+            fi
+          done
+          if [[ "$mergeable" != true ]]; then
+            echo 'GitHub has no mergeable revision for this PR.' >&2
+            exit 1
+          fi
+          merge=$(jq -er '.merge_commit_sha | strings' <<< "$pr")
           [[ "$merge" =~ ^[a-f0-9]{40}$ ]]
+          runs="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
+          if [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then
+            combined=$(gh api "$api/commits/$head/status")
+            if jq -e --arg merge "$merge" --arg runs "$runs" '.statuses | any(
+              .context == "Amp CI" and
+              (.target_url // "" | startswith($runs)) and
+              (.description // "" | endswith(" merge " + $merge))
+            )' <<< "$combined" >/dev/null; then
+              echo 'CI was already triggered for this merge commit.'
+              exit 0
+            fi
+          fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
-            -f context='Amp CI' -f state=pending -f description='Testing the reviewed PR' \
-            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            -f context='Amp CI' -f state=pending -f description="Testing merge $merge" \
+            -f target_url="$runs$GITHUB_RUN_ID"
           printf 'head=%s\nmerge=%s\n' "$head" "$merge" >> "$GITHUB_OUTPUT"
 
   # Fast, dependency-light job: the runtime interpreter, filters and tests work
@@ -239,16 +273,17 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           HEAD: ${{ needs.reviewed-head.outputs.head }}
+          MERGE: ${{ needs.reviewed-head.outputs.merge }}
           PASSED: >-
             ${{ needs.unit.result == 'success' && needs.coverage.result == 'success' &&
             needs.matrix.result == 'success' && needs.parity.result == 'success' &&
             needs.upstream-parity-full.result == 'success' && needs.ansible-test-native-parity.result == 'success' }}
         run: |
           state=failure
-          description='Tests did not pass'
+          description="Tests did not pass on merge $MERGE"
           if [[ "$PASSED" == true ]]; then
             state=success
-            description='Tests passed on the reviewed PR merge commit'
+            description="Tests passed on merge $MERGE"
           fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" \
             -f context='Amp CI' -f state="$state" -f description="$description" \
