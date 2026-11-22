@@ -232,6 +232,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
                 if entry.get("lookup_replays"):
                     bundled["lookup_replays"] = entry["lookup_replays"]
+                if entry.get("lookup_selections"):
+                    bundled["lookup_selections"] = entry["lookup_selections"]
             gather_vars_files.append(bundled)
     hosts = play.hosts
     if isinstance(hosts, list):
@@ -513,8 +515,11 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
                     # arbitrary lookup output such as a secret hashed by a filter.
                     known = {key: items for key, items in (lookups or ())
                              if all(item in record["path"] for item in items)}
+                    selector = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, raw)
                     if known:
-                        record["lookup_replays"] = {_PLAYBOOK_DIR_RE.sub(lambda _m: basedir, raw): known}
+                        record["lookup_replays"] = {selector: known}
+                    elif lookups and len(lookups) == 1 and _selector_depends_only_on_lookup(selector):
+                        record["lookup_selections"] = {selector: {lookups[0][0]: record["path"]}}
             break
         if ordered is not None and record:
             ordered.append(record)
@@ -546,6 +551,58 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
+def _selector_ast(selector):
+    from jinja2 import Environment, TemplateSyntaxError
+
+    try:
+        return Environment().parse(selector)
+    except TemplateSyntaxError:
+        return None
+
+
+def _selector_depends_only_on_lookup(selector):
+    """Outside the traced lookup call, permit only deterministic literal transforms."""
+    from jinja2 import nodes
+
+    def stable(node):
+        if isinstance(node, nodes.Call):
+            return (isinstance(node.node, nodes.Name) and node.node.name in ("lookup", "query", "q")
+                    and node.args and isinstance(node.args[0], nodes.Const)
+                    and node.args[0].value in ("file", "pipe", "ansible.builtin.file", "ansible.builtin.pipe",
+                                               "ansible.legacy.file", "ansible.legacy.pipe")
+                    and next(node.find_all(nodes.Call), None) is None)
+        if isinstance(node, nodes.Filter):
+            return (node.name in ("lower", "upper", "trim", "first", "basename", "dirname")
+                    and not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs) and stable(node.node))
+        return isinstance(node, (nodes.Template, nodes.Output, nodes.TemplateData, nodes.Const, nodes.Concat)) and all(
+            stable(child) for child in node.iter_child_nodes())
+
+    parsed = _selector_ast(selector)
+    return parsed is not None and stable(parsed)
+
+
+def _first_found_literal_dirs(selector):
+    from jinja2 import nodes
+
+    parsed = _selector_ast(selector)
+    if parsed is None:
+        return set()
+    directories = set()
+    for call in parsed.find_all(nodes.Call):
+        if (not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q")
+                or not call.args or not isinstance(call.args[0], nodes.Const)
+                or call.args[0].value not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")):
+            continue
+        for argument in [*call.args[1:], *call.kwargs]:
+            constants = (argument,) if isinstance(argument, nodes.Const) else argument.find_all(nodes.Const)
+            for literal in constants:
+                if isinstance(literal.value, str) and "/" in literal.value:
+                    directory = os.path.normpath(os.path.dirname(literal.value))
+                    if not os.path.isabs(directory) and directory.split(os.sep)[0] not in ("..", "~"):
+                        directories.add(directory)
+    return directories
+
+
 def _deferred_vars_files(play, basedir, entries, *, setup=False):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -573,6 +630,7 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
             # via an absolute path returned by the controller lookup.
             candidate_subdir = subdir or ("vars" if setup and "first_found" in name else None)
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+            lookup_patterns = set()
             if name.startswith(os.path.sep):
                 patterns = [pattern]
             else:
@@ -582,14 +640,17 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                         patterns.append(os.path.join(glob.escape(d), candidate_subdir, pattern))
                     patterns.append(os.path.join(glob.escape(d), pattern))
                 if setup and "first_found" in name:
-                    patterns.extend(os.path.join(glob.escape(d), pattern)
-                                    for d in _search_dirs(play, basedir, "files"))
+                    literal_dirs = _first_found_literal_dirs(name) | {"."}
+                    lookup_patterns = {os.path.join(glob.escape(d), glob.escape(relative), pattern)
+                                       for d in _search_dirs(play, basedir, "files") for relative in literal_dirs}
+                    patterns.extend(sorted(lookup_patterns))
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
                     if os.path.isfile(found):
                         in_vars_dir = os.path.normcase(os.path.realpath(found)).startswith(vars_dirs)
-                        candidates[found] = candidates.get(found, False) or in_vars_dir or not _is_templated(name)
+                        candidates[found] = (candidates.get(found, False) or in_vars_dir
+                                             or path in lookup_patterns or not _is_templated(name))
         files = {path: _bundled_vars_file(play, path, allow_lists) for path, allow_lists in candidates.items()}
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
         if unmodeled:

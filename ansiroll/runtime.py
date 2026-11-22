@@ -909,6 +909,10 @@ class _VarsFileLookupError(RuntimeError):
     """A vars_files lookup ran but could not select a file."""
 
 
+class _BakedVarsFileSelection(RuntimeError):
+    """Use the compiled filename for a selector with identical lookup inputs."""
+
+
 def _vars_file_lookup_key(name, args, options):
     relevant = {key: value for key, value in options.items()
                 if key not in ("wantlist", "errors", "allow_unsafe")}
@@ -920,10 +924,24 @@ def _vars_file_lookup_key(name, args, options):
 
 
 def _baked_vars_file_lookup(name, args, options, ctx):
-    replays = (ctx or {}).get("__ansiroll_selector_lookups")
-    if replays:
-        return replays.get(_vars_file_lookup_key(name, args, options))
-    return None
+    ctx = ctx or {}
+    replays = ctx.get("__ansiroll_selector_lookups") or {}
+    selections = ctx.get("__ansiroll_selector_selections") or {}
+    if not (replays or selections):
+        return None
+    key = _vars_file_lookup_key(name, args, options)
+    if key in selections:
+        raise _BakedVarsFileSelection(selections[key])
+    return replays.get(key)
+
+
+def _vars_file_lookup_failure(error, options, wantlist):
+    policy = options.get("errors")
+    if policy == "warn":
+        sys.stderr.write("[WARNING]: %s\n" % error)
+    elif policy != "ignore":
+        raise error
+    return [] if wantlist else None
 
 
 def _first_found_vars_file(args, options, ctx):
@@ -932,7 +950,6 @@ def _first_found_vars_file(args, options, ctx):
     _fail_on_undef(options)
     files = ctx["__ansiroll_selector_files"]
     dirs = ctx["__ansiroll_search_dirs"]
-    ignore_error = options.get("errors") in ("ignore", "warn")
     if not _core_at_least(2, 12):
         options = {}  # Legacy first_found takes its search options as a dict term.
 
@@ -952,17 +969,21 @@ def _first_found_vars_file(args, options, ctx):
                     candidate = os.path.normpath(os.path.join(search_dir, path))
                     if candidate in files:
                         return [candidate]
-    if options.get("skip") or ignore_error:
+    if options.get("skip"):
         return []
     raise _VarsFileLookupError("No bundled vars file was found when using first_found.")
 
 
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name)
+    selector = "__ansiroll_selector_files" in (ctx or {})
     if (name in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")
-            and "__ansiroll_selector_files" in (ctx or {})):
+            and selector):
         return _first_found_vars_file(args, kwargs, ctx)
     name = name.rsplit(".", 1)[-1]
+    if selector and name in ("file", "pipe"):
+        _fail_on_undef(args)
+        _fail_on_undef(kwargs)
     if name == "vars":
         vals = []
         for a in args:
@@ -1003,15 +1024,17 @@ def _lookup_values(name, args, kwargs, ctx=None):
             try:
                 with open(path) as f:
                     text = f.read()
-            except OSError:
+            except OSError as error:
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
                 if replay is not None:
                     return replay
+                if selector:
+                    raise _VarsFileLookupError("lookup plugin 'file' failed: %s" % error) from error
                 raise
             if lstrip:
                 text = text.lstrip()
             if rstrip:
-                text = text.rstrip("\r\n")
+                text = text.rstrip() if selector else text.rstrip("\r\n")
             vals.append(text)
         return vals
     if name == "pipe":
@@ -1023,9 +1046,12 @@ def _lookup_values(name, args, kwargs, ctx=None):
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
                 if replay is not None:
                     return replay
-                raise RuntimeError("lookup plugin 'pipe' failed: command %r returned "
-                                   "rc=%d: %s" % (a, proc.returncode, proc.stderr.strip()))
-            vals.append(proc.stdout.rstrip("\n"))
+                message = "lookup plugin 'pipe' failed: command %r returned rc=%d: %s" % (
+                    a, proc.returncode, proc.stderr.strip())
+                if selector:
+                    raise _VarsFileLookupError(message)
+                raise RuntimeError(message)
+            vals.append(proc.stdout.rstrip() if selector else proc.stdout.rstrip("\n"))
         return vals
     return _loop_lookup(name, list(args))
 
@@ -1618,8 +1644,10 @@ class _Templater:
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
-        except _VarsFileLookupError:
+        except _BakedVarsFileSelection:
             raise
+        except _VarsFileLookupError as e:
+            return _vars_file_lookup_failure(e, k, k.get("wantlist", False))
         except Exception as e:
             return _captured(str(e))
 
@@ -1632,8 +1660,10 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)
-        except _VarsFileLookupError:
+        except _BakedVarsFileSelection:
             raise
+        except _VarsFileLookupError as e:
+            return _vars_file_lookup_failure(e, k, True)
         except Exception as e:
             return _captured(str(e))
 
@@ -1788,7 +1818,7 @@ class _Templater:
                 # Captured, not raised: surfaces when the value is used (or is
                 # inspected via dump_object), like Ansible 2.19.
                 return _captured_jinja_error(e, syntax=True)
-            except _VarsFileLookupError:
+            except (_VarsFileLookupError, _BakedVarsFileSelection):
                 raise
             except Exception as e:
                 if strict and isinstance(e, jinja2.UndefinedError):
@@ -2735,12 +2765,17 @@ class Runtime:
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             lookup_replays = entry.get("lookup_replays", {}) if before_setup else {}
+            lookup_selections = entry.get("lookup_selections", {}) if before_setup else {}
             selected = None
             for raw in entry["names"]:
                 if lookup_replays:
                     ctx["__ansiroll_selector_lookups"] = lookup_replays.get(raw)
+                if lookup_selections:
+                    ctx["__ansiroll_selector_selections"] = lookup_selections.get(raw)
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
+                except _BakedVarsFileSelection as selection:
+                    name = selection.args[0]
                 except jinja2.UndefinedError as ex:
                     if before_setup:
                         break
@@ -2841,7 +2876,7 @@ class Runtime:
                 setup_vars.setdefault(key, value)
         remote_user = setup_vars.get("ansible_ssh_user") or setup_vars.get("ansible_user")
         if remote_user and "ansible_connection_user" not in setup_vars:
-            connection = self.template(setup_vars.get("ansible_connection"), self.ctx(base=setup_vars))
+            connection = _decode_included_var(setup_vars.get("ansible_connection"))
             if isinstance(connection, str) and connection == "local":
                 setup_vars["ansible_connection_user"] = remote_user
         address = setup_vars.get("ansible_host") or setup_vars.get("ansible_ssh_host") or self.host

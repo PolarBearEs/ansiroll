@@ -1369,30 +1369,36 @@ def test_setup_fact_path_sees_effective_connection(tmp_path, monkeypatch, connec
     assert _standalone(tmp_path, []) == expected
 
 
-@pytest.mark.parametrize("extra", [{}, {"ansible_connection_user": "override"}])
-def test_setup_fact_path_sees_local_connection_user(tmp_path, monkeypatch, extra):
+@pytest.mark.parametrize(("extra", "marker"), [
+    ({}, "play user"),
+    ({"ansible_connection_user": "override"}, "explicit connection user"),
+    ({"ansible_connection": "{{ transport }}", "transport": "local"}, "fallback"),
+])
+def test_setup_fact_path_sees_local_connection_user(tmp_path, monkeypatch, extra, marker):
     _write(tmp_path, {
         "alice/example.fact": '{"marker": "play user"}',
         "override/example.fact": '{"marker": "explicit connection user"}',
+        "fallback/example.fact": '{"marker": "fallback"}',
         "pb.yml": """
         - hosts: localhost
           connection: local
           remote_user: alice
           gather_facts: true
           gather_subset: ['!all', '!min', local]
-          fact_path: "{{ playbook_dir }}/{{ ansible_connection_user }}"
+          fact_path: "{{ playbook_dir }}/{{ ansible_connection_user | default('fallback') }}"
           tasks:
             - debug: {msg: "{{ ansible_local.example.marker }}"}
         """,
     })
     expected = _ansible(tmp_path, ["-e", json.dumps(extra)])
-    assert expected[0] == ['"explicit connection user"' if extra else '"play user"']
+    assert expected[0] == [json.dumps(marker)]
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps(extra))
     assert _standalone(tmp_path, []) == expected
 
 
 @pytest.mark.parametrize("selector", [
     "lookup('file', playbook_dir ~ '/files/profile.txt')",
+    "lookup('file', playbook_dir ~ '/files/profile.txt') | lower",
     "lookup('file', playbook_dir ~ '/files/profile.txt') | default('missing')",
     "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote)",
     "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote) | default('missing')",
@@ -1400,7 +1406,7 @@ def test_setup_fact_path_sees_local_connection_user(tmp_path, monkeypatch, extra
 ])
 def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, selector):
     _write(tmp_path, {
-        "files/profile.txt": "minimal\n",
+        "files/profile.txt": "MINIMAL \n" if selector.endswith("| lower") else "minimal \n",
         "vars/minimal.yml": "subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
@@ -1416,16 +1422,19 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
         [sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", str(output)],
         cwd=str(tmp_path), env=_env(), capture_output=True, check=True,
     )
-    (tmp_path / "files/profile.txt").unlink()
-    result = subprocess.run([sys.executable, str(output)], cwd=str(tmp_path),
-                            env=_env(), capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr
-    assert _summary(result.stdout)[0] == ['"distribution defined: False"']
+    for remove in (False, True):
+        if remove:
+            (tmp_path / "files/profile.txt").unlink()
+        result = subprocess.run([sys.executable, str(output)], cwd=str(tmp_path),
+                                env=_env(), capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert _summary(result.stdout)[0] == ['"distribution defined: False"']
 
 
 @pytest.mark.parametrize("selector", [
     "lookup('first_found', playbook_dir ~ '/vars/' ~ profile ~ '.yml')",
     "lookup('first_found', profile ~ '.yml')",
+    "lookup('first_found', 'profiles/' ~ profile ~ '.yml')",
     "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
 ])
 def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector):
@@ -1433,7 +1442,9 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
         "vars/dev.yml": "subset: [all]\n",
         "vars/prod.yml": "subset: ['!all', '!min']\n",
         "files/dev.yml": "subset: [all]\n",
-        "files/prod.yml": "subset: ['!all', '!min']\n",
+        "files/prod.yml": "- subset: ['!all', '!min']\n",
+        "files/profiles/dev.yml": "subset: [all]\n",
+        "files/profiles/prod.yml": "- subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
@@ -1479,7 +1490,8 @@ def test_setup_first_found_respects_missing_file_policy(tmp_path, monkeypatch, s
         assert _summary(result.stdout) == _summary(native.stdout)
 
 
-def test_setup_does_not_replay_lookup_for_changed_inputs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("errors", ["strict", "ignore"])
+def test_setup_does_not_replay_lookup_for_changed_inputs(tmp_path, monkeypatch, errors):
     _write(tmp_path, {
         "files/dev.txt": "dev\n",
         "vars/dev.yml": "subset: [all]\n",
@@ -1488,14 +1500,20 @@ def test_setup_does_not_replay_lookup_for_changed_inputs(tmp_path, monkeypatch):
           gather_facts: true
           gather_subset: "{{ subset | default(['!all', '!min']) }}"
           vars: {profile: dev}
-          vars_files: ["vars/{{ lookup('file', profile ~ '.txt') | default('missing') }}.yml"]
+          vars_files: ["{{ 'vars/' ~ (lookup('file', profile ~ '.txt', errors='%s') or 'fallback') ~ '.yml' }}"]
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % errors,
+        "vars/fallback.yml": "subset: ['!all', '!min']\n",
     })
     assert _standalone(tmp_path, [])[0] == ['"distribution defined: True"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps({"profile": "prod"}))
-    assert _standalone(tmp_path, [])[0] == ['"distribution defined: False"']
+    if errors == "ignore":
+        assert _standalone(tmp_path, [])[0] == ['"distribution defined: False"']
+    else:
+        result = _standalone_run(tmp_path, [])
+        assert result.returncode != 0
+        assert "prod.txt" in result.stderr
 
 
 @pytest.mark.parametrize("fallback", ["", " | default('missing')"])
