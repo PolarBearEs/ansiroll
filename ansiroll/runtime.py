@@ -1407,7 +1407,7 @@ class _LazyTplList(list):
     # list's C-level operations read the raw storage; render first, like
     # Ansible's _AnsibleLazyTemplateList.
     def __contains__(self, item):
-        return item in list(iter(self))
+        return item in iter(self)
 
     def __reversed__(self):
         return reversed(list(iter(self)))
@@ -2026,17 +2026,13 @@ class _Templater:
                       self._conditional_collection(env, pair.value) or self._conditional_member(env, pair.value))
                      for pair in node.items]
             return lambda ctx: {key(ctx): value(ctx) for key, value in pairs}
-        if isinstance(node, nodes.Call) and not node.args and node.dyn_args is None and node.dyn_kwargs is None:
+        if isinstance(node, nodes.Call):
             target = node.node
             if isinstance(target, nodes.Getattr) and target.attr == "copy" and isinstance(target.node, nodes.Dict):
-                if not node.kwargs:
+                if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
                     return self._conditional_collection(env, target.node)
             if isinstance(target, nodes.Name) and target.name == "dict" and env.globals.get("dict") is _jinja_dict:
-                fields = [(kwarg.key, self._conditional_collection(env, kwarg.value)
-                           or self._conditional_member(env, kwarg.value)) for kwarg in node.kwargs]
-                evaluate_call = self._conditional_member(env, node)
-                return lambda ctx: (evaluate_call(ctx) if "dict" in ctx
-                                    else {key: value(ctx) for key, value in fields})
+                return self._conditional_dict_call(env, node)
         if isinstance(node, nodes.Add):
             left = self._conditional_collection(env, node.left)
             right = self._conditional_collection(env, node.right)
@@ -2053,6 +2049,24 @@ class _Templater:
                 alternate = alternate or self._conditional_member(env, node.expr2)
                 return lambda ctx: selected(ctx) if test(ctx) else alternate(ctx)
         return None
+
+    def _conditional_dict_call(self, env, node):
+        def member(value):
+            return self._conditional_collection(env, value) or self._conditional_member(env, value)
+
+        positional = [member(arg) for arg in node.args]
+        fields = [(kwarg.key, member(kwarg.value)) for kwarg in node.kwargs]
+        extra_positional = member(node.dyn_args) if node.dyn_args is not None else lambda ctx: ()
+        extra_fields = member(node.dyn_kwargs) if node.dyn_kwargs is not None else lambda ctx: {}
+        evaluate_call = self._conditional_member(env, node)
+
+        def evaluate(ctx):
+            if "dict" in ctx:
+                return evaluate_call(ctx)
+            return _jinja_dict(*(value(ctx) for value in positional), *extra_positional(ctx),
+                               **{key: value(ctx) for key, value in fields}, **extra_fields(ctx))
+
+        return evaluate
 
     def _conditional_list(self, text, env, ctx, strict):
         key = (text, strict)
@@ -5567,17 +5581,22 @@ def agent_main():
             resolve_keys = None
             if action == "synchronize":
                 resolve_keys = _SYNCHRONIZE_VARS
-            _chan_send(resp_fd, {"t": "delegate", "uuid": task.get("uuid"),
-                                 "runtime_id": task.get("runtime_id"),
-                                 "action": task.get("action"), "args": args,
-                                 "vars": _delegate_vars(ctx, templater, resolve_keys),
-                                 "become": become, "to": task.get("delegate_to"),
-                                 "become_user": rt.become_user,
-                                 "check_mode": bool(rt.check_mode),
-                                 "diff_mode": bool(rt.diff_mode),
-                                 "fallback": bool(task.get("fallback")),
-                                 "search_dirs": task.get("search_dirs"),
-                                 "name": task.get("name")})
+            frame = {
+                "t": "delegate", "uuid": task.get("uuid"),
+                "runtime_id": task.get("runtime_id"),
+                "action": task.get("action"), "args": args,
+                "vars": _delegate_vars(ctx, templater, resolve_keys),
+                "become": become, "to": task.get("delegate_to"),
+                "become_user": rt.become_user,
+                "check_mode": bool(rt.check_mode),
+                "diff_mode": bool(rt.diff_mode),
+                "fallback": bool(task.get("fallback")),
+                "search_dirs": task.get("search_dirs"),
+                "name": task.get("name"),
+            }
+            if action == "synchronize":
+                frame["environment"] = rt._module_env
+            _chan_send(resp_fd, frame)
             reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":
                 return {"failed": True, "changed": False,

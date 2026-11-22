@@ -543,6 +543,10 @@ class StrategyModule(StrategyBase):
             concrete.loop_with = None
             concrete.register = None
             concrete.notify = []
+            if "environment" in frame:
+                from ansible.utils.unsafe_proxy import wrap_var
+
+                concrete.environment = wrap_var(frame["environment"])
             # The agent applies the original retry policy around each controller call.
             concrete.retries = 0
             concrete.until = []

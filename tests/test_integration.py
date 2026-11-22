@@ -2017,6 +2017,54 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
+def test_synchronize_round_trips_the_rendered_loop_environment(monkeypatch):
+    import copy
+    from ansible.executor import task_executor
+    from ansiroll.compat import make_templar
+
+    agent = """
+from ansiroll import runtime
+runtime.PLAYS = [{"tasks": [{
+    "type": "task", "runtime_id": "sync", "name": "Synchronize",
+    "action": "ansible.posix.synchronize", "fallback": True,
+    "loop": ["release", "preview"], "vars": {"sync_label": "{{ item | upper }}"},
+    "environment": [{"SYNC_LABEL": "{{ sync_label }}",
+                     "SYNC_LITERAL": "{{ '{' ~ '{ placeholder }' ~ '}' }}"}],
+}]}]
+runtime.MODULES = {}
+runtime.ANSIBALLZ_CODE = ""
+runtime.agent_main()
+"""
+    reply = b'{"t":"delegate_result","result":{"changed":false}}'
+    result = subprocess.run([sys.executable, "-c", agent],
+                            input=(len(reply).to_bytes(4, "big") + reply) * 2,
+                            capture_output=True, timeout=15, check=True)
+    stream = io.BytesIO(result.stdout)
+    frames = []
+    while header := stream.read(4):
+        frame = json.loads(stream.read(int.from_bytes(header, "big")))
+        if frame["t"] == "delegate":
+            frames.append(frame)
+
+    class Executor:
+        def __init__(self, host, task, *args):
+            self.task = task
+
+        def run(self):
+            return {"environment": make_templar().template(self.task.environment)}
+
+    monkeypatch.setattr(task_executor, "TaskExecutor", Executor)
+    strategy = SimpleNamespace(_loader=None, _variable_manager=None)
+    original = SimpleNamespace(environment={"SYNC_LABEL": "{{ sync_label }}"})
+    original.copy = lambda: copy.copy(original)
+    run = _load_strategy_module().StrategyModule._run_native_controller_task
+    assert [run(strategy, frame, None, {}, {"sync": original}, None) for frame in frames] == [
+        {"environment": {"SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}"}}
+        for label in ("RELEASE", "PREVIEW")
+    ]
+    assert original.environment == {"SYNC_LABEL": "{{ sync_label }}"}
+
+
 def test_gather_embeds_setup():
     src, manifest = compile_playbook(os.path.join(FIXTURES, "gather.yml"))
     assert any(m.endswith("setup") for m in manifest["modules"])
