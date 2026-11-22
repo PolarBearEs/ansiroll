@@ -16,6 +16,7 @@ import textwrap
 import pytest
 from packaging.version import Version
 
+from tests import ansible_playbook_command, ansiroll_compile_command, parity_pythonpath
 from tests.run_official_suite import parse_task_trace
 
 pytest.importorskip("ansible")
@@ -33,7 +34,7 @@ RECAP_RE = re.compile(
 
 def _env():
     env = dict(os.environ)
-    env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = parity_pythonpath(ROOT)
     env["ANSIBLE_COLLECTIONS_PATH"] = os.path.join(ROOT, "collections")
     env["ANSIBLE_DEPRECATION_WARNINGS"] = "False"
     env["ANSIBLE_NOCOLOR"] = "1"
@@ -52,17 +53,10 @@ def _write(base, files):
             fh.write(textwrap.dedent(text).lstrip("\n"))
 
 
-def _summary(text):
+def _summary(text, stderr=""):
     recap = RECAP_RE.search(text)
-    assert recap, "no recap found in:\n%s" % text
+    assert recap, "no recap found in:\n%s%s" % (text, stderr)
     return MSG_RE.findall(text), recap.groups()
-
-
-def _ansible_playbook():
-    # Use the ansible-core that compiles the playbook (same interpreter), not
-    # whichever ansible-playbook happens to be first on PATH.
-    local = os.path.join(os.path.dirname(sys.executable), "ansible-playbook")
-    return local if os.path.exists(local) else "ansible-playbook"
 
 
 def _ansible_run(base, args, strategy=None):
@@ -70,19 +64,20 @@ def _ansible_run(base, args, strategy=None):
     if strategy:
         env["ANSIBLE_STRATEGY"] = strategy
     return subprocess.run(
-        [_ansible_playbook(), "-i", "localhost,", "-c", "local", "pb.yml"] + list(args),
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "pb.yml"] + list(args),
         cwd=str(base), env=env, capture_output=True, text=True, timeout=120,
     )
 
 
 def _ansible(base, args, strategy=None):
-    return _summary(_ansible_run(base, args, strategy).stdout)
+    result = _ansible_run(base, args, strategy)
+    return _summary(result.stdout, result.stderr)
 
 
 def _standalone_run(base, args, compile_args=()):
     out_py = os.path.join(str(base), "out.py")
     comp = subprocess.run(
-        [sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", out_py]
+        ansiroll_compile_command() + ["pb.yml", "-o", out_py]
         + list(args) + list(compile_args),
         cwd=str(base), env=_env(), capture_output=True, text=True,
     )

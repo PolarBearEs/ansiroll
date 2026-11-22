@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+from tests import ansible_playbook_command, ansiroll_compile_command, parity_pythonpath
+
 pytest.importorskip("ansible")
 
 from ansible import constants as C  # noqa: E402
@@ -33,7 +35,7 @@ MSG_RE = re.compile(r'^\s*"msg": (".*"),?\s*$', re.M)
 
 def _env():
     env = dict(os.environ)
-    env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = parity_pythonpath(ROOT)
     env["ANSIBLE_COLLECTIONS_PATH"] = os.path.join(ROOT, "collections")
     env["ANSIBLE_DEPRECATION_WARNINGS"] = "False"
     env["ANSIBLE_NOCOLOR"] = "1"
@@ -41,9 +43,9 @@ def _env():
     return env
 
 
-def _summary(text):
+def _summary(text, stderr=""):
     recap = RECAP_RE.search(text)
-    assert recap, text
+    assert recap, text + stderr
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
@@ -52,11 +54,11 @@ def _ansible(playbook, cwd, strategy=None):
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", "-c", "local",
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
          "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
-        cwd=str(cwd), env=env, capture_output=True, text=True,
+        cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
-    return _summary(proc.stdout)
+    return _summary(proc.stdout, proc.stderr)
 
 
 def _ansiroll(playbook, cwd):
@@ -89,6 +91,698 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
         actual = _ansiroll(path, tmp_path)
     assert actual == expected
     return expected
+
+
+def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
+    (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local import')\n")
+    result = subprocess.run(
+        ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
+@pytest.mark.parametrize("shadow_path", ["playbook", "symlink", "inherited"])
+def test_reference_bootstrap_uses_stdlib_runpy(tmp_path, monkeypatch, shadow_path):
+    playbook_dir = tmp_path / "playbook"
+    playbook_dir.mkdir()
+    shadow_dir = tmp_path / "dependencies" if shadow_path == "inherited" else playbook_dir
+    shadow_dir.mkdir(exist_ok=True)
+    (shadow_dir / "runpy.py").write_text("raise RuntimeError('unexpected runpy from PYTHONPATH')\n")
+    import_path = shadow_dir
+    if shadow_path == "symlink":
+        import_path = tmp_path / "playbook-link"
+        try:
+            import_path.symlink_to(playbook_dir, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+    monkeypatch.setenv("PYTHONPATH", str(import_path), prepend=os.pathsep)
+    command = ansible_playbook_command()
+    if sys.version_info >= (3, 11):
+        command[1:1] = ["-X", "frozen_modules=off"]
+    result = subprocess.run(
+        command + ["--version"], cwd=playbook_dir, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
+@pytest.mark.parametrize("module", ["csv", "_csv"])
+def test_reference_launcher_discovery_uses_stdlib_csv(tmp_path, monkeypatch, module):
+    from tests import _reference_python
+
+    (tmp_path / f"{module}.py").write_text("raise RuntimeError('unexpected playbook-local CSV module')\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+    command = _reference_python(
+        "script, _, _ = _parity_bootstrap['_select_playbook_launcher'](sys.argv.pop(1), sys.argv.pop(1)); "
+        "print(script)",
+        discover=True,
+    )
+    result = subprocess.run(
+        command + [__version__], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not result.stdout.strip() or os.path.isfile(result.stdout.strip())
+
+
+def test_reference_launcher_ignores_archived_distribution_metadata(tmp_path, monkeypatch):
+    from zipfile import ZipFile
+
+    archive = tmp_path / "foreign.zip"
+    with ZipFile(archive, "w") as zipped:
+        zipped.writestr("ansible_core-0.0.dist-info/METADATA", "Name: ansible-core\nVersion: 0.0\n")
+    monkeypatch.setenv("PYTHONPATH", str(archive), prepend=os.pathsep)
+    result = subprocess.run(
+        ansible_playbook_command() + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert __version__ in result.stdout
+
+
+def test_reference_bootstrap_preserves_playbook_local_imports(tmp_path, monkeypatch):
+    from tests import _reference_python
+
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local tests module')\n")
+    (tmp_path / "parity_playbook_helper.py").write_text("SOURCE = 'playbook'\n")
+    command = _reference_python(
+        "_parity_bootstrap['_load_reference_ansible'](sys.argv.pop(1)); "
+        "from parity_playbook_helper import SOURCE; print(SOURCE)"
+    )
+    result = subprocess.run(
+        command, cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert result.stdout.strip() == "playbook"
+
+
+def test_reference_bootstrap_rejects_a_cached_foreign_ansible_submodule(tmp_path):
+    expected = tmp_path / "expected" / "ansible" / "__init__.py"
+    foreign = tmp_path / "foreign" / "ansible" / "release.py"
+    command = (
+        "import sys, types; from tests import _load_reference_ansible; "
+        "module = types.ModuleType('ansible.release'); module.__file__ = sys.argv[2]; "
+        "sys.modules[module.__name__] = module; _load_reference_ansible(sys.argv[1])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command, str(expected), str(foreign)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "cached ansible.release" in result.stderr
+    assert str(foreign) in result.stderr and str(expected.parent) in result.stderr
+
+
+@pytest.mark.parametrize("alias, external", [
+    ("ansible.compat.selectors", "selectors"),
+    ("ansible.module_utils.compat.selectors", "selectors"),
+    ("ansible.module_utils.distro", "distro"),
+])
+def test_reference_bootstrap_accepts_ansible_compatibility_aliases(tmp_path, alias, external):
+    import ansible
+
+    command = (
+        "import selectors, sys, types; from tests import _load_reference_ansible; "
+        "_load_reference_ansible(sys.argv[1]); "
+        "module = sys.modules.get(sys.argv[3]) or types.ModuleType(sys.argv[3]); "
+        "module.__file__ = getattr(module, '__file__', selectors.__file__); "
+        "sys.modules[sys.argv[2]] = sys.modules[sys.argv[3]] = module; "
+        "_load_reference_ansible(sys.argv[1])"
+    )
+    subprocess.run(
+        [sys.executable, "-c", command, os.path.abspath(ansible.__file__), alias, external],
+        cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=10, check=True,
+    )
+
+
+@pytest.mark.parametrize("replace_alias", [False, True])
+def test_reference_bootstrap_verifies_six_alias_identity(tmp_path, replace_alias):
+    import ansible
+    from pathlib import Path
+
+    if not Path(ansible.__file__).with_name("module_utils").joinpath("six", "__init__.py").is_file():
+        pytest.skip("Ansible does not ship vendored six")
+    alias = "ansible.module_utils.six.moves.http_cookiejar"
+    command = (
+        "import http.cookiejar, importlib, sys, types; from tests import _load_reference_ansible; "
+        "_load_reference_ansible(sys.argv[1]); "
+        "module = importlib.import_module(sys.argv[2]); assert module is http.cookiejar; "
+        "foreign = types.ModuleType(sys.argv[2]); foreign.__file__ = module.__file__; "
+        "sys.modules[sys.argv[2]] = foreign if sys.argv[3] == 'replace' else module; "
+        "_load_reference_ansible(sys.argv[1])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", command, os.path.abspath(ansible.__file__), alias,
+         "replace" if replace_alias else "keep"],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10,
+    )
+    if replace_alias:
+        assert result.returncode != 0
+        assert f"cached {alias} came from" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+def test_reference_playbook_selects_the_matching_installed_launcher_lazily(tmp_path, monkeypatch, version):
+    from importlib import metadata
+    from pathlib import Path
+    from types import ModuleType, SimpleNamespace
+
+    import tests
+
+    launcher = Path("bin/ansible-playbook")
+    (tmp_path / launcher).parent.mkdir()
+    (tmp_path / launcher).write_text("#!/usr/bin/env python3\nfrom ansible.cli.playbook import main\nmain()\n")
+    ansible_package = str(tmp_path / "ansible")
+
+    def distributions(name, path):
+        assert name == "ansible-core"
+        assert str(tmp_path) in path
+        # Its records must not be accessed, because it is a different install.
+        yield SimpleNamespace(locate_file=lambda entry: tmp_path / "foreign" / entry)
+        yield SimpleNamespace(files=[launcher], locate_file=lambda entry: tmp_path / entry)
+        pytest.fail("searched later distributions after selecting the pinned launcher")
+
+    def verify_legacy(script, package, diagnostics, associated):
+        assert package == ansible_package and associated
+        return script, (), True
+
+    seen = []
+    cli = ModuleType("ansible.cli")
+    cli.playbook = SimpleNamespace(main=lambda: seen.extend(sys.argv))
+    monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: ansible_package)
+    monkeypatch.setattr(tests, "_legacy_python_launcher", verify_legacy)
+    monkeypatch.setattr(tests, "_run_legacy_playbook", lambda filename, script: seen.extend([script, *sys.argv[1:]]))
+    monkeypatch.setattr(metadata, "distributions", distributions)
+    monkeypatch.setitem(sys.modules, "ansible.cli", cli)
+    monkeypatch.setattr(sys, "argv", ["-c", "--version"])
+    monkeypatch.setattr(sys, "path", sys.path[:])
+    monkeypatch.setenv("PATH", "")
+    filename = str(tmp_path / "ansible" / "__init__.py")
+    script, flags, legacy = tests._select_playbook_launcher(filename, version)
+    assert not flags
+    runner = tests._run_legacy_playbook if legacy else tests._run_modern_playbook
+    runner(filename, script)
+    assert seen == [str(tmp_path / launcher), "--version"]
+
+
+@pytest.mark.parametrize("match_location", [None, "path", "sibling", "wrong-python"])
+def test_modern_launcher_verifies_fallback_installations(tmp_path, monkeypatch, match_location):
+    from types import ModuleType, SimpleNamespace
+
+    import tests
+
+    package_dir = tmp_path / "matching" / "lib" / "python3" / "dist-packages" / "ansible"
+    package_dir.mkdir(parents=True)
+    package = str(package_dir)
+    foreign = str(tmp_path / "foreign" / "bin" / "ansible-playbook")
+    matching = str(tmp_path / "matching" / "bin" / "ansible-playbook")
+    wrapper = str(tmp_path / "matching" / "bin" / "custom-ansible-playbook")
+    sibling = matching if match_location == "sibling" else foreign
+    selected_python = os.path.join(os.path.dirname(sibling), "python")
+    seen = []
+    for path in (foreign, matching, wrapper):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        interpreter = "/other/bin/python3 -P" if path == matching and match_location == "wrong-python" else selected_python
+        source = f"#!{interpreter}\nfrom ansible.cli.playbook import main\nmain()\n"
+        if path == wrapper:
+            source = source.replace("main()\n", "import os\nos.environ['ANSIBLE_CONFIG'] = '/other.cfg'\nmain()\n")
+        with open(path, "w") as script:
+            script.write(source)
+
+    cli = ModuleType("ansible.cli")
+    cli.playbook = SimpleNamespace(main=lambda: seen.append(sys.argv[0]))
+    monkeypatch.setattr(sys, "executable", selected_python)
+    monkeypatch.setitem(sys.modules, "ansible.cli", cli)
+    monkeypatch.setattr(sys, "argv", ["-c", "--version"])
+    monkeypatch.setattr(sys, "path", sys.path[:])
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
+    path = [wrapper, foreign, matching] if match_location in ("path", "wrong-python") else [wrapper, foreign]
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(path))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("launcher was probed"))
+    monkeypatch.setattr(tests, "_load_reference_ansible", lambda filename: package)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    filename = os.path.join(package, "__init__.py")
+    script, flags, legacy = tests._select_playbook_launcher(filename, "2.14.18")
+    assert not flags and not legacy
+    tests._run_modern_playbook(filename, script)
+    if match_location in ("path", "sibling"):
+        assert seen == [matching]
+    else:
+        assert seen == [os.path.join(package, "cli", "playbook.py")]
+        assert os.path.dirname(foreign) not in sys.path
+
+
+@pytest.mark.parametrize("venv", [False, True])
+def test_fallback_installation_uses_the_candidate_scheme_and_abi(tmp_path, monkeypatch, venv):
+    import sysconfig
+
+    from tests import _launcher_installation_matches
+
+    package = tmp_path / "lib" / "python3.14t" / "site-packages" / "ansible"
+    package.mkdir(parents=True)
+    if venv:
+        (tmp_path / "pyvenv.cfg").touch()
+
+    def install_path(kind, vars, **kwargs):
+        assert kind in ("purelib", "platlib")
+        assert vars == {"base": str(tmp_path), "platbase": str(tmp_path)}
+        assert kwargs == ({"scheme": "venv"} if venv else {})
+        return str(package.parent)
+
+    monkeypatch.setattr(sysconfig, "get_scheme_names", lambda: ("posix_local", "venv"))
+    monkeypatch.setattr(sysconfig, "get_path", install_path)
+    assert _launcher_installation_matches(tmp_path / "bin" / "ansible-playbook", str(package))
+
+
+@pytest.mark.parametrize("config_beside_python", [False, True])
+def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, monkeypatch, config_beside_python):
+    from tests import _stock_playbook_flags
+
+    system = tmp_path / "system" / "bin" / "python3"
+    system.parent.mkdir(parents=True)
+    system.touch()
+    executables = []
+    for name in ("selected", "foreign"):
+        root = tmp_path / ("shared" if config_beside_python else name)
+        bin_dir = f"{name}-bin" if config_beside_python else "bin"
+        executable = root / bin_dir / "python3"
+        executable.parent.mkdir(parents=True)
+        config_dir = executable.parent if config_beside_python else root
+        (config_dir / "pyvenv.cfg").touch()
+        try:
+            executable.symlink_to(system)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+        executables.append(executable)
+    selected, foreign = executables
+    monkeypatch.setattr(sys, "executable", str(selected))
+    script = selected.with_name("ansible-playbook")
+    body = "from ansible.cli.playbook import main\nmain()\n"
+    script.write_text(f"#!{foreign} -s\n{body}")
+    assert _stock_playbook_flags(script, str(tmp_path), match_python=True) is None
+    script.write_text(f"#!{selected} -s\n{body}")
+    assert _stock_playbook_flags(script, str(tmp_path), match_python=True) == ("-s",)
+    alias = tmp_path / "alias" / "bin"
+    alias.parent.mkdir()
+    alias.symlink_to(selected.parent, target_is_directory=True)
+    script.write_text(f"#!{alias / 'python3'} -s\n{body}")
+    assert _stock_playbook_flags(script, str(tmp_path), match_python=True) is None
+
+
+@pytest.mark.parametrize("has_matching_python", [False, True])
+def test_legacy_launcher_prefers_matching_python_and_ignores_foreign_flags(tmp_path, monkeypatch, has_matching_python):
+    import tests
+
+    package = tmp_path / "ansible"
+    stub = package / "cli" / "scripts" / "ansible_cli_stub.py"
+    stub.parent.mkdir(parents=True)
+    body = "start_expected_release()\n"
+    stub.write_text(f"#!/usr/bin/env python\n{body}")
+    selected = tmp_path / "selected" / "python3"
+    monkeypatch.setattr(sys, "executable", str(selected))
+    launches = []
+    for name, interpreter in [("foreign-flags", "/other/bin/python3 -s"),
+                              ("foreign-plain", "/other/bin/python3"), ("matching", selected)]:
+        script = tmp_path / name / "ansible-playbook"
+        script.parent.mkdir()
+        script.write_text(f"#!{interpreter}\n{body}")
+        launches.append(str(script))
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter(()))
+    candidates = launches if has_matching_python else launches[:2]
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(candidates))
+    expected = launches[2] if has_matching_python else launches[1]
+    assert tests._select_playbook_launcher(str(package / "__init__.py"), "2.12.10") == (expected, (), True)
+
+
+def test_modern_launcher_accepts_pip_entrypoint(tmp_path):
+    from tests import _stock_playbook_flags
+
+    script = tmp_path / "ansible-playbook"
+    script.write_text(
+        "#!/usr/bin/python3\nimport sys\nfrom ansible.cli.playbook import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        "    sys.exit(main())\n"
+    )
+    assert _stock_playbook_flags(str(script), str(tmp_path / "ansible")) == ()
+
+
+@pytest.mark.parametrize("customized", [False, True])
+def test_modern_launcher_recognizes_the_pinned_source_module(tmp_path, customized):
+    from tests import _stock_playbook_flags
+
+    package = tmp_path / "ansible"
+    module = package / "cli" / "playbook.py"
+    module.parent.mkdir(parents=True)
+    source = "#!/usr/bin/env python3\ndef main():\n    pass\nif __name__ == '__main__':\n    main()\n"
+    module.write_text(source)
+    script = tmp_path / "ansible-playbook"
+    script.write_text(source + ("set_custom_config()\n" if customized else ""))
+    assert _stock_playbook_flags(str(script), str(package)) == (None if customized else ())
+
+
+def test_modern_launcher_rejects_recorded_wrapper_initialization(tmp_path, monkeypatch):
+    import tests
+
+    wrapper = tmp_path / "ansible-playbook"
+    wrapper.write_text("#!/usr/bin/env python3\nimport os\nos.environ['ANSIBLE_CONFIG'] = '/other.cfg'\n")
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter([str(wrapper)]))
+    with pytest.raises(RuntimeError, match="launcher initialization cannot be replayed"):
+        tests._select_playbook_launcher(str(tmp_path / "ansible" / "__init__.py"), "2.14.18")
+
+
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+def test_recorded_launcher_does_not_transfer_flags_from_foreign_python(tmp_path, monkeypatch, version):
+    import tests
+
+    launcher = tmp_path / "ansible-playbook"
+    launcher.write_text("#!/other/bin/python3 -s\nfrom ansible.cli.playbook import main\nmain()\n")
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter([str(launcher)]))
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(()))
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "selected" / "python3"))
+    filename = str(tmp_path / "ansible" / "__init__.py")
+    if version == "2.12.10":
+        with pytest.raises(FileNotFoundError, match="cannot replay flags from a different Python interpreter"):
+            tests._select_playbook_launcher(filename, version)
+    else:
+        assert tests._select_playbook_launcher(filename, version) == ("", (), False)
+
+
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+@pytest.mark.parametrize("no_user_site", [False, True])
+@pytest.mark.parametrize("safe_path", [None, "environment", "shebang", "env-shebang"])
+def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, no_user_site, safe_path):
+    from tests import _reference_playbook_command
+
+    if safe_path and not hasattr(sys.flags, "safe_path"):
+        pytest.skip("Python does not support safe-path mode")
+    # Virtual environments can disable usercustomize even without -s.
+    monkeypatch.setattr(sys, "executable", os.path.realpath(sys._base_executable))
+    monkeypatch.setenv("PATH", os.path.dirname(sys.executable), prepend=os.pathsep)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    monkeypatch.delenv("ANSIROLL_TEST_USERCUSTOMIZE", raising=False)
+    monkeypatch.delenv("ANSIROLL_TEST_SITECUSTOMIZE", raising=False)
+    if safe_path == "environment":
+        monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    source = "inherited" if safe_path else "launcher"
+    package = tmp_path / "lib" / "ansible"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "import csv, os, site, sys\nfrom parity_legacy_dependency import SOURCE\n"
+        "assert csv.PARITY_TEST_MODULE\n"
+        f"assert bool(sys.flags.no_user_site) is {no_user_site!r}\n"
+        "assert ('ANSIROLL_TEST_USERCUSTOMIZE' in os.environ) is bool(site.ENABLE_USER_SITE)\n"
+        "assert os.environ['ANSIROLL_TEST_SITECUSTOMIZE'] == '1'\n"
+    )
+    (package / "cli").mkdir()
+    (package / "cli" / "playbook.py").write_text(
+        "import ansible, sys\ndef main():\n"
+        f"    assert not {no_user_site!r} or sys.flags.no_user_site\n"
+        "    print(ansible.SOURCE)\n"
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "parity_legacy_dependency.py").write_text("SOURCE = 'launcher'\n")
+    options = ("s" if no_user_site else "") + ("P" if safe_path == "shebang" else "")
+    if safe_path == "env-shebang":
+        shebang = "#!/usr/bin/env -S python3 -s -P" if no_user_site else "#!/usr/bin/env -S python3 -P"
+    else:
+        shebang = f"#!{sys.executable} -{options}" if options else "#!/usr/bin/env python"
+    legacy_body = (
+        "import os, sys, ansible\n"
+        f"assert ansible.SOURCE == {source!r}, ansible.SOURCE\n"
+        f"assert not {no_user_site!r} or sys.flags.no_user_site\n"
+        "print('ansible python module location = ' + os.path.dirname(ansible.__file__))\n"
+    )
+    body = legacy_body if version == "2.12.10" else "from ansible.cli.playbook import main\nmain()\n"
+    (bin_dir / "ansible-playbook").write_text(f"{shebang}\n{body}")
+    (tmp_path / "parity_legacy_dependency.py").write_text("SOURCE = 'inherited'\n")
+    (tmp_path / "csv.py").write_text("PARITY_TEST_MODULE = True\n")
+    (tmp_path / "usercustomize.py").write_text("import os\nos.environ['ANSIROLL_TEST_USERCUSTOMIZE'] = '1'\n")
+    (tmp_path / "sitecustomize.py").write_text(
+        "import os\n"
+        "key = 'ANSIROLL_TEST_SITECUSTOMIZE'\n"
+        "os.environ[key] = str(int(os.environ.get(key, '0')) + 1)\n"
+        "with open('startup.log', 'a') as log:\n"
+        "    log.write('sitecustomize\\n')\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
+    command = _reference_playbook_command(str(package / "__init__.py"), version)
+    result = subprocess.run(
+        command + ["--version"], cwd=tmp_path, env=_env(),
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    expected = f"ansible python module location = {package}" if version == "2.12.10" else source
+    assert result.stdout.strip() == expected
+    assert (tmp_path / "startup.log").read_text().splitlines() == ["sitecustomize"]
+
+
+def test_subprocess_compile_pins_the_pytest_ansible_package(tmp_path, monkeypatch):
+    foreign = tmp_path / "foreign"
+    package = foreign / "ansible"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("raise RuntimeError('wrong Ansible selected')\n")
+    monkeypatch.setenv("PYTHONPATH", str(foreign), prepend=os.pathsep)
+    playbook = _write(tmp_path, "- hosts: localhost\n  gather_facts: false\n")
+    output = tmp_path / "compiled.py"
+    result = subprocess.run(
+        ansiroll_compile_command() + [str(playbook), "-o", str(output)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.is_file()
+
+
+@pytest.mark.parametrize("reference", [False, True])
+def test_parity_subprocess_imports_playbook_local_filter_helpers(tmp_path, monkeypatch, reference):
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(dependencies), prepend=os.pathsep)
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
+    filter_imports = ""
+    if reference:
+        filter_imports = (
+            "import sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n"
+        )
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - import_tasks: "{{ 'included' | parity_task_file }}"
+""", {
+        "tests.py": "def task_file(name):\n    return name + '.yml'\n",
+        "filter_plugins/parity_filters.py": (
+            filter_imports + "from tests import task_file\n"
+            "class FilterModule:\n"
+            "    def filters(self):\n"
+            "        return {'parity_task_file': task_file}\n"
+        ),
+        "included.yml": "- debug: msg=selected-from-playbook\n",
+    })
+    output = tmp_path / "compiled.py"
+    if reference:
+        command = ansible_playbook_command() + ["-i", "localhost,", str(playbook)]
+    else:
+        command = ansiroll_compile_command() + [str(playbook), "-o", str(output)]
+    result = subprocess.run(
+        command, cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    if reference:
+        assert "selected-from-playbook" in result.stdout
+    else:
+        assert output.is_file()
+
+
+def test_legacy_launcher_reports_unsupported_wrapper(tmp_path):
+    from tests import _legacy_python_launcher
+
+    wrapper = tmp_path / "ansible-playbook"
+    wrapper.write_text("#!/bin/sh\nexport ANSIBLE_CONFIG=/some/config\nexec ansible-playbook \"$@\"\n")
+    diagnostics = []
+    assert _legacy_python_launcher(str(wrapper), "", diagnostics, associated=True) is None
+    assert "cannot replay a non-Python launcher's initialization" in diagnostics[0]
+
+
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("prefix", [
+    "#!/usr/bin/python3\n",
+    "#! /usr/bin/env python3\n",
+    "#!/usr/bin/env -S python3\n",
+    "#!/bin/sh\n'''exec' '/path with spaces/python3' \"$0\" \"$@\"\n' '''\n",
+    "#!/bin/sh\n'''exec' '/user'\"'\"'s env/python3' \"$0\" \"$@\"\n' '''\n",
+    "#!/bin/sh\n'''exec' \"/path with spaces/python3\" \"$0\" \"$@\"\n' '''\n",
+    ("#!/bin/sh\n'''exec' /workspace/team@2/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team,2=parity:linux#1/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team\u3000two/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team[draft/" + "long-component/" * 8
+     + "venv/bin/python3 \"$0\" \"$@\"\n' '''\n"),
+    ("#!/bin/sh\n'''exec' /workspace/team{draft}/" + "long-component/" * 8
+     + "venv/bin/python3.10d \"$0\" \"$@\"\n' '''\n"),
+    "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
+])
+def test_legacy_fallback_verifies_launcher_against_selected_package(tmp_path, stale, prefix):
+    import tests
+
+    package = tmp_path / "ansible"
+    scripts = package / "cli" / "scripts"
+    scripts.mkdir(parents=True)
+    stub = scripts / "ansible_cli_stub.py"
+    stub.write_text("#!/usr/bin/env python\nstart_expected_release()\n")
+    launcher = tmp_path / "ansible-playbook"
+    startup = "start_stale_release()" if stale else "start_expected_release()"
+    launcher.write_text(prefix + startup + "\n")
+    diagnostics = []
+    found = tests._legacy_python_launcher(
+        str(launcher), str(package), diagnostics, associated=False)
+    if stale:
+        assert found is None
+        assert "differs from the selected Ansible release" in diagnostics[0]
+    else:
+        assert found is not None and found[:2] == (str(launcher), ())
+
+
+@pytest.mark.parametrize("interpreter", [
+    "ANSIBLE_CONFIG=/custom /usr/bin/python3",
+    "/workspace/team two/bin/python3",
+    "/workspace/team\ttwo/bin/python3",
+    "/workspace/$TEAM/bin/python3",
+    "/workspace/{old,new}/bin/python3",
+    "/workspace/{old{draft},new}/bin/python3",
+    "/workspace/team{-1..+3..+2}/bin/python3",
+    "/workspace/team[12]/bin/python3",
+    "/workspace/team[^]/bin/python3",
+    "/workspace/team[]]/bin/python3",
+    "/workspace/team?2/bin/python3",
+    "/workspace/team*2/bin/python3",
+    "/workspace/team;other/bin/python3",
+])
+def test_launcher_body_keeps_unrecognized_shell_initialization(monkeypatch, interpreter):
+    import tests
+
+    monkeypatch.setattr(tests, "_shell_preserves_braces", lambda: False)
+    monkeypatch.setattr(tests, "_shell_preserves_path_pattern", lambda path: False)
+    wrapper = (
+        f"#!/bin/sh\n'''exec' {interpreter} \"$0\" \"$@\"\n"
+        "' '''\nstart_expected_release()\n"
+    )
+    assert tests._launcher_body(wrapper) == wrapper
+
+
+def test_launcher_body_accepts_the_current_interpreter_under_a_custom_name(tmp_path, monkeypatch):
+    from tests import _launcher_body
+
+    executable = tmp_path / "custom-cpython"
+    monkeypatch.setattr(sys, "executable", str(executable))
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' '{executable}' \"$0\" \"$@\"\n' '''\n{body}"
+    assert _launcher_body(wrapper) == body
+
+
+@pytest.mark.parametrize("literal_braces", [True, False])
+@pytest.mark.parametrize("matching_python", [True, False])
+def test_legacy_launcher_with_brace_alternatives_requires_a_literal_shell(
+    monkeypatch, literal_braces, matching_python,
+):
+    import tests
+
+    executable = "/workspace/team{dev,prod}/" + "long-component/" * 8 + "venv/bin/python3"
+    monkeypatch.setattr(sys, "executable", executable if matching_python else "/other/bin/python3")
+    monkeypatch.setattr(tests, "_shell_preserves_braces", lambda: literal_braces)
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
+    assert tests._launcher_body(wrapper) == (body if literal_braces else wrapper)
+
+
+@pytest.mark.skipif(not os.path.isfile("/bin/sh"), reason="requires a POSIX shell")
+@pytest.mark.parametrize("dirname", ["team[12]", "team*", "team?"])
+@pytest.mark.parametrize("alternative_exists", [True, False])
+def test_shell_probe_checks_whether_pathname_patterns_stay_literal(tmp_path, monkeypatch, dirname, alternative_exists):
+    from tests import _shell_preserves_path_pattern
+
+    monkeypatch.chdir(tmp_path)
+    executable = tmp_path / dirname / "python3"
+    executable.parent.mkdir()
+    executable.touch()
+    if alternative_exists:
+        alternative = tmp_path / "team1" / "python3"
+        alternative.parent.mkdir()
+        alternative.touch()
+    assert _shell_preserves_path_pattern(f"{dirname}/python3") is not alternative_exists
+
+
+@pytest.mark.parametrize("stays_literal", [True, False])
+def test_legacy_launcher_uses_the_shell_probe_for_pathname_patterns(monkeypatch, stays_literal):
+    import tests
+
+    executable = "/workspace/team[12]/venv/bin/python3"
+    probes = []
+
+    def check_pattern(path):
+        probes.append(path)
+        return stays_literal
+
+    monkeypatch.setattr(tests, "_shell_preserves_path_pattern", check_pattern)
+    body = "start_expected_release()\n"
+    wrapper = f"#!/bin/sh\n'''exec' {executable} \"$0\" \"$@\"\n' '''\n{body}"
+    assert tests._launcher_body(wrapper) == (body if stays_literal else wrapper)
+    assert probes == [executable]
+
+
+@pytest.mark.parametrize("stub_available", [True, False])
+@pytest.mark.parametrize("shebang", [
+    "#!/usr/bin/env -S ANSIBLE_CONFIG=/custom/ansible.cfg python3",
+    "#!/usr/bin/env -S python3 -I",
+    "#!/usr/bin/python3 -I",
+])
+def test_legacy_launcher_rejects_shebang_settings_before_replay(
+    tmp_path, stub_available, shebang,
+):
+    import tests
+
+    package = tmp_path / "ansible"
+    if stub_available:
+        scripts = package / "cli" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "ansible_cli_stub.py").write_text("#!/usr/bin/env python\nstart_expected_release()\n")
+    launcher = tmp_path / "ansible-playbook"
+    launcher.write_text(shebang + "\nstart_expected_release()\n")
+    diagnostics = []
+    assert tests._legacy_python_launcher(str(launcher), str(package), diagnostics, associated=True) is None
+    assert "launcher shebang cannot be replayed" in diagnostics[0]
+
+
+@pytest.mark.parametrize("relative_path", [False, True])
+def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, monkeypatch, relative_path):
+    checkout = tmp_path / "checkout"
+    package = checkout / "ansible"
+    package.mkdir(parents=True)
+    init = package / "__init__.py"
+    init.write_text("from parity_dependency import SOURCE\n")
+    (checkout / "parity_dependency.py").write_text("SOURCE = 'checkout'\n")
+    dependencies = tmp_path / "dependencies"
+    dependencies.mkdir()
+    (dependencies / "parity_dependency.py").write_text("SOURCE = 'inherited'\n")
+    monkeypatch.setenv("PYTHONPATH", dependencies.name if relative_path else str(dependencies))
+
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; from tests import _load_reference_ansible; "
+         "_load_reference_ansible(sys.argv[1]); import ansible; print(ansible.SOURCE)",
+         str(init)],
+        cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert result.stdout.strip() == "inherited"
 
 
 def test_untrusted_data_is_not_templated_again(tmp_path):
@@ -1230,7 +1924,7 @@ def test_break_when_error_fails_the_item(tmp_path):
     script = tmp_path / "compiled.py"
     script.write_text(src)
     commands = [
-        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(path)],
         [sys.executable, str(script)],
     ]
     for command in commands:
@@ -1317,7 +2011,7 @@ def test_debug_nested_undefined_survives_generated_result_reporting(tmp_path):
 """)
     script = tmp_path / "compiled.py"
     script.write_text(compile_playbook(str(path))[0])
-    ansible = ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)]
+    ansible = ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(path)]
     modern = Version(__version__) >= Version("2.19")
     runs = [(ansible, _env()), ([sys.executable, str(script)], _env())]
     if modern:
@@ -1468,12 +2162,12 @@ def test_broken_conditional_policy_is_baked(tmp_path, enabled):
 """)
     env = dict(_env(), ANSIBLE_ALLOW_BROKEN_CONDITIONALS=str(enabled))
     expected = subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(path)],
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(path)],
         cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
     )
     script = tmp_path / "compiled.py"
     subprocess.run(
-        [sys.executable, "-m", "ansiroll.cli", "compile", str(path), "-o",
+        ansiroll_compile_command() + [str(path), "-o",
          str(script), "--tree-shake"], cwd=tmp_path, env=env,
         capture_output=True, text=True, check=True,
     )
