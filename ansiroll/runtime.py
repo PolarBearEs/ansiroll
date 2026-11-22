@@ -2677,6 +2677,7 @@ class Runtime:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
                     if before_setup:
+                        selected = baked
                         break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "

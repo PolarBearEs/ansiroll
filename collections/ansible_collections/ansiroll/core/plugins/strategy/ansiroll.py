@@ -406,7 +406,7 @@ class StrategyModule(StrategyBase):
                     gather_reply = {"t": "gather_args_result"}
                     if gather_facts:
                         try:
-                            gather_reply["args"] = self._gather_args(host, task_map["__gather_facts__"])
+                            gather_reply["args"] = self._gather_args(host, task_map["__gather_facts__"], play_context)
                         except Exception as ex:
                             gather_reply["error"] = str(ex)
                     else:
@@ -424,7 +424,7 @@ class StrategyModule(StrategyBase):
             last_frame = now
         return host_failed
 
-    def _gather_args(self, host, task):
+    def _gather_args(self, host, task, play_context):
         variables = self._variable_manager.get_vars(play=self._cur_play, host=host, task=task)
         search_path = task.get_search_path()
         basedir = self._loader.get_basedir()
@@ -432,11 +432,24 @@ class StrategyModule(StrategyBase):
             search_path.append(basedir)
         variables["ansible_search_path"] = search_path
         templar = self._mk_templar(variables)
+        context_error = None
+        try:
+            # Match TaskExecutor's connection context for implicit setup.
+            setup_context = play_context.set_task_and_variable_override(task, variables, templar)
+            setup_context.post_validate(templar=templar)
+            if not setup_context.remote_addr:
+                setup_context.remote_addr = host.address
+            setup_context.update_vars(variables)
+        except AnsibleError as ex:
+            context_error = ex
+        templar.available_variables = variables
         if task.when:
             resolve = getattr(task, "_resolve_conditional", None)
             allowed = resolve(task.when, variables) if resolve else task.evaluate_conditional(templar, variables)
             if not allowed:
                 return None
+        if context_error is not None:
+            raise context_error
         args = templar.template(task.args)
         omit = variables.get("omit")
         return {key: value for key, value in args.items() if value is not None and value != omit}

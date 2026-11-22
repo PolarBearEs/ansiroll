@@ -1347,8 +1347,12 @@ def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
     assert msgs == ['"default path"']
 
 
-@pytest.mark.parametrize("fallback", ["", " | default('missing')"])
-def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, fallback):
+@pytest.mark.parametrize("selector", [
+    "lookup('file', playbook_dir ~ '/files/profile.txt')",
+    "lookup('file', playbook_dir ~ '/files/profile.txt') | default('missing')",
+    "lookup('pipe', 'cat ' ~ (playbook_dir ~ '/files/profile.txt') | quote)",
+])
+def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, selector):
     _write(tmp_path, {
         "files/profile.txt": "minimal\n",
         "vars/minimal.yml": "subset: ['!all', '!min']\n",
@@ -1356,10 +1360,10 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
-          vars_files: ["vars/{{ lookup('file', playbook_dir ~ '/files/profile.txt')%s }}.yml"]
+          vars_files: ["vars/{{ %s }}.yml"]
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """ % fallback,
+        """ % selector,
     })
     output = tmp_path / "out.py"
     subprocess.run(
@@ -1508,6 +1512,25 @@ def test_strategy_setup_uses_controller_skip_result(tmp_path):
     actual = _ansible_run(tmp_path, [], "ansiroll.core.ansiroll")
     assert expected.returncode == actual.returncode == 0
     assert _summary(expected.stdout) == _summary(actual.stdout)
+
+
+def test_strategy_setup_fact_path_uses_connection_address(tmp_path):
+    _write(tmp_path, {
+        "localhost/example.fact": '{"marker": "connection address"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ ansible_host }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    })
+    expected = _ansible_run(tmp_path, [])
+    actual = _ansible_run(tmp_path, [], "ansiroll.core.ansiroll")
+    assert expected.returncode == actual.returncode == 0, actual.stdout + actual.stderr
+    assert _summary(actual.stdout) == _summary(expected.stdout)
+    assert _summary(expected.stdout)[0] == ['"connection address"']
 
 
 def test_implicit_setup_fact_path_uses_controller_task_vars(tmp_path):
