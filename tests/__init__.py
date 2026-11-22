@@ -215,8 +215,10 @@ def _python_environment(executable):
     # Resolve the environment root only after finding the configuration.
     directory = os.path.dirname(os.path.abspath(executable))
     prefix = os.path.dirname(directory)
-    if any(os.path.isfile(os.path.join(parent, "pyvenv.cfg")) for parent in (directory, prefix)):
-        return os.path.realpath(prefix)
+    for parent in (directory, prefix):
+        config = os.path.join(parent, "pyvenv.cfg")
+        if os.path.isfile(config):
+            return os.path.realpath(prefix), os.path.realpath(config)
     return None
 
 

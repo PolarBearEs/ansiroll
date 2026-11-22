@@ -366,8 +366,9 @@ def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, mon
     system.touch()
     executables = []
     for name in ("selected", "foreign"):
-        root = tmp_path / name
-        executable = root / "bin" / "python3"
+        root = tmp_path / ("shared" if config_beside_python else name)
+        bin_dir = f"{name}-bin" if config_beside_python else "bin"
+        executable = root / bin_dir / "python3"
         executable.parent.mkdir(parents=True)
         config_dir = executable.parent if config_beside_python else root
         (config_dir / "pyvenv.cfg").touch()
