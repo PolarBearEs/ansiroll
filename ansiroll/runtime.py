@@ -5487,6 +5487,21 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
+def _delegate_fallback_value(value):
+    """Read lazy members once, leaving undefined mapping keys absent."""
+    if isinstance(value, dict):
+        resolved = {}
+        for key in value:
+            try:
+                resolved[key] = _delegate_fallback_value(value[key])
+            except jinja2.UndefinedError:
+                continue
+        return resolved
+    if isinstance(value, (list, tuple)):
+        return [_delegate_fallback_value(item) for item in value]
+    return _fail_on_undef(value)
+
+
 def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *,
                    controller_vars=None, play_fallbacks=None):
     """Return the serializable part of a task context for controller actions."""
@@ -5516,7 +5531,7 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *,
                     try:
                         rendered = (scope[key] if isinstance(original, _PlayVarTemplate)
                                     else templater.resolve_variable(key, original, scope))
-                        play_fallbacks[key] = json.loads(json.dumps(_fail_on_undef(rendered), default=str))
+                        play_fallbacks[key] = json.loads(json.dumps(_delegate_fallback_value(rendered), default=str))
                     except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
                         pass
             if templater is not None and (resolve_keys is None or key in resolve_keys):

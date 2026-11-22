@@ -2071,7 +2071,9 @@ from ansiroll import runtime
 runtime._INJECTED_VARS = json.loads(sys.argv[3])
 runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
     "names": ["/vars/{{ inventory_hostname }}.yml"],
-    "files": {"/vars/localhost.yml": [{"file_options": {"label": "{{ 'release' | upper }}"}}]},
+    "files": {"/vars/localhost.yml": [{"file_options": {
+        "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
+    }}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
     "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},

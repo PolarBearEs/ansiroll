@@ -208,6 +208,26 @@ def test_delegation_resolves_selected_action_variables():
     assert sent["unused"] == "{{ rsync_binary }}"
 
 
+def test_delegated_play_fallback_renders_each_member_once():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    calls = []
+
+    def label():
+        calls.append(True)
+        return "ready"
+
+    rt.templater.env.globals["label"] = label
+    values = rt.template_vars({"settings": {"label": "{{ label() }}", "optional": "{{ missing }}"}},
+                              {}, dynamic=True)
+    deferred = {}
+    fallbacks = {}
+    _delegate_vars(values, rt.templater, set(), deferred, play_fallbacks=fallbacks)
+    assert fallbacks == {"settings": {"label": "ready"}}
+    assert calls == [True]
+
+
 def test_delegated_loop_task_alias_uses_agent_filters():
     from ansiroll.runtime import _delegate_vars
 
