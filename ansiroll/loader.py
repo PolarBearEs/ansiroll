@@ -221,7 +221,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         _is_templated(item) for value in gather_options.values() for item in _as_list(value)
     )
     gather_vars_files = []
-    if scoped_gather and any("selector" in entry for entry in ordered_vars_files):
+    if scoped_gather:
         for entry in ordered_vars_files:
             if "selector" not in entry:
                 gather_vars_files.append(_tag_untrusted(entry))
@@ -532,7 +532,8 @@ def _deferred_vars_files(play, basedir, entries):
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
     in another directory level than the template's position. A name whose leading directory is a template
     can render to any directory, so its entry lists it under ``unmodeled``. A file the runtime must not load is bundled
-    as an error marker that aborts the run if it is selected.
+    as an error marker that aborts the run if it is selected. Lists of mappings are accepted for explicit
+    filenames and in the play's vars search directories.
     """
     import glob
 
@@ -541,10 +542,11 @@ def _deferred_vars_files(play, basedir, entries):
     else:
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
+    vars_dirs = tuple(os.path.normcase(os.path.realpath(os.path.join(d, "vars"))) + os.sep for d in dirs)
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
-        files = {}
+        candidates = {}
         unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
@@ -559,8 +561,10 @@ def _deferred_vars_files(play, basedir, entries):
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
-                    if found not in files and os.path.isfile(found):
-                        files[found] = _bundled_vars_file(play, found)
+                    if os.path.isfile(found):
+                        in_vars_dir = os.path.normcase(os.path.realpath(found)).startswith(vars_dirs)
+                        candidates[found] = candidates.get(found, False) or in_vars_dir or not _is_templated(name)
+        files = {path: _bundled_vars_file(play, path, allow_lists) for path, allow_lists in candidates.items()}
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
         if unmodeled:
             entry["unmodeled"] = unmodeled
@@ -568,7 +572,7 @@ def _deferred_vars_files(play, basedir, entries):
     return deferred
 
 
-def _bundled_vars_file(play, path):
+def _bundled_vars_file(play, path, allow_lists=False):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
@@ -582,10 +586,15 @@ def _bundled_vars_file(play, path):
     try:
         from ansible.vars.manager import preprocess_vars
 
-        return _tag_untrusted(preprocess_vars(_load_vars_file(play, path)) or [])
+        loaded = _load_vars_file(play, path)
+        if isinstance(loaded, dict) or loaded is None or allow_lists:
+            return _tag_untrusted(preprocess_vars(loaded) or [])
+        preprocess_vars(loaded)
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+    return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
+            "a mapping" % path}
 
 
 def _vars_file_variable_names(entries):

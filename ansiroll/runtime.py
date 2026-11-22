@@ -2628,8 +2628,9 @@ class Runtime:
         return ctx
 
     def _with_deferred_vars_files(self, play, gather_magic, base=None, before_setup=False):
-        """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
-        files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
+        """Apply vars_files in order, including the lower-precedence scope for setup."""
+        if not before_setup and not play.get("deferred_vars_files"):
+            return dict(play.get("vars") or {})
         scope = play.get("gather_scope") or {}
         play_vars = dict(scope.get("base_vars", play.get("vars")) or {})
         merge = (before_setup or bool(scope)) and self._gather_hash_merge()
@@ -2639,6 +2640,9 @@ class Runtime:
                 base = self._gather_host_base(scope, gather_magic, merge)
             else:
                 base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        if before_setup:
+            play_vars = _f_combine(base, play_vars, recursive=merge)
+            base = {}
         for entry in scope.get("vars_files", play.get("deferred_vars_files")) or ():
             values = entry.get("values")
             if not before_setup and "compile_path" in entry:
@@ -2659,6 +2663,11 @@ class Runtime:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
                     if before_setup:
+                        if "compile_path" in entry:
+                            # A deployed runner may no longer have the controller
+                            # input needed to reproduce a compile-time selector.
+                            values = entry["files"][entry["compile_path"]]
+                            play_vars = _f_combine(play_vars, *values, recursive=merge)
                         break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
@@ -2705,6 +2714,17 @@ class Runtime:
         return config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
 
     def _gather_host_base(self, scope, magic, merge):
+        import ipaddress
+
+        inventory = dict(self._gather_inventory_vars)
+        hostname = inventory.setdefault("inventory_hostname", self.host)
+        if "inventory_hostname_short" not in inventory:
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError:
+                hostname = hostname.split(".", 1)[0]
+            inventory["inventory_hostname_short"] = hostname
+        inventory.setdefault("group_names", [])
         controller = {key: self.vars[key] for key in
                       ("__ansiroll_controller_env", "__ansiroll_controller_config")}
         config = controller["__ansiroll_controller_config"]
@@ -2714,7 +2734,7 @@ class Runtime:
         else:
             facts = {"ansible_local": cached.get("ansible_local", {})}
         facts["ansible_facts"] = _normalized_facts(cached, preserve_local=True)
-        return _f_combine(scope["role_defaults"], self._gather_inventory_vars, facts,
+        return _f_combine(scope["role_defaults"], inventory, facts,
                           controller, magic, recursive=merge)
 
     def _gather_contexts(self, play, magic, run_setup):
@@ -2732,8 +2752,8 @@ class Runtime:
         for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
             play_base[key] = self.vars[key]
         play_base.update(magic)
-        play_files = self._with_deferred_vars_files(play, magic, base=play_base, before_setup=True)
-        play_vars = _f_combine(play_base, play_files, exports, self.extra_vars, magic, recursive=merge)
+        play_vars = self._with_deferred_vars_files(play, magic, base=play_base, before_setup=True)
+        play_vars = _f_combine(play_vars, exports, self.extra_vars, magic, recursive=merge)
         play_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
         play_ctx = self.ctx(base=play_vars)
 
@@ -2742,8 +2762,8 @@ class Runtime:
 
         # The implicit setup task resolves fact_path with host and task vars.
         host_base = self._gather_host_base(scope, magic, merge)
-        setup_files = self._with_deferred_vars_files(play, magic, base=host_base, before_setup=True)
-        setup_vars = _f_combine(host_base, setup_files, exports, self._include_vars_layer,
+        setup_vars = self._with_deferred_vars_files(play, magic, base=host_base, before_setup=True)
+        setup_vars = _f_combine(setup_vars, exports, self._include_vars_layer,
                                 self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
         setup_vars["ansible_search_path"] = scope["search_path"]
         setup_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []

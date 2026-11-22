@@ -1347,6 +1347,71 @@ def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
     assert msgs == ['"default path"']
 
 
+def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path):
+    _write(tmp_path, {
+        "files/profile.txt": "minimal\n",
+        "vars/minimal.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars_files: ["vars/{{ lookup('file', playbook_dir ~ '/files/profile.txt') }}.yml"]
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    output = tmp_path / "out.py"
+    subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", str(output)],
+        cwd=str(tmp_path), env=_env(), capture_output=True, check=True,
+    )
+    (tmp_path / "files/profile.txt").unlink()
+    result = subprocess.run([sys.executable, str(output)], cwd=str(tmp_path),
+                            env=_env(), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert _summary(result.stdout)[0] == ['"distribution defined: False"']
+
+
+def test_setup_fact_path_uses_standalone_inventory_magic(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "localhost/example.fact": '{"marker": "host path"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ inventory_hostname_short if group_names is defined else 'missing' }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    })
+    expected = _ansible(tmp_path, [])
+    assert expected[0] == ['"host path"']
+    monkeypatch.setenv("ANSIROLL_HOST", "localhost.example.test")
+    assert _standalone(tmp_path, []) == expected
+
+
+def test_setup_applies_static_vars_files_in_hash_merge_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    msgs, _ = check(tmp_path, {
+        "group_vars/all.yml": "profile: {directory: wrong}\n",
+        "vars/final.yml": "profile: {other: value}\n",
+        "correct/example.fact": '{"marker": "correct merge"}',
+        "wrong/example.fact": '{"marker": "wrong merge"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          vars:
+            profile: cleared
+          vars_files: [vars/final.yml]
+          fact_path: "{{ playbook_dir }}/{{ profile.directory | default('correct') }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    }, strategy=False)
+    assert msgs == ['"correct merge"']
+
+
 def test_setup_reselection_preserves_standalone_task_includes(tmp_path, monkeypatch):
     from ansiroll.compiler import _shadowed_var_names
     from ansiroll.loader import parse_playbook
