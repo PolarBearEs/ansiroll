@@ -3,7 +3,15 @@ name: CI
 on:
   push:
     branches: [main, master]
-  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: GitHub's merge commit for the reviewed PR
+        type: string
+        required: true
+
+permissions:
+  contents: read
 
 jobs:
   # Fast, dependency-light job: the runtime interpreter, filters and tests work
@@ -12,6 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -25,6 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -75,6 +89,9 @@ jobs:
     name: "ansible ${{ matrix.ansible }} (py${{ matrix.python }})"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "${{ matrix.python }}"
@@ -114,12 +131,15 @@ jobs:
     name: "Ansible parity ${{ matrix.series }}"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          enable-cache: ${{ github.event_name == 'push' }}
       - name: Run linear and Ansiroll in fresh ansible-test containers
         id: docker-parity
         run: >-
@@ -138,12 +158,15 @@ jobs:
     name: "upstream parity 2.20 (full)"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          enable-cache: ${{ github.event_name == 'push' }}
       - name: Run matching upstream integration targets
         run: python tests/run_version_matrix.py 2.20 --profile full --skip-repo-tests
 
@@ -156,12 +179,15 @@ jobs:
     name: "ansible-test native-only parity 2.20"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          enable-cache: ${{ github.event_name == 'push' }}
       - name: Run native-only parity with execution provenance
         run: >-
           python tests/run_ansible_test_suite.py 2.20
