@@ -1379,8 +1379,28 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
     assert _summary(result.stdout)[0] == ['"distribution defined: False"']
 
 
+def test_setup_uses_baked_vars_when_controller_lookup_plugin_is_unavailable(tmp_path):
+    msgs, _ = check(tmp_path, {
+        "vars/minimal.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars_files:
+            - "{{ lookup('first_found', playbook_dir ~ '/vars/minimal.yml') }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    }, strategy=False)
+    assert msgs == ['"distribution defined: False"']
+
+
 @pytest.mark.parametrize("fallback", ["", " | default('missing')"])
-def test_setup_does_not_reuse_baked_vars_for_unset_runtime_profile(tmp_path, monkeypatch, fallback):
+@pytest.mark.parametrize("selector", [
+    "'vars/' ~ lookup('vars', 'selector_' ~ profile) ~ '.yml'",
+    "lookup('first_found', {'files': [profiles[profile]], 'paths': [playbook_dir]})",
+])
+def test_setup_does_not_reuse_baked_vars_for_unset_runtime_profile(tmp_path, monkeypatch, fallback, selector):
     _write(tmp_path, {
         "vars/configured.yml": "subset: [all]\n",
         "pb.yml": """
@@ -1390,10 +1410,11 @@ def test_setup_does_not_reuse_baked_vars_for_unset_runtime_profile(tmp_path, mon
           vars:
             profile: dev
             selector_dev: configured
-          vars_files: ["vars/{{ lookup('vars', 'selector_' ~ profile)%s }}.yml"]
+            profiles: {dev: vars/configured.yml}
+          vars_files: ["{{ (%s)%s }}"]
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """ % fallback,
+        """ % (selector, fallback),
     })
     assert _standalone(tmp_path, [])[0] == ['"distribution defined: True"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps({"profile": "unknown"}))

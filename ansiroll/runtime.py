@@ -1639,6 +1639,13 @@ class _Templater:
                              % (name, self._lookup_errors[name]))
         source = self._lookup_sources.get(name)
         if source is None:
+            if "__ansiroll_selector_lookup_failures" in (self._current_ctx or {}):
+                try:
+                    _fail_on_undef(args)
+                    _fail_on_undef(kwargs)
+                except jinja2.UndefinedError as e:
+                    return _captured(str(e))
+                _record_controller_lookup_failure(self._current_ctx)
             return _captured("lookup plugin '%s' was not found" % name)
         try:
             ns = {"__name__": "ansiroll_lookup_%s" % name}
