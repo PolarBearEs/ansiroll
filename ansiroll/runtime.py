@@ -1064,6 +1064,8 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
         return rt.templater._observe_untrusted(value)
     if task_vars and type(value) is str and _looks_templated(value):
         value = _TaskVarTemplate(value)
+    if type(value) is tuple and rt.templater._untrusted_task_interpolation is not None:
+        return _LazyTplTuple(value, rt, ctx)
     if isinstance(value, (str, tuple)):
         if getattr(rt, "_strict_var_resolution", False):
             return rt.template(value, ctx, strict=True)
@@ -1077,8 +1079,8 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
 
 def _observe_container_value(value, rt, render_ctx):
     templater = rt.templater
-    if templater._untrusted_task_interpolation is not None and type(value) in (dict, list):
-        return _lazy_container(value, rt, render_ctx())
+    if templater._untrusted_task_interpolation is not None and type(value) in (dict, list, tuple):
+        return _lazy_wrap(value, rt, render_ctx())
     return templater._observe_untrusted(value)
 
 
@@ -1438,6 +1440,31 @@ class _LazyTplList(list):
     __hash__ = None
 
 
+class _LazyTplTuple(tuple):
+    """A tuple whose members are observed when a conditional reads them."""
+
+    def __new__(cls, raw, rt, ctx):
+        view = tuple.__new__(cls, raw)
+        view._rt = rt
+        view._ctx = ctx
+        return view
+
+    def __getitem__(self, index):
+        return _lazy_wrap(tuple.__getitem__(self, index), self._rt, self._ctx)
+
+    def __iter__(self):
+        for value in tuple.__iter__(self):
+            yield _lazy_wrap(value, self._rt, self._ctx)
+
+    def __reversed__(self):
+        return (self[index] for index in range(len(self) - 1, -1, -1))
+
+    def __repr__(self):
+        return repr(tuple(iter(self)))
+
+    __str__ = __repr__
+
+
 def _jinja_dict(*args, **kwargs):
     # Python 3.5's dict(view) may copy a dict subclass's raw storage.
     if args and isinstance(args[0], (_LazyTplDict, _PlayVarView)):
@@ -1546,6 +1573,26 @@ class _StrictAnsirollUndefined(jinja2.StrictUndefined):
         jinja2.StrictUndefined.__init__(self, _undefined_hint(hint, obj, name), obj, name, exc)
 
 
+class _ConditionalName:
+    def __init__(self, context, key):
+        self.context = context
+        self.key = key
+
+
+class _ConditionalCodeGenerator(jinja2.compiler.CodeGenerator):
+    """Observe external names at their use sites in conditional templates."""
+
+    def get_resolve_func(self):
+        return self.get_context_ref() + "._defer_name"
+
+    def visit_Name(self, node, frame):
+        if node.ctx == "load":
+            self.write("context._consume_name(")
+        super().visit_Name(node, frame)
+        if node.ctx == "load":
+            self.write(")")
+
+
 class _AnsirollContext(jinja2.runtime.Context):
     """Template variables are templated lazily when a template looks them up.
 
@@ -1553,6 +1600,18 @@ class _AnsirollContext(jinja2.runtime.Context):
     trusted variable value that is itself a template renders on access; data
     marked as never-templated (results, facts, rendered output) is returned
     verbatim.  Names bound inside the template itself are never touched."""
+
+    def _defer_name(self, key):
+        scope = self.parent.get("vars")
+        if key in self or (isinstance(scope, _HandlerNameVars) and key in scope):
+            return _ConditionalName(self, key)
+        return jinja2.runtime.missing
+
+    @staticmethod
+    def _consume_name(value):
+        while isinstance(value, _ConditionalName):
+            value = value.context.resolve_or_missing(value.key)
+        return value
 
     def resolve_or_missing(self, key):
         if key in self.vars:
@@ -1570,7 +1629,7 @@ class _AnsirollContext(jinja2.runtime.Context):
             return value
         context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
         return templater.resolve_variable(
-            key, value, context, strict=self.environment is templater._strict_env)
+            key, value, context, strict=self.environment.undefined is _StrictAnsirollUndefined)
 
 
 class _PluginDict(dict):
@@ -1655,6 +1714,9 @@ class _Templater:
         self.env.globals.setdefault("undef", _jinja_undef)
         self.env.globals["dict"] = _jinja_dict
         self._strict_env = self.env.overlay(undefined=_StrictAnsirollUndefined)
+        self._conditional_env = self.env.overlay()
+        self._conditional_env.code_generator_class = _ConditionalCodeGenerator
+        self._strict_conditional_env = self._conditional_env.overlay(undefined=_StrictAnsirollUndefined)
 
     def _lookup_ctx(self, name, terms):
         """The vars lookup templates trusted values like a variable reference."""
@@ -1793,8 +1855,11 @@ class _Templater:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
             return _lazy_wrap(value, value._rt, ctx)
-        if self._runtime is not None and type(value) in (dict, list, _LoopVarsSnapshot, _RegisteredResult):
-            return _lazy_wrap(value, self._runtime, ctx)
+        if self._runtime is not None:
+            if type(value) in (dict, list, _LoopVarsSnapshot, _RegisteredResult):
+                return _lazy_wrap(value, self._runtime, ctx)
+            if type(value) is tuple and self._untrusted_task_interpolation is not None:
+                return _LazyTplTuple(value, self._runtime, ctx)
         return value
 
     def _observe_untrusted(self, value):
@@ -1942,8 +2007,12 @@ class _Templater:
         return result
 
     def _render_string(self, text, ctx, strict=False):
-        env = self._strict_env if strict else self.env
-        template_key = (text, strict)
+        tracking = self._untrusted_task_interpolation is not None
+        if tracking:
+            env = self._strict_conditional_env if strict else self._conditional_env
+        else:
+            env = self._strict_env if strict else self.env
+        template_key = (text, strict, tracking)
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
@@ -1951,9 +2020,9 @@ class _Templater:
                 and (stripped.count("{{") == 1 or lookup_expr)
                 and "{%" not in stripped):
             expr = stripped[2:-2].strip()
-            expr_key = (expr, True) if strict else expr
+            expr_key = (expr, strict, tracking)
             try:
-                if self._untrusted_task_interpolation is not None and ("[" in expr or "(" in expr or "+" in expr):
+                if tracking and ("[" in expr or "(" in expr or "+" in expr):
                     sequence = self._conditional_list(stripped, env, ctx, strict)
                     if sequence is not _NO_CONDITIONAL_LIST:
                         return sequence
@@ -1995,6 +2064,12 @@ class _Templater:
                 )
         try:
             result = _concretize(result)
+            if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
+                # Filter-produced containers can outlive this member's tracking
+                # when a later assertion member reads a cached alias.
+                result = _mark_unsafe(result, condition_text=True)
+                if self._runtime is not None:
+                    result = _lazy_wrap(result, self._runtime, ctx)
         except jinja2.TemplateError as e:
             return _captured_jinja_error(
                 e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
@@ -2007,7 +2082,7 @@ class _Templater:
             return expr
         expr = str(expr)
         ctx = self._play_var_scope(ctx, strict)
-        expr_key = (expr, True) if strict else expr
+        expr_key = (expr, strict, False)
         previous = self._current_ctx
         self._current_ctx = ctx
         try:
@@ -5316,6 +5391,7 @@ _SYNCHRONIZE_VARS = frozenset((
     "ansible_host_key_checking", "ansible_ssh_host_key_checking", "ansible_pipelining",
     "ansible_ssh_pipelining", "ansible_sftp_batch_mode", "ansible_ssh_use_tty",
     "ansible_podman_executable", "ansible_podman_extra_args",
+    "ansible_docker_extra_args",
     "ansible_become", "ansible_become_method", "ansible_become_user", "ansible_become_password",
     "ansible_become_pass", "ansible_become_exe", "ansible_become_flags",
     "ansible_sudo_user", "ansible_sudo_exe", "ansible_sudo_flags", "ansible_sudo_pass", "ansible_sudo_chdir",

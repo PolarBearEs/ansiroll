@@ -242,6 +242,7 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
         "ansible_ssh_use_tty": "{{ item != 'sample' }}",
         "ansible_podman_executable": "/usr/bin/{{ item | agent_filter }}",
         "ansible_podman_extra_args": "--name {{ item | agent_filter }}",
+        "ansible_docker_extra_args": "--context {{ item | agent_filter }}",
         "ansible_become": "{{ item == 'sample' }}",
         "ansible_become_user": "{{ item | agent_filter }}",
         "ansible_sudo_flags": "-H -u {{ item }}",
@@ -262,6 +263,7 @@ def test_delegated_synchronize_loop_sends_rendered_ssh_options():
     assert sent["ansible_ssh_use_tty"] is False
     assert sent["ansible_podman_executable"] == "/usr/bin/SAMPLE"
     assert sent["ansible_podman_extra_args"] == "--name SAMPLE"
+    assert sent["ansible_docker_extra_args"] == "--context SAMPLE"
     assert sent["ansible_become"] is True
     assert sent["ansible_become_user"] == "SAMPLE"
     assert sent["ansible_sudo_flags"] == "-H -u sample"
@@ -403,6 +405,7 @@ def test_conditional_rendering_tracks_marked_mapping_mutations(expression):
 @pytest.mark.parametrize("expression", [
     "result.data.pop()",
     "result.data.copy()[0]",
+    "result.data | reverse | first",
     "result.nested.pop().value",
 ])
 def test_conditional_rendering_tracks_marked_list_reads(expression):
@@ -415,6 +418,34 @@ def test_conditional_rendering_tracks_marked_list_reads(expression):
     ctx["item"] = "sample"
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", ["result.data[0]", "result.data | first"])
+def test_conditional_rendering_tracks_marked_tuple_reads(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": ("sample",)})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ (" + expression + ") ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", [
+    "'sample' if true else item",
+    "true and 'sample' or item",
+    "'sample' if true else unused_alias",
+])
+def test_loop_conditional_uses_only_selected_alias_branches(expression):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ " + expression + " }}",
+        "unused_alias": "{{ item ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = rt.template({"__ansiroll_unsafe__": "sample"}, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample'"}], ctx)
 
 
 def test_boolean_loop_conditions_read_only_the_selected_values():
@@ -649,6 +680,20 @@ def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():
     task = _task("task", "Task", None, loop=[1], vars={
         "text": "item == {{ result.stdout }}",
         "alias": "{{ [vars.text == 'item == 1', vars.text ~ ' and true'] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("expression", ["expressions[0]", "expressions[0] ~ ' and true'"])
+def test_loop_assertion_preserves_unsafe_marker_in_cached_alias_collection(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"parts": ["item == 1"]})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "expressions": "{{ result.parts | map('upper') | map('lower') | list }}",
+        "alias": "{{ [expressions[0] is string, " + expression + "] }}",
     })
     ctx = rt._task_ctx(task, {})
     ctx["item"] = 1
