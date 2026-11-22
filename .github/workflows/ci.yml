@@ -3,30 +3,62 @@ name: CI
 on:
   push:
     branches: [main, master]
-  pull_request:
-  pull_request_review:
-    types: [submitted]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
 
 jobs:
+  reviewed-head:
+    # issue_comment uses the default branch's workflow. Keep write permissions
+    # in jobs that only call GitHub's API and never check out PR code.
+    if: >-
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      vars.AMP_CI_ACTOR_ID != '' &&
+      format('{0}', github.event.comment.user.id) == vars.AMP_CI_ACTOR_ID &&
+      startsWith(github.event.comment.body, 'Amp cleared ci.yml for ')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      statuses: write
+    outputs:
+      head: ${{ steps.resolve.outputs.head }}
+      merge: ${{ steps.resolve.outputs.merge }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.issue.number }}
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          pattern='^Amp cleared ci\.yml for ([a-f0-9]{40})\.$'
+          [[ "$COMMENT" =~ $pattern ]] || exit 0
+          head=${BASH_REMATCH[1]}
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+          jq -e --arg head "$head" '.state == "open" and .head.sha == $head' <<< "$pr" >/dev/null || exit 0
+          merge=$(jq -er 'select(.mergeable == true) | .merge_commit_sha | strings' <<< "$pr")
+          [[ "$merge" =~ ^[a-f0-9]{40}$ ]]
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
+            -f context='Amp CI' -f state=pending -f description='Testing the reviewed PR' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          printf 'head=%s\nmerge=%s\n' "$head" "$merge" >> "$GITHUB_OUTPUT"
+
   # Fast, dependency-light job: the runtime interpreter, filters and tests work
   # with only Jinja2 (no Ansible) -- this proves the "runs on a bare target" path.
   unit:
-    # Setting the Amp actor enables review-first CI after the flow is installed.
-    # The review is tied to the PR head and CI tests GitHub's merge commit.
+    needs: reviewed-head
     if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'pull_request' && vars.AMP_CI_ACTOR == '') ||
-      (github.event_name == 'pull_request_review' &&
-       vars.AMP_CI_ACTOR != '' && github.event.review.user.login == vars.AMP_CI_ACTOR &&
-       github.event.review.state == 'commented' &&
-       github.event.review.commit_id == github.event.pull_request.head.sha &&
-       github.event.review.body == format('Amp cleared ci.yml for {0}.', github.event.pull_request.head.sha))
+      !cancelled() && (github.event_name == 'push' ||
+      (needs.reviewed-head.result == 'success' && needs.reviewed-head.outputs.merge != ''))
     runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ needs.reviewed-head.outputs.merge || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.reviewed-head.outputs.merge || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -40,6 +72,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.unit.outputs.ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -90,6 +125,9 @@ jobs:
     name: "ansible ${{ matrix.ansible }} (py${{ matrix.python }})"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.unit.outputs.ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "${{ matrix.python }}"
@@ -129,12 +167,15 @@ jobs:
     name: "Ansible parity ${{ matrix.series }}"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.unit.outputs.ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          enable-cache: ${{ github.event_name == 'push' }}
       - name: Run linear and Ansiroll in fresh ansible-test containers
         id: docker-parity
         run: >-
@@ -153,12 +194,15 @@ jobs:
     name: "upstream parity 2.20 (full)"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.unit.outputs.ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          enable-cache: ${{ github.event_name == 'push' }}
       - name: Run matching upstream integration targets
         run: python tests/run_version_matrix.py 2.20 --profile full --skip-repo-tests
 
@@ -171,13 +215,41 @@ jobs:
     name: "ansible-test native-only parity 2.20"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.unit.outputs.ref }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
+          enable-cache: ${{ github.event_name == 'push' }}
       - name: Run native-only parity with execution provenance
         run: >-
           python tests/run_ansible_test_suite.py 2.20
           --profile native --native-only --provenance
+
+  report-pr-ci:
+    needs: [reviewed-head, unit, coverage, matrix, parity, upstream-parity-full, ansible-test-native-parity]
+    if: always() && needs.reviewed-head.outputs.head != ''
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ needs.reviewed-head.outputs.head }}
+          PASSED: >-
+            ${{ needs.unit.result == 'success' && needs.coverage.result == 'success' &&
+            needs.matrix.result == 'success' && needs.parity.result == 'success' &&
+            needs.upstream-parity-full.result == 'success' && needs.ansible-test-native-parity.result == 'success' }}
+        run: |
+          state=failure
+          description='Tests did not pass'
+          if [[ "$PASSED" == true ]]; then
+            state=success
+            description='Tests passed on the reviewed PR merge commit'
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" \
+            -f context='Amp CI' -f state="$state" -f description="$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
