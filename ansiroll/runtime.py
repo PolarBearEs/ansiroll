@@ -403,7 +403,7 @@ def _debug_var_value(value):
 def _condition_contains_string(value, string_type):
     if isinstance(value, string_type):
         return True
-    if isinstance(value, (_LazyTplDict, _LazyTplList)):
+    if isinstance(value, (_LazyTplDict, _LazyTplList, _LazyTplTuple)):
         # The condition renderer observes members it actually accesses,
         # after the current loop item has been bound.
         return False
@@ -1247,7 +1247,8 @@ class _LookupVars(dict):
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
-        if isinstance(value, _TaskVarTemplate):
+        if isinstance(value, _TaskVarTemplate) or (
+                isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
             return self.templater.resolve_variable(key, value, self.ctx)
         return self.templater._observe_untrusted(value)
 
@@ -1459,6 +1460,51 @@ class _LazyTplTuple(tuple):
     def __reversed__(self):
         return (self[index] for index in range(len(self) - 1, -1, -1))
 
+    def __eq__(self, other):
+        return tuple(iter(self)) == (tuple(iter(other)) if isinstance(other, _LazyTplTuple) else other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __contains__(self, value):
+        return value in tuple(iter(self))
+
+    def __add__(self, other):
+        if isinstance(other, _LazyTplTuple):
+            other = tuple(iter(other))
+        return tuple.__add__(tuple(iter(self)), other)
+
+    def __radd__(self, other):
+        if not isinstance(other, tuple):
+            return NotImplemented
+        return other + tuple(iter(self))
+
+    def __mul__(self, count):
+        return tuple.__mul__(tuple(iter(self)), count)
+
+    __rmul__ = __mul__
+
+    def __lt__(self, other):
+        return tuple.__lt__(tuple(iter(self)), tuple(iter(other)) if isinstance(other, _LazyTplTuple) else other)
+
+    def __le__(self, other):
+        return tuple.__le__(tuple(iter(self)), tuple(iter(other)) if isinstance(other, _LazyTplTuple) else other)
+
+    def __gt__(self, other):
+        return tuple.__gt__(tuple(iter(self)), tuple(iter(other)) if isinstance(other, _LazyTplTuple) else other)
+
+    def __ge__(self, other):
+        return tuple.__ge__(tuple(iter(self)), tuple(iter(other)) if isinstance(other, _LazyTplTuple) else other)
+
+    def __hash__(self):
+        return hash(tuple(iter(self)))
+
+    def index(self, *args):
+        return tuple(iter(self)).index(*args)
+
+    def count(self, value):
+        return tuple(iter(self)).count(value)
+
     def __repr__(self):
         return repr(tuple(iter(self)))
 
@@ -1474,7 +1520,8 @@ def _jinja_dict(*args, **kwargs):
 
 def _type_name(value):
     """type_debug: internal wrappers report the builtin type they stand for."""
-    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"), (_LazyTplList, "list")):
+    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"),
+                           (_LazyTplList, "list"), (_LazyTplTuple, "tuple")):
         if isinstance(value, internal):
             return name
     if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
@@ -1908,7 +1955,9 @@ class _Templater:
         try:
             result = self._render_string(text, ctx, strict)
             if alias:
-                if isinstance(result, bool):
+                if isinstance(result, (bool, dict, list, tuple)):
+                    # Collection members carry their own markers, which the
+                    # consuming expression observes when it reads them.
                     self._untrusted_task_interpolation = False
                 elif self._untrusted_task_interpolation and isinstance(result, str):
                     # A later read of a cached alias must preserve the marker.
@@ -1953,8 +2002,8 @@ class _Templater:
             self._untrusted_task_interpolation = False
             try:
                 value = _concretize(expression(**ctx))
-                if self._untrusted_task_interpolation and isinstance(value, (str, list, tuple)):
-                    value = _mark_unsafe(value, condition_text=True)
+                if self._untrusted_task_interpolation and isinstance(value, (str, dict, list, tuple)):
+                    value = self._observe_derived_value(_mark_unsafe(value, condition_text=True), ctx)
                 return value
             finally:
                 # A boolean's inputs don't taint the expression in a sibling.
@@ -1969,6 +2018,11 @@ class _Templater:
             members = [self._conditional_collection(env, item) or self._conditional_member(env, item)
                        for item in node.items]
             return lambda ctx: collection(member(ctx) for member in members)
+        if isinstance(node, nodes.Dict):
+            pairs = [(self._conditional_member(env, pair.key),
+                      self._conditional_collection(env, pair.value) or self._conditional_member(env, pair.value))
+                     for pair in node.items]
+            return lambda ctx: {key(ctx): value(ctx) for key, value in pairs}
         if isinstance(node, nodes.Add):
             left = self._conditional_collection(env, node.left)
             right = self._conditional_collection(env, node.right)
@@ -2004,7 +2058,12 @@ class _Templater:
         result = _concretize(evaluate(ctx))
         if _condition_contains_string(result, _UntrustedConditionValue):
             self._untrusted_task_interpolation = True
-        return result
+        return self._observe_derived_value(result, ctx)
+
+    def _observe_derived_value(self, value, ctx):
+        if self._runtime is not None and type(value) in (dict, list, tuple):
+            return _lazy_wrap(value, self._runtime, ctx)
+        return value
 
     def _render_string(self, text, ctx, strict=False):
         tracking = self._untrusted_task_interpolation is not None
@@ -2022,7 +2081,7 @@ class _Templater:
             expr = stripped[2:-2].strip()
             expr_key = (expr, strict, tracking)
             try:
-                if tracking and ("[" in expr or "(" in expr or "+" in expr):
+                if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(stripped, env, ctx, strict)
                     if sequence is not _NO_CONDITIONAL_LIST:
                         return sequence
@@ -2067,9 +2126,7 @@ class _Templater:
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
                 # when a later assertion member reads a cached alias.
-                result = _mark_unsafe(result, condition_text=True)
-                if self._runtime is not None:
-                    result = _lazy_wrap(result, self._runtime, ctx)
+                result = self._observe_derived_value(_mark_unsafe(result, condition_text=True), ctx)
         except jinja2.TemplateError as e:
             return _captured_jinja_error(
                 e, syntax=isinstance(e, jinja2.TemplateSyntaxError)

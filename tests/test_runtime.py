@@ -420,7 +420,13 @@ def test_conditional_rendering_tracks_marked_list_reads(expression):
         rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
 
 
-@pytest.mark.parametrize("expression", ["result.data[0]", "result.data | first"])
+@pytest.mark.parametrize("expression", [
+    "result.data[0]",
+    "result.data | first",
+    "(result.data + ('other',))[0]",
+    "(('other',) + result.data)[1]",
+    "(result.data * 2)[1]",
+])
 def test_conditional_rendering_tracks_marked_tuple_reads(expression):
     rt = Runtime({}, "", {})
     rt._store_register({"register": "result"}, {"data": ("sample",)})
@@ -430,6 +436,26 @@ def test_conditional_rendering_tracks_marked_tuple_reads(expression):
     ctx = rt._task_ctx(task, {})
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+def test_conditional_tuple_operations_render_members_and_keep_tuple_type():
+    rt = Runtime({}, "", {"value": "sample", "outer": {"data": ("{{ value }}",)}})
+    assert rt.templater.render_conditional_template(
+        "{{ outer.data == ('sample',) and (outer.data | type_debug) == 'tuple' }}", rt.ctx())
+
+
+def test_lookup_plugin_reads_nested_task_alias_with_loop_binding():
+    rt = Runtime({}, "", {})
+    rt.templater._lookup_loaded["read_settings"] = lambda terms, variables, **kwargs: [
+        variables["settings"]["name"],
+    ]
+    task = _task("task", "Task", None, loop=["alpha"], vars={
+        "settings": {"name": "{{ item | default('pre-loop') }}"},
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "alpha"
+    rendered = rt.template("{{ [settings.name, lookup('read_settings')] }}", ctx)
+    assert rendered == ["alpha", "alpha"]
 
 
 @pytest.mark.parametrize("expression", [
@@ -688,17 +714,37 @@ def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():
 
 
 @pytest.mark.parametrize("expression", ["expressions[0]", "expressions[0] ~ ' and true'"])
-def test_loop_assertion_preserves_unsafe_marker_in_cached_alias_collection(expression):
+@pytest.mark.parametrize("expressions", [
+    "{{ result.parts | map('upper') | map('lower') | list }}",
+    "{{ [result.parts[0] | lower] }}",
+    "{{ (result.parts[0] | lower,) }}",
+])
+def test_loop_assertion_preserves_unsafe_marker_in_cached_alias_collection(expression, expressions):
     rt = Runtime({}, "", {})
     rt._store_register({"register": "result"}, {"parts": ["item == 1"]})
     task = _task("task", "Task", None, loop=[1], vars={
-        "expressions": "{{ result.parts | map('upper') | map('lower') | list }}",
+        "expressions": expressions,
         "alias": "{{ [expressions[0] is string, " + expression + "] }}",
     })
     ctx = rt._task_ctx(task, {})
     ctx["item"] = 1
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+def test_loop_assertion_keeps_trusted_literal_fields_in_cached_mapping():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"text": "item == 1"})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": "{{ {'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower} }}",
+        "alias": "{{ [checks.computed, checks.trusted] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ [checks.computed, checks.derived ~ ' and true'] }}"}],
+                ctx, keyword=None)
 
 
 @pytest.mark.parametrize("reference", ["alias", "settings"])
