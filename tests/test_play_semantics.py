@@ -1347,6 +1347,28 @@ def test_setup_fact_path_sees_empty_fact_namespace(tmp_path):
     assert msgs == ['"default path"']
 
 
+@pytest.mark.parametrize("connection", ["local", "ansible.builtin.local"])
+def test_setup_fact_path_sees_effective_connection(tmp_path, monkeypatch, connection):
+    _write(tmp_path, {
+        "local/example.fact": '{"marker": "play setting"}',
+        "ansible.builtin.local/example.fact": '{"marker": "extra vars"}',
+        "pb.yml": """
+        - hosts: localhost
+          connection: local
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ ansible_connection }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    })
+    extra = {} if connection == "local" else {"ansible_connection": connection}
+    expected = _ansible(tmp_path, ["-e", json.dumps(extra)])
+    assert expected[0] == ['"play setting"' if not extra else '"extra vars"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps(extra))
+    assert _standalone(tmp_path, []) == expected
+
+
 @pytest.mark.parametrize("selector", [
     "lookup('file', playbook_dir ~ '/files/profile.txt')",
     "lookup('file', playbook_dir ~ '/files/profile.txt') | default('missing')",
@@ -1379,20 +1401,31 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
     assert _summary(result.stdout)[0] == ['"distribution defined: False"']
 
 
-def test_setup_uses_baked_vars_when_controller_lookup_plugin_is_unavailable(tmp_path):
-    msgs, _ = check(tmp_path, {
-        "vars/minimal.yml": "subset: ['!all', '!min']\n",
+@pytest.mark.parametrize("selector", [
+    "lookup('first_found', playbook_dir ~ '/vars/' ~ profile ~ '.yml')",
+    "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
+])
+def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector):
+    _write(tmp_path, {
+        "vars/dev.yml": "subset: [all]\n",
+        "vars/prod.yml": "subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
+          vars: {profile: dev}
           vars_files:
-            - "{{ lookup('first_found', playbook_dir ~ '/vars/minimal.yml') }}"
+            - "{{ %s }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
-    }, strategy=False)
-    assert msgs == ['"distribution defined: False"']
+        """ % selector,
+    })
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+    extra = json.dumps({"profile": "prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
 
 
 @pytest.mark.parametrize("fallback", ["", " | default('missing')"])

@@ -226,7 +226,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             if "selector" not in entry:
                 gather_vars_files.append(_tag_untrusted(entry))
                 continue
-            bundled, = _deferred_vars_files(play, basedir, [entry["selector"]])
+            bundled, = _deferred_vars_files(play, basedir, [entry["selector"]], setup=True)
             if "path" in entry:
                 bundled["compile_path"] = entry["path"]
                 bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
@@ -349,12 +349,18 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 magic[key] = sorted(magic[key])
         names = ("ansible_play_name", "ansible_playbook_python", "ansible_config_file", "role_names",
                  "ansible_play_role_names", "ansible_role_names", "ansible_dependent_role_names", "ansible_version")
+        connection_defaults = [
+            (C.MAGIC_VARIABLE_MAPPING[key], _tag_untrusted(value))
+            for key in ("connection", "remote_user", "port", "executable", "module_compression")
+            if (value := getattr(play, key, None)) is not None
+        ]
         result["gather_scope"] = {
             "role_defaults": _tag_untrusted(defaults),
             "role_exports": _tag_untrusted(exports),
             "magic": _tag_untrusted({key: magic[key] for key in names if key in magic}),
             "search_path": _raw_search_path(play, basedir),
             "search_dirs": _search_dirs(play, basedir, "files"),
+            "connection_defaults": connection_defaults,
         }
         if gather_vars_files:
             result["gather_scope"].update({
@@ -530,7 +536,7 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
-def _deferred_vars_files(play, basedir, entries):
+def _deferred_vars_files(play, basedir, entries, *, setup=False):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -553,14 +559,17 @@ def _deferred_vars_files(play, basedir, entries):
         candidates = {}
         unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
+            # A legacy bare expression can still select a file inside vars/
+            # via an absolute path returned by the controller lookup.
+            candidate_subdir = subdir or ("vars" if setup and "first_found" in name else None)
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
             if name.startswith(os.path.sep):
                 patterns = [pattern]
             else:
                 patterns = []
                 for d in dirs:
-                    if subdir and name.split("/")[0] != subdir:
-                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
+                    if candidate_subdir and name.split("/")[0] != candidate_subdir:
+                        patterns.append(os.path.join(glob.escape(d), candidate_subdir, pattern))
                     patterns.append(os.path.join(glob.escape(d), pattern))
             for path in patterns:
                 for found in glob.glob(path):

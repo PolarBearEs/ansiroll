@@ -911,8 +911,40 @@ def _record_controller_lookup_failure(ctx):
         failures.append(True)
 
 
+def _first_found_vars_file(args, options, ctx):
+    """Resolve setup's controller lookup against the bundled files."""
+    _fail_on_undef(args)
+    _fail_on_undef(options)
+    files = ctx["__ansiroll_selector_files"]
+    dirs = ctx["__ansiroll_search_dirs"]
+
+    def split(value, separators):
+        return [word for part in _flatten_deep([value]) for word in re.split(separators, part)]
+
+    for term in _flatten_deep(args or [options.get("files")]):
+        if isinstance(term, dict):
+            options = term
+            names = split(term.get("files"), "[,;]")
+        else:
+            names = split(term, "[,;]")
+        for directory in split(options.get("paths"), "[,:;]") or [""]:
+            for name in names:
+                path = os.path.expanduser(os.path.join(directory, name))
+                for search_dir in dirs:
+                    candidate = os.path.normpath(os.path.join(search_dir, path))
+                    if candidate in files:
+                        return [candidate]
+    if options.get("skip"):
+        return []
+    raise RuntimeError("No bundled vars file was found when using first_found.")
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
-    name = str(name).rsplit(".", 1)[-1]
+    name = str(name)
+    if (name in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")
+            and "__ansiroll_selector_files" in (ctx or {})):
+        return _first_found_vars_file(args, kwargs, ctx)
+    name = name.rsplit(".", 1)[-1]
     if name == "vars":
         vals = []
         for a in args:
@@ -1639,13 +1671,6 @@ class _Templater:
                              % (name, self._lookup_errors[name]))
         source = self._lookup_sources.get(name)
         if source is None:
-            if "__ansiroll_selector_lookup_failures" in (self._current_ctx or {}):
-                try:
-                    _fail_on_undef(args)
-                    _fail_on_undef(kwargs)
-                except jinja2.UndefinedError as e:
-                    return _captured(str(e))
-                _record_controller_lookup_failure(self._current_ctx)
             return _captured("lookup plugin '%s' was not found" % name)
         try:
             ns = {"__name__": "ansiroll_lookup_%s" % name}
@@ -2679,6 +2704,8 @@ class Runtime:
             if scope:
                 variables = _f_combine(variables, gather_magic, recursive=merge)
                 variables["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
+                if before_setup:
+                    variables["__ansiroll_selector_files"] = entry["files"]
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             baked = entry["files"].get(entry.get("compile_path")) if before_setup else None
@@ -2787,6 +2814,10 @@ class Runtime:
         setup_vars = self._with_deferred_vars_files(play, magic, base=host_base, before_setup=True)
         setup_vars = _f_combine(setup_vars, exports, self._include_vars_layer,
                                 self._set_fact_overrides, self.extra_vars, magic, recursive=merge)
+        for aliases, default in scope.get("connection_defaults", ()):
+            value = next((setup_vars[key] for key in aliases if key in setup_vars), default)
+            for key in aliases:
+                setup_vars.setdefault(key, value)
         address = setup_vars.get("ansible_host") or setup_vars.get("ansible_ssh_host") or self.host
         setup_vars.setdefault("ansible_host", address)
         setup_vars.setdefault("ansible_ssh_host", address)
