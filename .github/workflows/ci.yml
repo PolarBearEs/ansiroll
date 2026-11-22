@@ -4,11 +4,32 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: Commit approved by the Amp review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Fast, dependency-light job: the runtime interpreter, filters and tests work
   # with only Jinja2 (no Ansible) -- this proves the "runs on a bare target" path.
   unit:
+    # Setting the Amp actor enables review-first CI after the flow is installed.
+    # Dispatch binds the workflow and its checks to the head of the PR branch.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && vars.AMP_CI_ACTOR == '') ||
+      (github.event_name == 'workflow_dispatch' &&
+       vars.AMP_CI_ACTOR != '' && github.actor == vars.AMP_CI_ACTOR &&
+       github.ref_type == 'branch' && github.sha == inputs.reviewed_sha)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
