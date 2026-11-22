@@ -2039,7 +2039,9 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
           environment:
             - SYNC_LITERAL: "{{ '{' ~ '{ placeholder }' ~ '}' }}"
               SYNC_UNSAFE: !unsafe "{{ item }}"
-              SYNC_MIRROR: "{{ ansible_delegated_vars['localhost']['mirror'] }}"
+              SYNC_MIRROR: "{{ sync_alias ~ '-' ~ ansible_delegated_vars['localhost']['mirror'] }}"
+              SYNC_FLAG: "{{ true }}"
+              SYNC_EMPTY: "{{ none }}"
             - "{{ ansible_delegated_vars['localhost']['environment'] }}"
 """)
     loader = DataLoader()
@@ -2053,7 +2055,8 @@ from ansiroll import runtime
 runtime.PLAYS = [{"tasks": [{
     "type": "task", "runtime_id": "sync", "name": "Synchronize",
     "action": "ansible.posix.synchronize", "fallback": True,
-    "loop": [0, 1], "vars": {"sync_index": "{{ item }}"},
+    "loop": [0, 1], "vars": {"sync_index": "{{ item }}",
+                              "sync_alias": "{{ ['release', 'preview'][item] | upper }}"},
     "environment": json.loads(sys.argv[1]),
 }]}]
 runtime.MODULES = {}
@@ -2093,7 +2096,8 @@ runtime.agent_main()
     assert [strategy._run_native_controller_task(frame, None, {}, {"sync": original}, None)
             for frame in frames] == [
         {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
-                         "SYNC_UNSAFE": "{{ item }}", "SYNC_MIRROR": "controller", "SYNC_WHOLE": "delegated"}}
+                         "SYNC_UNSAFE": "{{ item }}", "SYNC_MIRROR": label + "-controller",
+                         "SYNC_FLAG": True, "SYNC_EMPTY": None, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")
     ]
     assert original.environment == original_environment

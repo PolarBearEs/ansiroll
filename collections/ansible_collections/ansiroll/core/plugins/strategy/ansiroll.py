@@ -553,6 +553,10 @@ class StrategyModule(StrategyBase):
             concrete.failed_when = []
             job_vars = dict(hv or {})
             job_vars.update(frame.get("vars") or {})
+            if frame.get("environment_aliases"):
+                from ansible.utils.unsafe_proxy import wrap_var
+
+                job_vars.update(wrap_var(frame["environment_aliases"]))
 
             class _QuietQueue:
                 @staticmethod

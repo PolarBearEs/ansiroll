@@ -1232,7 +1232,7 @@ class _PlayVarScope(dict):
                     value, self, strict=self.strict)
             finally:
                 self.resolving.remove(key)
-        return self.templater._observe_untrusted(self.resolved[key])
+        return self.templater._resolved_alias(key, self.resolved[key])
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1731,6 +1731,7 @@ class _Templater:
         self._template_cache = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
+        self._environment_aliases = None
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -1891,7 +1892,7 @@ class _Templater:
                 cache = ctx.resolved_task
             cache_key = (key, id(value))
             if cache is not None and cache_key in cache:
-                return self._observe_untrusted(cache[cache_key])
+                return self._resolved_alias(key, cache[cache_key])
             marker = (key, value)
             if marker in self._resolving:
                 return _captured("Recursive loop detected in template: %s" % value)
@@ -1900,7 +1901,7 @@ class _Templater:
                 result = self.render_string(value, ctx, strict=strict)
                 if cache is not None:
                     cache[cache_key] = result
-                return self._observe_untrusted(result)
+                return self._resolved_alias(key, result)
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
@@ -1916,6 +1917,11 @@ class _Templater:
         if self._untrusted_task_interpolation is not None and isinstance(value, _UntrustedConditionValue):
             self._untrusted_task_interpolation = True
         return value
+
+    def _resolved_alias(self, key, value):
+        if self._environment_aliases is not None and not _is_undef(value):
+            self._environment_aliases[key] = value
+        return self._observe_untrusted(value)
 
     def render_conditional_template(self, text, ctx, strict=False):
         # A rendered alias can lose its marker when combined with literal text.
@@ -3569,7 +3575,12 @@ class Runtime:
                 self.become_user = _as_text(become_user)
             delegated = self.delegate_fn and (task.get("delegate_to") or task.get("fallback"))
             env_parts = [] if delegated and task["action"].rsplit(".", 1)[-1] == "synchronize" else None
-            self._module_env = self._task_environment(task, ctx, env_parts)
+            env_aliases = {} if env_parts is not None else None
+            self.templater._environment_aliases = env_aliases
+            try:
+                self._module_env = self._task_environment(task, ctx, env_parts)
+            finally:
+                self.templater._environment_aliases = None
             special = task.get("special")
             if special and (special == "debug"
                             or not (self.delegate_fn and task.get("delegate_to"))):
@@ -3599,7 +3610,10 @@ class Runtime:
                     args = _fail_on_undef(_strip_omit(
                         self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
-                    delegate_task = task if env_parts is None else dict(task, _delegate_environment=env_parts)
+                    delegate_task = task
+                    if env_parts is not None:
+                        delegate_task = dict(task, _delegate_environment=env_parts,
+                                             _delegate_environment_aliases=env_aliases)
                     res = self.delegate_fn(delegate_task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
@@ -3787,15 +3801,18 @@ class Runtime:
             for k, v in entry.items():
                 try:
                     v = self.template(v, ctx)
+                    if delegate_parts is not None:
+                        _fail_on_undef(v)
                 except Exception:
                     unresolved.append(k)
                     continue
                 if _is_undef(v):
                     unresolved.append(k)
                 elif v != _OMIT:
-                    resolved[str(k)] = _as_text(v)
-            env.update(resolved)
-            if delegate_parts is not None and (isinstance(source, dict) or not unresolved):
+                    resolved[str(k)] = v
+            if delegate_parts is None:
+                env.update({key: _as_text(value) for key, value in resolved.items()})
+            elif isinstance(source, dict) or not unresolved:
                 delegate_parts[-1] = {"rendered": resolved, "unresolved": unresolved}
         return env or None
 
@@ -5614,7 +5631,10 @@ def agent_main():
                 "name": task.get("name"),
             }
             if action == "synchronize":
-                frame["environment"] = task["_delegate_environment"]
+                environment = task["_delegate_environment"]
+                frame["environment"] = environment
+                if any(part is None or part["unresolved"] for part in environment):
+                    frame["environment_aliases"] = _delegate_vars(task["_delegate_environment_aliases"])
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":
