@@ -228,6 +228,16 @@ def test_delegated_play_fallback_renders_each_member_once():
     assert calls == [True]
 
 
+def test_delegated_play_fallback_discards_overwritten_undefined_paths():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    values = rt.template_vars({"settings": {1: ["{{ missing }}"], "1": "winner"}}, {}, dynamic=True)
+    fallbacks = {}
+    _delegate_vars(values, rt.templater, set(), {}, play_fallbacks=fallbacks)
+    assert fallbacks == {"settings": {"value": {"1": "winner"}, "undefined": []}}
+
+
 def test_delegated_loop_task_alias_uses_agent_filters():
     from ansiroll.runtime import _delegate_vars
 

@@ -2056,6 +2056,7 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_FILE: "{{ file_options.label }}"
               SYNC_FILE_LIST: "{{ file_options.labels[0] ~ '-' ~ file_options.labels[2] }}"
               SYNC_FILE_MISSING: "{{ file_options.labels[1] is defined }}"
+              SYNC_FILE_DEFAULT: "{{ file_options.labels[1].nested | default('fallback') }}"
               SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
               SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
               SYNC_FLAG: "{{ true }}"
@@ -2132,6 +2133,7 @@ runtime.agent_main()
                          "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
                          "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
                          "SYNC_FILE_LIST": "RELEASE-tail", "SYNC_FILE_MISSING": False,
+                         "SYNC_FILE_DEFAULT": "fallback",
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")

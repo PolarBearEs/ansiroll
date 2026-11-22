@@ -5491,12 +5491,17 @@ def _delegate_fallback_value(value, undefined, path=()):
     """Read lazy members once and record undefined list indices without shifting them."""
     if isinstance(value, dict):
         resolved = {}
+        missing_by_key = {}
         for key in value:
+            wire_key = key if isinstance(key, str) else next(iter(json.loads(json.dumps({key: None}))))
+            missing = []
             try:
-                wire_key = key if isinstance(key, str) else next(iter(json.loads(json.dumps({key: None}))))
-                resolved[key] = _delegate_fallback_value(value[key], undefined, (*path, wire_key))
+                resolved[wire_key] = _delegate_fallback_value(value[key], missing, (*path, wire_key))
             except jinja2.UndefinedError:
                 continue
+            missing_by_key[wire_key] = missing
+        for missing in missing_by_key.values():
+            undefined.extend(missing)
         return resolved
     if isinstance(value, (list, tuple)):
         resolved = []

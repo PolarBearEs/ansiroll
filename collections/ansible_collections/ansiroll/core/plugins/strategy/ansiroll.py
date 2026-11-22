@@ -603,9 +603,14 @@ class StrategyModule(StrategyBase):
         try:
             from ansible._internal._templating._jinja_common import UndefinedMarker
         except ImportError:
-            from jinja2 import StrictUndefined
+            from ansible.template import AnsibleUndefined
 
-            missing = StrictUndefined(hint="Undefined element in a delegated play variable")
+            class DelegatedUndefined(AnsibleUndefined):
+                # Prevent the legacy templar from evaluating this placeholder
+                # when it recursively loads the surrounding container.
+                __UNSAFE__ = True
+
+            missing = DelegatedUndefined(hint="Undefined element in a delegated play variable")
         else:
             missing = UndefinedMarker(hint="Undefined element in a delegated play variable", _no_template_source=True)
         for path in undefined:
