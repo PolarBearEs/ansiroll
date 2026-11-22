@@ -3,95 +3,25 @@ name: CI
 on:
   push:
     branches: [main, master]
-  issue_comment:
-    types: [created]
+  workflow_call:
+    inputs:
+      ref:
+        description: GitHub's merge commit for the reviewed PR
+        type: string
+        required: true
 
 permissions:
   contents: read
 
-concurrency:
-  group: >-
-    ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-    format('{0}', github.event.comment.user.id) == vars.AMP_CI_ACTOR_ID &&
-    startsWith(github.event.comment.body, 'Amp cleared ci.yml for ') &&
-    format('amp-ci-pr-{0}', github.event.issue.number) || github.run_id }}
-  cancel-in-progress: false
-
 jobs:
-  reviewed-head:
-    # issue_comment uses the default branch's workflow. Keep write permissions
-    # in jobs that only call GitHub's API and never check out PR code.
-    if: >-
-      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-      vars.AMP_CI_ACTOR_ID != '' &&
-      format('{0}', github.event.comment.user.id) == vars.AMP_CI_ACTOR_ID &&
-      startsWith(github.event.comment.body, 'Amp cleared ci.yml for ')
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-      statuses: write
-    outputs:
-      head: ${{ steps.resolve.outputs.head }}
-      merge: ${{ steps.resolve.outputs.merge }}
-    steps:
-      - id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.issue.number }}
-          COMMENT: ${{ github.event.comment.body }}
-        run: |
-          pattern='^Amp cleared ci\.yml for ([a-f0-9]{40})\.$'
-          [[ "$COMMENT" =~ $pattern ]] || exit 0
-          head=${BASH_REMATCH[1]}
-          api="repos/$GITHUB_REPOSITORY"
-          for attempt in 1 2 3 4 5; do
-            pr=$(gh api "$api/pulls/$PR")
-            jq -e --arg head "$head" '.state == "open" and .head.sha == $head' <<< "$pr" >/dev/null || exit 0
-            mergeable=$(jq -r '.mergeable' <<< "$pr")
-            if [[ "$mergeable" != null ]]; then
-              break
-            fi
-            if [[ "$attempt" != 5 ]]; then
-              sleep 2
-            fi
-          done
-          if [[ "$mergeable" != true ]]; then
-            echo 'GitHub has no mergeable revision for this PR.' >&2
-            exit 1
-          fi
-          merge=$(jq -er '.merge_commit_sha | strings' <<< "$pr")
-          [[ "$merge" =~ ^[a-f0-9]{40}$ ]]
-          runs="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
-          if [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then
-            combined=$(gh api "$api/commits/$head/status")
-            if jq -e --arg merge "$merge" --arg runs "$runs" '.statuses | any(
-              .context == "Amp CI" and
-              (.target_url // "" | startswith($runs)) and
-              (.description // "" | endswith(" merge " + $merge))
-            )' <<< "$combined" >/dev/null; then
-              echo 'CI was already triggered for this merge commit.'
-              exit 0
-            fi
-          fi
-          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head" \
-            -f context='Amp CI' -f state=pending -f description="Testing merge $merge" \
-            -f target_url="$runs$GITHUB_RUN_ID"
-          printf 'head=%s\nmerge=%s\n' "$head" "$merge" >> "$GITHUB_OUTPUT"
-
   # Fast, dependency-light job: the runtime interpreter, filters and tests work
   # with only Jinja2 (no Ansible) -- this proves the "runs on a bare target" path.
   unit:
-    needs: reviewed-head
-    if: >-
-      !cancelled() && (github.event_name == 'push' ||
-      (needs.reviewed-head.result == 'success' && needs.reviewed-head.outputs.merge != ''))
     runs-on: ubuntu-latest
-    outputs:
-      ref: ${{ needs.reviewed-head.outputs.merge || github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.reviewed-head.outputs.merge || github.sha }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -107,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.unit.outputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -160,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.unit.outputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -202,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.unit.outputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -229,7 +159,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.unit.outputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -250,7 +180,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.unit.outputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -262,40 +192,3 @@ jobs:
         run: >-
           python tests/run_ansible_test_suite.py 2.20
           --profile native --native-only --provenance
-
-  report-pr-ci:
-    needs: [reviewed-head, unit, coverage, matrix, parity, upstream-parity-full, ansible-test-native-parity]
-    if: always() && needs.reviewed-head.outputs.head != ''
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      statuses: write
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD: ${{ needs.reviewed-head.outputs.head }}
-          MERGE: ${{ needs.reviewed-head.outputs.merge }}
-          PASSED: >-
-            ${{ needs.unit.result == 'success' && needs.coverage.result == 'success' &&
-            needs.matrix.result == 'success' && needs.parity.result == 'success' &&
-            needs.upstream-parity-full.result == 'success' && needs.ansible-test-native-parity.result == 'success' }}
-        run: |
-          state=failure
-          description="Tests did not pass on merge $MERGE"
-          if [[ "$PASSED" == true ]]; then
-            # The aggregate matrix result can miss a job cancelled before it got a runner.
-            # Use all attempts so re-running failed jobs still includes earlier successes.
-            jobs=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100")
-            if jq -e --arg reporter "$GITHUB_JOB" '
-              [.[].jobs[]] | group_by(.name) | map(max_by(.id)) |
-              map(select(.name != $reporter and .name != "ansible ansible-base==2.10.17 (py3.9)"
-                and .name != "Ansible parity 2.10")) |
-              length > 0 and all(.[]; .conclusion == "success")
-            ' <<< "$jobs" >/dev/null; then
-              state=success
-              description="Tests passed on merge $MERGE"
-            fi
-          fi
-          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" \
-            -f context='Amp CI' -f state="$state" -f description="$description" \
-            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
