@@ -1369,6 +1369,28 @@ def test_setup_fact_path_sees_effective_connection(tmp_path, monkeypatch, connec
     assert _standalone(tmp_path, []) == expected
 
 
+@pytest.mark.parametrize("extra", [{}, {"ansible_connection_user": "override"}])
+def test_setup_fact_path_sees_local_connection_user(tmp_path, monkeypatch, extra):
+    _write(tmp_path, {
+        "alice/example.fact": '{"marker": "play user"}',
+        "override/example.fact": '{"marker": "explicit connection user"}',
+        "pb.yml": """
+        - hosts: localhost
+          connection: local
+          remote_user: alice
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ playbook_dir }}/{{ ansible_connection_user }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.example.marker }}"}
+        """,
+    })
+    expected = _ansible(tmp_path, ["-e", json.dumps(extra)])
+    assert expected[0] == ['"explicit connection user"' if extra else '"play user"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps(extra))
+    assert _standalone(tmp_path, []) == expected
+
+
 @pytest.mark.parametrize("selector", [
     "lookup('file', playbook_dir ~ '/files/profile.txt')",
     "lookup('file', playbook_dir ~ '/files/profile.txt') | default('missing')",
@@ -1403,12 +1425,15 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
 
 @pytest.mark.parametrize("selector", [
     "lookup('first_found', playbook_dir ~ '/vars/' ~ profile ~ '.yml')",
+    "lookup('first_found', profile ~ '.yml')",
     "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
 ])
 def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector):
     _write(tmp_path, {
         "vars/dev.yml": "subset: [all]\n",
         "vars/prod.yml": "subset: ['!all', '!min']\n",
+        "files/dev.yml": "subset: [all]\n",
+        "files/prod.yml": "subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
@@ -1426,6 +1451,51 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
     assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_setup_first_found_respects_missing_file_policy(tmp_path, monkeypatch, skip):
+    _write(tmp_path, {
+        "files/dev.yml": "subset: [all]",
+        "files/fallback.yml": "subset: ['!all', '!min']",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset | default(['!all', '!min']) }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ query('first_found', {'files': [profile ~ '.yml'], 'skip': %s})
+                  | first | default(playbook_dir ~ '/files/fallback.yml') }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % str(skip).lower(),
+    })
+    extra = json.dumps({"profile": "absent"})
+    native = _ansible_run(tmp_path, ["-e", extra])
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    result = _standalone_run(tmp_path, [])
+    assert (result.returncode == 0) == (native.returncode == 0) == skip
+    if skip:
+        assert _summary(result.stdout) == _summary(native.stdout)
+
+
+def test_setup_does_not_replay_lookup_for_changed_inputs(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "files/dev.txt": "dev\n",
+        "vars/dev.yml": "subset: [all]\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset | default(['!all', '!min']) }}"
+          vars: {profile: dev}
+          vars_files: ["vars/{{ lookup('file', profile ~ '.txt') | default('missing') }}.yml"]
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    assert _standalone(tmp_path, [])[0] == ['"distribution defined: True"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", json.dumps({"profile": "prod"}))
+    assert _standalone(tmp_path, [])[0] == ['"distribution defined: False"']
 
 
 @pytest.mark.parametrize("fallback", ["", " | default('missing')"])

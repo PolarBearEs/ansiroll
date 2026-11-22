@@ -905,10 +905,25 @@ _ANSIBLE_TESTS = {
 }
 
 
-def _record_controller_lookup_failure(ctx):
-    failures = (ctx or {}).get("__ansiroll_selector_lookup_failures")
-    if failures is not None:
-        failures.append(True)
+class _VarsFileLookupError(RuntimeError):
+    """A vars_files lookup ran but could not select a file."""
+
+
+def _vars_file_lookup_key(name, args, options):
+    relevant = {key: value for key, value in options.items()
+                if key not in ("wantlist", "errors", "allow_unsafe")}
+    try:
+        inputs = json.dumps([name, args, relevant], sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(inputs.encode()).hexdigest()
+
+
+def _baked_vars_file_lookup(name, args, options, ctx):
+    replays = (ctx or {}).get("__ansiroll_selector_lookups")
+    if replays:
+        return replays.get(_vars_file_lookup_key(name, args, options))
+    return None
 
 
 def _first_found_vars_file(args, options, ctx):
@@ -917,6 +932,9 @@ def _first_found_vars_file(args, options, ctx):
     _fail_on_undef(options)
     files = ctx["__ansiroll_selector_files"]
     dirs = ctx["__ansiroll_search_dirs"]
+    ignore_error = options.get("errors") in ("ignore", "warn")
+    if not _core_at_least(2, 12):
+        options = {}  # Legacy first_found takes its search options as a dict term.
 
     def split(value, separators):
         return [word for part in _flatten_deep([value]) for word in re.split(separators, part)]
@@ -934,9 +952,9 @@ def _first_found_vars_file(args, options, ctx):
                     candidate = os.path.normpath(os.path.join(search_dir, path))
                     if candidate in files:
                         return [candidate]
-    if options.get("skip"):
+    if options.get("skip") or ignore_error:
         return []
-    raise RuntimeError("No bundled vars file was found when using first_found.")
+    raise _VarsFileLookupError("No bundled vars file was found when using first_found.")
 
 
 def _lookup_values(name, args, kwargs, ctx=None):
@@ -986,7 +1004,9 @@ def _lookup_values(name, args, kwargs, ctx=None):
                 with open(path) as f:
                     text = f.read()
             except OSError:
-                _record_controller_lookup_failure(ctx)
+                replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
+                if replay is not None:
+                    return replay
                 raise
             if lstrip:
                 text = text.lstrip()
@@ -1000,7 +1020,9 @@ def _lookup_values(name, args, kwargs, ctx=None):
             proc = subprocess.run(str(a), shell=True, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, universal_newlines=True)
             if proc.returncode != 0:
-                _record_controller_lookup_failure(ctx)
+                replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
+                if replay is not None:
+                    return replay
                 raise RuntimeError("lookup plugin 'pipe' failed: command %r returned "
                                    "rc=%d: %s" % (a, proc.returncode, proc.stderr.strip()))
             vals.append(proc.stdout.rstrip("\n"))
@@ -1596,6 +1618,8 @@ class _Templater:
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
+        except _VarsFileLookupError:
+            raise
         except Exception as e:
             return _captured(str(e))
 
@@ -1608,6 +1632,8 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)
+        except _VarsFileLookupError:
+            raise
         except Exception as e:
             return _captured(str(e))
 
@@ -1663,8 +1689,6 @@ class _Templater:
                                                       dict(self._current_ctx or {}),
                                                       **kwargs))
             except Exception as e:
-                if isinstance(e, OSError):
-                    _record_controller_lookup_failure(self._current_ctx)
                 return _captured("lookup plugin '%s' failed: %s" % (name, e))
         if name in self._lookup_errors:
             return _captured("lookup plugin '%s' failed to load: %s"
@@ -1764,6 +1788,8 @@ class _Templater:
                 # Captured, not raised: surfaces when the value is used (or is
                 # inspected via dump_object), like Ansible 2.19.
                 return _captured_jinja_error(e, syntax=True)
+            except _VarsFileLookupError:
+                raise
             except Exception as e:
                 if strict and isinstance(e, jinja2.UndefinedError):
                     return _captured_jinja_error(e)
@@ -2708,12 +2734,11 @@ class Runtime:
                     variables["__ansiroll_selector_files"] = entry["files"]
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
-            baked = entry["files"].get(entry.get("compile_path")) if before_setup else None
-            lookup_failures = []
-            if baked is not None:
-                ctx["__ansiroll_selector_lookup_failures"] = lookup_failures
+            lookup_replays = entry.get("lookup_replays", {}) if before_setup else {}
             selected = None
             for raw in entry["names"]:
+                if lookup_replays:
+                    ctx["__ansiroll_selector_lookups"] = lookup_replays.get(raw)
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
@@ -2750,10 +2775,6 @@ class Runtime:
                         raise VarsFilesError("vars file %s was not found" % (item,))
                     sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                      % (item,))
-            if selected is None and lookup_failures:
-                # Keep the compiled selection if its controller lookup cannot
-                # run on the deployed target, even if Jinja caught the error.
-                selected = baked
             if selected is not None:
                 play_vars = _f_combine(play_vars, *selected, recursive=merge)
         return play_vars
@@ -2818,6 +2839,11 @@ class Runtime:
             value = next((setup_vars[key] for key in aliases if key in setup_vars), default)
             for key in aliases:
                 setup_vars.setdefault(key, value)
+        remote_user = setup_vars.get("ansible_ssh_user") or setup_vars.get("ansible_user")
+        if remote_user and "ansible_connection_user" not in setup_vars:
+            connection = self.template(setup_vars.get("ansible_connection"), self.ctx(base=setup_vars))
+            if isinstance(connection, str) and connection == "local":
+                setup_vars["ansible_connection_user"] = remote_user
         address = setup_vars.get("ansible_host") or setup_vars.get("ansible_ssh_host") or self.host
         setup_vars.setdefault("ansible_host", address)
         setup_vars.setdefault("ansible_ssh_host", address)

@@ -203,8 +203,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    ordered_vars_files = [] if gather_facts is None else None
-    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
     core_version = _core_version()
     gather_options = {}
     for option in ("gather_subset", "gather_timeout", "fact_path"):
@@ -220,6 +218,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     scoped_gather = gather_facts is None and any(
         _is_templated(item) for value in gather_options.values() for item in _as_list(value)
     )
+    ordered_vars_files = [] if scoped_gather else None
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
     gather_vars_files = []
     if scoped_gather:
         for entry in ordered_vars_files:
@@ -230,6 +230,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             if "path" in entry:
                 bundled["compile_path"] = entry["path"]
                 bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
+                if entry.get("lookup_replays"):
+                    bundled["lookup_replays"] = entry["lookup_replays"]
             gather_vars_files.append(bundled)
     hosts = play.hosts
     if isinstance(hosts, list):
@@ -479,11 +481,12 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
             if not isinstance(filename, str):
                 continue
             raw = filename
+            lookups = [] if ordered is not None else None
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 record["selector"] = entry
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
-                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
+                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars, lookups)
                 if filename is None:
                     if unresolved is not None:
                         unresolved.append(entry)
@@ -505,6 +508,13 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
                 record["values"] = values
                 if "selector" in record:
                     record["path"] = os.path.normpath(os.path.join(basedir, path))
+                    # Keep only lookup results already visible in that path, e.g.
+                    # the profile name read from a controller file. Do not embed
+                    # arbitrary lookup output such as a secret hashed by a filter.
+                    known = {key: items for key, items in (lookups or ())
+                             if all(item in record["path"] for item in items)}
+                    if known:
+                        record["lookup_replays"] = {_PLAYBOOK_DIR_RE.sub(lambda _m: basedir, raw): known}
             break
         if ordered is not None and record:
             ordered.append(record)
@@ -571,6 +581,9 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                     if candidate_subdir and name.split("/")[0] != candidate_subdir:
                         patterns.append(os.path.join(glob.escape(d), candidate_subdir, pattern))
                     patterns.append(os.path.join(glob.escape(d), pattern))
+                if setup and "first_found" in name:
+                    patterns.extend(os.path.join(glob.escape(d), pattern)
+                                    for d in _search_dirs(play, basedir, "files"))
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
@@ -619,7 +632,7 @@ def _vars_file_variable_names(entries):
     return names
 
 
-def _template_vars_file_name(play, filename, play_vars, all_vars):
+def _template_vars_file_name(play, filename, play_vars, all_vars, lookups=None):
     from ansible.utils.vars import combine_vars
 
     variables = combine_vars(play_vars, all_vars or {})
@@ -631,12 +644,50 @@ def _template_vars_file_name(play, filename, play_vars, all_vars):
         except TypeError:
             templar = Templar(loader=play._loader)
             templar.available_variables = variables
-        rendered = templar.template(filename, fail_on_undefined=True)
+        if lookups is None:
+            rendered = templar.template(filename, fail_on_undefined=True)
+        else:
+            rendered = _template_vars_file_with_lookup_trace(templar, filename, play._loader, lookups)
     except Exception:
         return None
     if not isinstance(rendered, str) or _is_templated(rendered):
         return None
     return rendered
+
+
+def _template_vars_file_with_lookup_trace(templar, filename, loader, lookups):
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    from ansible.plugins.loader import lookup_loader
+
+    from .runtime import _vars_file_lookup_key
+
+    get_plugin = lookup_loader.get
+    patched_plugins = set()
+
+    def traced_plugin(name, *args, **kwargs):
+        plugin = get_plugin(name, *args, **kwargs)
+        short = re.sub(r"^ansible\.(?:builtin|legacy)\.", "", name)
+        if (kwargs.get("loader") is not loader or short not in ("file", "pipe")
+                or plugin is None or isinstance(plugin, type) or id(plugin) in patched_plugins):
+            return plugin
+        run = plugin.run
+
+        def traced_run(terms, variables=None, **options):
+            key = _vars_file_lookup_key(short, terms, options)
+            result = run(terms, variables=variables, **options)
+            if key is not None and isinstance(result, (list, tuple)) and all(isinstance(x, str) for x in result):
+                lookups.append((key, list(result)))
+            return result
+
+        patches.enter_context(patch.object(plugin, "run", traced_run))
+        patched_plugins.add(id(plugin))
+        return plugin
+
+    with ExitStack() as patches:
+        patches.enter_context(patch.object(lookup_loader, "get", traced_plugin))
+        return templar.template(filename, fail_on_undefined=True)
 
 
 def _tag_untrusted(value, template_syntax_only=False):
