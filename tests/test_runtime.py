@@ -444,6 +444,17 @@ def test_conditional_tuple_operations_render_members_and_keep_tuple_type():
         "{{ outer.data == ('sample',) and (outer.data | type_debug) == 'tuple' }}", rt.ctx())
 
 
+def test_conditional_tuple_membership_only_observes_examined_members():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"text": "registered"})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": "{{ ('ok', result.text) }}",
+        "alias": "{{ 'ok' if 'ok' in checks else 'missing' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'ok'"}], ctx)
+
+
 def test_lookup_plugin_reads_nested_task_alias_with_loop_binding():
     rt = Runtime({}, "", {})
     rt.templater._lookup_loaded["read_settings"] = lambda terms, variables, **kwargs: [
@@ -732,11 +743,16 @@ def test_loop_assertion_preserves_unsafe_marker_in_cached_alias_collection(expre
         rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
 
 
-def test_loop_assertion_keeps_trusted_literal_fields_in_cached_mapping():
+@pytest.mark.parametrize("mapping", [
+    "{'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower}",
+    "{'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower}.copy()",
+    "dict(computed=result.text is string, trusted='item == 1', derived=result.text | lower)",
+])
+def test_loop_assertion_keeps_trusted_literal_fields_in_cached_mapping(mapping):
     rt = Runtime({}, "", {})
     rt._store_register({"register": "result"}, {"text": "item == 1"})
     task = _task("task", "Task", None, loop=[1], vars={
-        "checks": "{{ {'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower} }}",
+        "checks": "{{ " + mapping + " }}",
         "alias": "{{ [checks.computed, checks.trusted] }}",
     })
     ctx = rt._task_ctx(task, {})
@@ -745,6 +761,13 @@ def test_loop_assertion_keeps_trusted_literal_fields_in_cached_mapping():
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "{{ [checks.computed, checks.derived ~ ' and true'] }}"}],
                 ctx, keyword=None)
+
+
+def test_assertion_does_not_template_a_rendered_collection_member_again():
+    rt = Runtime({}, "", {})
+    condition = {"__ansiroll_trusted_condition__": "{{ ['{' ~ '{ true }' ~ '}'] }}"}
+    with pytest.raises(UntrustedConditional):
+        rt.when([condition], rt.ctx(), keyword=None)
 
 
 @pytest.mark.parametrize("reference", ["alias", "settings"])

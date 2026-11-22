@@ -204,9 +204,12 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False):
+def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
+                 preserve_views=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
     if preserve_included_vars and isinstance(value, _IncludedVars):
+        return value
+    if preserve_views and isinstance(value, (_LazyTplDict, _LazyTplList, _LazyTplTuple, _PlayVarView)):
         return value
     if isinstance(value, str):
         if condition_text and not isinstance(value, _TrustedAsTemplateValue):
@@ -227,17 +230,17 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             # Lazy views render on access; plain containers are read raw.
             items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
             for key, item in items:
-                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text)
-                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text)
+                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views)
+                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views)
             return out
         if isinstance(value, list):
             out = []
             _seen[id(value)] = (value, out)
             items = (iter(value) if isinstance(value, _LazyTplList)
                      else list.__iter__(value))
-            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text) for v in items)
+            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views) for v in items)
             return out
-        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text) for v in value)
+        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views) for v in value)
     return value
 
 
@@ -1467,7 +1470,7 @@ class _LazyTplTuple(tuple):
         return not self == other
 
     def __contains__(self, value):
-        return value in tuple(iter(self))
+        return value in iter(self)
 
     def __add__(self, other):
         if isinstance(other, _LazyTplTuple):
@@ -2023,6 +2026,17 @@ class _Templater:
                       self._conditional_collection(env, pair.value) or self._conditional_member(env, pair.value))
                      for pair in node.items]
             return lambda ctx: {key(ctx): value(ctx) for key, value in pairs}
+        if isinstance(node, nodes.Call) and not node.args and node.dyn_args is None and node.dyn_kwargs is None:
+            target = node.node
+            if isinstance(target, nodes.Getattr) and target.attr == "copy" and isinstance(target.node, nodes.Dict):
+                if not node.kwargs:
+                    return self._conditional_collection(env, target.node)
+            if isinstance(target, nodes.Name) and target.name == "dict" and env.globals.get("dict") is _jinja_dict:
+                fields = [(kwarg.key, self._conditional_collection(env, kwarg.value)
+                           or self._conditional_member(env, kwarg.value)) for kwarg in node.kwargs]
+                evaluate_call = self._conditional_member(env, node)
+                return lambda ctx: (evaluate_call(ctx) if "dict" in ctx
+                                    else {key: value(ctx) for key, value in fields})
         if isinstance(node, nodes.Add):
             left = self._conditional_collection(env, node.left)
             right = self._conditional_collection(env, node.right)
@@ -2062,7 +2076,7 @@ class _Templater:
 
     def _observe_derived_value(self, value, ctx):
         if self._runtime is not None and type(value) in (dict, list, tuple):
-            return _lazy_wrap(value, self._runtime, ctx)
+            return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
     def _render_string(self, text, ctx, strict=False):
