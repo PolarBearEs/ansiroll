@@ -214,9 +214,9 @@ def _python_environment(executable):
     # CPython checks the executable's original directory and its parent.
     # Resolve the environment root only after finding the configuration.
     directory = os.path.dirname(os.path.abspath(executable))
-    for parent in (directory, os.path.dirname(directory)):
-        if os.path.isfile(os.path.join(parent, "pyvenv.cfg")):
-            return os.path.realpath(parent)
+    prefix = os.path.dirname(directory)
+    if any(os.path.isfile(os.path.join(parent, "pyvenv.cfg")) for parent in (directory, prefix)):
+        return os.path.realpath(prefix)
     return None
 
 
@@ -321,7 +321,7 @@ def _legacy_python_launcher(path, package, diagnostics, associated):
         diagnostics.append("%s: launcher shebang cannot be replayed" % path)
         return None
 
-    matching_python = associated or (
+    matching_python = (associated and not flags) or (
         source.startswith("#!") and _launcher_body_and_flags(source, match_script=path)[0] is not None
     )
     if flags and not matching_python:
@@ -483,6 +483,8 @@ def _select_playbook_launcher(filename, version):
             flags = _stock_playbook_flags(script, package)
             if flags is None:
                 raise RuntimeError(f"launcher initialization cannot be replayed: {script}")
+            if flags and _stock_playbook_flags(script, package, match_python=True) is None:
+                script, flags = _matching_path_launcher(package, environment_script)
         return script or "", flags, False
 
     # Older releases install a script instead of a module entry point.

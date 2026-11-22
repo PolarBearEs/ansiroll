@@ -357,7 +357,8 @@ def test_fallback_installation_uses_the_candidate_scheme_and_abi(tmp_path, monke
     assert _launcher_installation_matches(tmp_path / "bin" / "ansible-playbook", str(package))
 
 
-def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_beside_python", [False, True])
+def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, monkeypatch, config_beside_python):
     from tests import _stock_playbook_flags
 
     system = tmp_path / "system" / "bin" / "python3"
@@ -368,7 +369,8 @@ def test_fallback_distinguishes_venvs_that_share_the_python_binary(tmp_path, mon
         root = tmp_path / name
         executable = root / "bin" / "python3"
         executable.parent.mkdir(parents=True)
-        (root / "pyvenv.cfg").touch()
+        config_dir = executable.parent if config_beside_python else root
+        (config_dir / "pyvenv.cfg").touch()
         try:
             executable.symlink_to(system)
         except (OSError, NotImplementedError) as exc:
@@ -452,6 +454,23 @@ def test_modern_launcher_rejects_recorded_wrapper_initialization(tmp_path, monke
 
 
 @pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
+def test_recorded_launcher_does_not_transfer_flags_from_foreign_python(tmp_path, monkeypatch, version):
+    import tests
+
+    launcher = tmp_path / "ansible-playbook"
+    launcher.write_text("#!/other/bin/python3 -s\nfrom ansible.cli.playbook import main\nmain()\n")
+    monkeypatch.setattr(tests, "_installed_playbook_launchers", lambda package: iter([str(launcher)]))
+    monkeypatch.setattr(tests, "_path_playbook_launchers", lambda: iter(()))
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "selected" / "python3"))
+    filename = str(tmp_path / "ansible" / "__init__.py")
+    if version == "2.12.10":
+        with pytest.raises(FileNotFoundError, match="cannot replay flags from a different Python interpreter"):
+            tests._select_playbook_launcher(filename, version)
+    else:
+        assert tests._select_playbook_launcher(filename, version) == ("", (), False)
+
+
+@pytest.mark.parametrize("version", ["2.12.10", "2.14.18"])
 @pytest.mark.parametrize("no_user_site", [False, True])
 @pytest.mark.parametrize("safe_path", [None, "environment", "shebang", "env-shebang"])
 def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version, no_user_site, safe_path):
@@ -461,6 +480,7 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
         pytest.skip("Python does not support safe-path mode")
     # Virtual environments can disable usercustomize even without -s.
     monkeypatch.setattr(sys, "executable", os.path.realpath(sys._base_executable))
+    monkeypatch.setenv("PATH", os.path.dirname(sys.executable), prepend=os.pathsep)
     monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
     monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     monkeypatch.delenv("ANSIROLL_TEST_USERCUSTOMIZE", raising=False)
@@ -490,7 +510,7 @@ def test_launcher_import_order_matches_safe_path(tmp_path, monkeypatch, version,
     if safe_path == "env-shebang":
         shebang = "#!/usr/bin/env -S python3 -s -P" if no_user_site else "#!/usr/bin/env -S python3 -P"
     else:
-        shebang = f"#!/usr/bin/python3 -{options}" if options else "#!/usr/bin/env python"
+        shebang = f"#!{sys.executable} -{options}" if options else "#!/usr/bin/env python"
     legacy_body = (
         "import os, sys, ansible\n"
         f"assert ansible.SOURCE == {source!r}, ansible.SOURCE\n"
