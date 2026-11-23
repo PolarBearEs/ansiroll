@@ -121,6 +121,7 @@ def test_mixed_template_defers_unavailable_plugin_errors(plugin, expression):
     ("{{ lookup('source') }}/{{ suffix }}", "payload"),
     ({"nested": ["{{- lookup('source') -}} /{{ suffix }}"]}, "payload.nested[0]"),
     ("{{ (lookup('source')) }}/{{ suffix }}", "payload"),
+    ("{{ (lookup)('source') }}/{{ suffix }}", "payload"),
 ])
 @pytest.mark.parametrize("from_play", [False, True])
 def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, aliased, from_play):
@@ -147,6 +148,51 @@ def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, ali
     assert frames[1]["result"]["msg"] == "untouched"
     assert frames[2]["result"]["msg"] == "first/second|first/second"
     assert calls == ["source"]
+
+
+def test_literal_tasks_do_not_scan_other_hosts_for_lookup_templates(monkeypatch):
+    hostvars = {"another": {"example": "inventory-only value"}}
+    rt = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=lambda frame: None)
+    examined = []
+    has_lookup = rt.templater._has_lookup_call
+
+    def record(text):
+        examined.append(text)
+        return has_lookup(text)
+
+    monkeypatch.setattr(rt.templater, "_has_lookup_call", record)
+    task = _task("1", "literal", "debug", args={"msg": "untouched"})
+    rt.run_play({"tasks": [task], "gather_facts": False})
+    assert "inventory-only value" not in examined
+
+
+def test_task_defers_alias_to_mixed_lookup_in_hostvars():
+    frames, calls = [], []
+    hostvars = {"another": {"payload": "{{ lookup('source') }}/{{ suffix }}"}}
+    rt = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
+    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "first"
+    variables = {"alias": "{{ hostvars.another.payload }}", "suffix": "second"}
+    tasks = [
+        _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
+        _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok"]
+    assert frames[1]["result"]["msg"] == "first/second"
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize(
+    "expression", [" + ".join(["term"] * 1100), "(" * 1100 + "term" + ")" * 1100],
+    ids=["long_addition", "nested_parentheses"],
+)
+def test_unused_deep_lookup_template_does_not_abort_task_setup(expression):
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    task = _task("1", "literal", "debug", args={"msg": "untouched"})
+    lookup = "{{ " + expression + " }}/{{ lookup('source') }}"
+    rt.run_play({"tasks": [task], "gather_facts": False, "vars": {"unused": lookup}})
+    assert frames[0]["result"]["msg"] == "untouched"
 
 
 @pytest.mark.parametrize("expression", ["value | default('fallback')", "value | d('fallback')",

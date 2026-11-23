@@ -1751,7 +1751,8 @@ def _captured_jinja_error(error, syntax=False):
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
-    _LOOKUP_CALL = re.compile(r"\b(?:lookup|query|q)\s*\(")
+    _LOOKUP_CALL = re.compile(r"\b(?:lookup|query|q)\b\s*(?:\)\s*)*\(")
+    _SCOPE_REFERENCE = re.compile(r"\b(?:hostvars|vars)\b")
 
     def __init__(self):
         self._expr_cache = {}
@@ -2149,17 +2150,31 @@ class _Templater:
             return False
         if text not in self._lookup_templates:
             nodes = jinja2.nodes
+            has_lookup = False
             try:
-                calls = self.env.parse(text).find_all(nodes.Call)
-                has_lookup = any(isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
-                                 for call in calls)
+                pending = [self.env.parse(text)]
+                while pending:
+                    node = pending.pop()
+                    if (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name)
+                            and node.node.name in ("lookup", "query", "q")):
+                        has_lookup = True
+                        break
+                    pending.extend(node.iter_child_nodes())
+            except RecursionError:
+                # The parser may succeed later with a shallower call stack.
+                return False
             except jinja2.TemplateSyntaxError:
-                has_lookup = False
+                # Report a parser error only if the value is used.
+                pass
             self._lookup_templates[text] = has_lookup
         return self._lookup_templates[text]
 
     def _contains_mixed_lookup(self, scope):
-        pending, seen = [scope], set()
+        # Magic scope maps can hold a full inventory snapshot. Their members
+        # are already lazy unless a template reads them through an alias.
+        snapshots = {key: scope[key] for key in ("vars", "hostvars") if key in scope}
+        pending = [value for key, value in scope.items() if key not in ("vars", "hostvars")]
+        seen = set()
         while pending:
             value = pending.pop()
             if isinstance(value, (_LazyTplDict, _LazyTplList)):
@@ -2168,6 +2183,10 @@ class _Templater:
                 stripped = value.strip()
                 if self._has_lookup_call(stripped) and self._bare_lookup_expression(stripped) is None:
                     return True
+                if snapshots and _looks_templated(stripped):
+                    for key in self._SCOPE_REFERENCE.findall(stripped):
+                        if key in snapshots:
+                            pending.append(snapshots.pop(key))
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
                 if type(value) is dict:
