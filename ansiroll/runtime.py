@@ -65,11 +65,14 @@ def _legacy_non_native(ctx):
     return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
 
 
+_DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
+
+
 def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs"}
+                "__ansiroll_search_dirs", _DEFER_LOOKUP_NAMES}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -1569,6 +1572,15 @@ def _captured(msg, *, missing=False):
     return jinja2.StrictUndefined(hint=msg, exc=error_type)
 
 
+def _preserve_captured_errors(function):
+    def checked(value, *args, **kwargs):
+        if _is_undef(value) and value._undefined_exception is _CapturedTemplateError:
+            value._fail_with_undefined_error()
+        return function(value, *args, **kwargs)
+
+    return checked
+
+
 def _dump_object(v):
     if _is_undef(v):
         msg = getattr(v, "_undefined_hint", None) or "undefined value"
@@ -1739,12 +1751,13 @@ def _captured_jinja_error(error, syntax=False):
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
-    _LEADING_LOOKUP = re.compile(r"^\{\{[-+]?\s*(?:lookup|query|q)\s*\(")
+    _LOOKUP_CALL = re.compile(r"\b(?:lookup|query|q)\s*\(")
 
     def __init__(self):
         self._expr_cache = {}
         self._condition_list_cache = {}
         self._template_cache = {}
+        self._lookup_templates = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
         self._plugin_errors = {"filter": {}, "test": {}}
@@ -1766,6 +1779,10 @@ class _Templater:
         tests = _PluginDict("test", self._plugin_errors["test"])
         tests.update(self.env.tests)
         self.env.tests = tests
+        for name in ("d", "default"):
+            self.env.filters[name] = _preserve_captured_errors(self.env.filters[name])
+        for name in ("defined", "undefined"):
+            self.env.tests[name] = _preserve_captured_errors(self.env.tests[name])
         # A few commonly-used Ansible filters/tests, best-effort.
         for fname, func in _ANSIBLE_FILTERS.items():
             self.env.filters.setdefault(fname, _wrap_filter(func))
@@ -1953,7 +1970,7 @@ class _Templater:
     def _play_var_scope(self, ctx, strict):
         if isinstance(ctx, _PlayVarScope):
             return ctx
-        if (isinstance(ctx.get("vars"), _LoopVarsSnapshot)
+        if (ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
                 or any(isinstance(value, _PlayVarTemplate) for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
         return ctx
@@ -2113,7 +2130,9 @@ class _Templater:
         """Read the expression between the actual Jinja delimiters."""
         try:
             tokens = iter(self.env.lex(stripped))
-            _, _, opening = next(tokens)
+            _, kind, opening = next(tokens, (None, None, None))
+            if kind != "variable_begin":
+                return None
             for _, kind, closing in tokens:
                 if kind != "variable_end":
                     continue
@@ -2125,36 +2144,59 @@ class _Templater:
             pass
         return None
 
-    def _contains_mixed_lookup(self, value):
-        if type(value) is str:
-            stripped = value.strip()
-            return bool(self._LEADING_LOOKUP.match(stripped)) and self._bare_lookup_expression(stripped) is None
-        if type(value) is dict:
-            if len(value) == 1 and ("__ansiroll_unsafe__" in value or "__ansiroll_vault__" in value):
-                return False
-            return any(self._contains_mixed_lookup(item) for item in value.values())
-        if type(value) in (list, tuple):
-            return any(self._contains_mixed_lookup(item) for item in value)
+    def _has_lookup_call(self, text):
+        if not _looks_templated(text) or not self._LOOKUP_CALL.search(text):
+            return False
+        if text not in self._lookup_templates:
+            nodes = jinja2.nodes
+            try:
+                calls = self.env.parse(text).find_all(nodes.Call)
+                has_lookup = any(isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
+                                 for call in calls)
+            except jinja2.TemplateSyntaxError:
+                has_lookup = False
+            self._lookup_templates[text] = has_lookup
+        return self._lookup_templates[text]
+
+    def _contains_mixed_lookup(self, scope):
+        pending, seen = [scope], set()
+        while pending:
+            value = pending.pop()
+            if isinstance(value, (_LazyTplDict, _LazyTplList)):
+                value = value._raw
+            if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate):
+                stripped = value.strip()
+                if self._has_lookup_call(stripped) and self._bare_lookup_expression(stripped) is None:
+                    return True
+            elif type(value) in (dict, list, tuple) and id(value) not in seen:
+                seen.add(id(value))
+                if type(value) is dict:
+                    if len(value) == 1 and ("__ansiroll_unsafe__" in value or "__ansiroll_vault__" in value):
+                        continue
+                    pending.extend(value.values())
+                else:
+                    pending.extend(value)
         return False
 
     def _render_string(self, text, ctx, strict=False):
         tracking = self._untrusted_task_interpolation is not None
-        if tracking:
+        lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
+        if lazy_names:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
-        template_key = (text, strict, tracking)
+        template_key = (text, strict, lazy_names)
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
-        leading_lookup = self._LEADING_LOOKUP.match(stripped)
+        has_lookup = self._has_lookup_call(stripped)
         expr = None
-        if leading_lookup:
+        if has_lookup:
             expr = self._bare_lookup_expression(stripped)
         elif (stripped.startswith("{{") and stripped.endswith("}}")
               and stripped.count("{{") == 1 and "{%" not in stripped):
             expr = stripped[2:-2].strip()
         if expr is not None:
-            expr_key = (expr, strict, tracking)
+            expr_key = (expr, strict, lazy_names)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(stripped, env, ctx, strict)
@@ -2180,7 +2222,7 @@ class _Templater:
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
                 )
             except Exception as e:
-                if not leading_lookup:
+                if not has_lookup:
                     raise
                 return _captured_jinja_error(e)
         try:
@@ -2201,13 +2243,17 @@ class _Templater:
             return expr
         expr = str(expr)
         ctx = self._play_var_scope(ctx, strict)
-        expr_key = (expr, strict, False)
+        lazy_names = bool(ctx.get(_DEFER_LOOKUP_NAMES))
+        expr_key = (expr, strict, lazy_names)
         previous = self._current_ctx
         self._current_ctx = ctx
         try:
             compiled = self._expr_cache.get(expr_key)
             if compiled is None:
-                env = self._strict_env if strict else self.env
+                if lazy_names:
+                    env = self._strict_conditional_env if strict else self._conditional_env
+                else:
+                    env = self._strict_env if strict else self.env
                 compiled = env.compile_expression(expr, undefined_to_none=False)
                 self._expr_cache[expr_key] = compiled
             return compiled(**ctx)
@@ -3127,9 +3173,9 @@ class Runtime:
         # A loop expression can use task vars, and later uses can see the
         # loop bindings. Keep templates live until they are actually read.
         looped = task.get("type") != "include" and task.get("loop") is not None
-        # Aliases of a mixed lookup must also defer until after the task gate.
-        defer = looped or self.templater._contains_mixed_lookup(task_vars)
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=defer))
+        # Inherited lookups can be reached through aliases in task vars.
+        mixed_lookup = self.templater._contains_mixed_lookup({**ctx, **task_vars, **higher_vars})
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -3156,6 +3202,8 @@ class Runtime:
             current[key] = value
         hostvars[self.host] = current
         ctx["hostvars"] = hostvars
+        if mixed_lookup:
+            ctx[_DEFER_LOOKUP_NAMES] = True
         loop_snapshot = looped and bool(task_vars)
         play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
         if "vars" not in ctx or play_magic:
@@ -5595,7 +5643,7 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
     for key, value in (ctx or {}).items():
-        if key == "vars" or (deferred is not None and key == "omit"):
+        if key in ("vars", _DEFER_LOOKUP_NAMES) or (deferred is not None and key == "omit"):
             continue
         try:
             if deferred is not None and key not in resolve_keys:

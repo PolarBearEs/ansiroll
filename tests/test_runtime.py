@@ -120,8 +120,10 @@ def test_mixed_template_defers_unavailable_plugin_errors(plugin, expression):
 @pytest.mark.parametrize(("payload", "aliased"), [
     ("{{ lookup('source') }}/{{ suffix }}", "payload"),
     ({"nested": ["{{- lookup('source') -}} /{{ suffix }}"]}, "payload.nested[0]"),
+    ("{{ (lookup('source')) }}/{{ suffix }}", "payload"),
 ])
-def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, aliased):
+@pytest.mark.parametrize("from_play", [False, True])
+def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, aliased, from_play):
     frames = []
     rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
     calls = []
@@ -131,15 +133,38 @@ def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, ali
         return "first"
 
     rt.templater.env.globals["lookup"] = lookup
-    variables = {"payload": payload, "alias": "{{ %s }}" % aliased, "suffix": "second"}
+    variables = {"alias": "{{ %s }}" % aliased, "suffix": "second"}
+    play_vars = {"payload": payload} if from_play else {}
+    if not from_play:
+        variables["payload"] = payload
     tasks = [
-        _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
-        _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),
+        _task("1", "skipped", "debug", vars=variables, when=["false and alias"], args={"msg": "{{ alias }}"}),
+        _task("2", "unused", "debug", vars=variables, args={"msg": "{{ 'untouched' if true else alias }}"}),
+        _task("3", "runs", "debug", vars=variables, args={"msg": "{{ alias ~ '|' ~ alias }}"}),
     ]
-    rt.run_play({"tasks": tasks, "gather_facts": False})
-    assert [frame["status"] for frame in frames] == ["skipped", "ok"]
-    assert frames[1]["result"]["msg"] == "first/second"
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok", "ok"]
+    assert frames[1]["result"]["msg"] == "untouched"
+    assert frames[2]["result"]["msg"] == "first/second|first/second"
     assert calls == ["source"]
+
+
+@pytest.mark.parametrize("expression", ["value | default('fallback')", "value | d('fallback')",
+                                         "value is defined", "value is undefined"])
+@pytest.mark.parametrize(("source", "message"), [
+    ("{{ 1 // divisor }}", "by zero"),
+    ("{{ 'x' | unknown_filter }}", "No filter named"),
+])
+def test_captured_errors_do_not_count_as_missing_variables(expression, source, message):
+    from ansiroll.runtime import _dump_object
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ %s }}" % expression
+    result = templater.render_string(text, {"value": source, "divisor": 0})
+    assert message in _dump_object(result)["exception"]["message"]
+
+    missing = templater.render_string(text, {})
+    assert missing == {"value is defined": False, "value is undefined": True}.get(expression, "fallback")
 
 
 @pytest.mark.parametrize("version,resolve", [("2.18.20", False), ("2.19.15", True)])
