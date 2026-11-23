@@ -187,19 +187,22 @@ def _rewrite_playbook_include(item):
 
     include = item["include"]
     parts = split_args(include)
+    filename = parts[0].strip() if parts else ""
+    if not filename:
+        raise AnsibleParserError("legacy playbook include must specify a filename", obj=item)
+
     rewritten = copy(item)
     del rewritten["include"]
-    rewritten["import_playbook"] = include
-    if len(parts) <= 1:
+    if len(parts) == 1 and filename == include:
+        rewritten["import_playbook"] = include
         return rewritten
 
-    params = parse_kv(" ".join(parts[1:]))
+    params = parse_kv(" ".join(parts[1:])) if len(parts) > 1 else {}
     if "_raw_params" in params:
         raise AnsibleParserError("legacy playbook include parameters must use key=value", obj=item)
-    if "vars" in item or ("tags" in item and "tags" in params):
-        raise AnsibleParserError("conflicting inline parameters and vars or tags on legacy playbook include", obj=item)
+    if len(parts) > 1 and "vars" in item:
+        raise AnsibleParserError("conflicting inline parameters and vars on legacy playbook include", obj=item)
 
-    filename = parts[0]
     # Splitting a YAML string can drop its template trust on Core 2.19+.
     try:
         from ansible.template import is_trusted_as_template, trust_as_template
@@ -211,8 +214,13 @@ def _rewrite_playbook_include(item):
             params = {key: trust_as_template(value) for key, value in params.items()}
     rewritten["import_playbook"] = filename
     if "tags" in params:
-        rewritten["tags"] = params.pop("tags")
-    rewritten["vars"] = params
+        inline_tags = params.pop("tags")
+        # Legacy Ansible applies tag declarations in YAML key order.
+        last_tag_source = next(key for key in reversed(item) if key in ("include", "tags"))
+        if last_tag_source == "include":
+            rewritten["tags"] = inline_tags
+    if params:
+        rewritten["vars"] = params
     return rewritten
 
 

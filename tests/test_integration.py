@@ -2272,9 +2272,14 @@ def test_legacy_playbook_includes_preserve_nested_task_includes(tmp_path, root_i
     assert manifest["fallback_tasks"] == []
 
 
-def test_legacy_playbook_include_preserves_inline_variables(tmp_path):
+@pytest.mark.parametrize(("include", "greeting"), [
+    ("""- include: "{{ child_playbook }} greeting='hello world' tags=imported"\n""", "hello world"),
+    ("- include: >\n    {{ child_playbook }}\n", "original"),
+    ("- include: |\n    {{ child_playbook }}\n    greeting=hello\n", "hello"),
+])
+def test_legacy_playbook_include_preserves_inline_variables(tmp_path, include, greeting):
     playbook = tmp_path / "play.yml"
-    playbook.write_text("""- include: "{{ child_playbook }} greeting='hello world' tags=imported"\n""")
+    playbook.write_text(include)
     (tmp_path / "child.yml").write_text("""
 - hosts: localhost
   gather_facts: false
@@ -2283,8 +2288,26 @@ def test_legacy_playbook_include_preserves_inline_variables(tmp_path):
 """)
 
     plays, _ = parse_playbook(str(playbook), extra_vars={"child_playbook": "child.yml"})
-    assert plays[0]["vars"]["greeting"] == "hello world"
+    assert plays[0]["vars"]["greeting"] == greeting
     assert "tags" not in plays[0]["vars"]
+
+
+@pytest.mark.parametrize(("include", "tag"), [
+    ("- include: child.yml tags=inline\n  tags: explicit\n", "explicit"),
+    ("- tags: explicit\n  include: child.yml tags=inline\n", "inline"),
+])
+def test_legacy_playbook_include_uses_last_tag_declaration(tmp_path, include, tag):
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
+
+    from ansiroll.loader import _make_rewriting_loader
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(include)
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  tasks: []\n")
+
+    plays = Playbook.load(str(playbook), loader=_make_rewriting_loader(DataLoader)).get_plays()
+    assert plays[0].tags == [tag]
 
 
 @pytest.mark.parametrize("modern", ["import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook"])
