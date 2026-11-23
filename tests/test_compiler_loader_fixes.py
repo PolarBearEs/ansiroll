@@ -352,27 +352,36 @@ def test_compile_dynamic_role_source_selects_root_from_traversal_target(tmp_path
     assert destination.read_text() == "selected template\n"
 
 
-def test_compile_dynamic_role_source_uses_nonregular_traversal_target_without_baking_it(tmp_path):
+@pytest.mark.parametrize("later_root", [False, True])
+def test_compile_dynamic_role_source_uses_nonregular_traversal_target_without_baking_it(tmp_path, later_root):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {selection: link/../app}
+- set_fact: {selection: link/../app, direct: app}
 - template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
-""", "roles/r/templates/sites/app.j2": "selected template\n"})
-    sites = tmp_path / "roles/r/templates/sites"
+- template: {src: "sites/{{ direct }}.j2", dest: "direct.txt"}
+""", "roles/r/templates/sites/app.j2": "first template\n"})
+    sites = tmp_path / ("templates/sites" if later_root else "roles/r/templates/sites")
+    if later_root:
+        _write(sites, {"app.j2": "later template\n"})
     (sites / "other/branch").mkdir(parents=True)
     (sites / "other/app.j2").symlink_to(os.devnull)
     (sites / "link").symlink_to("other/branch", target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"
     destination = tmp_path / "rendered.txt"
+    selected = "later template\n" if later_root else "first template\n"
     expected = _ansible(playbook, returncode=0)
-    assert destination.read_text() == "selected template\n"
+    assert destination.read_text() == selected
     destination.unlink()
+    direct = tmp_path / "direct.txt"
+    assert direct.read_text() == "first template\n"
+    direct.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
-    assert destination.read_text() == "selected template\n"
+    assert destination.read_text() == selected
+    assert direct.read_text() == "first template\n"
     template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
                     if node.get("action", "").endswith("template"))
     assert "sites/other/app.j2" not in template["_baked"]

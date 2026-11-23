@@ -1979,6 +1979,16 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         if not prefix and not is_subdir:
             skipped.append((base, root_index))
             continue
+        special_names = set()
+        if root_aliases and claimed:
+            claimed_names = {os.path.basename(relative) for relative in claimed}
+            # A traversed special file and its normalized payload have the
+            # same basename, even when a symlink changes their parent path.
+            special_names = {
+                name for directory, _, files in walk for name in claimed_names.intersection(files)
+                if (mode := _role_source_mode(os.path.join(directory, name))) is not None
+                and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
+            }
         alias_candidates = set()
         if suffix and root_aliases:
             # The rendered prefix can reach any directory in this search root.
@@ -2023,7 +2033,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     blockers.setdefault(rel, set()).add(root_index)
                     continue
                 alternate = rel in claimed
-                if alternate and rel not in shadowed:
+                if alternate and rel not in shadowed and fn not in special_names:
                     # Traversal can select this root via a different path than
                     # the normalized path whose payload Ansible reads.
                     root_files[rel] = None
