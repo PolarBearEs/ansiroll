@@ -1878,6 +1878,10 @@ def _literal_head(src):
 def _literal_role_source_tail(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
+    from .runtime import _bare_template_expression
+
+    if _bare_template_expression(src) is not None:
+        return ""
     try:
         body = Environment(keep_trailing_newline=True).parse(src).body
     except TemplateSyntaxError:

@@ -255,6 +255,20 @@ def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, mo
     assert node["_baked"] == {selected: "usable template\n"}
 
 
+def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: "{{ selection }} ", dest: "rendered.txt"}
+""", "roles/r/templates/app": "selected template\n"})
+
+    _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
+    assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+
+
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
 def test_copy_remote_src_reads_target_at_runtime(tmp_path, remote_src):
     src = tmp_path / "remote.txt"

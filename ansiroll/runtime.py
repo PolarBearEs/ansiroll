@@ -1477,6 +1477,16 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message)
 
 
+def _bare_template_expression(text):
+    stripped = text.strip()
+    lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
+    if (stripped.startswith("{{") and stripped.endswith("}}")
+            and (stripped.count("{{") == 1 or lookup_expr)
+            and "{%" not in stripped):
+        return stripped[2:-2].strip()
+    return None
+
+
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
@@ -1693,13 +1703,9 @@ class _Templater:
     def _render_string(self, text, ctx, strict=False):
         env = self._strict_env if strict else self.env
         template_key = (text, strict)
-        stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
-        lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
-        if (stripped.startswith("{{") and stripped.endswith("}}")
-                and (stripped.count("{{") == 1 or lookup_expr)
-                and "{%" not in stripped):
-            expr = stripped[2:-2].strip()
+        expr = _bare_template_expression(text)
+        if expr is not None:
             expr_key = (expr, True) if strict else expr
             try:
                 compiled = self._expr_cache.get(expr_key)
