@@ -5493,9 +5493,9 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_member(value, key, undefined, errors, path):
+def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path):
     try:
-        return _delegate_fallback_value(value[key], undefined, errors, path)
+        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path)
     except _CapturedTemplateError as error:
         errors.append((path, str(error)))
     except jinja2.UndefinedError:
@@ -5505,17 +5505,20 @@ def _delegate_fallback_member(value, key, undefined, errors, path):
     return None
 
 
-def _delegate_fallback_value(value, undefined, errors, path=()):
+def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, dict):
-        keys = {}
-        for key in value:
-            wire_key = key if isinstance(key, str) else next(iter(json.loads(json.dumps({key: None}))))
-            keys[wire_key] = key
-        return {wire_key: _delegate_fallback_member(value, key, undefined, errors, (*path, wire_key))
-                for wire_key, key in keys.items()}
+        keys = list(value)
+        if all(isinstance(key, str) for key in keys):
+            wire_keys = keys
+        else:
+            # Index this mapping on the wire so 8080 and '8080' never collide.
+            wire_keys = [str(index) for index in range(len(keys))]
+            mapping_keys.append((path, keys))
+        return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys, (*path, wire_key))
+                for wire_key, key in zip(wire_keys, keys)}
     if isinstance(value, (list, tuple)):
-        return [_delegate_fallback_member(value, index, undefined, errors, (*path, index))
+        return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys, (*path, index))
                 for index in range(len(value))]
     return _fail_on_undef(value)
 
@@ -5528,10 +5531,13 @@ def _resolve_delegated_play_var(name, scope, templater):
             rendered = templater.resolve_variable(name, rendered, scope)
         undefined = []
         errors = []
-        value = _delegate_fallback_value(rendered, undefined, errors)
+        mapping_keys = []
+        value = _delegate_fallback_value(rendered, undefined, errors, mapping_keys)
         result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
         if errors:
             result["errors"] = errors
+        if mapping_keys:
+            result["mapping_keys"] = json.loads(json.dumps(mapping_keys))
         return result
     except _CapturedTemplateError as error:
         return {"error": str(error)}

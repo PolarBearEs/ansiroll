@@ -102,12 +102,14 @@ def _legacy_environment_validator(validate, aliases):
 
     from ansiroll.runtime import _ConditionalCodeGenerator, _ConditionalName
 
+    def check_error(member):
+        if isinstance(member, _DelegatedMemberError):
+            member._fail_with_undefined_error()
+        return member
+
     def check_member(access):
         def get_member(obj, key):
-            member = access(obj, key)
-            if isinstance(member, _DelegatedMemberError):
-                member._fail_with_undefined_error()
-            return member
+            return check_error(access(obj, key))
         return get_member
 
     def validate_environment(attr, value, templar):
@@ -131,6 +133,9 @@ def _legacy_environment_validator(validate, aliases):
                     value = value.resolve()
                     self._update_unsafe(value)
                 return value
+
+            def call(self, *args, **kwargs):
+                return check_error(super().call(*args, **kwargs))
 
         def template_variable(value, *args, **kwargs):
             # Legacy lookup plugins can read available_variables directly.
@@ -682,7 +687,8 @@ class StrategyModule(StrategyBase):
                     if "error" in resolved:
                         raise AnsibleError("delegated play variable %r: %s" % (name, resolved["error"]))
                     return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"],
-                                                       resolved.get("errors", ()))
+                                                       resolved.get("errors", ()),
+                                                       wrap_var(resolved.get("mapping_keys", ())))
 
                 bridge = _DelegatedPlayVariables(load_play_var)
                 try:
@@ -742,8 +748,8 @@ class StrategyModule(StrategyBase):
             }
 
     @staticmethod
-    def _restore_play_fallback(value, undefined, errors=()):
-        if not undefined and not errors:
+    def _restore_play_fallback(value, undefined, errors=(), mapping_keys=()):
+        if not undefined and not errors and not mapping_keys:
             return value
         try:
             from ansible._internal._templating._jinja_common import CapturedExceptionMarker, UndefinedMarker
@@ -774,6 +780,17 @@ class StrategyModule(StrategyBase):
             for key in path[:-1]:
                 container = container[key]
             container[path[-1]] = marker
+        def restore_key(key):
+            return tuple(restore_key(part) for part in key) if isinstance(key, list) else key
+
+        # Decode inner mappings before changing the keys used to reach them.
+        for path, keys in reversed(mapping_keys):
+            container = value
+            for key in path:
+                container = container[key]
+            entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
+            container.clear()
+            container.update(entries)
         return value
 
     def _run_local_template(self, frame, become_pass):

@@ -232,13 +232,14 @@ def test_delegated_play_fallback_renders_each_member_once():
     assert calls == [True]
 
 
-def test_delegated_play_fallback_discards_overwritten_undefined_paths():
+def test_delegated_play_fallback_preserves_typed_keys_and_undefined_paths():
     from ansiroll.runtime import _resolve_delegated_play_var
 
     rt = Runtime({}, "", {})
     values = rt.template_vars({"settings": {1: ["{{ missing }}"], "1": "winner"}}, {}, dynamic=True)
     assert _resolve_delegated_play_var("settings", values, rt.templater) == {
-        "value": {"1": "winner"}, "undefined": [],
+        "value": {"0": [None], "1": "winner"}, "undefined": [("0", 0)],
+        "mapping_keys": [[[], [1, "1"]]],
     }
 
 
