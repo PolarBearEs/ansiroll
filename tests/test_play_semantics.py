@@ -1152,16 +1152,24 @@ def test_implicit_setup_subset_uses_public_role_defaults_before_host_facts(tmp_p
     assert msgs == ['"distribution defined: False"']
 
 
-def test_standalone_setup_subset_uses_baked_controller_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("expression", "environment"), [
+    ("lookup('env', 'ANSIROLL_SETUP_SUBSET').split(',')", {"ANSIROLL_SETUP_SUBSET": "!all,!min"}),
+    ("query('env', 'ANSIROLL_SETUP_ALL', 'ANSIROLL_SETUP_MIN')",
+     {"ANSIROLL_SETUP_ALL": "!all", "ANSIROLL_SETUP_MIN": "!min"}),
+    ("q('ansible.builtin.env', 'ANSIROLL_SETUP_ALL', 'ANSIROLL_SETUP_MIN')",
+     {"ANSIROLL_SETUP_ALL": "!all", "ANSIROLL_SETUP_MIN": "!min"}),
+])
+def test_standalone_setup_subset_uses_baked_controller_environment(tmp_path, monkeypatch, expression, environment):
     _write(tmp_path, {"pb.yml": """
         - hosts: localhost
           gather_facts: true
-          gather_subset: "{{ lookup('env', 'ANSIROLL_SETUP_SUBSET').split(',') }}"
+          gather_subset: "{{ %s }}"
           tasks:
             - debug:
                 msg: "distribution defined: {{ ansible_facts.distribution is defined }}"
-    """})
-    monkeypatch.setenv("ANSIROLL_SETUP_SUBSET", "!all,!min")
+    """ % expression})
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
     expected = _ansible(tmp_path, [])
     assert expected[0] == ['"distribution defined: False"']
     output = tmp_path / "out.py"
@@ -1169,7 +1177,8 @@ def test_standalone_setup_subset_uses_baked_controller_environment(tmp_path, mon
         [sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", str(output)],
         cwd=str(tmp_path), env=_env(), capture_output=True, check=True,
     )
-    monkeypatch.delenv("ANSIROLL_SETUP_SUBSET")
+    for name in environment:
+        monkeypatch.delenv(name)
     result = subprocess.run([sys.executable, str(output)], cwd=str(tmp_path), env=_env(),
                             capture_output=True, text=True, check=True)
     assert _summary(result.stdout) == expected
@@ -1938,7 +1947,9 @@ def test_disabled_setup_does_not_bundle_fact_path_vars_file_alternatives(tmp_pat
 
 @pytest.mark.parametrize("selector", [
     "lookup('first_found', ['primary.yml', 'fallback.yml'])",
+    "lookup('first_found', ['primary.yml', 'fallback.yml']) | string",
     "query('first_found', {'files': ['primary.yml', 'fallback.yml']}) | first",
+    "query('first_found', {'files': ['primary.yml', 'fallback.yml']}) | first | string",
 ])
 def test_disabled_setup_validation_compiles_only_the_fixed_first_found_choice(tmp_path, selector):
     from ansiroll.loader import parse_playbook
@@ -1946,6 +1957,7 @@ def test_disabled_setup_validation_compiles_only_the_fixed_first_found_choice(tm
     _write(tmp_path, {
         "primary.yml": "subset: [all]\nselected_value: chosen\n",
         "fallback.yml": "selected_value: never_bundle_fixed_fallback\n",
+        "unrelated.yml": "selected_value: never_bundle_unrelated_data\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: false
@@ -1957,8 +1969,38 @@ def test_disabled_setup_validation_compiles_only_the_fixed_first_found_choice(tm
         """ % selector,
     })
     plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
-    assert "never_bundle_fixed_fallback" not in json.dumps(plays, default=str)
+    bundled = json.dumps(plays, default=str)
+    assert "never_bundle_fixed_fallback" not in bundled
+    assert "never_bundle_unrelated_data" not in bundled
     assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
+@pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
+def test_setup_first_found_replays_legacy_templated_filename(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "vars/dev-profile.yml": "subset: [all]\n",
+        "vars/prod-profile.yml": "subset: ['!all', '!min']\n",
+        "vars/unrelated.yml": "unrelated: never_bundle_without_matching_suffix\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ lookup('first_found', ['vars/{{ profile }}-profile.yml']) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "never_bundle_without_matching_suffix" not in json.dumps(plays, default=str)
+    extra = json.dumps({"profile": "prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
 
 
 def test_disabled_setup_does_not_capture_inactive_fact_path_environment(tmp_path, monkeypatch):

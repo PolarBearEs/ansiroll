@@ -49,8 +49,7 @@ _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ROLE_PATH_RE = re.compile(r"{{\s*role_path\s*}}")
 _USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
-    r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
-    r"""([A-Za-z_][A-Za-z0-9_]*)["']"""
+    r"""(?<![\w.])(?:lookup|query|q)\s*\(\s*["'](?:ansible\.(?:builtin|legacy)\.)?env["']\s*,"""
 )
 _CONFIG_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?config["']\s*,\s*["']"""
@@ -430,7 +429,22 @@ def _controller_env_names(value):
     """Find literal controller-side env lookups that the target must reproduce."""
     names = set()
     if isinstance(value, str):
-        names.update(_ENV_LOOKUP_RE.findall(value))
+        if not _ENV_LOOKUP_RE.search(value):
+            return names
+        from jinja2 import nodes
+
+        parsed = _selector_ast(value if _is_templated(value) else "{{ " + value + " }}")
+        if parsed is None:
+            return names
+        for call in parsed.find_all(nodes.Call):
+            if (isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
+                    and call.args and isinstance(call.args[0], nodes.Const)
+                    and call.args[0].value in ("env", "ansible.builtin.env", "ansible.legacy.env")):
+                names.update(arg.value for arg in call.args[1:] if isinstance(arg, nodes.Const)
+                             and isinstance(arg.value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg.value))
+        for literal in parsed.find_all(nodes.Const):
+            if _is_templated(literal.value):
+                names.update(_controller_env_names(literal.value))
     elif isinstance(value, dict):
         for key, item in value.items():
             names.update(_controller_env_names(key))
@@ -576,9 +590,13 @@ def _literal_first_found(selector):
             or len(parsed.body[0].nodes) != 1):
         return False
     expr = parsed.body[0].nodes[0]
-    first = isinstance(expr, nodes.Filter)
-    if first:
-        if expr.name != "first" or expr.args or expr.kwargs or expr.dyn_args or expr.dyn_kwargs:
+    first = False
+    while isinstance(expr, nodes.Filter):
+        if expr.args or expr.kwargs or expr.dyn_args or expr.dyn_kwargs:
+            return False
+        if expr.name == "first" and not first:
+            first = True
+        elif expr.name != "string" or first:
             return False
         expr = expr.node
     if (not isinstance(expr, nodes.Call) or not isinstance(expr.node, nodes.Name)
@@ -589,9 +607,13 @@ def _literal_first_found(selector):
     if name not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found"):
         return False
 
+    templates_lookup_paths = _core_version() < (2, 19)
+
     def literal(node):
         if isinstance(node, nodes.Const):
-            return not isinstance(node.value, str) or not re.search(r"(^|[,;:])~", node.value)
+            value = node.value
+            return not isinstance(value, str) or (
+                not re.search(r"(^|[,;:])~", value) and not (templates_lookup_paths and _is_templated(value)))
         return isinstance(node, (nodes.List, nodes.Tuple, nodes.Dict, nodes.Pair, nodes.Keyword)) and all(
             literal(child) for child in node.iter_child_nodes())
 
@@ -652,7 +674,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             fallback = call.args[0] if call.args else default_options.get("default_value")
             if fallback is not None:
                 fallbacks.append(fallback)
-        elif call.name != "first":
+        elif call.name not in ("first", "string"):
             return None
         call = call.node
     if (not isinstance(call, nodes.Call) or not isinstance(call.node, nodes.Name)
@@ -679,6 +701,14 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
 
     def path_pattern(term):
         parts = concat_parts(term)
+        if version < (2, 19) and isinstance(term, nodes.Const) and _is_templated(term.value):
+            nested = _selector_ast(term.value)
+            if nested is None or len(nested.body) != 1 or not isinstance(nested.body[0], nodes.Output):
+                return None
+            parts = [part for node in nested.body[0].nodes for part in (
+                [nodes.Const(node.data)] if isinstance(node, nodes.TemplateData) else concat_parts(node))]
+            if not parts:
+                return None
         anchored = isinstance(parts[0], nodes.Name) and parts[0].name == "playbook_dir"
         if anchored:
             parts = parts[1:]
