@@ -269,6 +269,30 @@ def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_pa
     assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
 
 
+def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: area/keep/..}
+- template: {src: "sites/{{ selection }}/live/app.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/actual/app.j2": "selected template\n",
+        "templates/sites/area/live/app.j2": "selected template\n",
+        "roles/r/templates/sites/unrelated/app.j2": "unrelated template\n"})
+    area = tmp_path / "roles/r/templates/sites/area"
+    (area / "keep").mkdir(parents=True)
+    (area / "live").symlink_to("../actual", target_is_directory=True)
+    playbook = tmp_path / "pb.yml"
+
+    _ansiroll(playbook, tmp_path, returncode=0)
+    assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "sites/actual/app.j2" in template["_baked"]
+    assert "sites/unrelated/app.j2" not in template["_baked"]
+
+
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
 def test_copy_remote_src_reads_target_at_runtime(tmp_path, remote_src):
     src = tmp_path / "remote.txt"

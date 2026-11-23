@@ -1919,29 +1919,49 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 fixed_path = os.sep + basename
             else:
                 fixed_path = os.sep + os.path.normpath(os.sep.join(trailing_components)).lstrip(os.sep)
-    baked = {}
-    meta = {}
-    directories = set()
+    trees = []
     aliases = {}
-    claimed = set()
-    skipped = []
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
+        walk = []
+        trees.append((base, is_subdir, walk))
         if not prefix and not is_subdir:
-            skipped.append(base)
             continue
         real_base = os.path.realpath(base)
         for root, dirs, files in os.walk(os.path.join(base, prefix)):
             dirs.sort()
-            directories.add(os.path.relpath(root, base))
+            if fixed_path:
+                files = [basename] if basename in files else []
+            walk.append((root, dirs, files))
             for dirname in dirs:
                 full = os.path.join(root, dirname)
-                claimed.add(os.path.relpath(full, base))
                 if os.path.islink(full):
                     aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
+
+    alias_candidates = set()
+    if fixed_path and aliases:
+        suffix = fixed_path.lstrip(os.sep).split(os.sep)
+        for index, component in enumerate(suffix[:-1]):
+            for alias, target in aliases.items():
+                if os.path.basename(alias) == component:
+                    for child in suffix[index + 1:-1]:
+                        target = os.path.normpath(os.path.join(target, child))
+                        target = aliases.get(target, target)
+                    alias_candidates.add(os.path.normpath(os.path.join(target, suffix[-1])))
+
+    baked, meta = {}, {}
+    directories, claimed = set(), set()
+    skipped = []
+    for base, is_subdir, walk in trees:
+        if not prefix and not is_subdir:
+            skipped.append(base)
+            continue
+        for root, dirs, files in walk:
+            directories.add(os.path.relpath(root, base))
+            claimed.update(os.path.relpath(os.path.join(root, name), base) for name in dirs)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if fixed_path and not (os.sep + rel).endswith(fixed_path):
+                if fixed_path and not ((os.sep + rel).endswith(fixed_path) or rel in alias_candidates):
                     continue
                 if os.sep not in tail and not fn.endswith(tail):
                     continue

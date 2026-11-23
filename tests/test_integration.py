@@ -2027,6 +2027,210 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
+@pytest.mark.parametrize(("alias_value", "alias_member", "alias_error"), [
+    ("{{ missing }}", "", None),
+    ("{{ missing | regex_replace('x', 'y') }}", "", None),
+    ("{{ 'value' | unknown_filter }}", "", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested[0]", "unknown_filter"),
+    ({"bad": "{{ 'value' | unknown_filter }}"}, ".get('bad')", "unknown_filter"),
+    ({"bad": "{{ 'value' | unknown_filter }}"}, ".values() | first", "unknown_filter"),
+    ({"bad": "{{ 'value' | unknown_filter }}"}, ".values() | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested[:1] | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "(ALIAS.nested + []) | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "([] + ALIAS.nested) | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "('opts=' ~ (ALIAS.nested[:1] | string))", "unknown_filter"),
+    ({"bad": "{{ 'value' | unknown_filter }}"}, ".values()", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"], "ok": "optional"}, ".ok", None),
+    ("{{ 1 / 0 }}", "", "division by zero"),
+])
+def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch, alias_value, alias_member, alias_error):
+    import copy
+
+    from ansible.executor import task_executor
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
+    from ansible.release import __version__ as ansible_version
+    from ansiroll.compat import make_templar
+    from ansiroll.loader import _tag_untrusted
+
+    make_templar()  # Initialize Ansible's collection loader before parsing.
+    legacy = tuple(map(int, ansible_version.split(".")[:2])) < (2, 19)
+    items_membership = "('ok', 'valid') in item_options.items()" if legacy else "true"
+    alias_read = (alias_member.replace("ALIAS", "optional_agent_alias") if "ALIAS" in alias_member
+                  else "optional_agent_alias" + alias_member)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- hosts: localhost
+  vars:
+    sync_play_value: "{{ 'PLAY' | lower }}"
+  environment:
+    PLAY_VALUE: "{{ sync_play_value }}"
+  tasks:
+    - environment:
+        SYNC_LABEL: "{{ ['RELEASE', 'PREVIEW'][sync_index] }}"
+      block:
+        - debug:
+            msg: placeholder
+          vars:
+            sync_index: "{{ item }}"
+            sync_alias: {value: "{{ ['release', 'preview'][item] | upper }}"}
+            sync_list: ["{{ ['release', 'preview'][item] | upper }}"]
+            sync_loop_label: "{{ ['release', 'preview'][item] | upper }}"
+            unsafe_label: !unsafe "{{ item }}"
+          environment:
+            - SYNC_LITERAL: "{{ '{' ~ '{ placeholder }' ~ '}' }}"
+              SYNC_UNSAFE: "{{ unsafe_label }}"
+              SYNC_PRIOR: "{{ prior.msg }}"
+              SYNC_MIRROR: "{{ sync_alias.value ~ '-' ~ ansible_delegated_vars['localhost']['mirror'] }}"
+              SYNC_LIST: "{{ sync_list[0] }}"
+              SYNC_FILE: "{{ file_options.label }}"
+              SYNC_FILE_LIST: "{{ file_options.labels[0] ~ '-' ~ file_options.labels[2] }}"
+              SYNC_FILE_MISSING: "{{ file_options.labels[1] is defined }}"
+              SYNC_FILE_DEFAULT: "{{ file_options.labels[1].nested | default('fallback') }}"
+              SYNC_FILE_KEYS: "{{ 'optional' in file_options and (file_options | length == 3) }}"
+              SYNC_FILE_OPTIONAL: "{{ file_options.optional | default('optional') }}"
+              SYNC_FILE_JSON: "json={{ file_env | to_json }}"
+              SYNC_LIST_JSON: "json={{ file_list | to_json }}"
+              SYNC_VARS_LOOKUP: "{{ (lookup('vars', 'file_env')).SYNC_FILE_WHOLE }}"
+              SYNC_TYPED_KEYS: "{{ typed_agent_alias[8080] ~ '-' ~ typed_agent_alias['8080'] ~ '-' ~ typed_agent_alias[3][3] }}"
+              SYNC_TYPED_MISSING: "{{ typed_agent_alias[4] | default('optional') }}"
+              SYNC_DATE_KEY: "{{ (dated_agent_alias.keys() | list | first | type_debug) ~ '-' ~ dated_agent_alias.plain }}"
+              SYNC_BINARY_KEY: "{{ (dated_agent_alias.keys() | list)[1] | type_debug }}"
+              SYNC_ITEM_CONTAINS: "{{ items_membership }}"
+              SYNC_UNDEFINED_ALIAS: "{{ optional_agent_alias is defined }}"
+              SYNC_DEFAULT_ALIAS: "{{ optional_agent_alias | default('optional') }}"
+              SYNC_UNUSED: "{{ 'skipped' if true else unused_agent_alias }}"
+              SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
+              SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
+              SYNC_FLAG: "{{ true }}"
+              SYNC_EMPTY: "{{ none }}"
+            - "{{ ansible_delegated_vars['localhost']['environment'] }}"
+            - "{{ file_env }}"
+""".replace("optional_agent_alias |", alias_read + " |")
+       .replace("items_membership", items_membership))
+    loader = DataLoader()
+    play, = Playbook.load(str(playbook), loader=loader).get_plays()
+    original, = play.tasks[0].block
+    original_environment = original.environment
+    agent = """
+import json
+import sys
+from ansiroll import runtime
+runtime._INJECTED_VARS = json.loads(sys.argv[3])
+runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
+    "names": ["/vars/{{ inventory_hostname }}.yml"],
+    "files": {"/vars/localhost.yml": [{"file_options": {
+        "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
+        "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
+    }, "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
+        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": json.loads(sys.argv[4]),
+        "typed_agent_alias": "{{ {8080: 'number', '8080': 'text', 3: {3: 'nested'}, 4: missing} }}",
+        "dated_agent_alias": "{{ '{2026-01-01: dated, ? !!binary YQ== : binary, plain: regular}' | from_yaml }}",
+        "item_options": {"bad": "{{ 'value' | unknown_filter }}", "ok": "valid"},
+        "unused_agent_alias": "{{ missing_value }}"}]},
+}], "tasks": [{
+    "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
+    "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},
+}, {
+    "type": "task", "runtime_id": "sync", "name": "Synchronize",
+    "action": "ansible.posix.synchronize", "fallback": True,
+    "loop": [0, 1], "vars": json.loads(sys.argv[2]),
+    "environment": json.loads(sys.argv[1]),
+}]}]
+runtime.MODULES = {}
+runtime.ANSIBALLZ_CODE = ""
+runtime._INJECTED_HOST = "localhost"
+runtime.agent_main()
+"""
+    names = ("file_options", "file_env", "file_list", "typed_agent_alias", "dated_agent_alias")
+    if legacy:
+        names += ("item_options",)
+    names += ("optional_agent_alias",)
+    messages = [{"t": "delegate_play_var", "name": name} for name in names]
+    messages.append({"t": "delegate_result", "result": {"changed": False}})
+    encoded = [json.dumps(message).encode() for message in messages]
+    replies = b"".join(len(message).to_bytes(4, "big") + message for message in encoded)
+    serialized_environment = json.dumps(_tag_untrusted(original_environment, template_syntax_only=True))
+    serialized_vars = json.dumps(_tag_untrusted(original.get_vars()))
+    serialized_play_vars = json.dumps(_tag_untrusted(play.vars))
+    result = subprocess.run([sys.executable, "-c", agent, serialized_environment,
+                             serialized_vars, serialized_play_vars, json.dumps(alias_value)],
+                            input=replies * 2,
+                            capture_output=True, timeout=15, check=True)
+    stream = io.BytesIO(result.stdout)
+    frames = []
+    fallbacks = []
+    while header := stream.read(4):
+        frame = json.loads(stream.read(int.from_bytes(header, "big")))
+        if frame["t"] == "delegate":
+            frames.append(frame)
+        elif frame["t"] == "delegate_play_var_result":
+            fallbacks.append(frame["fallback"])
+
+    class Executor:
+        def __init__(self, host, task, variables, *args):
+            self.task = task
+            self.variables = variables
+
+        def run(self):
+            templar = make_templar()
+            templar.available_variables = dict(self.variables, ansible_delegated_vars={
+                "localhost": {"mirror": "controller", "mirrors": ["controller"],
+                              "environment": {"SYNC_WHOLE": "delegated"}},
+            })
+            environment = self.task._post_validate_environment(None, self.task.environment, templar)
+            return {"environment": environment}
+
+    monkeypatch.setattr(task_executor, "TaskExecutor", Executor)
+    strategy_type = _load_strategy_module().StrategyModule
+    strategy = strategy_type.__new__(strategy_type)
+    strategy._loader = loader
+    strategy._variable_manager = None
+    empty = None if tuple(map(int, ansible_version.split(".")[:2])) >= (2, 19) else ""
+    requests = []
+
+    def resolve(name):
+        assert name in names
+        index = requests.count(name) * len(names) + names.index(name)
+        requests.append(name)
+        return fallbacks[index]
+
+    results = [strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None, resolve)
+               for frame in frames]
+    assert len(results) == 2
+    assert requests == list(names) * 2
+    if alias_error:
+        assert all(result["failed"] and alias_error in result["msg"] for result in results)
+        return
+    assert results == [
+        {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
+                         "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
+                         "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
+                         "SYNC_FILE_LIST": "RELEASE-tail", "SYNC_FILE_MISSING": False,
+                         "SYNC_FILE_DEFAULT": "fallback", "SYNC_UNUSED": "skipped", "SYNC_FILE_WHOLE": "MIXED",
+                         "SYNC_FILE_KEYS": True, "SYNC_FILE_OPTIONAL": "optional",
+                         "SYNC_FILE_JSON": 'json={"SYNC_FILE_WHOLE": "MIXED"}', "SYNC_LIST_JSON": 'json=["MIXED"]',
+                         "SYNC_VARS_LOOKUP": "MIXED", "SYNC_UNDEFINED_ALIAS": bool(alias_member),
+                         "SYNC_TYPED_KEYS": "number-text-nested", "SYNC_TYPED_MISSING": "optional",
+                         "SYNC_DATE_KEY": "date-regular",
+                         "SYNC_BINARY_KEY": "bytes",
+                         "SYNC_ITEM_CONTAINS": True,
+                         "SYNC_DEFAULT_ALIAS": "optional",
+                         "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
+                         "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
+        for label in ("RELEASE", "PREVIEW")
+    ]
+    assert all("unused_agent_alias" in frame["lazy_play_vars"] for frame in frames)
+    assert all("omit" not in frame["vars"] for frame in frames)
+    frame = copy.deepcopy(frames[0])
+    frame["vars"]["sync_loop_label"] = "{{ 'other' | upper }}"
+    rendered = strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None,
+                                                    lambda name: fallbacks[names.index(name)])
+    assert rendered["environment"]["SYNC_MIRRORS"] == "{{ 'other' | upper }}-controller"
+    assert original.environment == original_environment
+
+
 def test_gather_embeds_setup():
     src, manifest = compile_playbook(os.path.join(FIXTURES, "gather.yml"))
     assert any(m.endswith("setup") for m in manifest["modules"])
