@@ -2010,6 +2010,8 @@ def _linked_role_source_pattern(src):
         directory = index < len(segments) - 1
         # A substitution can supply a separator before or after a literal dot.
         segment = segment.replace("\0.\0", "\0")
+        if segment.startswith(".\0"):
+            segment = segment[1:]
         if directory and segment.endswith("\0."):
             segment = segment[:-1]
         optional = directory and "\0" in segment and segment.replace("\0", "") in ("", ".")
@@ -2104,6 +2106,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     assets, metadata, contents = {}, {}, {}
     newline = "" if subdir == "files" else None
     visits = 0
+    # Queue every search root before expanding aliases so cycles in one root
+    # cannot starve shallow paths in another.
+    pending_dirs = deque()
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         if not prefix and not is_subdir:
             continue
@@ -2111,67 +2116,67 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
-        pending_dirs = deque([(tree, False)])
-        while pending_dirs:
-            root, linked = pending_dirs.popleft()
-            step = next(os.walk(root), None)
-            if step is None:
+        pending_dirs.append((tree, base, is_subdir, False))
+    while pending_dirs:
+        root, base, is_subdir, linked = pending_dirs.popleft()
+        step = next(os.walk(root), None)
+        if step is None:
+            continue
+        _, dirs, files = step
+        for name in sorted(dirs):
+            path = os.path.join(root, name)
+            target = os.path.realpath(path)
+            if name.startswith(".") or not visible(target):
                 continue
-            _, dirs, files = step
-            for name in sorted(dirs):
-                path = os.path.join(root, name)
-                target = os.path.realpath(path)
-                if name.startswith(".") or not visible(target):
+            child_linked = linked or os.path.islink(path)
+            if child_linked:
+                # Visit short paths first so a cycle cannot consume the
+                # entire budget before other direct aliases are reached.
+                if visits >= 4096:
                     continue
-                child_linked = linked or os.path.islink(path)
-                if child_linked:
-                    # Visit short paths first so a cycle cannot consume the
-                    # entire budget before other direct aliases are reached.
-                    if visits >= 4096:
-                        continue
-                    visits += 1
-                pending_dirs.append((path, child_linked))
-            for name in sorted(files):
-                if name.startswith("."):
-                    continue
-                path = os.path.normpath(os.path.join(root, name))
-                relative = os.path.relpath(path, base)
-                if relative in ordinary and ordinary[relative]["fullpath"] == path:
-                    continue
-                paths_to_bake = list(pending.get(path, ()))
-                if linked:
-                    spellings = [relative]
-                    if is_subdir:
-                        spellings.append(os.path.join(subdir, relative))
-                    for spelling in spellings:
-                        if _linked_role_source_matches(pattern, spelling):
-                            paths_to_bake.extend(lookup_path for lookup_path in lookup_paths(spelling)
-                                                 if path == source_for(lookup_path))
-                if not paths_to_bake:
-                    continue
-                resolved_path = os.path.realpath(path)
-                if not visible(resolved_path) or not os.path.isfile(resolved_path):
-                    continue
-                key = "\0" + paths_to_bake[0]  # Cannot collide with a filesystem pathname.
+                visits += 1
+            pending_dirs.append((path, base, is_subdir, child_linked))
+        for name in sorted(files):
+            if name.startswith("."):
+                continue
+            path = os.path.normpath(os.path.join(root, name))
+            relative = os.path.relpath(path, base)
+            if relative in ordinary and ordinary[relative]["fullpath"] == path:
+                continue
+            paths_to_bake = list(pending.get(path, ()))
+            if linked:
+                spellings = [relative]
+                if is_subdir:
+                    spellings.append(os.path.join(subdir, relative))
+                for spelling in spellings:
+                    if _linked_role_source_matches(pattern, spelling):
+                        paths_to_bake.extend(lookup_path for lookup_path in lookup_paths(spelling)
+                                             if path == source_for(lookup_path))
+            if not paths_to_bake:
+                continue
+            resolved_path = os.path.realpath(path)
+            if not visible(resolved_path) or not os.path.isfile(resolved_path):
+                continue
+            key = "\0" + paths_to_bake[0]  # Cannot collide with a filesystem pathname.
+            try:
+                fd = _open_linked_role_source(resolved_path)
                 try:
-                    fd = _open_linked_role_source(resolved_path)
-                    try:
-                        info = os.fstat(fd)
-                        if not stat.S_ISREG(info.st_mode):
-                            continue
-                        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-                        if identity not in contents:
-                            with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", newline=newline,
-                                           closefd=False) as file:
-                                contents[identity] = file.read()
-                        assets[key] = contents[identity]
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    continue
-                metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
-                                 "mode": stat.S_IMODE(info.st_mode)}
-                direct.update(dict.fromkeys(paths_to_bake, key))
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    if identity not in contents:
+                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", newline=newline,
+                                       closefd=False) as file:
+                            contents[identity] = file.read()
+                    assets[key] = contents[identity]
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+            metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
+                             "mode": stat.S_IMODE(info.st_mode)}
+            direct.update(dict.fromkeys(paths_to_bake, key))
     return assets, metadata, direct
 
 

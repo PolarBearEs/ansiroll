@@ -1234,6 +1234,53 @@ def test_dynamic_role_template_resolves_finite_link_paths(tmp_path, source, sele
     assert destination.read_text() == "linked template\n"
 
 
+def test_dynamic_role_template_normalizes_dot_before_substitution(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {extra: /alias/}
+- template: {src: "sites/.{{ extra }}app.j2", dest: output.txt}
+""", "roles/r/templates/shared/app.j2": "linked template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir()
+    (sites / "alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "linked template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+def test_dynamic_role_template_reaches_later_search_root_with_cyclic_aliases(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "sites/{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/sites/local.txt": "unrelated\n", "shared/app.j2": "linked template\n"})
+    earlier = tmp_path / "roles/r/templates/sites"
+    for name in ("cycle_a", "cycle_b"):
+        (earlier / name).symlink_to(".", target_is_directory=True)
+    later = tmp_path / "templates/sites"
+    later.mkdir(parents=True)
+    (later / "alias").symlink_to("../../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "linked template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
 @pytest.mark.parametrize(("prefix", "linked_first", "dynamic_subdir"), [
     ("", False, False), ("./", True, False), ("", True, False), ("", None, False), ("./", None, False),
     ("", None, True), ("./", None, True), ("", True, True), ("./", True, True),
