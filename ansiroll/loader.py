@@ -627,7 +627,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             return concat_parts(term.left) + concat_parts(term.right)
         return [term]
 
-    def path_pattern(term, *, directory):
+    def path_pattern(term):
         parts = concat_parts(term)
         anchored = isinstance(parts[0], nodes.Name) and parts[0].name == "playbook_dir"
         if anchored:
@@ -646,20 +646,12 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 or not anchored and first and first.startswith((os.sep, "~"))
                 or any(".." in part.split(os.sep) for part in literals if part is not None)):
             return None
-        if literals and all(part is None for part in literals):
-            return (False, "**") if directory else None
-
         pattern = []
-        for index, part in enumerate(literals):
+        for part in literals:
             if part is not None:
                 pattern.append(escape(part))
-            elif (directory and (index == 0 or (literals[index - 1] or "").endswith(os.sep))
-                  and (index == len(literals) - 1 or (literals[index + 1] or "").startswith(os.sep))):
-                pattern.append("**")
-            else:
-                wildcard = "*" if directory else "\0"
-                if not pattern or pattern[-1] != wildcard:
-                    pattern.append(wildcard)
+            elif not pattern or pattern[-1] != "\0":
+                pattern.append("\0")
         return anchored, "".join(pattern).lstrip(os.sep)
 
     kwargs = {option.key: option.value for option in call.kwargs}
@@ -702,12 +694,14 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
 
     patterns = set()
     for dir_terms, files in groups:
-        directories = [path_pattern(term, directory=True) for term in dir_terms] or [(False, "")]
-        filenames = [path_pattern(term, directory=False) for term in flatten([files], "[,;]")]
+        directories = [path_pattern(term) for term in dir_terms] or [(False, "")]
+        filenames = [path_pattern(term) for term in flatten([files], "[,;]")]
         if None in directories or None in filenames:
             return None
         for absolute_dir, directory in directories:
             for absolute_file, filename_pattern in filenames:
+                if filename_pattern == "\0" and ("\0" in directory or os.path.normpath(directory) == "."):
+                    return None  # An unconstrained filename needs a fixed search directory.
                 if absolute_file:
                     patterns.add((basedir, "", filename_pattern))
                     continue
@@ -715,8 +709,8 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
                 patterns.update((root, directory, filename_pattern) for root in roots)
     for fallback in fallbacks:
-        candidate = path_pattern(fallback, directory=False)
-        if candidate is None:
+        candidate = path_pattern(fallback)
+        if candidate is None or candidate[1] == "\0":
             return None
         absolute, filename = candidate
         if absolute:
@@ -769,10 +763,10 @@ def _modeled_first_found_files(candidates, aliases):
 
         yield from walk(base, 0, {})
 
-    def matches_filename(filename, relative):
-        if fnmatchcase(relative, filename.replace("\0", "*")):
+    def matches_path(pattern, relative):
+        if fnmatchcase(relative, pattern.replace("\0", "*")):
             return True
-        parts = filename.split(os.sep)
+        parts = pattern.split(os.sep)
         if "\0" not in parts:
             return False
         names = relative.split(os.sep)
@@ -792,29 +786,32 @@ def _modeled_first_found_files(candidates, aliases):
 
         return matches(0, 0)
 
+    def matching_paths(base, pattern, real_base, *, directory):
+        pattern = os.path.normpath(pattern)
+        search = pattern
+        if "\0" in pattern:
+            # Walk fixed components explicitly so the recursive search can
+            # still match a finite suffix that passes through symlinks.
+            prefix = pattern.split("\0", 1)[0].rpartition(os.sep)[0]
+            suffix = pattern.rsplit("\0", 1)[-1]
+            _, separator, fixed_suffix = suffix.partition(os.sep)
+            if not separator and not directory:
+                fixed_suffix = "*" + suffix
+            search = os.path.join(prefix, "**", fixed_suffix)
+        for path in walk_pattern(base, search, real_base):
+            if not (path.is_dir() if directory else path.is_file()):
+                continue
+            resolved = path.resolve()
+            if (real_base in resolved.parents or (directory and resolved == real_base)) and matches_path(
+                    pattern, str(path.relative_to(base))):
+                yield path
+
     for root, directory_pattern, filename in sorted(candidates):
         base = Path(root)
         real_base = base.resolve()
-        directories = walk_pattern(base, directory_pattern, real_base)
-        filename = os.path.normpath(filename)
-        search = filename
-        if "\0" in filename:
-            # Narrow the walk with fixed path ends, then use fnmatch's
-            # separator-spanning wildcards to verify the entire filename.
-            prefix = filename.split("\0", 1)[0].rpartition(os.sep)[0]
-            suffix = filename.rsplit("\0", 1)[-1]
-            fixed_suffix = suffix.partition(os.sep)[2] if os.sep in suffix else "*" + suffix
-            search = os.path.join(prefix, "**", fixed_suffix)
-        for directory in directories:
-            if not directory.is_dir():
-                continue
-            resolved = directory.resolve()
-            if resolved != real_base and real_base not in resolved.parents:
-                continue
-            for path in walk_pattern(directory, search, real_base):
-                if (path.is_file() and matches_filename(filename, str(path.relative_to(directory)))
-                        and real_base in path.resolve().parents):
-                    yield os.path.normpath(path)
+        for directory in matching_paths(base, directory_pattern, real_base, directory=True):
+            for path in matching_paths(directory, filename, real_base, directory=False):
+                yield os.path.normpath(path)
 
 
 def _deferred_vars_files(play, basedir, entries, *, setup=False):
