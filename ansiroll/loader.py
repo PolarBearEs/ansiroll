@@ -1793,6 +1793,10 @@ def _find_needle(task, subdir, rel):
     return path if os.path.isfile(path) else None
 
 
+class _RoleSourceLeaseError(ValueError):
+    pass
+
+
 def _open_role_source(path):
     for attempt in range(5):
         try:
@@ -1801,7 +1805,7 @@ def _open_role_source(path):
             if ex.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 raise
             if attempt == 4:
-                raise ValueError("cannot bake role source %r while a write lease is active" % path) from ex
+                raise _RoleSourceLeaseError("cannot bake role source %r while a write lease is active" % path) from ex
             time.sleep(0.05)
 
 
@@ -1923,25 +1927,28 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     aliases = {}
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         walk = []
-        trees.append((base, is_subdir, walk))
+        root_dirs, root_aliases = set(), {}
+        trees.append((base, is_subdir, walk, root_dirs, root_aliases))
         if not prefix and not is_subdir:
             continue
         real_base = os.path.realpath(base)
         for root, dirs, files in os.walk(os.path.join(base, prefix)):
             dirs.sort()
-            directories.add(os.path.relpath(root, base))
+            directory = os.path.relpath(root, base)
+            while directory not in root_dirs:
+                root_dirs.add(directory)
+                directory = os.path.dirname(directory) or "."
             if fixed_path:
                 files = [basename] if basename in files else []
             walk.append((root, dirs, files))
             for dirname in dirs:
                 full = os.path.join(root, dirname)
                 if os.path.islink(full):
-                    aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
-
-    for directory in list(directories):
-        while directory not in ("", "."):
-            directory = os.path.dirname(directory)
-            directories.add(directory or ".")
+                    relative = os.path.relpath(full, base)
+                    target = os.path.relpath(os.path.realpath(full), real_base)
+                    root_aliases[relative] = target
+                    aliases.setdefault(relative, target)
+        directories.update(root_dirs)
     aliases = {path: target for path, target in aliases.items() if target in directories}
     alias_candidates = set()
     if os.sep in fixed_path[1:] and aliases:
@@ -1957,12 +1964,19 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked, meta = {}, {}
     claimed = set()
     skipped = []
-    for base, is_subdir, walk in trees:
+    blockers, shadowed, source_roots = {}, {}, []
+    for base, is_subdir, walk, root_dirs, root_aliases in trees:
         if not prefix and not is_subdir:
             skipped.append(base)
             continue
+        root_index = len(source_roots)
+        root_blocks, root_files = set(), set()
+        source_roots.append((root_dirs, root_aliases, root_blocks, root_files))
         for root, dirs, files in walk:
-            claimed.update(os.path.relpath(os.path.join(root, name), base) for name in dirs)
+            for dirname in dirs:
+                relative = os.path.relpath(os.path.join(root, dirname), base)
+                root_blocks.add(relative)
+                blockers.setdefault(relative, []).append(root_index)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
@@ -1974,9 +1988,14 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     continue
                 if not os.path.exists(full):
                     continue
-                claimed.add(rel)
                 if not os.path.isfile(full):
+                    root_blocks.add(rel)
+                    blockers.setdefault(rel, []).append(root_index)
                     continue
+                claimed.add(rel)
+                root_files.add(rel)
+                if rel in blockers:
+                    shadowed[rel] = (blockers[rel].copy(), root_index)
                 try:
                     # The path may have become a FIFO after the file check.
                     fd = _open_role_source(full)
@@ -1988,6 +2007,9 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                             baked[rel] = fh.read()
                     finally:
                         os.close(fd)
+                except _RoleSourceLeaseError as ex:
+                    baked[rel] = {"__ansiroll_source_error__": str(ex)}
+                    continue
                 except OSError:
                     continue
                 meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
@@ -2001,6 +2023,14 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     node["_baked_tree_dirs"] = sorted(directories)
     if aliases:
         node["_baked_tree_aliases"] = aliases
+    if shadowed:
+        baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
+        node["_baked_tree_shadowed"] = shadowed
+        node["_baked_tree_roots"] = [
+            (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
+             sorted(root_blocks), sorted(root_files))
+            for root_dirs, root_aliases, root_blocks, root_files in source_roots
+        ]
     return True
 
 

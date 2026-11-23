@@ -3716,6 +3716,26 @@ class Runtime:
         return res
 
     @staticmethod
+    def _baked_role_path(parts, directories, aliases):
+        prefix = []
+        for part in parts[:-1]:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not prefix:
+                    return None
+                prefix.pop()
+            else:
+                prefix.append(part)
+                directory = "/".join(prefix)
+                if directory in aliases:
+                    target = aliases[directory]
+                    prefix = [] if target == "." else target.split("/")
+                elif directory not in directories:
+                    return None
+        return "/".join(prefix + [parts[-1]])
+
+    @staticmethod
     def _baked_source_key(task, src):
         if isinstance(src, str) and os.path.isabs(src):
             # Dynamic absolute sources are baked with repeated separators collapsed.
@@ -3733,26 +3753,25 @@ class Runtime:
         if ".." in parts:
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
+            normalized = os.path.normpath(src)
+            shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
+            if shadowed:
+                blockers, selected = shadowed
+                roots = task["_baked_tree_roots"]
+                for root in blockers:
+                    directories, aliases, blocked, _ = roots[root]
+                    if Runtime._baked_role_path(parts, directories, aliases) in blocked:
+                        return "\0blocked"
+                directories, aliases, _, files = roots[selected]
+                if Runtime._baked_role_path(parts, directories, aliases) in files:
+                    return normalized
+                return src
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}
-            prefix = []
-            for part in parts[:-1]:
-                if part in ("", "."):
-                    continue
-                if part == "..":
-                    if not prefix:
-                        return src
-                    prefix.pop()
-                else:
-                    prefix.append(part)
-                    directory = "/".join(prefix)
-                    if directory in aliases:
-                        target = aliases[directory]
-                        prefix = [] if target == "." else target.split("/")
-                    elif directory not in directories:
-                        return src
-            if "/".join(prefix + [parts[-1]]) not in (task.get("_baked") or {}):
+            if Runtime._baked_role_path(parts, directories, aliases) not in (task.get("_baked") or {}):
                 return src
+        elif os.path.normpath(src) in (task.get("_baked_tree_shadowed") or {}):
+            return "\0blocked"
         # Ansible checks the original relative path, then normalizes it when reading.
         return os.path.normpath(src)
 
@@ -4808,6 +4827,8 @@ class Runtime:
         self._close_workers()
 
     def _asset_bytes(self, marker):
+        if isinstance(marker, dict) and "__ansiroll_source_error__" in marker:
+            raise RuntimeError(marker["__ansiroll_source_error__"])
         if not (isinstance(marker, dict)
                 and set(marker) == {"__ansiroll_asset__"}):
             if isinstance(marker, bytes):
@@ -4826,10 +4847,9 @@ class Runtime:
         return data
 
     def _asset_text(self, marker):
-        if not (isinstance(marker, dict)
-                and set(marker) == {"__ansiroll_asset__"}):
-            return marker
-        return self._asset_bytes(marker).decode("utf-8", "surrogateescape")
+        if isinstance(marker, dict) and set(marker) in ({"__ansiroll_asset__"}, {"__ansiroll_source_error__"}):
+            return self._asset_bytes(marker).decode("utf-8", "surrogateescape")
+        return marker
 
     def _module_params(self, args):
         module_args = dict(args)

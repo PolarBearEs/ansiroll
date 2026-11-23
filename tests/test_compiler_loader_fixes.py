@@ -186,6 +186,7 @@ def test_compile_dynamic_role_source_does_not_substitute_later_file(tmp_path, mo
     from types import SimpleNamespace
 
     from ansiroll import loader
+    from ansiroll.runtime import Runtime
 
     _write(tmp_path, {"earlier/sites/keep.j2": "keep\n", "later/sites/app.j2": "wrong template\n"})
     os.mkfifo(tmp_path / "earlier/sites/app.j2")
@@ -194,7 +195,10 @@ def test_compile_dynamic_role_source_does_not_substitute_later_file(tmp_path, mo
     node = {}
     assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
                                     "sites/{{ selection }}.j2")
-    assert node["_baked"] == {"sites/keep.j2": "keep\n"}
+    assert node["_baked"]["sites/keep.j2"] == "keep\n"
+    key = Runtime._baked_source_key(node, "sites/app.j2")
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        Runtime({}, "", {})._asset_text(node["_baked"][key])
 
 
 def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypatch):
@@ -303,6 +307,75 @@ def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_pa
     assert "sites/actual/app.j2" in template["_baked"]
     assert "sites/unrelated/app.j2" not in template["_baked"]
     assert "sites/private/app.j2" not in template["_baked"]
+
+
+@pytest.mark.parametrize("earlier_has_branch", [False, True])
+def test_compile_dynamic_role_source_checks_parent_traversal_per_root(tmp_path, earlier_has_branch):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: branch/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "templates/sites/app.j2": "later template\n"})
+    earlier = tmp_path / "roles/r/templates/sites"
+    (earlier / "app.j2").mkdir(parents=True)
+    if earlier_has_branch:
+        (earlier / "branch").mkdir()
+    (tmp_path / "templates/sites/branch").mkdir()
+
+    playbook = tmp_path / "pb.yml"
+    _ansible(playbook, returncode=2 if earlier_has_branch else 0)
+    destination = tmp_path / "rendered.txt"
+    if destination.exists():
+        destination.unlink()
+    _ansiroll(playbook, tmp_path, returncode=1 if earlier_has_branch else 0)
+    if earlier_has_branch:
+        assert not destination.exists()
+    else:
+        assert destination.read_text() == "later template\n"
+
+
+@pytest.mark.parametrize("leased_source_exists_at_runtime", [False, True])
+def test_compile_dynamic_role_source_defers_lease_errors(tmp_path, monkeypatch, leased_source_exists_at_runtime):
+    from ansiroll import loader
+
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: {src: "sites/{{ selection }}/keep/../templates/app.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/prod/templates/app.j2": "usable template\n",
+        "roles/r/templates/sites/notes/templates/app.j2": "leased template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    (sites / "prod/keep").mkdir()
+    if leased_source_exists_at_runtime:
+        (sites / "notes/keep").mkdir()
+    leased = str(sites / "notes/templates/app.j2")
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if path == leased:
+            raise loader._RoleSourceLeaseError("write lease is active")
+        return original_open(path)
+
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True,
+                            env=dict(_env(), ANSIROLL_EXTRA_VARS='{"selection":"prod"}'), timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "rendered.txt").read_text() == "usable template\n"
+
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True,
+                            env=dict(_env(), ANSIROLL_EXTRA_VARS='{"selection":"notes"}'), timeout=15)
+    assert result.returncode == 1, result.stdout + result.stderr
+    expected = "write lease is active" if leased_source_exists_at_runtime else "was not baked"
+    assert expected in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
