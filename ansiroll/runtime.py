@@ -2105,6 +2105,7 @@ class _Templater:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
+        render_as_text = True
         template_key = (text, strict, tracking)
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
@@ -2121,9 +2122,20 @@ class _Templater:
                         return sequence
                 compiled = self._expr_cache.get(expr_key)
                 if compiled is None:
-                    compiled = env.compile_expression(expr, undefined_to_none=False)
-                    self._expr_cache[expr_key] = compiled
-                result = compiled(**ctx)
+                    tmpl = None
+                    if "{{" in expr:
+                        # A lookup can contain quoted template text. Count
+                        # actual render tags, which exclude quoted delimiters.
+                        tmpl = self._template_cache.get(template_key)
+                        if tmpl is None and sum(kind == "variable_begin" for _, kind, _ in env.lex(text)) > 1:
+                            tmpl = env.from_string(text)
+                            self._template_cache[template_key] = tmpl
+                    if tmpl is None:
+                        compiled = env.compile_expression(expr, undefined_to_none=False)
+                        self._expr_cache[expr_key] = compiled
+                if compiled is not None:
+                    result = compiled(**ctx)
+                    render_as_text = False
             except jinja2.TemplateSyntaxError as e:
                 # Captured, not raised: surfaces when the value is used (or is
                 # inspected via dump_object), like Ansible 2.19.
@@ -2131,17 +2143,7 @@ class _Templater:
             except Exception as e:
                 if strict and isinstance(e, jinja2.UndefinedError):
                     return _captured_jinja_error(e)
-                try:
-                    tmpl = self._template_cache.get(template_key)
-                    if tmpl is None:
-                        tmpl = env.from_string(text)
-                        self._template_cache[template_key] = tmpl
-                    result = tmpl.render(**ctx)
-                except jinja2.TemplateError as e:
-                    return _captured_jinja_error(
-                        e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
-                    )
-        else:
+        if render_as_text:
             try:
                 tmpl = self._template_cache.get(template_key)
                 if tmpl is None:

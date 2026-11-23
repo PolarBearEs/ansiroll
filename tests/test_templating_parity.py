@@ -815,6 +815,18 @@ def test_untrusted_data_is_not_templated_again(tmp_path):
     assert msgs[-1] == "BASE,BASE-2"
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}/{{ 'second' }}"
+""", {"data.txt": "first"}, use_strategy=use_strategy)
+    assert messages == ["first/second"]
+
+
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost

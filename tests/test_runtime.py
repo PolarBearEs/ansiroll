@@ -36,6 +36,44 @@ def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
 
 
+def test_lookup_followed_by_another_template_segment_renders_as_text():
+    templater = Runtime({}, "", {}).templater
+    calls = []
+
+    def lookup(name):
+        calls.append(name)
+        return "first"
+
+    templater.env.globals["lookup"] = lookup
+    text = "{{ lookup('source') }}/{{ 'second' }}"
+    assert templater.render_string(text, {}) == "first/second"
+    assert templater.render_string(" " + text + " ", {}) == " first/second "
+    assert templater.render_string(text, {}) == "first/second"
+    assert calls == ["source"] * 3
+
+
+def test_single_lookup_with_a_quoted_template_keeps_its_native_value():
+    templater = Runtime({}, "", {}).templater
+    templater.env.globals["query"] = lambda _name, term: [term]
+    assert templater.render_string("{{ query('source', '{{ key }}') }}", {}) == ["{{ key }}"]
+
+
+def test_mixed_template_does_not_repeat_lookup_after_a_render_error():
+    from jinja2 import Undefined
+
+    templater = Runtime({}, "", {}).templater
+    calls = []
+
+    def lookup(source):
+        calls.append(source)
+        return "first"
+
+    templater.env.globals["lookup"] = lookup
+    result = templater.render_string("{{ lookup('source') }}/{{ missing.attribute }}", {})
+    assert isinstance(result, Undefined)
+    assert calls == ["source"]
+
+
 @pytest.mark.parametrize("version,resolve", [("2.18.20", False), ("2.19.15", True)])
 def test_play_var_mapping_iteration_only_resolves_consumed_values(monkeypatch, version, resolve):
     import ansiroll.runtime as runtime_mod
