@@ -582,7 +582,9 @@ def _selector_depends_only_on_lookup(selector):
     return parsed is not None and stable(parsed)
 
 
-def _first_found_literal_dirs(selector, basedir):
+def _first_found_directory_patterns(selector, basedir):
+    from glob import escape
+
     from jinja2 import nodes
 
     parsed = _selector_ast(selector)
@@ -590,23 +592,35 @@ def _first_found_literal_dirs(selector, basedir):
         return set()
     directories = set()
 
+    def concat_parts(argument):
+        if isinstance(argument, nodes.Concat):
+            return argument.nodes
+        if isinstance(argument, nodes.Add):
+            return concat_parts(argument.left) + concat_parts(argument.right)
+        return [argument]
+
     def add_playbook_paths(argument):
         if isinstance(argument, (nodes.List, nodes.Tuple)):
             for item in argument.items:
                 add_playbook_paths(item)
             return
-        if isinstance(argument, nodes.Concat):
-            parts = argument.nodes
-        elif isinstance(argument, nodes.Add):
-            parts = (argument.left, argument.right)
-        else:
+        root, *suffix = concat_parts(argument)
+        if not isinstance(root, nodes.Name) or root.name != "playbook_dir" or not suffix:
             return
-        root, *suffix = parts
-        if (isinstance(root, nodes.Name) and root.name == "playbook_dir"
-                and all(isinstance(part, nodes.Const) and isinstance(part.value, str) for part in suffix)):
-            path = os.path.normpath(basedir + "".join(part.value for part in suffix))
-            if os.path.commonpath((basedir, path)) == basedir:
-                directories.add(path)
+        prefix = suffix[0]
+        if not isinstance(prefix, nodes.Const) or not isinstance(prefix.value, str) or not prefix.value.startswith(os.sep):
+            return
+        parts = []
+        for part in suffix:
+            if isinstance(part, nodes.Const) and isinstance(part.value, str):
+                parts.append(escape(part.value))
+            elif isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem)):
+                parts.append("*")
+            else:
+                return
+        relative = os.path.normpath("".join(parts).lstrip(os.sep))
+        if relative != ".." and not relative.startswith(".." + os.sep):
+            directories.add(os.path.join(escape(basedir), relative))
 
     def add_literals(argument, *, paths=False):
         if paths:
@@ -618,7 +632,7 @@ def _first_found_literal_dirs(selector, basedir):
             for value in re.split("[,:;]" if paths else "[,;]", literal.value):
                 directory = os.path.normpath(value if paths else os.path.dirname(value))
                 if not os.path.isabs(directory) and directory.split(os.sep)[0] not in ("..", "~"):
-                    directories.add(directory)
+                    directories.add(escape(directory))
 
     for call in parsed.find_all(nodes.Call):
         if (not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q")
@@ -674,9 +688,9 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                         patterns.append(os.path.join(glob.escape(d), candidate_subdir, pattern))
                     patterns.append(os.path.join(glob.escape(d), pattern))
                 if setup and "first_found" in name:
-                    literal_dirs = _first_found_literal_dirs(name, basedir) | {"."}
-                    lookup_patterns = {os.path.join(glob.escape(d), glob.escape(relative), pattern)
-                                       for d in _search_dirs(play, basedir, "files") for relative in literal_dirs}
+                    path_patterns = _first_found_directory_patterns(name, basedir) | {"."}
+                    lookup_patterns = {os.path.join(glob.escape(d), directory, pattern)
+                                       for d in _search_dirs(play, basedir, "files") for directory in path_patterns}
                     patterns.extend(sorted(lookup_patterns))
             for path in patterns:
                 for found in glob.glob(path):

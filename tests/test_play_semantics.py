@@ -1485,12 +1485,33 @@ def test_setup_pipe_uses_playbook_directory_and_decodes_only_stdout(tmp_path):
     assert "utf-8" in result.stderr and "invalid start byte" in result.stderr
 
 
+def test_setup_pipe_option_survives_artifact_relocation(tmp_path):
+    source = tmp_path / "source"
+    _write(source, {
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ ['!all', lookup('pipe', 'printf !min')] }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", "out.py"],
+                   cwd=source, env=_env(), capture_output=True, check=True)
+    deployed = source.rename(tmp_path / "deployed")
+    result = subprocess.run([sys.executable, "out.py"], cwd=deployed,
+                            env=_env(), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert _summary(result.stdout)[0] == ['"distribution defined: False"']
+
+
 @pytest.mark.parametrize("selector", [
     "lookup('first_found', playbook_dir ~ '/vars/' ~ profile ~ '.yml')",
     "lookup('first_found', profile ~ '.yml')",
     "lookup('first_found', 'profiles/' ~ profile ~ '.yml')",
     "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': ['profiles']})",
     "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': [playbook_dir ~ '/files/profiles']})",
+    "lookup('first_found', {'files': ['facts.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile]})",
     "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
 ])
 def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector):
@@ -1501,6 +1522,8 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
         "files/prod.yml": "- subset: ['!all', '!min']\n",
         "files/profiles/dev.yml": "subset: [all]\n",
         "files/profiles/prod.yml": "- subset: ['!all', '!min']\n",
+        "files/profiles/dev/facts.yml": "subset: [all]\n",
+        "files/profiles/prod/facts.yml": "- subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true

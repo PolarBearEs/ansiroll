@@ -1040,6 +1040,10 @@ def _lookup_values(name, args, kwargs, ctx=None):
         return vals
     if name == "pipe":
         vals = []
+        cwd = ctx.get("playbook_dir") if gather_lookup else None
+        if cwd and not selector and not os.path.isdir(cwd):
+            # A direct gather option can still run after the artifact moves.
+            cwd = None
         for a in args:
             if not gather_lookup:
                 proc = subprocess.run(str(a), shell=True, stdout=subprocess.PIPE,
@@ -1050,7 +1054,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
                 vals.append(proc.stdout.rstrip("\n"))
                 continue
             try:
-                proc = subprocess.run(str(a), shell=True, cwd=ctx.get("playbook_dir"),
+                proc = subprocess.run(str(a), shell=True, cwd=cwd,
                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             except OSError as error:
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
