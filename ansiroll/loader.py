@@ -1913,12 +1913,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         trailing_components = tail.partition(os.sep)[2].split(os.sep)
         basename = trailing_components[-1]
         if basename not in ("", ".", ".."):
-            if ".." in trailing_components:
-                # Parent traversal can take a different route through directory
-                # aliases, but it still ends at the same literal filename.
-                fixed_path = os.sep + basename
-            else:
-                fixed_path = os.sep + os.path.normpath(os.sep.join(trailing_components)).lstrip(os.sep)
+            # Parent traversal can change the starting directory, but the
+            # literal components after the last ".." still constrain the path.
+            start = max((index + 1 for index, part in enumerate(trailing_components) if part == ".."), default=0)
+            suffix = os.sep.join(trailing_components[start:])
+            fixed_path = os.sep + os.path.normpath(suffix).lstrip(os.sep)
     trees = []
     directories = set()
     aliases = {}

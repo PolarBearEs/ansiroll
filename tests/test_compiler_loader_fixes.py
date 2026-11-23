@@ -234,6 +234,7 @@ def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypat
     ("sites/{{ selection }}.j2\n", "sites/app.j2\n", "sites/app.j2"),
     ("sites/{{ selection }}/templates/app.j2", "sites/prod/templates/app.j2", "sites/notes/app.j2"),
     ("sites/{{ selection }}/keep/../templates/app.j2", "sites/prod/templates/app.j2", "sites/notes.txt"),
+    ("sites/{{ selection }}/keep/../templates/app.j2", "sites/prod/templates/app.j2", "sites/notes/app.j2"),
 ])
 def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, monkeypatch, template, selected, unrelated):
     from types import SimpleNamespace
@@ -269,8 +270,9 @@ def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_pa
     assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
 
 
-@pytest.mark.parametrize("suffix", ["live", "prod/live"])
+@pytest.mark.parametrize("suffix", ["live", "prod/live", "keep/../prod/live"])
 def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_path, suffix):
+    resolved_suffix = os.path.normpath(suffix)
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
@@ -279,11 +281,11 @@ def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_pa
 - set_fact: {selection: area/keep/..}
 - template: {src: "sites/{{ selection }}/%s/app.j2", dest: "rendered.txt"}
 """ % suffix, "roles/r/templates/sites/actual/app.j2": "selected template\n",
-        "templates/sites/area/" + suffix + "/app.j2": "selected template\n",
+        "templates/sites/area/" + resolved_suffix + "/app.j2": "selected template\n",
         "roles/r/templates/sites/unrelated/app.j2": "unrelated template\n"})
     area = tmp_path / "roles/r/templates/sites/area"
     (area / "keep").mkdir(parents=True)
-    if suffix == "prod/live":
+    if resolved_suffix == "prod/live":
         sites = area.parent
         (sites / "staging").mkdir()
         (area / "prod").symlink_to("../staging", target_is_directory=True)
