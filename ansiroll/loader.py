@@ -154,6 +154,15 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
     return plays, actions
 
 
+def _playbook_read_path(loader, filename):
+    path = loader.path_dwim(filename)
+    if _core_version() < (2, 19):
+        from ansible.module_utils.common.text.converters import to_bytes
+
+        return to_bytes(path)
+    return path
+
+
 def _make_rewriting_loader(DataLoader):
     """A DataLoader that revives the removed legacy ``include:`` keyword.
 
@@ -175,12 +184,7 @@ def _make_rewriting_loader(DataLoader):
 
             # Match Ansible's filename representation and decryption on either
             # side of the loader's switch to tagged source data.
-            path = self.path_dwim(file_name)
-            legacy = _core_version() < (2, 19)
-            if legacy:
-                from ansible.module_utils.common.text.converters import to_bytes
-
-                path = to_bytes(path)
+            path = _playbook_read_path(self, file_name)
             try:
                 with open(path, "rb") as stream:
                     observe(path, os.fstat(stream.fileno()))
@@ -190,7 +194,7 @@ def _make_rewriting_loader(DataLoader):
             except OSError as ex:
                 raise AnsibleParserError("An error occurred while trying to read the file %r: %s" %
                                          (file_name, ex)) from ex
-            if legacy:
+            if isinstance(path, bytes):
                 return self._decrypt_if_vault_data(data, path)
 
             from ansible._internal._datatag._tags import Origin

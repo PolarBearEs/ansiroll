@@ -313,6 +313,26 @@ def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     assert output == b"ansiroll: compile -o - requires separate stdout and stderr streams\n"
 
 
+@pytest.mark.parametrize("alias", ["same", "hardlink", "expanded"])
+def test_merged_compile_diagnostics_leave_the_input_playbook_intact(tmp_path, alias):
+    if alias == "expanded":
+        pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    destination = playbook
+    if alias == "hardlink":
+        destination = tmp_path / "diagnostics"
+        os.link(playbook, destination)
+    source = tmp_path / "$ANSIROLL_INPUT" if alias == "expanded" else playbook
+    with destination.open("ab") as stream:
+        result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(source), "-o", "-"],
+                                stdout=stream, stderr=subprocess.STDOUT, timeout=10,
+                                env=dict(os.environ, ANSIROLL_INPUT=playbook.name))
+    assert result.returncode == 2
+    assert playbook.read_bytes() == original
+
+
 def test_stdout_compile_requires_redirected_output():
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()

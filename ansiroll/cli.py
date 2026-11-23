@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -469,6 +469,28 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
             json.dump(manifest, manifest_file, indent=2)
 
 
+def _merged_stream_may_be_playbook(stream, playbook):
+    if not stat.S_ISREG(stream.st_mode):
+        return False
+    path = os.path.abspath(playbook)
+    directory, name = os.path.split(playbook)
+    if "$" in playbook or "$" in path or name.startswith(("~", "'", "\"")):
+        # Ansible can emit diagnostics during import. Keep them off this
+        # stream until the input's identity is known.
+        with open(os.devnull, "w") as sink, redirect_stderr(sink):
+            try:
+                from ansible.parsing.dataloader import DataLoader
+                from .loader import _playbook_read_path
+
+                loader = DataLoader()
+                loader.set_basedir(directory if os.path.isabs(playbook) else os.path.abspath(directory))
+                path = _playbook_read_path(loader, loader.path_dwim(name))
+            except (Exception, SystemExit):
+                return True
+    source = _try_stat(path)
+    return source is not None and os.path.samestat(stream, source)
+
+
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
@@ -476,6 +498,8 @@ def _cmd_compile_stdout(args):
         if os.isatty(1):
             raise ValueError("compile -o - requires redirected output: redirect stdout to a pipe or file")
         if _same_stream(stdout_stat, os.fstat(2)) and not _discard_stream(stdout_stat):
+            if _merged_stream_may_be_playbook(stdout_stat, args.playbook):
+                return 2
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:
