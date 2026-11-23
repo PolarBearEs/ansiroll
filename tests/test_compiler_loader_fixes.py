@@ -1090,7 +1090,6 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
     contents = set(template["_baked_direct_sources"])
     assert {"sites/alias/app.j2", "sites/second/app.j2"} <= contents
     assert not any(path.endswith(("/unrelated.txt", "/hidden.j2")) for path in contents)
-    assert "sites/alias/back/alias/app.j2" not in contents
     assert not any(path.startswith("sites/project/") for path in contents)
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == "from the shared template\n"
@@ -1210,6 +1209,7 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
 
 @pytest.mark.parametrize(("source", "selection", "alias", "target", "file_path"), [
     ("sites/{{ selection }}.j2", "alias/app", "alias", ".", "sites/app.j2"),
+    ("sites/{{ selection }}.j2", "alias/alias/app", "alias", ".", "sites/app.j2"),
     ("sites/{{ selection }}.j2", "alias/sub/app", "alias", ".", "sites/sub/app.j2"),
     ("sites/{{ selection }}../app.j2", "client", "client..", "../shared", "shared/app.j2"),
 ])
@@ -1359,18 +1359,20 @@ def test_dynamic_role_template_pattern_handles_many_repeated_literals():
     assert _linked_role_source_matches(pattern, path + "b.j2")
 
 
-def test_dynamic_role_template_preserves_directory_before_computed_dot(tmp_path):
+@pytest.mark.parametrize(("literal_directory", "prefix"), [("", "alias/"), ("alias", "/")])
+def test_dynamic_role_template_preserves_directory_before_computed_dot(tmp_path, literal_directory, prefix):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {prefix: alias/}
-- template: {src: "sites/{{ prefix }}./app.j2", dest: "output.txt"}
-""", "roles/r/templates/shared/app.j2": "linked template\n"})
+- set_fact: {prefix: "%s"}
+- template: {src: "sites/%s{{ prefix }}./app.j2", dest: "output.txt"}
+""" % (prefix, literal_directory), "roles/r/templates/shared/app.j2": "linked template\n"})
     sites = tmp_path / "roles/r/templates/sites"
     sites.mkdir()
     (sites / "alias").symlink_to("../shared", target_is_directory=True)
+    (sites / "other").symlink_to("../shared", target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook, returncode=0)
@@ -1378,6 +1380,10 @@ def test_dynamic_role_template_preserves_directory_before_computed_dot(tmp_path)
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == "linked template\n"
+    if literal_directory:
+        template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                        if node.get("action", "").endswith("template"))
+        assert "sites/other/app.j2" not in template["_baked_direct_sources"]
 
 
 def test_dynamic_role_template_rejects_link_target_replaced_during_open(tmp_path, monkeypatch):

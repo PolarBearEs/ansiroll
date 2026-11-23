@@ -2008,6 +2008,10 @@ def _linked_role_source_pattern(src):
     pattern = []
     for index, segment in enumerate(segments):
         directory = index < len(segments) - 1
+        # A substitution can supply a separator before or after a literal dot.
+        segment = segment.replace("\0.\0", "\0")
+        if directory and segment.endswith("\0."):
+            segment = segment[:-1]
         optional = directory and "\0" in segment and segment.replace("\0", "") in ("", ".")
         if optional:
             # A wildcard may emit a directory followed by the dot component
@@ -2058,6 +2062,8 @@ def _open_linked_role_source(resolved_path):
 
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
+    from collections import deque
+
     parsed = _linked_role_source_pattern(src)
     if parsed is None:
         return {}, {}, {}
@@ -2105,31 +2111,26 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
-        paths = {tree: (frozenset(), False)}
-        for root, dirs, files in os.walk(tree, followlinks=True):
-            visited_links, linked = paths.pop(root)
-            if linked:
-                visits += 1
-                if visits > 4096:
-                    # Acyclic links can still multiply the archive exponentially.
-                    return assets, metadata, direct
-            children = []
+        pending_dirs = deque([(tree, False)])
+        while pending_dirs:
+            root, linked = pending_dirs.popleft()
+            step = next(os.walk(root), None)
+            if step is None:
+                continue
+            _, dirs, files = step
             for name in sorted(dirs):
                 path = os.path.join(root, name)
                 target = os.path.realpath(path)
                 if name.startswith(".") or not visible(target):
                     continue
-                is_link = os.path.islink(path)
-                links = visited_links
-                if is_link:
-                    # Allow a finite path through a link back to an ancestor.
-                    edge = os.path.join(os.path.realpath(root), name)
-                    if edge in visited_links:
+                child_linked = linked or os.path.islink(path)
+                if child_linked:
+                    # Visit short paths first so a cycle cannot consume the
+                    # entire budget before other direct aliases are reached.
+                    if visits >= 4096:
                         continue
-                    links = visited_links | {edge}
-                children.append(name)
-                paths[path] = (links, linked or is_link)
-            dirs[:] = children
+                    visits += 1
+                pending_dirs.append((path, child_linked))
             for name in sorted(files):
                 if name.startswith("."):
                     continue
