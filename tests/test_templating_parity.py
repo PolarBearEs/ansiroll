@@ -820,11 +820,15 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
+  vars:
+    empty_suffix: null
   tasks:
     - debug:
         msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}/{{ 'second' }}"
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}/{{ empty_suffix }}"
 """, {"data.txt": "first"}, use_strategy=use_strategy)
-    assert messages == ["first/second"]
+    assert messages == ["first/second", "first/"]
 
 
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):

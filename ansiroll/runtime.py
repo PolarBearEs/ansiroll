@@ -1731,6 +1731,8 @@ def _captured_jinja_error(error, syntax=False):
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
+    _LEADING_LOOKUP = re.compile(r"^\{\{\s*(?:lookup|query|q)\s*\(")
+
     def __init__(self):
         self._expr_cache = {}
         self._condition_list_cache = {}
@@ -1744,7 +1746,7 @@ class _Templater:
         self.env = jinja2.Environment(
             undefined=_AnsirollUndefined,
             keep_trailing_newline=True,
-            finalize=_concretize,
+            finalize=lambda value: "" if value is None else _concretize(value),
         )
         self.env.context_class = _AnsirollContext
         self.env._ansiroll_templater = self
@@ -2099,6 +2101,19 @@ class _Templater:
             return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
+    def _has_lookup_suffix(self, stripped):
+        if not self._LEADING_LOOKUP.match(stripped):
+            return False
+        try:
+            tokens = iter(self.env.lex(stripped))
+            for _, kind, _ in tokens:
+                if kind == "variable_end":
+                    return next(tokens, None) is not None
+        except jinja2.TemplateSyntaxError:
+            # Rendering reports the error when the variable is consumed.
+            return False
+        return False
+
     def _render_string(self, text, ctx, strict=False):
         tracking = self._untrusted_task_interpolation is not None
         if tracking:
@@ -2109,10 +2124,11 @@ class _Templater:
         template_key = (text, strict, tracking)
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
-        lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
+        lookup_expr = self._LEADING_LOOKUP.match(stripped)
+        lookup_with_suffix = bool(lookup_expr) and self._has_lookup_suffix(stripped)
         if (stripped.startswith("{{") and stripped.endswith("}}")
-                and (stripped.count("{{") == 1 or lookup_expr)
-                and "{%" not in stripped):
+                and not lookup_with_suffix
+                and (lookup_expr or (stripped.count("{{") == 1 and "{%" not in stripped))):
             expr = stripped[2:-2].strip()
             expr_key = (expr, strict, tracking)
             try:
@@ -2122,26 +2138,16 @@ class _Templater:
                         return sequence
                 compiled = self._expr_cache.get(expr_key)
                 if compiled is None:
-                    tmpl = None
-                    if "{{" in expr:
-                        # A lookup can contain quoted template text. Count
-                        # actual render tags, which exclude quoted delimiters.
-                        tmpl = self._template_cache.get(template_key)
-                        if tmpl is None and sum(kind == "variable_begin" for _, kind, _ in env.lex(text)) > 1:
-                            tmpl = env.from_string(text)
-                            self._template_cache[template_key] = tmpl
-                    if tmpl is None:
-                        compiled = env.compile_expression(expr, undefined_to_none=False)
-                        self._expr_cache[expr_key] = compiled
-                if compiled is not None:
-                    result = compiled(**ctx)
-                    render_as_text = False
+                    compiled = env.compile_expression(expr, undefined_to_none=False)
+                    self._expr_cache[expr_key] = compiled
+                result = compiled(**ctx)
+                render_as_text = False
             except jinja2.TemplateSyntaxError as e:
                 # Captured, not raised: surfaces when the value is used (or is
                 # inspected via dump_object), like Ansible 2.19.
                 return _captured_jinja_error(e, syntax=True)
             except Exception as e:
-                if strict and isinstance(e, jinja2.UndefinedError):
+                if lookup_expr or (strict and isinstance(e, jinja2.UndefinedError)):
                     return _captured_jinja_error(e)
         if render_as_text:
             try:
@@ -2149,14 +2155,15 @@ class _Templater:
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-            except jinja2.TemplateSyntaxError as e:
-                return _captured_jinja_error(e, syntax=True)
-            try:
                 result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
                 return _captured_jinja_error(
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
                 )
+            except Exception as e:
+                if not lookup_with_suffix:
+                    raise
+                return _captured_jinja_error(e)
         try:
             result = _concretize(result)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
@@ -3101,7 +3108,10 @@ class Runtime:
         # A loop expression can use task vars, and later uses can see the
         # loop bindings. Keep templates live until they are actually read.
         looped = task.get("type") != "include" and task.get("loop") is not None
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped))
+        # Aliases of a mixed lookup must also defer until after the task gate.
+        defer = looped or any(type(value) is str and self.templater._has_lookup_suffix(value.strip())
+                              for value in task_vars.values())
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=defer))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):

@@ -56,9 +56,24 @@ def test_single_lookup_with_a_quoted_template_keeps_its_native_value():
     templater = Runtime({}, "", {}).templater
     templater.env.globals["query"] = lambda _name, term: [term]
     assert templater.render_string("{{ query('source', '{{ key }}') }}", {}) == ["{{ key }}"]
+    block = "{% if true %}x{% endif %}"
+    assert templater.render_string("{{ query('source', '%s') }}" % block, {}) == [block]
 
 
-def test_mixed_template_does_not_repeat_lookup_after_a_render_error():
+def test_lookup_with_literal_closing_braces_and_null_suffix():
+    templater = Runtime({}, "", {}).templater
+    templater.env.globals["lookup"] = lambda _name: "first"
+    assert templater.render_string("{{ lookup('source') }}/literal}}", {}) == "first/literal}}"
+    assert templater.render_string("{{ lookup('source') }}/{{ suffix }}", {"suffix": None}) == "first/"
+    assert templater.render_string("{{ suffix }}", {"suffix": None}) is None
+
+
+@pytest.mark.parametrize("text", [
+    "{{ lookup('source') }}/{{ missing.attribute }}",
+    "{{ lookup('source') }}/{{ 1 // divisor }}",
+    "{{ lookup('source') ~ missing }}",
+])
+def test_template_does_not_repeat_lookup_after_a_render_error(text):
     from jinja2 import Undefined
 
     templater = Runtime({}, "", {}).templater
@@ -69,8 +84,44 @@ def test_mixed_template_does_not_repeat_lookup_after_a_render_error():
         return "first"
 
     templater.env.globals["lookup"] = lookup
-    result = templater.render_string("{{ lookup('source') }}/{{ missing.attribute }}", {})
+    result = templater.render_string(text, {"divisor": 0})
     assert isinstance(result, Undefined)
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize("plugin,expression", [
+    ("filter", "'x' | broken"),
+    ("test", "'x' is broken"),
+])
+def test_mixed_template_defers_unavailable_plugin_errors(plugin, expression):
+    from jinja2 import Undefined
+
+    templater = Runtime({}, "", {}).templater
+    templater._plugin_errors[plugin]["broken"] = "load failed"
+    result = templater.render_string("{{ lookup('source') }}/{{ %s }}" % expression, {})
+    assert isinstance(result, Undefined)
+    assert "load failed" in result._undefined_hint
+
+
+def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs():
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    calls = []
+
+    def lookup(name):
+        calls.append(name)
+        return "first"
+
+    rt.templater.env.globals["lookup"] = lookup
+    variables = {"payload": "{{ lookup('source') }}/{{ suffix }}",
+                 "alias": "{{ payload }}", "suffix": "second"}
+    tasks = [
+        _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
+        _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok"]
+    assert frames[1]["result"]["msg"] == "first/second"
     assert calls == ["source"]
 
 
