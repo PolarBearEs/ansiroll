@@ -965,15 +965,18 @@ def _first_found_setup(args, options, ctx, *, selector):
     def collect(terms):
         nonlocal options
         paths = []
+        skip = False
         for term in terms:
             if isinstance(term, (list, tuple)):
-                paths.extend(collect(term))
+                nested, skip = collect(term)
+                paths.extend(nested)
                 continue
             if isinstance(term, dict):
                 options = term
+                skip = options.get("skip", False)
                 names = split(options.get("files"), "[,;]")
                 directories = split(options.get("paths"), "[,:;]")
-                if reset_positional and not directories:
+                if reset_positional and not directories and (names or not keyword_supported):
                     paths = names
                     continue
             elif term is None:
@@ -983,6 +986,7 @@ def _first_found_setup(args, options, ctx, *, selector):
                     paths.append(term)
                     continue
                 options = keyword_options
+                skip = options.get("skip", False)
                 names = split(options.get("files"), "[,;]")
                 directories = split(options.get("paths"), "[,:;]")
                 if not directories:
@@ -992,19 +996,23 @@ def _first_found_setup(args, options, ctx, *, selector):
                         paths.append(term)
                     continue
             else:
+                skip = options.get("skip", False)
                 names = split(term, "[,;]")
                 directories = split(options.get("paths"), "[,:;]")
             paths.extend(os.path.join(directory, name) for directory in directories or [""] for name in names)
-        return paths
+        return paths, skip
 
-    for path in collect(args or [keyword_options.get("files")]):
+    candidates, skip = collect(args or [keyword_options.get("files")])
+    for path in candidates:
         path = os.path.expanduser(path)
         search_dirs = lookup_dirs.get("files" if path.split(os.sep)[0] == "files" else "default", dirs)
         for search_dir in search_dirs:
             candidate = os.path.normpath(os.path.join(search_dir, path))
             if exists(candidate):
                 return [candidate]
-    if options.get("skip"):
+    if _core_at_least(2, 19):
+        skip = options.get("skip", False)
+    if skip:
         return []
     message = "No bundled vars file was found" if selector else "No file was found"
     raise _VarsFileLookupError(message + " when using first_found.")
@@ -1168,8 +1176,9 @@ def _lookup(name, *args, **kwargs):
     vals = _lookup_values(name, args, kwargs, ctx)
     if wantlist:
         return vals
-    if (not vals and _core_at_least(2, 19) and str(name).rsplit(".", 1)[-1] == "first_found"
-            and "__ansiroll_selector_files" in (ctx or {})):
+    if (not vals and str(name).rsplit(".", 1)[-1] == "first_found"
+            and ((ctx or {}).get("__ansiroll_gather_options")
+                 or (_core_at_least(2, 19) and "__ansiroll_selector_files" in (ctx or {})))):
         return vals
     if len(vals) == 1:
         return vals[0]
@@ -2532,7 +2541,7 @@ class Runtime:
                 try:
                     play_options = self._setup_args(play_keywords, play.get("gather_option_defaults"),
                                                     setup_ctx, gather_play_ctx)
-                except (ValueError, TypeError, jinja2.UndefinedError, decimal.DecimalException) as ex:
+                except (ValueError, TypeError, jinja2.UndefinedError, decimal.DecimalException, _VarsFileLookupError) as ex:
                     raise PlayConfigurationError("invalid play fact gathering options: %s" % ex)
         if run_setup:
             gathered = self.gather_facts(

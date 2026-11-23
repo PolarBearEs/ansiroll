@@ -1635,6 +1635,7 @@ def test_setup_first_found_matches_core_search_order_for_an_explicit_files_prefi
 
 @pytest.mark.parametrize("selector", [
     "lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': ['new.yml']})",
+    "lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': []})",
     pytest.param("lookup('first_found', 'new.yml', paths=['profiles'])",
                  marks=pytest.mark.skipif(CORE_VERSION < (2, 16), reason="modern keyword option selection")),
 ])
@@ -1670,6 +1671,72 @@ def test_setup_fact_path_supports_first_found_lookup(tmp_path):
     expected = _ansible(tmp_path, [])
     assert expected[0] == ['"ready"']
     assert _standalone(tmp_path, []) == expected
+
+
+def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "vars/dev.yml": "subset: [all]\n",
+        "vars/team/prod.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': [profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    extra = json.dumps({"profile": "team/prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.skipif(CORE_VERSION < (2, 12) or CORE_VERSION >= (2, 19), reason="legacy nested skip behavior")
+def test_setup_first_found_legacy_nested_list_resets_skip(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "dev.yml": "subset: [all]\n",
+        "fallback.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ query('first_found', {'files': [profile ~ '.yml'], 'skip': true}, [])
+                  | first | default('fallback.yml') }}"
+          tasks:
+            - debug: {msg: gathered}
+        """,
+    })
+    extra = json.dumps({"profile": "missing"})
+    assert _ansible_run(tmp_path, ["-e", extra]).returncode != 0
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    result = _standalone_run(tmp_path, [])
+    assert result.returncode != 0
+    assert "No bundled vars file was found" in result.stderr
+
+
+@pytest.mark.parametrize("skip", [False, True])
+def test_setup_first_found_preserves_direct_lookup_policy(tmp_path, skip):
+    _write(tmp_path, {"pb.yml": """
+    - hosts: localhost
+      gather_facts: true
+      gather_subset: "{{ lookup('first_found', {'files': ['missing.yml'], 'skip': %s}) }}"
+      tasks:
+        - debug: {msg: gathered}
+    """ % str(skip).lower()})
+    native = _ansible_run(tmp_path, [])
+    result = _standalone_run(tmp_path, [])
+    assert (result.returncode == 0) == (native.returncode == 0)
+    if result.returncode == 0:
+        assert _summary(result.stdout) == _summary(native.stdout)
+    elif not skip:
+        assert "invalid play fact gathering options" in result.stderr
+        assert "No file was found when using first_found" in result.stderr
+        assert "Traceback" not in result.stderr
 
 
 @pytest.mark.parametrize("skip", [False, True])

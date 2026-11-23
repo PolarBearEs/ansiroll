@@ -655,9 +655,21 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             elif (directory and index > 0 and (literals[index - 1] or "").endswith(os.sep)
                   and (index == len(literals) - 1 or (literals[index + 1] or "").startswith(os.sep))):
                 pattern.append("**")
-            elif not pattern or pattern[-1] != "*":
-                pattern.append("*")
+            else:
+                wildcard = "*" if directory else "\0"
+                if not pattern or pattern[-1] != wildcard:
+                    pattern.append(wildcard)
         return anchored, "".join(pattern).lstrip(os.sep)
+
+    def filename_globs(pattern):
+        # A filename expression can contain separators, while its literal
+        # prefix and suffix still restrict which files the lookup can select.
+        yield pattern.replace("\0", "*")
+        for index, char in enumerate(pattern):
+            if char == "\0":
+                prefix = pattern[:index].replace("\0", "*")
+                suffix = pattern[index + 1:].replace("\0", "*")
+                yield prefix + "*/**/*" + suffix
 
     kwargs = {option.key: option.value for option in call.kwargs}
     version = tuple(map(int, _fact_schema().split(".")))
@@ -685,8 +697,9 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 files = term
             if files is None:
                 continue
+            file_terms = list(flatten([files], "[,;]"))
             dir_terms = list(flatten([paths], "[,:;]", preserve_empty=True)) if paths is not None else []
-            if version < (2, 16) and not dir_terms:
+            if version < (2, 16) and not dir_terms and (file_terms or version < (2, 12)):
                 groups.clear()
             groups.append((dir_terms, files))
         return groups
@@ -703,24 +716,26 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         if None in directories or None in filenames:
             return None
         for absolute_dir, directory in directories:
-            for absolute_file, filename in filenames:
-                if absolute_file:
-                    patterns.add((basedir, filename))
-                    continue
-                relative = os.path.join(directory, filename)
-                roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
-                patterns.update((root, relative) for root in roots)
+            for absolute_file, filename_pattern in filenames:
+                for filename in filename_globs(filename_pattern):
+                    if absolute_file:
+                        patterns.add((basedir, filename))
+                        continue
+                    relative = os.path.join(directory, filename)
+                    roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
+                    patterns.update((root, relative) for root in roots)
     for fallback in fallbacks:
         candidate = path_pattern(fallback, directory=False)
         if candidate is None:
             return None
-        absolute, filename = candidate
-        if absolute:
-            patterns.add((basedir, filename))
-        elif filename:
-            patterns.update((root, filename) for root in vars_dirs)
-            if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
-                patterns.update((os.path.join(root, vars_subdir), filename) for root in vars_dirs)
+        absolute, filename_pattern = candidate
+        for filename in filename_globs(filename_pattern):
+            if absolute:
+                patterns.add((basedir, filename))
+            elif filename:
+                patterns.update((root, filename) for root in vars_dirs)
+                if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
+                    patterns.update((os.path.join(root, vars_subdir), filename) for root in vars_dirs)
     return patterns
 
 
