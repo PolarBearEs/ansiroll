@@ -2006,27 +2006,28 @@ def _linked_role_source_pattern(src):
     segments = os.path.normpath(re.sub("\0+", "\0", "".join(parts))).split(os.sep)
     pattern = []
     for index, segment in enumerate(segments):
-        if segment == "\0" and index < len(segments) - 1:
-            pattern.append("\0/")
-        else:
-            pattern.extend(part for part in re.split("(\0)", segment) if part)
-            if index < len(segments) - 1:
-                pattern.append("/")
-    return head.rpartition(os.sep)[0], pattern
+        directory = index < len(segments) - 1
+        optional = directory and "\0" in segment and segment.replace("\0", "") in ("", ".")
+        tokens = tuple(part for part in re.split("(\0)", segment) if part)
+        pattern.append((tokens + (("/",) if directory else ()), optional))
+    prefix = os.path.normpath(head.rpartition(os.sep)[0])
+    return ("" if prefix == "." else prefix), pattern
 
 
 def _linked_role_source_matches(pattern, relative):
     # At most one position per character is retained after each token.
     positions = {0}
-    for token in pattern:
-        if token == "\0":
-            positions = set(range(min(positions), len(relative) + 1))
-        elif token == "\0/":
-            # An empty expression also drops its following separator.
-            start = min(positions)
-            positions.update(index + 1 for index in range(start + 1, len(relative)) if relative[index] == "/")
-        else:
-            positions = {index + len(token) for index in positions if relative.startswith(token, index)}
+    for tokens, optional in pattern:
+        # Empty and dot components can vanish on normalization.
+        skipped = positions if optional else ()
+        for token in tokens:
+            if token == "\0":
+                positions = set(range(min(positions), len(relative) + 1))
+            else:
+                positions = {index + len(token) for index in positions if relative.startswith(token, index)}
+            if not positions:
+                break
+        positions.update(skipped)
         if not positions:
             return False
     return len(relative) in positions
@@ -2087,6 +2088,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                         pending.setdefault(winner, []).append(lookup_path)
 
     assets, metadata, contents = {}, {}, {}
+    newline = "" if subdir == "files" else None
     visits = 0
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         if not prefix and not is_subdir:
@@ -2142,7 +2144,8 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                             continue
                         identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
                         if identity not in contents:
-                            with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as file:
+                            with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", newline=newline,
+                                           closefd=False) as file:
                                 contents[identity] = file.read()
                         assets[key] = contents[identity]
                     finally:

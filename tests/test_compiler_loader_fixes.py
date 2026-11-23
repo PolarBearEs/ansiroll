@@ -1053,6 +1053,7 @@ def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, pr
     ("shared", "sites//./", ""),
     ("shared", "././sites/", "{% if staged %}.staging{% endif %}"),
     ("roles/r/templates/shared", "sites/{{ group }}/", ""),
+    ("roles/r/templates/shared", "sites/{{ group }}./", ""),
 ])
 def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_dir, prefix, ending):
     destination = tmp_path / "rendered.txt"
@@ -1099,6 +1100,65 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
     tasks.write_text(tasks.read_text().replace("alias/app", "alias/../local"))
     assert _ansiroll(playbook, tmp_path, returncode=1)[1] == _ansible(playbook, returncode=2)[1]
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("action", ["copy", "unarchive"])
+def test_dynamic_linked_role_file_preserves_binary_content(tmp_path, action):
+    import tarfile
+
+    payload = b"one\r\ntwo\rthree\xff\n"
+    destination = tmp_path / "output"
+    extension = ".bin" if action == "copy" else ".tar"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- %s: {src: "sites/{{ selection }}%s", dest: "%s"}
+""" % (action, extension, destination)})
+    files = tmp_path / "roles/r/files"
+    (files / "shared").mkdir(parents=True)
+    (files / "sites").mkdir()
+    (files / "sites/alias").symlink_to("../shared", target_is_directory=True)
+    source = files / "shared" / ("app" + extension)
+    if action == "copy":
+        source.write_bytes(payload)
+        extracted = destination
+    else:
+        with tarfile.open(source, "w") as archive:
+            member = tarfile.TarInfo("member.bin")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        destination.mkdir()
+        extracted = destination / "member.bin"
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    assert extracted.read_bytes() == payload
+    extracted.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert extracted.read_bytes() == payload
+
+
+def test_dynamic_role_template_limits_dot_prefix_to_action_directories(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: local}
+- template: {src: "./{{ selection }}.j2", dest: "unused"}
+""", "roles/r/templates/local.j2": "ordinary template\n",
+        "roles/r/private/shared/app.j2": "unrelated template\n"})
+    private = tmp_path / "roles/r/private"
+    (private / "bare").mkdir()
+    (private / "bare/alias").symlink_to("../shared", target_is_directory=True)
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "local.j2" in template["_baked"]
+    assert "private/bare/alias/app.j2" not in (template.get("_baked_direct_sources") or {})
 
 
 def test_dynamic_role_template_preserves_earlier_regular_directory(tmp_path):
