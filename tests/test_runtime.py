@@ -52,12 +52,13 @@ def test_lookup_followed_by_another_template_segment_renders_as_text():
     assert calls == ["source"] * 3
 
 
-def test_single_lookup_with_a_quoted_template_keeps_its_native_value():
+@pytest.mark.parametrize(("opening", "closing"), [("{{", "}}"), ("{{-", "}}"), ("{{", "-}}"), ("{{-", "-}}")])
+def test_single_lookup_with_a_quoted_template_keeps_its_native_value(opening, closing):
     templater = Runtime({}, "", {}).templater
     templater.env.globals["query"] = lambda _name, term: [term]
     assert templater.render_string("{{ query('source', '{{ key }}') }}", {}) == ["{{ key }}"]
     block = "{% if true %}x{% endif %}"
-    assert templater.render_string("{{ query('source', '%s') }}" % block, {}) == [block]
+    assert templater.render_string(f"{opening} query('source', '{block}') {closing}", {}) == [block]
 
 
 def test_lookup_with_literal_closing_braces_and_null_suffix():
@@ -68,10 +69,23 @@ def test_lookup_with_literal_closing_braces_and_null_suffix():
     assert templater.render_string("{{ suffix }}", {"suffix": None}) is None
 
 
+def test_null_interpolation_respects_legacy_native_mode(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    templater = Runtime({}, "", {}).templater
+    for text in ("prefix/{{ suffix }}", "prefix/{{ none }}"):
+        ctx = {"suffix": None, "__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": True}}
+        assert templater.render_string(text, ctx) == "prefix/None"
+        ctx["__ansiroll_controller_config"]["DEFAULT_JINJA2_NATIVE"] = False
+        assert templater.render_string(text, ctx) == "prefix/"
+
+
 @pytest.mark.parametrize("text", [
     "{{ lookup('source') }}/{{ missing.attribute }}",
     "{{ lookup('source') }}/{{ 1 // divisor }}",
     "{{ lookup('source') ~ missing }}",
+    "{{ 'prefix' ~ lookup('source') ~ missing }}",
 ])
 def test_template_does_not_repeat_lookup_after_a_render_error(text):
     from jinja2 import Undefined
@@ -103,7 +117,11 @@ def test_mixed_template_defers_unavailable_plugin_errors(plugin, expression):
     assert "load failed" in result._undefined_hint
 
 
-def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs():
+@pytest.mark.parametrize(("payload", "aliased"), [
+    ("{{ lookup('source') }}/{{ suffix }}", "payload"),
+    ({"nested": ["{{- lookup('source') -}} /{{ suffix }}"]}, "payload.nested[0]"),
+])
+def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, aliased):
     frames = []
     rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
     calls = []
@@ -113,8 +131,7 @@ def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs():
         return "first"
 
     rt.templater.env.globals["lookup"] = lookup
-    variables = {"payload": "{{ lookup('source') }}/{{ suffix }}",
-                 "alias": "{{ payload }}", "suffix": "second"}
+    variables = {"payload": payload, "alias": "{{ %s }}" % aliased, "suffix": "second"}
     tasks = [
         _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
         _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),

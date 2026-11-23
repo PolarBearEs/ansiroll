@@ -817,6 +817,8 @@ def test_untrusted_data_is_not_templated_again(tmp_path):
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy):
+    from ansible import constants as C
+
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -828,7 +830,8 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
     - debug:
         msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}/{{ empty_suffix }}"
 """, {"data.txt": "first"}, use_strategy=use_strategy)
-    assert messages == ["first/second", "first/"]
+    null_suffix = "None" if not MODERN_TEMPLATING and C.DEFAULT_JINJA2_NATIVE else ""
+    assert messages == ["first/second", "first/" + null_suffix]
 
 
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):

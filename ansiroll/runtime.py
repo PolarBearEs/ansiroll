@@ -1549,6 +1549,14 @@ def _concretize(value):
     return value
 
 
+def _finalize_text_segment(context, value):
+    if value is None:
+        config = context.get("__ansiroll_controller_config") or {}
+        if not (_legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True):
+            return ""
+    return _concretize(value)
+
+
 class _CapturedTemplateError(jinja2.UndefinedError):
     """A template failure represented lazily as an undefined object."""
 
@@ -1731,7 +1739,7 @@ def _captured_jinja_error(error, syntax=False):
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
-    _LEADING_LOOKUP = re.compile(r"^\{\{\s*(?:lookup|query|q)\s*\(")
+    _LEADING_LOOKUP = re.compile(r"^\{\{[-+]?\s*(?:lookup|query|q)\s*\(")
 
     def __init__(self):
         self._expr_cache = {}
@@ -1746,7 +1754,7 @@ class _Templater:
         self.env = jinja2.Environment(
             undefined=_AnsirollUndefined,
             keep_trailing_newline=True,
-            finalize=lambda value: "" if value is None else _concretize(value),
+            finalize=(getattr(jinja2, "pass_context", None) or jinja2.contextfunction)(_finalize_text_segment),
         )
         self.env.context_class = _AnsirollContext
         self.env._ansiroll_templater = self
@@ -2101,17 +2109,32 @@ class _Templater:
             return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
-    def _has_lookup_suffix(self, stripped):
-        if not self._LEADING_LOOKUP.match(stripped):
-            return False
+    def _bare_lookup_expression(self, stripped):
+        """Read the expression between the actual Jinja delimiters."""
         try:
             tokens = iter(self.env.lex(stripped))
-            for _, kind, _ in tokens:
-                if kind == "variable_end":
-                    return next(tokens, None) is not None
+            _, _, opening = next(tokens)
+            for _, kind, closing in tokens:
+                if kind != "variable_end":
+                    continue
+                if next(tokens, None) is None:
+                    return stripped[len(opening):-len(closing)].strip()
+                break
         except jinja2.TemplateSyntaxError:
             # Rendering reports the error when the variable is consumed.
-            return False
+            pass
+        return None
+
+    def _contains_mixed_lookup(self, value):
+        if type(value) is str:
+            stripped = value.strip()
+            return bool(self._LEADING_LOOKUP.match(stripped)) and self._bare_lookup_expression(stripped) is None
+        if type(value) is dict:
+            if len(value) == 1 and ("__ansiroll_unsafe__" in value or "__ansiroll_vault__" in value):
+                return False
+            return any(self._contains_mixed_lookup(item) for item in value.values())
+        if type(value) in (list, tuple):
+            return any(self._contains_mixed_lookup(item) for item in value)
         return False
 
     def _render_string(self, text, ctx, strict=False):
@@ -2120,16 +2143,17 @@ class _Templater:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
-        render_as_text = True
         template_key = (text, strict, tracking)
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
-        lookup_expr = self._LEADING_LOOKUP.match(stripped)
-        lookup_with_suffix = bool(lookup_expr) and self._has_lookup_suffix(stripped)
-        if (stripped.startswith("{{") and stripped.endswith("}}")
-                and not lookup_with_suffix
-                and (lookup_expr or (stripped.count("{{") == 1 and "{%" not in stripped))):
+        leading_lookup = self._LEADING_LOOKUP.match(stripped)
+        expr = None
+        if leading_lookup:
+            expr = self._bare_lookup_expression(stripped)
+        elif (stripped.startswith("{{") and stripped.endswith("}}")
+              and stripped.count("{{") == 1 and "{%" not in stripped):
             expr = stripped[2:-2].strip()
+        if expr is not None:
             expr_key = (expr, strict, tracking)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
@@ -2141,15 +2165,10 @@ class _Templater:
                     compiled = env.compile_expression(expr, undefined_to_none=False)
                     self._expr_cache[expr_key] = compiled
                 result = compiled(**ctx)
-                render_as_text = False
-            except jinja2.TemplateSyntaxError as e:
-                # Captured, not raised: surfaces when the value is used (or is
-                # inspected via dump_object), like Ansible 2.19.
-                return _captured_jinja_error(e, syntax=True)
             except Exception as e:
-                if lookup_expr or (strict and isinstance(e, jinja2.UndefinedError)):
-                    return _captured_jinja_error(e)
-        if render_as_text:
+                # Capture evaluation errors without replaying lookups.
+                return _captured_jinja_error(e, syntax=isinstance(e, jinja2.TemplateSyntaxError))
+        else:
             try:
                 tmpl = self._template_cache.get(template_key)
                 if tmpl is None:
@@ -2161,7 +2180,7 @@ class _Templater:
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
                 )
             except Exception as e:
-                if not lookup_with_suffix:
+                if not leading_lookup:
                     raise
                 return _captured_jinja_error(e)
         try:
@@ -3109,8 +3128,7 @@ class Runtime:
         # loop bindings. Keep templates live until they are actually read.
         looped = task.get("type") != "include" and task.get("loop") is not None
         # Aliases of a mixed lookup must also defer until after the task gate.
-        defer = looped or any(type(value) is str and self.templater._has_lookup_suffix(value.strip())
-                              for value in task_vars.values())
+        defer = looped or self.templater._contains_mixed_lookup(task_vars)
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=defer))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
