@@ -1875,6 +1875,20 @@ def _literal_head(src):
     return src[:m.start()] if m else src
 
 
+def _literal_role_source_tail(src):
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    try:
+        body = Environment(trim_blocks=True).parse(src).body
+    except TemplateSyntaxError:
+        return ""
+    if body and isinstance(body[-1], nodes.Output):
+        output = body[-1].nodes
+        if output and isinstance(output[-1], nodes.TemplateData):
+            return output[-1].data.strip()
+    return ""
+
+
 def _bake_search_tree(node, task, basedir, subdir, src):
     """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
     its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
@@ -1889,8 +1903,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             return False
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
-    tail = re.split(r"{{.*?}}|{%.*?%}|{#.*?#}", src, flags=re.S)[-1]
-    fixed_name = os.path.basename(tail) if os.sep in tail else ""
+    tail = _literal_role_source_tail(src)
+    fixed_path = ""
+    if os.sep in tail:
+        trailing_components = tail.partition(os.sep)[2].split(os.sep)
+        if trailing_components[-1] not in ("", ".", "..") and ".." not in trailing_components:
+            fixed_path = os.sep + os.path.normpath(os.sep.join(trailing_components)).lstrip(os.sep)
     baked = {}
     meta = {}
     directories = set()
@@ -1911,12 +1929,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 if os.path.islink(full):
                     aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
             for fn in sorted(files):
-                if fixed_name and fn != fixed_name:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, base)
+                if fixed_path and not (os.sep + rel).endswith(fixed_path):
                     continue
                 if os.sep not in tail and not fn.endswith(tail):
                     continue
-                full = os.path.join(root, fn)
-                rel = os.path.relpath(full, base)
                 if rel in claimed or any(os.path.exists(os.path.join(d, rel)) for d in skipped):
                     continue
                 if not os.path.exists(full):
