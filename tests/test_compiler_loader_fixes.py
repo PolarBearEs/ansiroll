@@ -558,6 +558,39 @@ def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_a
     assert node["_baked"][key] == "available\n"
 
 
+@pytest.mark.parametrize("replace_with_file", [False, True])
+def test_compile_dynamic_role_source_rechecks_walked_directory(tmp_path, monkeypatch, replace_with_file):
+    from types import SimpleNamespace
+
+    from ansible.parsing.dataloader import DataLoader
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"later/sites/app.j2": "later file\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    earlier.mkdir(parents=True)
+    original_walk = os.walk
+
+    def walk_then_replace(path, *args, **kwargs):
+        for directory, dirs, files in original_walk(path, *args, **kwargs):
+            if directory == str(earlier.parent) and earlier.name in dirs and earlier.is_dir():
+                earlier.rmdir()
+                if replace_with_file:
+                    earlier.write_text("replacement file\n")
+            yield directory, dirs, files
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    task = SimpleNamespace(_role=object(), _loader=DataLoader(), get_search_path=lambda: [base for base, _ in roots])
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "walk", walk_then_replace)
+        node = {}
+        assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
+    key = Runtime._baked_source_key(node, "sites/app.j2")
+    assert node["_baked"][key] == ("replacement file\n" if replace_with_file else "later file\n")
+
+
 @pytest.mark.parametrize("leased_source_exists_at_runtime", [False, True])
 def test_compile_dynamic_role_source_defers_lease_errors(tmp_path, monkeypatch, leased_source_exists_at_runtime):
     from ansiroll import loader

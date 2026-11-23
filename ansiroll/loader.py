@@ -1990,8 +1990,15 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
         for root, dirs, files in walk:
             for dirname in dirs:
-                relative = os.path.relpath(os.path.join(root, dirname), base)
-                root_blocks[relative] = True
+                path = os.path.join(root, dirname)
+                mode = _role_source_mode(path)
+                if mode is None:
+                    continue
+                if stat.S_ISREG(mode):
+                    files.append(dirname)
+                    continue
+                relative = os.path.relpath(path, base)
+                root_blocks[relative] = stat.S_ISDIR(mode)
                 blockers.setdefault(relative, set()).add(root_index)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
