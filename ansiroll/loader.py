@@ -2281,7 +2281,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 continue
             path = os.path.normpath(os.path.join(root, name))
             relative = os.path.relpath(path, base)
-            if relative in ordinary and ordinary[relative]["fullpath"] == path:
+            # A linked root may need an action-prefixed spelling for an asset
+            # already baked by the ordinary walk.
+            if not linked and path in ordinary_by_path:
                 continue
             paths_to_bake = list(pending.get(path, ()))
             if linked:
@@ -2290,8 +2292,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                         winner = source_for(lookup_path)
                         if winner is None:
                             continue
-                        direct.setdefault(lookup_path, ordinary_by_path.get(winner))
-                        if path == winner:
+                        winner_key = ordinary_by_path.get(winner)
+                        direct.setdefault(lookup_path, winner_key)
+                        if path == winner and winner_key is None:
                             paths_to_bake.append(lookup_path)
             if not paths_to_bake:
                 continue

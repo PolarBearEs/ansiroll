@@ -1431,6 +1431,31 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     assert destination.read_text() == expected_content
 
 
+@pytest.mark.parametrize("selection", ["app", "templates/app"])
+def test_dynamic_role_template_reuses_asset_under_linked_action_root(tmp_path, selection):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: %s}
+- template: {src: "{{ selection }}.j2", dest: "output.txt"}
+""" % selection, "roles/r/shared/app.j2": "linked template\n"})
+    role = tmp_path / "roles/r"
+    (role / "templates").symlink_to("shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert template["_baked_direct_sources"]["templates/app.j2"] == "app.j2"
+    assert set(template["_baked"]) == {"app.j2"}
+
+
 def test_dynamic_role_template_bakes_a_symlink_crossed_by_the_scan_prefix(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
