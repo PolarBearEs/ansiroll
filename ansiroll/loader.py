@@ -2008,8 +2008,15 @@ def _linked_role_source_pattern(src):
     for index, segment in enumerate(segments):
         directory = index < len(segments) - 1
         optional = directory and "\0" in segment and segment.replace("\0", "") in ("", ".")
-        tokens = tuple(part for part in re.split("(\0)", segment) if part)
-        pattern.append((tokens + (("/",) if directory else ()), optional))
+        if optional:
+            # A wildcard may emit a directory followed by the dot component
+            # that normalization removes, or leave the whole component empty.
+            tokens = ("\0", "/")
+        else:
+            tokens = tuple(part for part in re.split("(\0)", segment) if part)
+            if directory:
+                tokens += ("/",)
+        pattern.append((tokens, optional))
     prefix = os.path.normpath(head.rpartition(os.sep)[0])
     return ("" if prefix == "." else prefix), pattern
 

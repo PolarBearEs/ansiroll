@@ -1330,6 +1330,27 @@ def test_dynamic_role_template_pattern_handles_many_repeated_literals():
     assert _linked_role_source_matches(pattern, path + "b.j2")
 
 
+def test_dynamic_role_template_preserves_directory_before_computed_dot(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {prefix: alias/}
+- template: {src: "sites/{{ prefix }}./app.j2", dest: "output.txt"}
+""", "roles/r/templates/shared/app.j2": "linked template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir()
+    (sites / "alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
 def test_dynamic_role_template_rejects_link_target_replaced_during_open(tmp_path, monkeypatch):
     from ansiroll import loader
 
