@@ -56,7 +56,7 @@ def _compiled_plays(src, tmp_path):
     artifact = tmp_path / "compiled.py"
     artifact.write_text(src, encoding="utf-8")
     probe = "import json, runpy, sys; print(json.dumps(runpy.run_path(sys.argv[1])['PLAYS']))"
-    result = subprocess.run([sys.executable, "-c", probe, str(artifact)],
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", probe, str(artifact)],
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -2039,7 +2039,9 @@ def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     src, manifest = compile_playbook(os.path.join(FIXTURES, "legacy", "play.yml"))
     # The included task must be inlined (no crash on removed `include`), and not
     # left as a fallback.
+    importers = tuple(sys.meta_path)
     assert "included-marker" in json.dumps(_compiled_plays(src, tmp_path))
+    assert tuple(sys.meta_path) == importers
     assert manifest["fallback_tasks"] == []
     with pytest.raises(jinja2.UndefinedError):
         environment.from_string("{{ missing }}").render()
