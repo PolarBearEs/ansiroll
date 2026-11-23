@@ -3311,11 +3311,16 @@ class Runtime:
         normalized = os.path.normpath(src)
         if ".." in parts:
             return normalized
-        lookup = normalized
-        if (parts[0] == "." and normalized.startswith("~")
-                or parts[0] != task["_baked_tree"] and normalized.split("/", 1)[0] == task["_baked_tree"]):
-            lookup = "./" + normalized
+        lookup = Runtime._baked_direct_lookup(task["_baked_tree"], src, normalized)
         return (task.get("_baked_direct_sources") or {}).get(lookup, normalized)
+
+    @staticmethod
+    def _baked_direct_lookup(subdir, src, normalized):
+        first = src.split("/", 1)[0]
+        if (first == "." and normalized.startswith("~")
+                or first != subdir and normalized.split("/", 1)[0] == subdir):
+            return "./" + normalized
+        return normalized
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
@@ -3839,6 +3844,10 @@ class Runtime:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
             fullpath = meta.get("fullpath", src)
+            if name == "template" and meta.get("lookup_roots"):
+                lookup = self._baked_direct_lookup(task["_baked_tree"], src, os.path.normpath(src))
+                if lookup in meta["lookup_roots"]:
+                    fullpath = meta["lookup_roots"][lookup] + src
             source_display = fullpath
             source_rel = os.path.basename(str(fullpath))
             if args.get("mode") == "preserve":

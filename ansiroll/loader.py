@@ -2082,9 +2082,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
 
     def source_for(relative):
         if relative not in winners:
-            result = _find_needle(task, subdir, relative)
-            winners[relative] = os.path.normpath(result) if result else None
-        return winners[relative]
+            winners[relative] = _find_needle(task, subdir, relative)
+        winner = winners[relative]
+        return os.path.normpath(winner) if winner else None
 
     def lookup_paths(relative):
         yield relative
@@ -2109,7 +2109,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     # Finish paths with the current number of symlinks before expanding paths
     # with one more, even when a path has many ordinary directories.
     pending_dirs, next_hop_dirs = deque(), deque()
-    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
+    for base, is_subdir in dict.fromkeys(_search_dirs(task, basedir, subdir, tagged=True)):
         if not prefix and not is_subdir:
             continue
         tree = os.path.join(base, prefix)
@@ -2155,8 +2155,11 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                     spellings.append(os.path.join(subdir, relative))
                 for spelling in spellings:
                     if _linked_role_source_matches(pattern, spelling):
-                        paths_to_bake.extend(lookup_path for lookup_path in lookup_paths(spelling)
-                                             if path == source_for(lookup_path))
+                        for lookup_path in lookup_paths(spelling):
+                            winner = source_for(lookup_path)
+                            direct.setdefault(lookup_path, ordinary_by_path.get(winner))
+                            if path == winner:
+                                paths_to_bake.append(lookup_path)
             if not paths_to_bake:
                 continue
             resolved_path = os.path.realpath(path)
@@ -2181,6 +2184,11 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 continue
             metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
                              "mode": stat.S_IMODE(info.st_mode)}
+            if subdir == "templates":
+                lookup_roots = {spelling: winners[spelling][:-len(spelling)] for spelling in paths_to_bake
+                                if winners[spelling].endswith(os.sep + spelling)}
+                if lookup_roots:
+                    metadata[key]["lookup_roots"] = lookup_roots
             direct.update(dict.fromkeys(paths_to_bake, key))
     return assets, metadata, direct
 

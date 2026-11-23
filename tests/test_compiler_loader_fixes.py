@@ -1066,7 +1066,7 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
 - template: {src: "%s{{ selection }}%s.j2", dest: "%s"}
 """ % (prefix, ending, destination),
         "roles/r/templates/sites/local.j2": "local\n",
-        shared_dir + "/app.j2": "from the shared template\n",
+        shared_dir + "/app.j2": "from the shared template\n{{ template_fullpath }}\n",
         shared_dir + "/unrelated.txt": "ordinary data\n",
         shared_dir + "/.private/hidden.j2": "hidden data\n"})
     templates = tmp_path / "roles/r/templates"
@@ -1080,7 +1080,8 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
 
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook, returncode=0)
-    assert destination.read_text() == "from the shared template\n"
+    expected_content = destination.read_text()
+    assert expected_content.startswith("from the shared template\n")
     destination.unlink()
     artifact = tmp_path / "probe.py"
     subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
@@ -1092,7 +1093,7 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
     assert not any(path.endswith(("/unrelated.txt", "/hidden.j2")) for path in contents)
     assert not any(path.startswith("sites/project/") for path in contents)
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
-    assert destination.read_text() == "from the shared template\n"
+    assert destination.read_text() == expected_content
 
     destination.unlink()
     tasks = tmp_path / "roles/r/tasks/main.yml"
@@ -1182,7 +1183,8 @@ def test_dynamic_role_template_preserves_earlier_regular_directory(tmp_path):
     assert destination.read_text() == "role template\n"
 
 
-def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path):
+@pytest.mark.parametrize("linked_fallbacks", [False, True])
+def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path, linked_fallbacks):
     destination = tmp_path / "rendered.txt"
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -1192,10 +1194,15 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
 - set_fact: {selection: alias/app}
 - template: {src: "sites/{{ selection }}.j2", dest: "%s"}
 """ % destination, "roles/r/templates/.private/app.j2": "earlier source\n",
-        "templates/sites/alias/app.j2": "later source\n",
-        "sites/alias/app.j2": "controller working directory source\n"})
-    (tmp_path / "roles/r/templates/sites").mkdir()
+        "roles/r/templates/sites/local.j2": "valid source\n",
+        "later/app.j2" if linked_fallbacks else "templates/sites/alias/app.j2": "later source\n",
+        "working/app.j2" if linked_fallbacks else "sites/alias/app.j2": "controller working directory source\n"})
     (tmp_path / "roles/r/templates/sites/alias").symlink_to("../.private", target_is_directory=True)
+    if linked_fallbacks:
+        for parent, target in (("templates/sites", "later"), ("sites", "working")):
+            path = tmp_path / parent
+            path.mkdir(parents=True)
+            (path / "alias").symlink_to(tmp_path / target, target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"
     _ansible(playbook, returncode=0)
@@ -1520,6 +1527,33 @@ def test_dynamic_role_template_keeps_ordinary_sources_at_link_limit(tmp_path):
                     if node.get("action", "").endswith("template"))
     assert "sites/local.j2" in template["_baked"]
     assert "_baked_direct_sources" not in template
+
+
+def test_dynamic_role_template_counts_duplicate_search_roots_once(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": "- include_tasks: sub/entry.yml\n",
+        "roles/r/tasks/sub/entry.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "sites/{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/sites/local.txt": "unrelated\n",
+        "unused/data.txt": "unrelated alias target\n", "shared/app.j2": "playbook template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for index in range(2048):
+        (sites / str(index)).symlink_to(tmp_path / "unused", target_is_directory=True)
+    later = tmp_path / "templates/sites"
+    later.mkdir(parents=True)
+    (later / "alias").symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "playbook template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "playbook template\n"
 
 
 def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):
