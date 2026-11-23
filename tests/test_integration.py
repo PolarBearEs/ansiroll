@@ -52,6 +52,16 @@ def _load_strategy_module():
     return mod
 
 
+def _compiled_plays(src, tmp_path):
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(src, encoding="utf-8")
+    probe = "import json, runpy, sys; print(json.dumps(runpy.run_path(sys.argv[1])['PLAYS']))"
+    result = subprocess.run([sys.executable, "-c", probe, str(artifact)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 # ---- module embedding (cross-version core mechanism) --------------------
 
 
@@ -2022,14 +2032,17 @@ def test_gather_embeds_setup():
     assert any(m.endswith("setup") for m in manifest["modules"])
 
 
-def test_legacy_include_is_rewritten_and_inlined():
+def test_legacy_include_is_rewritten_and_inlined(tmp_path):
+    import jinja2
+
+    environment = jinja2.Environment(undefined=jinja2.StrictUndefined)
     src, manifest = compile_playbook(os.path.join(FIXTURES, "legacy", "play.yml"))
     # The included task must be inlined (no crash on removed `include`), and not
     # left as a fallback.
-    ns = {"__name__": "ansiroll_test_agent"}
-    exec(compile(src, "<ansiroll-test>", "exec"), ns)
-    assert "included-marker" in json.dumps(ns["PLAYS"])
+    assert "included-marker" in json.dumps(_compiled_plays(src, tmp_path))
     assert manifest["fallback_tasks"] == []
+    with pytest.raises(jinja2.UndefinedError):
+        environment.from_string("{{ missing }}").render()
 
 
 def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):
@@ -2049,8 +2062,7 @@ def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):
     src, manifest = compile_playbook(
         str(play), extra_vars={"run_mode": "update"}, tree_shake=True
     )
-    ns = {"__name__": "ansiroll_test_agent"}
-    exec(compile(src, "<ansiroll-test>", "exec"), ns)
+    plays = _compiled_plays(src, tmp_path)
 
     assert manifest["modules"] == []
     assert manifest["tree_shake"]["removed_nodes"] == 1
@@ -2064,7 +2076,7 @@ def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):
                 yield from tasks(node.get("tasks", []))
             else:
                 yield node
-    task = next(node for node in tasks(ns["PLAYS"][0]["tasks"])
+    task = next(node for node in tasks(plays[0]["tasks"])
                 if node.get("action", "").endswith("debug"))
     assert task["action"].endswith("debug")
     assert task["when"] == ["runtime_only | default(true)"]
@@ -2087,8 +2099,7 @@ def test_tree_shake_short_circuits_unknown_runtime_values(tmp_path):
     src, manifest = compile_playbook(
         str(play), extra_vars={"report_to_slack": False}, tree_shake=True
     )
-    ns = {"__name__": "ansiroll_test_agent"}
-    exec(compile(src, "<ansiroll-test>", "exec"), ns)
+    plays = _compiled_plays(src, tmp_path)
     def leaf_tasks(nodes):
         for node in nodes:
             if node.get("type") == "block":
@@ -2099,7 +2110,7 @@ def test_tree_shake_short_circuits_unknown_runtime_values(tmp_path):
                 yield from leaf_tasks(node.get("tasks", []))
             elif node.get("action") != "meta":
                 yield node
-    tasks = list(leaf_tasks(ns["PLAYS"][0]["tasks"]))
+    tasks = list(leaf_tasks(plays[0]["tasks"]))
 
     assert manifest["modules"] == []
     assert manifest["tree_shake"]["removed_nodes"] == 1
