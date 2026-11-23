@@ -622,7 +622,7 @@ def test_compile_reports_ansible_configuration_errors_for_an_expanded_input(tmp_
     assert result.returncode == 2
     if tuple(map(int, release.__version__.split(".")[:2])) >= (2, 16):
         assert "Traceback" not in result.stderr
-    assert "bogus" in result.stderr
+    assert "DEFAULT_VERBOSITY" in result.stderr
     assert not output.exists()
 
 
