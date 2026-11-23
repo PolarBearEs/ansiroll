@@ -1145,17 +1145,22 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
     assert not destination.exists()
 
 
-@pytest.mark.parametrize(("prefix", "linked_first"), [("", False), ("./", True), ("", True), ("", None), ("./", None)])
-def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path, prefix, linked_first):
+@pytest.mark.parametrize(("prefix", "linked_first", "dynamic_subdir"), [
+    ("", False, False), ("./", True, False), ("", True, False), ("", None, False), ("./", None, False),
+    ("", None, True), ("./", None, True),
+])
+def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path, prefix, linked_first, dynamic_subdir):
     destination = tmp_path / "rendered.txt"
+    selection = prefix + "templates/sites/alias/app" if dynamic_subdir else "alias/app"
+    source = "{{ selection }}.j2" if dynamic_subdir else prefix + "templates/sites/{{ selection }}.j2"
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {selection: alias/app}
-- template: {src: "%stemplates/sites/{{ selection }}.j2", dest: "%s"}
-""" % (prefix, destination), "roles/r/templates/shared/app.j2": "linked path\n"})
+- set_fact: {selection: "%s"}
+- template: {src: "%s", dest: "%s"}
+""" % (selection, source, destination), "roles/r/templates/shared/app.j2": "linked path\n"})
     templates = tmp_path / "roles/r/templates"
     normal, prepended = templates / "sites", templates / "templates/sites"
     linked, regular = (normal, prepended) if linked_first else (prepended, normal)
@@ -1198,6 +1203,7 @@ def test_dynamic_role_template_preserves_dot_prefixed_tilde(tmp_path):
      "report-alias/app.j2", "alias/other.j2"),
     ("sites/{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ group }}/{% if staged %}stage{% endif %}//app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ empty }}{{ suffix }}/alias/app.j2", "alias/app.j2", "alias/not-app.j2"),
 ])
 def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkeypatch, src, matched, excluded):
     _write(tmp_path, {"pb.yml": """
@@ -1205,7 +1211,7 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {name: alias/app, group: alias, staged: false}
+- set_fact: {name: alias/app, group: alias, staged: false, empty: '', suffix: ''}
 - template: {src: "%s", dest: "output.txt"}
 """ % src, "roles/r/templates/sites/app.j2": "ordinary\n",
         "shared/app.j2": "linked\n", "shared/other.j2": "excluded\n",
@@ -1231,6 +1237,15 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
     assert "sites/" + matched in direct
     assert "sites/" + excluded not in direct
     assert len(reads) == 1
+
+
+def test_dynamic_role_template_pattern_handles_many_repeated_literals():
+    from ansiroll.loader import _linked_role_source_matches, _linked_role_source_pattern
+
+    _, pattern = _linked_role_source_pattern("sites/" + "{{ name }}a" * 24 + "b{{ name }}.j2")
+    path = "sites/" + "a" * 100
+    assert not _linked_role_source_matches(pattern, path + ".j2")
+    assert _linked_role_source_matches(pattern, path + "b.j2")
 
 
 @pytest.mark.parametrize("src", [

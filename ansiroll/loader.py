@@ -2003,16 +2003,33 @@ def _linked_role_source_pattern(src):
         parts = [head, "\0", tail]
     if any(".." in part.split(os.sep) for part in parts):
         return None
-    segments = os.path.normpath("".join(parts)).split(os.sep)
+    segments = os.path.normpath(re.sub("\0+", "\0", "".join(parts))).split(os.sep)
     pattern = []
     for index, segment in enumerate(segments):
         if segment == "\0" and index < len(segments) - 1:
-            pattern.append("(?:.+/)?")
+            pattern.append("\0/")
         else:
-            pattern.append(re.escape(segment).replace("\0", ".*"))
+            pattern.extend(part for part in re.split("(\0)", segment) if part)
             if index < len(segments) - 1:
                 pattern.append("/")
-    return head.rpartition(os.sep)[0], re.compile("".join(pattern), re.S)
+    return head.rpartition(os.sep)[0], pattern
+
+
+def _linked_role_source_matches(pattern, relative):
+    # At most one position per character is retained after each token.
+    positions = {0}
+    for token in pattern:
+        if token == "\0":
+            positions = set(range(min(positions), len(relative) + 1))
+        elif token == "\0/":
+            # An empty expression also drops its following separator.
+            start = min(positions)
+            positions.update(index + 1 for index in range(start + 1, len(relative)) if relative[index] == "/")
+        else:
+            positions = {index + len(token) for index in positions if relative.startswith(token, index)}
+        if not positions:
+            return False
+    return len(relative) in positions
 
 
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
@@ -2044,11 +2061,13 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
             yield "./" + relative
 
     direct = {}
+    ordinary_by_path = {os.path.normpath(meta["fullpath"]): relative for relative, meta in ordinary.items()}
     for relative, meta in ordinary.items():
-        if pattern.fullmatch(relative):
+        if _linked_role_source_matches(pattern, relative):
             for lookup_path in lookup_paths(relative):
-                if os.path.normpath(meta["fullpath"]) != source_for(lookup_path):
-                    direct[lookup_path] = None
+                winner = source_for(lookup_path)
+                if os.path.normpath(meta["fullpath"]) != winner:
+                    direct[lookup_path] = ordinary_by_path.get(winner)
 
     assets, metadata, contents = {}, {}, {}
     visits = 0
@@ -2081,7 +2100,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 relative = os.path.relpath(path, base)
                 if not linked and relative not in ordinary:
                     continue
-                if name.startswith(".") or not pattern.fullmatch(relative):
+                if name.startswith(".") or not _linked_role_source_matches(pattern, relative):
                     continue
                 if relative in ordinary and ordinary[relative]["fullpath"] == os.path.normpath(path):
                     continue
