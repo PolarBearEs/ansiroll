@@ -355,6 +355,17 @@ def test_merged_compile_diagnostics_use_legacy_filename_encoding(monkeypatch, cl
     assert cli._merged_stream_may_be_playbook(stream, path.name)
 
 
+def test_merged_compile_diagnostics_fail_closed_if_sink_cannot_open(monkeypatch, tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("input playbook")
+
+    def exhausted_sink(*args, **kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(cli, "open", exhausted_sink, raising=False)
+    assert cli._merged_stream_may_be_playbook(playbook.stat(), "$ANSIROLL_INPUT")
+
+
 def test_stdout_compile_requires_redirected_output():
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()
@@ -656,6 +667,31 @@ def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path
     assert result.returncode == 2
     assert b"stdout points to input playbook" in result.stderr
     assert playbook.read_bytes() == original
+
+
+def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
+    playbook = tmp_path / "play.yml"
+    destination = tmp_path / "stdout"
+    playbook.write_bytes(b"input playbook")
+    destination.write_bytes(b"")
+
+    def compile_playbook(path, *, on_playbook_open, **kwargs):
+        on_playbook_open(path, playbook.stat())
+        return "pass\n", {"modules": [], "fallback_tasks": []}
+
+    def write_manifest(*args, **kwargs):
+        playbook.unlink()
+        playbook.symlink_to(destination)
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+    monkeypatch.setattr(cli, "_write_stdout_manifest", write_manifest)
+    args = Namespace(playbook=str(playbook), output="-", manifest=str(tmp_path / "manifest.json"),
+                     interpreter="python3", extra_vars=[], vault_password_file=None, tree_shake=False,
+                     freeze_playbook_vars=False, freeze_var=[])
+    with destination.open("ab") as stdout:
+        assert cli._cmd_compile(args, stdout) == 2
+    assert "stdout points to input playbook" in capsys.readouterr().err
+    assert destination.read_bytes() == b""
 
 
 @pytest.mark.parametrize("alias", ["missing", "dangling", "same", "symlink", "hardlink", "replaced"])

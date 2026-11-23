@@ -477,16 +477,16 @@ def _merged_stream_may_be_playbook(stream, playbook):
     if not path.isascii() or "$" in playbook or "$" in path or name.startswith(("~", "'", "\"")):
         # Ansible can emit diagnostics during import. Keep them off this
         # stream until the input's identity is known.
-        with open(os.devnull, "w") as sink, redirect_stderr(sink):
-            try:
+        try:
+            with open(os.devnull, "w") as sink, redirect_stderr(sink):
                 from ansible.parsing.dataloader import DataLoader
                 from .loader import _playbook_read_path
 
                 loader = DataLoader()
                 loader.set_basedir(directory if os.path.isabs(playbook) else os.path.abspath(directory))
                 path = _playbook_read_path(loader, loader.path_dwim(name))
-            except (Exception, SystemExit):
-                return True
+        except (Exception, SystemExit):
+            return True
     source = _try_stat(path)
     return source is not None and os.path.samestat(stream, source)
 
@@ -604,7 +604,9 @@ def _cmd_compile(args, stdout=None):
         else:
             if args.manifest:
                 _write_stdout_manifest(args.manifest, manifest, stdout.fileno(), validate_input=validate_input)
-            stdout.write(source.encode("utf-8"))
+            encoded = source.encode("utf-8")
+            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
+            stdout.write(encoded)
             stdout.flush()
     except (ValueError, _TruncatingReopenError) as ex:
         sys.stderr.write("ansiroll: %s\n" % ex)
