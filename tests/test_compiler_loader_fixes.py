@@ -297,7 +297,8 @@ def test_compile_dynamic_role_source_respects_explicit_templates_prefix(tmp_path
         assert destination.read_text() == "selected template\n"
 
 
-def test_compile_dynamic_role_source_records_duplicate_traversal_target(tmp_path):
+@pytest.mark.parametrize("directory_target", [False, True])
+def test_compile_dynamic_role_source_selects_root_from_traversal_target(tmp_path, directory_target):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
@@ -306,11 +307,15 @@ def test_compile_dynamic_role_source_records_duplicate_traversal_target(tmp_path
 - set_fact: {selection: link/../app}
 - template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
 """, "roles/r/templates/sites/other/app.j2": "earlier traversal target\n",
-        "roles/r/sites/other/app.j2": "later traversal target\n",
         "roles/r/sites/app.j2": "selected template\n"})
     (tmp_path / "roles/r/templates/sites/app.j2").mkdir()
     later = tmp_path / "roles/r/sites"
-    (later / "other/branch").mkdir()
+    (later / "other/branch").mkdir(parents=True)
+    target = later / "other/app.j2"
+    if directory_target:
+        target.mkdir()
+    else:
+        target.write_text("later traversal target\n")
     (later / "link").symlink_to("other/branch", target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"

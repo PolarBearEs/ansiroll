@@ -3760,10 +3760,13 @@ class Runtime:
                 for root in shadowed:
                     directories, aliases, blocked, files = roots[root]
                     path = Runtime._baked_role_path(parts, directories, aliases)
-                    if path in blocked:
+                    if path not in blocked and path not in files:
+                        continue
+                    # The traversed path selects the root. Ansible reads the
+                    # normalized path within that root.
+                    if normalized in blocked:
                         return "\0blocked"
-                    if path in files:
-                        return files.get(normalized) or src
+                    return files.get(normalized) or src
                 return src
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}
