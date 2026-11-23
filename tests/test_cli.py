@@ -1100,6 +1100,62 @@ def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_
     assert json.loads(manifest.read_text()) == data
 
 
+@pytest.mark.parametrize("mode", ["stdout", "file"])
+def test_compile_rechecks_input_after_preparing_manifest_writer(cli_os, tmp_path, capsys, mode):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    source = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(source)
+    original = tmp_path / "original.yml"
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    manifest.touch()
+    writer_fd = None
+    truncate_failed = replaced = False
+
+    def track_manifest_writer(path, flags, *args):
+        nonlocal writer_fd
+        fd = os.open(path, flags, *args)
+        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+            writer_fd = fd
+        return fd
+
+    def cannot_truncate(_size):
+        nonlocal truncate_failed
+        truncate_failed = True
+        raise OSError(errno.EOPNOTSUPP, "standalone truncation unavailable")
+
+    def wrap_writer(fd, mode):
+        file = os.fdopen(fd, mode)
+        if fd == writer_fd:
+            file.truncate = cannot_truncate
+        return file
+
+    def replace_input_on_empty_file_check(fd):
+        nonlocal replaced
+        if fd == writer_fd and truncate_failed and not replaced:
+            playbook.rename(original)
+            playbook.symlink_to(manifest)
+            replaced = True
+        return os.fstat(fd)
+
+    cli_os.open = track_manifest_writer
+    cli_os.fdopen = wrap_writer
+    cli_os.fstat = replace_input_on_empty_file_check
+    if mode == "stdout":
+        args = Namespace(playbook=str(playbook), output="-", manifest=str(manifest),
+                         interpreter="python3", extra_vars=[], vault_password_file=None, tree_shake=False,
+                         freeze_playbook_vars=False, freeze_var=[])
+        with output.open("wb") as stdout:
+            status = cli._cmd_compile(args, stdout)
+    else:
+        status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert status == 2 and replaced
+    assert "manifest path points to input playbook" in capsys.readouterr().err
+    assert manifest.read_bytes() == b""
+    assert original.read_text() == source
+
+
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
 @pytest.mark.parametrize("destination", ["output", "manifest"])
 @pytest.mark.parametrize("unsupported_truncate", [False, True])

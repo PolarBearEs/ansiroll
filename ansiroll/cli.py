@@ -331,6 +331,8 @@ def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None):
             validate_input(info, "manifest path", path)
 
     with _open_compile_destination(path, validate) as fh:
+        if validate_input is not None:
+            validate_input(os.fstat(fh.fileno()), "manifest path", path)
         json.dump(manifest, fh, indent=2)
 
 
@@ -469,6 +471,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
         with _open_compile_destination(
             manifest_path, validate_manifest, release_output=release_output,
         ) as manifest_file:
+            validate_input(os.fstat(manifest_file.fileno()), "manifest path", manifest_path)
             json.dump(manifest, manifest_file, indent=2)
 
 
