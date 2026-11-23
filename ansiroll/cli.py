@@ -204,12 +204,17 @@ def _pin_for_truncate(path, fd, original_error):
         raise _truncation_unavailable(path, original_error) from ex
 
 
-def _open_truncated_destination(path, reference, original_error):
+def _open_truncated_destination(path, reference, original_error, validate):
     fd_path = "/proc/self/fd/%d" % reference
     try:
         os.stat(fd_path)
     except OSError as ex:
         raise _truncation_unavailable(path, original_error) from ex
+    # Following the procfs link can block on the destination filesystem.
+    info = os.fstat(reference)
+    validate(info, None)
+    if not stat.S_ISREG(info.st_mode):
+        raise original_error
     return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
 
 
@@ -312,11 +317,7 @@ def _open_compile_destination(path, validate, *, release_output=None):
                 return
 
         # Reopen the validated inode even if its pathname has since changed.
-        info = os.fstat(reference)
-        validate(info, None)
-        if not stat.S_ISREG(info.st_mode):
-            raise original_error
-        fd = _open_truncated_destination(path, reference, original_error)
+        fd = _open_truncated_destination(path, reference, original_error, validate)
         with os.fdopen(fd, "w") as writer:
             yield writer
 
@@ -488,8 +489,15 @@ def _merged_stream_may_be_playbook(stream, playbook):
                 path = _playbook_read_path(loader, loader.path_dwim(name))
         except (Exception, SystemExit):
             return True
-    source = _try_stat(path)
-    return source is not None and os.path.samestat(stream, source)
+    try:
+        source = os.stat(path)
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeError):
+        # The open stream may still reach the input even if its path cannot
+        # be inspected. Keep diagnostics off it unless we can rule out an alias.
+        return True
+    return os.path.samestat(stream, source)
 
 
 def _cmd_compile_stdout(args):

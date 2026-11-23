@@ -366,6 +366,29 @@ def test_merged_compile_diagnostics_fail_closed_if_sink_cannot_open(monkeypatch,
     assert cli._merged_stream_may_be_playbook(playbook.stat(), "$ANSIROLL_INPUT")
 
 
+@pytest.mark.parametrize(("error", "emits_diagnostic"), [(errno.ENOENT, True), (errno.EACCES, False), (errno.EIO, False)])
+def test_merged_compile_diagnostics_handle_failed_input_stat(monkeypatch, cli_os, tmp_path, capsys,
+                                                       error, emits_diagnostic):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("input playbook")
+    stream = playbook.stat()
+    cli_os.fstat = lambda fd: stream
+    cli_os.isatty = lambda fd: False
+    monkeypatch.setattr(cli, "_prepare_compile_stderr", lambda: None, raising=False)
+
+    def unreadable_input(path):
+        assert path == str(playbook)
+        raise OSError(error, os.strerror(error), path)
+
+    cli_os.stat = unreadable_input
+    assert cli.main(["compile", str(playbook), "-o", "-"], _standalone=True) == 2
+    diagnostic = capsys.readouterr().err
+    if emits_diagnostic:
+        assert "requires separate stdout and stderr" in diagnostic
+    else:
+        assert diagnostic == ""
+
+
 def test_stdout_compile_requires_redirected_output():
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()
@@ -956,6 +979,41 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
     assert len(reopened) == 1
     assert output.read_text() == source
     assert json.loads(manifest.read_text()) == data
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
+                    reason="requires reopening a metadata-only descriptor")
+def test_compile_rechecks_input_after_procfs_lookup(monkeypatch, cli_os, tmp_path, capsys):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    original = "previous output\n"
+    output.write_text(original)
+    replaced = False
+
+    def require_truncate(path, flags, *args, **kwargs):
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY:
+            raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
+        return os.open(path, flags, *args, **kwargs)
+
+    def replace_on_procfs_lookup(path, *args, **kwargs):
+        nonlocal replaced
+        if str(path).startswith("/proc/self/fd/") and not replaced:
+            playbook.rename(tmp_path / "original.yml")
+            playbook.symlink_to(output)
+            replaced = True
+        return os.stat(path, *args, **kwargs)
+
+    cli_os.open = require_truncate
+    cli_os.stat = replace_on_procfs_lookup
+    status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert replaced
+    assert status == 2
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert output.read_text() == original
+    assert not manifest.exists()
 
 
 @pytest.mark.parametrize("through_symlinks", [False, True])
