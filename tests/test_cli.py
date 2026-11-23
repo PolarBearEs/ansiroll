@@ -161,7 +161,8 @@ def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch,
     stream = Namespace(st_rdev=alias_device if alias_fd == 2 else device, st_mode=stat.S_IFCHR)
     monkeypatch.setattr(os, "fstat", lambda fd: stream)
     monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: device)
-    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: 123)
+    monkeypatch.setattr(os, "isatty", lambda fd: True)
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: fd + 123)  # A foreground job switch does not change identity.
     assert cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
 
     def outside_session(fd):
@@ -171,6 +172,13 @@ def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch,
 
     monkeypatch.setattr(os, "tcgetpgrp", outside_session)
     assert not cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+    def no_controlling_session(fd):
+        raise OSError(errno.ENOTTY, "compiler has no controlling session")
+
+    monkeypatch.setattr(os, "tcgetpgrp", no_controlling_session)
+    with pytest.raises(ValueError, match="cannot distinguish terminal for manifest path"):
+        cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux devpts device identities")
@@ -202,6 +210,7 @@ def test_manifest_terminal_preflight_opens_requested_path(monkeypatch):
     monkeypatch.setattr(os, "open", open_terminal)
     monkeypatch.setattr(os, "close", lambda fd: None)
     monkeypatch.setattr(os, "fstat", handles.__getitem__)
+    monkeypatch.setattr(os, "isatty", lambda fd: True)
     monkeypatch.setattr(os, "tcgetpgrp", lambda fd: 123)
     monkeypatch.setattr(cli, "_linux_terminal_device", device)
     assert cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
@@ -212,6 +221,30 @@ def test_manifest_terminal_preflight_opens_requested_path(monkeypatch):
     calls.clear()
     assert not cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
     assert calls == []
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
+def test_manifest_terminal_does_not_probe_unrelated_character_device(monkeypatch):
+    stream = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR)
+    destination = Namespace(st_rdev=os.makedev(10, 130), st_mode=stat.S_IFCHR)
+    monkeypatch.setattr(os, "fstat", lambda fd: stream)
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: os.makedev(136, 1))
+
+    def unexpected_open(*args):
+        pytest.fail("unrelated character device was opened during preflight")
+
+    monkeypatch.setattr(os, "open", unexpected_open)
+    assert not cli._same_manifest_stream("device", destination, 2)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux virtual consoles")
+@pytest.mark.parametrize(("first", "second"), [((4, 0), (5, 0)), ((5, 0), (4, 0))])
+def test_manifest_resolves_aliases_of_the_active_virtual_console(monkeypatch, first, second):
+    destination = Namespace(st_rdev=os.makedev(*first), st_mode=stat.S_IFCHR)
+    stream = Namespace(st_rdev=os.makedev(*second), st_mode=stat.S_IFCHR)
+    monkeypatch.setattr(os, "fstat", lambda fd: stream)
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: os.makedev(4, 1))
+    assert cli._same_manifest_stream("virtual console", destination, 2, destination_fd=6)
 
 
 @pytest.mark.parametrize("destination", ["pipe", "file"])

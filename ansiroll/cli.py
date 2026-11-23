@@ -103,18 +103,29 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
     if not (sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode)):
         return _same_stream(info, stream)
 
-    tty_alias = os.makedev(5, 0)
-    if tty_alias not in (info.st_rdev, stream.st_rdev):
+    tty_aliases = {os.makedev(5, 0), os.makedev(4, 0), os.makedev(5, 1)}  # tty, tty0, console
+    destination_alias = info.st_rdev in tty_aliases
+    stream_alias = stream.st_rdev in tty_aliases
+    if not (destination_alias or stream_alias):
         # Unix98 PTY slave numbers are allocated independently by devpts mounts.
         if info.st_rdev == stream.st_rdev and 136 <= os.major(info.st_rdev) <= 143:
             return os.path.samestat(info, stream)
         return _same_stream(info, stream)
 
-    def foreground_group(terminal):
+    stream_device = _linux_terminal_device(fd) if stream_alias else stream.st_rdev
+    if stream_device is None:
+        return _same_stream(info, stream)
+    if not destination_alias and info.st_rdev != stream_device:
+        return False  # In particular, do not open an unrelated character device.
+    if destination_alias and not stream_alias and not os.isatty(fd):
+        return False
+
+    def controls_terminal(terminal):
         try:
-            return os.tcgetpgrp(terminal)
+            os.tcgetpgrp(terminal)
         except OSError:
-            return None
+            return False
+        return True
 
     with ExitStack() as stack:
         if destination_fd is None:
@@ -126,14 +137,20 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
             opened = os.fstat(destination_fd)
             if not os.path.samestat(info, opened) or not stat.S_ISCHR(opened.st_mode):
                 return False  # The final validation checks the destination actually opened for writing.
-        destination_device = (_linux_terminal_device(destination_fd) if info.st_rdev == tty_alias else info.st_rdev)
-        stream_device = _linux_terminal_device(fd) if stream.st_rdev == tty_alias else stream.st_rdev
-        if destination_device is None or stream_device is None:
+        destination_device = _linux_terminal_device(destination_fd) if destination_alias else info.st_rdev
+        if destination_device is None:
             return _same_stream(info, stream)
         if destination_device != stream_device:
             return False
-        # Linux only returns a slave's foreground group to its controlling session.
-        return foreground_group(destination_fd) == foreground_group(fd)
+        if not 136 <= os.major(destination_device) <= 143:
+            return True
+        # Only the controlling session can query a PTY slave's foreground
+        # group. Use success, since the foreground group itself can change.
+        destination_controlled = controls_terminal(destination_fd)
+        stream_controlled = controls_terminal(fd)
+        if not (destination_controlled or stream_controlled):
+            raise ValueError("cannot distinguish terminal for manifest path %s from a redirected stream" % path)
+        return destination_controlled and stream_controlled
 
 
 def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None):
