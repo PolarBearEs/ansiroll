@@ -562,9 +562,16 @@ def _cmd_compile(args, stdout=None):
     def validate_input(info, name, path):
         if info is None or input_stat is None:
             return
-        for input_info in (input_stat, _try_stat(input_path)):
-            if input_info is not None and os.path.samestat(info, input_info):
-                raise ValueError("%s points to input playbook: %s" % (name, path))
+        if not os.path.samestat(info, input_stat):
+            try:
+                current_input = os.stat(input_path)
+            except FileNotFoundError:
+                return
+            except (OSError, UnicodeError) as ex:
+                raise ValueError("cannot check current input playbook: %s" % ex) from ex
+            if not os.path.samestat(info, current_input):
+                return
+        raise ValueError("%s points to input playbook: %s" % (name, path))
 
     def check_input_destinations():
         if stdout is None:

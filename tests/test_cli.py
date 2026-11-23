@@ -752,6 +752,40 @@ def test_file_compile_checks_input_after_the_other_destination_lookup(monkeypatc
     assert destination.read_bytes() == original
 
 
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
+def test_file_compile_preserves_destination_when_current_input_identity_is_unavailable(
+        cli_os, tmp_path, capsys, error):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    output, manifest = (tmp_path / name for name in ("compiled.py", "manifest.json"))
+    original = b"existing destination\n"
+    output.write_bytes(original)
+    replaced = False
+
+    def replace_input_on_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY and not replaced:
+            playbook.rename(tmp_path / "original.yml")
+            playbook.symlink_to(output)
+            replaced = True
+        return os.open(path, flags, *args, **kwargs)
+
+    def unavailable_input(path, *args, **kwargs):
+        if replaced and os.fsdecode(path) == str(playbook):
+            raise OSError(error, os.strerror(error), path)
+        return os.stat(path, *args, **kwargs)
+
+    cli_os.open = replace_input_on_open
+    cli_os.stat = unavailable_input
+    status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert replaced
+    assert status == 2
+    assert "cannot check current input playbook" in capsys.readouterr().err
+    assert output.read_bytes() == original
+    assert not manifest.exists()
+
+
 @pytest.mark.parametrize("alias", ["missing", "dangling", "same", "symlink", "hardlink", "replaced"])
 def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alias):
     output = tmp_path / "compiled.py"
