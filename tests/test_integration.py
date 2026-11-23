@@ -2025,6 +2025,8 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".get('bad')", "unknown_filter"),
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".values() | first", "unknown_filter"),
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".values() | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested | map('default', 'fallback') | first", "unknown_filter"),
+    ({"bad": "{{ 'value' | unknown_filter }}"}, ".values()", "unknown_filter"),
     ({"nested": ["{{ 'value' | unknown_filter }}"], "ok": "optional"}, ".ok", None),
     ("{{ 1 / 0 }}", "", "division by zero"),
 ])
@@ -2039,6 +2041,8 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
     from ansiroll.loader import _tag_untrusted
 
     make_templar()  # Initialize Ansible's collection loader before parsing.
+    legacy = tuple(map(int, ansible_version.split(".")[:2])) < (2, 19)
+    items_membership = "('ok', 'valid') in item_options.items()" if legacy else "true"
     playbook = tmp_path / "play.yml"
     playbook.write_text("""
 - hosts: localhost
@@ -2077,6 +2081,7 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_TYPED_MISSING: "{{ typed_agent_alias[4] | default('optional') }}"
               SYNC_DATE_KEY: "{{ (dated_agent_alias.keys() | list | first | type_debug) ~ '-' ~ dated_agent_alias.plain }}"
               SYNC_BINARY_KEY: "{{ (dated_agent_alias.keys() | list)[1] | type_debug }}"
+              SYNC_ITEM_CONTAINS: "{{ items_membership }}"
               SYNC_UNDEFINED_ALIAS: "{{ optional_agent_alias is defined }}"
               SYNC_DEFAULT_ALIAS: "{{ optional_agent_alias | default('optional') }}"
               SYNC_UNUSED: "{{ 'skipped' if true else unused_agent_alias }}"
@@ -2086,7 +2091,8 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_EMPTY: "{{ none }}"
             - "{{ ansible_delegated_vars['localhost']['environment'] }}"
             - "{{ file_env }}"
-""".replace("optional_agent_alias |", "optional_agent_alias" + alias_member + " |"))
+""".replace("optional_agent_alias |", "optional_agent_alias" + alias_member + " |")
+       .replace("items_membership", items_membership))
     loader = DataLoader()
     play, = Playbook.load(str(playbook), loader=loader).get_plays()
     original, = play.tasks[0].block
@@ -2105,6 +2111,7 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
         "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": json.loads(sys.argv[4]),
         "typed_agent_alias": "{{ {8080: 'number', '8080': 'text', 3: {3: 'nested'}, 4: missing} }}",
         "dated_agent_alias": "{{ '{2026-01-01: dated, ? !!binary YQ== : binary, plain: regular}' | from_yaml }}",
+        "item_options": {"bad": "{{ 'value' | unknown_filter }}", "ok": "valid"},
         "unused_agent_alias": "{{ missing_value }}"}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
@@ -2120,7 +2127,10 @@ runtime.ANSIBALLZ_CODE = ""
 runtime._INJECTED_HOST = "localhost"
 runtime.agent_main()
 """
-    names = ("file_options", "file_env", "file_list", "typed_agent_alias", "dated_agent_alias", "optional_agent_alias")
+    names = ("file_options", "file_env", "file_list", "typed_agent_alias", "dated_agent_alias")
+    if legacy:
+        names += ("item_options",)
+    names += ("optional_agent_alias",)
     messages = [{"t": "delegate_play_var", "name": name} for name in names]
     messages.append({"t": "delegate_result", "result": {"changed": False}})
     encoded = [json.dumps(message).encode() for message in messages]
@@ -2189,6 +2199,7 @@ runtime.agent_main()
                          "SYNC_TYPED_KEYS": "number-text-nested", "SYNC_TYPED_MISSING": "optional",
                          "SYNC_DATE_KEY": "date-regular",
                          "SYNC_BINARY_KEY": "bytes",
+                         "SYNC_ITEM_CONTAINS": True,
                          "SYNC_DEFAULT_ALIAS": "optional",
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}

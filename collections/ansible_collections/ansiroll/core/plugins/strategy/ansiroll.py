@@ -31,7 +31,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Collection
+from collections.abc import MappingView
 
 DOCUMENTATION = """
     name: ansiroll
@@ -112,25 +112,33 @@ def _legacy_environment_validator(validate, aliases):
     def check_error(member):
         if isinstance(member, _DelegatedMemberError):
             member._fail_with_undefined_error()
+        if type(member) is list and any(isinstance(item, _DelegatedMemberError) for item in member):
+            return CheckedList(member)
         return member
 
-    class CheckedView(Collection):
+    class CheckedList(list):
+        def __iter__(self):
+            for member in super().__iter__():
+                yield check_error(member)
+
+    class CheckedView(MappingView):
         def __init__(self, view, items):
-            self.view = view
+            super().__init__(view)
             self.items = items
 
         def __iter__(self):
-            for member in self.view:
+            for member in self._mapping:
                 if self.items:
                     key, value = member
                     yield key, check_error(value)
                 else:
                     yield check_error(member)
 
-        def __len__(self):
-            return len(self.view)
-
         def __contains__(self, member):
+            if self.items:
+                # dict_items looks up only the requested key before comparing
+                # its value. Iterating would trip errors on unrelated keys.
+                return member in self._mapping
             return any(value == member for value in self)
 
     def check_member(access):
@@ -160,7 +168,7 @@ def _legacy_environment_validator(validate, aliases):
                 if isinstance(value, _LegacyDelegatedValue):
                     value = value.resolve()
                     self._update_unsafe(value)
-                return value
+                return check_error(value)
 
             def call(self, *args, **kwargs):
                 result = check_error(super().call(*args, **kwargs))
