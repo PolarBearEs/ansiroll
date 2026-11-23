@@ -1147,7 +1147,7 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
 
 @pytest.mark.parametrize(("prefix", "linked_first", "dynamic_subdir"), [
     ("", False, False), ("./", True, False), ("", True, False), ("", None, False), ("./", None, False),
-    ("", None, True), ("./", None, True),
+    ("", None, True), ("./", None, True), ("", True, True), ("./", True, True),
 ])
 def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path, prefix, linked_first, dynamic_subdir):
     destination = tmp_path / "rendered.txt"
@@ -1246,6 +1246,41 @@ def test_dynamic_role_template_pattern_handles_many_repeated_literals():
     path = "sites/" + "a" * 100
     assert not _linked_role_source_matches(pattern, path + ".j2")
     assert _linked_role_source_matches(pattern, path + "b.j2")
+
+
+def test_dynamic_role_template_rejects_link_target_replaced_during_open(tmp_path, monkeypatch):
+    from ansiroll import loader
+
+    project = tmp_path / "project"
+    _write(project, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "sites/{{ selection }}.j2", dest: "unused"}
+""", "roles/r/templates/sites/local.j2": "local\n",
+        "shared/app.j2": "allowed\n"})
+    _write(tmp_path, {"outside/app.j2": "outside\n"})
+    shared = project / "shared"
+    (project / "roles/r/templates/sites/alias").symlink_to(shared, target_is_directory=True)
+
+    opened = []
+    open_linked_source = loader._open_linked_role_source
+
+    def replace_target(path):
+        if path == str(shared / "app.j2") and not opened:
+            opened.append(path)
+            shared.rename(project / "moved")
+            shared.symlink_to(tmp_path / "outside", target_is_directory=True)
+        return open_linked_source(path)
+
+    monkeypatch.setattr(loader, "_open_linked_role_source", replace_target)
+    source, _manifest = compile_playbook(str(project / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert opened == [str(shared / "app.j2")]
+    assert set(template["_baked"]) == {"sites/local.j2"}
 
 
 @pytest.mark.parametrize("src", [

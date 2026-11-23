@@ -2032,6 +2032,21 @@ def _linked_role_source_matches(pattern, relative):
     return len(relative) in positions
 
 
+def _open_linked_role_source(resolved_path):
+    """Open a validated real path without following replacement symlinks."""
+    *directories, filename = resolved_path.split(os.sep)[1:]
+    directory_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open(os.sep, directory_flags)
+    try:
+        for directory in directories:
+            child = os.open(directory, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        return os.open(filename, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
     parsed = _linked_role_source_pattern(src)
@@ -2060,7 +2075,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
             # A leading "." changes action-subdir and home-path handling.
             yield "./" + relative
 
-    direct = {}
+    direct, pending = {}, {}
     ordinary_by_path = {os.path.normpath(meta["fullpath"]): relative for relative, meta in ordinary.items()}
     for relative, meta in ordinary.items():
         if _linked_role_source_matches(pattern, relative):
@@ -2068,6 +2083,8 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 winner = source_for(lookup_path)
                 if os.path.normpath(meta["fullpath"]) != winner:
                     direct[lookup_path] = ordinary_by_path.get(winner)
+                    if winner is not None and direct[lookup_path] is None:
+                        pending.setdefault(winner, []).append(lookup_path)
 
     assets, metadata, contents = {}, {}, {}
     visits = 0
@@ -2096,22 +2113,28 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 paths[path] = (ancestors | {target}, linked or os.path.islink(path))
             dirs[:] = children
             for name in sorted(files):
-                path = os.path.join(root, name)
+                path = os.path.normpath(os.path.join(root, name))
                 relative = os.path.relpath(path, base)
-                if not linked and relative not in ordinary:
+                waiting = pending.get(path, ())
+                if name.startswith("."):
                     continue
-                if name.startswith(".") or not _linked_role_source_matches(pattern, relative):
+                matches = linked and _linked_role_source_matches(pattern, relative)
+                if not (waiting or matches):
                     continue
-                if relative in ordinary and ordinary[relative]["fullpath"] == os.path.normpath(path):
+                if relative in ordinary and ordinary[relative]["fullpath"] == path:
                     continue
-                paths_to_bake = [lookup_path for lookup_path in lookup_paths(relative)
-                                 if (linked or (lookup_path in direct and direct[lookup_path] is None))
-                                 and os.path.normpath(path) == source_for(lookup_path)]
-                if not paths_to_bake or not os.path.isfile(path) or not visible(os.path.realpath(path)):
+                paths_to_bake = list(waiting)
+                if matches:
+                    paths_to_bake.extend(lookup_path for lookup_path in lookup_paths(relative)
+                                         if path == source_for(lookup_path))
+                if not paths_to_bake:
+                    continue
+                resolved_path = os.path.realpath(path)
+                if not visible(resolved_path) or not os.path.isfile(resolved_path):
                     continue
                 key = "\0" + paths_to_bake[0]  # Cannot collide with a filesystem pathname.
                 try:
-                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    fd = _open_linked_role_source(resolved_path)
                     try:
                         info = os.fstat(fd)
                         if not stat.S_ISREG(info.st_mode):
