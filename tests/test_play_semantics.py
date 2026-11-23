@@ -1550,13 +1550,14 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
     assert _standalone(tmp_path, []) == expected
 
 
-@pytest.mark.parametrize("use_default", [False, True])
-def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_path, monkeypatch, use_default):
+@pytest.mark.parametrize("default_filter", [None, "default('fallback.yml')", "default('fallback.yml', boolean=true)",
+                                           "default(default_value='fallback.yml')"])
+def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_path, monkeypatch, default_filter):
     from ansiroll.loader import parse_playbook
 
     args = "{'files': ['facts.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile], 'skip': true}"
-    selector = ("query('first_found', %s) | first | default('fallback.yml')" % args
-                if use_default else "lookup('first_found', %s)" % args)
+    selector = ("query('first_found', %s) | first | %s" % (args, default_filter)
+                if default_filter else "lookup('first_found', %s)" % args)
     _write(tmp_path, {
         "files/profiles/dev/facts.yml": "subset: [all]\n",
         "files/profiles/team/prod/facts.yml": "subset: ['!all', '!min']\n",
@@ -1579,7 +1580,7 @@ def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_p
     plays, _actions = parse_playbook(str(tmp_path / "pb.yml"))
     serialized = json.dumps(plays, default=str)
     assert "never_bundle_this" not in serialized
-    assert ("bundled_fallback" in serialized) == use_default
+    assert ("bundled_fallback" in serialized) == bool(default_filter)
     extra = json.dumps({"profile": "team/prod"})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
@@ -1629,6 +1630,45 @@ def test_setup_first_found_matches_core_search_order_for_an_explicit_files_prefi
         """,
     })
     expected = _ansible(tmp_path, [])
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.parametrize("selector", [
+    "lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': ['new.yml']})",
+    pytest.param("lookup('first_found', 'new.yml', paths=['profiles'])",
+                 marks=pytest.mark.skipif(CORE_VERSION < (2, 16), reason="modern keyword option selection")),
+])
+def test_setup_first_found_matches_version_specific_candidate_order(tmp_path, selector):
+    _write(tmp_path, {
+        "profiles/old.yml": "subset: ['!all', '!min']\n",
+        "profiles/new.yml": "subset: ['!all', '!min']\n",
+        "new.yml": "subset: [all]\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars_files: ["{{ %s }}"]
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % selector,
+    })
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
+def test_setup_fact_path_supports_first_found_lookup(tmp_path):
+    _write(tmp_path, {
+        "custom/site.fact": '{"value":"ready"}',
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: ['!all', '!min', local]
+          fact_path: "{{ lookup('first_found', 'custom/site.fact') | dirname }}"
+          tasks:
+            - debug: {msg: "{{ ansible_local.site.value }}"}
+        """,
+    })
+    expected = _ansible(tmp_path, [])
+    assert expected[0] == ['"ready"']
     assert _standalone(tmp_path, []) == expected
 
 

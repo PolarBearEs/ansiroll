@@ -944,11 +944,11 @@ def _vars_file_lookup_failure(error, options, wantlist):
     return [] if wantlist else None
 
 
-def _first_found_vars_file(args, options, ctx):
-    """Resolve setup's controller lookup against the bundled files."""
+def _first_found_setup(args, options, ctx, *, selector):
+    """Replay lookup order using bundled vars files or live setup paths."""
     _fail_on_undef(args)
     _fail_on_undef(options)
-    files = ctx["__ansiroll_selector_files"]
+    exists = ctx["__ansiroll_selector_files"].__contains__ if selector else os.path.exists
     dirs = ctx["__ansiroll_search_dirs"]
     lookup_dirs = ctx.get("__ansiroll_first_found_dirs") or {}
     keyword_supported = _core_at_least(2, 12)
@@ -956,31 +956,58 @@ def _first_found_vars_file(args, options, ctx):
     if not keyword_supported:
         options = {}  # Legacy first_found takes its search options as a dict term.
     keyword_options = options
+    if args and _core_at_least(2, 16) and not _core_at_least(2, 17):
+        options = {}  # Core 2.16 only initializes keyword options without positional terms.
 
     def split(value, separators):
         return [word for part in _flatten_deep([value]) for word in re.split(separators, part)]
 
-    for term in _flatten_deep(args or [options.get("files")]):
-        if isinstance(term, dict):
-            options = term
-            path_options = term
-            names = split(term.get("files"), "[,;]")
-        else:
-            names = split(term, "[,;]")
-            path_options = keyword_options if reset_positional else options
-            if keyword_supported and reset_positional:
+    def collect(terms):
+        nonlocal options
+        paths = []
+        for term in terms:
+            if isinstance(term, (list, tuple)):
+                paths.extend(collect(term))
+                continue
+            if isinstance(term, dict):
+                options = term
+                names = split(options.get("files"), "[,;]")
+                directories = split(options.get("paths"), "[,:;]")
+                if reset_positional and not directories:
+                    paths = names
+                    continue
+            elif term is None:
+                continue
+            elif reset_positional:
+                if not keyword_supported:
+                    paths.append(term)
+                    continue
                 options = keyword_options
-        for directory in split(path_options.get("paths"), "[,:;]") or [""]:
-            for name in names:
-                path = os.path.expanduser(os.path.join(directory, name))
-                search_dirs = lookup_dirs.get("files" if path.split(os.sep)[0] == "files" else "default", dirs)
-                for search_dir in search_dirs:
-                    candidate = os.path.normpath(os.path.join(search_dir, path))
-                    if candidate in files:
-                        return [candidate]
+                names = split(options.get("files"), "[,;]")
+                directories = split(options.get("paths"), "[,:;]")
+                if not directories:
+                    if names:
+                        paths = names
+                    else:
+                        paths.append(term)
+                    continue
+            else:
+                names = split(term, "[,;]")
+                directories = split(options.get("paths"), "[,:;]")
+            paths.extend(os.path.join(directory, name) for directory in directories or [""] for name in names)
+        return paths
+
+    for path in collect(args or [keyword_options.get("files")]):
+        path = os.path.expanduser(path)
+        search_dirs = lookup_dirs.get("files" if path.split(os.sep)[0] == "files" else "default", dirs)
+        for search_dir in search_dirs:
+            candidate = os.path.normpath(os.path.join(search_dir, path))
+            if exists(candidate):
+                return [candidate]
     if options.get("skip"):
         return []
-    raise _VarsFileLookupError("No bundled vars file was found when using first_found.")
+    message = "No bundled vars file was found" if selector else "No file was found"
+    raise _VarsFileLookupError(message + " when using first_found.")
 
 
 def _lookup_values(name, args, kwargs, ctx=None):
@@ -988,8 +1015,8 @@ def _lookup_values(name, args, kwargs, ctx=None):
     selector = "__ansiroll_selector_files" in (ctx or {})
     gather_lookup = selector or (ctx or {}).get("__ansiroll_gather_options", False)
     if (name in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")
-            and selector):
-        return _first_found_vars_file(args, kwargs, ctx)
+            and gather_lookup):
+        return _first_found_setup(args, kwargs, ctx, selector=selector)
     name = name.rsplit(".", 1)[-1]
     if gather_lookup and name in ("file", "pipe"):
         _fail_on_undef(args)
@@ -2894,6 +2921,7 @@ class Runtime:
         play_vars = self._with_deferred_vars_files(play, magic, base=play_base, before_setup=True)
         play_vars = _f_combine(play_vars, exports, self.extra_vars, magic, recursive=merge)
         play_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
+        play_vars["__ansiroll_first_found_dirs"] = scope.get("first_found_dirs")
         play_vars["__ansiroll_gather_options"] = True
         play_ctx = self.ctx(base=play_vars)
 
@@ -2919,6 +2947,7 @@ class Runtime:
         setup_vars.setdefault("ansible_ssh_host", address)
         setup_vars["ansible_search_path"] = scope["search_path"]
         setup_vars["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
+        setup_vars["__ansiroll_first_found_dirs"] = scope.get("first_found_dirs")
         setup_vars["__ansiroll_gather_options"] = True
         return self.ctx(base=setup_vars), play_ctx
 

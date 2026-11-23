@@ -595,8 +595,13 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
     call = parsed.body[0].nodes[0]
     fallbacks = []
     while isinstance(call, nodes.Filter):
-        if call.name in ("default", "d") and call.args and not (call.kwargs or call.dyn_args or call.dyn_kwargs):
-            fallbacks.append(call.args[0])
+        if call.name in ("default", "d") and not (call.dyn_args or call.dyn_kwargs):
+            default_options = {option.key: option.value for option in call.kwargs}
+            if default_options.keys() - {"default_value", "boolean"}:
+                return None
+            fallback = call.args[0] if call.args else default_options.get("default_value")
+            if fallback is not None:
+                fallbacks.append(fallback)
         elif call.name != "first":
             return None
         call = call.node
@@ -657,24 +662,42 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
     kwargs = {option.key: option.value for option in call.kwargs}
     version = tuple(map(int, _fact_schema().split(".")))
     keyword_paths = kwargs.get("paths") if version >= (2, 12) else None
-    groups = []
-    paths = keyword_paths
-    for term in flatten(call.args[1:], "[,;]"):
-        if isinstance(term, nodes.Dict):
-            mapping = {pair.key.value: pair.value for pair in term.items if isinstance(pair.key, nodes.Const)}
-            paths = mapping.get("paths")
-            if "files" in mapping:
-                groups.append((paths, mapping["files"]))
-        else:
-            if version < (2, 16):
+    paths = None if call.args[1:] and version == (2, 16) else keyword_paths
+
+    def collect(terms):
+        nonlocal paths
+        groups = []
+        for term in terms:
+            if isinstance(term, (nodes.List, nodes.Tuple)):
+                groups.extend(collect(term.items))
+                continue
+            if isinstance(term, nodes.Dict):
+                mapping = {pair.key.value: pair.value for pair in term.items if isinstance(pair.key, nodes.Const)}
+                paths = mapping.get("paths")
+                files = mapping.get("files")
+            elif version < (2, 16):
                 paths = keyword_paths
-            groups.append((paths, term))
-    if version >= (2, 12) and not groups and "files" in kwargs:
-        groups.append((paths, kwargs["files"]))
+                files = kwargs.get("files") if version >= (2, 12) else None
+                if files is None and paths is None:
+                    groups.append(([], term))
+                    continue
+            else:
+                files = term
+            if files is None:
+                continue
+            dir_terms = list(flatten([paths], "[,:;]", preserve_empty=True)) if paths is not None else []
+            if version < (2, 16) and not dir_terms:
+                groups.clear()
+            groups.append((dir_terms, files))
+        return groups
+
+    groups = collect(call.args[1:])
+    if version >= (2, 12) and not call.args[1:] and "files" in kwargs:
+        dir_terms = list(flatten([paths], "[,:;]", preserve_empty=True)) if paths is not None else []
+        groups.append((dir_terms, kwargs["files"]))
 
     patterns = set()
-    for paths, files in groups:
-        dir_terms = list(flatten([paths], "[,:;]", preserve_empty=True)) if paths is not None else []
+    for dir_terms, files in groups:
         directories = [path_pattern(term, directory=True) for term in dir_terms] or [(False, "")]
         filenames = [path_pattern(term, directory=False) for term in flatten([files], "[,;]")]
         if None in directories or None in filenames:
