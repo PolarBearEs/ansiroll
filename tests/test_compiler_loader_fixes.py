@@ -1220,9 +1220,10 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
     assert not destination.exists()
 
 
-def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_empty(tmp_path):
+@pytest.mark.parametrize("name", ["generated", ".generated"])
+def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_empty(tmp_path, name):
     project = tmp_path / "project"
-    generated = project / "sites/alias/generated.j2"
+    generated = project / ("sites/alias/%s.j2" % name)
     destination = project / "output.txt"
     _write(project, {"pb.yml": """
 - hosts: localhost
@@ -1230,9 +1231,9 @@ def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_e
   roles: [r]
 """, "roles/r/tasks/main.yml": """
 - copy: {content: generated, dest: "%s"}
-- set_fact: {selection: alias/generated}
+- set_fact: {selection: alias/%s}
 - template: {src: "sites/{{ selection }}.j2", dest: "%s"}
-""" % (generated, destination), "roles/r/templates/sites/local.j2": "ordinary template\n"})
+""" % (generated, name, destination), "roles/r/templates/sites/local.j2": "ordinary template\n"})
     generated.parent.mkdir(parents=True)
     excluded = tmp_path / "excluded"
     excluded.mkdir()
