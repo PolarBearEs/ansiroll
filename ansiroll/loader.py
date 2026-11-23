@@ -2113,20 +2113,21 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 paths[path] = (ancestors | {target}, linked or os.path.islink(path))
             dirs[:] = children
             for name in sorted(files):
-                path = os.path.normpath(os.path.join(root, name))
-                relative = os.path.relpath(path, base)
-                waiting = pending.get(path, ())
                 if name.startswith("."):
                     continue
-                matches = linked and _linked_role_source_matches(pattern, relative)
-                if not (waiting or matches):
-                    continue
+                path = os.path.normpath(os.path.join(root, name))
+                relative = os.path.relpath(path, base)
                 if relative in ordinary and ordinary[relative]["fullpath"] == path:
                     continue
-                paths_to_bake = list(waiting)
-                if matches:
-                    paths_to_bake.extend(lookup_path for lookup_path in lookup_paths(relative)
-                                         if path == source_for(lookup_path))
+                paths_to_bake = list(pending.get(path, ()))
+                if linked:
+                    spellings = [relative]
+                    if is_subdir:
+                        spellings.append(os.path.join(subdir, relative))
+                    for spelling in spellings:
+                        if _linked_role_source_matches(pattern, spelling):
+                            paths_to_bake.extend(lookup_path for lookup_path in lookup_paths(spelling)
+                                                 if path == source_for(lookup_path))
                 if not paths_to_bake:
                     continue
                 resolved_path = os.path.realpath(path)

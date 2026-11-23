@@ -1198,6 +1198,28 @@ def test_dynamic_role_template_preserves_dot_prefixed_tilde(tmp_path):
     assert destination.read_text() == "from the role\n"
 
 
+@pytest.mark.parametrize("prefix", ["", "./"])
+def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tmp_path, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: "%stemplates/sites/alias/app"}
+- template: {src: "{{ selection }}.j2", dest: "output.txt"}
+""" % prefix, "roles/r/templates/shared/app.j2": "linked source\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir(parents=True)
+    (sites / "alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked source\n"
+
+
 @pytest.mark.parametrize(("src", "matched", "excluded"), [
     ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
      "report-alias/app.j2", "alias/other.j2"),
