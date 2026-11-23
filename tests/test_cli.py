@@ -93,7 +93,16 @@ import termios
 same_terminal, first, second = map(int, sys.argv[1:])
 fcntl.ioctl(first, termios.TIOCSCTTY, 0)
 cli = '''
+import errno
+import os
 from ansiroll import cli
+
+open_fd = os.open
+def only_writable_tty(path, flags, *args, **kwargs):
+    if path == '/dev/tty' and flags & os.O_ACCMODE == os.O_RDONLY and not flags & getattr(os, 'O_PATH', 0):
+        raise PermissionError(errno.EACCES, 'read access declined', path)
+    return open_fd(path, flags, *args, **kwargs)
+os.open = only_writable_tty
 cli.compile_playbook = lambda *a, **k: ('pass', {'modules': [], 'fallback_tasks': []})
 raise SystemExit(cli.entrypoint())
 '''
@@ -126,6 +135,37 @@ raise SystemExit(result.returncode)
     finally:
         for fd in (first_read, first_write, second_read, second_write):
             os.close(fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal ioctl encodings")
+@pytest.mark.parametrize(("machine", "expected"), [("x86_64", 0x80045432), ("ppc64le", 0x40045432)])
+def test_linux_terminal_uses_native_ioctl_encoding(monkeypatch, machine, expected):
+    import fcntl
+    import struct
+
+    def ioctl(fd, request, data):
+        assert fd == 3 and request == expected and data == bytes(4)
+        return struct.pack("I", 1056)
+
+    monkeypatch.setattr(os, "uname", lambda: Namespace(machine=machine))
+    monkeypatch.setattr(fcntl, "ioctl", ioctl)
+    assert cli._linux_terminal_device(3) == 1056
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux devpts device identities")
+def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch):
+    device = os.makedev(136, 5)
+    destination = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR)
+    monkeypatch.setattr(os, "fstat", lambda fd: Namespace(st_rdev=device, st_mode=stat.S_IFCHR))
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: device)
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: 123)
+    assert cli._same_manifest_stream(destination, 2, destination_fd=6)
+
+    def outside_session(fd):
+        raise OSError(errno.ENOTTY, "terminal is outside this session")
+
+    monkeypatch.setattr(os, "tcgetpgrp", outside_session)
+    assert not cli._same_manifest_stream(destination, 2, destination_fd=6)
 
 
 @pytest.mark.parametrize("destination", ["pipe", "file"])
