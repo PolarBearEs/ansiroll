@@ -2049,8 +2049,8 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     try:
                         fd = _open_role_source(full)
                     except OSError as ex:
-                        # A socket can reject open before fstat is possible.
-                        mode = _role_source_mode(full) if ex.errno == errno.ENXIO else None
+                        # A replacement special file can fail open before fstat.
+                        mode = _role_source_mode(full) if ex.errno in (errno.ENXIO, errno.EACCES) else None
                         if mode is None or stat.S_ISREG(mode):
                             raise
                     else:

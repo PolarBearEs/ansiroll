@@ -146,8 +146,9 @@ def test_compile_dynamic_role_sources_skips_unused_fifos(tmp_path):
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
-@pytest.mark.parametrize("replacement", ["fifo", "directory", "socket"])
+@pytest.mark.parametrize("replacement", ["fifo", "denied-fifo", "directory", "socket"])
 def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, replacement):
+    import errno
     import socket
     from types import SimpleNamespace
 
@@ -162,9 +163,10 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
     open_fd = os.open
     opened = []
     if replacement == "socket":
-        with socket.socket(socket.AF_UNIX) as listener:
-            socket_path = str(target.with_name("s"))
-            listener.bind(socket_path)
+        socket_path = target.with_name("s")
+        with monkeypatch.context() as patch, socket.socket(socket.AF_UNIX) as listener:
+            patch.chdir(socket_path.parent)
+            listener.bind(socket_path.name)
 
     def swap_then_open(path, flags):
         if path == str(target):
@@ -172,6 +174,9 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
             target.unlink()
             if replacement == "fifo":
                 os.mkfifo(target)
+            elif replacement == "denied-fifo":
+                os.mkfifo(target, mode=0)
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
             elif replacement == "socket":
                 os.rename(socket_path, path)
             else:
@@ -193,7 +198,7 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
         Runtime({}, "", {})._asset_text(node["_baked"][direct])
     traversed = Runtime._baked_source_key(node, "sites/branch/../swap.j2")
     assert node["_baked"][traversed] == "later template\n"
-    if replacement == "socket":
+    if replacement in ("socket", "denied-fifo"):
         assert not opened
     else:
         assert len(opened) == 1
