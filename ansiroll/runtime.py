@@ -944,11 +944,33 @@ def _vars_file_lookup_failure(error, options, wantlist):
     return [] if wantlist else None
 
 
+def _bundled_vars_file_path(path, files, aliases):
+    for _ in range(40):
+        if path in files:
+            return path
+        if not aliases:
+            break
+        prefix = os.path.dirname(path)
+        while prefix not in aliases and os.path.dirname(prefix) != prefix:
+            prefix = os.path.dirname(prefix)
+        if prefix not in aliases:
+            break
+        path = os.path.join(aliases[prefix], os.path.relpath(path, prefix))
+    return None
+
+
 def _first_found_setup(args, options, ctx, *, selector):
     """Replay lookup order using bundled vars files or live setup paths."""
     _fail_on_undef(args)
     _fail_on_undef(options)
-    exists = ctx["__ansiroll_selector_files"].__contains__ if selector else os.path.exists
+    if selector:
+        files = ctx["__ansiroll_selector_files"]
+        aliases = ctx.get("__ansiroll_first_found_aliases")
+
+        def exists(path):
+            return _bundled_vars_file_path(path, files, aliases) is not None
+    else:
+        exists = os.path.exists
     dirs = ctx["__ansiroll_search_dirs"]
     lookup_dirs = ctx.get("__ansiroll_first_found_dirs") or {}
     keyword_supported = _core_at_least(2, 12)
@@ -2825,12 +2847,14 @@ class Runtime:
                 play_vars = _f_combine(play_vars, *values, recursive=merge)
                 continue
             variables = _f_combine(base, play_vars, self.extra_vars, recursive=merge)
+            aliases = entry.get("first_found_aliases") if before_setup else None
             if scope:
                 variables = _f_combine(variables, gather_magic, recursive=merge)
                 variables["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
                 if before_setup:
                     variables["__ansiroll_selector_files"] = entry["files"]
                     variables["__ansiroll_first_found_dirs"] = scope.get("first_found_dirs")
+                    variables["__ansiroll_first_found_aliases"] = aliases
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             lookup_replays = entry.get("lookup_replays", {}) if before_setup else {}
@@ -2868,9 +2892,11 @@ class Runtime:
                         if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
-                found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
-                if found:
-                    selected = entry["files"][found[0]]
+                found = next((found for path in candidates
+                              if (found := _bundled_vars_file_path(os.path.normpath(path), entry["files"], aliases))
+                              is not None), None)
+                if found is not None:
+                    selected = entry["files"][found]
                     if isinstance(selected, dict):
                         raise VarsFilesError(selected["__ansiroll_vars_file_error__"], selected.get("rc", 1))
                     break

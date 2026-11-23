@@ -652,7 +652,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         for index, part in enumerate(literals):
             if part is not None:
                 pattern.append(escape(part))
-            elif (directory and index > 0 and (literals[index - 1] or "").endswith(os.sep)
+            elif (directory and (index == 0 or (literals[index - 1] or "").endswith(os.sep))
                   and (index == len(literals) - 1 or (literals[index + 1] or "").startswith(os.sep))):
                 pattern.append("**")
             else:
@@ -727,7 +727,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
     return patterns
 
 
-def _modeled_first_found_files(candidates):
+def _modeled_first_found_files(candidates, aliases):
     from fnmatch import fnmatchcase
     from pathlib import Path
 
@@ -756,16 +756,17 @@ def _modeled_first_found_files(candidates):
                 if not (resolved == real_base or real_base in resolved.parents):
                     continue
                 if recursive and child.is_symlink():
-                    # A recursive component may follow a link to an ancestor once.
-                    # Explicit components already limit how often a link is visited.
+                    # The first traversal discovers the files. On cycles, retain
+                    # the equivalent prefix for concrete paths rendered at runtime.
                     link = (directory.resolve(), child.name, index)
                     if link in links:
+                        aliases[os.path.normpath(child)] = links[link]
                         continue
-                    yield from walk(child, index, links | {link})
+                    yield from walk(child, index, {**links, link: os.path.normpath(child)})
                 else:
                     yield from walk(child, index if recursive else index + 1, links)
 
-        yield from walk(base, 0, frozenset())
+        yield from walk(base, 0, {})
 
     def matches_filename(filename, relative):
         if fnmatchcase(relative, filename.replace("\0", "*")):
@@ -837,13 +838,14 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         candidates = {}
+        aliases = {}
         unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
             first_found = setup and "first_found" in name
             if first_found:
                 lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs, dirs, subdir)
                 if lookup_candidates is not None:
-                    candidates.update((found, True) for found in _modeled_first_found_files(lookup_candidates))
+                    candidates.update((found, True) for found in _modeled_first_found_files(lookup_candidates, aliases))
                     continue
             # A legacy bare expression can still select a file inside vars/
             # via an absolute path returned by the controller lookup.
@@ -870,6 +872,8 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                                              or path in lookup_patterns or not _is_templated(name))
         files = {path: _bundled_vars_file(play, path, allow_lists) for path, allow_lists in candidates.items()}
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
+        if aliases:
+            entry["first_found_aliases"] = aliases
         if unmodeled:
             entry["unmodeled"] = unmodeled
         deferred.append(entry)

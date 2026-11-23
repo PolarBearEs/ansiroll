@@ -1707,7 +1707,7 @@ def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatc
     assert _standalone(tmp_path, []) == expected
 
 
-@pytest.mark.parametrize("team", ["org", "current/org"])
+@pytest.mark.parametrize("team", ["org", "current/org", "current/current/current/org"])
 def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path, monkeypatch, team):
     _write(tmp_path, {
         "vars/dev/profiles/prod.yml": "subset: [all]\n",
@@ -1728,6 +1728,28 @@ def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path,
     (tmp_path / "vars/shared/cycle").symlink_to("..", target_is_directory=True)
     (tmp_path / "vars/current").symlink_to(".", target_is_directory=True)
     extra = json.dumps({"team": team})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+def test_setup_first_found_discovers_nested_leading_search_path(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "dev/settings/facts.yml": "subset: [all]\n",
+        "team/prod/settings/facts.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': ['facts.yml'], 'paths': [profile ~ '/settings']}) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    extra = json.dumps({"profile": "team/prod"})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
