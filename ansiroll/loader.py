@@ -364,6 +364,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             "magic": _tag_untrusted({key: magic[key] for key in names if key in magic}),
             "search_path": _raw_search_path(play, basedir),
             "search_dirs": _search_dirs(play, basedir, "files"),
+            "first_found_dirs": _first_found_search_dirs(play, basedir),
             "connection_defaults": connection_defaults,
         }
         if gather_vars_files:
@@ -582,118 +583,102 @@ def _selector_depends_only_on_lookup(selector):
     return parsed is not None and stable(parsed)
 
 
-def _first_found_candidate_patterns(selector, basedir):
-    """Infer lookup directories and narrowly scoped globs for runtime profiles."""
+def _first_found_candidate_patterns(selector, basedir, search_dirs):
+    """Pair modeled first_found directory terms with their filename terms."""
     from glob import escape
-
     from jinja2 import nodes
 
     parsed = _selector_ast(selector)
-    if parsed is None:
-        return set(), set(), None
-    directories = set()
-    file_patterns = set()
-    exact_names = None
-    expression = None
-    if len(parsed.body) == 1 and isinstance(parsed.body[0], nodes.Output) and len(parsed.body[0].nodes) == 1:
-        expression = parsed.body[0].nodes[0]
-        if isinstance(expression, nodes.Filter) and expression.name == "first":
-            expression = expression.node
+    if (parsed is None or len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output)
+            or len(parsed.body[0].nodes) != 1):
+        return None
+    call = parsed.body[0].nodes[0]
+    if isinstance(call, nodes.Filter) and call.name == "first":
+        call = call.node
+    if (not isinstance(call, nodes.Call) or not isinstance(call.node, nodes.Name)
+            or call.node.name not in ("lookup", "query", "q") or call.dyn_args or call.dyn_kwargs
+            or not call.args or not isinstance(call.args[0], nodes.Const)
+            or call.args[0].value not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")):
+        return None
 
-    def concat_parts(argument):
-        if isinstance(argument, nodes.Concat):
-            return argument.nodes
-        if isinstance(argument, nodes.Add):
-            return concat_parts(argument.left) + concat_parts(argument.right)
-        return [argument]
+    def flatten(terms, separators):
+        for term in terms:
+            if isinstance(term, (nodes.List, nodes.Tuple)):
+                yield from flatten(term.items, separators)
+            elif isinstance(term, nodes.Const) and isinstance(term.value, str):
+                yield from (nodes.Const(part) for part in re.split(separators, term.value) if part)
+            else:
+                yield term
 
-    def literal_filenames(argument):
-        if isinstance(argument, (nodes.List, nodes.Tuple)):
-            names = [literal_filenames(item) for item in argument.items]
-            return None if None in names else [name for group in names for name in group]
-        if isinstance(argument, nodes.Dict):
-            options = {pair.key.value: pair.value for pair in argument.items if isinstance(pair.key, nodes.Const)}
-            return literal_filenames(options.get("files"))
-        if not isinstance(argument, nodes.Const) or not isinstance(argument.value, str):
-            return None
-        names = [os.path.normpath(name) for name in re.split("[,;]", argument.value) if name]
-        if any(os.path.isabs(name) or name.split(os.sep)[0] in ("..", "~") for name in names):
-            return None
-        return names
+    def concat_parts(term):
+        if isinstance(term, nodes.Concat):
+            return term.nodes
+        if isinstance(term, nodes.Add):
+            return concat_parts(term.left) + concat_parts(term.right)
+        return [term]
 
-    def add_playbook_paths(argument, filenames):
-        if isinstance(argument, (nodes.List, nodes.Tuple)):
-            for item in argument.items:
-                add_playbook_paths(item, filenames)
-            return
-        root, *suffix = concat_parts(argument)
-        if not isinstance(root, nodes.Name) or root.name != "playbook_dir" or not suffix:
-            return
-        prefix = suffix[0]
-        if not isinstance(prefix, nodes.Const) or not isinstance(prefix.value, str) or not prefix.value.startswith(os.sep):
-            return
-        parts = []
-        for part in suffix:
+    def path_pattern(term, *, directory):
+        parts = concat_parts(term)
+        anchored = isinstance(parts[0], nodes.Name) and parts[0].name == "playbook_dir"
+        if anchored:
+            parts = parts[1:]
+        literals = []
+        for part in parts:
             if isinstance(part, nodes.Const) and isinstance(part.value, str):
                 if part.value:
-                    parts.append(part.value)
+                    literals.append(part.value)
             elif isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem)):
-                parts.append(None)
+                literals.append(None)
             else:
-                return
-        if None not in parts:
-            relative = os.path.normpath("".join(parts).lstrip(os.sep))
-            if relative.split(os.sep)[0] != "..":
-                directories.add(os.path.join(escape(basedir), escape(relative)))
-            return
-        if not filenames or any(".." in part.split(os.sep) for part in parts if part is not None):
-            return
-        # A whole dynamic path segment may name several nested directories.
+                return None
+        first = literals[0] if literals else ""
+        if (anchored and literals and (first is None or not first.startswith(os.sep))
+                or not anchored and first and first.startswith((os.sep, "~"))
+                or any(".." in part.split(os.sep) for part in literals if part is not None)
+                or literals and all(part is None for part in literals)):
+            return None
+
         pattern = []
-        for index, part in enumerate(parts):
+        for index, part in enumerate(literals):
             if part is not None:
                 pattern.append(escape(part))
-            elif (index > 0 and (parts[index - 1] or "").endswith(os.sep)
-                  and (index == len(parts) - 1 or (parts[index + 1] or "").startswith(os.sep))):
+            elif (directory and index > 0 and (literals[index - 1] or "").endswith(os.sep)
+                  and (index == len(literals) - 1 or (literals[index + 1] or "").startswith(os.sep))):
                 pattern.append("**")
             elif not pattern or pattern[-1] != "*":
                 pattern.append("*")
-        relative = "".join(pattern).lstrip(os.sep)
-        file_patterns.update(os.path.join(relative, escape(name)) for name in filenames)
+        return anchored, "".join(pattern).lstrip(os.sep)
 
-    def add_literals(argument, *, paths=False, filenames=()):
-        if paths:
-            add_playbook_paths(argument, filenames)
-        constants = (argument,) if isinstance(argument, nodes.Const) else argument.find_all(nodes.Const)
-        for literal in constants:
-            if not isinstance(literal.value, str):
-                continue
-            for value in re.split("[,:;]" if paths else "[,;]", literal.value):
-                directory = os.path.normpath(value if paths else os.path.dirname(value))
-                if not os.path.isabs(directory) and directory.split(os.sep)[0] not in ("..", "~"):
-                    directories.add(escape(directory))
+    kwargs = {option.key: option.value for option in call.kwargs}
+    groups = []
+    paths = kwargs.get("paths")
+    for term in flatten(call.args[1:], "[,;]"):
+        if isinstance(term, nodes.Dict):
+            mapping = {pair.key.value: pair.value for pair in term.items if isinstance(pair.key, nodes.Const)}
+            paths = mapping.get("paths")
+            if "files" in mapping:
+                groups.append((paths, mapping["files"]))
+        else:
+            groups.append((paths, term))
+    if not groups and "files" in kwargs:
+        groups.append((paths, kwargs["files"]))
 
-    for call in parsed.find_all(nodes.Call):
-        if (not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q")
-                or not call.args or not isinstance(call.args[0], nodes.Const)
-                or call.args[0].value not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")):
-            continue
-        for argument in call.args[1:]:
-            add_literals(argument)
-            mappings = (argument,) if isinstance(argument, nodes.Dict) else argument.find_all(nodes.Dict)
-            for mapping in mappings:
-                options = {pair.key.value: pair.value for pair in mapping.items if isinstance(pair.key, nodes.Const)}
-                if "paths" in options:
-                    add_literals(options["paths"], paths=True, filenames=literal_filenames(options.get("files")))
-        keyword_files = next((option.value for option in call.kwargs if option.key == "files"), None)
-        terms = call.args[1:] + ([keyword_files] if keyword_files is not None else [])
-        term_names = [literal_filenames(term) for term in terms]
-        filenames = [name for names in term_names if names for name in names]
-        if expression is call and filenames and None not in term_names and not (call.dyn_args or call.dyn_kwargs):
-            exact_names = tuple(os.sep + name for name in filenames)
-        for option in call.kwargs:
-            add_literals(option.value, paths=option.key == "paths", filenames=filenames)
-    return directories, file_patterns, exact_names
+    patterns = set()
+    for paths, files in groups:
+        dir_terms = list(flatten([paths], "[,:;]")) if paths is not None else []
+        directories = [path_pattern(term, directory=True) for term in dir_terms] or [(False, "")]
+        filenames = [path_pattern(term, directory=False) for term in flatten([files], "[,;]")]
+        if None in directories or None in filenames:
+            return None
+        for absolute_dir, directory in directories:
+            for absolute_file, filename in filenames:
+                if absolute_file:
+                    patterns.add((basedir, filename))
+                    continue
+                relative = os.path.join(directory, filename)
+                roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
+                patterns.update((root, relative) for root in roots)
+    return patterns
 
 
 def _deferred_vars_files(play, basedir, entries, *, setup=False):
@@ -706,6 +691,7 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
     filenames and in the play's vars search directories.
     """
     import glob
+    from pathlib import Path
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
@@ -713,18 +699,29 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
     vars_dirs = tuple(os.path.normcase(os.path.realpath(os.path.join(d, "vars"))) + os.sep for d in dirs)
+    first_found_dirs = _first_found_search_dirs(play, basedir) if setup else None
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         candidates = {}
         unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
+            first_found = setup and "first_found" in name
+            if first_found:
+                lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs)
+                if lookup_candidates is not None:
+                    for root, file_pattern in sorted(lookup_candidates):
+                        base = Path(root)
+                        real_base = base.resolve()
+                        for found in base.glob(file_pattern):
+                            if found.is_file() and real_base in found.resolve().parents:
+                                candidates[os.path.normpath(found)] = True
+                    continue
             # A legacy bare expression can still select a file inside vars/
             # via an absolute path returned by the controller lookup.
-            candidate_subdir = subdir or ("vars" if setup and "first_found" in name else None)
+            candidate_subdir = subdir or ("vars" if first_found else None)
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
             lookup_patterns = set()
-            exact_names = None
             if name.startswith(os.path.sep):
                 patterns = [pattern]
             else:
@@ -733,24 +730,12 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                     if candidate_subdir and name.split("/")[0] != candidate_subdir:
                         patterns.append(os.path.join(glob.escape(d), candidate_subdir, pattern))
                     patterns.append(os.path.join(glob.escape(d), pattern))
-                if setup and "first_found" in name:
-                    from pathlib import Path
-
-                    path_patterns, file_patterns, exact_names = _first_found_candidate_patterns(name, basedir)
-                    lookup_patterns = {os.path.join(glob.escape(d), directory, pattern)
-                                       for d in _search_dirs(play, basedir, "files") for directory in path_patterns | {"."}}
+                if first_found:
+                    lookup_patterns = {os.path.join(glob.escape(d), pattern) for d in first_found_dirs["default"]}
                     patterns.extend(sorted(lookup_patterns))
-                    base = Path(basedir)
-                    real_base = base.resolve()
-                    for file_pattern in sorted(file_patterns):
-                        for found in base.glob(file_pattern):
-                            if found.is_file() and real_base in found.resolve().parents:
-                                candidates[os.path.normpath(found)] = True
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
-                    if exact_names and not found.endswith(exact_names):
-                        continue
                     if os.path.isfile(found):
                         in_vars_dir = os.path.normcase(os.path.realpath(found)).startswith(vars_dirs)
                         candidates[found] = (candidates.get(found, False) or in_vars_dir
@@ -2259,7 +2244,17 @@ def _raw_search_path(task, basedir):
     return stack or [basedir]
 
 
-def _search_dirs(task, basedir, subdir, tagged=False):
+def _first_found_search_dirs(play, basedir):
+    version = tuple(map(int, _fact_schema().split(".")))
+    # Core 2.19–2.20 passes None for direct lookups, which DataLoader converts to 'None'.
+    subdir = "None" if (2, 19) <= version < (2, 21) else "files"
+    return {
+        "default": _search_dirs(play, basedir, subdir),
+        "files": _search_dirs(play, basedir, subdir, skip_subdir=version >= (2, 21)),
+    }
+
+
+def _search_dirs(task, basedir, subdir, tagged=False, *, skip_subdir=False):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
     a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
     call it: each task search path (role-aware), then the loader basedir.
@@ -2289,13 +2284,15 @@ def _search_dirs(task, basedir, subdir, tagged=False):
         if is_role and pb_base_dir.endswith("/tasks"):
             dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True))
             dirs.append((pb_base_dir, False))
-        dirs.append((os.path.join(upath, subdir), True))
+        if not skip_subdir:
+            dirs.append((os.path.join(upath, subdir), True))
         dirs.append((upath, False))
     try:
         base = loader.get_basedir()
     except Exception:
         base = basedir
-    dirs.append((os.path.join(base, subdir), True))
+    if not skip_subdir:
+        dirs.append((os.path.join(base, subdir), True))
     dirs.append((base, False))
     return dirs if tagged else [d for d, _ in dirs]
 

@@ -1511,6 +1511,7 @@ def test_setup_pipe_option_survives_artifact_relocation(tmp_path):
     "lookup('first_found', 'profiles/' ~ profile ~ '.yml')",
     "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': ['profiles']})",
     "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': [playbook_dir ~ '/files/profiles']})",
+    "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile]})",
     "lookup('first_found', {'files': ['facts.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile]})",
     "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
 ])
@@ -1524,6 +1525,12 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
         "files/profiles/prod.yml": "- subset: ['!all', '!min']\n",
         "files/profiles/dev/facts.yml": "subset: [all]\n",
         "files/profiles/prod/facts.yml": "- subset: ['!all', '!min']\n",
+        "files/profiles/dev/dev.yml": "subset: [all]\n",
+        "files/profiles/prod/prod.yml": "- subset: ['!all', '!min']\n",
+        "None/dev.yml": "subset: [all]\n",
+        "None/prod.yml": "subset: ['!all', '!min']\n",
+        "None/profiles/dev.yml": "subset: [all]\n",
+        "None/profiles/prod.yml": "subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
@@ -1551,6 +1558,8 @@ def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_p
         "files/profiles/team/prod/facts.yml": "subset: ['!all', '!min']\n",
         "files/profiles/team/prod/unrelated.yml": "unrelated_value: never_bundle_this\n",
         "files/unrelated.yml": "another_value: never_bundle_this_either\n",
+        "files/facts.yml": "unrelated_lookup_file: never_bundle_this_later\n",
+        "vars/facts.yml": "unrelated_vars_file: never_bundle_this_again\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
@@ -1571,10 +1580,29 @@ def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_p
     assert _standalone(tmp_path, []) == expected
 
 
+def test_setup_first_found_matches_core_search_order_for_an_explicit_files_prefix(tmp_path):
+    _write(tmp_path, {
+        "files/config.yml": "subset: ['!all', '!min']\n",
+        "files/files/config.yml": "subset: [all]\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars_files:
+            - "{{ lookup('first_found', 'files/config.yml') }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    expected = _ansible(tmp_path, [])
+    assert _standalone(tmp_path, []) == expected
+
+
 @pytest.mark.parametrize("skip", [False, True])
 def test_setup_first_found_respects_missing_file_policy(tmp_path, monkeypatch, skip):
     _write(tmp_path, {
         "files/dev.yml": "subset: [all]",
+        "None/dev.yml": "subset: [all]",
         "files/fallback.yml": "subset: ['!all', '!min']",
         "pb.yml": """
         - hosts: localhost
@@ -1601,6 +1629,7 @@ def test_setup_first_found_respects_missing_file_policy(tmp_path, monkeypatch, s
 def test_setup_rejects_empty_first_found_lookup_as_vars_file(tmp_path, monkeypatch):
     _write(tmp_path, {
         "files/dev.yml": "subset: [all]",
+        "None/dev.yml": "subset: [all]",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true

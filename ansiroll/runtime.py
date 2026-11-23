@@ -69,7 +69,7 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs"}
+                "__ansiroll_search_dirs", "__ansiroll_first_found_dirs"}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -950,6 +950,7 @@ def _first_found_vars_file(args, options, ctx):
     _fail_on_undef(options)
     files = ctx["__ansiroll_selector_files"]
     dirs = ctx["__ansiroll_search_dirs"]
+    lookup_dirs = ctx.get("__ansiroll_first_found_dirs") or {}
     if not _core_at_least(2, 12):
         options = {}  # Legacy first_found takes its search options as a dict term.
 
@@ -965,7 +966,8 @@ def _first_found_vars_file(args, options, ctx):
         for directory in split(options.get("paths"), "[,:;]") or [""]:
             for name in names:
                 path = os.path.expanduser(os.path.join(directory, name))
-                for search_dir in dirs:
+                search_dirs = lookup_dirs.get("files" if path.split(os.sep)[0] == "files" else "default", dirs)
+                for search_dir in search_dirs:
                     candidate = os.path.normpath(os.path.join(search_dir, path))
                     if candidate in files:
                         return [candidate]
@@ -2784,6 +2786,7 @@ class Runtime:
                 variables["__ansiroll_search_dirs"] = scope.get("search_dirs") or []
                 if before_setup:
                     variables["__ansiroll_selector_files"] = entry["files"]
+                    variables["__ansiroll_first_found_dirs"] = scope.get("first_found_dirs")
             ctx = self.ctx(base=variables)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             lookup_replays = entry.get("lookup_replays", {}) if before_setup else {}
