@@ -1957,16 +1957,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         for relative, target in root_aliases.items():
             aliases.setdefault(relative, target)
     aliases = {path: target for path, target in aliases.items() if target in directories}
-    alias_candidates = set()
-    if os.sep in fixed_path[1:] and aliases:
-        suffix = fixed_path.lstrip(os.sep).split(os.sep)
-        # The rendered prefix can reach any recorded directory. Follow all
-        # literal components before keeping an alias target.
-        reachable = directories
-        for component in suffix[:-1]:
-            children = (os.path.normpath(os.path.join(directory, component)) for directory in reachable)
-            reachable = {target for child in children if (target := aliases.get(child, child)) in directories}
-        alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
+    suffix = fixed_path[1:].split(os.sep) if os.sep in fixed_path[1:] else ()
 
     baked, meta = {}, {}
     alternate_meta = {}
@@ -1980,6 +1971,15 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         if not prefix and not is_subdir:
             skipped.append((base, root_index))
             continue
+        alias_candidates = set()
+        if suffix and root_aliases:
+            # The rendered prefix can reach any directory in this search root.
+            # Follow the literal suffix with this root's aliases.
+            reachable = root_dirs
+            for component in suffix[:-1]:
+                children = (os.path.normpath(os.path.join(directory, component)) for directory in reachable)
+                reachable = {target for child in children if (target := root_aliases.get(child, child)) in root_dirs}
+            alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
         for root, dirs, files in walk:
             for dirname in dirs:
                 relative = os.path.relpath(os.path.join(root, dirname), base)

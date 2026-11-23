@@ -337,6 +337,64 @@ def test_compile_dynamic_role_source_selects_root_from_traversal_target(tmp_path
     assert destination.read_text() == "selected template\n"
 
 
+def test_compile_dynamic_role_source_rejects_copy_of_traversed_directory(tmp_path):
+    destination = tmp_path / "output"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- copy: {src: "sites/{{ selection }}.j2", dest: "%s/", local_follow: true}
+""" % destination, "roles/r/sites/app.j2": "regular file at the normalized path\n",
+        "roles/r/sites/copied-content.txt": "from the traversed directory\n"})
+    (tmp_path / "roles/r/files/sites/app.j2").mkdir(parents=True)
+    later = tmp_path / "roles/r/sites"
+    (later / "other/branch").mkdir(parents=True)
+    (later / "other/app.j2").mkdir()
+    (later / "other/app.j2/contents.txt").symlink_to("../../copied-content.txt")
+    (later / "link").symlink_to("other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    _ansible(playbook, returncode=0)
+    copied = destination / "app.j2"
+    contents = copied / "contents.txt"
+    assert contents.read_text() == "from the traversed directory\n"
+    contents.unlink()
+    copied.rmdir()
+    _ansiroll(playbook, tmp_path, returncode=1)
+    assert not copied.exists()
+
+
+def test_compile_dynamic_role_source_uses_alias_suffix_targets_from_each_root(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: base/link/..}
+- template: {src: "sites/{{ selection }}/live/app.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/first/app.j2": "earlier traversal target\n",
+        "templates/sites/second/app.j2": "later traversal target\n",
+        "templates/sites/base/live/app.j2": "selected template\n"})
+    earlier = tmp_path / "roles/r/templates/sites"
+    (earlier / "base/live/app.j2").mkdir(parents=True)
+    (earlier / "other").mkdir()
+    (earlier / "other/live").symlink_to("../first", target_is_directory=True)
+    later = tmp_path / "templates/sites"
+    (later / "other/branch").mkdir(parents=True)
+    (later / "other/live").symlink_to("../second", target_is_directory=True)
+    (later / "base/link").symlink_to("../other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "selected template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "selected template\n"
+
+
 @pytest.mark.parametrize("suffix", ["live", "prod/live", "keep/../prod/live"])
 def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_path, suffix):
     resolved_suffix = os.path.normpath(suffix)

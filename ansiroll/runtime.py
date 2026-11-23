@@ -3757,14 +3757,15 @@ class Runtime:
             shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
             if shadowed:
                 roots = task["_baked_tree_roots"]
+                is_copy = (task.get("action") or "").rsplit(".", 1)[-1] == "copy"
                 for root in shadowed:
                     directories, aliases, blocked, files = roots[root]
                     path = Runtime._baked_role_path(parts, directories, aliases)
                     if path not in blocked and path not in files:
                         continue
-                    # The traversed path selects the root. Ansible reads the
-                    # normalized path within that root.
-                    if normalized in blocked:
+                    # Ansible reads the normalized path within the selected root,
+                    # but copy checks the traversed path before choosing whether to recurse.
+                    if normalized in blocked or (is_copy and path in blocked):
                         return "\0blocked"
                     return files.get(normalized) or src
                 return src
