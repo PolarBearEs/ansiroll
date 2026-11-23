@@ -1677,6 +1677,7 @@ def test_setup_fact_path_supports_first_found_lookup(tmp_path):
     ("profile ~ '.yml'", {"profile": "team/prod"}, "team/prod.yml"),
     ("team ~ '/profiles/' ~ profile ~ '.yml'", {"team": "org/team", "profile": "env/prod"},
      "org/team/profiles/env/prod.yml"),
+    ("'profiles/' ~ team ~ '/' ~ profile ~ '.yml'", {"team": "", "profile": "prod"}, "profiles/prod.yml"),
 ])
 def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatch, filename, runtime, expected_path):
     from ansiroll.loader import parse_playbook
@@ -1684,6 +1685,7 @@ def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatc
     _write(tmp_path, {
         "vars/dev.yml": "subset: [all]\n",
         "vars/default/profiles/dev.yml": "subset: [all]\n",
+        "vars/profiles/default/dev.yml": "subset: [all]\n",
         "vars/" + expected_path: "subset: ['!all', '!min']\n",
         "vars/org/team/unrelated/env/prod.txt": "unrelated: never_bundle_this\n",
         "pb.yml": """
@@ -1705,7 +1707,8 @@ def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatc
     assert _standalone(tmp_path, []) == expected
 
 
-def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path, monkeypatch):
+@pytest.mark.parametrize("team", ["org", "current/org"])
+def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path, monkeypatch, team):
     _write(tmp_path, {
         "vars/dev/profiles/prod.yml": "subset: [all]\n",
         "vars/shared/prod.yml": "subset: ['!all', '!min']\n",
@@ -1723,7 +1726,8 @@ def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path,
     (tmp_path / "vars/org").mkdir()
     (tmp_path / "vars/org/profiles").symlink_to("../shared", target_is_directory=True)
     (tmp_path / "vars/shared/cycle").symlink_to("..", target_is_directory=True)
-    extra = json.dumps({"team": "org"})
+    (tmp_path / "vars/current").symlink_to(".", target_is_directory=True)
+    extra = json.dumps({"team": team})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)

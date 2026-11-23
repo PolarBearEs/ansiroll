@@ -735,7 +735,7 @@ def _modeled_first_found_files(candidates):
         parts = Path(pattern).parts
         visited = set()
 
-        def walk(directory, index, ancestors):
+        def walk(directory, index, links):
             state = (directory, index)
             if state in visited:
                 return
@@ -745,7 +745,7 @@ def _modeled_first_found_files(candidates):
                 return
             recursive = parts[index] == "**"
             if recursive:
-                yield from walk(directory, index + 1, ancestors)
+                yield from walk(directory, index + 1, links)
             for child in directory.glob("*" if recursive else parts[index]):
                 if not recursive and index == len(parts) - 1:
                     yield child
@@ -753,11 +753,42 @@ def _modeled_first_found_files(candidates):
                 if not child.is_dir():
                     continue
                 resolved = child.resolve()
-                if resolved in ancestors or not (resolved == real_base or real_base in resolved.parents):
+                if not (resolved == real_base or real_base in resolved.parents):
                     continue
-                yield from walk(child, index if recursive else index + 1, ancestors | {resolved})
+                if recursive and child.is_symlink():
+                    # A recursive component may follow a link to an ancestor once.
+                    # Explicit components already limit how often a link is visited.
+                    link = (directory.resolve(), child.name, index)
+                    if link in links:
+                        continue
+                    yield from walk(child, index, links | {link})
+                else:
+                    yield from walk(child, index if recursive else index + 1, links)
 
-        yield from walk(base, 0, {base.resolve()})
+        yield from walk(base, 0, frozenset())
+
+    def matches_filename(filename, relative):
+        if fnmatchcase(relative, filename.replace("\0", "*")):
+            return True
+        parts = filename.split(os.sep)
+        if "\0" not in parts:
+            return False
+        names = relative.split(os.sep)
+
+        @lru_cache(maxsize=None)
+        def matches(index, start):
+            if index == len(parts):
+                return start == len(names)
+            part = parts[index]
+            if "\0" not in part:
+                return start < len(names) and fnmatchcase(names[start], part) and matches(index + 1, start + 1)
+            first_end = start if part == "\0" else start + 1
+            return any(
+                fnmatchcase(os.sep.join(names[start:end]), part.replace("\0", "*")) and matches(index + 1, end)
+                for end in range(first_end, len(names) + 1)
+            )
+
+        return matches(0, 0)
 
     for root, directory_pattern, filename in sorted(candidates):
         base = Path(root)
@@ -772,7 +803,6 @@ def _modeled_first_found_files(candidates):
             suffix = filename.rsplit("\0", 1)[-1]
             leaf = suffix.rsplit(os.sep, 1)[-1] if os.sep in suffix else "*" + suffix
             search = os.path.join(prefix, "**", leaf)
-        match = filename.replace("\0", "*")
         for directory in directories:
             if not directory.is_dir():
                 continue
@@ -780,7 +810,7 @@ def _modeled_first_found_files(candidates):
             if resolved != real_base and real_base not in resolved.parents:
                 continue
             for path in walk_pattern(directory, search, real_base):
-                if (path.is_file() and fnmatchcase(str(path.relative_to(directory)), match)
+                if (path.is_file() and matches_filename(filename, str(path.relative_to(directory)))
                         and real_base in path.resolve().parents):
                     yield os.path.normpath(path)
 
