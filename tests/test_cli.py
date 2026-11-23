@@ -193,14 +193,18 @@ def test_manifest_compares_direct_pty_slaves_by_filesystem_identity(monkeypatch)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
-def test_manifest_terminal_preflight_opens_requested_path(monkeypatch):
+def test_manifest_terminal_preflight_pins_requested_path(monkeypatch):
     alias = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR, st_ino=5, st_dev=17)
     slave = Namespace(st_rdev=os.makedev(136, 5), st_mode=stat.S_IFCHR, st_ino=5, st_dev=18)
-    handles = {2: slave, 6: alias}
+    handles = {2: slave, 6: alias, 8: alias}
     calls = []
 
     def open_terminal(path, flags):
-        assert path == "/proc/self/fd/4" and flags & os.O_ACCMODE == os.O_WRONLY
+        calls.append(path)
+        if flags == os.O_PATH:
+            assert path == "/proc/self/fd/4"
+            return 8
+        assert path == "/proc/self/fd/8" and flags & os.O_ACCMODE == os.O_WRONLY
         return 6
 
     def device(fd):
@@ -214,13 +218,13 @@ def test_manifest_terminal_preflight_opens_requested_path(monkeypatch):
     monkeypatch.setattr(os, "tcgetpgrp", lambda fd: 123)
     monkeypatch.setattr(cli, "_linux_terminal_device", device)
     assert cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
-    assert calls == [6]
+    assert calls == ["/proc/self/fd/4", "/proc/self/fd/8", 6]
 
     # A swap after stat cannot supply the metadata of an unrelated terminal.
-    handles[6] = slave
+    handles[8] = slave
     calls.clear()
     assert not cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
-    assert calls == []
+    assert calls == ["/proc/self/fd/4"]
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
@@ -238,13 +242,15 @@ def test_manifest_terminal_does_not_probe_unrelated_character_device(monkeypatch
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux virtual consoles")
-@pytest.mark.parametrize(("first", "second"), [((4, 0), (5, 0)), ((5, 0), (4, 0))])
-def test_manifest_resolves_aliases_of_the_active_virtual_console(monkeypatch, first, second):
+@pytest.mark.parametrize(("first", "second"), [
+    ((4, 0), (5, 0)), ((5, 0), (4, 0)), ((5, 1), (136, 5)), ((136, 5), (5, 1)),
+])
+def test_manifest_rejects_ambiguous_console_aliases(monkeypatch, first, second):
     destination = Namespace(st_rdev=os.makedev(*first), st_mode=stat.S_IFCHR)
     stream = Namespace(st_rdev=os.makedev(*second), st_mode=stat.S_IFCHR)
     monkeypatch.setattr(os, "fstat", lambda fd: stream)
-    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: os.makedev(4, 1))
-    assert cli._same_manifest_stream("virtual console", destination, 2, destination_fd=6)
+    with pytest.raises(ValueError, match="cannot verify redirected console"):
+        cli._same_manifest_stream("virtual console", destination, 2, destination_fd=6)
 
 
 @pytest.mark.parametrize("destination", ["pipe", "file"])

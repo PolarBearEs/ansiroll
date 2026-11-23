@@ -103,9 +103,18 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
     if not (sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode)):
         return _same_stream(info, stream)
 
-    tty_aliases = {os.makedev(5, 0), os.makedev(4, 0), os.makedev(5, 1)}  # tty, tty0, console
-    destination_alias = info.st_rdev in tty_aliases
-    stream_alias = stream.st_rdev in tty_aliases
+    console_aliases = {os.makedev(4, 0), os.makedev(5, 1)}  # tty0, console
+    if info.st_rdev in console_aliases or stream.st_rdev in console_aliases:
+        discard_device = os.stat(os.devnull).st_rdev
+        if discard_device in (info.st_rdev, stream.st_rdev):
+            return False
+        # TIOCGDEV reports the tty opened, which can differ from the device
+        # receiving writes after a TIOCCONS redirection.
+        raise ValueError("cannot verify redirected console for manifest path %s" % path)
+
+    controlling_alias = os.makedev(5, 0)
+    destination_alias = info.st_rdev == controlling_alias
+    stream_alias = stream.st_rdev == controlling_alias
     if not (destination_alias or stream_alias):
         # Unix98 PTY slave numbers are allocated independently by devpts mounts.
         if info.st_rdev == stream.st_rdev and 136 <= os.major(info.st_rdev) <= 143:
@@ -130,8 +139,19 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
     with ExitStack() as stack:
         if destination_fd is None:
             try:
-                destination_fd = os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+                pinned_fd = os.open(path, os.O_PATH)
             except OSError:
+                return _same_stream(info, stream)
+            stack.callback(os.close, pinned_fd)
+            pinned = os.fstat(pinned_fd)
+            if not stat.S_ISCHR(pinned.st_mode) or not os.path.samestat(info, pinned):
+                return False  # Final validation uses the actual writable descriptor.
+            fd_path = "/proc/self/fd/%d" % pinned_fd
+            try:
+                destination_fd = os.open(fd_path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+            except OSError as ex:
+                if ex.errno in (errno.ENOENT, errno.ENOTDIR):
+                    raise ValueError("cannot verify terminal for manifest path %s without /proc/self/fd" % path) from ex
                 return _same_stream(info, stream)
             stack.callback(os.close, destination_fd)
             opened = os.fstat(destination_fd)
