@@ -474,7 +474,7 @@ def _merged_stream_may_be_playbook(stream, playbook):
         return False
     path = os.path.abspath(playbook)
     directory, name = os.path.split(playbook)
-    if "$" in playbook or "$" in path or name.startswith(("~", "'", "\"")):
+    if not path.isascii() or "$" in playbook or "$" in path or name.startswith(("~", "'", "\"")):
         # Ansible can emit diagnostics during import. Keep them off this
         # stream until the input's identity is known.
         with open(os.devnull, "w") as sink, redirect_stderr(sink):

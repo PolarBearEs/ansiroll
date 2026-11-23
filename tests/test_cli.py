@@ -333,6 +333,28 @@ def test_merged_compile_diagnostics_leave_the_input_playbook_intact(tmp_path, al
     assert playbook.read_bytes() == original
 
 
+@pytest.mark.parametrize("component", ["filename", "directory"])
+def test_merged_compile_diagnostics_use_legacy_filename_encoding(monkeypatch, cli_os, tmp_path, component):
+    pytest.importorskip("ansible")
+    from ansiroll import loader
+
+    folder = tmp_path / "café" if component == "directory" else tmp_path
+    folder.mkdir(exist_ok=True)
+    path = folder / ("play-é.yml" if component == "filename" else "play.yml")
+    path.write_text("input playbook")
+    monkeypatch.chdir(folder)
+    monkeypatch.setattr(loader, "_core_version", lambda: (2, 10))
+    stream = path.stat()
+
+    def stat_legacy_path(candidate):
+        if candidate == str(path).encode("utf-8"):
+            return stream
+        raise FileNotFoundError(candidate)
+
+    monkeypatch.setattr(cli_os, "stat", stat_legacy_path)
+    assert cli._merged_stream_may_be_playbook(stream, path.name)
+
+
 def test_stdout_compile_requires_redirected_output():
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()
