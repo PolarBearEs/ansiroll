@@ -11,6 +11,14 @@ import pytest
 from ansiroll import cli
 
 
+@pytest.fixture
+def cli_os(monkeypatch):
+    # Terminal tests must leave the OS functions used by pytest capture intact.
+    isolated = Namespace(**vars(os))
+    monkeypatch.setattr(cli, "os", isolated)
+    return isolated
+
+
 def test_compile_streams_executable_python_and_writes_manifest(tmp_path):
     pytest.importorskip("ansible")
     playbook = tmp_path / "play.yml"
@@ -66,6 +74,229 @@ def test_stdout_compile_rejects_manifest_alias():
     assert b"manifest path points to stdout" in result.stderr
 
 
+def test_stdout_compile_rejects_manifest_aliasing_stderr(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    with manifest.open("wb") as diagnostics:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", "missing.yml", "-o", "-", "-m", str(manifest)],
+            stdout=subprocess.PIPE, stderr=diagnostics,
+        )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert manifest.read_text() == "ansiroll: manifest path points to stderr: %s\n" % manifest
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux controlling terminal device identities")
+@pytest.mark.parametrize("same_terminal", [False, True])
+def test_stdout_manifest_compares_underlying_terminals(same_terminal):
+    pty = pytest.importorskip("pty")
+    driver = """
+import fcntl
+import os
+import subprocess
+import sys
+import termios
+
+same_terminal, first, second = map(int, sys.argv[1:])
+fcntl.ioctl(first, termios.TIOCSCTTY, 0)
+cli = '''
+import errno
+import os
+from ansiroll import cli
+
+open_fd = os.open
+def only_writable_tty(path, flags, *args, **kwargs):
+    if path == '/dev/tty' and flags & os.O_ACCMODE == os.O_RDONLY and not flags & getattr(os, 'O_PATH', 0):
+        raise PermissionError(errno.EACCES, 'read access declined', path)
+    return open_fd(path, flags, *args, **kwargs)
+os.open = only_writable_tty
+cli.compile_playbook = lambda *a, **k: ('pass', {'modules': [], 'fallback_tasks': []})
+raise SystemExit(cli.entrypoint())
+'''
+with open('/dev/tty', 'wb') as inherited_terminal:
+    result = subprocess.run(
+        [sys.executable, '-c', cli, 'compile', 'pb.yml', '-o', '-', '-m', '/dev/tty'],
+        stderr=first if same_terminal else inherited_terminal,
+        start_new_session=not same_terminal, pass_fds=(second,),
+        preexec_fn=None if same_terminal else lambda: fcntl.ioctl(second, termios.TIOCSCTTY, 0),
+        timeout=10,
+    )
+raise SystemExit(result.returncode)
+"""
+    first_read, first_write = pty.openpty()
+    second_read, second_write = pty.openpty()
+    try:
+        args = [str(int(same_terminal)), str(first_write), str(second_write)]
+        result = subprocess.run([sys.executable, "-c", driver, *args], stdout=subprocess.PIPE,
+                                start_new_session=True, pass_fds=(first_write, second_write), timeout=15)
+        os.set_blocking(first_read, False)
+        diagnostics = os.read(first_read, 4096)
+        if same_terminal:
+            assert result.returncode == 2 and result.stdout == b""
+            assert diagnostics == b"ansiroll: manifest path points to stderr: /dev/tty\r\n"
+        else:
+            assert result.returncode == 0 and result.stdout == b"pass"
+            assert b"compiled pb.yml" in diagnostics
+            os.set_blocking(second_read, False)
+            assert json.loads(os.read(second_read, 4096)) == {"modules": [], "fallback_tasks": []}
+    finally:
+        for fd in (first_read, first_write, second_read, second_write):
+            os.close(fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal ioctl encodings")
+@pytest.mark.parametrize(("machine", "expected"), [("x86_64", 0x80045432), ("ppc64le", 0x40045432)])
+def test_linux_terminal_uses_native_ioctl_encoding(monkeypatch, cli_os, machine, expected):
+    import fcntl
+    import struct
+
+    def ioctl(fd, request, data):
+        assert fd == 3 and request == expected and data == bytes(4)
+        return struct.pack("I", 1056)
+
+    cli_os.uname = lambda: Namespace(machine=machine)
+    monkeypatch.setattr(fcntl, "ioctl", ioctl)
+    assert cli._linux_terminal_device(3) == 1056
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux devpts device identities")
+@pytest.mark.parametrize("alias_fd", [2, 6])
+def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch, cli_os, alias_fd):
+    device = os.makedev(136, 5)
+    alias_device = os.makedev(5, 0)
+    destination = Namespace(st_rdev=alias_device if alias_fd == 6 else device, st_mode=stat.S_IFCHR)
+    stream = Namespace(st_rdev=alias_device if alias_fd == 2 else device, st_mode=stat.S_IFCHR)
+    cli_os.fstat = lambda fd: stream
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: device)
+    cli_os.isatty = lambda fd: False
+    cli_os.tcgetpgrp = lambda fd: fd + 123  # A foreground job switch does not change identity.
+    assert cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+    def outside_session(fd):
+        if fd == 2:
+            raise OSError(errno.ENOTTY, "terminal is outside this session")
+        return 123
+
+    cli_os.tcgetpgrp = outside_session
+    assert not cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+    def denied_foreground_group(fd):
+        if fd == 2:
+            raise PermissionError(errno.EPERM, "terminal foreground group denied")
+        return 123
+
+    cli_os.tcgetpgrp = denied_foreground_group
+    with pytest.raises(ValueError, match="cannot verify terminal for manifest path"):
+        cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+    def no_controlling_session(fd):
+        raise OSError(errno.ENOTTY, "compiler has no controlling session")
+
+    cli_os.tcgetpgrp = no_controlling_session
+    with pytest.raises(ValueError, match="cannot distinguish terminal for manifest path"):
+        cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux devpts device identities")
+def test_manifest_compares_direct_pty_slaves_by_filesystem_identity(cli_os):
+    device = os.makedev(136, 5)
+    destination = Namespace(st_rdev=device, st_mode=stat.S_IFCHR, st_ino=5, st_dev=17)
+    stream = Namespace(st_rdev=device, st_mode=stat.S_IFCHR, st_ino=5, st_dev=18)
+    cli_os.fstat = lambda fd: stream
+    assert not cli._same_manifest_stream("manifest", destination, 2)
+    stream.st_dev = destination.st_dev
+    assert cli._same_manifest_stream("manifest", destination, 2)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
+def test_manifest_terminal_preflight_pins_requested_path(monkeypatch, cli_os):
+    alias = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR, st_ino=5, st_dev=17)
+    slave = Namespace(st_rdev=os.makedev(136, 5), st_mode=stat.S_IFCHR, st_ino=5, st_dev=18)
+    handles = {2: slave, 6: alias, 8: alias}
+    calls = []
+
+    def open_terminal(path, flags):
+        calls.append(path)
+        if flags == os.O_PATH:
+            assert path == "/proc/self/fd/4"
+            return 8
+        assert path == "/proc/self/fd/8" and flags & os.O_ACCMODE == os.O_WRONLY
+        return 6
+
+    def device(fd):
+        calls.append(fd)
+        return slave.st_rdev
+
+    cli_os.open = open_terminal
+    cli_os.close = lambda fd: None
+    cli_os.fstat = handles.__getitem__
+    cli_os.tcgetpgrp = lambda fd: 123
+    monkeypatch.setattr(cli, "_linux_terminal_device", device)
+    assert cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
+    assert calls == ["/proc/self/fd/4", "/proc/self/fd/8", 6]
+
+    # A swap after stat cannot supply the metadata of an unrelated terminal.
+    handles[8] = slave
+    calls.clear()
+    assert not cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
+    assert calls == ["/proc/self/fd/4"]
+
+    def denied_reopen(path, flags):
+        if flags == os.O_PATH:
+            return 8
+        raise PermissionError(errno.EACCES, "write probe denied", path)
+
+    handles[8] = alias
+    cli_os.open = denied_reopen
+    with pytest.raises(ValueError, match="cannot verify terminal for manifest path"):
+        cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
+def test_manifest_terminal_does_not_probe_unrelated_character_device(monkeypatch, cli_os):
+    stream = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR)
+    destination = Namespace(st_rdev=os.makedev(10, 130), st_mode=stat.S_IFCHR)
+    cli_os.fstat = lambda fd: stream
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: os.makedev(136, 1))
+
+    def unexpected_open(*args):
+        pytest.fail("unrelated character device was opened during preflight")
+
+    cli_os.open = unexpected_open
+    assert not cli._same_manifest_stream("device", destination, 2)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux virtual consoles")
+@pytest.mark.parametrize(("first", "second"), [
+    ((4, 0), (5, 0)), ((5, 0), (4, 0)), ((5, 1), (136, 5)), ((136, 5), (5, 1)),
+])
+def test_manifest_rejects_ambiguous_console_aliases(cli_os, first, second):
+    destination = Namespace(st_rdev=os.makedev(*first), st_mode=stat.S_IFCHR)
+    stream = Namespace(st_rdev=os.makedev(*second), st_mode=stat.S_IFCHR)
+    cli_os.fstat = lambda fd: stream
+    with pytest.raises(ValueError, match="cannot verify redirected console"):
+        cli._same_manifest_stream("virtual console", destination, 2, destination_fd=6)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
+@pytest.mark.parametrize("alias_fd", [2, 6])
+def test_manifest_rejects_unidentified_potential_terminal_alias(monkeypatch, cli_os, alias_fd):
+    alias = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR)
+    slave = Namespace(st_rdev=os.makedev(136, 5), st_mode=stat.S_IFCHR)
+    cli_os.fstat = lambda fd: alias if alias_fd == 2 else slave
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: None)
+    with pytest.raises(ValueError, match="cannot verify terminal for manifest path"):
+        cli._same_manifest_stream("manifest", alias if alias_fd == 6 else slave, 2, destination_fd=6)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux virtual consoles")
+def test_manifest_distinguishes_console_and_zero(cli_os):
+    console = Namespace(st_rdev=os.makedev(5, 1), st_mode=stat.S_IFCHR)
+    cli_os.fstat = lambda fd: console
+    assert not cli._same_manifest_stream("/dev/zero", os.stat("/dev/zero"), 2)
+
+
 @pytest.mark.parametrize("destination", ["pipe", "file"])
 def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     path = tmp_path / "compiled.py"
@@ -115,20 +346,21 @@ raise SystemExit(cli.entrypoint())
     )
 
 
-def test_stdout_compile_rejects_manifest_replaced_with_alias(tmp_path):
+@pytest.mark.parametrize("alias", ["stdout", "stderr"])
+def test_stdout_compile_rejects_manifest_replaced_with_alias(tmp_path, alias):
     script = """
 import os
 import sys
 from ansiroll import cli
 
-output, manifest = sys.argv[1:]
+target, manifest = sys.argv[1:]
 cli.compile_playbook = lambda *a, **k: ("pass", {"modules": [], "fallback_tasks": []})
 open_fd = os.open
 
 def replace_manifest(path, flags, *args, **kwargs):
-    if path == manifest:
+    if path == manifest and flags & os.O_ACCMODE == os.O_WRONLY:
         os.unlink(manifest)
-        os.symlink(output, manifest)
+        os.symlink(target, manifest)
     return open_fd(path, flags, *args, **kwargs)
 
 os.open = replace_manifest
@@ -139,15 +371,19 @@ raise SystemExit(cli.entrypoint())
     output.write_text("# existing output\n")
     manifest = tmp_path / "manifest.json"
     manifest.touch()
-    with output.open("r+b") as stream:
+    diagnostics = tmp_path / "diagnostics.txt"
+    diagnostics.write_text("existing diagnostics\n")
+    target = output if alias == "stdout" else diagnostics
+    with output.open("r+b") as stream, diagnostics.open("ab") as errors:
         result = subprocess.run(
-            [sys.executable, "-c", script, str(output), str(manifest)],
-            stdout=stream, stderr=subprocess.PIPE,
+            [sys.executable, "-c", script, str(target), str(manifest)],
+            stdout=stream, stderr=errors,
         )
 
     assert result.returncode == 2
     assert output.read_text() == "# existing output\n"
-    assert b"manifest path points to stdout" in result.stderr
+    assert diagnostics.read_text() == "existing diagnostics\nansiroll: manifest path points to %s: %s\n" % (
+        alias, manifest)
 
 
 @pytest.mark.parametrize("redirection", ['exec "$@" 2>&-', 'exec "$@" 2</dev/null'])
