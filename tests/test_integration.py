@@ -2346,6 +2346,24 @@ def test_legacy_playbook_include_defers_import_fields(tmp_path, monkeypatch, inl
     assert "imported-task" in result.stdout
 
 
+def test_legacy_playbook_include_ignores_templated_import_name(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- name: "{{ deployment_name }}"
+  include: child.yml
+""")
+    (tmp_path / "child.yml").write_text("""
+- name: Child play
+  hosts: localhost
+  gather_facts: false
+  vars: {deployment_name: rollout}
+  tasks: []
+""")
+
+    plays, _ = parse_playbook(str(playbook))
+    assert [play["name"] for play in plays] == ["Child play"]
+
+
 @pytest.mark.parametrize("modern", ["import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook"])
 def test_legacy_playbook_include_rejects_conflicting_imports(tmp_path, modern):
     from ansible.errors import AnsibleParserError

@@ -186,6 +186,10 @@ def _make_rewriting_loader(DataLoader):
                 return (isinstance(value, str) and is_trusted_as_template(value)
                         and any(token in value for token in ("{{", "{%", "{#")))
 
+            # The import label is never passed to the child play.
+            if templated(entry.get("name")):
+                del entry["name"]
+
             # Core 2.19+ validates the import before it loads the child.
             # Pass opaque values through that step and restore their original
             # trusted strings after Ansible has propagated them to the play.
