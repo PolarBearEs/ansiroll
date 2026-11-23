@@ -584,7 +584,7 @@ def _selector_depends_only_on_lookup(selector):
 
 
 def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, vars_subdir):
-    """Pair modeled first_found directory terms with their filename terms."""
+    """Return modeled first_found candidates and whether shallow discovery is also needed."""
     from glob import escape
     from jinja2 import nodes
 
@@ -704,7 +704,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 if filename_pattern == "\0":
                     # Preserve shallow discovery for absolute overrides.
                     needs_fallback = True
-                    if "\0" in directory or os.path.normpath(directory) == ".":
+                    if "\0" in directory or not dir_terms:
                         continue
                 if absolute_file:
                     patterns.add((basedir, "", filename_pattern))
@@ -712,6 +712,9 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 relative = os.path.join(directory, filename_pattern)
                 roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
                 patterns.update((root, directory, filename_pattern) for root in roots)
+                if filename_pattern.startswith("\0"):
+                    # A rendered absolute filename bypasses the search directories.
+                    patterns.update((root, "", filename_pattern) for root in vars_dirs)
     for fallback in fallbacks:
         candidate = path_pattern(fallback)
         if candidate is None or candidate[1] == "\0":
@@ -731,7 +734,7 @@ def _modeled_first_found_files(candidates, aliases):
     from fnmatch import fnmatchcase
     from pathlib import Path
 
-    def walk_pattern(base, pattern, real_base):
+    def walk_pattern(base, pattern, real_base, *, skip_hidden=False):
         parts = Path(pattern).parts
         visited = set()
 
@@ -747,6 +750,8 @@ def _modeled_first_found_files(candidates, aliases):
             if recursive:
                 yield from walk(directory, index + 1, links)
             for child in directory.glob("*" if recursive else parts[index]):
+                if skip_hidden and child.name.startswith("."):
+                    continue
                 if not recursive and index == len(parts) - 1:
                     yield child
                     continue
@@ -791,7 +796,7 @@ def _modeled_first_found_files(candidates, aliases):
 
         return matches(0, 0)
 
-    def matching_paths(base, pattern, real_base, *, directory):
+    def matching_paths(base, pattern, real_base, *, directory, skip_hidden=False):
         pattern = os.path.normpath(pattern)
         search = pattern
         if "\0" in pattern:
@@ -803,7 +808,7 @@ def _modeled_first_found_files(candidates, aliases):
             if not separator and not directory:
                 fixed_suffix = "*" + suffix
             search = os.path.join(prefix, "**", fixed_suffix)
-        for path in walk_pattern(base, search, real_base):
+        for path in walk_pattern(base, search, real_base, skip_hidden=skip_hidden):
             if not (path.is_dir() if directory else path.is_file()):
                 continue
             resolved = path.resolve()
@@ -814,8 +819,10 @@ def _modeled_first_found_files(candidates, aliases):
     for root, directory_pattern, filename in sorted(candidates):
         base = Path(root)
         real_base = base.resolve()
+        # Root-wide discovery keeps the legacy glob's hidden-file exclusion.
+        skip_hidden = not directory_pattern and filename.startswith("\0")
         for directory in matching_paths(base, directory_pattern, real_base, directory=True):
-            for path in matching_paths(directory, filename, real_base, directory=False):
+            for path in matching_paths(directory, filename, real_base, directory=False, skip_hidden=skip_hidden):
                 yield os.path.normpath(path)
 
 

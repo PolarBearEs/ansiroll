@@ -2892,14 +2892,16 @@ class Runtime:
                         if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
-                found = next((found for path in candidates
-                              if (found := _bundled_vars_file_path(os.path.normpath(path), entry["files"], aliases))
-                              is not None), None)
-                if found is not None:
-                    selected = entry["files"][found]
-                    if isinstance(selected, dict):
-                        raise VarsFilesError(selected["__ansiroll_vars_file_error__"], selected.get("rc", 1))
-                    break
+                for path in candidates:
+                    found = _bundled_vars_file_path(os.path.normpath(path), entry["files"], aliases)
+                    if found is not None:
+                        selected = entry["files"][found]
+                        if isinstance(selected, dict):
+                            raise VarsFilesError(selected["__ansiroll_vars_file_error__"], selected.get("rc", 1))
+                        break
+                else:
+                    continue
+                break
             else:
                 if not before_setup:
                     # Before 2.15, a missing file was fatal by default.
