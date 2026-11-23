@@ -72,7 +72,7 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", _DEFER_LOOKUP_NAMES}
+                "__ansiroll_search_dirs", "__ansiroll_delegated_play_vars", _DEFER_LOOKUP_NAMES}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -2170,9 +2170,8 @@ class _Templater:
         return self._lookup_templates[text]
 
     def _contains_mixed_lookup(self, scope):
-        # Magic scope maps can hold a full inventory snapshot. Their members
-        # are already lazy unless a template reads them through an alias.
-        snapshots = {key: scope[key] for key in ("vars", "hostvars") if key in scope}
+        # Scope maps may contain an entire inventory. A template that can
+        # access one needs lazy binding without inspecting the map itself.
         pending = [value for key, value in scope.items() if key not in ("vars", "hostvars")]
         seen = set()
         while pending:
@@ -2181,12 +2180,10 @@ class _Templater:
                 value = value._raw
             if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate):
                 stripped = value.strip()
+                if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
+                    return True
                 if self._has_lookup_call(stripped) and self._bare_lookup_expression(stripped) is None:
                     return True
-                if snapshots and _looks_templated(stripped):
-                    for key in self._SCOPE_REFERENCE.findall(stripped):
-                        if key in snapshots:
-                            pending.append(snapshots.pop(key))
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
                 if type(value) is dict:
@@ -5636,7 +5633,7 @@ def _resolve_delegated_play_var(name, scope, templater):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
         rendered = scope[name]
-        if not isinstance(scope, _PlayVarScope):
+        if not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
             rendered = templater.resolve_variable(name, rendered, scope)
         undefined = []
         errors = []
@@ -5662,7 +5659,9 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
     for key, value in (ctx or {}).items():
-        if key in ("vars", _DEFER_LOOKUP_NAMES) or (deferred is not None and key == "omit"):
+        if key in ("vars", _DEFER_LOOKUP_NAMES):
+            continue
+        if key == "omit" and deferred is not None and key not in resolve_keys:
             continue
         try:
             if deferred is not None and key not in resolve_keys:
@@ -5766,8 +5765,11 @@ def agent_main():
             action = (task.get("action") or "").rsplit(".", 1)[-1]
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
+            defer_template = action == "template" and ctx.get(_DEFER_LOOKUP_NAMES)
+            if defer_template:
+                resolve_keys = {"omit"}
             deferred = {} if resolve_keys is not None else None
-            lazy_play = set() if deferred is not None else None
+            lazy_play = set() if action == "synchronize" else None
             scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
@@ -5783,16 +5785,20 @@ def agent_main():
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),
             }
-            if deferred:
+            if lazy_play is not None and deferred:
                 frame["deferred_vars"] = deferred
             if lazy_play:
                 frame["lazy_play_vars"] = sorted(lazy_play)
+            requested_names = lazy_play or set()
+            if defer_template:
+                requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+                frame["lazy_template_vars"] = sorted(requested_names)
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
                 name = reply.get("name")
                 fallback = None
-                if isinstance(name, str) and lazy_play and name in lazy_play:
+                if isinstance(name, str) and name in requested_names:
                     fallback = _resolve_delegated_play_var(name, scope, templater)
                 _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
                 reply = _chan_recv()

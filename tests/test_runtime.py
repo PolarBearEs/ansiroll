@@ -162,16 +162,26 @@ def test_literal_tasks_do_not_scan_other_hosts_for_lookup_templates(monkeypatch)
 
     monkeypatch.setattr(rt.templater, "_has_lookup_call", record)
     task = _task("1", "literal", "debug", args={"msg": "untouched"})
-    rt.run_play({"tasks": [task], "gather_facts": False})
+    rt.run_play({"tasks": [task], "gather_facts": False,
+                 "vars": {"unused": "{{ hostvars.another.example }}"}})
     assert "inventory-only value" not in examined
 
 
-def test_task_defers_alias_to_mixed_lookup_in_hostvars():
+@pytest.mark.parametrize("host_vars", ["hostvars", "lookup('vars', scope_name)"])
+def test_task_defers_alias_to_mixed_lookup_in_hostvars(host_vars):
     frames, calls = [], []
     hostvars = {"another": {"payload": "{{ lookup('source') }}/{{ suffix }}"}}
     rt = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
-    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "first"
-    variables = {"alias": "{{ hostvars.another.payload }}", "suffix": "second"}
+    lookup = rt.templater.env.globals["lookup"]
+
+    def record(name, *args):
+        if name == "source":
+            calls.append(name)
+            return "first"
+        return lookup(name, *args)
+
+    rt.templater.env.globals["lookup"] = record
+    variables = {"alias": "{{ %s.another.payload }}" % host_vars, "suffix": "second", "scope_name": "hostvars"}
     tasks = [
         _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
         _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),

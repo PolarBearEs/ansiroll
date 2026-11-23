@@ -1880,6 +1880,30 @@ def test_delegated_task_ignores_unrelated_undefined_context_values(tmp_path):
     assert recap == ("2", "0", "0", "0", "0", "0", "0")
 
 
+def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        dest: "{{ playbook_dir }}/runtime.j2"
+        content: !unsafe "{{ used }}|{{ used }}|{{ 'untouched' if true else unused }}\\n"
+    - template:
+        src: "{{ playbook_dir }}/runtime.j2"
+        dest: "{{ playbook_dir }}/output.txt"
+      delegate_to: localhost
+      vars:
+        used: >-
+          {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote) ~ '; printf hello') }}/tail
+        unused: >-
+          {{ lookup('pipe', 'printf unused >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}/tail
+""")
+    _, recap = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert recap == ("2", "2", "0", "0", "0", "0", "0")
+    assert (tmp_path / "output.txt").read_text() == "hello/tail|hello/tail|untouched\n"
+    assert (tmp_path / "lookups").read_text() == "used"
+
+
 def test_until_and_assert_errors_and_invalid_ignore_errors(tmp_path):
     from ansible.release import __version__
     from packaging.version import Version
