@@ -14,6 +14,7 @@ import pkgutil
 import re
 import stat
 import time
+from copy import copy
 from functools import lru_cache
 
 from .compat import init_loader
@@ -141,6 +142,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
     uuids = {}
     runtime_writes = set()
     for play in pb.get_plays():
+        loader.restore_legacy_import_fields(play)
         # Like ansible-playbook (cli/playbook.py, executor/playbook_executor.py):
         # run each play with the loader's basedir set to the directory of the
         # playbook file that defined it, so role, include and src lookups are
@@ -156,37 +158,153 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
 
 
 def _make_rewriting_loader(DataLoader):
-    """A DataLoader that revives the removed legacy ``include:`` keyword.
+    """Read legacy playbook and task includes using their modern keywords."""
+    import sys
 
-    Modern ansible-core rejects ``include:`` outright. As files are read we rewrite
-    it to ``import_tasks:`` (static, so it inlines) or ``include_tasks:`` when the
-    task loops, so playbooks written for older ansible still compile.
-    """
+    from ansible.playbook import Playbook
+    from ansible.playbook.helpers import load_list_of_tasks
+    from ansible.playbook.role import Role
+
+    playbook_reader = Playbook._load_playbook_data.__code__
+    role_reader = Role._load_role_yaml.__code__
+    task_readers = {load_list_of_tasks.__code__, _convert_include_tasks.__code__}
 
     class RewritingDataLoader(DataLoader):
+        def __init__(self):
+            super().__init__()
+            self._deferred_import_fields = {}
+
         def load_from_file(self, *args, **kwargs):
+            # Playbooks, task files, and vars files can have the same YAML shape.
+            reader = sys._getframe(1).f_code
+            playbook = reader is playbook_reader
+            role_tasks = reader is role_reader and sys._getframe(1).f_locals.get("subdir") in ("tasks", "handlers")
             data = super(RewritingDataLoader, self).load_from_file(*args, **kwargs)
-            return _rewrite_includes(data)
+            if not (playbook or role_tasks or reader in task_readers):
+                return data
+            return _rewrite_includes(data, playbook=playbook, defer_import_fields=self._defer_import_fields)
+
+        def _defer_import_fields(self, entry):
+            try:
+                from ansible.template import is_trusted_as_template, trust_as_template
+            except ImportError:
+                return
+            from uuid import uuid4
+
+            def templated(value):
+                return (isinstance(value, str) and is_trusted_as_template(value)
+                        and any(token in value for token in ("{{", "{%", "{#")))
+
+            # The import label is never passed to the child play.
+            if templated(entry.get("name")):
+                del entry["name"]
+
+            # Core 2.19+ validates the import before it loads the child.
+            # Pass opaque values through that step and restore their original
+            # trusted strings after Ansible has propagated them to the play.
+            for field in ("tags", "when"):
+                original = entry.get(field)
+                values = original if isinstance(original, list) else [original]
+                if not any(templated(value) for value in values):
+                    continue
+                if field == "tags" and isinstance(original, str):
+                    values = [trust_as_template(tag.strip()) for tag in original.split(",")]
+                deferred = []
+                for value in values:
+                    if templated(value):
+                        marker = "__ansiroll_import_" + uuid4().hex
+                        self._deferred_import_fields[marker] = value
+                        deferred.append(marker)
+                    else:
+                        deferred.append(value)
+                entry[field] = deferred
+
+        def restore_legacy_import_fields(self, play):
+            if not self._deferred_import_fields:
+                return
+            fields = [(play, "_tags"), (play, "_included_conditional")]
+            fields.extend((node, "_when") for node in (*play.pre_tasks, *play.roles, *play.tasks, *play.post_tasks))
+            for node, field in fields:
+                values = getattr(node, field, None)
+                if isinstance(values, list):
+                    restored = [self._deferred_import_fields.get(value, value) if isinstance(value, str) else value
+                                for value in values]
+                    if restored != values:
+                        setattr(node, field, restored)
 
     return RewritingDataLoader()
 
 
 _TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+_PLAYBOOK_IMPORT_KEYS = ("import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook")
 
 
-def _rewrite_includes(data):
-    # Rewrite in place: ansible-core's parsed containers carry origin tags
-    # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies. Only task lists are touched, since
-    # vars files go through this loader too.
+def _rewrite_playbook_include(item):
+    from ansible.errors import AnsibleParserError
+    from ansible.parsing.splitter import parse_kv, split_args
+
+    modern = next((key for key in _PLAYBOOK_IMPORT_KEYS if key in item), None)
+    if modern:
+        raise AnsibleParserError(f"conflicting playbook include keys: include and {modern}", obj=item)
+
+    include = item["include"]
+    parts = split_args(include)
+    filename = parts[0].strip() if parts else ""
+    if not filename:
+        raise AnsibleParserError("legacy playbook include must specify a filename", obj=item)
+
+    rewritten = copy(item)
+    del rewritten["include"]
+    if len(parts) == 1 and filename == include:
+        rewritten["import_playbook"] = include
+        return rewritten
+
+    inline = " ".join(parts[1:])
+    params = parse_kv(inline)
+    # Unassigned tokens overwrite even an explicit _raw_params assignment.
+    if "_raw_params" in params and parse_kv(inline + " _raw_params=")["_raw_params"]:
+        raise AnsibleParserError("legacy playbook include parameters must use key=value", obj=item)
+    if len(parts) > 1 and "vars" in item:
+        raise AnsibleParserError("conflicting inline parameters and vars on legacy playbook include", obj=item)
+
+    # Splitting a YAML string can drop its template trust on Core 2.19+.
+    try:
+        from ansible.template import is_trusted_as_template, trust_as_template
+    except ImportError:
+        pass
+    else:
+        if is_trusted_as_template(include):
+            filename = trust_as_template(filename)
+            params = {key: trust_as_template(value) for key, value in params.items()}
+    rewritten["import_playbook"] = filename
+    if "tags" in params:
+        inline_tags = params.pop("tags")
+        # Legacy Ansible applies tag declarations in YAML key order.
+        last_tag_source = next(key for key in reversed(item) if key in ("include", "tags"))
+        if last_tag_source == "include":
+            rewritten["tags"] = inline_tags
+    if params:
+        rewritten["vars"] = params
+    return rewritten
+
+
+def _rewrite_includes(data, *, playbook=False, defer_import_fields=None):
+    # Keep Ansible's source metadata when rewriting task or playbook mappings.
     if not isinstance(data, list):
         return data
-    for item in data:
+    for index, item in enumerate(data):
         if not isinstance(item, dict):
             continue
         for k in _TASK_LIST_KEYS:
             _rewrite_includes(item.get(k))
         if "include" in item and isinstance(item.get("include"), str):
+            if playbook:
+                # The original mapping may also be referenced via a YAML alias.
+                rewritten = _rewrite_playbook_include(item)
+                if defer_import_fields is not None:
+                    defer_import_fields(rewritten)
+                data[index] = rewritten
+                continue
             dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
             items = [(new_key if k == "include" else k, v) for k, v in item.items()]
