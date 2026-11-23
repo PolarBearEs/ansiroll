@@ -1879,13 +1879,13 @@ def _literal_role_source_tail(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     try:
-        body = Environment(trim_blocks=True).parse(src).body
+        body = Environment(keep_trailing_newline=True).parse(src).body
     except TemplateSyntaxError:
         return ""
     if body and isinstance(body[-1], nodes.Output):
         output = body[-1].nodes
         if output and isinstance(output[-1], nodes.TemplateData):
-            return output[-1].data.strip()
+            return output[-1].data
     return ""
 
 
@@ -1907,8 +1907,14 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     fixed_path = ""
     if os.sep in tail:
         trailing_components = tail.partition(os.sep)[2].split(os.sep)
-        if trailing_components[-1] not in ("", ".", "..") and ".." not in trailing_components:
-            fixed_path = os.sep + os.path.normpath(os.sep.join(trailing_components)).lstrip(os.sep)
+        basename = trailing_components[-1]
+        if basename not in ("", ".", ".."):
+            if ".." in trailing_components:
+                # Parent traversal can take a different route through directory
+                # aliases, but it still ends at the same literal filename.
+                fixed_path = os.sep + basename
+            else:
+                fixed_path = os.sep + os.path.normpath(os.sep.join(trailing_components)).lstrip(os.sep)
     baked = {}
     meta = {}
     directories = set()

@@ -230,7 +230,10 @@ def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypat
     ("sites/{{ selection }}.j2", "sites/app.j2", "sites/notes.txt"),
     ("sites/{{ selection -}}   .j2", "sites/app.j2", "sites/notes.txt"),
     ("sites/{{ selection | default('}}') }}.j2", "sites/app.j2", "sites/notes.txt"),
+    ("sites/{{ selection }}.j2 ", "sites/app.j2 ", "sites/app.j2"),
+    ("sites/{{ selection }}.j2\n", "sites/app.j2\n", "sites/app.j2"),
     ("sites/{{ selection }}/templates/app.j2", "sites/prod/templates/app.j2", "sites/notes/app.j2"),
+    ("sites/{{ selection }}/keep/../templates/app.j2", "sites/prod/templates/app.j2", "sites/notes.txt"),
 ])
 def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, monkeypatch, template, selected, unrelated):
     from types import SimpleNamespace
