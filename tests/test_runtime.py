@@ -242,6 +242,30 @@ def test_delegated_play_fallback_discards_overwritten_undefined_paths():
     }
 
 
+def test_delegated_play_requests_share_lookup_results():
+    from ansiroll.runtime import _resolve_delegated_play_var
+
+    rt = Runtime({}, "", {})
+    calls = []
+
+    def load_profile():
+        calls.append(True)
+        return "prod"
+
+    rt.templater.env.globals["load_profile"] = load_profile
+    variables = rt.template_vars({
+        "profile": "{{ load_profile() }}",
+        "first": "{{ profile ~ '-first' }}",
+        "second": "{{ profile ~ '-second' }}",
+    }, {}, dynamic=True)
+    scope = rt.templater._play_var_scope(variables, strict=False)
+    for name in ("first", "second"):
+        assert _resolve_delegated_play_var(name, scope, rt.templater) == {
+            "value": "prod-" + name, "undefined": [],
+        }
+    assert calls == [True]
+
+
 def test_delegated_loop_task_alias_uses_agent_filters():
     from ansiroll.runtime import _delegate_vars
 

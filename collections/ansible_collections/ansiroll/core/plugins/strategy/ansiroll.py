@@ -31,7 +31,6 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
 
 DOCUMENTATION = """
     name: ansiroll
@@ -77,8 +76,8 @@ class _DelegatedPlayVariables:
         return self.values[index]
 
 
-class _LegacyDelegatedCollection:
-    """Keep legacy Ansible from converting a lazy container to text."""
+class _LegacyDelegatedValue:
+    """Let Jinja load the native value when an expression uses the alias."""
 
     __UNSAFE__ = True
 
@@ -86,22 +85,46 @@ class _LegacyDelegatedCollection:
         self._bridge = bridge
         self._index = index
 
-    def __getitem__(self, key):
-        return self._bridge[self._index][key]
-
-    def __iter__(self):
-        return iter(self._bridge[self._index])
-
-    def __len__(self):
-        return len(self._bridge[self._index])
+    def resolve(self):
+        return self._bridge[self._index]
 
 
-class _LegacyDelegatedMapping(_LegacyDelegatedCollection, Mapping):
-    pass
+def _legacy_environment_validator(validate, aliases):
+    """Keep native Ansible environment validation, with lazy Jinja name binding."""
+    from jinja2.runtime import missing
 
+    from ansiroll.runtime import _ConditionalCodeGenerator, _ConditionalName
 
-class _LegacyDelegatedSequence(_LegacyDelegatedCollection, Sequence):
-    pass
+    def validate_environment(attr, value, templar):
+        environment = getattr(templar, "_environment", None)
+        if environment is None:
+            environment = templar.environment
+        variables = templar.available_variables
+        generator, context_class = environment.code_generator_class, environment.context_class
+
+        class DelegatedContext(context_class):
+            def _defer_name(self, key):
+                return _ConditionalName(self, key) if key in self else missing
+
+            def _consume_name(self, value):
+                if isinstance(value, _ConditionalName):
+                    value = value.context.resolve_or_missing(value.key)
+                if isinstance(value, _LegacyDelegatedValue):
+                    value = value.resolve()
+                    self._update_unsafe(value)
+                return value
+
+        try:
+            templar.available_variables = {**variables, **aliases}
+            environment.context_class = DelegatedContext
+            environment.code_generator_class = _ConditionalCodeGenerator
+            return validate(attr, value, templar)
+        finally:
+            environment.context_class = context_class
+            environment.code_generator_class = generator
+            templar.available_variables = variables
+
+    return validate_environment
 
 
 class StrategyModule(StrategyBase):
@@ -624,6 +647,7 @@ class StrategyModule(StrategyBase):
                     from ansible.template import trust_as_template
                 except ImportError:
                     trust_as_template = None
+                legacy_aliases = {}
 
                 for name, scope in deferred.items():
                     if name not in job_vars:
@@ -642,12 +666,9 @@ class StrategyModule(StrategyBase):
                         expression = "{{ __ansiroll_delegated_play_vars[%d] }}" % index
                         if trust_as_template is not None:
                             job_vars[name] = trust_as_template(expression)
-                        elif isinstance(value, dict):
-                            job_vars[name] = _LegacyDelegatedMapping(bridge, index)
-                        elif isinstance(value, list):
-                            job_vars[name] = _LegacyDelegatedSequence(bridge, index)
                         else:
                             job_vars[name] = expression
+                            legacy_aliases[name] = _LegacyDelegatedValue(bridge, index)
                     elif scope == "play" and name in play_fallbacks:
                         job_vars[name] = self._restore_play_fallback(wrap_var(play_fallbacks[name]),
                                                                     play_undefined.get(name, ()))
@@ -655,6 +676,9 @@ class StrategyModule(StrategyBase):
                         job_vars[name] = wrap_var(value)
                 if bridge.names:
                     job_vars["__ansiroll_delegated_play_vars"] = bridge
+                if legacy_aliases:
+                    concrete._post_validate_environment = _legacy_environment_validator(
+                        concrete._post_validate_environment, legacy_aliases)
 
             class _QuietQueue:
                 @staticmethod

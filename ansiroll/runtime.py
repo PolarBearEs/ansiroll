@@ -5516,13 +5516,12 @@ def _delegate_fallback_value(value, undefined, path=()):
     return _fail_on_undef(value)
 
 
-def _resolve_delegated_play_var(name, ctx, templater):
+def _resolve_delegated_play_var(name, scope, templater):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
-        original = ctx[name]
-        scope = templater._play_var_scope(ctx, strict=False)
-        rendered = (scope[name] if isinstance(original, _PlayVarTemplate)
-                    else templater.resolve_variable(name, original, scope))
+        rendered = scope[name]
+        if not isinstance(scope, _PlayVarScope):
+            rendered = templater.resolve_variable(name, rendered, scope)
         undefined = []
         value = _delegate_fallback_value(rendered, undefined)
         return {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
@@ -5641,11 +5640,12 @@ def agent_main():
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
             deferred = {} if resolve_keys is not None else None
             lazy_play = set() if deferred is not None else None
+            scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
                 "runtime_id": task.get("runtime_id"),
                 "action": task.get("action"), "args": args,
-                "vars": _delegate_vars(ctx, templater, resolve_keys, deferred,
+                "vars": _delegate_vars(scope, templater, resolve_keys, deferred,
                                        controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play),
                 "become": become, "to": task.get("delegate_to"),
                 "become_user": rt.become_user,
@@ -5665,7 +5665,7 @@ def agent_main():
                 name = reply.get("name")
                 fallback = None
                 if isinstance(name, str) and lazy_play and name in lazy_play:
-                    fallback = _resolve_delegated_play_var(name, ctx, rt.templater)
+                    fallback = _resolve_delegated_play_var(name, scope, templater)
                 _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
                 reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":

@@ -2057,12 +2057,15 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_FILE_LIST: "{{ file_options.labels[0] ~ '-' ~ file_options.labels[2] }}"
               SYNC_FILE_MISSING: "{{ file_options.labels[1] is defined }}"
               SYNC_FILE_DEFAULT: "{{ file_options.labels[1].nested | default('fallback') }}"
+              SYNC_FILE_JSON: "json={{ file_env | to_json }}"
+              SYNC_LIST_JSON: "json={{ file_list | to_json }}"
               SYNC_UNUSED: "{{ 'skipped' if true else unused_agent_alias }}"
               SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
               SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
               SYNC_FLAG: "{{ true }}"
               SYNC_EMPTY: "{{ none }}"
             - "{{ ansible_delegated_vars['localhost']['environment'] }}"
+            - "{{ file_env }}"
 """)
     loader = DataLoader()
     play, = Playbook.load(str(playbook), loader=loader).get_plays()
@@ -2078,7 +2081,8 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
     "files": {"/vars/localhost.yml": [{"file_options": {
         "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
         "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
-    }, "unused_agent_alias": "{{ missing_value }}"}]},
+    }, "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
+        "file_list": ["{{ 'mixed' | upper }}"], "unused_agent_alias": "{{ missing_value }}"}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
     "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},
@@ -2093,15 +2097,17 @@ runtime.ANSIBALLZ_CODE = ""
 runtime._INJECTED_HOST = "localhost"
 runtime.agent_main()
 """
-    request = b'{"t":"delegate_play_var","name":"file_options"}'
-    reply = b'{"t":"delegate_result","result":{"changed":false}}'
+    names = ("file_options", "file_env", "file_list")
+    messages = [{"t": "delegate_play_var", "name": name} for name in names]
+    messages.append({"t": "delegate_result", "result": {"changed": False}})
+    encoded = [json.dumps(message).encode() for message in messages]
+    replies = b"".join(len(message).to_bytes(4, "big") + message for message in encoded)
     serialized_environment = json.dumps(_tag_untrusted(original_environment, template_syntax_only=True))
     serialized_vars = json.dumps(_tag_untrusted(original.get_vars()))
     serialized_play_vars = json.dumps(_tag_untrusted(play.vars))
     result = subprocess.run([sys.executable, "-c", agent, serialized_environment,
                              serialized_vars, serialized_play_vars],
-                            input=((len(request).to_bytes(4, "big") + request) +
-                                   (len(reply).to_bytes(4, "big") + reply)) * 2,
+                            input=replies * 2,
                             capture_output=True, timeout=15, check=True)
     stream = io.BytesIO(result.stdout)
     frames = []
@@ -2136,9 +2142,10 @@ runtime.agent_main()
     requests = []
 
     def resolve(name):
-        assert name == "file_options"
+        assert name in names
+        index = requests.count(name) * len(names) + names.index(name)
         requests.append(name)
-        return fallbacks[len(requests) - 1]
+        return fallbacks[index]
 
     assert [strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None, resolve)
             for frame in frames] == [
@@ -2146,18 +2153,19 @@ runtime.agent_main()
                          "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
                          "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
                          "SYNC_FILE_LIST": "RELEASE-tail", "SYNC_FILE_MISSING": False,
-                         "SYNC_FILE_DEFAULT": "fallback", "SYNC_UNUSED": "skipped",
+                         "SYNC_FILE_DEFAULT": "fallback", "SYNC_UNUSED": "skipped", "SYNC_FILE_WHOLE": "MIXED",
+                         "SYNC_FILE_JSON": 'json={"SYNC_FILE_WHOLE": "MIXED"}', "SYNC_LIST_JSON": 'json=["MIXED"]',
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")
     ]
-    assert requests == ["file_options", "file_options"]
+    assert requests == list(names) * 2
     assert all("unused_agent_alias" in frame["lazy_play_vars"] for frame in frames)
     assert all("omit" not in frame["vars"] for frame in frames)
     frame = copy.deepcopy(frames[0])
     frame["vars"]["sync_loop_label"] = "{{ 'other' | upper }}"
     rendered = strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None,
-                                                    lambda name: fallbacks[0])
+                                                    lambda name: fallbacks[names.index(name)])
     assert rendered["environment"]["SYNC_MIRRORS"] == "{{ 'other' | upper }}-controller"
     assert original.environment == original_environment
 
