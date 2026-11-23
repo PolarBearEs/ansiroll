@@ -531,6 +531,8 @@ def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tm
 def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_after_stat(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
+    from ansible.parsing.dataloader import DataLoader
+
     from ansiroll import loader
     from ansiroll.runtime import Runtime
 
@@ -546,11 +548,11 @@ def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_a
 
     roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
     monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    task = SimpleNamespace(_role=object(), _loader=DataLoader(), get_search_path=lambda: [base for base, _ in roots])
     with monkeypatch.context() as patch:
         patch.setattr(os, "stat", stat_then_remove)
         node = {}
-        assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
-                                        "sites/{{ selection }}.j2")
+        assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
     assert not earlier.exists()
     key = Runtime._baked_source_key(node, "sites/app.j2")
     assert node["_baked"][key] == "available\n"
