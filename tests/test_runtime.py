@@ -167,8 +167,12 @@ def test_literal_tasks_do_not_scan_other_hosts_for_lookup_templates(monkeypatch)
     assert "inventory-only value" not in examined
 
 
-def test_literal_tasks_scan_inherited_lookup_containers_once(monkeypatch):
-    rt = Runtime({}, "", {"inventory_hostname": "h", "unused": ["inherited marker"]})
+@pytest.mark.parametrize("layer", ["host", "role_defaults", "role_vars"])
+def test_literal_tasks_scan_inherited_lookup_containers_once(monkeypatch, layer):
+    host_vars = {"inventory_hostname": "h"}
+    if layer == "host":
+        host_vars["unused"] = ["inherited marker"]
+    rt = Runtime({}, "", host_vars, on_result=lambda frame: None)
     examined = []
     has_lookup = rt.templater._has_lookup_call
 
@@ -179,6 +183,9 @@ def test_literal_tasks_scan_inherited_lookup_containers_once(monkeypatch):
 
     monkeypatch.setattr(rt.templater, "_has_lookup_call", record)
     tasks = [_task(str(index), "literal", "debug", args={"msg": "untouched"}) for index in range(10)]
+    if layer != "host":
+        for task in tasks:
+            task[layer] = {"unused": ["inherited marker"]}
     rt.run_play({"tasks": tasks, "gather_facts": False})
     assert examined == ["inherited marker"]
 
@@ -682,6 +689,22 @@ def test_conditional_rendering_tracks_marked_list_reads(expression):
     ctx["item"] = "sample"
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+def test_delegated_list_mutations_compare_resolved_values():
+    from ansiroll.runtime import _DelegatedTemplateValue, _lazy_container
+
+    rt = Runtime({}, "", {})
+    reads = []
+    rows = _lazy_container([
+        _DelegatedTemplateValue(lambda text=text: reads.append(text) or text)
+        for text in ("remove", "b", "a")
+    ], rt, {})
+    rows.remove("remove")
+    assert reads == ["remove"]
+    rows.sort()
+    assert reads == ["remove", "b", "a"]
+    assert rows == ["a", "b"]
 
 
 @pytest.mark.parametrize("expression", [

@@ -1086,6 +1086,8 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
 
 
 def _observe_container_value(value, rt, render_ctx):
+    if isinstance(value, _DelegatedTemplateValue):
+        return value.resolve()
     templater = rt.templater
     if templater._untrusted_task_interpolation is not None and type(value) in (dict, list, tuple):
         return _lazy_wrap(value, rt, render_ctx())
@@ -1151,6 +1153,9 @@ class _LazyTplDict(dict):
         return [self[k] for k in dict.keys(self)]
 
     def copy(self):
+        raw_items = dict.items(self)
+        if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
+            return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())
         return {k: self[k] for k in self}
 
     def __iter__(self):
@@ -1164,13 +1169,15 @@ class _LazyTplDict(dict):
 
     def __repr__(self):
         # str()/repr() inside a template shows the rendered values.
-        return repr(self.copy())
+        return repr({k: self[k] for k in self})
 
     __str__ = __repr__
 
     def __eq__(self, other):
         mine = {k: self[k] for k in dict.keys(self)}
-        return mine == (other.copy() if isinstance(other, _LazyTplDict) else other)
+        if isinstance(other, _LazyTplDict):
+            other = {k: other[k] for k in dict.keys(other)}
+        return mine == other
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -1415,9 +1422,28 @@ class _LazyTplList(list):
     def pop(self, index=-1):
         return _observe_container_value(list.pop(self, index), self._rt, self._render_ctx)
 
+    def _has_delegated_items(self):
+        return any(isinstance(value, _DelegatedTemplateValue) for value in list.__iter__(self))
+
     def copy(self):
         values = list.copy(self)
+        if self._has_delegated_items():
+            return _LazyTplList(values, self._rt, self._render_ctx())
         return _observe_container_value(values, self._rt, self._render_ctx)
+
+    def remove(self, item):
+        if not self._has_delegated_items():
+            return list.remove(self, item)
+        for index, value in enumerate(self):
+            if value is item or value == item:
+                del self[index]
+                return
+        raise ValueError("list.remove(x): x not in list")
+
+    def sort(self, *, key=None, reverse=False):
+        if self._has_delegated_items():
+            self[:] = list(self)
+        list.sort(self, key=key, reverse=reverse)
 
     def __eq__(self, other):
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
@@ -2189,25 +2215,32 @@ class _Templater:
             self._lookup_templates[text] = has_lookup, dynamic_plugin
         return self._lookup_templates[text][0]
 
-    def _contains_mixed_lookup(self, scope, inherited):
+    def _contains_mixed_lookup(self, inherited, overrides, role_layers):
         # Scope maps may contain an entire inventory. A template that can
         # access one needs lazy binding without inspecting the map itself.
         cache = self._inherited_lookup_scans
-        for key in tuple(cache):
-            if inherited.get(key) is not cache[key][0]:
-                del cache[key]
+        for key in cache.keys() - inherited.keys():
+            del cache[key]
+        scope = {**inherited, **overrides} if overrides else inherited
         for key, value in scope.items():
             if key in ("vars", "hostvars"):
                 continue
-            # Facts can change in place. Task overlays can change the value
-            # under a name even when the inherited binding has not changed.
-            if key != "ansible_facts" and inherited.get(key) is value and isinstance(
+            # Facts can change in place. Scan task overrides independently.
+            if key != "ansible_facts" and key not in overrides and isinstance(
                     value, (dict, list, tuple)):
-                if key not in cache:
-                    cache[key] = value, self._value_needs_lookup_deferral(value)
-                if cache[key][1]:
-                    return True
-            elif self._value_needs_lookup_deferral(value):
+                previous, was_role_data, needs_deferral = cache.get(key, (None, False, False))
+                if previous is not value:
+                    plain_role_data = (type(value) in (dict, list, tuple)
+                                       and any(layer.get(key) is value for layer in role_layers))
+                    # Compiled tasks can deserialize equal copies of raw role
+                    # data. Live variables can contain views with lazy equality.
+                    if not (plain_role_data and was_role_data and type(value) is type(previous)
+                            and value == previous):
+                        needs_deferral = self._value_needs_lookup_deferral(value)
+                    cache[key] = value, plain_role_data, needs_deferral
+            else:
+                needs_deferral = self._value_needs_lookup_deferral(value)
+            if needs_deferral:
                 return True
         return False
 
@@ -3213,9 +3246,11 @@ class Runtime:
         # < role vars < block vars < task vars < include_vars < set_fact/
         # register < role params < include params < extra vars < loop item.
         ctx = {}
-        ctx.update(task.get("role_defaults") or {})
+        role_defaults = task.get("role_defaults") or {}
+        role_vars = task.get("role_vars") or {}
+        ctx.update(role_defaults)
         ctx.update(self.vars)
-        ctx.update(task.get("role_vars") or {})
+        ctx.update(role_vars)
         ctx.update(overlay)
         higher_vars = self._layered_ctx({}, overlay, task.get("role_params"))
         if task.get("type") == "include":
@@ -3231,7 +3266,8 @@ class Runtime:
         # loop bindings. Keep templates live until they are actually read.
         looped = task.get("type") != "include" and task.get("loop") is not None
         # Inherited lookups can be reached through aliases in task vars.
-        mixed_lookup = self.templater._contains_mixed_lookup({**ctx, **task_vars, **higher_vars}, self.vars)
+        mixed_lookup = self.templater._contains_mixed_lookup(
+            {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
