@@ -1465,10 +1465,42 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
     assert len(reads) == 1
 
 
-def test_dynamic_role_template_pattern_handles_many_repeated_literals():
-    from ansiroll.loader import _linked_role_source_matches, _linked_role_source_pattern
+@pytest.mark.parametrize("directory_expression", [
+    "{% if use_blue %}blue{% elif use_green %}green{% else %}orange{% endif %}",
+    "{{ 'blue' if use_blue else ('green' if use_green else 'orange') }}",
+])
+def test_dynamic_role_template_bakes_only_conditional_directory_choices(tmp_path, directory_expression):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: app, use_blue: false, use_green: true}
+- template: {src: "sites/%s/{{ name }}.j2", dest: output.txt}
+""" % directory_expression, "roles/r/templates/sites/local.j2": "ordinary template\n",
+        "shared/blue/app.j2": "blue template\n", "shared/green/app.j2": "green template\n",
+        "shared/orange/app.j2": "orange template\n", "shared/prod/client-key.j2": "unrelated input\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for name in ("blue", "green", "orange", "prod"):
+        (sites / name).symlink_to(tmp_path / "shared" / name, target_is_directory=True)
 
-    _, pattern = _linked_role_source_pattern("sites/" + "{{ name }}a" * 24 + "b{{ name }}.j2")
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "green template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "green template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert set(template["_baked_direct_sources"]) == {"sites/%s/app.j2" % name for name in ("blue", "green", "orange")}
+
+
+def test_dynamic_role_template_pattern_handles_many_repeated_literals():
+    from ansiroll.loader import _linked_role_source_matches, _linked_role_source_patterns
+
+    _, patterns = _linked_role_source_patterns("sites/" + "{{ name }}a" * 24 + "b{{ name }}.j2")
+    (_, pattern), = patterns
     path = "sites/" + "a" * 100
     assert not _linked_role_source_matches(pattern, path + ".j2")
     assert _linked_role_source_matches(pattern, path + "b.j2")

@@ -1978,7 +1978,7 @@ def _search_dirs(task, basedir, subdir, tagged=False):
     return dirs if tagged else [d for d, _ in dirs]
 
 
-def _linked_role_source_pattern(src):
+def _linked_role_source_patterns(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     try:
@@ -1994,17 +1994,55 @@ def _linked_role_source_pattern(src):
         return ""
 
     head = literal(body[0], 0)
-    if len(body) == 1 and isinstance(body[0], nodes.Output):
-        parts = [node.data if isinstance(node, nodes.TemplateData) else "\0" for node in body[0].nodes]
-    else:
-        tail = literal(body[-1], -1)
-        if not tail:
-            return None
-        parts = [head, "\0", tail]
-    joined = re.sub("\0+", "\0", "".join(parts))
-    if ".." in joined.split(os.sep):
+    if not (len(body) == 1 and isinstance(body[0], nodes.Output)) and not literal(body[-1], -1):
         return None
-    segments = os.path.normpath(joined).split(os.sep)
+
+    def expand(sequence):
+        paths = [""]
+        for node in sequence:
+            choices = expand_node(node)
+            if len(paths) * len(choices) > 128:
+                raise ValueError("too many linked source alternatives")
+            paths = [prefix + suffix for prefix in paths for suffix in choices]
+        return paths
+
+    def expand_node(node):
+        if isinstance(node, nodes.TemplateData):
+            return [node.data]
+        if isinstance(node, nodes.Const) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, nodes.Output):
+            return expand(node.nodes)
+        if isinstance(node, nodes.If):
+            choices = []
+            for branch in (node, *node.elif_):
+                if not isinstance(branch.test, nodes.Const) or branch.test.value:
+                    choices.extend(expand(branch.body))
+                if isinstance(branch.test, nodes.Const) and branch.test.value:
+                    return choices
+            return choices + expand(node.else_)
+        if isinstance(node, nodes.CondExpr):
+            branches = (node.expr1, node.expr2)
+            if isinstance(node.test, nodes.Const):
+                branches = (node.expr1 if node.test.value else node.expr2,)
+            return [path for branch in branches if branch is not None for path in expand_node(branch)]
+        if isinstance(node, nodes.Expr):
+            return ["\0"]
+        raise ValueError("unsupported linked source statement")
+
+    try:
+        candidates = expand(body)
+    except ValueError:
+        return None
+    patterns = []
+    for candidate in dict.fromkeys(candidates):
+        if candidate and not os.path.isabs(candidate) and ".." not in candidate.split(os.sep):
+            patterns.append((candidate.partition("\0")[0], _linked_role_source_pattern(candidate)))
+    return (head, patterns) if patterns else None
+
+
+def _linked_role_source_pattern(candidate):
+    segments = os.path.normpath(re.sub("\0+", "\0", candidate)).split(os.sep)
     pattern = []
     for index, segment in enumerate(segments):
         directory = index < len(segments) - 1
@@ -2024,7 +2062,7 @@ def _linked_role_source_pattern(src):
             if directory:
                 tokens += ("/",)
         pattern.append((tokens, optional))
-    return head, pattern
+    return pattern
 
 
 def _linked_role_source_matches(pattern, relative):
@@ -2071,10 +2109,10 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
     from collections import deque
 
-    parsed = _linked_role_source_pattern(src)
+    parsed = _linked_role_source_patterns(src)
     if parsed is None:
         return {}, {}, {}
-    head, pattern = parsed
+    head, patterns = parsed
     prefix = os.path.normpath(head.rpartition(os.sep)[0])
     if prefix == ".":
         prefix = ""
@@ -2093,11 +2131,14 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         return os.path.normpath(winner) if winner else None
 
     def lookup_paths(relative):
+        matching_heads = [prefix for prefix, pattern in patterns if _linked_role_source_matches(pattern, relative)]
+        if not matching_heads:
+            return
         if relative.startswith("~") or relative.split(os.sep, 1)[0] == subdir:
             # A leading "." changes action-subdir and home-path handling.
-            if not head.startswith("."):
+            if any(not prefix.startswith(".") for prefix in matching_heads):
                 yield relative
-            if not head or head.startswith("."):
+            if any(not prefix or prefix.startswith(".") for prefix in matching_heads):
                 yield "./" + relative
         else:
             yield relative
@@ -2110,13 +2151,12 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     direct, pending = {}, {}
     ordinary_by_path = {os.path.normpath(meta["fullpath"]): relative for relative, meta in ordinary.items()}
     for relative, meta in ordinary.items():
-        if _linked_role_source_matches(pattern, relative):
-            for lookup_path in lookup_paths(relative):
-                winner = source_for(lookup_path)
-                if os.path.normpath(meta["fullpath"]) != winner:
-                    direct[lookup_path] = ordinary_by_path.get(winner)
-                    if winner is not None and direct[lookup_path] is None:
-                        pending.setdefault(winner, []).append(lookup_path)
+        for lookup_path in lookup_paths(relative):
+            winner = source_for(lookup_path)
+            if os.path.normpath(meta["fullpath"]) != winner:
+                direct[lookup_path] = ordinary_by_path.get(winner)
+                if winner is not None and direct[lookup_path] is None:
+                    pending.setdefault(winner, []).append(lookup_path)
 
     assets, metadata, contents = {}, {}, {}
     newline = "" if subdir == "files" else None
@@ -2166,14 +2206,13 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
             paths_to_bake = list(pending.get(path, ()))
             if linked:
                 for spelling in source_spellings(relative, is_subdir):
-                    if _linked_role_source_matches(pattern, spelling):
-                        for lookup_path in lookup_paths(spelling):
-                            winner = source_for(lookup_path)
-                            if winner is None:
-                                continue
-                            direct.setdefault(lookup_path, ordinary_by_path.get(winner))
-                            if path == winner:
-                                paths_to_bake.append(lookup_path)
+                    for lookup_path in lookup_paths(spelling):
+                        winner = source_for(lookup_path)
+                        if winner is None:
+                            continue
+                        direct.setdefault(lookup_path, ordinary_by_path.get(winner))
+                        if path == winner:
+                            paths_to_bake.append(lookup_path)
             if not paths_to_bake:
                 continue
             resolved_path = os.path.realpath(path)
