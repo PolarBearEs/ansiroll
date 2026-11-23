@@ -2063,8 +2063,32 @@ def test_standalone_captures_controller_environment_from_conditions_only_for_bar
     assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
 
 
+def test_standalone_environment_capture_follows_nested_lookup_argument_values(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    monkeypatch.setenv("ANSIROLL_NESTED_TEMPLATE", "active")
+    monkeypatch.setenv("ANSIROLL_FILTERED_EXAMPLE", "controller-only-value")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          tasks:
+            - debug:
+                msg: >-
+                  {{ lookup('vars', 'missing', default='{{ query("env", "ANSIROLL_FILTERED_EXAMPLE") }}' | length) }}
+            - debug:
+                msg: >-
+                  {{ lookup('vars', 'missing', default='{{ query("env", "ANSIROLL_NESTED_TEMPLATE") }}') }}
+    """})
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert plays[0]["controller_env"] == {"ANSIROLL_NESTED_TEMPLATE": "active"}
+
+
 @pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
-@pytest.mark.parametrize(("expression", "live"), [("'DEV' | lower", False), ("'prod' if live else 'dev'", True)])
+@pytest.mark.parametrize(("expression", "live"), [
+    ("'DEV' | lower", False),
+    ("'prod' if live else 'dev'", True),
+    ("('PROD' if live else 'DEV') | lower", True),
+])
 def test_setup_first_found_only_bundles_reachable_legacy_filenames(tmp_path, monkeypatch, expression, live):
     from ansiroll.loader import parse_playbook
 
@@ -2091,6 +2115,36 @@ def test_setup_first_found_only_bundles_reachable_legacy_filenames(tmp_path, mon
     extra = json.dumps({"live": live})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: %s"' % (not live)]
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
+def test_setup_first_found_respects_playbook_filter_override(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "filter_plugins/custom.py": """
+        class FilterModule:
+            def filters(self):
+                return {'lower': lambda value: 'custom'}
+        """,
+        "vars/dev/custom.yml": "subset: [all]\n",
+        "vars/prod/custom.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - >-
+              {{ lookup('first_found', ["vars/{{ profile }}/{{ 'CONFIG' | lower }}.yml"]) }}
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
+    extra = json.dumps({"profile": "prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
     assert _standalone(tmp_path, []) == expected
 

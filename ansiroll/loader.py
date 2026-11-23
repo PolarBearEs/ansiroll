@@ -225,15 +225,23 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         _is_templated(item) for value in gather_options.values()
         for item in _as_list(value)
     )
+    jinja_plugins = _collect_jinja_plugins(play, basedir)
+    builtin_filters = set()
+    if scoped_gather and any(
+            isinstance(name, str) and "first_found" in name and "|" in name
+            for entry in _as_list(play.vars_files) for name in _as_list(entry)):
+        builtin_filters = _builtin_first_found_filters(play, jinja_plugins)
     ordered_vars_files = [] if scoped_gather else None
-    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files,
+                                    builtin_filters=builtin_filters)
     gather_vars_files = []
     if scoped_gather:
         for entry in ordered_vars_files:
             if "selector" not in entry:
                 gather_vars_files.append(_tag_untrusted(entry))
                 continue
-            bundled, = _deferred_vars_files(play, basedir, [entry["selector"]], setup=True)
+            bundled, = _deferred_vars_files(play, basedir, [entry["selector"]], setup=True,
+                                            builtin_filters=builtin_filters)
             if "path" in entry:
                 bundled["compile_path"] = entry["path"]
                 bundled["files"][entry["path"]] = _tag_untrusted(entry["values"])
@@ -294,7 +302,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     result = {
         "name": play.name or "",
         "hosts": hosts,
-        "jinja_plugins": _collect_jinja_plugins(play, basedir),
+        "jinja_plugins": jinja_plugins,
         "gather_facts": bool(gather),
         "gather_options": _tag_untrusted(gather_options),
         "gather_option_defaults": gather_option_defaults,
@@ -443,6 +451,20 @@ def _controller_env_names(value, *, expression=False):
         parsed = _selector_ast(value if templated else "{{ " + value + " }}")
         if parsed is None:
             return names
+
+        def nested_values(arg):
+            if isinstance(arg, nodes.Const):
+                yield arg.value
+            elif isinstance(arg, (nodes.Keyword, nodes.Pair, nodes.List, nodes.Tuple, nodes.Dict)):
+                for value in arg.iter_child_nodes():
+                    yield from nested_values(value)
+            elif isinstance(arg, nodes.CondExpr):
+                branches = (arg.expr1, arg.expr2)
+                if isinstance(arg.test, nodes.Const):
+                    branches = (arg.expr1 if arg.test.value else arg.expr2,)
+                for branch in branches:
+                    yield from nested_values(branch)
+
         for call in parsed.find_all(nodes.Call):
             if not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q"):
                 continue
@@ -452,10 +474,9 @@ def _controller_env_names(value, *, expression=False):
                              and isinstance(arg.value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg.value))
             # The lookup term renderer also processes templates embedded in arguments.
             for arg in (*call.args[1:], *call.kwargs):
-                literals = (arg,) if isinstance(arg, nodes.Const) else arg.find_all(nodes.Const)
-                for literal in literals:
-                    if _is_templated(literal.value):
-                        names.update(_controller_env_names(literal.value))
+                for literal in nested_values(arg):
+                    if _is_templated(literal):
+                        names.update(_controller_env_names(literal))
     elif isinstance(value, dict):
         if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_untrusted_condition__"}):
             return names
@@ -495,7 +516,7 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, *, builtin_filters=()):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -538,7 +559,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
                 out = combine_vars(out, item)
             if ordered is not None:
                 record["values"] = values
-                if "selector" in record and not earlier_selector and _literal_first_found(raw):
+                if "selector" in record and not earlier_selector and _literal_first_found(raw, builtin_filters):
                     # This lookup has no host or extra-var inputs to reselect.
                     del record["selector"]
                 if "selector" in record:
@@ -593,7 +614,38 @@ def _selector_ast(selector):
         return None
 
 
-def _literal_first_found(selector):
+def _builtin_first_found_filters(play, plugins):
+    """Return filters whose controller and bundled implementations are both built-ins."""
+    from inspect import unwrap
+
+    from ansible.template import Templar
+    from jinja2.filters import FILTERS
+
+    templar = Templar(loader=play._loader)
+    engine = getattr(templar, "_engine", templar)
+    controller_filters = engine.environment.filters
+    bundled_filters = FILTERS
+    filter_plugins = [plugin for plugin in (plugins or ()) if plugin["kind"] == "filter"]
+    if filter_plugins:
+        from .runtime import _Templater
+
+        bundled = _Templater()
+        bundled.register_plugins(filter_plugins)
+        bundled_filters = bundled.env.filters
+
+    verified = set()
+    for name in ("first", "lower", "upper", "trim", "string", "replace"):
+        try:
+            builtin = unwrap(FILTERS[name])
+            if unwrap(controller_filters[name]) is builtin and unwrap(bundled_filters[name]) is builtin:
+                verified.add(name)
+        except Exception:
+            # Unknown or failed plugins must remain dynamic.
+            continue
+    return verified
+
+
+def _literal_first_found(selector, builtin_filters):
     """Identify a built-in first_found whose inputs cannot change at runtime."""
     from ansible.plugins.loader import lookup_loader
     from jinja2 import nodes
@@ -605,7 +657,7 @@ def _literal_first_found(selector):
     expr = parsed.body[0].nodes[0]
     first = False
     while isinstance(expr, nodes.Filter):
-        if expr.args or expr.kwargs or expr.dyn_args or expr.dyn_kwargs:
+        if expr.name not in builtin_filters or expr.args or expr.kwargs or expr.dyn_args or expr.dyn_kwargs:
             return False
         if expr.name == "first" and not first:
             first = True
@@ -668,8 +720,9 @@ def _first_found_search_dirs(play, basedir):
     }
 
 
-def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, vars_subdir):
+def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, vars_subdir, builtin_filters):
     """Return modeled first_found candidates and whether shallow discovery is also needed."""
+    from copy import copy
     from glob import escape
     from jinja2 import nodes
 
@@ -687,7 +740,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             fallback = call.args[0] if call.args else default_options.get("default_value")
             if fallback is not None:
                 fallbacks.append(fallback)
-        elif call.name not in ("first", "string"):
+        elif call.name not in ("first", "string") or call.name not in builtin_filters:
             return None
         call = call.node
     if (not isinstance(call, nodes.Call) or not isinstance(call.node, nodes.Name)
@@ -715,7 +768,9 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
     def constant_path_part(part):
         if isinstance(part, nodes.Const):
             return True
-        return (isinstance(part, nodes.Filter) and part.name in ("lower", "upper", "trim", "string", "replace")
+        if isinstance(part, nodes.Concat):
+            return all(constant_path_part(value) for value in part.nodes)
+        return (isinstance(part, nodes.Filter) and part.name in builtin_filters and part.name != "first"
                 and not (part.dyn_args or part.dyn_kwargs)
                 and all(constant_path_part(value) for value in (part.node, *part.args,
                                                                 *(kw.value for kw in part.kwargs))))
@@ -730,9 +785,16 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                     branches = (part.expr1 if part.test.value else part.expr2,)
                 choices = [choice for branch in branches if branch is not None
                            for choice in expand_conditionals(concat_parts(branch))]
-                # A large combination can still use the surrounding literal bounds.
-                if len(variants) * len(choices) > 128:
-                    choices = [[part]]
+            elif isinstance(part, nodes.Filter) and part.name in builtin_filters and part.name != "first":
+                choices = []
+                for operand in expand_conditionals([part.node]):
+                    filtered = copy(part)
+                    filtered.node = (operand[0] if len(operand) == 1
+                                     else nodes.Concat(operand).set_environment(part.environment))
+                    choices.append([filtered])
+            # A large combination can still use the surrounding literal bounds.
+            if len(variants) * len(choices) > 128:
+                choices = [[part]]
             variants = [variant + choice for variant in variants for choice in choices]
         return variants
 
@@ -976,7 +1038,7 @@ def _modeled_first_found_files(candidates, aliases):
                 yield os.path.normpath(path)
 
 
-def _deferred_vars_files(play, basedir, entries, *, setup=False):
+def _deferred_vars_files(play, basedir, entries, *, setup=False, builtin_filters=()):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -1004,7 +1066,8 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
         for name in names:
             first_found = setup and "first_found" in name
             if first_found:
-                lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs, dirs, subdir)
+                lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs, dirs, subdir,
+                                                                    builtin_filters)
                 if lookup_candidates is not None:
                     patterns, needs_fallback = lookup_candidates
                     candidates.update((found, True) for found in _modeled_first_found_files(patterns, aliases))
