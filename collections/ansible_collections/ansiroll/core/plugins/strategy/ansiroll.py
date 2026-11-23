@@ -31,6 +31,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections.abc import Collection
 
 DOCUMENTATION = """
     name: ansiroll
@@ -113,6 +114,25 @@ def _legacy_environment_validator(validate, aliases):
             member._fail_with_undefined_error()
         return member
 
+    class CheckedView(Collection):
+        def __init__(self, view, items):
+            self.view = view
+            self.items = items
+
+        def __iter__(self):
+            for member in self.view:
+                if self.items:
+                    key, value = member
+                    yield key, check_error(value)
+                else:
+                    yield check_error(member)
+
+        def __len__(self):
+            return len(self.view)
+
+        def __contains__(self, member):
+            return any(value == member for value in self)
+
     def check_member(access):
         def get_member(obj, key):
             return check_error(access(obj, key))
@@ -143,7 +163,12 @@ def _legacy_environment_validator(validate, aliases):
                 return value
 
             def call(self, *args, **kwargs):
-                return check_error(super().call(*args, **kwargs))
+                result = check_error(super().call(*args, **kwargs))
+                if isinstance(result, (type({}.values()), type({}.items()))):
+                    items = isinstance(result, type({}.items()))
+                    if any(isinstance(member[1] if items else member, _DelegatedMemberError) for member in result):
+                        return CheckedView(result, items)
+                return result
 
         def template_variable(value, *args, **kwargs):
             # Legacy lookup plugins can read available_variables directly.
@@ -794,6 +819,8 @@ class StrategyModule(StrategyBase):
             if isinstance(key, dict):
                 from datetime import date, datetime
 
+                if "bytes" in key:
+                    return base64.b64decode(key["bytes"], validate=True)
                 if "date" in key:
                     return date.fromisoformat(key["date"])
                 return datetime.fromisoformat(key["datetime"])

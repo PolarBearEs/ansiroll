@@ -5530,6 +5530,8 @@ def _encode_delegated_key(key):
         return {"datetime": key.isoformat()}
     if isinstance(key, date):
         return {"date": key.isoformat()}
+    if isinstance(key, bytes):
+        return {"bytes": base64.b64encode(key).decode("ascii")}
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
