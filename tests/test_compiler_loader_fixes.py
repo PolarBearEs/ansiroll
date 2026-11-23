@@ -706,6 +706,39 @@ def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_dupli
     assert duplicate.exists() is not disappears
 
 
+@pytest.mark.parametrize(("tail", "required_dir_exists", "retains_duplicate"), [
+    ("missing/../prod/app.j2", False, False),
+    ("missing/../prod/app.j2", True, True),
+    ("../prod/app.j2", False, True),
+])
+def test_compile_dynamic_role_source_checks_literal_traversal_before_retaining_duplicates(
+        tmp_path, monkeypatch, tail, required_dir_exists, retains_duplicate):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/prod/app.j2": "first\n", "later/sites/prod/app.j2": "later\n"})
+    later = tmp_path / "later/sites"
+    (later / "other/branch").mkdir(parents=True)
+    (later / "other/prod").mkdir()
+    (later / "other/prod/app.j2").symlink_to(os.devnull)
+    (later / "link").symlink_to("other/branch", target_is_directory=True)
+    if required_dir_exists:
+        (later / "other/missing").mkdir()
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    node = {}
+    source = "sites/{{ selection }}/" + tail
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates", source)
+    assert ("later\n" in node["_baked"].values()) is retains_duplicate
+    if retains_duplicate:
+        traversal = "sites/link/" + (tail if tail.startswith("../") else "../" + tail)
+        key = Runtime._baked_source_key(node, traversal)
+        assert node["_baked"][key] == "later\n"
+
+
 def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_after_stat(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

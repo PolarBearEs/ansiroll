@@ -1920,10 +1920,12 @@ def _role_source_mode(path):
         return None
 
 
-def _role_traversal_duplicates(claimed, special_paths, directories, aliases, suffix):
+def _role_traversal_duplicates(claimed, special_paths, directories, aliases, literal_tail):
     """Find normalized files whose spelling can traverse a special file."""
     if not special_paths:
         return set()
+
+    from collections import deque
 
     children, parents = {}, {}
     for path in (directories | aliases.keys()) - {"."}:
@@ -1933,47 +1935,107 @@ def _role_traversal_duplicates(claimed, special_paths, directories, aliases, suf
         children.setdefault(parent, {})[name] = target
         parents.setdefault(target, set()).add(parent)
 
-    # An excursion adds a component and cancels it with "..". An alias can
-    # change the physical directory even when the normalized path is the same.
-    excursions, incoming, pending = {}, {}, []
+    def parent_of(path):
+        return (os.path.dirname(path) or ".") if path != "." else None
 
-    def connect(start, end):
-        if start != end and end not in excursions.setdefault(start, set()):
-            excursions[start].add(end)
-            incoming.setdefault(end, set()).add(start)
-            pending.append((start, end))
+    # A child/parent pair leaves the normalized path unchanged. Only explore
+    # nontrivial pairs and ancestors that can contain them.
+    affected = {parent_of(path) for path, target in aliases.items()
+                if target != "." and parent_of(path) != parent_of(target)}
+    if all(path.count(os.sep) == target.count(os.sep) and target != "." for path, target in aliases.items()):
+        # A depth-preserving walk can only end elsewhere if an alias leaves
+        # the subtree of the starting directory.
+        affected = {ancestor for path, target in aliases.items()
+                    for ancestor in _role_directory_parents(path)
+                    if ancestor != "." and not target.startswith(ancestor + os.sep)}
+    else:
+        pending = list(affected)
+        while pending:
+            for parent in parents.get(pending.pop(), ()):
+                if parent not in affected:
+                    affected.add(parent)
+                    pending.append(parent)
 
-    for path, target in aliases.items():
-        if target != ".":
-            connect(os.path.dirname(path) or ".", os.path.dirname(target) or ".")
-    # Compose excursions and allow one inside another child/parent pair.
-    while pending:
-        start, end = pending.pop()
-        for following in tuple(excursions.get(end, ())):
-            connect(start, following)
-        for preceding in tuple(incoming.get(start, ())):
-            connect(preceding, end)
-        if end != ".":
-            for parent in parents.get(start, ()):
-                connect(parent, os.path.dirname(end) or ".")
+    arrivals, seen, waiting, work = {}, {}, {}, deque()
 
+    def add(start, end):
+        if end not in seen.setdefault(start, set()):
+            seen[start].add(end)
+            arrivals.setdefault(start, []).append(end)
+            work.append((start, end))
+
+    def destinations(start):
+        if start not in affected:
+            yield start
+            return
+        add(start, start)
+        index = 0
+        while index < len(arrivals[start]) or work:
+            if index < len(arrivals[start]):
+                yield arrivals[start][index]
+                index += 1
+                continue
+            origin, current = work.popleft()
+            if current != ".":
+                for outer in waiting.get(origin, ()):
+                    add(outer, parent_of(current))
+            for child in children.get(current, {}).values():
+                if child not in affected:
+                    parent = parent_of(child)
+                    if parent is not None:
+                        add(origin, parent)
+                    continue
+                waiters = waiting.setdefault(child, set())
+                if origin in waiters:
+                    continue
+                waiters.add(origin)
+                add(child, child)
+                # A child may have been visited before this query needed it.
+                for reached in tuple(arrivals[child]):
+                    if reached != ".":
+                        add(origin, parent_of(reached))
+
+    normalized_tail = os.path.normpath(os.sep.join(literal_tail)).split(os.sep) if literal_tail else []
+    pops = 0
+    while pops < len(normalized_tail) and normalized_tail[pops] == "..":
+        pops += 1
+    ending = normalized_tail[pops:]
     special_names = {os.path.basename(path) for path in special_paths}
+
+    def reaches_special(parent, tail):
+        for part in tail[:-1]:
+            if part == "..":
+                parent = parent_of(parent)
+            elif part not in ("", "."):
+                parent = children.get(parent, {}).get(part)
+            if parent is None:
+                return False
+        return os.path.normpath(os.path.join(parent, tail[-1])) in special_paths
+
     duplicates = set()
     for path in claimed:
         parts = path.split(os.sep)
-        if parts[-1] not in special_names or (suffix and parts[-len(suffix):] != suffix):
+        if parts[-1] not in special_names or (ending and parts[-len(ending):] != ending):
             continue
+        prefix = parts[:-(len(ending) or 1)]
         current = {"."}
-        suffix_start = len(parts) - len(suffix)
-        for index, component in enumerate(parts):
-            # A canceled segment may occur before the fixed trailing parts.
-            if index <= suffix_start:
-                current |= {end for start in current for end in excursions.get(start, ())}
-            if index < len(parts) - 1:
-                current = {child for parent in current if (child := children.get(parent, {}).get(component))}
-        if any(os.path.normpath(os.path.join(parent, parts[-1])) in special_paths for parent in current):
+        for component in prefix:
+            current = {child for start in current for parent in destinations(start)
+                       if (child := children.get(parent, {}).get(component))}
+        # The fixed tail may pop directories supplied by the variable.
+        for _ in range(pops):
+            current = {child for start in current for parent in destinations(start)
+                       for child in children.get(parent, {}).values()}
+        tail = literal_tail or parts[-1:]
+        if any(reaches_special(parent, tail) for start in current for parent in destinations(start)):
             duplicates.add(path)
     return duplicates
+
+
+def _role_directory_parents(path):
+    while path != ".":
+        path = os.path.dirname(path) or "."
+        yield path
 
 
 def _bake_search_tree(node, task, basedir, subdir, src):
@@ -1992,10 +2054,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         prefix = ""
     tail = _literal_role_source_tail(src)
     fixed_path = ""
+    literal_tail = ()
     if os.sep in tail:
         trailing_components = tail.partition(os.sep)[2].split(os.sep)
         basename = trailing_components[-1]
         if basename not in ("", ".", ".."):
+            literal_tail = trailing_components
             # Parent traversal can change the starting directory, but the
             # literal components after the last ".." still constrain the path.
             start = max((index + 1 for index, part in enumerate(trailing_components) if part == ".."), default=0)
@@ -2067,7 +2131,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                         mode = _role_source_mode(path)
                         if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                             special_paths.add(relative)
-        traversal_duplicates = _role_traversal_duplicates(claimed, special_paths, root_dirs, root_aliases, suffix)
+        traversal_duplicates = _role_traversal_duplicates(claimed, special_paths, root_dirs, root_aliases, literal_tail)
         for root, dirs, files in walk:
             for dirname in dirs:
                 path = os.path.join(root, dirname)
