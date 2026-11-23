@@ -1239,8 +1239,8 @@ class _PlayVarScope(dict):
         self.resolved = {}
         self.resolved_task = {}
         self.resolved_snapshot = {}
-        if any(isinstance(value, _DelegatedTemplateValue) for value in ctx.values()):
-            view = _DelegatedPlayVarView
+        if ctx.get(_DEFER_LOOKUP_NAMES):
+            view = _DeferredPlayVarView
         else:
             view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
         snapshot = ctx.get("vars")
@@ -1317,12 +1317,14 @@ class _LookupVars(dict):
 class _PlayVarView(dict):
     """The finite public vars mapping for a lazy play-variable scope."""
 
+    _preserve_legacy_sources = True
+
     def __init__(self, snapshot, scope, loop_snapshot=False):
         super().__init__(snapshot)
         self.scope = scope
         self._loop_snapshot = loop_snapshot or isinstance(snapshot, _LoopVarsSnapshot)
         self._templates = {}
-        if not _core_at_least(2, 19):
+        if self._preserve_legacy_sources and not _core_at_least(2, 19):
             for key, value in snapshot.items():
                 if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
                     if self._loop_snapshot:
@@ -1337,14 +1339,15 @@ class _PlayVarView(dict):
             return value
         if not self._loop_snapshot:
             return self.scope.templater.resolve_variable(key, self.scope[key], self.scope, strict=self.scope.strict)
-        if key not in self.scope.resolved_snapshot:
-            value = self._templates.get(key, value)
+        value = self._templates.get(key, value)
+        cache_key = (key, id(value))
+        if cache_key not in self.scope.resolved_snapshot:
             if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
                 resolved = self.scope[key]
             else:
                 resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
-            self.scope.resolved_snapshot[key] = resolved
-        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[key])
+            self.scope.resolved_snapshot[cache_key] = value, resolved
+        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[cache_key][1])
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1387,13 +1390,21 @@ class _ModernPlayVarView(_PlayVarView):
     __str__ = __repr__
 
 
-class _DelegatedPlayVarView(_ModernPlayVarView):
-    """Read controller template aliases lazily through the magic vars mapping."""
+class _DeferredPlayVarView(_ModernPlayVarView):
+    """Read deferred agent and controller aliases through the magic vars mapping."""
+
+    _preserve_legacy_sources = False
 
     def __getitem__(self, key):
-        value = dict.__getitem__(self, key)
+        if self._loop_snapshot:
+            return super().__getitem__(key)
+        return self._resolve(key, dict.__getitem__(self, key))
+
+    def _resolve(self, key, value):
         if key == "vars":
             return value
+        if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
+            return self.scope[key]
         return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
 
     def items(self):
@@ -1403,21 +1414,21 @@ class _DelegatedPlayVarView(_ModernPlayVarView):
         return ValuesView(self)
 
     def copy(self):
-        return type(self)(dict(dict.items(self)), self.scope)
-
-    @staticmethod
-    def _resolve_delegated(value):
-        return value.resolve() if isinstance(value, _DelegatedTemplateValue) else value
+        return type(self)(dict(dict.items(self)), self.scope, self._loop_snapshot)
 
     def pop(self, key, *default):
-        return self._resolve_delegated(dict.pop(self, key, *default))
+        if key in self:
+            return self._resolve(key, dict.pop(self, key, *default))
+        return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return key, self._resolve_delegated(value)
+        return key, self._resolve(key, value)
 
     def setdefault(self, key, default=None):
-        return self._resolve_delegated(dict.setdefault(self, key, default))
+        if key in self:
+            return self[key]
+        return dict.setdefault(self, key, default)
 
 
 class _LazyTplList(list):
@@ -2264,24 +2275,28 @@ class _Templater:
         if text not in self._lookup_templates:
             nodes = jinja2.nodes
             has_lookup = dynamic_plugin = False
+            template_args = []
             try:
-                pending = [self.env.parse(text)]
+                pending = [(self.env.parse(text), False)]
                 while pending:
-                    node = pending.pop()
+                    node, in_lookup = pending.pop()
                     if (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name)
                             and node.node.name in ("lookup", "query", "q")):
                         has_lookup = True
+                        in_lookup = True
                         if not node.args or not isinstance(node.args[0], nodes.Const):
                             dynamic_plugin = True
                             break
-                    pending.extend(node.iter_child_nodes())
+                    if in_lookup and isinstance(node, nodes.Const) and _looks_templated(node.value):
+                        template_args.append(node.value)
+                    pending.extend((child, in_lookup) for child in node.iter_child_nodes())
             except RecursionError:
                 # The parser may succeed later with a shallower call stack.
                 return False
             except jinja2.TemplateSyntaxError:
                 # Report a parser error only if the value is used.
                 pass
-            self._lookup_templates[text] = has_lookup, dynamic_plugin
+            self._lookup_templates[text] = has_lookup, dynamic_plugin, template_args
         return self._lookup_templates[text][0]
 
     def _contains_mixed_lookup(self, inherited, overrides, role_layers):
@@ -2324,9 +2339,11 @@ class _Templater:
                 stripped = value.strip()
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
-                if self._has_lookup_call(stripped) and (
-                        self._lookup_templates[stripped][1] or self._bare_lookup_expression(stripped) is None):
-                    return True
+                if self._has_lookup_call(stripped):
+                    _, dynamic_plugin, template_args = self._lookup_templates[stripped]
+                    if dynamic_plugin or self._bare_lookup_expression(stripped) is None:
+                        return True
+                    pending.extend(template_args)
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
                 if type(value) is dict:

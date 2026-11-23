@@ -217,6 +217,43 @@ def test_task_defers_alias_to_mixed_lookup_in_hostvars(host_vars):
     assert calls == ["source"]
 
 
+@pytest.mark.parametrize("loop", [None, ["loop item"]])
+def test_legacy_vars_methods_resolve_deferred_task_aliases(monkeypatch, loop):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames, calls = [], []
+    rt = Runtime({}, "", {"inventory_hostname": "h", "item": "original item"}, on_result=frames.append)
+    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "used"
+    task = _task("task", "Show alias", "debug", loop=loop, vars={
+        "alias": "{{ 'value' }}", "unused": "{{ lookup('source') }}/tail",
+    }, args={"msg": "{{ vars.copy().alias }} / "
+             "{{ (vars.items() | selectattr('0', 'equalto', 'alias') | first)[1] }} / {{ vars.copy().item }}"})
+    rt.run_play({"tasks": [task], "gather_facts": False})
+    assert frames[0]["result"]["msg"] == "value / value / original item"
+    assert calls == []
+
+
+def test_task_defers_mixed_lookup_in_a_lookup_argument():
+    frames, calls = [], []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.templater._lookup_loaded["source"] = lambda terms, variables: calls.append("source") or ["first"]
+    rt.templater._lookup_loaded["consume"] = lambda terms, variables: terms
+    variables = {
+        "alias": '''{{ lookup('consume', "{{ lookup('source') }}/{{ suffix }}") }}''',
+        "suffix": "second",
+    }
+    tasks = [
+        _task("skip", "Skip", "debug", vars=variables, when=[False], args={"msg": "{{ alias }}"}),
+        _task("unused", "Unused", "debug", vars=variables, args={"msg": "untouched"}),
+        _task("use", "Use", "debug", vars=variables, args={"msg": "{{ alias }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok", "ok"]
+    assert frames[-1]["result"]["msg"] == "first/second"
+    assert calls == ["source"]
+
+
 @pytest.mark.parametrize(
     "expression", [" + ".join(["term"] * 1100), "(" * 1100 + "term" + ")" * 1100],
     ids=["long_addition", "nested_parentheses"],
