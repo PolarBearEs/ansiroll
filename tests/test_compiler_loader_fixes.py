@@ -337,7 +337,8 @@ def test_compile_dynamic_role_source_selects_root_from_traversal_target(tmp_path
     assert destination.read_text() == "selected template\n"
 
 
-def test_compile_dynamic_role_source_rejects_copy_of_traversed_directory(tmp_path):
+@pytest.mark.parametrize("traversed_type", ["directory", "socket"])
+def test_compile_dynamic_role_source_copy_distinguishes_traversed_file_types(tmp_path, monkeypatch, traversed_type):
     destination = tmp_path / "output"
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -351,19 +352,32 @@ def test_compile_dynamic_role_source_rejects_copy_of_traversed_directory(tmp_pat
     (tmp_path / "roles/r/files/sites/app.j2").mkdir(parents=True)
     later = tmp_path / "roles/r/sites"
     (later / "other/branch").mkdir(parents=True)
-    (later / "other/app.j2").mkdir()
-    (later / "other/app.j2/contents.txt").symlink_to("../../copied-content.txt")
+    if traversed_type == "directory":
+        (later / "other/app.j2").mkdir()
+        (later / "other/app.j2/contents.txt").symlink_to("../../copied-content.txt")
+    else:
+        import socket
+
+        with monkeypatch.context() as patch, socket.socket(socket.AF_UNIX) as source_socket:
+            patch.chdir(later / "other")
+            source_socket.bind("app.j2")
     (later / "link").symlink_to("other/branch", target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"
-    _ansible(playbook, returncode=0)
+    expected = _ansible(playbook, returncode=0)
     copied = destination / "app.j2"
-    contents = copied / "contents.txt"
-    assert contents.read_text() == "from the traversed directory\n"
-    contents.unlink()
-    copied.rmdir()
-    _ansiroll(playbook, tmp_path, returncode=1)
-    assert not copied.exists()
+    if traversed_type == "directory":
+        contents = copied / "contents.txt"
+        assert contents.read_text() == "from the traversed directory\n"
+        contents.unlink()
+        copied.rmdir()
+        _ansiroll(playbook, tmp_path, returncode=1)
+        assert not copied.exists()
+    else:
+        assert copied.read_text() == "regular file at the normalized path\n"
+        copied.unlink()
+        assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+        assert copied.read_text() == "regular file at the normalized path\n"
 
 
 def test_compile_dynamic_role_source_uses_alias_suffix_targets_from_each_root(tmp_path):
@@ -512,6 +526,34 @@ def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tm
     assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
                                     "sites/{{ selection }}.j2")
     assert node["_baked"] == {"sites/app.j2": "available\n"}
+
+
+def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_after_stat(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/app.j2": "removed\n", "later/sites/app.j2": "available\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    original_stat = os.stat
+
+    def stat_then_remove(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if path == str(earlier):
+            earlier.unlink()
+        return info
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", stat_then_remove)
+        node = {}
+        assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                        "sites/{{ selection }}.j2")
+    assert not earlier.exists()
+    key = Runtime._baked_source_key(node, "sites/app.j2")
+    assert node["_baked"][key] == "available\n"
 
 
 @pytest.mark.parametrize("leased_source_exists_at_runtime", [False, True])

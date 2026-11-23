@@ -3765,7 +3765,8 @@ class Runtime:
                         continue
                     # Ansible reads the normalized path within the selected root,
                     # but copy checks the traversed path before choosing whether to recurse.
-                    if normalized in blocked or (is_copy and path in blocked):
+                    traversed_directory = blocked.get(path, False) if isinstance(blocked, dict) else path in blocked
+                    if normalized in blocked or (is_copy and traversed_directory):
                         return "\0blocked"
                     return files.get(normalized) or src
                 return src

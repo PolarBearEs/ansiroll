@@ -1913,6 +1913,13 @@ def _role_source_layout(base, walk):
     return directories, aliases
 
 
+def _role_source_mode(path):
+    try:
+        return os.stat(path).st_mode
+    except OSError:
+        return None
+
+
 def _bake_search_tree(node, task, basedir, subdir, src):
     """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
     its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
@@ -1966,7 +1973,8 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     blockers, shadowed, source_roots = {}, {}, []
     for base, is_subdir, walk, root_dirs, root_aliases in trees:
         root_index = len(source_roots)
-        root_blocks, root_files = set(), {}
+        # The blocker's flag records whether copy would recurse into it.
+        root_blocks, root_files = {}, {}
         source_roots.append((root_dirs, root_aliases, root_blocks, root_files))
         if not prefix and not is_subdir:
             skipped.append((base, root_index))
@@ -1983,7 +1991,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         for root, dirs, files in walk:
             for dirname in dirs:
                 relative = os.path.relpath(os.path.join(root, dirname), base)
-                root_blocks.add(relative)
+                root_blocks[relative] = True
                 blockers.setdefault(relative, set()).add(root_index)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
@@ -1992,31 +2000,37 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     continue
                 if os.sep not in tail and not fn.endswith(tail):
                     continue
-                alternate = rel in claimed
-                if any(os.path.isfile(os.path.join(d, rel)) for d, _ in skipped):
+                mode = _role_source_mode(full)
+                if mode is None:
                     continue
-                if not os.path.exists(full):
+                earlier_sources = []
+                for earlier_base, earlier_index in skipped:
+                    earlier_path = os.path.join(earlier_base, rel)
+                    earlier_mode = _role_source_mode(earlier_path)
+                    if earlier_mode is not None:
+                        earlier_sources.append((earlier_base, earlier_index, earlier_path, earlier_mode))
+                if any(stat.S_ISREG(earlier_mode) for _, _, _, earlier_mode in earlier_sources):
                     continue
-                if not os.path.isfile(full):
-                    root_blocks.add(rel)
+                if not stat.S_ISREG(mode):
+                    root_blocks[rel] = stat.S_ISDIR(mode)
                     blockers.setdefault(rel, set()).add(root_index)
                     continue
+                alternate = rel in claimed
                 if alternate and rel not in shadowed:
                     # Traversal can select this root via a different path than
                     # the normalized path whose payload Ansible reads.
                     root_files[rel] = None
                     continue
-                for earlier_base, earlier_index in skipped:
-                    earlier_path = os.path.join(earlier_base, rel)
-                    if not os.path.exists(earlier_path):
-                        continue
+                for earlier_base, earlier_index, earlier_path, earlier_mode in earlier_sources:
                     earlier_dirs, earlier_aliases, earlier_blocks, _ = source_roots[earlier_index]
                     if not earlier_dirs:
                         found_dirs, found_aliases = _role_source_layout(earlier_base, os.walk(earlier_base))
                         earlier_dirs.update(found_dirs)
                         earlier_aliases.update(found_aliases)
-                    earlier_blocks.add(rel)
-                    earlier_blocks.add(os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base)))
+                    is_directory = stat.S_ISDIR(earlier_mode)
+                    earlier_blocks[rel] = is_directory
+                    resolved_rel = os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base))
+                    earlier_blocks[resolved_rel] = is_directory
                     blockers.setdefault(rel, set()).add(earlier_index)
                 claimed.add(rel)
                 key = "\0%d\0%s" % (root_index, rel) if alternate else rel
@@ -2032,7 +2046,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                             if not alternate:
                                 claimed.remove(rel)
                             del root_files[rel]
-                            root_blocks.add(rel)
+                            root_blocks[rel] = stat.S_ISDIR(st.st_mode)
                             blockers.setdefault(rel, set()).add(root_index)
                             if rel in shadowed:
                                 shadowed[rel].discard(root_index)
@@ -2075,7 +2089,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         node["_baked_tree_shadowed"] = {rel: sorted(blockers[rel] | roots) for rel, roots in shadowed.items()}
         node["_baked_tree_roots"] = [
             (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
-             sorted(root_blocks), root_files)
+             dict(sorted(root_blocks.items())), root_files)
             for root_dirs, root_aliases, root_blocks, root_files in source_roots
         ]
     return True
