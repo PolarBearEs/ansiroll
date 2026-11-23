@@ -2066,15 +2066,15 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 except _RoleSourceLeaseError as ex:
                     baked[key] = {"__ansiroll_source_error__": str(ex)}
                     continue
-                except (FileNotFoundError, NotADirectoryError):
+                except OSError as ex:
+                    if not isinstance(ex, (FileNotFoundError, NotADirectoryError)) and ex.errno != errno.ELOOP:
+                        continue
                     if not alternate:
                         claimed.remove(rel)
                         shadowed.pop(rel, None)
                     else:
                         shadowed[rel].discard(root_index)
                     del root_files[rel]
-                    continue
-                except OSError:
                     continue
                 if not stat.S_ISREG(mode):
                     if not alternate:

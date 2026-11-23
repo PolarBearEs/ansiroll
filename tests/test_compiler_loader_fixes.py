@@ -539,8 +539,8 @@ def test_compile_dynamic_role_source_checks_a_traversed_directory_without_normal
     assert not (tmp_path / "rendered.txt").exists()
 
 
-@pytest.mark.parametrize("replace_parent", [False, True])
-def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch, replace_parent):
+@pytest.mark.parametrize("replacement", ["missing", "parent-file", "symlink-loop"])
+def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch, replacement):
     from types import SimpleNamespace
 
     from ansiroll import loader
@@ -551,11 +551,13 @@ def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tm
 
     def open_source(path):
         if path == str(earlier):
-            if replace_parent:
+            if replacement == "parent-file":
                 earlier.parent.rename(tmp_path / "removed")
                 earlier.parent.write_text("no longer a directory")
             else:
                 earlier.unlink()
+                if replacement == "symlink-loop":
+                    earlier.symlink_to(earlier.name)
         return original_open(path)
 
     roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
