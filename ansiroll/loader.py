@@ -1941,7 +1941,9 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     trees = []
     directories = set()
     aliases = {}
-    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
+    # Before 2.21 Ansible compared the byte path component to a text dirname.
+    explicit_subdir = _literal_head(src).startswith(subdir + "/") and _core_version() >= (2, 21)
+    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True, explicit_subdir=explicit_subdir):
         walk = []
         if prefix or is_subdir:
             for root, dirs, files in os.walk(os.path.join(base, prefix)):
@@ -1991,8 +1993,6 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 if os.sep not in tail and not fn.endswith(tail):
                     continue
                 alternate = rel in claimed
-                if alternate and rel not in shadowed:
-                    continue
                 if any(os.path.isfile(os.path.join(d, rel)) for d, _ in skipped):
                     continue
                 if not os.path.exists(full):
@@ -2000,6 +2000,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 if not os.path.isfile(full):
                     root_blocks.add(rel)
                     blockers.setdefault(rel, set()).add(root_index)
+                    continue
+                if alternate and rel not in shadowed:
+                    # Traversal can select this root via a different path than
+                    # the normalized path whose payload Ansible reads.
+                    root_files[rel] = None
                     continue
                 for earlier_base, earlier_index in skipped:
                     earlier_path = os.path.join(earlier_base, rel)
@@ -2078,7 +2083,7 @@ def _raw_search_path(task, basedir):
     return stack or [basedir]
 
 
-def _search_dirs(task, basedir, subdir, tagged=False):
+def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
     a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
     call it: each task search path (role-aware), then the loader basedir.
@@ -2108,13 +2113,15 @@ def _search_dirs(task, basedir, subdir, tagged=False):
         if is_role and pb_base_dir.endswith("/tasks"):
             dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True))
             dirs.append((pb_base_dir, False))
-        dirs.append((os.path.join(upath, subdir), True))
+        if not explicit_subdir:
+            dirs.append((os.path.join(upath, subdir), True))
         dirs.append((upath, False))
     try:
         base = loader.get_basedir()
     except Exception:
         base = basedir
-    dirs.append((os.path.join(base, subdir), True))
+    if not explicit_subdir:
+        dirs.append((os.path.join(base, subdir), True))
     dirs.append((base, False))
     return dirs if tagged else [d for d, _ in dirs]
 

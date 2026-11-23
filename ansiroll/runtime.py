@@ -3763,7 +3763,7 @@ class Runtime:
                     if path in blocked:
                         return "\0blocked"
                     if path in files:
-                        return files.get(normalized, src)
+                        return files.get(normalized) or src
                 return src
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}

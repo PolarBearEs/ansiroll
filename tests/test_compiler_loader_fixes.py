@@ -274,6 +274,54 @@ def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_pa
     assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
 
 
+@pytest.mark.parametrize("prefix", ["templates/", "./templates/"])
+def test_compile_dynamic_role_source_respects_explicit_templates_prefix(tmp_path, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: "%s{{ selection }}.j2", dest: "rendered.txt"}
+""" % prefix, "roles/r/templates/app.j2": "selected template\n"})
+    (tmp_path / "roles/r/templates/templates/app.j2").mkdir(parents=True)
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    skips_subdirectory = prefix == "templates/" and _CORE >= (2, 21)
+    _ansible(playbook, returncode=0 if skips_subdirectory else 2)
+    if skips_subdirectory:
+        assert destination.read_text() == "selected template\n"
+        destination.unlink()
+    _ansiroll(playbook, tmp_path, returncode=0 if skips_subdirectory else 1)
+    if skips_subdirectory:
+        assert destination.read_text() == "selected template\n"
+
+
+def test_compile_dynamic_role_source_records_duplicate_traversal_target(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/other/app.j2": "earlier traversal target\n",
+        "roles/r/sites/other/app.j2": "later traversal target\n",
+        "roles/r/sites/app.j2": "selected template\n"})
+    (tmp_path / "roles/r/templates/sites/app.j2").mkdir()
+    later = tmp_path / "roles/r/sites"
+    (later / "other/branch").mkdir()
+    (later / "link").symlink_to("other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "selected template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "selected template\n"
+
+
 @pytest.mark.parametrize("suffix", ["live", "prod/live", "keep/../prod/live"])
 def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_path, suffix):
     resolved_suffix = os.path.normpath(suffix)
