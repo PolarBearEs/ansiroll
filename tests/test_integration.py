@@ -2272,6 +2272,49 @@ def test_legacy_playbook_includes_preserve_nested_task_includes(tmp_path, root_i
     assert manifest["fallback_tasks"] == []
 
 
+def test_legacy_playbook_include_preserves_inline_variables(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- include: "{{ child_playbook }} greeting='hello world' tags=imported"\n""")
+    (tmp_path / "child.yml").write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars: {greeting: original}
+  tasks: []
+""")
+
+    plays, _ = parse_playbook(str(playbook), extra_vars={"child_playbook": "child.yml"})
+    assert plays[0]["vars"]["greeting"] == "hello world"
+    assert "tags" not in plays[0]["vars"]
+
+
+@pytest.mark.parametrize("modern", ["import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook"])
+def test_legacy_playbook_include_rejects_conflicting_imports(tmp_path, modern):
+    from ansible.errors import AnsibleParserError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"- include: child.yml\n  {modern}: child.yml\n")
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  tasks: []\n")
+
+    with pytest.raises(AnsibleParserError, match="conflicting playbook include"):
+        parse_playbook(str(playbook))
+
+
+def test_legacy_playbook_include_keeps_aliased_mapping_in_later_vars(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- &imported
+  include: child.yml
+- hosts: localhost
+  gather_facts: false
+  vars: {settings: *imported}
+  tasks: []
+""")
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  tasks: []\n")
+
+    plays, _ = parse_playbook(str(playbook))
+    assert plays[1]["vars"]["settings"] == {"include": "child.yml"}
+
+
 def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):
     play = tmp_path / "play.yml"
     play.write_text("""

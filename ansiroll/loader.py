@@ -12,6 +12,7 @@ import os
 import pkgutil
 import re
 import stat
+from copy import copy
 from functools import lru_cache
 
 from .compat import init_loader
@@ -173,25 +174,64 @@ def _make_rewriting_loader(DataLoader):
 
 
 _TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
+_PLAYBOOK_IMPORT_KEYS = ("import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook")
+
+
+def _rewrite_playbook_include(item):
+    from ansible.errors import AnsibleParserError
+    from ansible.parsing.splitter import parse_kv, split_args
+
+    modern = next((key for key in _PLAYBOOK_IMPORT_KEYS if key in item), None)
+    if modern:
+        raise AnsibleParserError(f"conflicting playbook include keys: include and {modern}", obj=item)
+
+    include = item["include"]
+    parts = split_args(include)
+    rewritten = copy(item)
+    del rewritten["include"]
+    rewritten["import_playbook"] = include
+    if len(parts) <= 1:
+        return rewritten
+
+    params = parse_kv(" ".join(parts[1:]))
+    if "_raw_params" in params:
+        raise AnsibleParserError("legacy playbook include parameters must use key=value", obj=item)
+    if "vars" in item or ("tags" in item and "tags" in params):
+        raise AnsibleParserError("conflicting inline parameters and vars or tags on legacy playbook include", obj=item)
+
+    filename = parts[0]
+    # Splitting a YAML string can drop its template trust on Core 2.19+.
+    try:
+        from ansible.template import is_trusted_as_template, trust_as_template
+    except ImportError:
+        pass
+    else:
+        if is_trusted_as_template(include):
+            filename = trust_as_template(filename)
+            params = {key: trust_as_template(value) for key, value in params.items()}
+    rewritten["import_playbook"] = filename
+    if "tags" in params:
+        rewritten["tags"] = params.pop("tags")
+    rewritten["vars"] = params
+    return rewritten
 
 
 def _rewrite_includes(data, *, playbook=False):
-    # Rewrite in place: ansible-core's parsed containers carry origin tags
-    # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies.
+    # Keep Ansible's source metadata when rewriting task or playbook mappings.
     if not isinstance(data, list):
         return data
-    for item in data:
+    for index, item in enumerate(data):
         if not isinstance(item, dict):
             continue
         for k in _TASK_LIST_KEYS:
             _rewrite_includes(item.get(k))
         if "include" in item and isinstance(item.get("include"), str):
             if playbook:
-                new_key = "import_playbook"
-            else:
-                dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
-                new_key = "include_tasks" if dynamic else "import_tasks"
+                # The original mapping may also be referenced via a YAML alias.
+                data[index] = _rewrite_playbook_include(item)
+                continue
+            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
+            new_key = "include_tasks" if dynamic else "import_tasks"
             items = [(new_key if k == "include" else k, v) for k, v in item.items()]
             item.clear()
             item.update(items)
