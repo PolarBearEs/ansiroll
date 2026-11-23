@@ -352,6 +352,32 @@ def test_compile_dynamic_role_source_selects_root_from_traversal_target(tmp_path
     assert destination.read_text() == "selected template\n"
 
 
+def test_compile_dynamic_role_source_uses_nonregular_traversal_target_without_baking_it(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/app.j2": "selected template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    (sites / "other/branch").mkdir(parents=True)
+    (sites / "other/app.j2").symlink_to(os.devnull)
+    (sites / "link").symlink_to("other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "selected template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "selected template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "sites/other/app.j2" not in template["_baked"]
+
+
 @pytest.mark.parametrize("traversed_type", ["directory", "socket"])
 def test_compile_dynamic_role_source_copy_distinguishes_traversed_file_types(tmp_path, monkeypatch, traversed_type):
     destination = tmp_path / "output"

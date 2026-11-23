@@ -3755,8 +3755,8 @@ class Runtime:
             # directories. A missing or unbaked component can't be canceled.
             normalized = os.path.normpath(src)
             shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
-            if shadowed:
-                roots = task["_baked_tree_roots"]
+            roots = task.get("_baked_tree_roots")
+            if roots:
                 is_copy = (task.get("action") or "").rsplit(".", 1)[-1] == "copy"
                 for directories, aliases, blocked, files in roots:
                     path = Runtime._baked_role_path(parts, directories, aliases)
@@ -3765,9 +3765,12 @@ class Runtime:
                     # Ansible reads the normalized path within the selected root,
                     # but copy checks the traversed path before choosing whether to recurse.
                     traversed_directory = blocked.get(path, False) if isinstance(blocked, dict) else path in blocked
+                    if not shadowed and (path not in blocked or traversed_directory):
+                        break
                     if normalized in blocked or (is_copy and traversed_directory):
                         return "\0blocked"
                     return files.get(normalized) or src
+            if shadowed:
                 return src
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}

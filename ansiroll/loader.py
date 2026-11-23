@@ -2107,8 +2107,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     if aliases:
         node["_baked_tree_aliases"] = aliases
     if shadowed:
-        baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
         node["_baked_tree_shadowed"] = {rel: sorted(blockers.get(rel, set()) | roots) for rel, roots in shadowed.items()}
+    has_special_traversal = any(root_aliases and False in root_blocks.values()
+                                for _, root_aliases, root_blocks, _ in source_roots)
+    if shadowed or has_special_traversal:
+        baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
         node["_baked_tree_roots"] = [
             (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
              dict(sorted(root_blocks.items())), root_files)
