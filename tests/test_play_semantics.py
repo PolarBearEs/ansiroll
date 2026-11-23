@@ -1776,9 +1776,8 @@ def test_setup_first_found_discovers_nested_search_path(tmp_path, monkeypatch, d
 @pytest.mark.parametrize(("fallback_path", "selected_path", "override", "suffix"), [
     ("", "profiles/team/prod.yml", "team/prod.yml", ""),
     (", ''", "profiles/team/prod.yml", "team/prod.yml", ""),
-    (", ''", "team/prod.yml", "team/prod.yml", ""),
+    (", ''", "team/prod.yml", "team/prod.yml", ".yml"),
     ("", "prod.yml", None, ""),
-    ("", "team/prod.yml", None, ""),
     ("", "team/prod.yml", None, ".yml"),
 ])
 def test_setup_first_found_discovers_variable_filename_in_explicit_path(
@@ -1818,38 +1817,71 @@ def test_setup_first_found_discovers_variable_filename_in_explicit_path(
     assert _standalone(project, []) == expected
 
 
-@pytest.mark.parametrize("lookup_args", ["filename", "{'files': [filename], 'paths': [directory]}"])
+@pytest.mark.parametrize("explicit_paths", [False, True])
+@pytest.mark.parametrize("suffix", ["", ".yml"])
 def test_setup_first_found_bundles_absolute_overrides_without_following_links_outside_roots(
-        tmp_path, monkeypatch, lookup_args):
+        tmp_path, monkeypatch, explicit_paths, suffix):
     from ansiroll.loader import parse_playbook
 
+    filename = "filename ~ '.yml'" if suffix else "filename"
+    lookup_args = "{'files': [%s], 'paths': [directory]}" % filename if explicit_paths else filename
+    selected = "team/prod.yml" if suffix else "prod.yml"
     project = tmp_path / "playbook"
     _write(tmp_path, {"outside/unselected.yml": "unrelated: never_bundle_this\n"})
     _write(project, {
         "dev.yml": "subset: [all]\n",
         "profiles/dev.yml": "subset: [all]\n",
-        "team/prod.yml": "subset: ['!all', '!min']\n",
+        selected: "subset: ['!all', '!min']\n",
+        "roles/unrelated/defaults/main.yml": "unrelated: never_bundle_nested\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
-          vars: {filename: dev.yml, directory: profiles}
+          vars: {filename: %s, directory: profiles}
           vars_files:
             - "{{ lookup('first_found', %s) }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """ % lookup_args,
+        """ % ("dev" if suffix else "dev.yml", lookup_args),
     })
     (project / "unselected.yml").symlink_to(tmp_path / "outside/unselected.yml")
     (project / "files").symlink_to(tmp_path / "outside", target_is_directory=True)
     plays, _ = parse_playbook(str(project / "pb.yml"))
-    assert "never_bundle_this" not in json.dumps(plays, default=str)
+    bundled = json.dumps(plays, default=str)
+    assert "never_bundle_this" not in bundled
+    if not suffix:
+        assert "never_bundle_nested" not in bundled
 
-    extra = json.dumps({"filename": str(project / "team/prod.yml")})
+    override = str(project / selected)
+    extra = json.dumps({"filename": override[:-len(suffix)] if suffix else override})
     expected = _ansible(project, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
     assert _standalone(project, []) == expected
+
+
+def test_setup_first_found_bundles_literal_absolute_fallback(tmp_path, monkeypatch):
+    fallback_file = tmp_path / "team/default.yml"
+    _write(tmp_path, {
+        "profiles/dev.yml": "subset: [all]\n",
+        "team/default.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - >-
+              {{ lookup('first_found', {'files': [profile ~ '.yml', %s], 'paths': [playbook_dir ~ '/profiles']}) }}
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % json.dumps(str(fallback_file)),
+    })
+    extra = json.dumps({"profile": "missing"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
 
 
 @pytest.mark.skipif(CORE_VERSION < (2, 12) or CORE_VERSION >= (2, 19), reason="legacy nested skip behavior")

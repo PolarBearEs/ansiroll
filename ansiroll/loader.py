@@ -643,8 +643,16 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 return None
         first = literals[0] if literals else ""
         if (anchored and literals and (first is None or not first.startswith(os.sep))
-                or not anchored and first and first.startswith((os.sep, "~"))
+                or not anchored and first and first.startswith("~")
                 or any(".." in part.split(os.sep) for part in literals if part is not None)):
+            return None
+        if not anchored and first and first.startswith(os.sep):
+            if None in literals:
+                return None
+            path = os.path.normpath("".join(literals))
+            for root in vars_dirs:
+                if path == root or path.startswith(os.path.join(root, "")):
+                    return root, escape(os.path.relpath(path, root))
             return None
         pattern = []
         for part in literals:
@@ -652,7 +660,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 pattern.append(escape(part))
             elif not pattern or pattern[-1] != "\0":
                 pattern.append("\0")
-        return anchored, "".join(pattern).lstrip(os.sep)
+        return basedir if anchored else None, "".join(pattern).lstrip(os.sep)
 
     kwargs = {option.key: option.value for option in call.kwargs}
     version = tuple(map(int, _fact_schema().split(".")))
@@ -695,33 +703,34 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
     patterns = set()
     needs_fallback = False
     for dir_terms, files in groups:
-        directories = [path_pattern(term) for term in dir_terms] or [(False, "")]
+        directories = [path_pattern(term) for term in dir_terms] or [(None, "")]
         filenames = [path_pattern(term) for term in flatten([files], "[,;]")]
         if None in directories or None in filenames:
             needs_fallback = True
-        for absolute_file, filename_pattern in filter(None, filenames):
-            if absolute_file:
-                patterns.add((basedir, "", filename_pattern))
+        for file_root, filename_pattern in filter(None, filenames):
+            if file_root is not None:
+                patterns.add((file_root, "", filename_pattern))
                 continue
-            if filename_pattern.startswith("\0"):
-                # A rendered absolute filename bypasses the search directories.
+            if filename_pattern.startswith("\0") and filename_pattern != "\0":
+                # A bounded absolute override bypasses the search directories.
                 patterns.update((root, "", filename_pattern) for root in vars_dirs)
             if filename_pattern == "\0":
                 needs_fallback = True
-            for absolute_dir, directory in filter(None, directories):
-                if filename_pattern == "\0" and ("\0" in directory or not dir_terms):
+            for directory_root, directory in filter(None, directories):
+                if filename_pattern == "\0" and ("\0" in directory or os.path.normpath(directory) == "."):
                     continue
                 relative = os.path.join(directory, filename_pattern)
-                roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
+                roots = ([directory_root] if directory_root is not None
+                         else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"]))
                 patterns.update((root, directory, filename_pattern) for root in roots)
     for fallback in fallbacks:
         candidate = path_pattern(fallback)
         if candidate is None or candidate[1] == "\0":
             needs_fallback = True
             continue
-        absolute, filename = candidate
-        if absolute:
-            patterns.add((basedir, "", filename))
+        root, filename = candidate
+        if root is not None:
+            patterns.add((root, "", filename))
         elif filename:
             patterns.update((root, "", filename) for root in vars_dirs)
             if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
