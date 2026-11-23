@@ -105,8 +105,8 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
 
     console_aliases = {os.makedev(4, 0), os.makedev(5, 1)}  # tty0, console
     if info.st_rdev in console_aliases or stream.st_rdev in console_aliases:
-        discard_device = os.stat(os.devnull).st_rdev
-        if discard_device in (info.st_rdev, stream.st_rdev):
+        # The Linux memory devices include null, zero and full.
+        if 1 in (os.major(info.st_rdev), os.major(stream.st_rdev)):
             return False
         # TIOCGDEV reports the tty opened, which can differ from the device
         # receiving writes after a TIOCCONS redirection.
@@ -121,13 +121,15 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
             return os.path.samestat(info, stream)
         return _same_stream(info, stream)
 
+    if (1 in (os.major(info.st_rdev), os.major(stream.st_rdev))
+            or (destination_alias and not stream_alias and not os.isatty(fd))):
+        return False
+    probe_error = "cannot verify terminal for manifest path %s" % path
     stream_device = _linux_terminal_device(fd) if stream_alias else stream.st_rdev
     if stream_device is None:
-        return _same_stream(info, stream)
+        raise ValueError(probe_error)
     if not destination_alias and info.st_rdev != stream_device:
         return False  # In particular, do not open an unrelated character device.
-    if destination_alias and not stream_alias and not os.isatty(fd):
-        return False
 
     def controls_terminal(terminal):
         try:
@@ -140,8 +142,8 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
         if destination_fd is None:
             try:
                 pinned_fd = os.open(path, os.O_PATH)
-            except OSError:
-                return _same_stream(info, stream)
+            except OSError as ex:
+                raise ValueError(probe_error) from ex
             stack.callback(os.close, pinned_fd)
             pinned = os.fstat(pinned_fd)
             if not stat.S_ISCHR(pinned.st_mode) or not os.path.samestat(info, pinned):
@@ -150,16 +152,14 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
             try:
                 destination_fd = os.open(fd_path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
             except OSError as ex:
-                if ex.errno in (errno.ENOENT, errno.ENOTDIR):
-                    raise ValueError("cannot verify terminal for manifest path %s without /proc/self/fd" % path) from ex
-                return _same_stream(info, stream)
+                raise ValueError(probe_error) from ex
             stack.callback(os.close, destination_fd)
             opened = os.fstat(destination_fd)
             if not os.path.samestat(info, opened) or not stat.S_ISCHR(opened.st_mode):
                 return False  # The final validation checks the destination actually opened for writing.
         destination_device = _linux_terminal_device(destination_fd) if destination_alias else info.st_rdev
         if destination_device is None:
-            return _same_stream(info, stream)
+            raise ValueError(probe_error)
         if destination_device != stream_device:
             return False
         if not 136 <= os.major(destination_device) <= 143:

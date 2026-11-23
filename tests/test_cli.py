@@ -226,6 +226,16 @@ def test_manifest_terminal_preflight_pins_requested_path(monkeypatch):
     assert not cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
     assert calls == ["/proc/self/fd/4"]
 
+    def denied_reopen(path, flags):
+        if flags == os.O_PATH:
+            return 8
+        raise PermissionError(errno.EACCES, "write probe denied", path)
+
+    handles[8] = alias
+    monkeypatch.setattr(os, "open", denied_reopen)
+    with pytest.raises(ValueError, match="cannot verify terminal for manifest path"):
+        cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
+
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
 def test_manifest_terminal_does_not_probe_unrelated_character_device(monkeypatch):
@@ -251,6 +261,25 @@ def test_manifest_rejects_ambiguous_console_aliases(monkeypatch, first, second):
     monkeypatch.setattr(os, "fstat", lambda fd: stream)
     with pytest.raises(ValueError, match="cannot verify redirected console"):
         cli._same_manifest_stream("virtual console", destination, 2, destination_fd=6)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
+@pytest.mark.parametrize("alias_fd", [2, 6])
+def test_manifest_rejects_unidentified_potential_terminal_alias(monkeypatch, alias_fd):
+    alias = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR)
+    slave = Namespace(st_rdev=os.makedev(136, 5), st_mode=stat.S_IFCHR)
+    monkeypatch.setattr(os, "fstat", lambda fd: alias if alias_fd == 2 else slave)
+    monkeypatch.setattr(os, "isatty", lambda fd: True)
+    monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: None)
+    with pytest.raises(ValueError, match="cannot verify terminal for manifest path"):
+        cli._same_manifest_stream("manifest", alias if alias_fd == 6 else slave, 2, destination_fd=6)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux virtual consoles")
+def test_manifest_distinguishes_console_and_zero(monkeypatch):
+    console = Namespace(st_rdev=os.makedev(5, 1), st_mode=stat.S_IFCHR)
+    monkeypatch.setattr(os, "fstat", lambda fd: console)
+    assert not cli._same_manifest_stream("/dev/zero", os.stat("/dev/zero"), 2)
 
 
 @pytest.mark.parametrize("destination", ["pipe", "file"])
