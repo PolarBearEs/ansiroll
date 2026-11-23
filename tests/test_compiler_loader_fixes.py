@@ -1477,6 +1477,7 @@ def test_dynamic_role_template_keeps_link_budget_after_a_fixed_prefix(tmp_path):
 
 
 @pytest.mark.parametrize(("src", "matched", "excluded"), [
+    ("sites/{{ 'a' + ('li' + 'as') }}/app.j2", "alias/app.j2", "report-alias/app.j2"),
     ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
      "report-alias/app.j2", "alias/other.j2"),
     ("sites/{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),

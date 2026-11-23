@@ -2049,6 +2049,9 @@ def _linked_role_source_patterns(src):
             return [(bindings.get(node.name, "\0"), bindings)]
         if isinstance(node, (nodes.Output, nodes.Concat)):
             return expand(node.nodes, bindings)
+        if isinstance(node, nodes.Add):
+            choices = expand((node.left, node.right), bindings)
+            return [(value if "\0" not in value else "\0", updated) for value, updated in choices]
         if isinstance(node, assignments):
             return expand_assignment(node, bindings)
         if isinstance(node, nodes.If):
