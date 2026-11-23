@@ -1428,6 +1428,10 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
      "report-alias/app.j2", "alias/other.j2"),
     ("sites/{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}{% set stem = 'app' %}/{{ stem }}.j2",
+     "alias/app.j2", "alias/app.j2.bak"),
+    ("sites/{{ group }}{% set stem %}app{% endset %}/{{ stem }}.j2",
+     "alias/app.j2", "alias/app.j2.bak"),
     ("sites/{{ group }}/{% if staged %}stage{% endif %}//app.j2", "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ empty }}{{ suffix }}/alias/app.j2", "alias/app.j2", "alias/not-app.j2"),
 ])
@@ -1441,7 +1445,7 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
 - template: {src: "%s", dest: "output.txt"}
 """ % src, "roles/r/templates/sites/app.j2": "ordinary\n",
         "shared/app.j2": "linked\n", "shared/other.j2": "excluded\n",
-        "shared/not-app.j2": "excluded\n"})
+        "shared/not-app.j2": "excluded\n", "shared/app.j2.bak": "excluded\n"})
     sites = tmp_path / "roles/r/templates/sites"
     for name in ("alias", "report-alias"):
         (sites / name).symlink_to(tmp_path / "shared", target_is_directory=True)
@@ -1465,19 +1469,20 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
     assert len(reads) == 1
 
 
-@pytest.mark.parametrize("directory_expression", [
-    "{% if use_blue %}blue{% elif use_green %}green{% else %}orange{% endif %}",
-    "{{ 'blue' if use_blue else ('green' if use_green else 'orange') }}",
+@pytest.mark.parametrize("src", [
+    "sites/{% if use_blue %}blue{% elif use_green %}green{% else %}orange{% endif %}/{{ name }}.j2",
+    "sites/{{ 'blue' if use_blue else ('green' if use_green else 'orange') }}/{{ name }}.j2",
+    "sites/{{ ('blue' if use_blue else ('green' if use_green else 'orange')) ~ '/' ~ name }}.j2",
 ])
-def test_dynamic_role_template_bakes_only_conditional_directory_choices(tmp_path, directory_expression):
+def test_dynamic_role_template_bakes_only_conditional_directory_choices(tmp_path, src):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
 - set_fact: {name: app, use_blue: false, use_green: true}
-- template: {src: "sites/%s/{{ name }}.j2", dest: output.txt}
-""" % directory_expression, "roles/r/templates/sites/local.j2": "ordinary template\n",
+- template: {src: "%s", dest: output.txt}
+""" % src, "roles/r/templates/sites/local.j2": "ordinary template\n",
         "shared/blue/app.j2": "blue template\n", "shared/green/app.j2": "green template\n",
         "shared/orange/app.j2": "orange template\n", "shared/prod/client-key.j2": "unrelated input\n"})
     sites = tmp_path / "roles/r/templates/sites"

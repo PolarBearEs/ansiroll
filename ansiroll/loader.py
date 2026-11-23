@@ -2011,8 +2011,10 @@ def _linked_role_source_patterns(src):
             return [node.data]
         if isinstance(node, nodes.Const) and isinstance(node.value, str):
             return [node.value]
-        if isinstance(node, nodes.Output):
+        if isinstance(node, (nodes.Output, nodes.Concat)):
             return expand(node.nodes)
+        if isinstance(node, (nodes.Assign, nodes.AssignBlock)):
+            return [""]
         if isinstance(node, nodes.If):
             choices = []
             for branch in (node, *node.elif_):
