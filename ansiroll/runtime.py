@@ -1002,7 +1002,8 @@ def _first_found_setup(args, options, ctx, *, selector):
             paths.extend(os.path.join(directory, name) for directory in directories or [""] for name in names)
         return paths, skip
 
-    candidates, skip = collect(args or [keyword_options.get("files")])
+    terms = args or ([keyword_options.get("files")] if not reset_positional else ())
+    candidates, skip = collect(terms)
     for path in candidates:
         path = os.path.expanduser(path)
         search_dirs = lookup_dirs.get("files" if path.split(os.sep)[0] == "files" else "default", dirs)
@@ -1012,7 +1013,7 @@ def _first_found_setup(args, options, ctx, *, selector):
                 return [candidate]
     if _core_at_least(2, 19):
         skip = options.get("skip", False)
-    if skip:
+    if _ansible_boolean(skip):
         return []
     message = "No bundled vars file was found" if selector else "No file was found"
     raise _VarsFileLookupError(message + " when using first_found.")

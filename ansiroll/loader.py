@@ -661,16 +661,6 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                     pattern.append(wildcard)
         return anchored, "".join(pattern).lstrip(os.sep)
 
-    def filename_globs(pattern):
-        # A filename expression can contain separators, while its literal
-        # prefix and suffix still restrict which files the lookup can select.
-        yield pattern.replace("\0", "*")
-        for index, char in enumerate(pattern):
-            if char == "\0":
-                prefix = pattern[:index].replace("\0", "*")
-                suffix = pattern[index + 1:].replace("\0", "*")
-                yield prefix + "*/**/*" + suffix
-
     kwargs = {option.key: option.value for option in call.kwargs}
     version = tuple(map(int, _fact_schema().split(".")))
     keyword_paths = kwargs.get("paths") if version >= (2, 12) else None
@@ -705,7 +695,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         return groups
 
     groups = collect(call.args[1:])
-    if version >= (2, 12) and not call.args[1:] and "files" in kwargs:
+    if version >= (2, 16) and not call.args[1:] and "files" in kwargs:
         dir_terms = list(flatten([paths], "[,:;]", preserve_empty=True)) if paths is not None else []
         groups.append((dir_terms, kwargs["files"]))
 
@@ -717,26 +707,50 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             return None
         for absolute_dir, directory in directories:
             for absolute_file, filename_pattern in filenames:
-                for filename in filename_globs(filename_pattern):
-                    if absolute_file:
-                        patterns.add((basedir, filename))
-                        continue
-                    relative = os.path.join(directory, filename)
-                    roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
-                    patterns.update((root, relative) for root in roots)
+                if absolute_file:
+                    patterns.add((basedir, "", filename_pattern))
+                    continue
+                relative = os.path.join(directory, filename_pattern)
+                roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
+                patterns.update((root, directory, filename_pattern) for root in roots)
     for fallback in fallbacks:
         candidate = path_pattern(fallback, directory=False)
         if candidate is None:
             return None
-        absolute, filename_pattern = candidate
-        for filename in filename_globs(filename_pattern):
-            if absolute:
-                patterns.add((basedir, filename))
-            elif filename:
-                patterns.update((root, filename) for root in vars_dirs)
-                if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
-                    patterns.update((os.path.join(root, vars_subdir), filename) for root in vars_dirs)
+        absolute, filename = candidate
+        if absolute:
+            patterns.add((basedir, "", filename))
+        elif filename:
+            patterns.update((root, "", filename) for root in vars_dirs)
+            if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
+                patterns.update((root, vars_subdir, filename) for root in vars_dirs)
     return patterns
+
+
+def _modeled_first_found_files(candidates):
+    from fnmatch import fnmatchcase
+    from pathlib import Path
+
+    for root, directory_pattern, filename in sorted(candidates):
+        base = Path(root)
+        real_base = base.resolve()
+        directories = base.glob(directory_pattern) if directory_pattern else (base,)
+        search = filename
+        if "\0" in filename:
+            # Narrow the walk with fixed path ends, then use fnmatch's
+            # separator-spanning wildcards to verify the entire filename.
+            prefix = filename.split("\0", 1)[0].rpartition(os.sep)[0]
+            suffix = filename.rsplit("\0", 1)[-1]
+            leaf = suffix.rsplit(os.sep, 1)[-1] if os.sep in suffix else "*" + suffix
+            search = os.path.join(prefix, "**", leaf)
+        match = filename.replace("\0", "*")
+        for directory in directories:
+            if not directory.is_dir() or not directory.resolve().is_relative_to(real_base):
+                continue
+            for path in directory.glob(search):
+                if (path.is_file() and fnmatchcase(str(path.relative_to(directory)), match)
+                        and path.resolve().is_relative_to(real_base)):
+                    yield os.path.normpath(path)
 
 
 def _deferred_vars_files(play, basedir, entries, *, setup=False):
@@ -749,7 +763,6 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
     filenames and in the play's vars search directories.
     """
     import glob
-    from pathlib import Path
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
@@ -768,12 +781,7 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
             if first_found:
                 lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs, dirs, subdir)
                 if lookup_candidates is not None:
-                    for root, file_pattern in sorted(lookup_candidates):
-                        base = Path(root)
-                        real_base = base.resolve()
-                        for found in base.glob(file_pattern):
-                            if found.is_file() and real_base in found.resolve().parents:
-                                candidates[os.path.normpath(found)] = True
+                    candidates.update((found, True) for found in _modeled_first_found_files(lookup_candidates))
                     continue
             # A legacy bare expression can still select a file inside vars/
             # via an absolute path returned by the controller lookup.
