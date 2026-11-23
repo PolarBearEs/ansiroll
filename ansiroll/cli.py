@@ -510,7 +510,7 @@ def _diagnostic_stream_may_be_playbook(stream, playbook):
             return True
     try:
         source = os.stat(path)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     except (OSError, UnicodeError):
         # The open stream may still reach the input even if its path cannot

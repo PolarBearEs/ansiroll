@@ -365,6 +365,24 @@ def test_merged_compile_diagnostics_leave_the_input_fifo_empty(tmp_path):
     assert result.returncode == 2
 
 
+@pytest.mark.parametrize("output_mode", ["file", "stdout"])
+def test_compile_reports_input_with_a_nondirectory_component(tmp_path, output_mode):
+    pytest.importorskip("ansible")
+    parent = tmp_path / "regular-file"
+    parent.touch()
+    playbook = parent / "play.yml"
+    output = tmp_path / "compiled.py"
+    result = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+         "-o", "-" if output_mode == "stdout" else str(output)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 2
+    assert "play.yml" in result.stderr
+    assert result.stdout == ""
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("component", ["filename", "directory"])
 def test_merged_compile_diagnostics_use_legacy_filename_encoding(monkeypatch, cli_os, tmp_path, component):
     pytest.importorskip("ansible")
