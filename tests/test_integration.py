@@ -2310,6 +2310,42 @@ def test_legacy_playbook_include_uses_last_tag_declaration(tmp_path, include, ta
     assert plays[0].tags == [tag]
 
 
+@pytest.mark.parametrize("inline_tags", [False, True])
+def test_legacy_playbook_include_defers_import_fields(tmp_path, monkeypatch, inline_tags):
+    from ansiroll import loader
+
+    include = "child.yml tags='{{ deployment_tag }}'" if inline_tags else "child.yml"
+    tags = "" if inline_tags else '  tags: ["{{ deployment_tag }}"]\n'
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(
+        f'- include: "{include}"\n' + tags
+        + """  when: "{{ inventory_hostname == 'localhost' }}"\n"""
+    )
+    (tmp_path / "child.yml").write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars: {deployment_tag: rollout}
+  tasks:
+    - debug: {msg: imported-task}
+""")
+    original_convert = loader._convert_play
+
+    def check_tags(play, *args, **kwargs):
+        assert play.tags == ["{{ deployment_tag }}"]
+        return original_convert(play, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "_convert_play", check_tags)
+    source, _ = compile_playbook(str(playbook))
+    plans = _compiled_plays(source, tmp_path)
+    condition = {"__ansiroll_trusted_condition__": "{{ inventory_hostname == 'localhost' }}"}
+    assert plans[0]["gather_when"] == [condition]
+    task = next(task for block in plans[0]["tasks"] for task in block["block"] if task.get("action") == "debug")
+    assert task["when"] == [condition]
+    result = subprocess.run([sys.executable, str(tmp_path / "compiled.py")],
+                            capture_output=True, text=True, timeout=30, check=True)
+    assert "imported-task" in result.stdout
+
+
 @pytest.mark.parametrize("modern", ["import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook"])
 def test_legacy_playbook_include_rejects_conflicting_imports(tmp_path, modern):
     from ansible.errors import AnsibleParserError

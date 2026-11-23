@@ -140,6 +140,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
     uuids = {}
     runtime_writes = set()
     for play in pb.get_plays():
+        loader.restore_legacy_import_fields(play)
         # Like ansible-playbook (cli/playbook.py, executor/playbook_executor.py):
         # run each play with the loader's basedir set to the directory of the
         # playbook file that defined it, so role, include and src lookups are
@@ -163,12 +164,60 @@ def _make_rewriting_loader(DataLoader):
     playbook_reader = Playbook._load_playbook_data.__code__
 
     class RewritingDataLoader(DataLoader):
+        def __init__(self):
+            super().__init__()
+            self._deferred_import_fields = {}
+
         def load_from_file(self, *args, **kwargs):
             # An include-only playbook and an include-only task file have the
             # same YAML shape. Use the reader that requested the file.
             playbook = sys._getframe(1).f_code is playbook_reader
             data = super(RewritingDataLoader, self).load_from_file(*args, **kwargs)
-            return _rewrite_includes(data, playbook=playbook)
+            return _rewrite_includes(data, playbook=playbook, defer_import_fields=self._defer_import_fields)
+
+        def _defer_import_fields(self, entry):
+            try:
+                from ansible.template import is_trusted_as_template, trust_as_template
+            except ImportError:
+                return
+            from uuid import uuid4
+
+            def templated(value):
+                return (isinstance(value, str) and is_trusted_as_template(value)
+                        and any(token in value for token in ("{{", "{%", "{#")))
+
+            # Core 2.19+ validates the import before it loads the child.
+            # Pass opaque values through that step and restore their original
+            # trusted strings after Ansible has propagated them to the play.
+            for field in ("tags", "when"):
+                original = entry.get(field)
+                values = original if isinstance(original, list) else [original]
+                if not any(templated(value) for value in values):
+                    continue
+                if field == "tags" and isinstance(original, str):
+                    values = [trust_as_template(tag.strip()) for tag in original.split(",")]
+                deferred = []
+                for value in values:
+                    if templated(value):
+                        marker = "__ansiroll_import_" + uuid4().hex
+                        self._deferred_import_fields[marker] = value
+                        deferred.append(marker)
+                    else:
+                        deferred.append(value)
+                entry[field] = deferred
+
+        def restore_legacy_import_fields(self, play):
+            if not self._deferred_import_fields:
+                return
+            fields = [(play, "_tags"), (play, "_included_conditional")]
+            fields.extend((node, "_when") for node in (*play.pre_tasks, *play.roles, *play.tasks, *play.post_tasks))
+            for node, field in fields:
+                values = getattr(node, field, None)
+                if isinstance(values, list):
+                    restored = [self._deferred_import_fields.get(value, value) if isinstance(value, str) else value
+                                for value in values]
+                    if restored != values:
+                        setattr(node, field, restored)
 
     return RewritingDataLoader()
 
@@ -224,7 +273,7 @@ def _rewrite_playbook_include(item):
     return rewritten
 
 
-def _rewrite_includes(data, *, playbook=False):
+def _rewrite_includes(data, *, playbook=False, defer_import_fields=None):
     # Keep Ansible's source metadata when rewriting task or playbook mappings.
     if not isinstance(data, list):
         return data
@@ -236,7 +285,10 @@ def _rewrite_includes(data, *, playbook=False):
         if "include" in item and isinstance(item.get("include"), str):
             if playbook:
                 # The original mapping may also be referenced via a YAML alias.
-                data[index] = _rewrite_playbook_include(item)
+                rewritten = _rewrite_playbook_include(item)
+                if defer_import_fields is not None:
+                    defer_import_fields(rewritten)
+                data[index] = rewritten
                 continue
             dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
             new_key = "include_tasks" if dynamic else "import_tasks"
