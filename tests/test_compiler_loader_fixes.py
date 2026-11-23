@@ -1411,7 +1411,7 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
 """, "roles/r/tasks/main.yml": """
 - set_fact: {selection: "%stemplates/sites/alias/app"}
 - template: {src: "{{ selection }}.j2", dest: "output.txt"}
-""" % prefix, "roles/r/templates/shared/app.j2": "linked source\n"})
+""" % prefix, "roles/r/templates/shared/app.j2": "linked source\n{{ template_fullpath }}\n"})
     sites = tmp_path / "roles/r/templates/sites"
     sites.mkdir(parents=True)
     (sites / "alias").symlink_to("../shared", target_is_directory=True)
@@ -1419,9 +1419,11 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook, returncode=0)
     destination = tmp_path / "output.txt"
+    expected_content = destination.read_text()
+    assert expected_content.startswith("linked source\n")
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
-    assert destination.read_text() == "linked source\n"
+    assert destination.read_text() == expected_content
 
 
 @pytest.mark.parametrize(("src", "matched", "excluded"), [
@@ -1432,6 +1434,10 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     ("sites/{{ group }}{% set stem = 'app' %}/{{ stem }}.j2",
      "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ group }}{% set stem %}app{% endset %}/{{ stem }}.j2",
+     "alias/app.j2", "alias/not-app.j2"),
+    ("{% set unused %}{% for value in [1] %}discard{% endfor %}{% endset %}sites/{{ group }}/app.j2",
+     "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}/{% set folder %}{% for value in [] %}{{ value }}{% endfor %}{% endset %}{{ folder }}/app.j2",
      "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ ('staging/' if staged) ~ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ 'staging/' if staged }}{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),

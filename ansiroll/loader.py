@@ -1982,9 +1982,10 @@ def _linked_role_source_patterns(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     try:
-        body = Environment(keep_trailing_newline=True).parse(src).body
+        parsed = Environment(keep_trailing_newline=True).parse(src)
     except TemplateSyntaxError:
         return None
+    body = parsed.body
     assignments = (nodes.Assign, nodes.AssignBlock)
     output_nodes = [node for node in body if not isinstance(node, assignments)]
     if not output_nodes:
@@ -1999,6 +2000,7 @@ def _linked_role_source_patterns(src):
     if (not (len(output_nodes) == 1 and isinstance(output_nodes[0], nodes.Output))
             and not literal(output_nodes[-1], -1)):
         return None
+    referenced = {name.name for name in parsed.find_all(nodes.Name) if name.ctx == "load"}
 
     def expand(sequence, bindings):
         paths = [("", bindings)]
@@ -2017,12 +2019,18 @@ def _linked_role_source_patterns(src):
         if not isinstance(target, nodes.Name):
             unknown = {name.name: "\0" for name in target.find_all(nodes.Name)}
             return [("", {**bindings, **unknown})]
+        if target.name not in referenced:
+            return [("", bindings)]
         if isinstance(node, nodes.Assign):
             values = expand_node(node.node, bindings)
-        elif node.filter is None:
-            values = expand(node.body, bindings)
         else:
             values = [("\0", bindings)]
+            if node.filter is None:
+                try:
+                    values = expand(node.body, bindings)
+                except ValueError:
+                    # Captured output does not otherwise affect the path.
+                    pass
         return [("", {**bindings, target.name: value}) for value, _ in values]
 
     def expand_node(node, bindings):
