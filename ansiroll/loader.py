@@ -699,22 +699,21 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         filenames = [path_pattern(term) for term in flatten([files], "[,;]")]
         if None in directories or None in filenames:
             needs_fallback = True
-        for absolute_dir, directory in filter(None, directories):
-            for absolute_file, filename_pattern in filter(None, filenames):
-                if filename_pattern == "\0":
-                    # Preserve shallow discovery for absolute overrides.
-                    needs_fallback = True
-                    if "\0" in directory or not dir_terms:
-                        continue
-                if absolute_file:
-                    patterns.add((basedir, "", filename_pattern))
+        for absolute_file, filename_pattern in filter(None, filenames):
+            if absolute_file:
+                patterns.add((basedir, "", filename_pattern))
+                continue
+            if filename_pattern.startswith("\0"):
+                # A rendered absolute filename bypasses the search directories.
+                patterns.update((root, "", filename_pattern) for root in vars_dirs)
+            if filename_pattern == "\0":
+                needs_fallback = True
+            for absolute_dir, directory in filter(None, directories):
+                if filename_pattern == "\0" and ("\0" in directory or not dir_terms):
                     continue
                 relative = os.path.join(directory, filename_pattern)
                 roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
                 patterns.update((root, directory, filename_pattern) for root in roots)
-                if filename_pattern.startswith("\0"):
-                    # A rendered absolute filename bypasses the search directories.
-                    patterns.update((root, "", filename_pattern) for root in vars_dirs)
     for fallback in fallbacks:
         candidate = path_pattern(fallback)
         if candidate is None or candidate[1] == "\0":
@@ -844,6 +843,7 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
     dirs = [os.path.normpath(d) for d in dirs]
     vars_dirs = tuple(os.path.normcase(os.path.realpath(os.path.join(d, "vars"))) + os.sep for d in dirs)
     first_found_dirs = _first_found_search_dirs(play, basedir) if setup else None
+    setup_roots = tuple(os.path.join(os.path.normcase(os.path.realpath(d)), "") for d in dirs) if setup else ()
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
@@ -882,7 +882,8 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                         in_vars_dir = os.path.normcase(os.path.realpath(found)).startswith(vars_dirs)
                         candidates[found] = (candidates.get(found, False) or in_vars_dir
                                              or path in lookup_patterns or not _is_templated(name))
-        files = {path: _bundled_vars_file(play, path, allow_lists) for path, allow_lists in candidates.items()}
+        files = {path: _bundled_vars_file(play, path, allow_lists) for path, allow_lists in candidates.items()
+                 if not setup or os.path.normcase(os.path.realpath(path)).startswith(setup_roots)}
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
         if aliases:
             entry["first_found_aliases"] = aliases

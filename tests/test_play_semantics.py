@@ -1818,6 +1818,40 @@ def test_setup_first_found_discovers_variable_filename_in_explicit_path(
     assert _standalone(project, []) == expected
 
 
+@pytest.mark.parametrize("lookup_args", ["filename", "{'files': [filename], 'paths': [directory]}"])
+def test_setup_first_found_bundles_absolute_overrides_without_following_links_outside_roots(
+        tmp_path, monkeypatch, lookup_args):
+    from ansiroll.loader import parse_playbook
+
+    project = tmp_path / "playbook"
+    _write(tmp_path, {"outside/unselected.yml": "unrelated: never_bundle_this\n"})
+    _write(project, {
+        "dev.yml": "subset: [all]\n",
+        "profiles/dev.yml": "subset: [all]\n",
+        "team/prod.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {filename: dev.yml, directory: profiles}
+          vars_files:
+            - "{{ lookup('first_found', %s) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % lookup_args,
+    })
+    (project / "unselected.yml").symlink_to(tmp_path / "outside/unselected.yml")
+    (project / "files").symlink_to(tmp_path / "outside", target_is_directory=True)
+    plays, _ = parse_playbook(str(project / "pb.yml"))
+    assert "never_bundle_this" not in json.dumps(plays, default=str)
+
+    extra = json.dumps({"filename": str(project / "team/prod.yml")})
+    expected = _ansible(project, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(project, []) == expected
+
+
 @pytest.mark.skipif(CORE_VERSION < (2, 12) or CORE_VERSION >= (2, 19), reason="legacy nested skip behavior")
 def test_setup_first_found_legacy_nested_list_resets_skip(tmp_path, monkeypatch):
     _write(tmp_path, {
