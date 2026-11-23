@@ -2029,6 +2029,7 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested[:1] | map('default', 'fallback') | first", "unknown_filter"),
     ({"nested": ["{{ 'value' | unknown_filter }}"]}, "(ALIAS.nested + []) | map('default', 'fallback') | first", "unknown_filter"),
     ({"nested": ["{{ 'value' | unknown_filter }}"]}, "([] + ALIAS.nested) | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "('opts=' ~ (ALIAS.nested[:1] | string))", "unknown_filter"),
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".values()", "unknown_filter"),
     ({"nested": ["{{ 'value' | unknown_filter }}"], "ok": "optional"}, ".ok", None),
     ("{{ 1 / 0 }}", "", "division by zero"),

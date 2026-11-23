@@ -94,6 +94,9 @@ class _LegacyDelegatedValue:
 class _DelegatedMemberError(StrictUndefined):
     __UNSAFE__ = True
 
+    def __repr__(self):
+        self._fail_with_undefined_error()
+
 
 def _legacy_environment_validator(validate, aliases):
     """Keep native Ansible environment validation, with lazy Jinja name binding."""
