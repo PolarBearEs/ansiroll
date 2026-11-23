@@ -2009,7 +2009,7 @@ def _linked_role_source_pattern(src):
     for index, segment in enumerate(segments):
         directory = index < len(segments) - 1
         # A substitution can supply a separator before or after a literal dot.
-        segment = segment.replace("\0.\0", "\0")
+        segment = re.sub(r"\x00(?:\.\x00)+", "\0", segment)
         if segment.startswith(".\0"):
             segment = segment[1:]
         if directory and segment.endswith("\0."):
@@ -2105,10 +2105,10 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
 
     assets, metadata, contents = {}, {}, {}
     newline = "" if subdir == "files" else None
-    visits = 0
-    # Queue every search root before expanding aliases so cycles in one root
-    # cannot starve shallow paths in another.
-    pending_dirs = deque()
+    remaining_linked_visits = 4096
+    # Finish paths with the current number of symlinks before expanding paths
+    # with one more, even when a path has many ordinary directories.
+    pending_dirs, next_hop_dirs = deque(), deque()
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         if not prefix and not is_subdir:
             continue
@@ -2116,9 +2116,17 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
-        pending_dirs.append((tree, base, is_subdir, False))
-    while pending_dirs:
-        root, base, is_subdir, linked = pending_dirs.popleft()
+        pending_dirs.append((tree, base, is_subdir))
+    linked = False
+    while pending_dirs or next_hop_dirs:
+        if not pending_dirs:
+            pending_dirs, next_hop_dirs = next_hop_dirs, pending_dirs
+            linked = True
+        if linked:
+            if not remaining_linked_visits:
+                break
+            remaining_linked_visits -= 1
+        root, base, is_subdir = pending_dirs.popleft()
         step = next(os.walk(root), None)
         if step is None:
             continue
@@ -2128,14 +2136,11 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
             target = os.path.realpath(path)
             if name.startswith(".") or not visible(target):
                 continue
-            child_linked = linked or os.path.islink(path)
-            if child_linked:
-                # Visit short paths first so a cycle cannot consume the
-                # entire budget before other direct aliases are reached.
-                if visits >= 4096:
-                    continue
-                visits += 1
-            pending_dirs.append((path, base, is_subdir, child_linked))
+            child_is_link = os.path.islink(path)
+            queue = next_hop_dirs if child_is_link else pending_dirs
+            if (linked or child_is_link) and len(queue) >= remaining_linked_visits:
+                continue
+            queue.append((path, base, is_subdir))
         for name in sorted(files):
             if name.startswith("."):
                 continue

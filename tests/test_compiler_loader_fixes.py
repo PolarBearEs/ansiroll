@@ -1234,15 +1234,19 @@ def test_dynamic_role_template_resolves_finite_link_paths(tmp_path, source, sele
     assert destination.read_text() == "linked template\n"
 
 
-def test_dynamic_role_template_normalizes_dot_before_substitution(tmp_path):
+@pytest.mark.parametrize(("source", "variables"), [
+    ("sites/.{{ extra }}app.j2", {"extra": "/alias/"}),
+    ("sites/{{ a }}.{{ b }}.{{ c }}app.j2", {"a": "alias/", "b": "/", "c": "/"}),
+])
+def test_dynamic_role_template_normalizes_computed_dot_components(tmp_path, source, variables):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {extra: /alias/}
-- template: {src: "sites/.{{ extra }}app.j2", dest: output.txt}
-""", "roles/r/templates/shared/app.j2": "linked template\n"})
+- set_fact: %s
+- template: {src: "%s", dest: output.txt}
+""" % (json.dumps(variables), source), "roles/r/templates/shared/app.j2": "linked template\n"})
     sites = tmp_path / "roles/r/templates/sites"
     sites.mkdir()
     (sites / "alias").symlink_to("../shared", target_is_directory=True)
@@ -1256,21 +1260,23 @@ def test_dynamic_role_template_normalizes_dot_before_substitution(tmp_path):
     assert destination.read_text() == "linked template\n"
 
 
-def test_dynamic_role_template_reaches_later_search_root_with_cyclic_aliases(tmp_path):
+@pytest.mark.parametrize("depth", [0, 11])
+def test_dynamic_role_template_reaches_later_search_root_with_cyclic_aliases(tmp_path, depth):
+    directory = "/".join(["nested"] * depth + ["alias"])
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {selection: alias/app}
+- set_fact: {selection: %s/app}
 - template: {src: "sites/{{ selection }}.j2", dest: output.txt}
-""", "roles/r/templates/sites/local.txt": "unrelated\n", "shared/app.j2": "linked template\n"})
+""" % directory, "roles/r/templates/sites/local.txt": "unrelated\n", "shared/app.j2": "linked template\n"})
     earlier = tmp_path / "roles/r/templates/sites"
     for name in ("cycle_a", "cycle_b"):
         (earlier / name).symlink_to(".", target_is_directory=True)
-    later = tmp_path / "templates/sites"
-    later.mkdir(parents=True)
-    (later / "alias").symlink_to("../../shared", target_is_directory=True)
+    alias = tmp_path / "templates/sites" / directory
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(tmp_path / "shared", target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook, returncode=0)
