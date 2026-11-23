@@ -1920,6 +1920,62 @@ def _role_source_mode(path):
         return None
 
 
+def _role_traversal_duplicates(claimed, special_paths, directories, aliases, suffix):
+    """Find normalized files whose spelling can traverse a special file."""
+    if not special_paths:
+        return set()
+
+    children, parents = {}, {}
+    for path in (directories | aliases.keys()) - {"."}:
+        parent, name = os.path.split(path)
+        parent = parent or "."
+        target = aliases.get(path, path)
+        children.setdefault(parent, {})[name] = target
+        parents.setdefault(target, set()).add(parent)
+
+    # An excursion adds a component and cancels it with "..". An alias can
+    # change the physical directory even when the normalized path is the same.
+    excursions, incoming, pending = {}, {}, []
+
+    def connect(start, end):
+        if start != end and end not in excursions.setdefault(start, set()):
+            excursions[start].add(end)
+            incoming.setdefault(end, set()).add(start)
+            pending.append((start, end))
+
+    for path, target in aliases.items():
+        if target != ".":
+            connect(os.path.dirname(path) or ".", os.path.dirname(target) or ".")
+    # Compose excursions and allow one inside another child/parent pair.
+    while pending:
+        start, end = pending.pop()
+        for following in tuple(excursions.get(end, ())):
+            connect(start, following)
+        for preceding in tuple(incoming.get(start, ())):
+            connect(preceding, end)
+        if end != ".":
+            for parent in parents.get(start, ()):
+                connect(parent, os.path.dirname(end) or ".")
+
+    special_names = {os.path.basename(path) for path in special_paths}
+    duplicates = set()
+    for path in claimed:
+        parts = path.split(os.sep)
+        if parts[-1] not in special_names or (suffix and parts[-len(suffix):] != suffix):
+            continue
+        current = {"."}
+        suffix_start = len(parts) - len(suffix)
+        for index, component in enumerate(parts):
+            # A canceled segment may occur before the fixed trailing parts.
+            if index <= suffix_start:
+                current |= {end for start in current for end in excursions.get(start, ())}
+            if index < len(parts) - 1:
+                current = {child for parent in current if (child := children.get(parent, {}).get(component))}
+        if any(os.path.normpath(os.path.join(parent, parts[-1])) in special_paths for parent in current):
+            duplicates.add(path)
+    return duplicates
+
+
 def _bake_search_tree(node, task, basedir, subdir, src):
     """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
     its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
@@ -1993,7 +2049,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 children = (os.path.normpath(os.path.join(directory, component)) for directory in reachable)
                 reachable = {target for child in children if (target := root_aliases.get(child, child)) in root_dirs}
             alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
-        special_names = set()
+        special_paths = set()
         # Canceling a sibling alias with ".." returns to the same parent.
         # A walked regular file can only differ from the traversed source
         # after a symlink changes the parent reached by "..".
@@ -2006,10 +2062,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             for directory, _, files in walk:
                 for filename in claimed_names.intersection(files):
                     path = os.path.join(directory, filename)
-                    if matches_suffix(os.path.relpath(path, base), filename, alias_candidates):
+                    relative = os.path.relpath(path, base)
+                    if matches_suffix(relative, filename, alias_candidates):
                         mode = _role_source_mode(path)
                         if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                            special_names.add(filename)
+                            special_paths.add(relative)
+        traversal_duplicates = _role_traversal_duplicates(claimed, special_paths, root_dirs, root_aliases, suffix)
         for root, dirs, files in walk:
             for dirname in dirs:
                 path = os.path.join(root, dirname)
@@ -2043,7 +2101,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     blockers.setdefault(rel, set()).add(root_index)
                     continue
                 alternate = rel in claimed
-                if alternate and rel not in shadowed and fn not in special_names:
+                if alternate and rel not in shadowed and rel not in traversal_duplicates:
                     # Traversal can select this root via a different path than
                     # the normalized path whose payload Ansible reads.
                     root_files[rel] = None

@@ -645,19 +645,31 @@ def test_compile_dynamic_role_source_can_bypass_an_unreadable_earlier_file(tmp_p
         assert node["_baked"][traversed] == "available\n"
 
 
-@pytest.mark.parametrize("scenario", ["suffix_mismatch", "sibling_alias", "disappears"])
+@pytest.mark.parametrize("scenario", ["suffix_mismatch", "sibling_alias", "remote_redirect", "disappears", "chained"])
 def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_duplicates(tmp_path, monkeypatch, scenario):
-    disappears = scenario == "disappears"
     from types import SimpleNamespace
 
     from ansiroll import loader
+    from ansiroll.runtime import Runtime
 
+    disappears = scenario == "disappears"
     _write(tmp_path, {"earlier/sites/prod/app.j2": "first\n", "later/sites/prod/app.j2": "later\n"})
     later = tmp_path / "later/sites"
-    if disappears:
+    if scenario == "chained":
+        special = later / "prod/middle/other"
+        alias = later / "prod/middle/link"
+        target = special / "branch"
+        (later / "prod/middle/branch").mkdir(parents=True)
+        (later / "prod/link").symlink_to("middle/branch", target_is_directory=True)
+    elif disappears:
         special = later / "prod/other"
         alias = later / "prod/link"
         target = special / "branch"
+    elif scenario == "remote_redirect":
+        special = later / "isolated/prod"
+        alias = later / "elsewhere/from/link"
+        alias.parent.mkdir(parents=True)
+        target = later / "elsewhere/to/branch"
     elif scenario == "sibling_alias":
         special = later / "isolated/prod"
         alias = later / "link"
@@ -667,7 +679,7 @@ def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_dupli
         alias = later / "link"
         target = special / "branch"
     special.mkdir(parents=True)
-    target.mkdir()
+    target.mkdir(parents=True)
     (special / "app.j2").symlink_to(os.devnull)
     alias.symlink_to(target, target_is_directory=True)
     duplicate = later / "prod/app.j2"
@@ -682,10 +694,15 @@ def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_dupli
     monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
     monkeypatch.setattr(loader, "_open_role_source", open_source)
     node = {}
-    source = "sites/{{ selection }}.j2" if disappears else "sites/{{ selection }}/prod/app.j2"
+    source = ("sites/{{ selection }}.j2" if scenario in ("disappears", "chained")
+              else "sites/{{ selection }}/prod/app.j2")
     assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates", source)
     assert node["_baked"]["sites/prod/app.j2"] == "first\n"
-    assert "later\n" not in node["_baked"].values()
+    if scenario == "chained":
+        key = Runtime._baked_source_key(node, "sites/prod/link/../link/../app.j2")
+        assert node["_baked"][key] == "later\n"
+    else:
+        assert "later\n" not in node["_baked"].values()
     assert duplicate.exists() is not disappears
 
 
