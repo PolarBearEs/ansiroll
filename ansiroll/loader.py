@@ -2214,7 +2214,69 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     alternate_meta = {}
     claimed = set()
     skipped = []
+    deferred_duplicates = {}
     blockers, shadowed, source_roots = {}, {}, []
+
+    def bake_source(full, rel, root_index, alternate):
+        _, _, root_blocks, root_files = source_roots[root_index]
+        claimed.add(rel)
+        key = "\0%d\0%s" % (root_index, rel) if alternate else rel
+        root_files[rel] = key
+        if rel in blockers:
+            shadowed.setdefault(rel, set()).add(root_index)
+        try:
+            # The path may have become a FIFO after the file check.
+            try:
+                fd = _open_role_source(full)
+            except OSError as ex:
+                # A replacement special file can fail open before fstat.
+                if ex.errno not in (errno.ENXIO, errno.EACCES):
+                    raise
+                mode = os.stat(full).st_mode
+                if stat.S_ISREG(mode):
+                    raise
+            else:
+                try:
+                    st = os.fstat(fd)
+                    mode = st.st_mode
+                    if stat.S_ISREG(mode):
+                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape",
+                                       closefd=False) as fh:
+                            baked[key] = fh.read()
+                finally:
+                    os.close(fd)
+        except _RoleSourceLeaseError as ex:
+            baked[key] = {"__ansiroll_source_error__": str(ex)}
+            shadowed.setdefault(rel, set()).add(root_index)
+            return
+        except OSError as ex:
+            if not isinstance(ex, (FileNotFoundError, NotADirectoryError)) and ex.errno != errno.ELOOP:
+                baked[key] = {"__ansiroll_source_error__": str(ex)}
+                shadowed.setdefault(rel, set()).add(root_index)
+                return
+            if not alternate:
+                claimed.remove(rel)
+                shadowed.pop(rel, None)
+            elif rel in shadowed:
+                shadowed[rel].discard(root_index)
+            del root_files[rel]
+            return
+        if not stat.S_ISREG(mode):
+            if not alternate:
+                claimed.remove(rel)
+            del root_files[rel]
+            root_blocks[rel] = stat.S_ISDIR(mode)
+            blockers.setdefault(rel, set()).add(root_index)
+            if rel in shadowed:
+                shadowed[rel].discard(root_index)
+            return
+        if alternate:
+            alternate_meta[key] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime,
+                                   "uid": st.st_uid, "mode": stat.S_IMODE(st.st_mode)}
+            return
+        meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
+                     "mode": stat.S_IMODE(st.st_mode)}
+
     for base, is_subdir, walk, root_dirs, root_aliases in trees:
         root_index = len(source_roots)
         # The blocker's flag records whether copy would recurse into it.
@@ -2288,6 +2350,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     # Traversal can select this root via a different path than
                     # the normalized path whose payload Ansible reads.
                     root_files[rel] = None
+                    deferred_duplicates.setdefault(rel, []).append((root_index, full))
                     continue
                 for earlier_base, earlier_index, earlier_path, earlier_mode in earlier_sources:
                     earlier_dirs, earlier_aliases, earlier_blocks, _ = source_roots[earlier_index]
@@ -2300,63 +2363,13 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     resolved_rel = os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base))
                     earlier_blocks[resolved_rel] = is_directory
                     blockers.setdefault(rel, set()).add(earlier_index)
-                claimed.add(rel)
-                key = "\0%d\0%s" % (root_index, rel) if alternate else rel
-                root_files[rel] = key
-                if rel in blockers:
-                    shadowed.setdefault(rel, set()).add(root_index)
-                try:
-                    # The path may have become a FIFO after the file check.
-                    try:
-                        fd = _open_role_source(full)
-                    except OSError as ex:
-                        # A replacement special file can fail open before fstat.
-                        if ex.errno not in (errno.ENXIO, errno.EACCES):
-                            raise
-                        mode = os.stat(full).st_mode
-                        if stat.S_ISREG(mode):
-                            raise
-                    else:
-                        try:
-                            st = os.fstat(fd)
-                            mode = st.st_mode
-                            if stat.S_ISREG(mode):
-                                with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape",
-                                               closefd=False) as fh:
-                                    baked[key] = fh.read()
-                        finally:
-                            os.close(fd)
-                except _RoleSourceLeaseError as ex:
-                    baked[key] = {"__ansiroll_source_error__": str(ex)}
-                    shadowed.setdefault(rel, set()).add(root_index)
-                    continue
-                except OSError as ex:
-                    if not isinstance(ex, (FileNotFoundError, NotADirectoryError)) and ex.errno != errno.ELOOP:
-                        baked[key] = {"__ansiroll_source_error__": str(ex)}
-                        shadowed.setdefault(rel, set()).add(root_index)
-                        continue
-                    if not alternate:
-                        claimed.remove(rel)
-                        shadowed.pop(rel, None)
-                    elif rel in shadowed:
-                        shadowed[rel].discard(root_index)
-                    del root_files[rel]
-                    continue
-                if not stat.S_ISREG(mode):
-                    if not alternate:
-                        claimed.remove(rel)
-                    del root_files[rel]
-                    root_blocks[rel] = stat.S_ISDIR(mode)
-                    blockers.setdefault(rel, set()).add(root_index)
-                    if rel in shadowed:
-                        shadowed[rel].discard(root_index)
-                    continue
-                if alternate:
-                    alternate_meta[key] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime,
-                                           "uid": st.st_uid, "mode": stat.S_IMODE(st.st_mode)}
-                    continue
-                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
-                             "mode": stat.S_IMODE(st.st_mode)}
+                bake_source(full, rel, root_index, alternate)
+    # A later blocker or special traversal can make an earlier duplicate
+    # selectable. Read those payloads only after the search layout is known.
+    for rel, candidates in deferred_duplicates.items():
+        if rel in shadowed:
+            for root_index, full in candidates:
+                bake_source(full, rel, root_index, alternate=True)
     if not baked:
         return False
     node["_baked"] = baked

@@ -706,6 +706,36 @@ def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_dupli
     assert duplicate.exists() is not disappears
 
 
+def test_compile_dynamic_role_source_retains_earlier_duplicate_after_later_blocker(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {
+        "first/sites/app.j2": "shared template\n",
+        "second/sites/app.j2": "shared template\n",
+        "last/sites/app.j2": "last template\n",
+    })
+    (tmp_path / "second/sites/branch").mkdir()
+    (tmp_path / "blocked/sites/app.j2").mkdir(parents=True)
+    last = tmp_path / "last/sites"
+    (last / "other/branch").mkdir(parents=True)
+    (last / "other/app.j2").symlink_to(os.devnull)
+    (last / "link").symlink_to("other/branch", target_is_directory=True)
+
+    roots = [(str(tmp_path / name), True) for name in ("first", "second", "blocked", "last")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    direct = Runtime._baked_source_key(node, "sites/app.j2")
+    traversed = Runtime._baked_source_key(node, "sites/branch/../app.j2")
+    assert node["_baked_meta"][direct]["fullpath"] == str(tmp_path / "first/sites/app.j2")
+    assert node["_baked_meta"][traversed]["fullpath"] == str(tmp_path / "second/sites/app.j2")
+    assert node["_baked"][traversed] == "shared template\n"
+
+
 @pytest.mark.parametrize(("tail", "required_dir_exists", "retains_duplicate"), [
     ("missing/../prod/app.j2", False, False),
     ("missing/../prod/app.j2", True, True),
