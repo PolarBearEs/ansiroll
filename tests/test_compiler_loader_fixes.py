@@ -310,20 +310,22 @@ def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_pa
 
 
 @pytest.mark.parametrize("earlier_has_branch", [False, True])
-def test_compile_dynamic_role_source_checks_parent_traversal_per_root(tmp_path, earlier_has_branch):
+@pytest.mark.parametrize("walks_earlier_root", [False, True])
+def test_compile_dynamic_role_source_checks_parent_traversal_per_root(tmp_path, earlier_has_branch, walks_earlier_root):
+    prefix = "sites/" if walks_earlier_root else ""
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
 - set_fact: {selection: branch/../app}
-- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
-""", "templates/sites/app.j2": "later template\n"})
-    earlier = tmp_path / "roles/r/templates/sites"
+- template: {src: "%s{{ selection }}.j2", dest: "rendered.txt"}
+""" % prefix, "templates/" + prefix + "app.j2": "later template\n"})
+    earlier = tmp_path / ("roles/r/templates/sites" if walks_earlier_root else "roles/r")
     (earlier / "app.j2").mkdir(parents=True)
     if earlier_has_branch:
         (earlier / "branch").mkdir()
-    (tmp_path / "templates/sites/branch").mkdir()
+    (tmp_path / "templates" / prefix / "branch").mkdir()
 
     playbook = tmp_path / "pb.yml"
     _ansible(playbook, returncode=2 if earlier_has_branch else 0)
@@ -335,6 +337,29 @@ def test_compile_dynamic_role_source_checks_parent_traversal_per_root(tmp_path, 
         assert not destination.exists()
     else:
         assert destination.read_text() == "later template\n"
+
+
+def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+
+    _write(tmp_path, {"earlier/sites/app.j2": "removed\n", "later/sites/app.j2": "available\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if path == str(earlier):
+            earlier.unlink()
+        return original_open(path)
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    assert node["_baked"] == {"sites/app.j2": "available\n"}
 
 
 @pytest.mark.parametrize("leased_source_exists_at_runtime", [False, True])

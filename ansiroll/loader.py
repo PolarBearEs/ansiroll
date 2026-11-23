@@ -1897,6 +1897,22 @@ def _literal_role_source_tail(src):
     return ""
 
 
+def _role_source_layout(base, walk):
+    """Record directory traversal for a role search root."""
+    real_base = os.path.realpath(base)
+    directories, aliases = set(), {}
+    for root, dirs, _ in walk:
+        directory = os.path.relpath(root, base)
+        while directory not in directories:
+            directories.add(directory)
+            directory = os.path.dirname(directory) or "."
+        for name in dirs:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                aliases[os.path.relpath(path, base)] = os.path.relpath(os.path.realpath(path), real_base)
+    return directories, aliases
+
+
 def _bake_search_tree(node, task, basedir, subdir, src):
     """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
     its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
@@ -1927,28 +1943,17 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     aliases = {}
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         walk = []
-        root_dirs, root_aliases = set(), {}
+        if prefix or is_subdir:
+            for root, dirs, files in os.walk(os.path.join(base, prefix)):
+                dirs.sort()
+                if fixed_path:
+                    files = [basename] if basename in files else []
+                walk.append((root, dirs, files))
+        root_dirs, root_aliases = _role_source_layout(base, walk)
         trees.append((base, is_subdir, walk, root_dirs, root_aliases))
-        if not prefix and not is_subdir:
-            continue
-        real_base = os.path.realpath(base)
-        for root, dirs, files in os.walk(os.path.join(base, prefix)):
-            dirs.sort()
-            directory = os.path.relpath(root, base)
-            while directory not in root_dirs:
-                root_dirs.add(directory)
-                directory = os.path.dirname(directory) or "."
-            if fixed_path:
-                files = [basename] if basename in files else []
-            walk.append((root, dirs, files))
-            for dirname in dirs:
-                full = os.path.join(root, dirname)
-                if os.path.islink(full):
-                    relative = os.path.relpath(full, base)
-                    target = os.path.relpath(os.path.realpath(full), real_base)
-                    root_aliases[relative] = target
-                    aliases.setdefault(relative, target)
         directories.update(root_dirs)
+        for relative, target in root_aliases.items():
+            aliases.setdefault(relative, target)
     aliases = {path: target for path, target in aliases.items() if target in directories}
     alias_candidates = set()
     if os.sep in fixed_path[1:] and aliases:
@@ -1966,17 +1971,17 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     skipped = []
     blockers, shadowed, source_roots = {}, {}, []
     for base, is_subdir, walk, root_dirs, root_aliases in trees:
-        if not prefix and not is_subdir:
-            skipped.append(base)
-            continue
         root_index = len(source_roots)
         root_blocks, root_files = set(), set()
         source_roots.append((root_dirs, root_aliases, root_blocks, root_files))
+        if not prefix and not is_subdir:
+            skipped.append((base, root_index))
+            continue
         for root, dirs, files in walk:
             for dirname in dirs:
                 relative = os.path.relpath(os.path.join(root, dirname), base)
                 root_blocks.add(relative)
-                blockers.setdefault(relative, []).append(root_index)
+                blockers.setdefault(relative, set()).add(root_index)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
@@ -1984,18 +1989,30 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     continue
                 if os.sep not in tail and not fn.endswith(tail):
                     continue
-                if rel in claimed or any(os.path.exists(os.path.join(d, rel)) for d in skipped):
+                if rel in claimed or any(os.path.isfile(os.path.join(d, rel)) for d, _ in skipped):
                     continue
                 if not os.path.exists(full):
                     continue
                 if not os.path.isfile(full):
                     root_blocks.add(rel)
-                    blockers.setdefault(rel, []).append(root_index)
+                    blockers.setdefault(rel, set()).add(root_index)
                     continue
+                for earlier_base, earlier_index in skipped:
+                    earlier_path = os.path.join(earlier_base, rel)
+                    if not os.path.exists(earlier_path):
+                        continue
+                    earlier_dirs, earlier_aliases, earlier_blocks, _ = source_roots[earlier_index]
+                    if not earlier_dirs:
+                        found_dirs, found_aliases = _role_source_layout(earlier_base, os.walk(earlier_base))
+                        earlier_dirs.update(found_dirs)
+                        earlier_aliases.update(found_aliases)
+                    earlier_blocks.add(rel)
+                    earlier_blocks.add(os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base)))
+                    blockers.setdefault(rel, set()).add(earlier_index)
                 claimed.add(rel)
                 root_files.add(rel)
                 if rel in blockers:
-                    shadowed[rel] = (blockers[rel].copy(), root_index)
+                    shadowed[rel] = (sorted(blockers[rel]), root_index)
                 try:
                     # The path may have become a FIFO after the file check.
                     fd = _open_role_source(full)
@@ -2009,6 +2026,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                         os.close(fd)
                 except _RoleSourceLeaseError as ex:
                     baked[rel] = {"__ansiroll_source_error__": str(ex)}
+                    continue
+                except FileNotFoundError:
+                    claimed.remove(rel)
+                    root_files.remove(rel)
+                    shadowed.pop(rel, None)
                     continue
                 except OSError:
                     continue
