@@ -1920,6 +1920,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             else:
                 fixed_path = os.sep + os.path.normpath(os.sep.join(trailing_components)).lstrip(os.sep)
     trees = []
+    directories = set()
     aliases = {}
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         walk = []
@@ -1929,6 +1930,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         real_base = os.path.realpath(base)
         for root, dirs, files in os.walk(os.path.join(base, prefix)):
             dirs.sort()
+            directories.add(os.path.relpath(root, base))
             if fixed_path:
                 files = [basename] if basename in files else []
             walk.append((root, dirs, files))
@@ -1937,26 +1939,30 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 if os.path.islink(full):
                     aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
 
+    for directory in list(directories):
+        while directory not in ("", "."):
+            directory = os.path.dirname(directory)
+            directories.add(directory or ".")
+    aliases = {path: target for path, target in aliases.items() if target in directories}
     alias_candidates = set()
-    if fixed_path and aliases:
+    if os.sep in fixed_path[1:] and aliases:
         suffix = fixed_path.lstrip(os.sep).split(os.sep)
-        for index, component in enumerate(suffix[:-1]):
-            for alias, target in aliases.items():
-                if os.path.basename(alias) == component:
-                    for child in suffix[index + 1:-1]:
-                        target = os.path.normpath(os.path.join(target, child))
-                        target = aliases.get(target, target)
-                    alias_candidates.add(os.path.normpath(os.path.join(target, suffix[-1])))
+        # The rendered prefix can reach any recorded directory. Follow all
+        # literal components before keeping an alias target.
+        reachable = directories
+        for component in suffix[:-1]:
+            children = (os.path.normpath(os.path.join(directory, component)) for directory in reachable)
+            reachable = {target for child in children if (target := aliases.get(child, child)) in directories}
+        alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
 
     baked, meta = {}, {}
-    directories, claimed = set(), set()
+    claimed = set()
     skipped = []
     for base, is_subdir, walk in trees:
         if not prefix and not is_subdir:
             skipped.append(base)
             continue
         for root, dirs, files in walk:
-            directories.add(os.path.relpath(root, base))
             claimed.update(os.path.relpath(os.path.join(root, name), base) for name in dirs)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
@@ -1993,13 +1999,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
-    for directory in list(directories):
-        while directory not in ("", "."):
-            directory = os.path.dirname(directory)
-            directories.add(directory or ".")
     node["_baked_tree_dirs"] = sorted(directories)
-    # Capture links to directories already in the tree without walking them.
-    aliases = {path: target for path, target in aliases.items() if target in directories}
     if aliases:
         node["_baked_tree_aliases"] = aliases
     return True
