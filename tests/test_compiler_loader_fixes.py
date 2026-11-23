@@ -151,9 +151,13 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
     from types import SimpleNamespace
 
     from ansiroll import loader
+    from ansiroll.runtime import Runtime
 
-    _write(tmp_path, {"sites/app.j2": "regular template\n", "sites/swap.j2": "previous regular file\n"})
-    target = tmp_path / "sites/swap.j2"
+    _write(tmp_path, {"earlier/sites/app.j2": "regular template\n",
+                      "earlier/sites/swap.j2": "previous regular file\n",
+                      "later/sites/swap.j2": "later template\n"})
+    (tmp_path / "later/sites/branch").mkdir()
+    target = tmp_path / "earlier/sites/swap.j2"
     open_fd = os.open
     opened = []
 
@@ -170,12 +174,18 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
             return fd
         return open_fd(path, flags)
 
-    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: [(str(tmp_path), True)])
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
     monkeypatch.setattr(os, "open", swap_then_open)
     node = {}
     task = SimpleNamespace(_role=object())
     assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
-    assert node["_baked"] == {"sites/app.j2": "regular template\n"}
+    assert node["_baked"]["sites/app.j2"] == "regular template\n"
+    direct = Runtime._baked_source_key(node, "sites/swap.j2")
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        Runtime({}, "", {})._asset_text(node["_baked"][direct])
+    traversed = Runtime._baked_source_key(node, "sites/branch/../swap.j2")
+    assert node["_baked"][traversed] == "later template\n"
     assert len(opened) == 1
     with pytest.raises(OSError):
         os.fstat(opened[0])

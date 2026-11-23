@@ -2029,6 +2029,13 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     try:
                         st = os.fstat(fd)
                         if not stat.S_ISREG(st.st_mode):
+                            if not alternate:
+                                claimed.remove(rel)
+                            del root_files[rel]
+                            root_blocks.add(rel)
+                            blockers.setdefault(rel, set()).add(root_index)
+                            if rel in shadowed:
+                                shadowed[rel].discard(root_index)
                             continue
                         with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as fh:
                             baked[key] = fh.read()
