@@ -731,10 +731,39 @@ def _modeled_first_found_files(candidates):
     from fnmatch import fnmatchcase
     from pathlib import Path
 
+    def walk_pattern(base, pattern, real_base):
+        parts = Path(pattern).parts
+        visited = set()
+
+        def walk(directory, index, ancestors):
+            state = (directory, index)
+            if state in visited:
+                return
+            visited.add(state)
+            if index == len(parts):
+                yield directory
+                return
+            recursive = parts[index] == "**"
+            if recursive:
+                yield from walk(directory, index + 1, ancestors)
+            for child in directory.glob("*" if recursive else parts[index]):
+                if not recursive and index == len(parts) - 1:
+                    yield child
+                    continue
+                if not child.is_dir():
+                    continue
+                resolved = child.resolve()
+                if resolved in ancestors or not (resolved == real_base or real_base in resolved.parents):
+                    continue
+                yield from walk(child, index if recursive else index + 1, ancestors | {resolved})
+
+        yield from walk(base, 0, {base.resolve()})
+
     for root, directory_pattern, filename in sorted(candidates):
         base = Path(root)
         real_base = base.resolve()
-        directories = base.glob(directory_pattern) if directory_pattern else (base,)
+        directories = walk_pattern(base, directory_pattern, real_base)
+        filename = os.path.normpath(filename)
         search = filename
         if "\0" in filename:
             # Narrow the walk with fixed path ends, then use fnmatch's
@@ -745,11 +774,14 @@ def _modeled_first_found_files(candidates):
             search = os.path.join(prefix, "**", leaf)
         match = filename.replace("\0", "*")
         for directory in directories:
-            if not directory.is_dir() or not directory.resolve().is_relative_to(real_base):
+            if not directory.is_dir():
                 continue
-            for path in directory.glob(search):
+            resolved = directory.resolve()
+            if resolved != real_base and real_base not in resolved.parents:
+                continue
+            for path in walk_pattern(directory, search, real_base):
                 if (path.is_file() and fnmatchcase(str(path.relative_to(directory)), match)
-                        and path.resolve().is_relative_to(real_base)):
+                        and real_base in path.resolve().parents):
                     yield os.path.normpath(path)
 
 

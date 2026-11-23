@@ -1705,6 +1705,31 @@ def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatc
     assert _standalone(tmp_path, []) == expected
 
 
+def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "vars/dev/profiles/prod.yml": "subset: [all]\n",
+        "vars/shared/prod.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {team: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': [team ~ '/profiles/./prod.yml'], 'paths': [playbook_dir ~ '/vars']}) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    (tmp_path / "vars/org").mkdir()
+    (tmp_path / "vars/org/profiles").symlink_to("../shared", target_is_directory=True)
+    (tmp_path / "vars/shared/cycle").symlink_to("..", target_is_directory=True)
+    extra = json.dumps({"team": "org"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
 @pytest.mark.skipif(CORE_VERSION < (2, 12) or CORE_VERSION >= (2, 19), reason="legacy nested skip behavior")
 def test_setup_first_found_legacy_nested_list_resets_skip(tmp_path, monkeypatch):
     _write(tmp_path, {
