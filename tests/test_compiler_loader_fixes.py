@@ -539,8 +539,9 @@ def test_compile_dynamic_role_source_checks_a_traversed_directory_without_normal
     assert not (tmp_path / "rendered.txt").exists()
 
 
-@pytest.mark.parametrize("replacement", ["missing", "parent-file", "symlink-loop"])
+@pytest.mark.parametrize("replacement", ["missing", "parent-file", "symlink-loop", "missing-on-recheck"])
 def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch, replacement):
+    import errno
     from types import SimpleNamespace
 
     from ansiroll import loader
@@ -558,6 +559,8 @@ def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tm
                 earlier.unlink()
                 if replacement == "symlink-loop":
                     earlier.symlink_to(earlier.name)
+                elif replacement == "missing-on-recheck":
+                    raise OSError(errno.ENXIO, os.strerror(errno.ENXIO), path)
         return original_open(path)
 
     roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
@@ -567,6 +570,44 @@ def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tm
     assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
                                     "sites/{{ selection }}.j2")
     assert node["_baked"] == {"sites/app.j2": "available\n"}
+
+
+@pytest.mark.parametrize("earlier_has_branch", [False, True])
+def test_compile_dynamic_role_source_can_bypass_an_unreadable_earlier_file(tmp_path, monkeypatch, earlier_has_branch):
+    import errno
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/app.j2": "unreadable\n", "later/sites/app.j2": "available\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    (tmp_path / "later/sites/branch").mkdir()
+    if earlier_has_branch:
+        (earlier.parent / "branch").mkdir()
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if path == str(earlier):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+        return original_open(path)
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    runtime = Runtime({}, "", {})
+    direct = runtime._baked_source_key(node, "sites/app.j2")
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        runtime._asset_text(node["_baked"][direct])
+    traversed = runtime._baked_source_key(node, "sites/branch/../app.j2")
+    if earlier_has_branch:
+        with pytest.raises(RuntimeError, match="Permission denied"):
+            runtime._asset_text(node["_baked"][traversed])
+    else:
+        assert node["_baked"][traversed] == "available\n"
 
 
 def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_after_stat(tmp_path, monkeypatch):

@@ -3774,6 +3774,12 @@ class Runtime:
             if Runtime._baked_role_path(parts, directories, aliases) not in (task.get("_baked") or {}):
                 return src
         elif os.path.normpath(src) in (task.get("_baked_tree_shadowed") or {}):
+            normalized = os.path.normpath(src)
+            for _, _, blocked, files in task["_baked_tree_roots"]:
+                if normalized in blocked:
+                    break
+                if normalized in files:
+                    return files[normalized] or src
             return "\0blocked"
         # Ansible checks the original relative path, then normalizes it when reading.
         return os.path.normpath(src)

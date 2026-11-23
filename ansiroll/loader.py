@@ -2050,8 +2050,10 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                         fd = _open_role_source(full)
                     except OSError as ex:
                         # A replacement special file can fail open before fstat.
-                        mode = _role_source_mode(full) if ex.errno in (errno.ENXIO, errno.EACCES) else None
-                        if mode is None or stat.S_ISREG(mode):
+                        if ex.errno not in (errno.ENXIO, errno.EACCES):
+                            raise
+                        mode = os.stat(full).st_mode
+                        if stat.S_ISREG(mode):
                             raise
                     else:
                         try:
@@ -2065,9 +2067,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                             os.close(fd)
                 except _RoleSourceLeaseError as ex:
                     baked[key] = {"__ansiroll_source_error__": str(ex)}
+                    shadowed.setdefault(rel, set()).add(root_index)
                     continue
                 except OSError as ex:
                     if not isinstance(ex, (FileNotFoundError, NotADirectoryError)) and ex.errno != errno.ELOOP:
+                        baked[key] = {"__ansiroll_source_error__": str(ex)}
+                        shadowed.setdefault(rel, set()).add(root_index)
                         continue
                     if not alternate:
                         claimed.remove(rel)
@@ -2103,7 +2108,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         node["_baked_tree_aliases"] = aliases
     if shadowed:
         baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
-        node["_baked_tree_shadowed"] = {rel: sorted(blockers[rel] | roots) for rel, roots in shadowed.items()}
+        node["_baked_tree_shadowed"] = {rel: sorted(blockers.get(rel, set()) | roots) for rel, roots in shadowed.items()}
         node["_baked_tree_roots"] = [
             (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
              dict(sorted(root_blocks.items())), root_files)
