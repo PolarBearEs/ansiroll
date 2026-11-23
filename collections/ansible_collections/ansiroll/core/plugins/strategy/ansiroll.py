@@ -102,6 +102,12 @@ def _legacy_environment_validator(validate, aliases):
 
     from ansiroll.runtime import _ConditionalCodeGenerator, _ConditionalName
 
+    class DelegatedCodeGenerator(_ConditionalCodeGenerator):
+        def visit_Filter(self, node, frame):
+            self.write("context._check_delegated_member(")
+            super().visit_Filter(node, frame)
+            self.write(")")
+
     def check_error(member):
         if isinstance(member, _DelegatedMemberError):
             member._fail_with_undefined_error()
@@ -123,6 +129,8 @@ def _legacy_environment_validator(validate, aliases):
         accessors = {name: vars(environment).get(name) for name in ("getitem", "getattr")}
 
         class DelegatedContext(context_class):
+            _check_delegated_member = staticmethod(check_error)
+
             def _defer_name(self, key):
                 return _ConditionalName(self, key) if key in self else missing
 
@@ -150,7 +158,7 @@ def _legacy_environment_validator(validate, aliases):
             templar.template = template_variable
             templar.available_variables = {**variables, **aliases}
             environment.context_class = DelegatedContext
-            environment.code_generator_class = _ConditionalCodeGenerator
+            environment.code_generator_class = DelegatedCodeGenerator
             for name in accessors:
                 setattr(environment, name, check_member(getattr(environment, name)))
             return validate(attr, value, templar)
@@ -781,7 +789,15 @@ class StrategyModule(StrategyBase):
                 container = container[key]
             container[path[-1]] = marker
         def restore_key(key):
-            return tuple(restore_key(part) for part in key) if isinstance(key, list) else key
+            if isinstance(key, list):
+                return tuple(restore_key(part) for part in key)
+            if isinstance(key, dict):
+                from datetime import date, datetime
+
+                if "date" in key:
+                    return date.fromisoformat(key["date"])
+                return datetime.fromisoformat(key["datetime"])
+            return key
 
         # Decode inner mappings before changing the keys used to reach them.
         for path, keys in reversed(mapping_keys):

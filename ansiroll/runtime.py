@@ -5523,6 +5523,16 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
     return _fail_on_undef(value)
 
 
+def _encode_delegated_key(key):
+    from datetime import date, datetime
+
+    if isinstance(key, datetime):
+        return {"datetime": key.isoformat()}
+    if isinstance(key, date):
+        return {"date": key.isoformat()}
+    raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
+
+
 def _resolve_delegated_play_var(name, scope, templater):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
@@ -5537,7 +5547,7 @@ def _resolve_delegated_play_var(name, scope, templater):
         if errors:
             result["errors"] = errors
         if mapping_keys:
-            result["mapping_keys"] = json.loads(json.dumps(mapping_keys))
+            result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
         return result
     except _CapturedTemplateError as error:
         return {"error": str(error)}
