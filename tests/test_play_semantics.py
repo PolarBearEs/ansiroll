@@ -1543,6 +1543,34 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
     assert _standalone(tmp_path, []) == expected
 
 
+def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "files/profiles/dev/facts.yml": "subset: [all]\n",
+        "files/profiles/team/prod/facts.yml": "subset: ['!all', '!min']\n",
+        "files/profiles/team/prod/unrelated.yml": "unrelated_value: never_bundle_this\n",
+        "files/unrelated.yml": "another_value: never_bundle_this_either\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': ['facts.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile]}) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    plays, _actions = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "never_bundle_this" not in json.dumps(plays, default=str)
+    extra = json.dumps({"profile": "team/prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
 @pytest.mark.parametrize("skip", [False, True])
 def test_setup_first_found_respects_missing_file_policy(tmp_path, monkeypatch, skip):
     _write(tmp_path, {
