@@ -2084,17 +2084,43 @@ def test_standalone_environment_capture_follows_nested_lookup_argument_values(tm
 
 
 @pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
-@pytest.mark.parametrize(("expression", "live"), [
-    ("'DEV' | lower", False),
-    ("'prod' if live else 'dev'", True),
-    ("('PROD' if live else 'DEV') | lower", True),
+def test_setup_captures_environment_from_filtered_lookup_term(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    monkeypatch.setenv("ANSIROLL_NESTED_PROFILE", "dev.yml")
+    _write(tmp_path, {
+        "files/dev.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars_files:
+            - >-
+              {{ lookup('first_found', ' {{ lookup("env", "ANSIROLL_NESTED_PROFILE") }} ' | trim) }}
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert plays[0]["controller_env"]["ANSIROLL_NESTED_PROFILE"] == "dev.yml"
+    expected = _ansible(tmp_path, [])
+    assert expected[0] == ['"distribution defined: False"']
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
+@pytest.mark.parametrize(("expression", "live", "suffix"), [
+    ("'DEV' | lower", False, ""),
+    ("'prod' if live else 'dev'", True, ""),
+    ("('PROD' if live else 'DEV') | lower", True, ""),
+    ("(('PROD' if live else 'DEV') ~ '-CONFIG') | lower", True, "-config"),
 ])
-def test_setup_first_found_only_bundles_reachable_legacy_filenames(tmp_path, monkeypatch, expression, live):
+def test_setup_first_found_only_bundles_reachable_legacy_filenames(tmp_path, monkeypatch, expression, live, suffix):
     from ansiroll.loader import parse_playbook
 
     _write(tmp_path, {
-        "vars/dev.yml": "subset: [all]\n",
-        "vars/prod.yml": "subset: ['!all', '!min']\nprofile_marker: selected_only_by_conditional\n",
+        f"vars/dev{suffix}.yml": "subset: [all]\n",
+        f"vars/prod{suffix}.yml": "subset: ['!all', '!min']\nprofile_marker: selected_only_by_conditional\n",
         "vars/unrelated.yml": "unrelated: never_bundle_unreachable_filename\n",
         "pb.yml": """
         - hosts: localhost
@@ -2143,6 +2169,36 @@ def test_setup_first_found_respects_playbook_filter_override(tmp_path, monkeypat
     })
     monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
     extra = json.dumps({"profile": "prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core supports overriding short filter names")
+def test_setup_first_found_discovers_nested_profiles_through_overridden_first(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "filter_plugins/custom.py": """
+        class FilterModule:
+            def filters(self):
+                return {'first': lambda paths: paths[0]}
+        """,
+        "files/profiles/dev/setup.yml": "subset: [all]\n",
+        "files/profiles/team/prod/setup.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files:
+            - >-
+              {{ query('first_found', ['profiles/' ~ profile ~ '/setup.yml']) | first }}
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    monkeypatch.setenv("ANSIBLE_FILTER_PLUGINS", str(tmp_path / "filter_plugins"))
+    extra = json.dumps({"profile": "team/prod"})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)

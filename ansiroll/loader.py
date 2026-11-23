@@ -45,6 +45,7 @@ _ITEM_RE = re.compile(r"{{\s*item\s*}}")
 _JINJA_RE = re.compile(r"{{.*?}}")
 # A src like "{{ playbook_dir }}/roles/{{ role }}/..." can match many files; past this it is left unbaked.
 _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
+_SELECTOR_VARIANT_LIMIT = 128
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ROLE_PATH_RE = re.compile(r"{{\s*role_path\s*}}")
 _USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
@@ -226,11 +227,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for item in _as_list(value)
     )
     jinja_plugins = _collect_jinja_plugins(play, basedir)
-    builtin_filters = set()
+    verified_filters = None
+
+    def get_builtin_filters():
+        nonlocal verified_filters
+        if verified_filters is None:
+            verified_filters = _builtin_selector_filters(play, jinja_plugins)
+        return verified_filters
+
+    builtin_filters = ()
     if scoped_gather and any(
             isinstance(name, str) and "first_found" in name and "|" in name
             for entry in _as_list(play.vars_files) for name in _as_list(entry)):
-        builtin_filters = _builtin_first_found_filters(play, jinja_plugins)
+        builtin_filters = get_builtin_filters()
     ordered_vars_files = [] if scoped_gather else None
     play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files,
                                     builtin_filters=builtin_filters)
@@ -380,13 +389,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 "base_vars": _tag_untrusted(dict(play.vars or {})),
                 "vars_files": gather_vars_files,
             })
-    names = _controller_env_names(result)
-    names.update(_controller_env_names(result["gather_when"], expression=True))
+    names = _controller_env_names(result, get_builtin_filters)
+    names.update(_controller_env_names(result["gather_when"], get_builtin_filters, expression=True))
     for node in _walk_play_nodes([result]):
         for keyword in ("when", "changed_when", "failed_when", "until", "loop_break_when"):
-            names.update(_controller_env_names(node.get(keyword), expression=True))
+            names.update(_controller_env_names(node.get(keyword), get_builtin_filters, expression=True))
         if (node.get("action") or "").rsplit(".", 1)[-1] == "assert":
-            names.update(_controller_env_names((node.get("args") or {}).get("that"), expression=True))
+            names.update(_controller_env_names((node.get("args") or {}).get("that"), get_builtin_filters,
+                                               expression=True))
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -439,7 +449,7 @@ def _apply_force_handlers_default(play):
         pass
 
 
-def _controller_env_names(value, *, expression=False):
+def _controller_env_names(value, get_builtin_filters, *, expression=False):
     """Find literal controller-side env lookups that the target must reproduce."""
     names = set()
     if isinstance(value, str):
@@ -464,6 +474,10 @@ def _controller_env_names(value, *, expression=False):
                     branches = (arg.expr1 if arg.test.value else arg.expr2,)
                 for branch in branches:
                     yield from nested_values(branch)
+            elif isinstance(arg, (nodes.Filter, nodes.Concat, nodes.Add)):
+                builtin_filters = get_builtin_filters()
+                for variant in _selector_variants(arg, builtin_filters):
+                    yield _constant_selector_string(variant, builtin_filters)
 
         for call in parsed.find_all(nodes.Call):
             if not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q"):
@@ -476,16 +490,16 @@ def _controller_env_names(value, *, expression=False):
             for arg in (*call.args[1:], *call.kwargs):
                 for literal in nested_values(arg):
                     if _is_templated(literal):
-                        names.update(_controller_env_names(literal))
+                        names.update(_controller_env_names(literal, get_builtin_filters))
     elif isinstance(value, dict):
         if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_untrusted_condition__"}):
             return names
         for key, item in value.items():
-            names.update(_controller_env_names(key))
-            names.update(_controller_env_names(item))
+            names.update(_controller_env_names(key, get_builtin_filters))
+            names.update(_controller_env_names(item, get_builtin_filters))
     elif isinstance(value, (list, tuple)):
         for item in value:
-            names.update(_controller_env_names(item, expression=expression))
+            names.update(_controller_env_names(item, get_builtin_filters, expression=expression))
     return names
 
 
@@ -614,7 +628,7 @@ def _selector_ast(selector):
         return None
 
 
-def _builtin_first_found_filters(play, plugins):
+def _builtin_selector_filters(play, plugins):
     """Return filters whose controller and bundled implementations are both built-ins."""
     from inspect import unwrap
 
@@ -643,6 +657,68 @@ def _builtin_first_found_filters(play, plugins):
             # Unknown or failed plugins must remain dynamic.
             continue
     return verified
+
+
+def _selector_variants(node, builtin_filters):
+    """Expand finite conditional operands while preserving their operators."""
+    from copy import copy
+    from jinja2 import nodes
+
+    if isinstance(node, nodes.CondExpr):
+        branches = (node.expr1, node.expr2)
+        if isinstance(node.test, nodes.Const):
+            branches = (node.expr1 if node.test.value else node.expr2,)
+        choices = [choice for branch in branches if branch is not None
+                   for choice in _selector_variants(branch, builtin_filters)]
+        return choices if len(choices) <= _SELECTOR_VARIANT_LIMIT else [node]
+    if isinstance(node, nodes.Concat):
+        children = node.nodes
+    elif isinstance(node, nodes.Add):
+        children = (node.left, node.right)
+    elif isinstance(node, nodes.Filter) and node.name in builtin_filters and node.name != "first":
+        children = (node.node,)
+    else:
+        return [node]
+    variants = [[]]
+    for child in children:
+        choices = _selector_variants(child, builtin_filters)
+        if len(variants) * len(choices) > _SELECTOR_VARIANT_LIMIT:
+            return [node]
+        variants = [variant + [choice] for variant in variants for choice in choices]
+    expanded = []
+    for children in variants:
+        variant = copy(node)
+        if isinstance(node, nodes.Concat):
+            variant.nodes = children
+        elif isinstance(node, nodes.Add):
+            variant.left, variant.right = children
+        else:
+            variant.node, = children
+        expanded.append(variant)
+    return expanded
+
+
+def _constant_selector_string(node, builtin_filters):
+    """Evaluate literal expressions without invoking custom filters or lookups."""
+    from jinja2 import nodes
+
+    def constant(part):
+        if isinstance(part, nodes.Const):
+            return True
+        if isinstance(part, (nodes.Concat, nodes.Add, nodes.Keyword)):
+            return all(constant(value) for value in part.iter_child_nodes())
+        return (isinstance(part, nodes.Filter) and part.name in builtin_filters and part.name != "first"
+                and not (part.dyn_args or part.dyn_kwargs)
+                and all(constant(value) for value in part.iter_child_nodes()))
+
+    if constant(node):
+        try:
+            value = node.as_const()
+        except nodes.Impossible:
+            return None
+        if isinstance(value, str):
+            return value
+    return None
 
 
 def _literal_first_found(selector, builtin_filters):
@@ -722,7 +798,6 @@ def _first_found_search_dirs(play, basedir):
 
 def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, vars_subdir, builtin_filters):
     """Return modeled first_found candidates and whether shallow discovery is also needed."""
-    from copy import copy
     from glob import escape
     from jinja2 import nodes
 
@@ -732,6 +807,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         return None
     call = parsed.body[0].nodes[0]
     fallbacks = []
+    needs_fallback = False
     while isinstance(call, nodes.Filter):
         if call.name in ("default", "d") and not (call.dyn_args or call.dyn_kwargs):
             default_options = {option.key: option.value for option in call.kwargs}
@@ -740,7 +816,11 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             fallback = call.args[0] if call.args else default_options.get("default_value")
             if fallback is not None:
                 fallbacks.append(fallback)
-        elif call.name not in ("first", "string") or call.name not in builtin_filters:
+        elif call.name in ("first", "string"):
+            # A custom filter can change the final path, but the lookup still
+            # needs its own candidates before the filter receives its input.
+            needs_fallback |= call.name not in builtin_filters
+        else:
             return None
         call = call.node
     if (not isinstance(call, nodes.Call) or not isinstance(call.node, nodes.Name)
@@ -765,35 +845,12 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             return concat_parts(term.left) + concat_parts(term.right)
         return [term]
 
-    def constant_path_part(part):
-        if isinstance(part, nodes.Const):
-            return True
-        if isinstance(part, nodes.Concat):
-            return all(constant_path_part(value) for value in part.nodes)
-        return (isinstance(part, nodes.Filter) and part.name in builtin_filters and part.name != "first"
-                and not (part.dyn_args or part.dyn_kwargs)
-                and all(constant_path_part(value) for value in (part.node, *part.args,
-                                                                *(kw.value for kw in part.kwargs))))
-
     def expand_conditionals(parts):
         variants = [[]]
         for part in parts:
-            choices = [[part]]
-            if isinstance(part, nodes.CondExpr):
-                branches = (part.expr1, part.expr2)
-                if isinstance(part.test, nodes.Const):
-                    branches = (part.expr1 if part.test.value else part.expr2,)
-                choices = [choice for branch in branches if branch is not None
-                           for choice in expand_conditionals(concat_parts(branch))]
-            elif isinstance(part, nodes.Filter) and part.name in builtin_filters and part.name != "first":
-                choices = []
-                for operand in expand_conditionals([part.node]):
-                    filtered = copy(part)
-                    filtered.node = (operand[0] if len(operand) == 1
-                                     else nodes.Concat(operand).set_environment(part.environment))
-                    choices.append([filtered])
+            choices = [concat_parts(choice) for choice in _selector_variants(part, builtin_filters)]
             # A large combination can still use the surrounding literal bounds.
-            if len(variants) * len(choices) > 128:
+            if len(variants) * len(choices) > _SELECTOR_VARIANT_LIMIT:
                 choices = [[part]]
             variants = [variant + choice for variant in variants for choice in choices]
         return variants
@@ -816,15 +873,11 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             parts = parts[1:]
         literals = []
         for part in parts:
-            if constant_path_part(part):
-                try:
-                    value = part.as_const()
-                except nodes.Impossible:
-                    value = None
-                if isinstance(value, str):
-                    if value:
-                        literals.append(value)
-                    continue
+            value = _constant_selector_string(part, builtin_filters)
+            if value is not None:
+                if value:
+                    literals.append(value)
+                continue
             if isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Filter, nodes.CondExpr)):
                 literals.append(None)
             else:
@@ -900,7 +953,6 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 filename = filename.replace("\0", "*")
         patterns.add((root, directory, filename))
 
-    needs_fallback = False
     for dir_terms, files in groups:
         directories = ([candidate for term in dir_terms for candidate in path_patterns(term)]
                        if dir_terms else [(None, "")])
