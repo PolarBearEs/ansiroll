@@ -31,6 +31,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections.abc import MappingView
 
 DOCUMENTATION = """
     name: ansiroll
@@ -48,6 +49,7 @@ from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
+from jinja2 import StrictUndefined
 
 _UnifiedTaskResult = None
 try:  # 2.18-2.20: callbacks accept the private raw result wrapper
@@ -60,6 +62,174 @@ except Exception:  # 2.21+ uses UnifiedTaskResult; older cores use TaskResult
         pass
 
 display = Display()
+
+
+class _DelegatedPlayVariables:
+    """Cache the agent's values for one controller task invocation."""
+
+    def __init__(self, load):
+        self._load = load
+        self.names = []
+        self.values = {}
+
+    def __getitem__(self, index):
+        if index not in self.values:
+            self.values[index] = self._load(self.names[index])
+        return self.values[index]
+
+
+class _LegacyDelegatedValue:
+    """Let Jinja load the native value when an expression uses the alias."""
+
+    __UNSAFE__ = True
+
+    def __init__(self, bridge, index):
+        self._bridge = bridge
+        self._index = index
+
+    def resolve(self):
+        return self._bridge[self._index]
+
+
+class _DelegatedMemberError(StrictUndefined):
+    __UNSAFE__ = True
+
+    def __repr__(self):
+        self._fail_with_undefined_error()
+
+
+def _legacy_environment_validator(validate, aliases):
+    """Keep native Ansible environment validation, with lazy Jinja name binding."""
+    from ansible.errors import AnsibleUndefinedVariable
+    from jinja2 import Undefined
+    from jinja2.runtime import missing
+
+    from ansiroll.runtime import _ConditionalCodeGenerator, _ConditionalName
+
+    class DelegatedCodeGenerator(_ConditionalCodeGenerator):
+        def visit_Filter(self, node, frame):
+            self.write("context._check_delegated_member(")
+            super().visit_Filter(node, frame)
+            self.write(")")
+
+    def check_error(member):
+        if isinstance(member, _DelegatedMemberError):
+            member._fail_with_undefined_error()
+        if type(member) is list and any(isinstance(item, _DelegatedMemberError) for item in member):
+            return CheckedList(member)
+        return member
+
+    class CheckedList(list):
+        def __iter__(self):
+            for member in super().__iter__():
+                yield check_error(member)
+
+        def __getitem__(self, index):
+            return check_error(super().__getitem__(index))
+
+        def __add__(self, other):
+            return check_error(super().__add__(other))
+
+        def __radd__(self, other):
+            if not isinstance(other, list):
+                return NotImplemented
+            return check_error(list.__add__(other, self))
+
+        def __mul__(self, count):
+            return check_error(super().__mul__(count))
+
+        __rmul__ = __mul__
+
+    class CheckedView(MappingView):
+        def __init__(self, view, items):
+            super().__init__(view)
+            self.items = items
+
+        def __iter__(self):
+            for member in self._mapping:
+                if self.items:
+                    key, value = member
+                    yield key, check_error(value)
+                else:
+                    yield check_error(member)
+
+        def __contains__(self, member):
+            if self.items:
+                # dict_items looks up only the requested key before comparing
+                # its value. Iterating would trip errors on unrelated keys.
+                return member in self._mapping
+            return any(value == member for value in self)
+
+    def check_member(access):
+        def get_member(obj, key):
+            return check_error(access(obj, key))
+        return get_member
+
+    def validate_environment(attr, value, templar):
+        environment = getattr(templar, "_environment", None)
+        if environment is None:
+            environment = templar.environment
+        variables = templar.available_variables
+        template = templar.template
+        instance_template = vars(templar).get("template")
+        generator, context_class = environment.code_generator_class, environment.context_class
+        accessors = {name: vars(environment).get(name) for name in ("getitem", "getattr")}
+
+        class DelegatedContext(context_class):
+            _check_delegated_member = staticmethod(check_error)
+
+            def _defer_name(self, key):
+                return _ConditionalName(self, key) if key in self else missing
+
+            def _consume_name(self, value):
+                if isinstance(value, _ConditionalName):
+                    value = value.context.resolve_or_missing(value.key)
+                if isinstance(value, _LegacyDelegatedValue):
+                    value = value.resolve()
+                    self._update_unsafe(value)
+                return check_error(value)
+
+            def call(self, *args, **kwargs):
+                result = check_error(super().call(*args, **kwargs))
+                if isinstance(result, (type({}.values()), type({}.items()))):
+                    items = isinstance(result, type({}.items()))
+                    if any(isinstance(member[1] if items else member, _DelegatedMemberError) for member in result):
+                        return CheckedView(result, items)
+                return result
+
+        def template_variable(value, *args, **kwargs):
+            # Legacy lookup plugins can read available_variables directly.
+            if isinstance(value, _LegacyDelegatedValue):
+                value = value.resolve()
+                if isinstance(value, Undefined) and kwargs.get("fail_on_undefined"):
+                    raise AnsibleUndefinedVariable(value._undefined_message)
+                return value
+            return template(value, *args, **kwargs)
+
+        try:
+            templar.template = template_variable
+            templar.available_variables = {**variables, **aliases}
+            environment.context_class = DelegatedContext
+            environment.code_generator_class = DelegatedCodeGenerator
+            for name in accessors:
+                setattr(environment, name, check_member(getattr(environment, name)))
+            return validate(attr, value, templar)
+        finally:
+            environment.context_class = context_class
+            environment.code_generator_class = generator
+            for name, accessor in accessors.items():
+                if accessor is None:
+                    vars(environment).pop(name, None)
+                else:
+                    setattr(environment, name, accessor)
+            if instance_template is None:
+                del templar.template
+            else:
+                templar.template = instance_template
+            templar.available_variables = variables
+
+    return validate_environment
+
 
 class StrategyModule(StrategyBase):
 
@@ -352,6 +522,14 @@ class StrategyModule(StrategyBase):
         seen = set()
         included_vars_by_task = {}
         last_frame = time.monotonic()
+
+        def resolve_play_var(name):
+            chan.send({"t": "delegate_play_var", "name": name})
+            reply = chan.recv()
+            if not reply or reply.get("t") != "delegate_play_var_result":
+                raise RuntimeError("ansiroll: agent did not return a delegated play variable")
+            return reply.get("fallback")
+
         while True:
             frame = chan.recv()
             now = time.monotonic()
@@ -389,7 +567,7 @@ class StrategyModule(StrategyBase):
                 chan.send({"t": "delegate_result",
                            "result": self._run_delegated(
                                frame, host, hv, templar, become_pass,
-                               task_map, play_context, included_vars_by_task
+                               task_map, play_context, included_vars_by_task, resolve_play_var
                            )})
                 self._profile("%s delegate +%.3fs %s"
                               % (host.name, time.monotonic() - delegate_started,
@@ -454,7 +632,7 @@ class StrategyModule(StrategyBase):
         self._emit_provenance(provenance)
 
     def _run_delegated(self, frame, host, hv, templar, become_pass,
-                       task_map=None, play_context=None, included_vars_by_task=None):
+                       task_map=None, play_context=None, included_vars_by_task=None, resolve_play_var=None):
         """Execute a delegated / controller-coupled task on the correct host and
         return its raw module result (the agent re-emits the framed result)."""
         action = str(frame.get("action") or "").rsplit(".", 1)[-1]
@@ -499,7 +677,7 @@ class StrategyModule(StrategyBase):
             }
         if action == "synchronize":
             return self._run_native_controller_task(
-                frame, host, hv, task_map or {}, play_context)
+                frame, host, hv, task_map or {}, play_context, resolve_play_var)
         to = frame.get("to")
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
@@ -525,7 +703,7 @@ class StrategyModule(StrategyBase):
             rt.diff_mode = previous_diff
             rt.become_user = previous_become_user
 
-    def _run_native_controller_task(self, frame, host, hv, task_map, play_context):
+    def _run_native_controller_task(self, frame, host, hv, task_map, play_context, resolve_play_var=None):
         """Run an action-plugin task with Ansible's official TaskExecutor."""
         task = task_map.get(frame.get("runtime_id"))
         if task is None:
@@ -550,6 +728,65 @@ class StrategyModule(StrategyBase):
             concrete.failed_when = []
             job_vars = dict(hv or {})
             job_vars.update(frame.get("vars") or {})
+            if deferred := frame.get("deferred_vars"):
+                from ansible.utils.unsafe_proxy import wrap_var
+
+                from ansiroll.loader import _tag_untrusted
+
+                # Restore the controller's tagged source for each deferred
+                # alias. Values supplied only by the agent remain data.
+                sources = {"task": task.get_vars(), "play": hv or {}}
+                play_fallbacks = frame.get("play_var_fallbacks") or {}
+                play_undefined = frame.get("play_var_undefined") or {}
+                lazy_play = set(frame.get("lazy_play_vars") or ()) if resolve_play_var else set()
+
+                def load_play_var(name):
+                    resolved = resolve_play_var(name)
+                    if resolved is None:
+                        raise AnsibleError("unable to resolve delegated play variable %r" % name)
+                    if "error" in resolved:
+                        raise AnsibleError("delegated play variable %r: %s" % (name, resolved["error"]))
+                    return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"],
+                                                       resolved.get("errors", ()),
+                                                       wrap_var(resolved.get("mapping_keys", ())))
+
+                bridge = _DelegatedPlayVariables(load_play_var)
+                try:
+                    from ansible.template import trust_as_template
+                except ImportError:
+                    trust_as_template = None
+                legacy_aliases = {}
+
+                for name, scope in deferred.items():
+                    if name not in job_vars:
+                        continue
+                    value = job_vars[name]
+                    source_vars = sources.get(scope, {})
+                    if name in source_vars:
+                        source = source_vars[name]
+                        tagged_source = json.loads(json.dumps(_tag_untrusted(source), default=str))
+                        if tagged_source == value:
+                            job_vars[name] = source
+                            continue
+                    if scope == "play" and name in lazy_play:
+                        index = len(bridge.names)
+                        bridge.names.append(name)
+                        expression = "{{ __ansiroll_delegated_play_vars[%d] }}" % index
+                        if trust_as_template is not None:
+                            job_vars[name] = trust_as_template(expression)
+                        else:
+                            job_vars[name] = expression
+                            legacy_aliases[name] = _LegacyDelegatedValue(bridge, index)
+                    elif scope == "play" and name in play_fallbacks:
+                        job_vars[name] = self._restore_play_fallback(wrap_var(play_fallbacks[name]),
+                                                                    play_undefined.get(name, ()))
+                    else:
+                        job_vars[name] = wrap_var(value)
+                if bridge.names:
+                    job_vars["__ansiroll_delegated_play_vars"] = bridge
+                if legacy_aliases:
+                    concrete._post_validate_environment = _legacy_environment_validator(
+                        concrete._post_validate_environment, legacy_aliases)
 
             class _QuietQueue:
                 @staticmethod
@@ -569,6 +806,62 @@ class StrategyModule(StrategyBase):
                 "msg": "ansiroll: controller action %s failed: %s"
                        % (frame.get("action"), ex),
             }
+
+    @staticmethod
+    def _restore_play_fallback(value, undefined, errors=(), mapping_keys=()):
+        if not undefined and not errors and not mapping_keys:
+            return value
+        try:
+            from ansible._internal._templating._jinja_common import CapturedExceptionMarker, UndefinedMarker
+        except ImportError:
+            from ansible.template import AnsibleUndefined
+
+            class DelegatedUndefined(AnsibleUndefined):
+                # Prevent the legacy templar from evaluating this placeholder
+                # when it recursively loads the surrounding container.
+                __UNSAFE__ = True
+
+            missing = DelegatedUndefined(hint="Undefined element in a delegated play variable")
+
+            def error_marker(message):
+                return _DelegatedMemberError(hint=message, exc=AnsibleError)
+        else:
+            missing = UndefinedMarker(hint="Undefined element in a delegated play variable", _no_template_source=True)
+
+            def error_marker(message):
+                return CapturedExceptionMarker(AnsibleError(message))
+
+        markers = [(path, missing) for path in undefined]
+        markers.extend((path, error_marker(message)) for path, message in errors)
+        for path, marker in markers:
+            if not path:
+                return marker
+            container = value
+            for key in path[:-1]:
+                container = container[key]
+            container[path[-1]] = marker
+        def restore_key(key):
+            if isinstance(key, list):
+                return tuple(restore_key(part) for part in key)
+            if isinstance(key, dict):
+                from datetime import date, datetime
+
+                if "bytes" in key:
+                    return base64.b64decode(key["bytes"], validate=True)
+                if "date" in key:
+                    return date.fromisoformat(key["date"])
+                return datetime.fromisoformat(key["datetime"])
+            return key
+
+        # Decode inner mappings before changing the keys used to reach them.
+        for path, keys in reversed(mapping_keys):
+            container = value
+            for key in path:
+                container = container[key]
+            entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
+            container.clear()
+            container.update(entries)
+        return value
 
     def _run_local_template(self, frame, become_pass):
         """Render a runtime-created controller file through the in-memory runtime."""
