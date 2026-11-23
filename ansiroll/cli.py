@@ -98,44 +98,47 @@ def _linux_terminal_device(fd):
         return None
 
 
-def _same_manifest_stream(info, fd, destination_fd=None):
+def _same_manifest_stream(path, info, fd, destination_fd=None):
     stream = os.fstat(fd)
-    if sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode):
-        tty_alias = os.makedev(5, 0)
-        if tty_alias in (info.st_rdev, stream.st_rdev):
-            destination_device = info.st_rdev
-            if destination_device == tty_alias:
-                if destination_fd is not None:
-                    destination_device = _linux_terminal_device(destination_fd)
-                else:
-                    try:
-                        terminal = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
-                    except OSError:
-                        destination_device = None
-                    else:
-                        try:
-                            destination_device = _linux_terminal_device(terminal)
-                        finally:
-                            os.close(terminal)
-            stream_device = _linux_terminal_device(fd) if stream.st_rdev == tty_alias else stream.st_rdev
-            if destination_device is not None and stream_device is not None:
-                if destination_device != stream_device:
-                    return False
-                if info.st_rdev == tty_alias:
-                    # PTYs from separate devpts mounts can share a device
-                    # number. The kernel checks controlling-session identity.
-                    try:
-                        os.tcgetpgrp(fd)
-                    except OSError as ex:
-                        if ex.errno == errno.ENOTTY:
-                            return False
-                return True
-    return _same_stream(info, stream)
+    if not (sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode)):
+        return _same_stream(info, stream)
+
+    tty_alias = os.makedev(5, 0)
+    if tty_alias not in (info.st_rdev, stream.st_rdev):
+        # Unix98 PTY slave numbers are allocated independently by devpts mounts.
+        if info.st_rdev == stream.st_rdev and 136 <= os.major(info.st_rdev) <= 143:
+            return os.path.samestat(info, stream)
+        return _same_stream(info, stream)
+
+    def foreground_group(terminal):
+        try:
+            return os.tcgetpgrp(terminal)
+        except OSError:
+            return None
+
+    with ExitStack() as stack:
+        if destination_fd is None:
+            try:
+                destination_fd = os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+            except OSError:
+                return _same_stream(info, stream)
+            stack.callback(os.close, destination_fd)
+            opened = os.fstat(destination_fd)
+            if not os.path.samestat(info, opened) or not stat.S_ISCHR(opened.st_mode):
+                return False  # The final validation checks the destination actually opened for writing.
+        destination_device = (_linux_terminal_device(destination_fd) if info.st_rdev == tty_alias else info.st_rdev)
+        stream_device = _linux_terminal_device(fd) if stream.st_rdev == tty_alias else stream.st_rdev
+        if destination_device is None or stream_device is None:
+            return _same_stream(info, stream)
+        if destination_device != stream_device:
+            return False
+        # Linux only returns a slave's foreground group to its controlling session.
+        return foreground_group(destination_fd) == foreground_group(fd)
 
 
 def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None):
     for stream, fd in (("stdout", stdout_fd), ("stderr", 2)):
-        if _same_manifest_stream(info, fd, destination_fd):
+        if _same_manifest_stream(path, info, fd, destination_fd):
             if _discard_stream(info):
                 return os.devnull
             raise ValueError("manifest path points to %s: %s" % (stream, path))

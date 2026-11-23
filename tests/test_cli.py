@@ -153,19 +153,65 @@ def test_linux_terminal_uses_native_ioctl_encoding(monkeypatch, machine, expecte
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux devpts device identities")
-def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch):
+@pytest.mark.parametrize("alias_fd", [2, 6])
+def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch, alias_fd):
     device = os.makedev(136, 5)
-    destination = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR)
-    monkeypatch.setattr(os, "fstat", lambda fd: Namespace(st_rdev=device, st_mode=stat.S_IFCHR))
+    alias_device = os.makedev(5, 0)
+    destination = Namespace(st_rdev=alias_device if alias_fd == 6 else device, st_mode=stat.S_IFCHR)
+    stream = Namespace(st_rdev=alias_device if alias_fd == 2 else device, st_mode=stat.S_IFCHR)
+    monkeypatch.setattr(os, "fstat", lambda fd: stream)
     monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: device)
     monkeypatch.setattr(os, "tcgetpgrp", lambda fd: 123)
-    assert cli._same_manifest_stream(destination, 2, destination_fd=6)
+    assert cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
 
     def outside_session(fd):
-        raise OSError(errno.ENOTTY, "terminal is outside this session")
+        if fd == 2:
+            raise OSError(errno.ENOTTY, "terminal is outside this session")
+        return 123
 
     monkeypatch.setattr(os, "tcgetpgrp", outside_session)
-    assert not cli._same_manifest_stream(destination, 2, destination_fd=6)
+    assert not cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux devpts device identities")
+def test_manifest_compares_direct_pty_slaves_by_filesystem_identity(monkeypatch):
+    device = os.makedev(136, 5)
+    destination = Namespace(st_rdev=device, st_mode=stat.S_IFCHR, st_ino=5, st_dev=17)
+    stream = Namespace(st_rdev=device, st_mode=stat.S_IFCHR, st_ino=5, st_dev=18)
+    monkeypatch.setattr(os, "fstat", lambda fd: stream)
+    assert not cli._same_manifest_stream("manifest", destination, 2)
+    stream.st_dev = destination.st_dev
+    assert cli._same_manifest_stream("manifest", destination, 2)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux terminal aliases")
+def test_manifest_terminal_preflight_opens_requested_path(monkeypatch):
+    alias = Namespace(st_rdev=os.makedev(5, 0), st_mode=stat.S_IFCHR, st_ino=5, st_dev=17)
+    slave = Namespace(st_rdev=os.makedev(136, 5), st_mode=stat.S_IFCHR, st_ino=5, st_dev=18)
+    handles = {2: slave, 6: alias}
+    calls = []
+
+    def open_terminal(path, flags):
+        assert path == "/proc/self/fd/4" and flags & os.O_ACCMODE == os.O_WRONLY
+        return 6
+
+    def device(fd):
+        calls.append(fd)
+        return slave.st_rdev
+
+    monkeypatch.setattr(os, "open", open_terminal)
+    monkeypatch.setattr(os, "close", lambda fd: None)
+    monkeypatch.setattr(os, "fstat", handles.__getitem__)
+    monkeypatch.setattr(os, "tcgetpgrp", lambda fd: 123)
+    monkeypatch.setattr(cli, "_linux_terminal_device", device)
+    assert cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
+    assert calls == [6]
+
+    # A swap after stat cannot supply the metadata of an unrelated terminal.
+    handles[6] = slave
+    calls.clear()
+    assert not cli._same_manifest_stream("/proc/self/fd/4", alias, 2)
+    assert calls == []
 
 
 @pytest.mark.parametrize("destination", ["pipe", "file"])
