@@ -84,9 +84,42 @@ def _manifest_for_stdout(path, stdout_fd):
     return _validate_stdout_manifest(path, manifest_stat, stdout_fd)
 
 
+def _linux_terminal_device(fd):
+    import fcntl
+    import struct
+
+    # TIOCGDEV returns the underlying terminal even for a /dev/tty handle.
+    try:
+        return struct.unpack("I", fcntl.ioctl(fd, 0x80045432, bytes(4)))[0]
+    except OSError:
+        return None
+
+
+def _same_manifest_stream(info, fd):
+    stream = os.fstat(fd)
+    if sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode):
+        tty_alias = os.makedev(5, 0)
+        if tty_alias in (info.st_rdev, stream.st_rdev):
+            destination_device = info.st_rdev
+            if destination_device == tty_alias:
+                try:
+                    terminal = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+                except OSError:
+                    destination_device = None
+                else:
+                    try:
+                        destination_device = _linux_terminal_device(terminal)
+                    finally:
+                        os.close(terminal)
+            stream_device = _linux_terminal_device(fd) if stream.st_rdev == tty_alias else stream.st_rdev
+            if destination_device is not None and stream_device is not None:
+                return destination_device == stream_device
+    return _same_stream(info, stream)
+
+
 def _validate_stdout_manifest(path, info, stdout_fd):
     for stream, fd in (("stdout", stdout_fd), ("stderr", 2)):
-        if _same_stream(info, os.fstat(fd)):
+        if _same_manifest_stream(info, fd):
             if _discard_stream(info):
                 return os.devnull
             raise ValueError("manifest path points to %s: %s" % (stream, path))

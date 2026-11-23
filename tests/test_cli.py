@@ -79,6 +79,55 @@ def test_stdout_compile_rejects_manifest_aliasing_stderr(tmp_path):
     assert manifest.read_text() == "ansiroll: manifest path points to stderr: %s\n" % manifest
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux controlling terminal device identities")
+@pytest.mark.parametrize("same_terminal", [False, True])
+def test_stdout_manifest_compares_underlying_terminals(same_terminal):
+    pty = pytest.importorskip("pty")
+    driver = """
+import fcntl
+import os
+import subprocess
+import sys
+import termios
+
+same_terminal, first, second = map(int, sys.argv[1:])
+fcntl.ioctl(first, termios.TIOCSCTTY, 0)
+cli = '''
+from ansiroll import cli
+cli.compile_playbook = lambda *a, **k: ('pass', {'modules': [], 'fallback_tasks': []})
+raise SystemExit(cli.entrypoint())
+'''
+with open('/dev/tty', 'wb') as inherited_terminal:
+    result = subprocess.run(
+        [sys.executable, '-c', cli, 'compile', 'pb.yml', '-o', '-', '-m', '/dev/tty'],
+        stderr=first if same_terminal else inherited_terminal,
+        start_new_session=not same_terminal, pass_fds=(second,),
+        preexec_fn=None if same_terminal else lambda: fcntl.ioctl(second, termios.TIOCSCTTY, 0),
+        timeout=10,
+    )
+raise SystemExit(result.returncode)
+"""
+    first_read, first_write = pty.openpty()
+    second_read, second_write = pty.openpty()
+    try:
+        args = [str(int(same_terminal)), str(first_write), str(second_write)]
+        result = subprocess.run([sys.executable, "-c", driver, *args], stdout=subprocess.PIPE,
+                                start_new_session=True, pass_fds=(first_write, second_write), timeout=15)
+        os.set_blocking(first_read, False)
+        diagnostics = os.read(first_read, 4096)
+        if same_terminal:
+            assert result.returncode == 2 and result.stdout == b""
+            assert diagnostics == b"ansiroll: manifest path points to stderr: /dev/tty\r\n"
+        else:
+            assert result.returncode == 0 and result.stdout == b"pass"
+            assert b"compiled pb.yml" in diagnostics
+            os.set_blocking(second_read, False)
+            assert json.loads(os.read(second_read, 4096)) == {"modules": [], "fallback_tasks": []}
+    finally:
+        for fd in (first_read, first_write, second_read, second_write):
+            os.close(fd)
+
+
 @pytest.mark.parametrize("destination", ["pipe", "file"])
 def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     path = tmp_path / "compiled.py"
@@ -140,7 +189,7 @@ cli.compile_playbook = lambda *a, **k: ("pass", {"modules": [], "fallback_tasks"
 open_fd = os.open
 
 def replace_manifest(path, flags, *args, **kwargs):
-    if path == manifest:
+    if path == manifest and flags & os.O_ACCMODE == os.O_WRONLY:
         os.unlink(manifest)
         os.symlink(target, manifest)
     return open_fd(path, flags, *args, **kwargs)
@@ -154,8 +203,9 @@ raise SystemExit(cli.entrypoint())
     manifest = tmp_path / "manifest.json"
     manifest.touch()
     diagnostics = tmp_path / "diagnostics.txt"
+    diagnostics.write_text("existing diagnostics\n")
     target = output if alias == "stdout" else diagnostics
-    with output.open("r+b") as stream, diagnostics.open("wb") as errors:
+    with output.open("r+b") as stream, diagnostics.open("ab") as errors:
         result = subprocess.run(
             [sys.executable, "-c", script, str(target), str(manifest)],
             stdout=stream, stderr=errors,
@@ -163,7 +213,8 @@ raise SystemExit(cli.entrypoint())
 
     assert result.returncode == 2
     assert output.read_text() == "# existing output\n"
-    assert diagnostics.read_text() == "ansiroll: manifest path points to %s: %s\n" % (alias, manifest)
+    assert diagnostics.read_text() == "existing diagnostics\nansiroll: manifest path points to %s: %s\n" % (
+        alias, manifest)
 
 
 @pytest.mark.parametrize("redirection", ['exec "$@" 2>&-', 'exec "$@" 2</dev/null'])
