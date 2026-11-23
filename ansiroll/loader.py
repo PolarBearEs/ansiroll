@@ -8,10 +8,12 @@ inlined runtime can interpret. This module runs only at compile time.
 
 from __future__ import annotations
 
+import errno
 import os
 import pkgutil
 import re
 import stat
+import time
 from functools import lru_cache
 
 from .compat import init_loader
@@ -1791,6 +1793,18 @@ def _find_needle(task, subdir, rel):
     return path if os.path.isfile(path) else None
 
 
+def _open_role_source(path):
+    for attempt in range(5):
+        try:
+            return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as ex:
+            if ex.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            if attempt == 4:
+                raise ValueError("cannot bake role source %r while a write lease is active" % path) from ex
+            time.sleep(0.05)
+
+
 def _bake_absolute_tree(node, src, basedir, with_meta):
     """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
     separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
@@ -1879,6 +1893,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     meta = {}
     directories = set()
     aliases = {}
+    claimed = set()
     skipped = []
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         if not prefix and not is_subdir:
@@ -1890,18 +1905,22 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             directories.add(os.path.relpath(root, base))
             for dirname in dirs:
                 full = os.path.join(root, dirname)
+                claimed.add(os.path.relpath(full, base))
                 if os.path.islink(full):
                     aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if rel in baked or any(os.path.isfile(os.path.join(d, rel)) for d in skipped):
+                if rel in claimed or any(os.path.exists(os.path.join(d, rel)) for d in skipped):
                     continue
+                if not os.path.exists(full):
+                    continue
+                claimed.add(rel)
                 if not os.path.isfile(full):
                     continue
                 try:
                     # The path may have become a FIFO after the file check.
-                    fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+                    fd = _open_role_source(full)
                     try:
                         st = os.fstat(fd)
                         if not stat.S_ISREG(st.st_mode):

@@ -181,6 +181,51 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
         os.fstat(opened[0])
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+def test_compile_dynamic_role_source_does_not_substitute_later_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+
+    _write(tmp_path, {"earlier/sites/keep.j2": "keep\n", "later/sites/app.j2": "wrong template\n"})
+    os.mkfifo(tmp_path / "earlier/sites/app.j2")
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    assert node["_baked"] == {"sites/keep.j2": "keep\n"}
+
+
+def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypatch):
+    import errno
+
+    from ansiroll import loader
+
+    source = tmp_path / "app.j2"
+    source.write_text("regular template\n")
+    open_fd = os.open
+    attempts = []
+
+    def busy_once(path, flags):
+        attempts.append(path)
+        if len(attempts) <= 2:
+            raise BlockingIOError(errno.EWOULDBLOCK, "write lease is active", path)
+        return open_fd(path, flags)
+
+    monkeypatch.setattr(os, "open", busy_once)
+    monkeypatch.setattr(loader.time, "sleep", lambda _seconds: None)
+    os.close(loader._open_role_source(str(source)))
+    assert attempts == [str(source)] * 3
+
+    def still_busy(path, flags):
+        raise BlockingIOError(errno.EWOULDBLOCK, "write lease is active", path)
+
+    monkeypatch.setattr(os, "open", still_busy)
+    with pytest.raises(ValueError, match="cannot bake role source .*app.j2"):
+        loader._open_role_source(str(source))
+
+
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
 def test_copy_remote_src_reads_target_at_runtime(tmp_path, remote_src):
     src = tmp_path / "remote.txt"
