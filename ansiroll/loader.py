@@ -1867,7 +1867,8 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     or files/ dirs are walked, since a whole role, task or playbook dir would bundle the entire playbook tree. A file
     that an unwalked, earlier dir would shadow is left out so the runtime fails loudly. Returns True if anything was
     baked."""
-    if getattr(task, "_role", None) is None:
+    role = getattr(task, "_role", None)
+    if role is None:
         return False
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
@@ -1878,23 +1879,62 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked = {}
     meta = {}
     directories = set()
+    classified = set()
     aliases = {}
     skipped = []
+    source_roots = tuple(os.path.realpath(path) for path in (basedir, getattr(role, "_role_path", None)) if path)
+    # A NUL cannot be part of a filename. Keep that placeholder intact while
+    # normalizing the literal path around each template expression.
+    parts = _JINJA_RE.split(src)
+    if any(".." in part.split(os.sep) for part in parts[1:]):
+        # A substituted value can span directories, so '..' may consume
+        # only part of it. Match the fixed filename ending within the walk.
+        tail = parts[-1]
+        prefix_pattern = ".*" if os.sep not in tail else "(?:.*/)?"
+        link_pattern = re.compile(prefix_pattern + re.escape(tail.rsplit(os.sep, 1)[-1]), re.S)
+    else:
+        normalized_src = os.path.normpath("\0".join(parts))
+        link_pattern = re.compile(".*".join(re.escape(part) for part in normalized_src.split("\0")), re.S)
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         if not prefix and not is_subdir:
             skipped.append(base)
             continue
         real_base = os.path.realpath(base)
-        for root, dirs, files in os.walk(os.path.join(base, prefix)):
-            dirs.sort()
-            directories.add(os.path.relpath(root, base))
-            for dirname in dirs:
+        tree_dir = os.path.join(base, prefix)
+        real_tree = os.path.realpath(tree_dir)
+        allowed_roots = (*source_roots, real_base, real_tree)
+        ancestry = {tree_dir: (frozenset((real_tree,)), False)}
+        for root, dirs, files in os.walk(tree_dir, followlinks=True):
+            parents, linked = ancestry.pop(root)
+            relative_root = os.path.relpath(root, base)
+            directories.add(relative_root)
+            classified.add(relative_root)
+            children = []
+            for dirname in sorted(dirs):
                 full = os.path.join(root, dirname)
-                if os.path.islink(full):
-                    aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
+                target = os.path.realpath(full)
+                symlink = os.path.islink(full)
+                relative = os.path.relpath(full, base)
+                if relative not in classified:
+                    classified.add(relative)
+                    if symlink:
+                        aliases[relative] = os.path.relpath(target, real_base)
+                if symlink:
+                    if target in source_roots or not any(_visible_below(target, allowed) for allowed in allowed_roots):
+                        continue
+                if linked and dirname.startswith("."):
+                    continue
+                if target in parents:
+                    continue
+                children.append(dirname)
+                ancestry[full] = (parents | {target}, linked or symlink)
+            dirs[:] = children
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
+                if linked and (not link_pattern.fullmatch(rel) or not os.path.isfile(full) or not _visible_below(rel, ".")
+                               or not any(_visible_below(os.path.realpath(full), allowed) for allowed in allowed_roots)):
+                    continue
                 if rel in baked or any(os.path.isfile(os.path.join(d, rel)) for d in skipped):
                     continue
                 try:
@@ -1915,11 +1955,14 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         while directory not in ("", "."):
             directory = os.path.dirname(directory)
             directories.add(directory or ".")
+    # Keep the canonical targets known to the runtime's '..' validation.
+    known_aliases = {path: target for path, target in aliases.items() if target in directories}
+    unresolved_aliases = sorted((aliases.keys() - known_aliases.keys()) & directories)
     node["_baked_tree_dirs"] = sorted(directories)
-    # Capture links to directories already in the tree without walking them.
-    aliases = {path: target for path, target in aliases.items() if target in directories}
-    if aliases:
-        node["_baked_tree_aliases"] = aliases
+    if known_aliases:
+        node["_baked_tree_aliases"] = known_aliases
+    if unresolved_aliases:
+        node["_baked_tree_unresolved_aliases"] = unresolved_aliases
     return True
 
 

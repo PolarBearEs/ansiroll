@@ -3289,12 +3289,13 @@ class Runtime:
             # directories. A missing or unbaked component can't be canceled.
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}
+            unresolved = set(task.get("_baked_tree_unresolved_aliases") or ())
             prefix = []
             for part in parts[:-1]:
                 if part in ("", "."):
                     continue
                 if part == "..":
-                    if not prefix:
+                    if not prefix or "/".join(prefix) in unresolved:
                         return src
                     prefix.pop()
                 else:
