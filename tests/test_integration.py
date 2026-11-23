@@ -2017,14 +2017,15 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
-@pytest.mark.parametrize(("alias_value", "alias_error"), [
-    ("{{ missing }}", None),
-    ("{{ missing | regex_replace('x', 'y') }}", None),
-    ("{{ 'value' | unknown_filter }}", "unknown_filter"),
-    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "unknown_filter"),
-    ("{{ 1 / 0 }}", "division by zero"),
+@pytest.mark.parametrize(("alias_value", "alias_member", "alias_error"), [
+    ("{{ missing }}", "", None),
+    ("{{ missing | regex_replace('x', 'y') }}", "", None),
+    ("{{ 'value' | unknown_filter }}", "", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested[0]", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"], "ok": "optional"}, ".ok", None),
+    ("{{ 1 / 0 }}", "", "division by zero"),
 ])
-def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch, alias_value, alias_error):
+def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch, alias_value, alias_member, alias_error):
     import copy
 
     from ansible.executor import task_executor
@@ -2064,6 +2065,8 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_FILE_LIST: "{{ file_options.labels[0] ~ '-' ~ file_options.labels[2] }}"
               SYNC_FILE_MISSING: "{{ file_options.labels[1] is defined }}"
               SYNC_FILE_DEFAULT: "{{ file_options.labels[1].nested | default('fallback') }}"
+              SYNC_FILE_KEYS: "{{ 'optional' in file_options and (file_options | length == 3) }}"
+              SYNC_FILE_OPTIONAL: "{{ file_options.optional | default('optional') }}"
               SYNC_FILE_JSON: "json={{ file_env | to_json }}"
               SYNC_LIST_JSON: "json={{ file_list | to_json }}"
               SYNC_VARS_LOOKUP: "{{ (lookup('vars', 'file_env')).SYNC_FILE_WHOLE }}"
@@ -2076,7 +2079,7 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_EMPTY: "{{ none }}"
             - "{{ ansible_delegated_vars['localhost']['environment'] }}"
             - "{{ file_env }}"
-""")
+""".replace("optional_agent_alias |", "optional_agent_alias" + alias_member + " |"))
     loader = DataLoader()
     play, = Playbook.load(str(playbook), loader=loader).get_plays()
     original, = play.tasks[0].block
@@ -2171,8 +2174,10 @@ runtime.agent_main()
                          "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
                          "SYNC_FILE_LIST": "RELEASE-tail", "SYNC_FILE_MISSING": False,
                          "SYNC_FILE_DEFAULT": "fallback", "SYNC_UNUSED": "skipped", "SYNC_FILE_WHOLE": "MIXED",
+                         "SYNC_FILE_KEYS": True, "SYNC_FILE_OPTIONAL": "optional",
                          "SYNC_FILE_JSON": 'json={"SYNC_FILE_WHOLE": "MIXED"}', "SYNC_LIST_JSON": 'json=["MIXED"]',
-                         "SYNC_VARS_LOOKUP": "MIXED", "SYNC_UNDEFINED_ALIAS": False, "SYNC_DEFAULT_ALIAS": "optional",
+                         "SYNC_VARS_LOOKUP": "MIXED", "SYNC_UNDEFINED_ALIAS": bool(alias_member),
+                         "SYNC_DEFAULT_ALIAS": "optional",
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")

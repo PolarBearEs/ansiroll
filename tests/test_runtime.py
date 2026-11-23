@@ -227,7 +227,7 @@ def test_delegated_play_fallback_renders_each_member_once():
     assert lazy_play == {"settings"}
     assert calls == []
     assert _resolve_delegated_play_var("settings", values, rt.templater) == {
-        "value": {"label": "ready"}, "undefined": [],
+        "value": {"label": "ready", "optional": None}, "undefined": [("optional",)],
     }
     assert calls == [True]
 

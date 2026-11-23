@@ -48,6 +48,7 @@ from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
+from jinja2 import StrictUndefined
 
 _UnifiedTaskResult = None
 try:  # 2.18-2.20: callbacks accept the private raw result wrapper
@@ -89,6 +90,10 @@ class _LegacyDelegatedValue:
         return self._bridge[self._index]
 
 
+class _DelegatedMemberError(StrictUndefined):
+    __UNSAFE__ = True
+
+
 def _legacy_environment_validator(validate, aliases):
     """Keep native Ansible environment validation, with lazy Jinja name binding."""
     from ansible.errors import AnsibleUndefinedVariable
@@ -96,6 +101,14 @@ def _legacy_environment_validator(validate, aliases):
     from jinja2.runtime import missing
 
     from ansiroll.runtime import _ConditionalCodeGenerator, _ConditionalName
+
+    def check_member(access):
+        def get_member(obj, key):
+            member = access(obj, key)
+            if isinstance(member, _DelegatedMemberError):
+                member._fail_with_undefined_error()
+            return member
+        return get_member
 
     def validate_environment(attr, value, templar):
         environment = getattr(templar, "_environment", None)
@@ -105,6 +118,7 @@ def _legacy_environment_validator(validate, aliases):
         template = templar.template
         instance_template = vars(templar).get("template")
         generator, context_class = environment.code_generator_class, environment.context_class
+        accessors = {name: vars(environment).get(name) for name in ("getitem", "getattr")}
 
         class DelegatedContext(context_class):
             def _defer_name(self, key):
@@ -132,10 +146,17 @@ def _legacy_environment_validator(validate, aliases):
             templar.available_variables = {**variables, **aliases}
             environment.context_class = DelegatedContext
             environment.code_generator_class = _ConditionalCodeGenerator
+            for name in accessors:
+                setattr(environment, name, check_member(getattr(environment, name)))
             return validate(attr, value, templar)
         finally:
             environment.context_class = context_class
             environment.code_generator_class = generator
+            for name, accessor in accessors.items():
+                if accessor is None:
+                    vars(environment).pop(name, None)
+                else:
+                    setattr(environment, name, accessor)
             if instance_template is None:
                 del templar.template
             else:
@@ -660,7 +681,8 @@ class StrategyModule(StrategyBase):
                         raise AnsibleError("unable to resolve delegated play variable %r" % name)
                     if "error" in resolved:
                         raise AnsibleError("delegated play variable %r: %s" % (name, resolved["error"]))
-                    return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"])
+                    return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"],
+                                                       resolved.get("errors", ()))
 
                 bridge = _DelegatedPlayVariables(load_play_var)
                 try:
@@ -720,11 +742,11 @@ class StrategyModule(StrategyBase):
             }
 
     @staticmethod
-    def _restore_play_fallback(value, undefined):
-        if not undefined:
+    def _restore_play_fallback(value, undefined, errors=()):
+        if not undefined and not errors:
             return value
         try:
-            from ansible._internal._templating._jinja_common import UndefinedMarker
+            from ansible._internal._templating._jinja_common import CapturedExceptionMarker, UndefinedMarker
         except ImportError:
             from ansible.template import AnsibleUndefined
 
@@ -734,15 +756,24 @@ class StrategyModule(StrategyBase):
                 __UNSAFE__ = True
 
             missing = DelegatedUndefined(hint="Undefined element in a delegated play variable")
+
+            def error_marker(message):
+                return _DelegatedMemberError(hint=message, exc=AnsibleError)
         else:
             missing = UndefinedMarker(hint="Undefined element in a delegated play variable", _no_template_source=True)
-        for path in undefined:
+
+            def error_marker(message):
+                return CapturedExceptionMarker(AnsibleError(message))
+
+        markers = [(path, missing) for path in undefined]
+        markers.extend((path, error_marker(message)) for path, message in errors)
+        for path, marker in markers:
             if not path:
-                return missing
+                return marker
             container = value
             for key in path[:-1]:
                 container = container[key]
-            container[path[-1]] = missing
+            container[path[-1]] = marker
         return value
 
     def _run_local_template(self, frame, become_pass):

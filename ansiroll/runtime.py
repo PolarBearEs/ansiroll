@@ -5493,36 +5493,30 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_value(value, undefined, path=()):
-    """Read lazy members once and record undefined list indices without shifting them."""
+def _delegate_fallback_member(value, key, undefined, errors, path):
+    try:
+        return _delegate_fallback_value(value[key], undefined, errors, path)
+    except _CapturedTemplateError as error:
+        errors.append((path, str(error)))
+    except jinja2.UndefinedError:
+        undefined.append(path)
+    except Exception as error:
+        errors.append((path, "%s: %s" % (type(error).__name__, error)))
+    return None
+
+
+def _delegate_fallback_value(value, undefined, errors, path=()):
+    """Keep each member's position and classify failures at its own path."""
     if isinstance(value, dict):
-        resolved = {}
-        missing_by_key = {}
+        keys = {}
         for key in value:
             wire_key = key if isinstance(key, str) else next(iter(json.loads(json.dumps({key: None}))))
-            missing = []
-            try:
-                resolved[wire_key] = _delegate_fallback_value(value[key], missing, (*path, wire_key))
-            except _CapturedTemplateError:
-                raise
-            except jinja2.UndefinedError:
-                continue
-            missing_by_key[wire_key] = missing
-        for missing in missing_by_key.values():
-            undefined.extend(missing)
-        return resolved
+            keys[wire_key] = key
+        return {wire_key: _delegate_fallback_member(value, key, undefined, errors, (*path, wire_key))
+                for wire_key, key in keys.items()}
     if isinstance(value, (list, tuple)):
-        resolved = []
-        for index in range(len(value)):
-            member = (*path, index)
-            try:
-                resolved.append(_delegate_fallback_value(value[index], undefined, member))
-            except _CapturedTemplateError:
-                raise
-            except jinja2.UndefinedError:
-                undefined.append(member)
-                resolved.append(None)
-        return resolved
+        return [_delegate_fallback_member(value, index, undefined, errors, (*path, index))
+                for index in range(len(value))]
     return _fail_on_undef(value)
 
 
@@ -5533,8 +5527,12 @@ def _resolve_delegated_play_var(name, scope, templater):
         if not isinstance(scope, _PlayVarScope):
             rendered = templater.resolve_variable(name, rendered, scope)
         undefined = []
-        value = _delegate_fallback_value(rendered, undefined)
-        return {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+        errors = []
+        value = _delegate_fallback_value(rendered, undefined, errors)
+        result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+        if errors:
+            result["errors"] = errors
+        return result
     except _CapturedTemplateError as error:
         return {"error": str(error)}
     except jinja2.UndefinedError:
