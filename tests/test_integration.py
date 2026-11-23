@@ -2017,7 +2017,12 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
-def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("alias_value", "alias_error"), [
+    ("{{ missing }}", None),
+    ("{{ 'value' | unknown_filter }}", "unknown_filter"),
+    ("{{ 1 / 0 }}", "division by zero"),
+])
+def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch, alias_value, alias_error):
     import copy
 
     from ansible.executor import task_executor
@@ -2085,7 +2090,7 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
         "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
         "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
     }, "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
-        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": "{{ missing }}",
+        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": sys.argv[4],
         "unused_agent_alias": "{{ missing_value }}"}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
@@ -2110,7 +2115,7 @@ runtime.agent_main()
     serialized_vars = json.dumps(_tag_untrusted(original.get_vars()))
     serialized_play_vars = json.dumps(_tag_untrusted(play.vars))
     result = subprocess.run([sys.executable, "-c", agent, serialized_environment,
-                             serialized_vars, serialized_play_vars],
+                             serialized_vars, serialized_play_vars, alias_value],
                             input=replies * 2,
                             capture_output=True, timeout=15, check=True)
     stream = io.BytesIO(result.stdout)
@@ -2151,8 +2156,14 @@ runtime.agent_main()
         requests.append(name)
         return fallbacks[index]
 
-    assert [strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None, resolve)
-            for frame in frames] == [
+    results = [strategy._run_native_controller_task(frame, None, play.vars, {"sync": original}, None, resolve)
+               for frame in frames]
+    assert len(results) == 2
+    assert requests == list(names) * 2
+    if alias_error:
+        assert all(result["failed"] and alias_error in result["msg"] for result in results)
+        return
+    assert results == [
         {"environment": {"PLAY_VALUE": "play", "SYNC_LABEL": label, "SYNC_LITERAL": "{{ placeholder }}",
                          "SYNC_UNSAFE": "{{ item }}", "SYNC_PRIOR": "{{ item }}",
                          "SYNC_MIRROR": label + "-controller", "SYNC_LIST": label, "SYNC_FILE": "RELEASE",
@@ -2164,7 +2175,6 @@ runtime.agent_main()
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")
     ]
-    assert requests == list(names) * 2
     assert all("unused_agent_alias" in frame["lazy_play_vars"] for frame in frames)
     assert all("omit" not in frame["vars"] for frame in frames)
     frame = copy.deepcopy(frames[0])

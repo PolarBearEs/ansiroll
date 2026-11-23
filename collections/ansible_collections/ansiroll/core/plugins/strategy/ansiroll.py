@@ -658,6 +658,8 @@ class StrategyModule(StrategyBase):
                     resolved = resolve_play_var(name)
                     if resolved is None:
                         raise AnsibleError("unable to resolve delegated play variable %r" % name)
+                    if "error" in resolved:
+                        raise AnsibleError("delegated play variable %r: %s" % (name, resolved["error"]))
                     return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"])
 
                 bridge = _DelegatedPlayVariables(load_play_var)

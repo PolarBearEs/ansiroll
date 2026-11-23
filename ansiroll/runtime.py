@@ -1549,11 +1549,16 @@ def _concretize(value):
     return value
 
 
-def _captured(msg):
+class _CapturedTemplateError(jinja2.UndefinedError):
+    """A template failure represented lazily as an undefined object."""
+
+
+def _captured(msg, *, missing=False):
     """An error captured as an Undefined: raises with `msg` when actually used
     (strict: even stringification raises), but inspectable via
     `ansible._protomatter.dump_object` (like Ansible 2.19's captured errors)."""
-    return jinja2.StrictUndefined(hint=msg)
+    error_type = jinja2.UndefinedError if missing else _CapturedTemplateError
+    return jinja2.StrictUndefined(hint=msg, exc=error_type)
 
 
 def _dump_object(v):
@@ -1567,7 +1572,7 @@ def _jinja_undef(hint=None):
     if hint is not None and not isinstance(hint, str):
         return _captured("The undef() hint argument must be of type 'str', got %r"
                          % type(hint).__name__)
-    return _captured(hint or "Mandatory variable has not been overridden")
+    return _captured(hint or "Mandatory variable has not been overridden", missing=True)
 
 
 def _wrap_filter(fn):
@@ -1719,7 +1724,8 @@ def _captured_jinja_error(error, syntax=False):
         )
     elif syntax:
         message = "Syntax error in template: %s" % message
-    return _captured(message)
+    missing = isinstance(error, jinja2.UndefinedError) and not isinstance(error, _CapturedTemplateError)
+    return _captured(message, missing=missing)
 
 
 class _Templater:
@@ -5525,10 +5531,13 @@ def _resolve_delegated_play_var(name, scope, templater):
         undefined = []
         value = _delegate_fallback_value(rendered, undefined)
         return {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+    except _CapturedTemplateError as error:
+        return {"error": str(error)}
     except jinja2.UndefinedError:
         return {"value": None, "undefined": [[]]}
-    except (TypeError, ValueError, RecursionError):
-        return None
+    except Exception as error:
+        # Finish the channel exchange even when a plugin or expression fails.
+        return {"error": "%s: %s" % (type(error).__name__, error)}
 
 
 def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None):
