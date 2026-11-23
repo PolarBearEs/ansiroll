@@ -1888,7 +1888,8 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
     - copy:
         dest: "{{ playbook_dir }}/runtime.j2"
         content: !unsafe >-
-          {{ (settings.rows.copy() | first).copy().used }}|{{ settings.rows.copy().pop(0).setdefault('used') }}|
+          {{ (vars.copy().settings.rows.copy() | first).copy().used }}|
+          {{ (vars.items() | selectattr('0', 'equalto', 'settings') | first)[1].rows.copy().pop(0).setdefault('used') }}|
           {{ settings.rows[0].pop('used') }}|{{ 'untouched' if true else unused }}|
           {{ alias.child | default('fallback') }}
     - template:
@@ -1910,7 +1911,7 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
 """)
     _, recap = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
     assert recap == ("2", "2", "0", "0", "0", "0", "0")
-    assert (tmp_path / "output.txt").read_text() == "hello/tail|hello/tail| hello/tail|untouched| fallback"
+    assert (tmp_path / "output.txt").read_text() == "hello/tail| hello/tail| hello/tail|untouched| fallback"
     assert (tmp_path / "lookups").read_text() == "used"
 
 

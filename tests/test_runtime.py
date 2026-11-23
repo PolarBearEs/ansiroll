@@ -699,12 +699,34 @@ def test_delegated_list_mutations_compare_resolved_values():
     rows = _lazy_container([
         _DelegatedTemplateValue(lambda text=text: reads.append(text) or text)
         for text in ("remove", "b", "a")
-    ], rt, {})
+    ], rt, {}, delegated=True)
     rows.remove("remove")
     assert reads == ["remove"]
     rows.sort()
     assert reads == ["remove", "b", "a"]
     assert rows == ["a", "b"]
+
+
+@pytest.mark.parametrize(("expression", "expected", "reads"), [
+    ("rows < ['z']", True, ["a"]),
+    ("rows.copy() <= ['z']", True, ["a"]),
+    ("['0'] < rows", True, ["a"]),
+    ("rows > ['a']", True, ["a"]),
+    ("rows >= []", True, []),
+    ("rows == ['a']", False, []),
+    ("rows != ['z', 'z']", True, ["a"]),
+])
+def test_delegated_list_comparisons_read_only_needed_items(expression, expected, reads):
+    from ansiroll.runtime import _DelegatedTemplateValue, _lazy_container
+
+    rt = Runtime({}, "", {})
+    requested = []
+    rows = _lazy_container([
+        _DelegatedTemplateValue(lambda text=text: requested.append(text) or text)
+        for text in ("a", "b")
+    ], rt, {}, delegated=True)
+    assert rt.templater.render_string("{{ %s }}" % expression, {"rows": rows}) is expected
+    assert requested == reads
 
 
 @pytest.mark.parametrize("expression", [

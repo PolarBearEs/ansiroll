@@ -18,6 +18,7 @@ installed Jinja2.
 import datetime as _dt
 import base64
 import json
+import operator
 import os
 import struct
 import selectors
@@ -27,7 +28,7 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import KeysView
+from collections.abc import ItemsView, KeysView, ValuesView
 from contextlib import contextmanager
 from itertools import groupby
 from numbers import Number
@@ -1054,11 +1055,11 @@ def _query(name, *args, **kwargs):
     return _lookup_values(name, args, kwargs, ctx)
 
 
-def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
+def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
     if isinstance(value, dict):
         return _LazyTplDict(value, rt, ctx, dynamic, origin, task_vars)
     if isinstance(value, list):
-        return _LazyTplList(value, rt, ctx, dynamic, origin, task_vars)
+        return _LazyTplList(value, rt, ctx, dynamic, origin, task_vars, delegated=delegated)
     return value
 
 
@@ -1238,7 +1239,10 @@ class _PlayVarScope(dict):
         self.resolved = {}
         self.resolved_task = {}
         self.resolved_snapshot = {}
-        view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
+        if any(isinstance(value, _DelegatedTemplateValue) for value in ctx.values()):
+            view = _DelegatedPlayVarView
+        else:
+            view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
         snapshot = ctx.get("vars")
         self["vars"] = view(snapshot if isinstance(snapshot, _LoopVarsSnapshot) else _vars_snapshot(ctx), self)
 
@@ -1324,7 +1328,7 @@ class _PlayVarView(dict):
                     if self._loop_snapshot:
                         self._templates[key] = value
                     self[key] = str(value)
-        if "vars" in snapshot:
+        if "vars" in snapshot and not isinstance(snapshot["vars"], _PlayVarView):
             self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
 
     def __getitem__(self, key):
@@ -1371,22 +1375,55 @@ class _ModernPlayVarView(_PlayVarView):
 
     def __eq__(self, other):
         if isinstance(other, _PlayVarView):
-            other = other.copy()
-        return self.copy() == other
+            other = dict(other.items())
+        return dict(self.items()) == other
 
     def __ne__(self, other):
         return not self == other
 
     def __repr__(self):
-        return repr(self.copy())
+        return repr(dict(self.items()))
 
     __str__ = __repr__
+
+
+class _DelegatedPlayVarView(_ModernPlayVarView):
+    """Read controller template aliases lazily through the magic vars mapping."""
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if key == "vars":
+            return value
+        return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
+
+    def items(self):
+        return ItemsView(self)
+
+    def values(self):
+        return ValuesView(self)
+
+    def copy(self):
+        return type(self)(dict(dict.items(self)), self.scope)
+
+    @staticmethod
+    def _resolve_delegated(value):
+        return value.resolve() if isinstance(value, _DelegatedTemplateValue) else value
+
+    def pop(self, key, *default):
+        return self._resolve_delegated(dict.pop(self, key, *default))
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        return key, self._resolve_delegated(value)
+
+    def setdefault(self, key, default=None):
+        return self._resolve_delegated(dict.setdefault(self, key, default))
 
 
 class _LazyTplList(list):
     """A vars list whose items render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
         list.__init__(self, raw)
         self._raw = raw
         self._rt = rt
@@ -1394,6 +1431,7 @@ class _LazyTplList(list):
         self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
         self._task_vars = task_vars
+        self._delegated = delegated
 
     def _render_ctx(self):
         if not self._dynamic:
@@ -1422,17 +1460,14 @@ class _LazyTplList(list):
     def pop(self, index=-1):
         return _observe_container_value(list.pop(self, index), self._rt, self._render_ctx)
 
-    def _has_delegated_items(self):
-        return any(isinstance(value, _DelegatedTemplateValue) for value in list.__iter__(self))
-
     def copy(self):
         values = list.copy(self)
-        if self._has_delegated_items():
-            return _LazyTplList(values, self._rt, self._render_ctx())
+        if self._delegated:
+            return _LazyTplList(values, self._rt, self._render_ctx(), delegated=True)
         return _observe_container_value(values, self._rt, self._render_ctx)
 
     def remove(self, item):
-        if not self._has_delegated_items():
+        if not self._delegated:
             return list.remove(self, item)
         for index, value in enumerate(self):
             if value is item or value == item:
@@ -1441,11 +1476,45 @@ class _LazyTplList(list):
         raise ValueError("list.remove(x): x not in list")
 
     def sort(self, *, key=None, reverse=False):
-        if self._has_delegated_items():
+        if self._delegated:
             self[:] = list(self)
         list.sort(self, key=key, reverse=reverse)
 
+    def _compares_delegated_items(self, other):
+        return isinstance(other, list) and (self._delegated or (
+            isinstance(other, _LazyTplList) and other._delegated))
+
+    def _compare_members(self, other, compare):
+        left_len, right_len = len(self), len(other)
+        # Index only shared positions. Iterating both lists could read a
+        # surplus deferred member when the shorter iterator is exhausted.
+        for index in range(min(left_len, right_len)):
+            left, right = self[index], other[index]
+            if left is right or left == right:
+                continue
+            return False if compare is operator.eq else compare(left, right)
+        return compare(left_len, right_len)
+
+    def _compare_order(self, other, compare, raw_compare):
+        if self._compares_delegated_items(other):
+            return self._compare_members(other, compare)
+        return raw_compare(self, other)
+
+    def __lt__(self, other):
+        return self._compare_order(other, operator.lt, list.__lt__)
+
+    def __le__(self, other):
+        return self._compare_order(other, operator.le, list.__le__)
+
+    def __gt__(self, other):
+        return self._compare_order(other, operator.gt, list.__gt__)
+
+    def __ge__(self, other):
+        return self._compare_order(other, operator.ge, list.__ge__)
+
     def __eq__(self, other):
+        if self._compares_delegated_items(other):
+            return len(self) == len(other) and self._compare_members(other, operator.eq)
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
 
     # list's C-level operations read the raw storage; render first, like
