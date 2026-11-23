@@ -1889,6 +1889,8 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             return False
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
+    tail = re.split(r"{{.*?}}|{%.*?%}|{#.*?#}", src, flags=re.S)[-1]
+    fixed_name = os.path.basename(tail) if os.sep in tail else ""
     baked = {}
     meta = {}
     directories = set()
@@ -1909,6 +1911,10 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 if os.path.islink(full):
                     aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
             for fn in sorted(files):
+                if fixed_name and fn != fixed_name:
+                    continue
+                if os.sep not in tail and not fn.endswith(tail):
+                    continue
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
                 if rel in claimed or any(os.path.exists(os.path.join(d, rel)) for d in skipped):

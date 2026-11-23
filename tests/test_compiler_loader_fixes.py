@@ -226,6 +226,26 @@ def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypat
         loader._open_role_source(str(source))
 
 
+def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+
+    _write(tmp_path, {"sites/app.j2": "usable template\n", "sites/notes.txt": "unrelated\n"})
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        assert path.endswith("/app.j2"), "an unrelated path reached the role source reader"
+        return original_open(path)
+
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: [(str(tmp_path), True)])
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    assert node["_baked"] == {"sites/app.j2": "usable template\n"}
+
+
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
 def test_copy_remote_src_reads_target_at_runtime(tmp_path, remote_src):
     src = tmp_path / "remote.txt"
