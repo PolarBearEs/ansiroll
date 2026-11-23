@@ -183,8 +183,16 @@ def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None):
     return path
 
 
+class _TruncatingReopenError(OSError):
+    pass
+
+
 def _truncation_unavailable(path, original_error):
-    return OSError(original_error.errno, "safe truncating reopen requires /proc/self/fd", path)
+    return _TruncatingReopenError(
+        original_error.errno,
+        "safe truncating reopen requires /proc/self/fd. Compile to a local staging file and copy the output",
+        path,
+    )
 
 
 def _pin_for_truncate(path, fd, original_error):
@@ -499,21 +507,6 @@ def _prepare_compile_stderr():
         sys.stderr = open(2, "w", closefd=False, errors="backslashreplace")
 
 
-def _playbook_input_path(path):
-    directory, filename = os.path.split(path)
-    absolute = os.path.abspath(path)
-    if "$" not in path and "$" not in absolute and not filename.startswith(("~", "'", "\"")):
-        return absolute
-
-    from ansible.parsing.dataloader import DataLoader
-
-    # Match Playbook.load's basedir and the two path_dwim calls made
-    # by load_from_file and _get_file_contents.
-    loader = DataLoader()
-    loader.set_basedir(directory if os.path.isabs(path) else os.path.abspath(directory))
-    return loader.path_dwim(loader.path_dwim(filename))
-
-
 def _try_stat(path):
     try:
         return os.stat(path)
@@ -523,13 +516,13 @@ def _try_stat(path):
 
 
 def _cmd_compile(args, stdout=None):
-    input_path = _playbook_input_path(args.playbook)
-    original_input = _try_stat(input_path)
+    input_path = None
+    input_stat = None
 
     def validate_input(info, name, path):
-        if info is None:
+        if info is None or input_stat is None:
             return
-        for input_info in (original_input, _try_stat(input_path)):
+        for input_info in (input_stat, _try_stat(input_path)):
             if input_info is not None and os.path.samestat(info, input_info):
                 raise ValueError("%s points to input playbook: %s" % (name, path))
 
@@ -541,8 +534,12 @@ def _cmd_compile(args, stdout=None):
         if args.manifest:
             validate_input(_try_stat(args.manifest), "manifest path", args.manifest)
 
-    try:
+    def on_playbook_open(path, info):
+        nonlocal input_path, input_stat
+        input_path, input_stat = path, info
         check_input_destinations()
+
+    try:
         if stdout is None and args.manifest:
             _check_file_destinations(args.output, args.manifest)
     except ValueError as ex:
@@ -559,7 +556,8 @@ def _cmd_compile(args, stdout=None):
                                             extra_vars=extra_vars,
                                             tree_shake=args.tree_shake,
                                             freeze_playbook_vars=args.freeze_playbook_vars,
-                                            freeze_vars=args.freeze_var)
+                                            freeze_vars=args.freeze_var,
+                                            on_playbook_open=on_playbook_open)
     except Exception as ex:
         if not isinstance(ex, (ValueError,) + _ansible_errors()):
             raise
@@ -577,7 +575,7 @@ def _cmd_compile(args, stdout=None):
                 _write_stdout_manifest(args.manifest, manifest, stdout.fileno(), validate_input=validate_input)
             stdout.write(source.encode("utf-8"))
             stdout.flush()
-    except ValueError as ex:
+    except (ValueError, _TruncatingReopenError) as ex:
         sys.stderr.write("ansiroll: %s\n" % ex)
         return 2
     sys.stderr.write(

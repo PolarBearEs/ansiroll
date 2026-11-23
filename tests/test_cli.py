@@ -512,8 +512,10 @@ def test_compile_preserves_a_literal_playbook_name_with_an_escaped_final_quote(t
 
 @pytest.mark.parametrize("destination", ["output-only", "output-with-manifest", "manifest"])
 def test_compile_checks_destination_inode_after_open(monkeypatch, tmp_path, capsys, destination):
+    pytest.importorskip("ansible")
     playbook = tmp_path / "play.yml"
-    playbook.write_text("original")
+    original = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(original)
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     open_fd = os.open
@@ -526,18 +528,79 @@ def test_compile_checks_destination_inode_after_open(monkeypatch, tmp_path, caps
         return open_fd(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", replace_destination_before_open)
-    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
     args = ["compile", str(playbook), "-o", str(output)]
     if destination != "output-only":
         args.extend(["-m", str(manifest)])
 
     assert cli.main(args) == 2
     assert "points to input playbook" in capsys.readouterr().err
-    assert playbook.read_text() == "original"
+    assert playbook.read_text() == original
     if destination == "manifest":
-        assert output.read_text() == "pass\n"
+        assert output.read_text().startswith("#!")
     else:
         assert not manifest.exists()
+
+
+def test_compile_preserves_the_inode_it_read_when_the_playbook_symlink_changes(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+
+    original = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    initial, selected, final = (tmp_path / name for name in ("first.yml", "selected.yml", "final.yml"))
+    for path in (initial, selected, final):
+        path.write_text(original)
+    playbook = tmp_path / "play.yml"
+    playbook.symlink_to(initial)
+    load_from_file = DataLoader.load_from_file
+
+    def load_after_replacing_link(loader, path, *args, **kwargs):
+        if path != playbook.name:
+            return load_from_file(loader, path, *args, **kwargs)
+        playbook.unlink()
+        playbook.symlink_to(selected)
+        try:
+            return load_from_file(loader, path, *args, **kwargs)
+        finally:
+            playbook.unlink()
+            playbook.symlink_to(final)
+
+    monkeypatch.setattr(DataLoader, "load_from_file", load_after_replacing_link)
+    assert cli.main(["compile", str(playbook), "-o", str(selected)]) == 2
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert selected.read_text() == original
+    assert playbook.resolve() == final
+
+
+def test_compile_reports_ansible_configuration_errors_for_an_expanded_input(tmp_path):
+    release = pytest.importorskip("ansible.release")
+    output = tmp_path / "compiled.py"
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", "$ANSIROLL_INPUT", "-o", str(output)],
+                            env=dict(os.environ, ANSIBLE_VERBOSITY="bogus", ANSIROLL_INPUT="input.yml"),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2
+    if tuple(map(int, release.__version__.split(".")[:2])) >= (2, 16):
+        assert "Traceback" not in result.stderr
+    assert "bogus" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires the Linux C locale")
+def test_legacy_compile_checks_ansible_filename_bytes_in_an_ascii_locale(tmp_path):
+    release = pytest.importorskip("ansible.release")
+    if tuple(map(int, release.__version__.split(".")[:2])) >= (2, 17):
+        pytest.skip("newer Ansible requires a UTF-8 locale")
+
+    playbook = tmp_path / "play-é.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile",
+                             str(tmp_path / "$ANSIROLL_INPUT"), "-o", str(playbook)],
+                            env=dict(os.environ, LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0",
+                                     ANSIROLL_INPUT=playbook.name),
+                            capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"output path points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
 
 
 def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path):
@@ -924,14 +987,16 @@ def test_manifest_open_can_release_output_pin(monkeypatch, tmp_path, manifest_pi
 
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
-def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_path):
+@pytest.mark.parametrize("destination", ["stdout-manifest", "output"])
+def test_compile_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_path, capsys, destination):
     output = tmp_path / "stdout"
     manifest = tmp_path / "manifest.json"
-    manifest.write_text("previous manifest")
+    target = output if destination == "output" else manifest
+    target.write_text("previous content")
     open_fd, stat_path = os.open, os.stat
 
     def require_truncate(path, flags, *args, **kwargs):
-        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
             raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
         return open_fd(path, flags, *args, **kwargs)
 
@@ -942,10 +1007,15 @@ def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_
 
     monkeypatch.setattr(os, "open", require_truncate)
     monkeypatch.setattr(os, "stat", stat_without_procfs)
-    with output.open("w") as stream:
-        with pytest.raises(PermissionError, match="safe truncating reopen requires /proc/self/fd"):
-            cli._write_stdout_manifest(str(manifest), {}, stream.fileno())
-    assert manifest.read_text() == "previous manifest"
+    if destination == "output":
+        monkeypatch.setattr(cli, "compile_playbook", lambda *args, **kwargs: ("pass\n", {}))
+        assert cli.main(["compile", "play.yml", "-o", str(output)]) == 2
+        assert "Compile to a local staging file" in capsys.readouterr().err
+    else:
+        with output.open("w") as stream:
+            with pytest.raises(OSError, match="safe truncating reopen requires /proc/self/fd"):
+                cli._write_stdout_manifest(str(manifest), {}, stream.fileno())
+    assert target.read_text() == "previous content"
 
 
 @pytest.mark.parametrize("destination", ["output", "manifest"])
