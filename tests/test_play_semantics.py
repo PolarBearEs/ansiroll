@@ -1707,10 +1707,16 @@ def test_setup_first_found_bundles_nested_dynamic_filenames(tmp_path, monkeypatc
     assert _standalone(tmp_path, []) == expected
 
 
-@pytest.mark.parametrize("team", ["org", "current/org", "current/current/current/org"])
-def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path, monkeypatch, team):
+@pytest.mark.parametrize(("team", "suffix"), [
+    ("org", "profiles/./prod.yml"),
+    ("current/org", "profiles/./prod.yml"),
+    ("current/current/current/org", "profiles/./prod.yml"),
+    ("current/current", "current/current/profiles/prod.yml"),
+])
+def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path, monkeypatch, team, suffix):
     _write(tmp_path, {
         "vars/dev/profiles/prod.yml": "subset: [all]\n",
+        "vars/dev/current/current/profiles/prod.yml": "subset: [all]\n",
         "vars/shared/prod.yml": "subset: ['!all', '!min']\n",
         "pb.yml": """
         - hosts: localhost
@@ -1718,15 +1724,16 @@ def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path,
           gather_subset: "{{ subset }}"
           vars: {team: dev}
           vars_files:
-            - "{{ lookup('first_found', {'files': [team ~ '/profiles/./prod.yml'], 'paths': [playbook_dir ~ '/vars']}) }}"
+            - "{{ lookup('first_found', {'files': [team ~ '/%s'], 'paths': [playbook_dir ~ '/vars']}) }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % suffix,
     })
     (tmp_path / "vars/org").mkdir()
     (tmp_path / "vars/org/profiles").symlink_to("../shared", target_is_directory=True)
     (tmp_path / "vars/shared/cycle").symlink_to("..", target_is_directory=True)
     (tmp_path / "vars/current").symlink_to(".", target_is_directory=True)
+    (tmp_path / "vars/profiles").symlink_to("shared", target_is_directory=True)
     extra = json.dumps({"team": team})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
@@ -1734,21 +1741,29 @@ def test_setup_first_found_discovers_normalized_paths_through_symlinks(tmp_path,
     assert _standalone(tmp_path, []) == expected
 
 
-def test_setup_first_found_discovers_nested_leading_search_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("directory_suffix", [" ~ '/settings'", ""])
+def test_setup_first_found_discovers_nested_leading_search_path(tmp_path, monkeypatch, directory_suffix):
+    from ansiroll.loader import parse_playbook
+
     _write(tmp_path, {
         "dev/settings/facts.yml": "subset: [all]\n",
         "team/prod/settings/facts.yml": "subset: ['!all', '!min']\n",
+        "dev/facts.yml": "subset: [all]\n",
+        "team/prod/facts.yml": "subset: ['!all', '!min']\n",
+        "team/prod/other.yml": "unrelated: never_bundle_this\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
           vars: {profile: dev}
           vars_files:
-            - "{{ lookup('first_found', {'files': ['facts.yml'], 'paths': [profile ~ '/settings']}) }}"
+            - "{{ lookup('first_found', {'files': ['facts.yml'], 'paths': [profile%s]}) }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % directory_suffix,
     })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "never_bundle_this" not in json.dumps(plays, default=str)
     extra = json.dumps({"profile": "team/prod"})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']

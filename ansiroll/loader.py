@@ -644,9 +644,10 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         first = literals[0] if literals else ""
         if (anchored and literals and (first is None or not first.startswith(os.sep))
                 or not anchored and first and first.startswith((os.sep, "~"))
-                or any(".." in part.split(os.sep) for part in literals if part is not None)
-                or literals and all(part is None for part in literals)):
+                or any(".." in part.split(os.sep) for part in literals if part is not None)):
             return None
+        if literals and all(part is None for part in literals):
+            return (False, "**") if directory else None
 
         pattern = []
         for index, part in enumerate(literals):
@@ -802,8 +803,8 @@ def _modeled_first_found_files(candidates, aliases):
             # separator-spanning wildcards to verify the entire filename.
             prefix = filename.split("\0", 1)[0].rpartition(os.sep)[0]
             suffix = filename.rsplit("\0", 1)[-1]
-            leaf = suffix.rsplit(os.sep, 1)[-1] if os.sep in suffix else "*" + suffix
-            search = os.path.join(prefix, "**", leaf)
+            fixed_suffix = suffix.partition(os.sep)[2] if os.sep in suffix else "*" + suffix
+            search = os.path.join(prefix, "**", fixed_suffix)
         for directory in directories:
             if not directory.is_dir():
                 continue
