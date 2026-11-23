@@ -434,10 +434,18 @@ class StrategyModule(StrategyBase):
                 subdir = "templates" if role_task.action.rsplit(".", 1)[-1] == "template" else "files"
                 fullpath = loader.path_dwim_relative_stack(role_task.get_search_path(), subdir, path)
                 realpath = os.path.realpath(fullpath)
-                if realpath != os.path.abspath(fullpath):
-                    roots = _role_source_roots(role_task, loader.get_basedir())
-                    if (not any(_visible_below(fullpath, root) for root in roots)
-                            or not any(_visible_below(realpath, os.path.realpath(root)) for root in roots)):
+                absolute = os.path.abspath(fullpath)
+                if realpath != absolute:
+                    roots = {os.path.abspath(root): os.path.realpath(root)
+                             for root in _role_source_roots(role_task, loader.get_basedir())}
+                    # Declared roots may themselves be reached through links.
+                    ordinary = any(
+                        os.path.commonpath((absolute, root)) == root
+                        and os.path.join(real_root, os.path.relpath(absolute, root)) == realpath
+                        for root, real_root in roots.items()
+                    )
+                    if not ordinary and (not any(_visible_below(fullpath, root) for root in roots)
+                                         or not any(_visible_below(realpath, root) for root in roots.values())):
                         return {"error": "controller role source %r is excluded" % path}
                 fd = _open_linked_role_source(realpath)
                 source = os.fdopen(fd, "rb", closefd=False)

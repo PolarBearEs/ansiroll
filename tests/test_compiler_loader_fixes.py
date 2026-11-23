@@ -1221,7 +1221,8 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
 
 
 @pytest.mark.parametrize("name", ["generated", ".generated"])
-def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_empty(tmp_path, name):
+@pytest.mark.parametrize("linked_root", [False, True])
+def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_empty(tmp_path, name, linked_root):
     project = tmp_path / "project"
     generated = project / ("sites/alias/%s.j2" % name)
     destination = project / "output.txt"
@@ -1239,7 +1240,10 @@ def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_e
     excluded.mkdir()
     (project / "roles/r/templates/sites/alias").symlink_to(excluded, target_is_directory=True)
 
-    playbook = project / "pb.yml"
+    root = tmp_path / "linked" if linked_root else project
+    if linked_root:
+        root.symlink_to(project, target_is_directory=True)
+    playbook = root / "pb.yml"
     expected = _ansible(playbook, returncode=0)
     assert destination.read_text() == "generated"
     generated.unlink()
@@ -1566,6 +1570,16 @@ def test_dynamic_role_template_pattern_handles_many_repeated_literals():
     path = "sites/" + "a" * 100
     assert not _linked_role_source_matches(pattern, path + ".j2")
     assert _linked_role_source_matches(pattern, path + "b.j2")
+
+
+def test_dynamic_role_template_bounds_expansion_of_assigned_path_parts():
+    from ansiroll.loader import _linked_role_source_patterns
+
+    setup = "{% set prefix = 'abcdefghijklmnop' %}"
+    doubling = "{% set prefix = prefix ~ prefix %}"
+    path = "sites/{{ prefix }}-{{ name }}.j2"
+    assert _linked_role_source_patterns(setup + doubling * 4 + path) is not None
+    assert _linked_role_source_patterns(setup + doubling * 14 + path) is None
 
 
 @pytest.mark.parametrize(("literal_directory", "prefix"), [("", "alias/"), ("alias", "/")])

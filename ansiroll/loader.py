@@ -2010,7 +2010,10 @@ def _linked_role_source_patterns(src):
                 choices = expand_node(node, current)
                 if len(variants) + len(choices) > 128:
                     raise ValueError("too many linked source alternatives")
-                variants.extend((prefix + suffix, updated) for suffix, updated in choices)
+                for suffix, updated in choices:
+                    if len(prefix) + len(suffix) > 4096:
+                        raise OverflowError("expanded linked source pattern is too long")
+                    variants.append((prefix + suffix, updated))
             paths = variants
         return paths
 
@@ -2067,7 +2070,7 @@ def _linked_role_source_patterns(src):
 
     try:
         candidates = expand(body, {})
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     patterns = []
     for candidate in dict.fromkeys(path for path, _ in candidates):
