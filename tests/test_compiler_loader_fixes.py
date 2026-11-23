@@ -1476,6 +1476,35 @@ def test_dynamic_role_template_keeps_link_budget_after_a_fixed_prefix(tmp_path):
     assert destination.read_text() == "linked template\n"
 
 
+def test_dynamic_role_template_excludes_unrelated_aliases_from_the_visit_budget(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: nested/app}
+- template: {src: "sites/{{ 'blue/' + name }}.j2", dest: output.txt}
+""", "shared/leaf/app.j2": "linked template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir(parents=True)
+    blue = tmp_path / "shared/blue"
+    blue.mkdir()
+    (blue / "nested").symlink_to("../leaf", target_is_directory=True)
+    (sites / "blue").symlink_to(blue, target_is_directory=True)
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    for index in range(4095):
+        (unrelated / ("dir-%d" % index)).mkdir()
+    (sites / "aaa").symlink_to(unrelated, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
 @pytest.mark.parametrize(("src", "matched", "excluded"), [
     ("sites/{{ 'a' + ('li' + 'as') }}/app.j2", "alias/app.j2", "report-alias/app.j2"),
     ("sites/{{ 'alias/' + name }}.j2", "alias/app.j2", "report-alias/app.j2"),

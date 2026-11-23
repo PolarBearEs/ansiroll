@@ -2126,6 +2126,18 @@ def _linked_role_source_matches(pattern, relative):
     return len(relative) in positions
 
 
+def _linked_role_source_prefix(pattern):
+    prefix = ""
+    for tokens, optional in pattern:
+        if optional:
+            break
+        literal, dynamic, _ = "".join(tokens).partition("\0")
+        prefix += literal
+        if dynamic:
+            break
+    return prefix
+
+
 def _open_linked_role_source(resolved_path):
     """Open a validated real path without following replacement symlinks."""
     *directories, filename = resolved_path.split(os.sep)[1:]
@@ -2150,11 +2162,13 @@ def _role_source_roots(task, basedir):
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
     from collections import deque
+    from pathlib import Path
 
     parsed = _linked_role_source_patterns(src)
     if parsed is None:
         return {}, {}, {}
     head, patterns = parsed
+    possible_prefixes = {_linked_role_source_prefix(pattern) for _, pattern in patterns}
     prefix = os.path.normpath(head.rpartition(os.sep)[0])
     if prefix == ".":
         prefix = ""
@@ -2200,6 +2214,22 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 if winner is not None and direct[lookup_path] is None:
                     pending.setdefault(winner, []).append(lookup_path)
 
+    # An ordinary spelling may resolve to a known winner under a different
+    # spelling. Keep its ancestors even when that path misses the pattern.
+    pending_parents = {str(parent) for winner in pending for parent in Path(winner).parents}
+
+    def may_have_sources(path, base, is_subdir):
+        if "" in possible_prefixes or os.path.normpath(path) in pending_parents:
+            return True
+        relative = os.path.relpath(path, base)
+        if relative == ".":
+            return True
+        for spelling in source_spellings(relative, is_subdir):
+            directory = spelling + os.sep
+            if any(directory.startswith(prefix) or prefix.startswith(directory) for prefix in possible_prefixes):
+                return True
+        return False
+
     assets, metadata, contents = {}, {}, {}
     newline = "" if subdir == "files" else None
     remaining_linked_visits = 4096
@@ -2210,6 +2240,8 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         if not prefix and not is_subdir:
             continue
         tree = os.path.join(base, prefix)
+        if not may_have_sources(tree, base, is_subdir):
+            continue
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
@@ -2232,8 +2264,10 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         _, dirs, files = step
         for name in sorted(dirs):
             path = os.path.join(root, name)
+            if name.startswith(".") or not may_have_sources(path, base, is_subdir):
+                continue
             target = os.path.realpath(path)
-            if name.startswith(".") or not visible(target):
+            if not visible(target):
                 continue
             child_is_link = os.path.islink(path)
             queue = next_hop_dirs if child_is_link else pending_dirs
