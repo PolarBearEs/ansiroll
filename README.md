@@ -133,7 +133,14 @@ when a package or purged configuration remains. Installations, upgrades,
 wildcards, cache updates, unusual dpkg states, and other options fall back to
 the official module before making changes.
 
-Fact gathering has a separate opt-in because Ansible's `setup` module exposes a
+When implicit fact gathering uses `first_found` to reselect a `vars_files` entry,
+the standalone artifact searches the candidates bundled at compile time. Use a
+fixed directory prefix such as `'profiles/' ~ profile ~ '.yml'` or a fixed lookup
+`paths` directory to support nested filename overrides. A filename suffix alone
+matches only the immediate entries of a search root. Literal absolute filenames
+within declared search roots can also be bundled.
+
+The fast fact collector is opt-in because Ansible's `setup` module exposes a
 much larger surface than the accelerated task modules:
 
 ```bash

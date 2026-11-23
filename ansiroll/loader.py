@@ -204,6 +204,13 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             basedir = os.getcwd()
     unresolved_vars_files = []
     core_version = _core_version()
+    # The strategy supplies the iterator's filtered setup decision. Standalone
+    # uses the play keyword and the controller's default gathering policy.
+    gather = gather_facts
+    if gather is None:
+        gather = play.gather_facts
+        if gather is None:
+            gather = C.DEFAULT_GATHERING != "explicit"
     gather_options = {}
     for option in ("gather_subset", "gather_timeout", "fact_path"):
         value = getattr(play, option, None)
@@ -216,7 +223,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             continue
         gather_options[option] = value
     scoped_gather = gather_facts is None and any(
-        _is_templated(item) for value in gather_options.values() for item in _as_list(value)
+        _is_templated(item) for option, value in gather_options.items()
+        if gather or option != "fact_path"
+        for item in _as_list(value)
     )
     ordered_vars_files = [] if scoped_gather else None
     play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
@@ -275,13 +284,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if runtime_writes is not None:
         runtime_writes.update(includes.runtime_writes)
     _assign_runtime_ids(tasks, handlers)
-    # The strategy supplies the iterator's filtered setup decision. Standalone
-    # uses the play keyword and the controller's default gathering policy.
-    gather = gather_facts
-    if gather is None:
-        gather = play.gather_facts
-        if gather is None:
-            gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
     # Before 2.18, omitting these play fields restores the controller default.

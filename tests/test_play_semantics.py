@@ -1881,6 +1881,55 @@ def test_setup_first_found_discovers_nested_filename_under_literal_prefix(tmp_pa
     assert _standalone(tmp_path, []) == expected
 
 
+def test_setup_first_found_does_not_recurse_from_a_filename_suffix_alone(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "profiles/dev.yml": "subset: [all]\n",
+        "team/prod.yml": "subset: ['!all', '!min']\nunrelated: never_bundle_nested\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {filename: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': [filename ~ '.yml'], 'paths': ['profiles', '']}) }}"
+          tasks:
+            - debug: {msg: gathered}
+        """,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "never_bundle_nested" not in json.dumps(plays, default=str)
+    extra = json.dumps({"filename": "team/prod"})
+    assert _ansible_run(tmp_path, ["-e", extra]).returncode == 0
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    result = _standalone_run(tmp_path, [])
+    assert result.returncode != 0
+    assert "No bundled vars file was found" in result.stdout + result.stderr
+
+
+def test_disabled_setup_does_not_bundle_fact_path_vars_file_alternatives(tmp_path):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "profiles/dev.yml": "facts_dir: selected-facts\n",
+        "profiles/prod.yml": "facts_dir: never_bundle_unused_facts\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          fact_path: "{{ playbook_dir }}/{{ facts_dir }}"
+          vars: {profile: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': [profile ~ '.yml'], 'paths': [playbook_dir ~ '/profiles']}) }}"
+          tasks:
+            - debug: {msg: "{{ facts_dir }}"}
+        """,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "never_bundle_unused_facts" not in json.dumps(plays, default=str)
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
 @pytest.mark.parametrize("fallback_path", ["team/default.yml", "profiles/../team/default.yml"])
 def test_setup_first_found_bundles_literal_absolute_fallback(tmp_path, monkeypatch, fallback_path):
     fallback_file = tmp_path / fallback_path
