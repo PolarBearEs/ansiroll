@@ -1711,8 +1711,10 @@ def test_dynamic_role_template_rejects_link_target_replaced_during_open(tmp_path
 @pytest.mark.parametrize("src", [
     "sites/.private/{{ selection }}.j2",
     "sites/{{ selection }}{% if staged %}.staging{% else %}.j2{% endif %}",
+    "sites/{{ selection }}.j2/",
+    "sites/{{ selection }}.j2/.",
 ])
-def test_dynamic_role_template_does_not_expand_unbounded_linked_candidates(tmp_path, src):
+def test_dynamic_role_template_skips_excluded_or_unusable_linked_candidates(tmp_path, src):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false

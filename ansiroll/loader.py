@@ -2078,8 +2078,12 @@ def _linked_role_source_patterns(src):
         return None
     patterns = []
     for candidate in dict.fromkeys(path for path, _ in candidates):
-        if candidate and not os.path.isabs(candidate) and ".." not in candidate.split(os.sep):
-            patterns.append((candidate.partition("\0")[0], _linked_role_source_pattern(candidate)))
+        if not candidate or os.path.isabs(candidate) or ".." in candidate.split(os.sep):
+            continue
+        # These spellings require a directory, even after the variables render.
+        if candidate.endswith((os.sep, os.sep + ".")):
+            continue
+        patterns.append((candidate.partition("\0")[0], _linked_role_source_pattern(candidate)))
     return (head, patterns) if patterns else None
 
 
