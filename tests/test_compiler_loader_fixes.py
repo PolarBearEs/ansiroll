@@ -146,8 +146,9 @@ def test_compile_dynamic_role_sources_skips_unused_fifos(tmp_path):
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
-@pytest.mark.parametrize("replacement", ["fifo", "directory"])
+@pytest.mark.parametrize("replacement", ["fifo", "directory", "socket"])
 def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, replacement):
+    import socket
     from types import SimpleNamespace
 
     from ansiroll import loader
@@ -160,6 +161,10 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
     target = tmp_path / "earlier/sites/swap.j2"
     open_fd = os.open
     opened = []
+    if replacement == "socket":
+        with socket.socket(socket.AF_UNIX) as listener:
+            socket_path = str(target.with_name("s"))
+            listener.bind(socket_path)
 
     def swap_then_open(path, flags):
         if path == str(target):
@@ -167,6 +172,8 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
             target.unlink()
             if replacement == "fifo":
                 os.mkfifo(target)
+            elif replacement == "socket":
+                os.rename(socket_path, path)
             else:
                 target.mkdir()
             fd = open_fd(path, flags)
@@ -186,9 +193,12 @@ def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, r
         Runtime({}, "", {})._asset_text(node["_baked"][direct])
     traversed = Runtime._baked_source_key(node, "sites/branch/../swap.j2")
     assert node["_baked"][traversed] == "later template\n"
-    assert len(opened) == 1
-    with pytest.raises(OSError):
-        os.fstat(opened[0])
+    if replacement == "socket":
+        assert not opened
+    else:
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            os.fstat(opened[0])
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
@@ -498,6 +508,30 @@ def test_compile_dynamic_role_source_continues_past_unreachable_candidates(tmp_p
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == expected_content
+
+
+def test_compile_dynamic_role_source_checks_a_traversed_directory_without_normalized_input(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "templates/sites/app.j2": "last template\n"})
+    (tmp_path / "roles/r/templates/sites/app.j2").mkdir(parents=True)
+    middle = tmp_path / "roles/r/sites"
+    (middle / "nested/branch").mkdir(parents=True)
+    (middle / "nested/app.j2").mkdir()
+    (middle / "link").symlink_to("nested/branch", target_is_directory=True)
+    last = tmp_path / "templates/sites"
+    (last / "branch").mkdir()
+    (last / "link").symlink_to("branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    _ansible(playbook, returncode=2)
+    _ansiroll(playbook, tmp_path, returncode=1)
+    assert not (tmp_path / "rendered.txt").exists()
 
 
 @pytest.mark.parametrize("replace_parent", [False, True])

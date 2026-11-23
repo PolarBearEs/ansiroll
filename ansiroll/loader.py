@@ -2046,22 +2046,23 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     shadowed.setdefault(rel, set()).add(root_index)
                 try:
                     # The path may have become a FIFO after the file check.
-                    fd = _open_role_source(full)
                     try:
-                        st = os.fstat(fd)
-                        if not stat.S_ISREG(st.st_mode):
-                            if not alternate:
-                                claimed.remove(rel)
-                            del root_files[rel]
-                            root_blocks[rel] = stat.S_ISDIR(st.st_mode)
-                            blockers.setdefault(rel, set()).add(root_index)
-                            if rel in shadowed:
-                                shadowed[rel].discard(root_index)
-                            continue
-                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as fh:
-                            baked[key] = fh.read()
-                    finally:
-                        os.close(fd)
+                        fd = _open_role_source(full)
+                    except OSError as ex:
+                        # A socket can reject open before fstat is possible.
+                        mode = _role_source_mode(full) if ex.errno == errno.ENXIO else None
+                        if mode is None or stat.S_ISREG(mode):
+                            raise
+                    else:
+                        try:
+                            st = os.fstat(fd)
+                            mode = st.st_mode
+                            if stat.S_ISREG(mode):
+                                with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape",
+                                               closefd=False) as fh:
+                                    baked[key] = fh.read()
+                        finally:
+                            os.close(fd)
                 except _RoleSourceLeaseError as ex:
                     baked[key] = {"__ansiroll_source_error__": str(ex)}
                     continue
@@ -2074,6 +2075,15 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     del root_files[rel]
                     continue
                 except OSError:
+                    continue
+                if not stat.S_ISREG(mode):
+                    if not alternate:
+                        claimed.remove(rel)
+                    del root_files[rel]
+                    root_blocks[rel] = stat.S_ISDIR(mode)
+                    blockers.setdefault(rel, set()).add(root_index)
+                    if rel in shadowed:
+                        shadowed[rel].discard(root_index)
                     continue
                 if alternate:
                     alternate_meta[key] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime,

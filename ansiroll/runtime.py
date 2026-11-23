@@ -3758,8 +3758,7 @@ class Runtime:
             if shadowed:
                 roots = task["_baked_tree_roots"]
                 is_copy = (task.get("action") or "").rsplit(".", 1)[-1] == "copy"
-                for root in shadowed:
-                    directories, aliases, blocked, files = roots[root]
+                for directories, aliases, blocked, files in roots:
                     path = Runtime._baked_role_path(parts, directories, aliases)
                     if path not in blocked and path not in files:
                         continue
