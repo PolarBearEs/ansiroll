@@ -1183,10 +1183,11 @@ def test_dynamic_role_template_preserves_earlier_regular_directory(tmp_path):
     assert destination.read_text() == "role template\n"
 
 
-@pytest.mark.parametrize("linked_fallbacks", [False, True])
-def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path, linked_fallbacks):
-    destination = tmp_path / "rendered.txt"
-    _write(tmp_path, {"pb.yml": """
+@pytest.mark.parametrize("fallbacks", ["regular", "linked", "filtered"])
+def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path, fallbacks):
+    project = tmp_path / "project"
+    destination = project / "rendered.txt"
+    _write(project, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
@@ -1194,17 +1195,20 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
 - set_fact: {selection: alias/app}
 - template: {src: "sites/{{ selection }}.j2", dest: "%s"}
 """ % destination, "roles/r/templates/.private/app.j2": "earlier source\n",
-        "roles/r/templates/sites/local.j2": "valid source\n",
-        "later/app.j2" if linked_fallbacks else "templates/sites/alias/app.j2": "later source\n",
-        "working/app.j2" if linked_fallbacks else "sites/alias/app.j2": "controller working directory source\n"})
-    (tmp_path / "roles/r/templates/sites/alias").symlink_to("../.private", target_is_directory=True)
-    if linked_fallbacks:
+        "roles/r/templates/sites/local.j2": "valid source\n"})
+    (project / "roles/r/templates/sites/alias").symlink_to("../.private", target_is_directory=True)
+    if fallbacks == "regular":
+        _write(project, {"templates/sites/alias/app.j2": "later source\n",
+                         "sites/alias/app.j2": "controller working directory source\n"})
+    else:
+        target_root = tmp_path if fallbacks == "filtered" else project
         for parent, target in (("templates/sites", "later"), ("sites", "working")):
-            path = tmp_path / parent
+            path = project / parent
             path.mkdir(parents=True)
-            (path / "alias").symlink_to(tmp_path / target, target_is_directory=True)
+            _write(target_root / target, {"app.j2": "%s source\n" % target})
+            (path / "alias").symlink_to(target_root / target, target_is_directory=True)
 
-    playbook = tmp_path / "pb.yml"
+    playbook = project / "pb.yml"
     _ansible(playbook, returncode=0)
     assert destination.read_text() == "earlier source\n"
     destination.unlink()
@@ -1328,6 +1332,28 @@ def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_pa
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == expected_source
+
+
+@pytest.mark.parametrize("prefix", ["", "./"])
+def test_dynamic_role_template_bakes_only_renderable_action_prefix(tmp_path, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "%stemplates/sites/{{ selection }}.j2", dest: output.txt}
+""" % prefix, "shared/first/app.j2": "direct template\n", "shared/second/app.j2": "prefixed template\n"})
+    templates = tmp_path / "roles/r/templates"
+    for parent, target in (("sites", "first"), ("templates/sites", "second")):
+        directory = templates / parent
+        directory.mkdir(parents=True)
+        (directory / "alias").symlink_to(tmp_path / "shared" / target, target_is_directory=True)
+
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert set(template["_baked_direct_sources"]) == {prefix + "templates/sites/alias/app.j2"}
 
 
 def test_dynamic_role_template_preserves_dot_prefixed_tilde(tmp_path):

@@ -3312,7 +3312,13 @@ class Runtime:
         if ".." in parts:
             return normalized
         lookup = Runtime._baked_direct_lookup(task["_baked_tree"], src, normalized)
-        return (task.get("_baked_direct_sources") or {}).get(lookup, normalized)
+        direct = task.get("_baked_direct_sources") or {}
+        if lookup in direct:
+            return direct[lookup]
+        if normalized not in (task.get("_baked") or {}) and lookup.startswith(
+                tuple(task.get("_baked_excluded_source_prefixes") or ())):
+            return None
+        return normalized
 
     @staticmethod
     def _baked_direct_lookup(subdir, src, normalized):
