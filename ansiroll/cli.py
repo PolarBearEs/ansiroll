@@ -53,10 +53,18 @@ def main(argv=None, *, _standalone=False):
     args = parser.parse_args(argv)
 
     if args.command == "compile":
-        if args.output == "-":
-            if not _standalone:
-                parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
+        if args.output == "-" and _standalone:
             return _cmd_compile_stdout(args)
+        try:
+            stderr_stat = os.fstat(2)
+        except OSError as ex:
+            if ex.errno != errno.EBADF:
+                raise
+        else:
+            if _diagnostic_stream_may_be_playbook(stderr_stat, args.playbook):
+                return 2
+        if args.output == "-":
+            parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -475,8 +483,8 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
             json.dump(manifest, manifest_file, indent=2)
 
 
-def _merged_stream_may_be_playbook(stream, playbook):
-    if not stat.S_ISREG(stream.st_mode):
+def _diagnostic_stream_may_be_playbook(stream, playbook):
+    if not (stat.S_ISREG(stream.st_mode) or stat.S_ISFIFO(stream.st_mode)):
         return False
     path = os.path.abspath(playbook)
     directory, name = os.path.split(playbook)
@@ -485,12 +493,19 @@ def _merged_stream_may_be_playbook(stream, playbook):
         # stream until the input's identity is known.
         try:
             with open(os.devnull, "w") as sink, redirect_stderr(sink):
-                from ansible.parsing.dataloader import DataLoader
-                from .loader import _playbook_read_path
+                from ansible.parsing.quoting import unquote
+                from ansible.utils.path import unfrackpath
 
-                loader = DataLoader()
-                loader.set_basedir(directory if os.path.isabs(playbook) else os.path.abspath(directory))
-                path = _playbook_read_path(loader, loader.path_dwim(name))
+                from .loader import _core_version, _playbook_read_path
+
+                # Mirror the loader's path resolution without loading its
+                # configuration, whose errors still need to reach safe stderr.
+                if not os.path.isabs(playbook) or _core_version() >= (2, 20):
+                    directory = os.path.abspath(directory)
+                name = unquote(name)
+                given = name if name.startswith((os.sep, "~")) else os.path.join(directory, name)
+                resolved = unfrackpath(given, follow=False)
+                path = _playbook_read_path(unfrackpath(resolved, follow=False))
         except (Exception, SystemExit):
             return True
     try:
@@ -508,11 +523,12 @@ def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
         _prepare_compile_stderr()
+        stderr_stat = os.fstat(2)
+        if _diagnostic_stream_may_be_playbook(stderr_stat, args.playbook):
+            return 2
         if os.isatty(1):
             raise ValueError("compile -o - requires redirected output: redirect stdout to a pipe or file")
-        if _same_stream(stdout_stat, os.fstat(2)) and not _discard_stream(stdout_stat):
-            if _merged_stream_may_be_playbook(stdout_stat, args.playbook):
-                return 2
+        if _same_stream(stdout_stat, stderr_stat) and not _discard_stream(stdout_stat):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:

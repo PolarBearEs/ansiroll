@@ -156,8 +156,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
     return plays, actions
 
 
-def _playbook_read_path(loader, filename):
-    path = loader.path_dwim(filename)
+def _playbook_read_path(path):
     if _core_version() < (2, 19):
         from ansible.module_utils.common.text.converters import to_bytes
 
@@ -193,7 +192,7 @@ def _make_rewriting_loader(DataLoader):
 
             # Match Ansible's filename representation and decryption on either
             # side of the loader's switch to tagged source data.
-            path = _playbook_read_path(self, file_name)
+            path = _playbook_read_path(self.path_dwim(file_name))
             try:
                 with open(path, "rb") as stream:
                     observe(path, os.fstat(stream.fileno()))

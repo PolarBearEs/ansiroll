@@ -333,6 +333,38 @@ def test_merged_compile_diagnostics_leave_the_input_playbook_intact(tmp_path, al
     assert playbook.read_bytes() == original
 
 
+@pytest.mark.parametrize("output_mode", ["file", "stdout"])
+def test_compile_rejects_stderr_alias_with_separate_stdout(tmp_path, output_mode):
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    output = tmp_path / "compiled.py"
+    with playbook.open("ab") as diagnostics:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+             "-o", "-" if output_mode == "stdout" else str(output)],
+            stdout=subprocess.PIPE, stderr=diagnostics, timeout=10,
+        )
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert not output.exists()
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_merged_compile_diagnostics_leave_the_input_fifo_empty(tmp_path):
+    playbook = tmp_path / "play.pipe"
+    os.mkfifo(playbook)
+    with os.fdopen(os.open(playbook, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
+        with playbook.open("wb") as stream:
+            result = subprocess.run(
+                [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+                stdout=stream, stderr=subprocess.STDOUT, timeout=10,
+            )
+        assert reader.read() == b""
+    assert result.returncode == 2
+
+
 @pytest.mark.parametrize("component", ["filename", "directory"])
 def test_merged_compile_diagnostics_use_legacy_filename_encoding(monkeypatch, cli_os, tmp_path, component):
     pytest.importorskip("ansible")
@@ -352,7 +384,7 @@ def test_merged_compile_diagnostics_use_legacy_filename_encoding(monkeypatch, cl
         raise FileNotFoundError(candidate)
 
     monkeypatch.setattr(cli_os, "stat", stat_legacy_path)
-    assert cli._merged_stream_may_be_playbook(stream, path.name)
+    assert cli._diagnostic_stream_may_be_playbook(stream, path.name)
 
 
 def test_merged_compile_diagnostics_fail_closed_if_sink_cannot_open(monkeypatch, tmp_path):
@@ -363,7 +395,7 @@ def test_merged_compile_diagnostics_fail_closed_if_sink_cannot_open(monkeypatch,
         raise OSError(errno.EMFILE, "Too many open files")
 
     monkeypatch.setattr(cli, "open", exhausted_sink, raising=False)
-    assert cli._merged_stream_may_be_playbook(playbook.stat(), "$ANSIROLL_INPUT")
+    assert cli._diagnostic_stream_may_be_playbook(playbook.stat(), "$ANSIROLL_INPUT")
 
 
 @pytest.mark.parametrize(("error", "emits_diagnostic"), [(errno.ENOENT, True), (errno.EACCES, False), (errno.EIO, False)])
