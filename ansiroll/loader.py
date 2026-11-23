@@ -643,16 +643,16 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 return None
         first = literals[0] if literals else ""
         if (anchored and literals and (first is None or not first.startswith(os.sep))
-                or not anchored and first and first.startswith("~")
-                or any(".." in part.split(os.sep) for part in literals if part is not None)):
+                or not anchored and first and first.startswith("~")):
             return None
-        if not anchored and first and first.startswith(os.sep):
-            if None in literals:
-                return None
-            path = os.path.normpath("".join(literals))
+        if None not in literals and (anchored or first.startswith(os.sep)):
+            path = os.path.normpath((basedir if anchored else "") + "".join(literals))
             for root in vars_dirs:
                 if path == root or path.startswith(os.path.join(root, "")):
                     return root, escape(os.path.relpath(path, root))
+            return None
+        if ((not anchored and first and first.startswith(os.sep))
+                or any(".." in part.split(os.sep) for part in literals if part is not None)):
             return None
         pattern = []
         for part in literals:
@@ -701,6 +701,17 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         groups.append((dir_terms, kwargs["files"]))
 
     patterns = set()
+
+    def add_candidate(root, directory, filename):
+        if "\0" in filename:
+            head = os.path.join(directory, filename).split("\0", 1)[0]
+            fixed_directory = head.rpartition(os.sep)[0]
+            if os.path.normpath(fixed_directory) == ".":
+                # A filename suffix alone does not bound a recursive search.
+                directory = directory.replace("\0", "*")
+                filename = filename.replace("\0", "*")
+        patterns.add((root, directory, filename))
+
     needs_fallback = False
     for dir_terms, files in groups:
         directories = [path_pattern(term) for term in dir_terms] or [(None, "")]
@@ -709,11 +720,12 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             needs_fallback = True
         for file_root, filename_pattern in filter(None, filenames):
             if file_root is not None:
-                patterns.add((file_root, "", filename_pattern))
+                add_candidate(file_root, "", filename_pattern)
                 continue
             if filename_pattern.startswith("\0") and filename_pattern != "\0":
-                # A bounded absolute override bypasses the search directories.
-                patterns.update((root, "", filename_pattern) for root in vars_dirs)
+                # Absolute overrides can also match files immediately under a known root.
+                for root in vars_dirs:
+                    add_candidate(root, "", filename_pattern)
             if filename_pattern == "\0":
                 needs_fallback = True
             for directory_root, directory in filter(None, directories):
@@ -722,7 +734,8 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 relative = os.path.join(directory, filename_pattern)
                 roots = ([directory_root] if directory_root is not None
                          else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"]))
-                patterns.update((root, directory, filename_pattern) for root in roots)
+                for root in roots:
+                    add_candidate(root, directory, filename_pattern)
     for fallback in fallbacks:
         candidate = path_pattern(fallback)
         if candidate is None or candidate[1] == "\0":
@@ -730,11 +743,12 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             continue
         root, filename = candidate
         if root is not None:
-            patterns.add((root, "", filename))
+            add_candidate(root, "", filename)
         elif filename:
-            patterns.update((root, "", filename) for root in vars_dirs)
-            if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
-                patterns.update((root, vars_subdir, filename) for root in vars_dirs)
+            for root in vars_dirs:
+                add_candidate(root, "", filename)
+                if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
+                    add_candidate(root, vars_subdir, filename)
     return patterns, needs_fallback
 
 
@@ -758,7 +772,7 @@ def _modeled_first_found_files(candidates, aliases):
             if recursive:
                 yield from walk(directory, index + 1, links)
             for child in directory.glob("*" if recursive else parts[index]):
-                if skip_hidden and child.name.startswith("."):
+                if skip_hidden and child.name.startswith(".") and not parts[index].startswith("."):
                     continue
                 if not recursive and index == len(parts) - 1:
                     yield child
@@ -828,8 +842,9 @@ def _modeled_first_found_files(candidates, aliases):
         base = Path(root)
         real_base = base.resolve()
         # Root-wide discovery keeps the legacy glob's hidden-file exclusion.
-        skip_hidden = not directory_pattern and filename.startswith("\0")
-        for directory in matching_paths(base, directory_pattern, real_base, directory=True):
+        skip_hidden = os.path.normpath(directory_pattern) == "." and filename.startswith(("\0", "*"))
+        for directory in matching_paths(base, directory_pattern, real_base, directory=True,
+                                        skip_hidden=directory_pattern.startswith("*")):
             for path in matching_paths(directory, filename, real_base, directory=False, skip_hidden=skip_hidden):
                 yield os.path.normpath(path)
 

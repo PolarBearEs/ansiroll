@@ -1776,9 +1776,8 @@ def test_setup_first_found_discovers_nested_search_path(tmp_path, monkeypatch, d
 @pytest.mark.parametrize(("fallback_path", "selected_path", "override", "suffix"), [
     ("", "profiles/team/prod.yml", "team/prod.yml", ""),
     (", ''", "profiles/team/prod.yml", "team/prod.yml", ""),
-    (", ''", "team/prod.yml", "team/prod.yml", ".yml"),
     ("", "prod.yml", None, ""),
-    ("", "team/prod.yml", None, ".yml"),
+    ("", "profiles/team/prod.yml", None, ".yml"),
 ])
 def test_setup_first_found_discovers_variable_filename_in_explicit_path(
         tmp_path, monkeypatch, fallback_path, selected_path, override, suffix):
@@ -1790,6 +1789,7 @@ def test_setup_first_found_discovers_variable_filename_in_explicit_path(
         "profiles/dev.yml": "subset: [all]\n",
         selected_path: "subset: ['!all', '!min']\n",
         ".hidden/prod.yml": "unrelated: never_bundle_this\n",
+        "roles/unrelated/defaults/main.yml": "unrelated: never_bundle_this\n",
         "team/other.json": '{"unrelated":"different_extension"}\n',
         "pb.yml": """
         - hosts: localhost
@@ -1825,7 +1825,7 @@ def test_setup_first_found_bundles_absolute_overrides_without_following_links_ou
 
     filename = "filename ~ '.yml'" if suffix else "filename"
     lookup_args = "{'files': [%s], 'paths': [directory]}" % filename if explicit_paths else filename
-    selected = "team/prod.yml" if suffix else "prod.yml"
+    selected = "prod.yml"
     project = tmp_path / "playbook"
     _write(tmp_path, {"outside/unselected.yml": "unrelated: never_bundle_this\n"})
     _write(project, {
@@ -1849,8 +1849,7 @@ def test_setup_first_found_bundles_absolute_overrides_without_following_links_ou
     plays, _ = parse_playbook(str(project / "pb.yml"))
     bundled = json.dumps(plays, default=str)
     assert "never_bundle_this" not in bundled
-    if not suffix:
-        assert "never_bundle_nested" not in bundled
+    assert "never_bundle_nested" not in bundled
 
     override = str(project / selected)
     extra = json.dumps({"filename": override[:-len(suffix)] if suffix else override})
@@ -1860,8 +1859,31 @@ def test_setup_first_found_bundles_absolute_overrides_without_following_links_ou
     assert _standalone(project, []) == expected
 
 
-def test_setup_first_found_bundles_literal_absolute_fallback(tmp_path, monkeypatch):
-    fallback_file = tmp_path / "team/default.yml"
+def test_setup_first_found_discovers_nested_filename_under_literal_prefix(tmp_path, monkeypatch):
+    _write(tmp_path, {
+        "profiles/team/dev.yml": "subset: [all]\n",
+        "team/blue/prod.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {filename: dev}
+          vars_files:
+            - "{{ lookup('first_found', {'files': ['team/' ~ filename ~ '.yml'], 'paths': [playbook_dir ~ '/profiles', '']}) }}"
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    extra = json.dumps({"filename": "blue/prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.parametrize("fallback_path", ["team/default.yml", "profiles/../team/default.yml"])
+def test_setup_first_found_bundles_literal_absolute_fallback(tmp_path, monkeypatch, fallback_path):
+    fallback_file = tmp_path / fallback_path
     _write(tmp_path, {
         "profiles/dev.yml": "subset: [all]\n",
         "team/default.yml": "subset: ['!all', '!min']\n",
