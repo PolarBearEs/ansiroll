@@ -694,6 +694,41 @@ def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tm
     assert destination.read_bytes() == b""
 
 
+@pytest.mark.parametrize("target", ["output", "manifest"])
+def test_file_compile_checks_input_after_the_other_destination_lookup(monkeypatch, cli_os, tmp_path, capsys, target):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    output, manifest = (tmp_path / name for name in ("compiled.py", "manifest.json"))
+    destination, other = (output, manifest) if target == "output" else (manifest, output)
+    original = b"existing destination\n"
+    destination.write_bytes(original)
+    opened = replaced = False
+
+    def track_write_open(path, flags, *args, **kwargs):
+        nonlocal opened
+        fd = os.open(path, flags, *args, **kwargs)
+        if path == str(destination) and flags & os.O_ACCMODE == os.O_WRONLY:
+            opened = True
+        return fd
+
+    def replace_input_on_lookup(path, *args, **kwargs):
+        nonlocal replaced
+        if opened and not replaced and path == str(other):
+            playbook.rename(tmp_path / "original.yml")
+            playbook.symlink_to(destination)
+            replaced = True
+        return os.stat(path, *args, **kwargs)
+
+    cli_os.open = track_write_open
+    cli_os.stat = replace_input_on_lookup
+    status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert replaced
+    assert status == 2
+    assert "points to input playbook" in capsys.readouterr().err
+    assert destination.read_bytes() == original
+
+
 @pytest.mark.parametrize("alias", ["missing", "dangling", "same", "symlink", "hardlink", "replaced"])
 def test_file_compile_rejects_manifest_alias(monkeypatch, tmp_path, capsys, alias):
     output = tmp_path / "compiled.py"

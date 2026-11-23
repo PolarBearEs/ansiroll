@@ -325,9 +325,9 @@ def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None):
     path = _manifest_for_stdout(path, stdout_fd)
 
     def validate(info, fd):
+        _validate_stdout_manifest(path, info, stdout_fd, fd)
         if validate_input is not None:
             validate_input(info, "manifest path", path)
-        _validate_stdout_manifest(path, info, stdout_fd, fd)
 
     with _open_compile_destination(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
@@ -431,9 +431,10 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
         _check_file_destinations(output_path, manifest_path)
 
     def validate_output(info, _fd):
-        validate_input(info, "output path", output_path)
+        # The manifest lookup may block while the input pathname changes.
         if manifest_path:
             _check_manifest_path(manifest_path, info)
+        validate_input(info, "output path", output_path)
 
     with ExitStack() as output_reference:
         reference = None
@@ -451,7 +452,6 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
             return
 
         def validate_manifest(info, _fd):
-            validate_input(info, "manifest path", manifest_path)
             try:
                 current_output = os.stat(output_path)
             except OSError:
@@ -459,6 +459,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
             if (_same_stream(output_stat, info)
                     or current_output is not None and _same_stream(current_output, info)):
                 raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+            validate_input(info, "manifest path", manifest_path)
 
         # Reopen the current pathname after Python output succeeds.
         _check_file_destinations(output_path, manifest_path)
