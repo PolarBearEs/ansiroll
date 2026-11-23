@@ -1447,6 +1447,30 @@ def test_dynamic_role_template_bakes_a_symlink_crossed_by_the_scan_prefix(tmp_pa
     assert destination.read_text() == "linked template\n"
 
 
+def test_dynamic_role_template_keeps_link_budget_after_a_fixed_prefix(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: nested/app}
+- template: {src: "sites/alias/{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/sites/unused": "", "shared/nested/app.j2": "linked template\n"})
+    prefix = tmp_path / "shared/prefix"
+    prefix.mkdir()
+    for index in range(4095):
+        (prefix / ("dir-%d" % index)).mkdir()
+    (prefix / "nested").symlink_to("../nested", target_is_directory=True)
+    (tmp_path / "roles/r/templates/sites/alias").symlink_to(prefix, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
 @pytest.mark.parametrize(("src", "matched", "excluded"), [
     ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
      "report-alias/app.j2", "alias/other.j2"),

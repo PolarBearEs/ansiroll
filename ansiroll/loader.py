@@ -2206,19 +2206,19 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
-        # The fixed prefix can already have crossed a symlink.
-        queue = pending_dirs if real_tree == os.path.abspath(tree) else next_hop_dirs
-        queue.append((tree, base, is_subdir))
-    linked = False
+        # The fixed prefix can require linked lookup before the walk expands
+        # any additional symlinks.
+        pending_dirs.append((tree, base, is_subdir, real_tree != os.path.abspath(tree)))
+    expanding_aliases = False
     while pending_dirs or next_hop_dirs:
         if not pending_dirs:
             pending_dirs, next_hop_dirs = next_hop_dirs, pending_dirs
-            linked = True
-        if linked:
+            expanding_aliases = True
+        if expanding_aliases:
             if not remaining_linked_visits:
                 break
             remaining_linked_visits -= 1
-        root, base, is_subdir = pending_dirs.popleft()
+        root, base, is_subdir, linked = pending_dirs.popleft()
         step = next(os.walk(root), None)
         if step is None:
             continue
@@ -2230,9 +2230,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 continue
             child_is_link = os.path.islink(path)
             queue = next_hop_dirs if child_is_link else pending_dirs
-            if (linked or child_is_link) and len(queue) >= remaining_linked_visits:
+            if (expanding_aliases or child_is_link) and len(queue) >= remaining_linked_visits:
                 continue
-            queue.append((path, base, is_subdir))
+            queue.append((path, base, is_subdir, linked or child_is_link))
         for name in sorted(files):
             if name.startswith("."):
                 continue
