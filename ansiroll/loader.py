@@ -2127,15 +2127,16 @@ def _linked_role_source_matches(pattern, relative):
 
 
 def _linked_role_source_prefix(pattern):
+    """Return the literal prefix and whether the pattern can extend it."""
     prefix = ""
     for tokens, optional in pattern:
         if optional:
-            break
+            return prefix, True
         literal, dynamic, _ = "".join(tokens).partition("\0")
         prefix += literal
         if dynamic:
-            break
-    return prefix
+            return prefix, True
+    return prefix, False
 
 
 def _open_linked_role_source(resolved_path):
@@ -2219,14 +2220,15 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     pending_parents = {str(parent) for winner in pending for parent in Path(winner).parents}
 
     def may_have_sources(path, base, is_subdir):
-        if "" in possible_prefixes or os.path.normpath(path) in pending_parents:
+        if ("", True) in possible_prefixes or os.path.normpath(path) in pending_parents:
             return True
         relative = os.path.relpath(path, base)
         if relative == ".":
             return True
         for spelling in source_spellings(relative, is_subdir):
             directory = spelling + os.sep
-            if any(directory.startswith(prefix) or prefix.startswith(directory) for prefix in possible_prefixes):
+            if any(prefix.startswith(directory) or (can_extend and directory.startswith(prefix))
+                   for prefix, can_extend in possible_prefixes):
                 return True
         return False
 
