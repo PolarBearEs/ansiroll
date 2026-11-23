@@ -1431,7 +1431,7 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     assert destination.read_text() == expected_content
 
 
-@pytest.mark.parametrize("selection", ["app", "templates/app"])
+@pytest.mark.parametrize("selection", ["app", "templates/app", "templates//app"])
 def test_dynamic_role_template_reuses_asset_under_linked_action_root(tmp_path, selection):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -1440,16 +1440,18 @@ def test_dynamic_role_template_reuses_asset_under_linked_action_root(tmp_path, s
 """, "roles/r/tasks/main.yml": """
 - set_fact: {selection: %s}
 - template: {src: "{{ selection }}.j2", dest: "output.txt"}
-""" % selection, "roles/r/shared/app.j2": "linked template\n"})
+""" % selection, "roles/r/shared/app.j2": "linked template\n{{ template_fullpath }}\n"})
     role = tmp_path / "roles/r"
     (role / "templates").symlink_to("shared", target_is_directory=True)
 
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook, returncode=0)
     destination = tmp_path / "output.txt"
+    expected_content = destination.read_text()
+    assert expected_content.startswith("linked template\n")
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
-    assert destination.read_text() == "linked template\n"
+    assert destination.read_text() == expected_content
     template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
                     if node.get("action", "").endswith("template"))
     assert template["_baked_direct_sources"]["templates/app.j2"] == "app.j2"

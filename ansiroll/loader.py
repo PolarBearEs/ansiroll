@@ -2320,12 +2320,12 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 continue
             metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
                              "mode": stat.S_IMODE(info.st_mode)}
-            if subdir == "templates":
-                lookup_roots = {spelling: winners[spelling][:-len(spelling)] for spelling in paths_to_bake
-                                if winners[spelling].endswith(os.sep + spelling)}
-                if lookup_roots:
-                    metadata[key]["lookup_roots"] = lookup_roots
             direct.update(dict.fromkeys(paths_to_bake, key))
+    if subdir == "templates":
+        for spelling, key in direct.items():
+            if key is not None and winners[spelling].endswith(os.sep + spelling):
+                meta = metadata[key] if key in metadata else ordinary[key]
+                meta.setdefault("lookup_roots", {})[spelling] = winners[spelling][:-len(spelling)]
     return assets, metadata, direct
 
 
