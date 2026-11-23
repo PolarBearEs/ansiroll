@@ -1976,7 +1976,11 @@ def test_disabled_setup_validation_compiles_only_the_fixed_first_found_choice(tm
 
 
 @pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
-def test_setup_first_found_replays_legacy_templated_filename(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("expression", "profile", "override"), [
+    ("profile", "dev", "prod"),
+    ("profile | lower", "DEV", "PROD"),
+])
+def test_setup_first_found_replays_legacy_templated_filename(tmp_path, monkeypatch, expression, profile, override):
     from ansiroll.loader import parse_playbook
 
     _write(tmp_path, {
@@ -1987,16 +1991,16 @@ def test_setup_first_found_replays_legacy_templated_filename(tmp_path, monkeypat
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
-          vars: {profile: dev}
+          vars: {profile: %s}
           vars_files:
-            - "{{ lookup('first_found', ['vars/{{ profile }}-profile.yml']) }}"
+            - "{{ lookup('first_found', ['vars/{{ %s }}-profile.yml']) }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % (profile, expression),
     })
     plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
     assert "never_bundle_without_matching_suffix" not in json.dumps(plays, default=str)
-    extra = json.dumps({"profile": "prod"})
+    extra = json.dumps({"profile": override})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
@@ -2017,6 +2021,24 @@ def test_disabled_setup_does_not_capture_inactive_fact_path_environment(tmp_path
     plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
     assert "fact_path" not in plays[0]["gather_options"]
     assert "ANSIROLL_UNUSED_FACT_PATH" not in plays[0].get("controller_env", {})
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
+def test_standalone_does_not_capture_environment_from_unsafe_text(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    monkeypatch.setenv("ANSIROLL_UNSAFE_LOOKUP_VALUE", "controller-only-value")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            example: !unsafe "{{ query('env', 'ANSIROLL_UNSAFE_LOOKUP_VALUE') }}"
+          tasks:
+            - debug: {msg: "{{ example }}"}
+    """})
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "ANSIROLL_UNSAFE_LOOKUP_VALUE" not in plays[0].get("controller_env", {})
+    assert "controller-only-value" not in json.dumps(plays, default=str)
     assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
 
 

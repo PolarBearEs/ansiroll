@@ -446,6 +446,8 @@ def _controller_env_names(value):
             if _is_templated(literal.value):
                 names.update(_controller_env_names(literal.value))
     elif isinstance(value, dict):
+        if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_untrusted_condition__"}):
+            return names
         for key, item in value.items():
             names.update(_controller_env_names(key))
             names.update(_controller_env_names(item))
@@ -717,7 +719,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             if isinstance(part, nodes.Const) and isinstance(part.value, str):
                 if part.value:
                     literals.append(part.value)
-            elif isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem)):
+            elif isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Filter)):
                 literals.append(None)
             else:
                 return None
