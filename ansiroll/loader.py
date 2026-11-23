@@ -214,7 +214,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     gather_options = {}
     for option in ("gather_subset", "gather_timeout", "fact_path"):
         value = getattr(play, option, None)
-        if value is None:
+        if value is None or (option == "fact_path" and not gather):
             continue
         # Pre-2.13 play iterators omit falsey timeout and fact path values.
         if core_version < (2, 13) and (
@@ -223,8 +223,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             continue
         gather_options[option] = value
     scoped_gather = gather_facts is None and any(
-        _is_templated(item) for option, value in gather_options.items()
-        if gather or option != "fact_path"
+        _is_templated(item) for value in gather_options.values()
         for item in _as_list(value)
     )
     ordered_vars_files = [] if scoped_gather else None
@@ -486,6 +485,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
             if not isinstance(filename, str):
                 continue
             raw = filename
+            earlier_selector = "selector" in record
             lookups = [] if ordered is not None else None
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
@@ -511,6 +511,9 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
                 out = combine_vars(out, item)
             if ordered is not None:
                 record["values"] = values
+                if "selector" in record and not earlier_selector and _literal_first_found(raw):
+                    # This lookup has no host or extra-var inputs to reselect.
+                    del record["selector"]
                 if "selector" in record:
                     record["path"] = os.path.normpath(os.path.join(basedir, path))
                     # Keep only lookup results already visible in that path, e.g.
@@ -563,6 +566,41 @@ def _selector_ast(selector):
         return None
 
 
+def _literal_first_found(selector):
+    """Identify a built-in first_found whose inputs cannot change at runtime."""
+    from ansible.plugins.loader import lookup_loader
+    from jinja2 import nodes
+
+    parsed = _selector_ast(selector)
+    if (parsed is None or len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output)
+            or len(parsed.body[0].nodes) != 1):
+        return False
+    expr = parsed.body[0].nodes[0]
+    first = isinstance(expr, nodes.Filter)
+    if first:
+        if expr.name != "first" or expr.args or expr.kwargs or expr.dyn_args or expr.dyn_kwargs:
+            return False
+        expr = expr.node
+    if (not isinstance(expr, nodes.Call) or not isinstance(expr.node, nodes.Name)
+            or expr.node.name not in (("query", "q") if first else ("lookup",))
+            or expr.dyn_args or expr.dyn_kwargs or not expr.args or not isinstance(expr.args[0], nodes.Const)):
+        return False
+    name = expr.args[0].value
+    if name not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found"):
+        return False
+
+    def literal(node):
+        if isinstance(node, nodes.Const):
+            return not isinstance(node.value, str) or not re.search(r"(^|[,;:])~", node.value)
+        return isinstance(node, (nodes.List, nodes.Tuple, nodes.Dict, nodes.Pair, nodes.Keyword)) and all(
+            literal(child) for child in node.iter_child_nodes())
+
+    if not all(literal(arg) for arg in (*expr.args[1:], *expr.kwargs)):
+        return False
+    plugin = lookup_loader.get(name, class_only=True)
+    return getattr(plugin, "__module__", None) == "ansible.plugins.lookup.first_found"
+
+
 def _selector_depends_only_on_lookup(selector):
     """Outside the traced lookup call, permit only deterministic literal transforms."""
     from jinja2 import nodes
@@ -583,6 +621,16 @@ def _selector_depends_only_on_lookup(selector):
 
     parsed = _selector_ast(selector)
     return parsed is not None and stable(parsed)
+
+
+def _first_found_search_dirs(play, basedir):
+    version = tuple(map(int, _fact_schema().split(".")))
+    # Core 2.19–2.20 passes None for direct lookups, which DataLoader converts to 'None'.
+    subdir = "None" if (2, 19) <= version < (2, 21) else "files"
+    return {
+        "default": _search_dirs(play, basedir, subdir),
+        "files": _search_dirs(play, basedir, subdir, explicit_subdir=version >= (2, 21)),
+    }
 
 
 def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, vars_subdir):
@@ -2415,17 +2463,7 @@ def _raw_search_path(task, basedir):
     return stack or [basedir]
 
 
-def _first_found_search_dirs(play, basedir):
-    version = tuple(map(int, _fact_schema().split(".")))
-    # Core 2.19–2.20 passes None for direct lookups, which DataLoader converts to 'None'.
-    subdir = "None" if (2, 19) <= version < (2, 21) else "files"
-    return {
-        "default": _search_dirs(play, basedir, subdir),
-        "files": _search_dirs(play, basedir, subdir, skip_subdir=version >= (2, 21)),
-    }
-
-
-def _search_dirs(task, basedir, subdir, tagged=False, *, skip_subdir=False):
+def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
     a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
     call it: each task search path (role-aware), then the loader basedir.
@@ -2455,14 +2493,14 @@ def _search_dirs(task, basedir, subdir, tagged=False, *, skip_subdir=False):
         if is_role and pb_base_dir.endswith("/tasks"):
             dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True))
             dirs.append((pb_base_dir, False))
-        if not skip_subdir:
+        if not explicit_subdir:
             dirs.append((os.path.join(upath, subdir), True))
         dirs.append((upath, False))
     try:
         base = loader.get_basedir()
     except Exception:
         base = basedir
-    if not skip_subdir:
+    if not explicit_subdir:
         dirs.append((os.path.join(base, subdir), True))
     dirs.append((base, False))
     return dirs if tagged else [d for d, _ in dirs]

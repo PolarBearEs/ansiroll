@@ -1633,13 +1633,13 @@ def test_setup_first_found_matches_core_search_order_for_an_explicit_files_prefi
     assert _standalone(tmp_path, []) == expected
 
 
-@pytest.mark.parametrize("selector", [
-    "lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': ['new.yml']})",
-    "lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': []})",
-    pytest.param("lookup('first_found', 'new.yml', paths=['profiles'])",
+@pytest.mark.parametrize("selector, missing", [
+    ("lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': ['new.yml']})", False),
+    ("lookup('first_found', {'files': ['old.yml'], 'paths': ['profiles']}, {'files': []})", CORE_VERSION < (2, 12)),
+    pytest.param("lookup('first_found', 'new.yml', paths=['profiles'])", False,
                  marks=pytest.mark.skipif(CORE_VERSION < (2, 16), reason="modern keyword option selection")),
 ])
-def test_setup_first_found_matches_version_specific_candidate_order(tmp_path, selector):
+def test_setup_first_found_matches_version_specific_candidate_order(tmp_path, selector, missing):
     _write(tmp_path, {
         "profiles/old.yml": "subset: ['!all', '!min']\n",
         "profiles/new.yml": "subset: ['!all', '!min']\n",
@@ -1653,7 +1653,13 @@ def test_setup_first_found_matches_version_specific_candidate_order(tmp_path, se
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
         """ % selector,
     })
-    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+    if missing:
+        # The legacy lookup replaces the accumulated paths with an empty list.
+        for result in (_ansible_run(tmp_path, []), _standalone_run(tmp_path, [])):
+            assert result.returncode != 0
+            assert "when using first_found" in result.stdout + result.stderr
+    else:
+        assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
 
 
 def test_setup_fact_path_supports_first_found_lookup(tmp_path):
@@ -1927,6 +1933,48 @@ def test_disabled_setup_does_not_bundle_fact_path_vars_file_alternatives(tmp_pat
     })
     plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
     assert "never_bundle_unused_facts" not in json.dumps(plays, default=str)
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
+@pytest.mark.parametrize("selector", [
+    "lookup('first_found', ['primary.yml', 'fallback.yml'])",
+    "query('first_found', {'files': ['primary.yml', 'fallback.yml']}) | first",
+])
+def test_disabled_setup_validation_compiles_only_the_fixed_first_found_choice(tmp_path, selector):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "primary.yml": "subset: [all]\nselected_value: chosen\n",
+        "fallback.yml": "selected_value: never_bundle_fixed_fallback\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          gather_subset: "{{ subset }}"
+          vars_files:
+            - "{{ %s }}"
+          tasks:
+            - debug: {msg: "{{ selected_value }}"}
+        """ % selector,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "never_bundle_fixed_fallback" not in json.dumps(plays, default=str)
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
+def test_disabled_setup_does_not_capture_inactive_fact_path_environment(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    monkeypatch.setenv("ANSIROLL_UNUSED_FACT_PATH", "controller-only-value")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          fact_path: "{{ lookup('env', 'ANSIROLL_UNUSED_FACT_PATH') }}"
+          tasks:
+            - debug: {msg: ran without gathering}
+    """})
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert "fact_path" not in plays[0]["gather_options"]
+    assert "ANSIROLL_UNUSED_FACT_PATH" not in plays[0].get("controller_env", {})
     assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
 
 
