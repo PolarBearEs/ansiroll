@@ -1773,12 +1773,14 @@ def test_setup_first_found_discovers_nested_search_path(tmp_path, monkeypatch, d
     assert _standalone(tmp_path, []) == expected
 
 
-def test_setup_first_found_discovers_variable_filename_in_explicit_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("fallback_path", "absolute"), [("", False), (", ''", False), ("", True)])
+def test_setup_first_found_discovers_variable_filename_in_explicit_path(tmp_path, monkeypatch, fallback_path, absolute):
     from ansiroll.loader import parse_playbook
 
     _write(tmp_path, {
         "profiles/dev.yml": "subset: [all]\n",
         "profiles/team/prod.yml": "subset: ['!all', '!min']\n",
+        "prod.yml": "subset: ['!all', '!min']\n",
         "outside/prod.yml": "unrelated: never_bundle_this\n",
         "pb.yml": """
         - hosts: localhost
@@ -1786,14 +1788,15 @@ def test_setup_first_found_discovers_variable_filename_in_explicit_path(tmp_path
           gather_subset: "{{ subset }}"
           vars: {filename: dev.yml}
           vars_files:
-            - "{{ lookup('first_found', {'files': [filename], 'paths': [playbook_dir ~ '/profiles']}) }}"
+            - "{{ lookup('first_found', {'files': [filename], 'paths': [playbook_dir ~ '/profiles'%s]}) }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % fallback_path,
     })
     plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
     assert "never_bundle_this" not in json.dumps(plays, default=str)
-    extra = json.dumps({"filename": "team/prod.yml"})
+    filename = str(tmp_path / "prod.yml") if absolute else "team/prod.yml"
+    extra = json.dumps({"filename": filename})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)

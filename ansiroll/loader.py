@@ -693,15 +693,19 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
         groups.append((dir_terms, kwargs["files"]))
 
     patterns = set()
+    needs_fallback = False
     for dir_terms, files in groups:
         directories = [path_pattern(term) for term in dir_terms] or [(False, "")]
         filenames = [path_pattern(term) for term in flatten([files], "[,;]")]
         if None in directories or None in filenames:
-            return None
-        for absolute_dir, directory in directories:
-            for absolute_file, filename_pattern in filenames:
-                if filename_pattern == "\0" and ("\0" in directory or os.path.normpath(directory) == "."):
-                    return None  # An unconstrained filename needs a fixed search directory.
+            needs_fallback = True
+        for absolute_dir, directory in filter(None, directories):
+            for absolute_file, filename_pattern in filter(None, filenames):
+                if filename_pattern == "\0":
+                    # Preserve shallow discovery for absolute overrides.
+                    needs_fallback = True
+                    if "\0" in directory or os.path.normpath(directory) == ".":
+                        continue
                 if absolute_file:
                     patterns.add((basedir, "", filename_pattern))
                     continue
@@ -711,7 +715,8 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
     for fallback in fallbacks:
         candidate = path_pattern(fallback)
         if candidate is None or candidate[1] == "\0":
-            return None
+            needs_fallback = True
+            continue
         absolute, filename = candidate
         if absolute:
             patterns.add((basedir, "", filename))
@@ -719,7 +724,7 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             patterns.update((root, "", filename) for root in vars_dirs)
             if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
                 patterns.update((root, vars_subdir, filename) for root in vars_dirs)
-    return patterns
+    return patterns, needs_fallback
 
 
 def _modeled_first_found_files(candidates, aliases):
@@ -843,8 +848,10 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
             if first_found:
                 lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs, dirs, subdir)
                 if lookup_candidates is not None:
-                    candidates.update((found, True) for found in _modeled_first_found_files(lookup_candidates, aliases))
-                    continue
+                    patterns, needs_fallback = lookup_candidates
+                    candidates.update((found, True) for found in _modeled_first_found_files(patterns, aliases))
+                    if not needs_fallback:
+                        continue
             # A legacy bare expression can still select a file inside vars/
             # via an absolute path returned by the controller lookup.
             candidate_subdir = subdir or ("vars" if first_found else None)
