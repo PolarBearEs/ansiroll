@@ -582,7 +582,7 @@ def _selector_depends_only_on_lookup(selector):
     return parsed is not None and stable(parsed)
 
 
-def _first_found_literal_dirs(selector):
+def _first_found_literal_dirs(selector, basedir):
     from jinja2 import nodes
 
     parsed = _selector_ast(selector)
@@ -590,7 +590,27 @@ def _first_found_literal_dirs(selector):
         return set()
     directories = set()
 
+    def add_playbook_paths(argument):
+        if isinstance(argument, (nodes.List, nodes.Tuple)):
+            for item in argument.items:
+                add_playbook_paths(item)
+            return
+        if isinstance(argument, nodes.Concat):
+            parts = argument.nodes
+        elif isinstance(argument, nodes.Add):
+            parts = (argument.left, argument.right)
+        else:
+            return
+        root, *suffix = parts
+        if (isinstance(root, nodes.Name) and root.name == "playbook_dir"
+                and all(isinstance(part, nodes.Const) and isinstance(part.value, str) for part in suffix)):
+            path = os.path.normpath(basedir + "".join(part.value for part in suffix))
+            if os.path.commonpath((basedir, path)) == basedir:
+                directories.add(path)
+
     def add_literals(argument, *, paths=False):
+        if paths:
+            add_playbook_paths(argument)
         constants = (argument,) if isinstance(argument, nodes.Const) else argument.find_all(nodes.Const)
         for literal in constants:
             if not isinstance(literal.value, str):
@@ -654,7 +674,7 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
                         patterns.append(os.path.join(glob.escape(d), candidate_subdir, pattern))
                     patterns.append(os.path.join(glob.escape(d), pattern))
                 if setup and "first_found" in name:
-                    literal_dirs = _first_found_literal_dirs(name) | {"."}
+                    literal_dirs = _first_found_literal_dirs(name, basedir) | {"."}
                     lookup_patterns = {os.path.join(glob.escape(d), glob.escape(relative), pattern)
                                        for d in _search_dirs(play, basedir, "files") for relative in literal_dirs}
                     patterns.extend(sorted(lookup_patterns))

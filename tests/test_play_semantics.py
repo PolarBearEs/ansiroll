@@ -1453,11 +1453,44 @@ def test_setup_uses_baked_vars_when_controller_lookup_file_is_missing(tmp_path, 
         assert _summary(result.stdout)[0] == ['"distribution defined: False"']
 
 
+def test_setup_pipe_uses_playbook_directory_and_decodes_only_stdout(tmp_path):
+    _write(tmp_path, {
+        "profile.txt": "full\n",
+        "elsewhere/profile.txt": "full\n",
+        "vars/full.yml": "subset: [all]\n",
+        "vars/minimal.yml": "subset: ['!all', '!min']\n",
+        "pb.yml": r"""
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars_files:
+            - 'vars/{{ lookup("pipe", "cat profile.txt; printf ''\\377'' >&2") }}.yml'
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """,
+    })
+    output = tmp_path / "out.py"
+    subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", "pb.yml", "-o", str(output)],
+                   cwd=tmp_path, env=_env(), capture_output=True, check=True)
+    (tmp_path / "profile.txt").write_text("minimal\n")
+    result = subprocess.run([sys.executable, str(output)], cwd=tmp_path / "elsewhere",
+                            env=_env(), capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert _summary(result.stdout)[0] == ['"distribution defined: False"']
+
+    (tmp_path / "profile.txt").write_bytes(b"\xff")
+    result = subprocess.run([sys.executable, str(output)], cwd=tmp_path / "elsewhere",
+                            env=_env(), capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "utf-8" in result.stderr and "invalid start byte" in result.stderr
+
+
 @pytest.mark.parametrize("selector", [
     "lookup('first_found', playbook_dir ~ '/vars/' ~ profile ~ '.yml')",
     "lookup('first_found', profile ~ '.yml')",
     "lookup('first_found', 'profiles/' ~ profile ~ '.yml')",
     "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': ['profiles']})",
+    "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': [playbook_dir ~ '/files/profiles']})",
     "query('ansible.builtin.first_found', {'files': ['missing.yml', profile ~ '.yml'], 'paths': [playbook_dir ~ '/vars']}) | first",
 ])
 def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector):
@@ -1539,7 +1572,7 @@ def test_setup_pipe_honors_error_policy_for_invalid_utf8(monkeypatch):
     import ansiroll.runtime as runtime
 
     def invalid_utf8(*args, **kwargs):
-        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return subprocess.CompletedProcess(args, 0, stdout=b"\xff", stderr=b"")
 
     monkeypatch.setattr(runtime.subprocess, "run", invalid_utf8)
     templater = runtime._Templater()

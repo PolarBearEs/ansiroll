@@ -1041,27 +1041,32 @@ def _lookup_values(name, args, kwargs, ctx=None):
     if name == "pipe":
         vals = []
         for a in args:
-            try:
+            if not gather_lookup:
                 proc = subprocess.run(str(a), shell=True, stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, universal_newlines=True,
-                                      encoding="utf-8" if gather_lookup else None)
-            except (OSError, UnicodeError) as error:
+                                      stderr=subprocess.PIPE, universal_newlines=True)
+                if proc.returncode != 0:
+                    raise RuntimeError("lookup plugin 'pipe' failed: command %r returned rc=%d: %s" % (
+                        a, proc.returncode, proc.stderr.strip()))
+                vals.append(proc.stdout.rstrip("\n"))
+                continue
+            try:
+                proc = subprocess.run(str(a), shell=True, cwd=ctx.get("playbook_dir"),
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except OSError as error:
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
                 if replay is not None:
                     return replay
-                if gather_lookup:
-                    raise _VarsFileLookupError("lookup plugin 'pipe' failed: %s" % error) from error
-                raise
+                raise _VarsFileLookupError("lookup plugin 'pipe' failed: %s" % error) from error
             if proc.returncode != 0:
                 replay = _baked_vars_file_lookup(name, args, kwargs, ctx)
                 if replay is not None:
                     return replay
-                message = "lookup plugin 'pipe' failed: command %r returned rc=%d: %s" % (
-                    a, proc.returncode, proc.stderr.strip())
-                if gather_lookup:
-                    raise _VarsFileLookupError(message)
-                raise RuntimeError(message)
-            vals.append(proc.stdout.rstrip() if gather_lookup else proc.stdout.rstrip("\n"))
+                raise _VarsFileLookupError("lookup plugin 'pipe' failed: command %r returned rc=%d: %s" % (
+                    a, proc.returncode, proc.stderr.decode("utf-8", errors="replace").strip()))
+            try:
+                vals.append(proc.stdout.decode("utf-8").rstrip())
+            except UnicodeError as error:
+                raise _VarsFileLookupError("lookup plugin 'pipe' failed: %s" % error) from error
         return vals
     return _loop_lookup(name, list(args))
 
