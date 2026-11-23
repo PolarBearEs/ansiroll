@@ -261,7 +261,14 @@ def _open_compile_destination(path, validate, *, release_output=None):
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
             # check on the initial O_CREAT open in a sticky directory.
-            if ex.errno not in _TRUNCATING_RETRY_ERRORS or reference is None:
+            if ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                raise
+            if reference is None:
+                # EPERM may be an ordinary permission denial.
+                current = _try_stat(path) if ex.errno != errno.EPERM else None
+                if current is not None and stat.S_ISREG(current.st_mode):
+                    validate(current, None)
+                    raise _truncation_unavailable(path, ex) from ex
                 raise
             original_error = ex
             # A failed create-open hasn't established permission to replace

@@ -1018,6 +1018,33 @@ def test_compile_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_p
     assert target.read_text() == "previous content"
 
 
+@pytest.mark.parametrize("error", [errno.EINVAL, errno.EOPNOTSUPP, errno.EACCES, errno.EPERM])
+def test_compile_handles_a_failed_output_open_without_a_metadata_pin(monkeypatch, cli_os, tmp_path, capsys, error):
+    output = tmp_path / "compiled.py"
+    original = "previous Python"
+    output.write_text(original)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *args, **kwargs: ("pass\n", {}))
+    monkeypatch.delattr(cli_os, "O_PATH", raising=False)
+    open_fd = cli_os.open
+
+    def require_truncate(path, flags, *args, **kwargs):
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY and not flags & os.O_EXCL:
+            raise OSError(error, os.strerror(error), path)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(cli_os, "open", require_truncate)
+    args = ["compile", "play.yml", "-o", str(output)]
+    if error in (errno.EACCES, errno.EPERM):
+        with pytest.raises(PermissionError) as failure:
+            cli.main(args)
+        assert failure.value.errno == error
+        assert not capsys.readouterr().err
+    else:
+        assert cli.main(args) == 2
+        assert "Compile to a local staging file" in capsys.readouterr().err
+    assert output.read_text() == original
+
+
 @pytest.mark.parametrize("destination", ["output", "manifest"])
 def test_compile_leaves_permission_denials_unchanged(monkeypatch, tmp_path, destination):
     output = tmp_path / "compiled.py"
