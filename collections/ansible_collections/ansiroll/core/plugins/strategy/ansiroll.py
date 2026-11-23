@@ -72,7 +72,7 @@ class _DelegatedPlayVariables:
 
     def __getitem__(self, index):
         if index not in self.values:
-            self.values[index] = self._load(*self.names[index])
+            self.values[index] = self._load(self.names[index])
         return self.values[index]
 
 
@@ -91,6 +91,8 @@ class _LegacyDelegatedValue:
 
 def _legacy_environment_validator(validate, aliases):
     """Keep native Ansible environment validation, with lazy Jinja name binding."""
+    from ansible.errors import AnsibleUndefinedVariable
+    from jinja2 import Undefined
     from jinja2.runtime import missing
 
     from ansiroll.runtime import _ConditionalCodeGenerator, _ConditionalName
@@ -100,6 +102,8 @@ def _legacy_environment_validator(validate, aliases):
         if environment is None:
             environment = templar.environment
         variables = templar.available_variables
+        template = templar.template
+        instance_template = vars(templar).get("template")
         generator, context_class = environment.code_generator_class, environment.context_class
 
         class DelegatedContext(context_class):
@@ -114,7 +118,17 @@ def _legacy_environment_validator(validate, aliases):
                     self._update_unsafe(value)
                 return value
 
+        def template_variable(value, *args, **kwargs):
+            # Legacy lookup plugins can read available_variables directly.
+            if isinstance(value, _LegacyDelegatedValue):
+                value = value.resolve()
+                if isinstance(value, Undefined) and kwargs.get("fail_on_undefined"):
+                    raise AnsibleUndefinedVariable(value._undefined_message)
+                return value
+            return template(value, *args, **kwargs)
+
         try:
+            templar.template = template_variable
             templar.available_variables = {**variables, **aliases}
             environment.context_class = DelegatedContext
             environment.code_generator_class = _ConditionalCodeGenerator
@@ -122,6 +136,10 @@ def _legacy_environment_validator(validate, aliases):
         finally:
             environment.context_class = context_class
             environment.code_generator_class = generator
+            if instance_template is None:
+                del templar.template
+            else:
+                templar.template = instance_template
             templar.available_variables = variables
 
     return validate_environment
@@ -636,10 +654,10 @@ class StrategyModule(StrategyBase):
                 play_undefined = frame.get("play_var_undefined") or {}
                 lazy_play = set(frame.get("lazy_play_vars") or ()) if resolve_play_var else set()
 
-                def load_play_var(name, source):
+                def load_play_var(name):
                     resolved = resolve_play_var(name)
                     if resolved is None:
-                        return wrap_var(source)
+                        raise AnsibleError("unable to resolve delegated play variable %r" % name)
                     return self._restore_play_fallback(wrap_var(resolved["value"]), resolved["undefined"])
 
                 bridge = _DelegatedPlayVariables(load_play_var)
@@ -662,7 +680,7 @@ class StrategyModule(StrategyBase):
                             continue
                     if scope == "play" and name in lazy_play:
                         index = len(bridge.names)
-                        bridge.names.append((name, value))
+                        bridge.names.append(name)
                         expression = "{{ __ansiroll_delegated_play_vars[%d] }}" % index
                         if trust_as_template is not None:
                             job_vars[name] = trust_as_template(expression)
@@ -717,6 +735,8 @@ class StrategyModule(StrategyBase):
         else:
             missing = UndefinedMarker(hint="Undefined element in a delegated play variable", _no_template_source=True)
         for path in undefined:
+            if not path:
+                return missing
             container = value
             for key in path[:-1]:
                 container = container[key]

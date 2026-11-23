@@ -5525,7 +5525,9 @@ def _resolve_delegated_play_var(name, scope, templater):
         undefined = []
         value = _delegate_fallback_value(rendered, undefined)
         return {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
-    except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
+    except jinja2.UndefinedError:
+        return {"value": None, "undefined": [[]]}
+    except (TypeError, ValueError, RecursionError):
         return None
 
 

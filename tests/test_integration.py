@@ -2059,6 +2059,9 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_FILE_DEFAULT: "{{ file_options.labels[1].nested | default('fallback') }}"
               SYNC_FILE_JSON: "json={{ file_env | to_json }}"
               SYNC_LIST_JSON: "json={{ file_list | to_json }}"
+              SYNC_VARS_LOOKUP: "{{ (lookup('vars', 'file_env')).SYNC_FILE_WHOLE }}"
+              SYNC_UNDEFINED_ALIAS: "{{ optional_agent_alias is defined }}"
+              SYNC_DEFAULT_ALIAS: "{{ optional_agent_alias | default('optional') }}"
               SYNC_UNUSED: "{{ 'skipped' if true else unused_agent_alias }}"
               SYNC_MIRRORS: "{% for mirror in ansible_delegated_vars['localhost']['mirrors'] %}{{ sync_loop_label }}-{{ mirror }}{% endfor %}"
               SYNC_DEFAULT: "{{ ansible_delegated_vars['localhost']['mirror'] | default('agent-default') }}"
@@ -2082,7 +2085,8 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
         "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
         "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
     }, "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
-        "file_list": ["{{ 'mixed' | upper }}"], "unused_agent_alias": "{{ missing_value }}"}]},
+        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": "{{ missing }}",
+        "unused_agent_alias": "{{ missing_value }}"}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
     "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},
@@ -2097,7 +2101,7 @@ runtime.ANSIBALLZ_CODE = ""
 runtime._INJECTED_HOST = "localhost"
 runtime.agent_main()
 """
-    names = ("file_options", "file_env", "file_list")
+    names = ("file_options", "file_env", "file_list", "optional_agent_alias")
     messages = [{"t": "delegate_play_var", "name": name} for name in names]
     messages.append({"t": "delegate_result", "result": {"changed": False}})
     encoded = [json.dumps(message).encode() for message in messages]
@@ -2155,6 +2159,7 @@ runtime.agent_main()
                          "SYNC_FILE_LIST": "RELEASE-tail", "SYNC_FILE_MISSING": False,
                          "SYNC_FILE_DEFAULT": "fallback", "SYNC_UNUSED": "skipped", "SYNC_FILE_WHOLE": "MIXED",
                          "SYNC_FILE_JSON": 'json={"SYNC_FILE_WHOLE": "MIXED"}', "SYNC_LIST_JSON": 'json=["MIXED"]',
+                         "SYNC_VARS_LOOKUP": "MIXED", "SYNC_UNDEFINED_ALIAS": False, "SYNC_DEFAULT_ALIAS": "optional",
                          "SYNC_MIRRORS": label + "-controller", "SYNC_DEFAULT": "controller",
                          "SYNC_FLAG": True, "SYNC_EMPTY": empty, "SYNC_WHOLE": "delegated"}}
         for label in ("RELEASE", "PREVIEW")
