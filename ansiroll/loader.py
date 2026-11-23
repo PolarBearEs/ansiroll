@@ -1897,10 +1897,19 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 rel = os.path.relpath(full, base)
                 if rel in baked or any(os.path.isfile(os.path.join(d, rel)) for d in skipped):
                     continue
+                if not os.path.isfile(full):
+                    continue
                 try:
-                    with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                        baked[rel] = fh.read()
-                    st = os.stat(full)
+                    # The path may have become a FIFO after the file check.
+                    fd = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+                    try:
+                        st = os.fstat(fd)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as fh:
+                            baked[rel] = fh.read()
+                    finally:
+                        os.close(fd)
                 except OSError:
                     continue
                 meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,

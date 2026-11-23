@@ -123,6 +123,64 @@ class FilterModule(object):
     assert _ansiroll(tmp_path / "pb2.yml", tmp_path) == _ansible(tmp_path / "pb2.yml")
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+def test_compile_dynamic_role_sources_skips_unused_fifos(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: "sites/{{ selection }}.j2", dest: /unused}
+""", "roles/r/templates/sites/app.j2": "regular template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    os.mkfifo(sites / "unused.txt")
+    (sites / "linked.j2").symlink_to("unused.txt")
+
+    artifact = tmp_path / "compiled.py"
+    subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(tmp_path / "pb.yml"), "-o", str(artifact)],
+                   cwd=ROOT, env=_env(), capture_output=True, check=True, timeout=15)
+    template = next(node for node in _task_nodes(_bundle_json(artifact.read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert set(template["_baked"]) == {"sites/app.j2"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+@pytest.mark.parametrize("replacement", ["fifo", "directory"])
+def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, replacement):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+
+    _write(tmp_path, {"sites/app.j2": "regular template\n", "sites/swap.j2": "previous regular file\n"})
+    target = tmp_path / "sites/swap.j2"
+    open_fd = os.open
+    opened = []
+
+    def swap_then_open(path, flags):
+        if path == str(target):
+            assert flags & os.O_NONBLOCK
+            target.unlink()
+            if replacement == "fifo":
+                os.mkfifo(target)
+            else:
+                target.mkdir()
+            fd = open_fd(path, flags)
+            opened.append(fd)
+            return fd
+        return open_fd(path, flags)
+
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: [(str(tmp_path), True)])
+    monkeypatch.setattr(os, "open", swap_then_open)
+    node = {}
+    task = SimpleNamespace(_role=object())
+    assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
+    assert node["_baked"] == {"sites/app.j2": "regular template\n"}
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
 def test_copy_remote_src_reads_target_at_runtime(tmp_path, remote_src):
     src = tmp_path / "remote.txt"
