@@ -3756,15 +3756,14 @@ class Runtime:
             normalized = os.path.normpath(src)
             shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
             if shadowed:
-                blockers, selected = shadowed
                 roots = task["_baked_tree_roots"]
-                for root in blockers:
-                    directories, aliases, blocked, _ = roots[root]
-                    if Runtime._baked_role_path(parts, directories, aliases) in blocked:
+                for root in shadowed:
+                    directories, aliases, blocked, files = roots[root]
+                    path = Runtime._baked_role_path(parts, directories, aliases)
+                    if path in blocked:
                         return "\0blocked"
-                directories, aliases, _, files = roots[selected]
-                if Runtime._baked_role_path(parts, directories, aliases) in files:
-                    return normalized
+                    if path in files:
+                        return files.get(normalized, src)
                 return src
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}

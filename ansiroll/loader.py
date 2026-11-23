@@ -1967,12 +1967,13 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
 
     baked, meta = {}, {}
+    alternate_meta = {}
     claimed = set()
     skipped = []
     blockers, shadowed, source_roots = {}, {}, []
     for base, is_subdir, walk, root_dirs, root_aliases in trees:
         root_index = len(source_roots)
-        root_blocks, root_files = set(), set()
+        root_blocks, root_files = set(), {}
         source_roots.append((root_dirs, root_aliases, root_blocks, root_files))
         if not prefix and not is_subdir:
             skipped.append((base, root_index))
@@ -1989,7 +1990,10 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     continue
                 if os.sep not in tail and not fn.endswith(tail):
                     continue
-                if rel in claimed or any(os.path.isfile(os.path.join(d, rel)) for d, _ in skipped):
+                alternate = rel in claimed
+                if alternate and rel not in shadowed:
+                    continue
+                if any(os.path.isfile(os.path.join(d, rel)) for d, _ in skipped):
                     continue
                 if not os.path.exists(full):
                     continue
@@ -2010,9 +2014,10 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     earlier_blocks.add(os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base)))
                     blockers.setdefault(rel, set()).add(earlier_index)
                 claimed.add(rel)
-                root_files.add(rel)
+                key = "\0%d\0%s" % (root_index, rel) if alternate else rel
+                root_files[rel] = key
                 if rel in blockers:
-                    shadowed[rel] = (sorted(blockers[rel]), root_index)
+                    shadowed.setdefault(rel, set()).add(root_index)
                 try:
                     # The path may have become a FIFO after the file check.
                     fd = _open_role_source(full)
@@ -2021,24 +2026,32 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                         if not stat.S_ISREG(st.st_mode):
                             continue
                         with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as fh:
-                            baked[rel] = fh.read()
+                            baked[key] = fh.read()
                     finally:
                         os.close(fd)
                 except _RoleSourceLeaseError as ex:
-                    baked[rel] = {"__ansiroll_source_error__": str(ex)}
+                    baked[key] = {"__ansiroll_source_error__": str(ex)}
                     continue
-                except FileNotFoundError:
-                    claimed.remove(rel)
-                    root_files.remove(rel)
-                    shadowed.pop(rel, None)
+                except (FileNotFoundError, NotADirectoryError):
+                    if not alternate:
+                        claimed.remove(rel)
+                        shadowed.pop(rel, None)
+                    else:
+                        shadowed[rel].discard(root_index)
+                    del root_files[rel]
                     continue
                 except OSError:
+                    continue
+                if alternate:
+                    alternate_meta[key] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime,
+                                           "uid": st.st_uid, "mode": stat.S_IMODE(st.st_mode)}
                     continue
                 meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
                              "mode": stat.S_IMODE(st.st_mode)}
     if not baked:
         return False
     node["_baked"] = baked
+    meta.update(alternate_meta)
     node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
@@ -2047,10 +2060,10 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         node["_baked_tree_aliases"] = aliases
     if shadowed:
         baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
-        node["_baked_tree_shadowed"] = shadowed
+        node["_baked_tree_shadowed"] = {rel: sorted(blockers[rel] | roots) for rel, roots in shadowed.items()}
         node["_baked_tree_roots"] = [
             (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
-             sorted(root_blocks), sorted(root_files))
+             sorted(root_blocks), root_files)
             for root_dirs, root_aliases, root_blocks, root_files in source_roots
         ]
     return True

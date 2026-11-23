@@ -339,7 +339,34 @@ def test_compile_dynamic_role_source_checks_parent_traversal_per_root(tmp_path, 
         assert destination.read_text() == "later template\n"
 
 
-def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch):
+@pytest.mark.parametrize("middle_has_branch", [False, True])
+def test_compile_dynamic_role_source_continues_past_unreachable_candidates(tmp_path, middle_has_branch):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: branch/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/sites/app.j2": "middle template\n",
+        "templates/sites/app.j2": "last template\n"})
+    (tmp_path / "roles/r/templates/sites/app.j2").mkdir(parents=True)
+    if middle_has_branch:
+        (tmp_path / "roles/r/sites/branch").mkdir()
+    (tmp_path / "templates/sites/branch").mkdir()
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "rendered.txt"
+    expected_content = "middle template\n" if middle_has_branch else "last template\n"
+    assert destination.read_text() == expected_content
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == expected_content
+
+
+@pytest.mark.parametrize("replace_parent", [False, True])
+def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch, replace_parent):
     from types import SimpleNamespace
 
     from ansiroll import loader
@@ -350,7 +377,11 @@ def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tm
 
     def open_source(path):
         if path == str(earlier):
-            earlier.unlink()
+            if replace_parent:
+                earlier.parent.rename(tmp_path / "removed")
+                earlier.parent.write_text("no longer a directory")
+            else:
+                earlier.unlink()
         return original_open(path)
 
     roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
