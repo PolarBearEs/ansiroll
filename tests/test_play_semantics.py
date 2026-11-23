@@ -2042,6 +2042,59 @@ def test_standalone_does_not_capture_environment_from_unsafe_text(tmp_path, monk
     assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
 
 
+def test_standalone_captures_controller_environment_from_conditions_only_for_bare_expressions(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    monkeypatch.setenv("ANSIROLL_LITERAL_EXAMPLE", "controller-only-value")
+    monkeypatch.setenv("ANSIROLL_ACTIVE_CONDITION", "yes")
+    _write(tmp_path, {"pb.yml": """
+        - hosts: localhost
+          gather_facts: false
+          vars:
+            example:
+              when: "query('env', 'ANSIROLL_LITERAL_EXAMPLE')"
+          tasks:
+            - debug: {msg: "query('env', 'ANSIROLL_LITERAL_EXAMPLE')"}
+              when: query('env', 'ANSIROLL_ACTIVE_CONDITION') == ['yes']
+            - debug: {msg: "{{ example.when }}"}
+    """})
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    assert plays[0]["controller_env"] == {"ANSIROLL_ACTIVE_CONDITION": "yes"}
+    assert _standalone(tmp_path, []) == _ansible(tmp_path, [])
+
+
+@pytest.mark.skipif(CORE_VERSION >= (2, 19), reason="older Core renders nested first_found templates")
+@pytest.mark.parametrize(("expression", "live"), [("'DEV' | lower", False), ("'prod' if live else 'dev'", True)])
+def test_setup_first_found_only_bundles_reachable_legacy_filenames(tmp_path, monkeypatch, expression, live):
+    from ansiroll.loader import parse_playbook
+
+    _write(tmp_path, {
+        "vars/dev.yml": "subset: [all]\n",
+        "vars/prod.yml": "subset: ['!all', '!min']\nprofile_marker: selected_only_by_conditional\n",
+        "vars/unrelated.yml": "unrelated: never_bundle_unreachable_filename\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {live: false}
+          vars_files:
+            - >-
+              {{ lookup('first_found', ["vars/{{ %s }}.yml"]) }}
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % expression,
+    })
+    plays, _ = parse_playbook(str(tmp_path / "pb.yml"))
+    bundled = json.dumps(plays, default=str)
+    assert "never_bundle_unreachable_filename" not in bundled
+    assert ("selected_only_by_conditional" in bundled) == live
+    extra = json.dumps({"live": live})
+    expected = _ansible(tmp_path, ["-e", extra])
+    assert expected[0] == ['"distribution defined: %s"' % (not live)]
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
 @pytest.mark.parametrize("fallback_path", ["team/default.yml", "profiles/../team/default.yml"])
 def test_setup_first_found_bundles_literal_absolute_fallback(tmp_path, monkeypatch, fallback_path):
     fallback_file = tmp_path / fallback_path

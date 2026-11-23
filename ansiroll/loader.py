@@ -373,6 +373,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 "vars_files": gather_vars_files,
             })
     names = _controller_env_names(result)
+    names.update(_controller_env_names(result["gather_when"], expression=True))
+    for node in _walk_play_nodes([result]):
+        for keyword in ("when", "changed_when", "failed_when", "until", "loop_break_when"):
+            names.update(_controller_env_names(node.get(keyword), expression=True))
+        if (node.get("action") or "").rsplit(".", 1)[-1] == "assert":
+            names.update(_controller_env_names((node.get("args") or {}).get("that"), expression=True))
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -425,26 +431,31 @@ def _apply_force_handlers_default(play):
         pass
 
 
-def _controller_env_names(value):
+def _controller_env_names(value, *, expression=False):
     """Find literal controller-side env lookups that the target must reproduce."""
     names = set()
     if isinstance(value, str):
-        if not _ENV_LOOKUP_RE.search(value):
+        templated = _is_templated(value)
+        if not (templated or expression) or not _ENV_LOOKUP_RE.search(value):
             return names
         from jinja2 import nodes
 
-        parsed = _selector_ast(value if _is_templated(value) else "{{ " + value + " }}")
+        parsed = _selector_ast(value if templated else "{{ " + value + " }}")
         if parsed is None:
             return names
         for call in parsed.find_all(nodes.Call):
-            if (isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
-                    and call.args and isinstance(call.args[0], nodes.Const)
+            if not isinstance(call.node, nodes.Name) or call.node.name not in ("lookup", "query", "q"):
+                continue
+            if (call.args and isinstance(call.args[0], nodes.Const)
                     and call.args[0].value in ("env", "ansible.builtin.env", "ansible.legacy.env")):
                 names.update(arg.value for arg in call.args[1:] if isinstance(arg, nodes.Const)
                              and isinstance(arg.value, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg.value))
-        for literal in parsed.find_all(nodes.Const):
-            if _is_templated(literal.value):
-                names.update(_controller_env_names(literal.value))
+            # The lookup term renderer also processes templates embedded in arguments.
+            for arg in (*call.args[1:], *call.kwargs):
+                literals = (arg,) if isinstance(arg, nodes.Const) else arg.find_all(nodes.Const)
+                for literal in literals:
+                    if _is_templated(literal.value):
+                        names.update(_controller_env_names(literal.value))
     elif isinstance(value, dict):
         if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_untrusted_condition__"}):
             return names
@@ -453,7 +464,7 @@ def _controller_env_names(value):
             names.update(_controller_env_names(item))
     elif isinstance(value, (list, tuple)):
         for item in value:
-            names.update(_controller_env_names(item))
+            names.update(_controller_env_names(item, expression=expression))
     return names
 
 
@@ -701,25 +712,58 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
             return concat_parts(term.left) + concat_parts(term.right)
         return [term]
 
-    def path_pattern(term):
+    def constant_path_part(part):
+        if isinstance(part, nodes.Const):
+            return True
+        return (isinstance(part, nodes.Filter) and part.name in ("lower", "upper", "trim", "string", "replace")
+                and not (part.dyn_args or part.dyn_kwargs)
+                and all(constant_path_part(value) for value in (part.node, *part.args,
+                                                                *(kw.value for kw in part.kwargs))))
+
+    def expand_conditionals(parts):
+        variants = [[]]
+        for part in parts:
+            choices = [[part]]
+            if isinstance(part, nodes.CondExpr):
+                branches = (part.expr1, part.expr2)
+                if isinstance(part.test, nodes.Const):
+                    branches = (part.expr1 if part.test.value else part.expr2,)
+                choices = [choice for branch in branches if branch is not None
+                           for choice in expand_conditionals(concat_parts(branch))]
+                # A large combination can still use the surrounding literal bounds.
+                if len(variants) * len(choices) > 128:
+                    choices = [[part]]
+            variants = [variant + choice for variant in variants for choice in choices]
+        return variants
+
+    def path_patterns(term):
         parts = concat_parts(term)
         if version < (2, 19) and isinstance(term, nodes.Const) and _is_templated(term.value):
             nested = _selector_ast(term.value)
             if nested is None or len(nested.body) != 1 or not isinstance(nested.body[0], nodes.Output):
-                return None
+                return [None]
             parts = [part for node in nested.body[0].nodes for part in (
                 [nodes.Const(node.data)] if isinstance(node, nodes.TemplateData) else concat_parts(node))]
             if not parts:
-                return None
+                return [None]
+        return [path_pattern(variant) for variant in expand_conditionals(parts)]
+
+    def path_pattern(parts):
         anchored = isinstance(parts[0], nodes.Name) and parts[0].name == "playbook_dir"
         if anchored:
             parts = parts[1:]
         literals = []
         for part in parts:
-            if isinstance(part, nodes.Const) and isinstance(part.value, str):
-                if part.value:
-                    literals.append(part.value)
-            elif isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Filter)):
+            if constant_path_part(part):
+                try:
+                    value = part.as_const()
+                except nodes.Impossible:
+                    value = None
+                if isinstance(value, str):
+                    if value:
+                        literals.append(value)
+                    continue
+            if isinstance(part, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Filter, nodes.CondExpr)):
                 literals.append(None)
             else:
                 return None
@@ -796,8 +840,9 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
 
     needs_fallback = False
     for dir_terms, files in groups:
-        directories = [path_pattern(term) for term in dir_terms] or [(None, "")]
-        filenames = [path_pattern(term) for term in flatten([files], "[,;]")]
+        directories = ([candidate for term in dir_terms for candidate in path_patterns(term)]
+                       if dir_terms else [(None, "")])
+        filenames = [candidate for term in flatten([files], "[,;]") for candidate in path_patterns(term)]
         if None in directories or None in filenames:
             needs_fallback = True
         for file_root, filename_pattern in filter(None, filenames):
@@ -819,18 +864,18 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, v
                 for root in roots:
                     add_candidate(root, directory, filename_pattern)
     for fallback in fallbacks:
-        candidate = path_pattern(fallback)
-        if candidate is None or candidate[1] == "\0":
-            needs_fallback = True
-            continue
-        root, filename = candidate
-        if root is not None:
-            add_candidate(root, "", filename)
-        elif filename:
-            for root in vars_dirs:
+        for candidate in path_patterns(fallback):
+            if candidate is None or candidate[1] == "\0":
+                needs_fallback = True
+                continue
+            root, filename = candidate
+            if root is not None:
                 add_candidate(root, "", filename)
-                if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
-                    add_candidate(root, vars_subdir, filename)
+            elif filename:
+                for root in vars_dirs:
+                    add_candidate(root, "", filename)
+                    if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
+                        add_candidate(root, vars_subdir, filename)
     return patterns, needs_fallback
 
 
@@ -1172,6 +1217,24 @@ def _collect_jinja_plugins(play, basedir):
                 except OSError:
                     continue
     return plugins or None
+
+
+def _walk_play_nodes(plays):
+    def walk(nodes):
+        for node in nodes or []:
+            if node.get("tree_shaken_handler"):
+                continue
+            yield node
+            if node.get("type") == "block":
+                for section in ("block", "rescue", "always"):
+                    yield from walk(node.get(section))
+            elif node.get("type") == "include":
+                yield from walk(node.get("tasks"))
+                yield from walk(node.get("handlers"))
+
+    for play in plays:
+        yield from walk(play.get("tasks"))
+        yield from walk(play.get("handlers"))
 
 
 def _assign_runtime_ids(tasks, handlers):

@@ -29,6 +29,7 @@ from .loader import (
     _loop_binding_names,
     _runtime_write_names,
     _vars_file_variable_names,
+    _walk_play_nodes,
     load_adjacent_group_vars,
     parse_playbook,
 )
@@ -240,24 +241,6 @@ def _freeze_value(value, context):
     if _contains_undefined(resolved):
         return None, False
     return resolved, True
-
-
-def _walk_play_nodes(plays):
-    def walk(nodes):
-        for node in nodes or []:
-            if node.get("tree_shaken_handler"):
-                continue
-            yield node
-            if node.get("type") == "block":
-                for section in ("block", "rescue", "always"):
-                    yield from walk(node.get(section))
-            elif node.get("type") == "include":
-                yield from walk(node.get("tasks"))
-                yield from walk(node.get("handlers"))
-
-    for play in plays:
-        yield from walk(play.get("tasks"))
-        yield from walk(play.get("handlers"))
 
 
 def _shadowed_var_names(plays):
