@@ -3287,7 +3287,8 @@ class Runtime:
         normalized = os.path.normpath(src)
         if ".." not in parts:
             lookup = normalized
-            if parts[0] != task["_baked_tree"] and normalized.split("/", 1)[0] == task["_baked_tree"]:
+            if (parts[0] == "." and normalized.startswith("~")
+                    or parts[0] != task["_baked_tree"] and normalized.split("/", 1)[0] == task["_baked_tree"]):
                 lookup = "./" + normalized
             return (task.get("_baked_direct_sources") or {}).get(lookup, normalized)
         if ".." in parts:

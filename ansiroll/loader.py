@@ -1978,39 +1978,49 @@ def _search_dirs(task, basedir, subdir, tagged=False):
     return dirs if tagged else [d for d, _ in dirs]
 
 
+def _linked_role_source_pattern(src):
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    try:
+        body = Environment(keep_trailing_newline=True).parse(src).body
+    except TemplateSyntaxError:
+        return None
+    if not body:
+        return None
+
+    def literal(node, index):
+        if isinstance(node, nodes.Output) and node.nodes and isinstance(node.nodes[index], nodes.TemplateData):
+            return node.nodes[index].data
+        return ""
+
+    head = literal(body[0], 0)
+    if len(body) == 1 and isinstance(body[0], nodes.Output):
+        parts = [node.data if isinstance(node, nodes.TemplateData) else "\0" for node in body[0].nodes]
+    else:
+        tail = literal(body[-1], -1)
+        if not tail:
+            return None
+        parts = [head, "\0", tail]
+    if any(".." in part.split(os.sep) for part in parts):
+        return None
+    segments = os.path.normpath("".join(parts)).split(os.sep)
+    pattern = []
+    for index, segment in enumerate(segments):
+        if segment == "\0" and index < len(segments) - 1:
+            pattern.append("(?:.+/)?")
+        else:
+            pattern.append(re.escape(segment).replace("\0", ".*"))
+            if index < len(segments) - 1:
+                pattern.append("/")
+    return head.rpartition(os.sep)[0], re.compile("".join(pattern), re.S)
+
+
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
-    parts = re.split(r"{{.*?}}|{%.*?%}|{#.*?#}", src, flags=re.S)
-    if any(".." in part.split(os.sep) for part in parts):
+    parsed = _linked_role_source_pattern(src)
+    if parsed is None:
         return {}, {}, {}
-    prefix = parts[0].rpartition(os.sep)[0]
-    tail = parts[-1].strip()
-    if "{%" in src and not tail:
-        # A branch can choose the entire ending. Without a literal suffix,
-        # the linked walk cannot tell which files the template can select.
-        return {}, {}, {}
-    if os.sep in tail:
-        tail = os.path.normpath(tail)
-    normalized = os.path.normpath("\0".join(parts))
-    # When a whole-component expression renders empty, the rendered path
-    # collapses the two separators into one.
-    fixed = normalized.replace("/\0/", "/\0").split("\0")
-
-    def matches(relative):
-        if "{%" in src:
-            return relative.endswith(tail)
-        if len(fixed) == 1:
-            return relative == fixed[0]
-        first, last = fixed[0], fixed[-1]
-        if not (relative.startswith(first) and relative.endswith(last) and len(relative) >= len(first) + len(last)):
-            return False
-        cursor, end = len(first), len(relative) - len(last)
-        for part in fixed[1:-1]:
-            found = relative.find(part, cursor, end)
-            if found < 0:
-                return False
-            cursor = found + len(part)
-        return True
+    prefix, pattern = parsed
     magic = _role_magic(task) or {}
     source_roots = tuple(root for root in
                          (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
@@ -2029,19 +2039,18 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
 
     def lookup_paths(relative):
         yield relative
-        if relative.split(os.sep, 1)[0] == subdir:
-            # Ansible can insert the action subdir when the raw first
-            # component is "." even if the normalized key starts with it.
+        if relative.startswith("~") or relative.split(os.sep, 1)[0] == subdir:
+            # A leading "." changes action-subdir and home-path handling.
             yield "./" + relative
 
     direct = {}
     for relative, meta in ordinary.items():
-        if matches(relative):
+        if pattern.fullmatch(relative):
             for lookup_path in lookup_paths(relative):
                 if os.path.normpath(meta["fullpath"]) != source_for(lookup_path):
                     direct[lookup_path] = None
 
-    assets, metadata = {}, {}
+    assets, metadata, contents = {}, {}, {}
     visits = 0
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
         if not prefix and not is_subdir:
@@ -2067,19 +2076,19 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 children.append(name)
                 paths[path] = (ancestors | {target}, linked or os.path.islink(path))
             dirs[:] = children
-            if not linked:
-                continue
             for name in sorted(files):
                 path = os.path.join(root, name)
                 relative = os.path.relpath(path, base)
-                if (name.startswith(".") or not matches(relative) or not os.path.isfile(path)
-                        or not visible(os.path.realpath(path))):
+                if not linked and relative not in ordinary:
                     continue
-                if relative in ordinary and os.path.normpath(ordinary[relative]["fullpath"]) == os.path.normpath(path):
+                if name.startswith(".") or not pattern.fullmatch(relative):
+                    continue
+                if relative in ordinary and ordinary[relative]["fullpath"] == os.path.normpath(path):
                     continue
                 paths_to_bake = [lookup_path for lookup_path in lookup_paths(relative)
-                                 if os.path.normpath(path) == source_for(lookup_path)]
-                if not paths_to_bake:
+                                 if (linked or (lookup_path in direct and direct[lookup_path] is None))
+                                 and os.path.normpath(path) == source_for(lookup_path)]
+                if not paths_to_bake or not os.path.isfile(path) or not visible(os.path.realpath(path)):
                     continue
                 key = "\0" + paths_to_bake[0]  # Cannot collide with a filesystem pathname.
                 try:
@@ -2088,8 +2097,11 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                         info = os.fstat(fd)
                         if not stat.S_ISREG(info.st_mode):
                             continue
-                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as file:
-                            assets[key] = file.read()
+                        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                        if identity not in contents:
+                            with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as file:
+                                contents[identity] = file.read()
+                        assets[key] = contents[identity]
                     finally:
                         os.close(fd)
                 except OSError:

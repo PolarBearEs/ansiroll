@@ -1145,7 +1145,7 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
     assert not destination.exists()
 
 
-@pytest.mark.parametrize(("prefix", "linked_first"), [("", False), ("./", True), ("", True)])
+@pytest.mark.parametrize(("prefix", "linked_first"), [("", False), ("./", True), ("", True), ("", None), ("./", None)])
 def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path, prefix, linked_first):
     destination = tmp_path / "rendered.txt"
     _write(tmp_path, {"pb.yml": """
@@ -1160,7 +1160,11 @@ def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_pa
     normal, prepended = templates / "sites", templates / "templates/sites"
     linked, regular = (normal, prepended) if linked_first else (prepended, normal)
     linked.mkdir(parents=True)
-    (linked / "alias").symlink_to(templates / "shared", target_is_directory=True)
+    if linked_first is None:
+        (linked / "alias").mkdir()
+        (linked / "alias/app.j2").write_text("other regular path\n")
+    else:
+        (linked / "alias").symlink_to(templates / "shared", target_is_directory=True)
     (regular / "alias").mkdir(parents=True)
     (regular / "alias/app.j2").write_text("regular path\n")
 
@@ -1170,6 +1174,63 @@ def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_pa
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == expected_source
+
+
+def test_dynamic_role_template_preserves_dot_prefixed_tilde(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: draft}
+- template: {src: "./~{{ name }}.j2", dest: "output.txt"}
+""", "roles/r/templates/~draft.j2": "from the role\n"})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "from the role\n"
+
+
+@pytest.mark.parametrize(("src", "matched", "excluded"), [
+    ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
+     "report-alias/app.j2", "alias/other.j2"),
+    ("sites/{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}/{% if staged %}stage{% endif %}//app.j2", "alias/app.j2", "alias/not-app.j2"),
+])
+def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkeypatch, src, matched, excluded):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: alias/app, group: alias, staged: false}
+- template: {src: "%s", dest: "output.txt"}
+""" % src, "roles/r/templates/sites/app.j2": "ordinary\n",
+        "shared/app.j2": "linked\n", "shared/other.j2": "excluded\n",
+        "shared/not-app.j2": "excluded\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for name in ("alias", "report-alias"):
+        (sites / name).symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    linked_stat = (tmp_path / "shared/app.j2").stat()
+    reads = []
+    original_fdopen = os.fdopen
+
+    def track_linked_read(fd, *args, **kwargs):
+        if os.path.samestat(os.fstat(fd), linked_stat):
+            reads.append(fd)
+        return original_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", track_linked_read)
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    direct = template["_baked_direct_sources"]
+    assert "sites/" + matched in direct
+    assert "sites/" + excluded not in direct
+    assert len(reads) == 1
 
 
 @pytest.mark.parametrize("src", [
