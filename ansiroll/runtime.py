@@ -951,8 +951,11 @@ def _first_found_vars_file(args, options, ctx):
     files = ctx["__ansiroll_selector_files"]
     dirs = ctx["__ansiroll_search_dirs"]
     lookup_dirs = ctx.get("__ansiroll_first_found_dirs") or {}
-    if not _core_at_least(2, 12):
+    keyword_supported = _core_at_least(2, 12)
+    reset_positional = not _core_at_least(2, 16)
+    if not keyword_supported:
         options = {}  # Legacy first_found takes its search options as a dict term.
+    keyword_options = options
 
     def split(value, separators):
         return [word for part in _flatten_deep([value]) for word in re.split(separators, part)]
@@ -960,10 +963,14 @@ def _first_found_vars_file(args, options, ctx):
     for term in _flatten_deep(args or [options.get("files")]):
         if isinstance(term, dict):
             options = term
+            path_options = term
             names = split(term.get("files"), "[,;]")
         else:
             names = split(term, "[,;]")
-        for directory in split(options.get("paths"), "[,:;]") or [""]:
+            path_options = keyword_options if reset_positional else options
+            if keyword_supported and reset_positional:
+                options = keyword_options
+        for directory in split(path_options.get("paths"), "[,:;]") or [""]:
             for name in names:
                 path = os.path.expanduser(os.path.join(directory, name))
                 search_dirs = lookup_dirs.get("files" if path.split(os.sep)[0] == "files" else "default", dirs)

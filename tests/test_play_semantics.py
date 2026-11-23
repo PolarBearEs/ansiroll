@@ -1550,9 +1550,13 @@ def test_setup_first_found_uses_runtime_profile(tmp_path, monkeypatch, selector)
     assert _standalone(tmp_path, []) == expected
 
 
-def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_path, monkeypatch):
+@pytest.mark.parametrize("use_default", [False, True])
+def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_path, monkeypatch, use_default):
     from ansiroll.loader import parse_playbook
 
+    args = "{'files': ['facts.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile], 'skip': true}"
+    selector = ("query('first_found', %s) | first | default('fallback.yml')" % args
+                if use_default else "lookup('first_found', %s)" % args)
     _write(tmp_path, {
         "files/profiles/dev/facts.yml": "subset: [all]\n",
         "files/profiles/team/prod/facts.yml": "subset: ['!all', '!min']\n",
@@ -1560,22 +1564,52 @@ def test_setup_first_found_bundles_only_named_files_across_nested_profiles(tmp_p
         "files/unrelated.yml": "another_value: never_bundle_this_either\n",
         "files/facts.yml": "unrelated_lookup_file: never_bundle_this_later\n",
         "vars/facts.yml": "unrelated_vars_file: never_bundle_this_again\n",
+        "fallback.yml": "subset: ['!all', '!min']\nfallback_marker: bundled_fallback\n",
         "pb.yml": """
         - hosts: localhost
           gather_facts: true
           gather_subset: "{{ subset }}"
           vars: {profile: dev}
           vars_files:
-            - "{{ lookup('first_found', {'files': ['facts.yml'], 'paths': [playbook_dir ~ '/files/profiles/' ~ profile]}) }}"
+            - "{{ %s }}"
           tasks:
             - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
-        """,
+        """ % selector,
     })
     plays, _actions = parse_playbook(str(tmp_path / "pb.yml"))
-    assert "never_bundle_this" not in json.dumps(plays, default=str)
+    serialized = json.dumps(plays, default=str)
+    assert "never_bundle_this" not in serialized
+    assert ("bundled_fallback" in serialized) == use_default
     extra = json.dumps({"profile": "team/prod"})
     expected = _ansible(tmp_path, ["-e", extra])
     assert expected[0] == ['"distribution defined: False"']
+    monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
+    assert _standalone(tmp_path, []) == expected
+
+
+@pytest.mark.parametrize("selector", [
+    "lookup('first_found', {'files': [profile ~ '.yml'], 'paths': ['profiles', '']})",
+    "lookup('first_found', {'files': ['missing.yml'], 'paths': ['profiles']}, profile ~ '.yml')",
+])
+def test_setup_first_found_searches_explicit_root_fallbacks(tmp_path, monkeypatch, selector):
+    _write(tmp_path, {
+        "dev.yml": "subset: [all]\n",
+        "prod.yml": "subset: ['!all', '!min']\n",
+        "profiles/dev.yml": "subset: [all]\n",
+        "pb.yml": """
+        - hosts: localhost
+          gather_facts: true
+          gather_subset: "{{ subset }}"
+          vars: {profile: dev}
+          vars_files: ["{{ %s }}"]
+          tasks:
+            - debug: {msg: "distribution defined: {{ ansible_facts.distribution is defined }}"}
+        """ % selector,
+    })
+    if "missing.yml" in selector and CORE_VERSION >= (2, 16):
+        (tmp_path / "profiles/prod.yml").write_text("subset: [all]\n")
+    extra = json.dumps({"profile": "prod"})
+    expected = _ansible(tmp_path, ["-e", extra])
     monkeypatch.setenv("ANSIROLL_EXTRA_VARS", extra)
     assert _standalone(tmp_path, []) == expected
 

@@ -583,7 +583,7 @@ def _selector_depends_only_on_lookup(selector):
     return parsed is not None and stable(parsed)
 
 
-def _first_found_candidate_patterns(selector, basedir, search_dirs):
+def _first_found_candidate_patterns(selector, basedir, search_dirs, vars_dirs, vars_subdir):
     """Pair modeled first_found directory terms with their filename terms."""
     from glob import escape
     from jinja2 import nodes
@@ -593,7 +593,12 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs):
             or len(parsed.body[0].nodes) != 1):
         return None
     call = parsed.body[0].nodes[0]
-    if isinstance(call, nodes.Filter) and call.name == "first":
+    fallbacks = []
+    while isinstance(call, nodes.Filter):
+        if call.name in ("default", "d") and call.args and not (call.kwargs or call.dyn_args or call.dyn_kwargs):
+            fallbacks.append(call.args[0])
+        elif call.name != "first":
+            return None
         call = call.node
     if (not isinstance(call, nodes.Call) or not isinstance(call.node, nodes.Name)
             or call.node.name not in ("lookup", "query", "q") or call.dyn_args or call.dyn_kwargs
@@ -601,12 +606,12 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs):
             or call.args[0].value not in ("first_found", "ansible.builtin.first_found", "ansible.legacy.first_found")):
         return None
 
-    def flatten(terms, separators):
+    def flatten(terms, separators, preserve_empty=False):
         for term in terms:
             if isinstance(term, (nodes.List, nodes.Tuple)):
-                yield from flatten(term.items, separators)
+                yield from flatten(term.items, separators, preserve_empty)
             elif isinstance(term, nodes.Const) and isinstance(term.value, str):
-                yield from (nodes.Const(part) for part in re.split(separators, term.value) if part)
+                yield from (nodes.Const(part) for part in re.split(separators, term.value) if part or preserve_empty)
             else:
                 yield term
 
@@ -650,8 +655,10 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs):
         return anchored, "".join(pattern).lstrip(os.sep)
 
     kwargs = {option.key: option.value for option in call.kwargs}
+    version = tuple(map(int, _fact_schema().split(".")))
+    keyword_paths = kwargs.get("paths") if version >= (2, 12) else None
     groups = []
-    paths = kwargs.get("paths")
+    paths = keyword_paths
     for term in flatten(call.args[1:], "[,;]"):
         if isinstance(term, nodes.Dict):
             mapping = {pair.key.value: pair.value for pair in term.items if isinstance(pair.key, nodes.Const)}
@@ -659,13 +666,15 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs):
             if "files" in mapping:
                 groups.append((paths, mapping["files"]))
         else:
+            if version < (2, 16):
+                paths = keyword_paths
             groups.append((paths, term))
-    if not groups and "files" in kwargs:
+    if version >= (2, 12) and not groups and "files" in kwargs:
         groups.append((paths, kwargs["files"]))
 
     patterns = set()
     for paths, files in groups:
-        dir_terms = list(flatten([paths], "[,:;]")) if paths is not None else []
+        dir_terms = list(flatten([paths], "[,:;]", preserve_empty=True)) if paths is not None else []
         directories = [path_pattern(term, directory=True) for term in dir_terms] or [(False, "")]
         filenames = [path_pattern(term, directory=False) for term in flatten([files], "[,;]")]
         if None in directories or None in filenames:
@@ -678,6 +687,17 @@ def _first_found_candidate_patterns(selector, basedir, search_dirs):
                 relative = os.path.join(directory, filename)
                 roots = [basedir] if absolute_dir else search_dirs.get(relative.split(os.sep)[0], search_dirs["default"])
                 patterns.update((root, relative) for root in roots)
+    for fallback in fallbacks:
+        candidate = path_pattern(fallback, directory=False)
+        if candidate is None:
+            return None
+        absolute, filename = candidate
+        if absolute:
+            patterns.add((basedir, filename))
+        elif filename:
+            patterns.update((root, filename) for root in vars_dirs)
+            if vars_subdir and filename.split(os.sep)[0] != vars_subdir:
+                patterns.update((os.path.join(root, vars_subdir), filename) for root in vars_dirs)
     return patterns
 
 
@@ -708,7 +728,7 @@ def _deferred_vars_files(play, basedir, entries, *, setup=False):
         for name in names:
             first_found = setup and "first_found" in name
             if first_found:
-                lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs)
+                lookup_candidates = _first_found_candidate_patterns(name, basedir, first_found_dirs, dirs, subdir)
                 if lookup_candidates is not None:
                     for root, file_pattern in sorted(lookup_candidates):
                         base = Path(root)
