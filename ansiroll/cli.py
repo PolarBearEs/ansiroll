@@ -306,10 +306,12 @@ def _open_compile_destination(path, validate, *, release_output=None):
             yield writer
 
 
-def _write_stdout_manifest(path, manifest, stdout_fd):
+def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None):
     path = _manifest_for_stdout(path, stdout_fd)
 
     def validate(info, fd):
+        if validate_input is not None:
+            validate_input(info, "manifest path", path)
         _validate_stdout_manifest(path, info, stdout_fd, fd)
 
     with _open_compile_destination(path, validate) as fh:
@@ -408,18 +410,15 @@ def _make_output_executable(path, reference, output_stat, mode):
     os.chmod(path, mode)
 
 
-def _write_compile_files(output_path, manifest_path, source, manifest):
-    if not manifest_path:
-        with open(output_path, "w") as output:
-            output.write(source)
-        os.chmod(output_path, os.stat(output_path).st_mode | stat.S_IEXEC | stat.S_IXGRP)
-        return
-
+def _write_compile_files(output_path, manifest_path, source, manifest, validate_input):
     # Paths can change during compilation or between the check and open.
-    _check_file_destinations(output_path, manifest_path)
+    if manifest_path:
+        _check_file_destinations(output_path, manifest_path)
 
     def validate_output(info, _fd):
-        _check_manifest_path(manifest_path, info)
+        validate_input(info, "output path", output_path)
+        if manifest_path:
+            _check_manifest_path(manifest_path, info)
 
     with ExitStack() as output_reference:
         reference = None
@@ -433,8 +432,11 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
         _make_output_executable(output_path, reference, output_stat, mode)
+        if not manifest_path:
+            return
 
         def validate_manifest(info, _fd):
+            validate_input(info, "manifest path", manifest_path)
             try:
                 current_output = os.stat(output_path)
             except OSError:
@@ -497,13 +499,55 @@ def _prepare_compile_stderr():
         sys.stderr = open(2, "w", closefd=False, errors="backslashreplace")
 
 
+def _playbook_input_path(path):
+    directory, filename = os.path.split(path)
+    absolute = os.path.abspath(path)
+    if "$" not in path and "$" not in absolute and not filename.startswith(("~", "'", "\"")):
+        return absolute
+
+    from ansible.parsing.dataloader import DataLoader
+
+    # Match Playbook.load's basedir and the two path_dwim calls made
+    # by load_from_file and _get_file_contents.
+    loader = DataLoader()
+    loader.set_basedir(directory if os.path.isabs(path) else os.path.abspath(directory))
+    return loader.path_dwim(loader.path_dwim(filename))
+
+
+def _try_stat(path):
+    try:
+        return os.stat(path)
+    except (OSError, UnicodeError):
+        # Let the compiler or destination open report inaccessible paths.
+        return None
+
+
 def _cmd_compile(args, stdout=None):
-    if stdout is None and args.manifest:
-        try:
+    input_path = _playbook_input_path(args.playbook)
+    original_input = _try_stat(input_path)
+
+    def validate_input(info, name, path):
+        if info is None:
+            return
+        for input_info in (original_input, _try_stat(input_path)):
+            if input_info is not None and os.path.samestat(info, input_info):
+                raise ValueError("%s points to input playbook: %s" % (name, path))
+
+    def check_input_destinations():
+        if stdout is None:
+            validate_input(_try_stat(args.output), "output path", args.output)
+        else:
+            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
+        if args.manifest:
+            validate_input(_try_stat(args.manifest), "manifest path", args.manifest)
+
+    try:
+        check_input_destinations()
+        if stdout is None and args.manifest:
             _check_file_destinations(args.output, args.manifest)
-        except ValueError as ex:
-            sys.stderr.write("ansiroll: %s\n" % ex)
-            return 2
+    except ValueError as ex:
+        sys.stderr.write("ansiroll: %s\n" % ex)
+        return 2
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
@@ -524,17 +568,18 @@ def _cmd_compile(args, stdout=None):
             message = "ansiroll: " + message
         sys.stderr.write(message + "\n")
         return 2
-    if stdout is None:
-        try:
-            _write_compile_files(args.output, args.manifest, source, manifest)
-        except ValueError as ex:
-            sys.stderr.write("ansiroll: %s\n" % ex)
-            return 2
-    else:
-        if args.manifest:
-            _write_stdout_manifest(args.manifest, manifest, stdout.fileno())
-        stdout.write(source.encode("utf-8"))
-        stdout.flush()
+    try:
+        check_input_destinations()
+        if stdout is None:
+            _write_compile_files(args.output, args.manifest, source, manifest, validate_input)
+        else:
+            if args.manifest:
+                _write_stdout_manifest(args.manifest, manifest, stdout.fileno(), validate_input=validate_input)
+            stdout.write(source.encode("utf-8"))
+            stdout.flush()
+    except ValueError as ex:
+        sys.stderr.write("ansiroll: %s\n" % ex)
+        return 2
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
         % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),

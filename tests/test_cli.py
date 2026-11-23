@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -429,6 +430,127 @@ def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys, with_mani
     assert stat.S_IMODE(output.stat().st_mode) == 0o750
     if with_manifest:
         assert manifest_path.read_text() == json.dumps(manifest, indent=2)
+
+
+@pytest.mark.parametrize("alias", ["same", "symlink", "hardlink"])
+@pytest.mark.parametrize("destination", ["output", "manifest", "stdout-manifest"])
+def test_compile_rejects_destinations_aliasing_the_playbook(tmp_path, alias, destination):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    playbook.chmod(0o640)
+    target = playbook if alias == "same" else tmp_path / "alias"
+    if alias == "symlink":
+        target.symlink_to(playbook)
+    elif alias == "hardlink":
+        os.link(playbook, target)
+
+    output = tmp_path / "compiled.py"
+    args = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook)]
+    if destination == "output":
+        args.extend(["-o", str(target)])
+    else:
+        args.extend(["-o", "-" if destination == "stdout-manifest" else str(output), "-m", str(target)])
+    result = subprocess.run(args, capture_output=True, timeout=10)
+
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert not result.stdout
+    assert playbook.read_bytes() == original
+    assert stat.S_IMODE(playbook.stat().st_mode) == 0o640
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("name", ["play.yml", "$ANSIROLL_PLAYBOOK_BASENAME"])
+def test_compile_checks_the_expanded_playbook_path(tmp_path, monkeypatch, name):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    monkeypatch.setenv("ANSIROLL_INPUT_NAME", name)
+    monkeypatch.setenv("ANSIROLL_PLAYBOOK_BASENAME", playbook.name)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile",
+                             str(tmp_path / "$ANSIROLL_INPUT_NAME"), "-o", str(playbook)],
+                            capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+def test_compile_checks_absolute_input_with_expansion_and_parent_traversal(tmp_path, monkeypatch):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+
+    monkeypatch.setenv("ANSIROLL_INPUT_DIR", "parent/child")
+    directory = tmp_path / "$ANSIROLL_INPUT_DIR" / ".."
+    loader = DataLoader()
+    loader.set_basedir(str(directory))
+    playbook = Path(loader.path_dwim("play.yml"))
+    playbook.parent.mkdir(exist_ok=True)
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(directory / "play.yml"),
+                             "-o", str(playbook)], capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name != "posix", reason="filename contains quotes and a backslash")
+def test_compile_preserves_a_literal_playbook_name_with_an_escaped_final_quote(tmp_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / '"play\\"'
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(playbook)],
+                            capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.parametrize("destination", ["output-only", "output-with-manifest", "manifest"])
+def test_compile_checks_destination_inode_after_open(monkeypatch, tmp_path, capsys, destination):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("original")
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    open_fd = os.open
+
+    target = manifest if destination == "manifest" else output
+
+    def replace_destination_before_open(path, flags, *args, **kwargs):
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY and not target.exists():
+            target.symlink_to(playbook)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_destination_before_open)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **k: ("pass\n", {}))
+    args = ["compile", str(playbook), "-o", str(output)]
+    if destination != "output-only":
+        args.extend(["-m", str(manifest)])
+
+    assert cli.main(args) == 2
+    assert "points to input playbook" in capsys.readouterr().err
+    assert playbook.read_text() == "original"
+    if destination == "manifest":
+        assert output.read_text() == "pass\n"
+    else:
+        assert not manifest.exists()
+
+
+def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    with playbook.open("ab") as destination:
+        result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+                                stdout=destination, stderr=subprocess.PIPE, timeout=10)
+    assert result.returncode == 2
+    assert b"stdout points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
 
 
 @pytest.mark.parametrize("alias", ["missing", "dangling", "same", "symlink", "hardlink", "replaced"])
