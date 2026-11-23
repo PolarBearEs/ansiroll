@@ -710,6 +710,7 @@ def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_dupli
     ("missing/../prod/app.j2", False, False),
     ("missing/../prod/app.j2", True, True),
     ("../prod/app.j2", False, True),
+    ("/prod//app.j2", False, True),
 ])
 def test_compile_dynamic_role_source_checks_literal_traversal_before_retaining_duplicates(
         tmp_path, monkeypatch, tail, required_dir_exists, retains_duplicate):

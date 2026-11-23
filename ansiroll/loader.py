@@ -2059,11 +2059,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         trailing_components = tail.partition(os.sep)[2].split(os.sep)
         basename = trailing_components[-1]
         if basename not in ("", ".", ".."):
-            literal_tail = trailing_components
+            # Extra separators are no-ops inside this relative suffix.
+            literal_tail = tuple(part for part in trailing_components if part)
             # Parent traversal can change the starting directory, but the
             # literal components after the last ".." still constrain the path.
-            start = max((index + 1 for index, part in enumerate(trailing_components) if part == ".."), default=0)
-            suffix = os.sep.join(trailing_components[start:])
+            start = max((index + 1 for index, part in enumerate(literal_tail) if part == ".."), default=0)
+            suffix = os.sep.join(literal_tail[start:])
             fixed_path = os.sep + os.path.normpath(suffix).lstrip(os.sep)
     trees = []
     directories = set()
