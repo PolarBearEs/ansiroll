@@ -121,6 +121,22 @@ def _legacy_environment_validator(validate, aliases):
             for member in super().__iter__():
                 yield check_error(member)
 
+        def __getitem__(self, index):
+            return check_error(super().__getitem__(index))
+
+        def __add__(self, other):
+            return check_error(super().__add__(other))
+
+        def __radd__(self, other):
+            if not isinstance(other, list):
+                return NotImplemented
+            return check_error(list.__add__(other, self))
+
+        def __mul__(self, count):
+            return check_error(super().__mul__(count))
+
+        __rmul__ = __mul__
+
     class CheckedView(MappingView):
         def __init__(self, view, items):
             super().__init__(view)

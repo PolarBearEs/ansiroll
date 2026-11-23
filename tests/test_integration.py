@@ -2026,6 +2026,9 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".values() | first", "unknown_filter"),
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".values() | map('default', 'fallback') | first", "unknown_filter"),
     ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, ".nested[:1] | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "(ALIAS.nested + []) | map('default', 'fallback') | first", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "([] + ALIAS.nested) | map('default', 'fallback') | first", "unknown_filter"),
     ({"bad": "{{ 'value' | unknown_filter }}"}, ".values()", "unknown_filter"),
     ({"nested": ["{{ 'value' | unknown_filter }}"], "ok": "optional"}, ".ok", None),
     ("{{ 1 / 0 }}", "", "division by zero"),
@@ -2043,6 +2046,8 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
     make_templar()  # Initialize Ansible's collection loader before parsing.
     legacy = tuple(map(int, ansible_version.split(".")[:2])) < (2, 19)
     items_membership = "('ok', 'valid') in item_options.items()" if legacy else "true"
+    alias_read = (alias_member.replace("ALIAS", "optional_agent_alias") if "ALIAS" in alias_member
+                  else "optional_agent_alias" + alias_member)
     playbook = tmp_path / "play.yml"
     playbook.write_text("""
 - hosts: localhost
@@ -2091,7 +2096,7 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
               SYNC_EMPTY: "{{ none }}"
             - "{{ ansible_delegated_vars['localhost']['environment'] }}"
             - "{{ file_env }}"
-""".replace("optional_agent_alias |", "optional_agent_alias" + alias_member + " |")
+""".replace("optional_agent_alias |", alias_read + " |")
        .replace("items_membership", items_membership))
     loader = DataLoader()
     play, = Playbook.load(str(playbook), loader=loader).get_plays()
