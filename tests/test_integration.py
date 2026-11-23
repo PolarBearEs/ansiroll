@@ -2292,6 +2292,26 @@ def test_legacy_playbook_include_preserves_inline_variables(tmp_path, include, g
     assert "tags" not in plays[0]["vars"]
 
 
+def test_legacy_playbook_include_preserves_explicit_raw_params(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- include: child.yml _raw_params=hello\n")
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+
+    plays, _ = parse_playbook(str(playbook))
+    assert plays[0]["vars"]["_raw_params"] == "hello"
+
+
+@pytest.mark.parametrize("parameters", ["trailing text", "_raw_params=hello trailing text"])
+def test_legacy_playbook_include_rejects_unassigned_parameters(tmp_path, parameters):
+    from ansible.errors import AnsibleParserError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"- include: child.yml {parameters}\n")
+
+    with pytest.raises(AnsibleParserError, match="must use key=value"):
+        parse_playbook(str(playbook))
+
+
 @pytest.mark.parametrize(("include", "tag"), [
     ("- include: child.yml tags=inline\n  tags: explicit\n", "explicit"),
     ("- tags: explicit\n  include: child.yml tags=inline\n", "inline"),
@@ -2390,6 +2410,26 @@ def test_legacy_playbook_include_keeps_aliased_mapping_in_later_vars(tmp_path):
 
     plays, _ = parse_playbook(str(playbook))
     assert plays[1]["vars"]["settings"] == {"include": "child.yml"}
+
+
+def test_legacy_include_rewrite_preserves_list_form_vars_file_keys(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars_files: [vars.yml]
+  tasks:
+    - include: tasks.yml
+""")
+    (tmp_path / "vars.yml").write_text("- include: preserved\n")
+    (tmp_path / "tasks.yml").write_text('- debug: {msg: "{{ include }}"}\n')
+
+    source, manifest = compile_playbook(str(playbook))
+    assert not manifest["fallback_tasks"]
+    assert _compiled_plays(source, tmp_path)[0]["vars"]["include"] == "preserved"
+    result = subprocess.run([sys.executable, str(tmp_path / "compiled.py")],
+                            capture_output=True, text=True, timeout=30, check=True)
+    assert "preserved" in result.stdout
 
 
 def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):

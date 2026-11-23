@@ -160,8 +160,12 @@ def _make_rewriting_loader(DataLoader):
     import sys
 
     from ansible.playbook import Playbook
+    from ansible.playbook.helpers import load_list_of_tasks
+    from ansible.playbook.role import Role
 
     playbook_reader = Playbook._load_playbook_data.__code__
+    role_reader = Role._load_role_yaml.__code__
+    task_readers = {load_list_of_tasks.__code__, _convert_include_tasks.__code__}
 
     class RewritingDataLoader(DataLoader):
         def __init__(self):
@@ -169,10 +173,13 @@ def _make_rewriting_loader(DataLoader):
             self._deferred_import_fields = {}
 
         def load_from_file(self, *args, **kwargs):
-            # An include-only playbook and an include-only task file have the
-            # same YAML shape. Use the reader that requested the file.
-            playbook = sys._getframe(1).f_code is playbook_reader
+            # Playbooks, task files, and vars files can have the same YAML shape.
+            reader = sys._getframe(1).f_code
+            playbook = reader is playbook_reader
+            role_tasks = reader is role_reader and sys._getframe(1).f_locals.get("subdir") in ("tasks", "handlers")
             data = super(RewritingDataLoader, self).load_from_file(*args, **kwargs)
+            if not (playbook or role_tasks or reader in task_readers):
+                return data
             return _rewrite_includes(data, playbook=playbook, defer_import_fields=self._defer_import_fields)
 
         def _defer_import_fields(self, entry):
@@ -250,8 +257,10 @@ def _rewrite_playbook_include(item):
         rewritten["import_playbook"] = include
         return rewritten
 
-    params = parse_kv(" ".join(parts[1:])) if len(parts) > 1 else {}
-    if "_raw_params" in params:
+    inline = " ".join(parts[1:])
+    params = parse_kv(inline)
+    # Unassigned tokens overwrite even an explicit _raw_params assignment.
+    if "_raw_params" in params and parse_kv(inline + " _raw_params=")["_raw_params"]:
         raise AnsibleParserError("legacy playbook include parameters must use key=value", obj=item)
     if len(parts) > 1 and "vars" in item:
         raise AnsibleParserError("conflicting inline parameters and vars on legacy playbook include", obj=item)
