@@ -1966,6 +1966,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     aliases = {path: target for path, target in aliases.items() if target in directories}
     suffix = fixed_path[1:].split(os.sep) if os.sep in fixed_path[1:] else ()
 
+    def matches_suffix(relative, filename, alias_candidates):
+        if fixed_path and not ((os.sep + relative).endswith(fixed_path) or relative in alias_candidates):
+            return False
+        return os.sep in tail or filename.endswith(tail)
+
     baked, meta = {}, {}
     alternate_meta = {}
     claimed = set()
@@ -1979,16 +1984,6 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         if not prefix and not is_subdir:
             skipped.append((base, root_index))
             continue
-        special_names = set()
-        if root_aliases and claimed:
-            claimed_names = {os.path.basename(relative) for relative in claimed}
-            # A traversed special file and its normalized payload have the
-            # same basename, even when a symlink changes their parent path.
-            special_names = {
-                name for directory, _, files in walk for name in claimed_names.intersection(files)
-                if (mode := _role_source_mode(os.path.join(directory, name))) is not None
-                and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
-            }
         alias_candidates = set()
         if suffix and root_aliases:
             # The rendered prefix can reach any directory in this search root.
@@ -1998,6 +1993,18 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 children = (os.path.normpath(os.path.join(directory, component)) for directory in reachable)
                 reachable = {target for child in children if (target := root_aliases.get(child, child)) in root_dirs}
             alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
+        special_names = set()
+        if root_aliases and claimed:
+            claimed_names = {os.path.basename(relative) for relative in claimed}
+            # A traversed special file and its normalized payload have the
+            # same basename, even when a symlink changes their parent path.
+            for directory, _, files in walk:
+                for filename in claimed_names.intersection(files):
+                    path = os.path.join(directory, filename)
+                    if matches_suffix(os.path.relpath(path, base), filename, alias_candidates):
+                        mode = _role_source_mode(path)
+                        if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                            special_names.add(filename)
         for root, dirs, files in walk:
             for dirname in dirs:
                 path = os.path.join(root, dirname)
@@ -2013,9 +2020,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if fixed_path and not ((os.sep + rel).endswith(fixed_path) or rel in alias_candidates):
-                    continue
-                if os.sep not in tail and not fn.endswith(tail):
+                if not matches_suffix(rel, fn, alias_candidates):
                     continue
                 mode = _role_source_mode(full)
                 if mode is None:
@@ -2087,7 +2092,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     if not alternate:
                         claimed.remove(rel)
                         shadowed.pop(rel, None)
-                    else:
+                    elif rel in shadowed:
                         shadowed[rel].discard(root_index)
                     del root_files[rel]
                     continue
