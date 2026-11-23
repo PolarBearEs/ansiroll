@@ -1994,7 +1994,12 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 reachable = {target for child in children if (target := root_aliases.get(child, child)) in root_dirs}
             alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
         special_names = set()
-        if root_aliases and claimed:
+        # Canceling a sibling alias with ".." returns to the same parent.
+        # A walked regular file can only differ from the traversed source
+        # after a symlink changes the parent reached by "..".
+        redirects_parent = any(os.path.dirname(path) != os.path.dirname(target)
+                               for path, target in root_aliases.items())
+        if redirects_parent and claimed:
             claimed_names = {os.path.basename(relative) for relative in claimed}
             # A traversed special file and its normalized payload have the
             # same basename, even when a symlink changes their parent path.

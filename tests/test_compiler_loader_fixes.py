@@ -645,18 +645,31 @@ def test_compile_dynamic_role_source_can_bypass_an_unreadable_earlier_file(tmp_p
         assert node["_baked"][traversed] == "available\n"
 
 
-@pytest.mark.parametrize("disappears", [False, True])
-def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_duplicates(tmp_path, monkeypatch, disappears):
+@pytest.mark.parametrize("scenario", ["suffix_mismatch", "sibling_alias", "disappears"])
+def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_duplicates(tmp_path, monkeypatch, scenario):
+    disappears = scenario == "disappears"
     from types import SimpleNamespace
 
     from ansiroll import loader
 
     _write(tmp_path, {"earlier/sites/prod/app.j2": "first\n", "later/sites/prod/app.j2": "later\n"})
     later = tmp_path / "later/sites"
-    special = later / ("prod/nested" if disappears else "unrelated")
+    if disappears:
+        special = later / "prod/other"
+        alias = later / "prod/link"
+        target = special / "branch"
+    elif scenario == "sibling_alias":
+        special = later / "isolated/prod"
+        alias = later / "link"
+        target = later / "peer"
+    else:
+        special = later / "unrelated"
+        alias = later / "link"
+        target = special / "branch"
     special.mkdir(parents=True)
+    target.mkdir()
     (special / "app.j2").symlink_to(os.devnull)
-    (later / "link").symlink_to(special, target_is_directory=True)
+    alias.symlink_to(target, target_is_directory=True)
     duplicate = later / "prod/app.j2"
     original_open = loader._open_role_source
 
@@ -673,6 +686,7 @@ def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_dupli
     assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates", source)
     assert node["_baked"]["sites/prod/app.j2"] == "first\n"
     assert "later\n" not in node["_baked"].values()
+    assert duplicate.exists() is not disappears
 
 
 def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_after_stat(tmp_path, monkeypatch):
