@@ -1426,6 +1426,27 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     assert destination.read_text() == expected_content
 
 
+def test_dynamic_role_template_bakes_a_symlink_crossed_by_the_scan_prefix(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template:
+    src: "{% set stem = 'app' %}sites/alias/{{ stem }}.j2"
+    dest: output.txt
+""", "shared/app.j2": "linked template\n", "roles/r/templates/sites/unused": ""})
+    alias = tmp_path / "roles/r/templates/sites/alias"
+    alias.symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
 @pytest.mark.parametrize(("src", "matched", "excluded"), [
     ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
      "report-alias/app.j2", "alias/other.j2"),

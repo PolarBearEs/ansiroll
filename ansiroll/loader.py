@@ -2206,7 +2206,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
-        pending_dirs.append((tree, base, is_subdir))
+        # The fixed prefix can already have crossed a symlink.
+        queue = pending_dirs if real_tree == os.path.abspath(tree) else next_hop_dirs
+        queue.append((tree, base, is_subdir))
     linked = False
     while pending_dirs or next_hop_dirs:
         if not pending_dirs:
