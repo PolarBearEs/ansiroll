@@ -3825,7 +3825,9 @@ class Runtime:
             raw = baked.get(key)
             meta = (task.get("_baked_meta") or {}).get(key) or {}
             lookup_task_id = None
-            if task.get("_baked_tree") and isinstance(src, str) and not os.path.isabs(src) and ".." not in src.split("/"):
+            direct_role_src = (task.get("_baked_tree") and isinstance(src, str)
+                               and not os.path.isabs(src) and ".." not in src.split("/"))
+            if direct_role_src:
                 lookup_task_id = task.get("runtime_id")
             if raw is None and self.controller_source_fn and (key is not None or lookup_task_id):
                 try:
@@ -3848,7 +3850,7 @@ class Runtime:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
             fullpath = meta.get("fullpath", src)
-            if name == "template" and meta.get("lookup_roots"):
+            if name == "template" and direct_role_src and meta.get("lookup_roots"):
                 lookup = self._baked_direct_lookup(task["_baked_tree"], src, os.path.normpath(src))
                 if lookup in meta["lookup_roots"]:
                     fullpath = meta["lookup_roots"][lookup] + src
