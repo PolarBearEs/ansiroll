@@ -1145,7 +1145,8 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
     assert not destination.exists()
 
 
-def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path):
+@pytest.mark.parametrize(("prefix", "linked_first"), [("", False), ("./", True), ("", True)])
+def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path, prefix, linked_first):
     destination = tmp_path / "rendered.txt"
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
@@ -1153,12 +1154,15 @@ def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_pa
   roles: [r]
 """, "roles/r/tasks/main.yml": """
 - set_fact: {selection: alias/app}
-- template: {src: "templates/sites/{{ selection }}.j2", dest: "%s"}
-""" % destination, "roles/r/templates/sites/alias/app.j2": "normal path\n",
-        "roles/r/templates/shared/app.j2": "prepended path\n"})
+- template: {src: "%stemplates/sites/{{ selection }}.j2", dest: "%s"}
+""" % (prefix, destination), "roles/r/templates/shared/app.j2": "linked path\n"})
     templates = tmp_path / "roles/r/templates"
-    (templates / "templates/sites").mkdir(parents=True)
-    (templates / "templates/sites/alias").symlink_to("../../shared", target_is_directory=True)
+    normal, prepended = templates / "sites", templates / "templates/sites"
+    linked, regular = (normal, prepended) if linked_first else (prepended, normal)
+    linked.mkdir(parents=True)
+    (linked / "alias").symlink_to(templates / "shared", target_is_directory=True)
+    (regular / "alias").mkdir(parents=True)
+    (regular / "alias/app.j2").write_text("regular path\n")
 
     playbook = tmp_path / "pb.yml"
     expected = _ansible(playbook, returncode=0)
@@ -1166,6 +1170,54 @@ def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_pa
     destination.unlink()
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == expected_source
+
+
+@pytest.mark.parametrize("src", [
+    "sites/.private/{{ selection }}.j2",
+    "sites/{{ selection }}{% if staged %}.staging{% else %}.j2{% endif %}",
+])
+def test_dynamic_role_template_does_not_expand_unbounded_linked_candidates(tmp_path, src):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app, staged: false}
+- template: {src: "%s", dest: "unused"}
+""" % src, "roles/r/templates/sites/local.j2": "ordinary\n",
+        "shared/alias/app.j2": "linked\n",
+        "links/app.j2": "nested linked\n",
+        "links/unrelated.txt": "never bundle this\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    (sites / ".private").symlink_to(tmp_path / "shared", target_is_directory=True)
+    (sites / "alias").symlink_to(tmp_path / "links", target_is_directory=True)
+    (tmp_path / "shared/alias/nested").symlink_to(tmp_path / "links", target_is_directory=True)
+
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "_baked_direct_sources" not in template
+
+
+def test_dynamic_role_template_keeps_ordinary_sources_at_link_limit(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: local}
+- template: {src: "sites/{{ selection }}.j2", dest: "unused"}
+""", "roles/r/templates/sites/local.j2": "ordinary\n",
+        "shared/unrelated.txt": "unrelated\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for index in range(4097):
+        (sites / str(index)).symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "sites/local.j2" in template["_baked"]
+    assert "_baked_direct_sources" not in template
 
 
 def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):

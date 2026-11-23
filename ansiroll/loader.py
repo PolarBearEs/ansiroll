@@ -1861,112 +1861,6 @@ def _literal_head(src):
     return src[:m.start()] if m else src
 
 
-def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
-    """Bake direct lookup candidates separately from the legacy parent-path map."""
-    parts = re.split(r"{{.*?}}|{%.*?%}|{#.*?#}", src, flags=re.S)
-    if any(".." in part.split(os.sep) for part in parts):
-        return {}, {}, {}
-    prefix = parts[0].rpartition(os.sep)[0]
-    tail = parts[-1]
-    if os.sep in tail:
-        tail = os.path.normpath(tail)
-    normalized = os.path.normpath("\0".join(parts))
-    # When a whole-component expression renders empty, the rendered path
-    # collapses the two separators into one.
-    fixed = normalized.replace("/\0/", "/\0").split("\0")
-
-    def matches(relative):
-        if "{%" in src:
-            return relative.endswith(tail)
-        if len(fixed) == 1:
-            return relative == fixed[0]
-        first, last = fixed[0], fixed[-1]
-        if not (relative.startswith(first) and relative.endswith(last) and len(relative) >= len(first) + len(last)):
-            return False
-        cursor, end = len(first), len(relative) - len(last)
-        for part in fixed[1:-1]:
-            found = relative.find(part, cursor, end)
-            if found < 0:
-                return False
-            cursor = found + len(part)
-        return True
-    magic = _role_magic(task) or {}
-    source_roots = tuple(os.path.realpath(root) for root in
-                         (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
-
-    def visible(path):
-        return any(_visible_below(path, root) for root in source_roots)
-
-    winners = {}
-
-    def source_for(relative):
-        if relative not in winners:
-            result = _find_needle(task, subdir, relative)
-            winners[relative] = os.path.normpath(result) if result else None
-        return winners[relative]
-
-    direct = {}
-    for relative, meta in ordinary.items():
-        if matches(relative) and os.path.normpath(meta["fullpath"]) != source_for(relative):
-            direct[relative] = None
-
-    assets, metadata = {}, {}
-    visits = 0
-    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
-        if not prefix and not is_subdir:
-            continue
-        tree = os.path.join(base, prefix)
-        real_tree = os.path.realpath(tree)
-        if not visible(real_tree):
-            continue
-        paths = {tree: ({real_tree}, False)}
-        for root, dirs, files in os.walk(tree, followlinks=True):
-            ancestors, linked = paths.pop(root)
-            if linked:
-                visits += 1
-                if visits > 4096:
-                    # Acyclic links can still multiply the archive exponentially.
-                    return None
-            children = []
-            for name in sorted(dirs):
-                path = os.path.join(root, name)
-                target = os.path.realpath(path)
-                if name.startswith(".") or target in ancestors or not visible(target):
-                    continue
-                children.append(name)
-                paths[path] = (ancestors | {target}, linked or os.path.islink(path))
-            dirs[:] = children
-            if not linked:
-                continue
-            for name in sorted(files):
-                path = os.path.join(root, name)
-                relative = os.path.relpath(path, base)
-                if (name.startswith(".") or not matches(relative) or not os.path.isfile(path)
-                        or not visible(os.path.realpath(path)) or os.path.normpath(path) != source_for(relative)):
-                    continue
-                if relative in ordinary and os.path.normpath(ordinary[relative]["fullpath"]) == os.path.normpath(path):
-                    continue
-                key = "\0" + relative  # Cannot collide with a filesystem pathname.
-                if key in assets:
-                    continue
-                try:
-                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-                    try:
-                        info = os.fstat(fd)
-                        if not stat.S_ISREG(info.st_mode):
-                            continue
-                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as file:
-                            assets[key] = file.read()
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    continue
-                metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
-                                 "mode": stat.S_IMODE(info.st_mode)}
-                direct[relative] = key
-    return assets, metadata, direct
-
-
 def _bake_search_tree(node, task, basedir, subdir, src):
     """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
     its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
@@ -2011,10 +1905,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     continue
                 meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
                              "mode": stat.S_IMODE(st.st_mode)}
-    linked = _bake_linked_role_sources(task, basedir, subdir, src, meta)
-    if linked is None:
-        return False
-    assets, metadata, direct = linked
+    assets, metadata, direct = _bake_linked_role_sources(task, basedir, subdir, src, meta)
     baked.update(assets)
     meta.update(metadata)
     if not baked:
@@ -2085,6 +1976,128 @@ def _search_dirs(task, basedir, subdir, tagged=False):
     dirs.append((os.path.join(base, subdir), True))
     dirs.append((base, False))
     return dirs if tagged else [d for d, _ in dirs]
+
+
+def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
+    """Bake direct lookup candidates separately from the legacy parent-path map."""
+    parts = re.split(r"{{.*?}}|{%.*?%}|{#.*?#}", src, flags=re.S)
+    if any(".." in part.split(os.sep) for part in parts):
+        return {}, {}, {}
+    prefix = parts[0].rpartition(os.sep)[0]
+    tail = parts[-1].strip()
+    if "{%" in src and not tail:
+        # A branch can choose the entire ending. Without a literal suffix,
+        # the linked walk cannot tell which files the template can select.
+        return {}, {}, {}
+    if os.sep in tail:
+        tail = os.path.normpath(tail)
+    normalized = os.path.normpath("\0".join(parts))
+    # When a whole-component expression renders empty, the rendered path
+    # collapses the two separators into one.
+    fixed = normalized.replace("/\0/", "/\0").split("\0")
+
+    def matches(relative):
+        if "{%" in src:
+            return relative.endswith(tail)
+        if len(fixed) == 1:
+            return relative == fixed[0]
+        first, last = fixed[0], fixed[-1]
+        if not (relative.startswith(first) and relative.endswith(last) and len(relative) >= len(first) + len(last)):
+            return False
+        cursor, end = len(first), len(relative) - len(last)
+        for part in fixed[1:-1]:
+            found = relative.find(part, cursor, end)
+            if found < 0:
+                return False
+            cursor = found + len(part)
+        return True
+    magic = _role_magic(task) or {}
+    source_roots = tuple(root for root in
+                         (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
+    real_roots = tuple(os.path.realpath(root) for root in source_roots)
+
+    def visible(path):
+        return any(_visible_below(path, root) for root in real_roots)
+
+    winners = {}
+
+    def source_for(relative):
+        if relative not in winners:
+            result = _find_needle(task, subdir, relative)
+            winners[relative] = os.path.normpath(result) if result else None
+        return winners[relative]
+
+    def lookup_paths(relative):
+        yield relative
+        if relative.split(os.sep, 1)[0] == subdir:
+            # Ansible can insert the action subdir when the raw first
+            # component is "." even if the normalized key starts with it.
+            yield "./" + relative
+
+    direct = {}
+    for relative, meta in ordinary.items():
+        if matches(relative):
+            for lookup_path in lookup_paths(relative):
+                if os.path.normpath(meta["fullpath"]) != source_for(lookup_path):
+                    direct[lookup_path] = None
+
+    assets, metadata = {}, {}
+    visits = 0
+    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
+        if not prefix and not is_subdir:
+            continue
+        tree = os.path.join(base, prefix)
+        real_tree = os.path.realpath(tree)
+        if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
+            continue
+        paths = {tree: ({real_tree}, False)}
+        for root, dirs, files in os.walk(tree, followlinks=True):
+            ancestors, linked = paths.pop(root)
+            if linked:
+                visits += 1
+                if visits > 4096:
+                    # Acyclic links can still multiply the archive exponentially.
+                    return assets, metadata, direct
+            children = []
+            for name in sorted(dirs):
+                path = os.path.join(root, name)
+                target = os.path.realpath(path)
+                if name.startswith(".") or target in ancestors or not visible(target):
+                    continue
+                children.append(name)
+                paths[path] = (ancestors | {target}, linked or os.path.islink(path))
+            dirs[:] = children
+            if not linked:
+                continue
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                relative = os.path.relpath(path, base)
+                if (name.startswith(".") or not matches(relative) or not os.path.isfile(path)
+                        or not visible(os.path.realpath(path))):
+                    continue
+                if relative in ordinary and os.path.normpath(ordinary[relative]["fullpath"]) == os.path.normpath(path):
+                    continue
+                paths_to_bake = [lookup_path for lookup_path in lookup_paths(relative)
+                                 if os.path.normpath(path) == source_for(lookup_path)]
+                if not paths_to_bake:
+                    continue
+                key = "\0" + paths_to_bake[0]  # Cannot collide with a filesystem pathname.
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    try:
+                        info = os.fstat(fd)
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", closefd=False) as file:
+                            assets[key] = file.read()
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    continue
+                metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
+                                 "mode": stat.S_IMODE(info.st_mode)}
+                direct.update(dict.fromkeys(paths_to_bake, key))
+    return assets, metadata, direct
 
 
 def _only_item(src):

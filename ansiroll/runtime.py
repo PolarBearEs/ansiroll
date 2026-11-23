@@ -3286,7 +3286,10 @@ class Runtime:
             return src
         normalized = os.path.normpath(src)
         if ".." not in parts:
-            return (task.get("_baked_direct_sources") or {}).get(normalized, normalized)
+            lookup = normalized
+            if parts[0] != task["_baked_tree"] and normalized.split("/", 1)[0] == task["_baked_tree"]:
+                lookup = "./" + normalized
+            return (task.get("_baked_direct_sources") or {}).get(lookup, normalized)
         if ".." in parts:
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
