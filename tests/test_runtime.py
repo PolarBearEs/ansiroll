@@ -167,7 +167,24 @@ def test_literal_tasks_do_not_scan_other_hosts_for_lookup_templates(monkeypatch)
     assert "inventory-only value" not in examined
 
 
-@pytest.mark.parametrize("host_vars", ["hostvars", "lookup('vars', scope_name)"])
+def test_literal_tasks_scan_inherited_lookup_containers_once(monkeypatch):
+    rt = Runtime({}, "", {"inventory_hostname": "h", "unused": ["inherited marker"]})
+    examined = []
+    has_lookup = rt.templater._has_lookup_call
+
+    def record(text):
+        if text == "inherited marker":
+            examined.append(text)
+        return has_lookup(text)
+
+    monkeypatch.setattr(rt.templater, "_has_lookup_call", record)
+    tasks = [_task(str(index), "literal", "debug", args={"msg": "untouched"}) for index in range(10)]
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert examined == ["inherited marker"]
+
+
+@pytest.mark.parametrize("host_vars", ["hostvars", "lookup('vars', scope_name)",
+                                       "lookup(plugin_name, scope_name)"])
 def test_task_defers_alias_to_mixed_lookup_in_hostvars(host_vars):
     frames, calls = [], []
     hostvars = {"another": {"payload": "{{ lookup('source') }}/{{ suffix }}"}}
@@ -181,7 +198,8 @@ def test_task_defers_alias_to_mixed_lookup_in_hostvars(host_vars):
         return lookup(name, *args)
 
     rt.templater.env.globals["lookup"] = record
-    variables = {"alias": "{{ %s.another.payload }}" % host_vars, "suffix": "second", "scope_name": "hostvars"}
+    variables = {"alias": "{{ %s.another.payload }}" % host_vars, "suffix": "second",
+                 "scope_name": "hostvars", "plugin_name": "vars"}
     tasks = [
         _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
         _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),

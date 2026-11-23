@@ -1887,20 +1887,27 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
   tasks:
     - copy:
         dest: "{{ playbook_dir }}/runtime.j2"
-        content: !unsafe "{{ used }}|{{ used }}|{{ 'untouched' if true else unused }}\\n"
+        content: !unsafe >-
+          {{ settings.rows[0].used }}|{{ settings.rows[0].used }}|{{ 'untouched' if true else unused }}|
+          {{ alias.child | default('fallback') }}
     - template:
         src: "{{ playbook_dir }}/runtime.j2"
         dest: "{{ playbook_dir }}/output.txt"
       delegate_to: localhost
       vars:
-        used: >-
-          {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote) ~ '; printf hello') }}/tail
+        settings:
+          rows:
+            - used: >-
+                {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote) ~ '; printf hello') }}/tail
+              unused: >-
+                {{ lookup('pipe', 'printf sibling >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}/tail
         unused: >-
           {{ lookup('pipe', 'printf unused >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}/tail
+        alias: "{{ missing }}"
 """)
     _, recap = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
     assert recap == ("2", "2", "0", "0", "0", "0", "0")
-    assert (tmp_path / "output.txt").read_text() == "hello/tail|hello/tail|untouched\n"
+    assert (tmp_path / "output.txt").read_text() == "hello/tail|hello/tail|untouched| fallback"
     assert (tmp_path / "lookups").read_text() == "used"
 
 

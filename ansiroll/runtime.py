@@ -72,7 +72,7 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", "__ansiroll_delegated_play_vars", _DEFER_LOOKUP_NAMES}
+                "__ansiroll_search_dirs", _DEFER_LOOKUP_NAMES}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -1063,6 +1063,8 @@ def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False)
 
 
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
+    if isinstance(value, _DelegatedTemplateValue):
+        return value.resolve()
     if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
         # Dynamic containers resolve their members in the task's context.
         return _lazy_container(value._raw, rt, ctx, task_vars=value._task_vars)
@@ -1201,6 +1203,19 @@ class _TaskVarTemplate(str):
     """Source of a task variable that may need a loop binding."""
 
 
+class _DelegatedTemplateValue:
+    """Read an agent variable or container member once, on demand."""
+
+    def __init__(self, load):
+        self._load = load
+
+    def resolve(self):
+        if self._load is not None:
+            self._value = self._load()
+            self._load = None
+        return self._value
+
+
 class _LoopVarsSnapshot(dict):
     """The task's magic vars mapping before its loop bindings were applied."""
 
@@ -1253,7 +1268,7 @@ class _LookupVars(dict):
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
-        if isinstance(value, _TaskVarTemplate) or (
+        if isinstance(value, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
                 isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
             return self.templater.resolve_variable(key, value, self.ctx)
         return self.templater._observe_untrusted(value)
@@ -1759,6 +1774,7 @@ class _Templater:
         self._condition_list_cache = {}
         self._template_cache = {}
         self._lookup_templates = {}
+        self._inherited_lookup_scans = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
         self._plugin_errors = {"filter": {}, "test": {}}
@@ -1918,6 +1934,8 @@ class _Templater:
 
     def resolve_variable(self, key, value, ctx, strict=False):
         """Template a variable's trusted value when a template references it."""
+        if isinstance(value, _DelegatedTemplateValue):
+            return value.resolve()
         self._observe_untrusted(value)
         if type(value) in (str, _TaskVarTemplate, _PlayVarTemplate) and _looks_templated(value):
             cache = None
@@ -2150,7 +2168,7 @@ class _Templater:
             return False
         if text not in self._lookup_templates:
             nodes = jinja2.nodes
-            has_lookup = False
+            has_lookup = dynamic_plugin = False
             try:
                 pending = [self.env.parse(text)]
                 while pending:
@@ -2158,7 +2176,9 @@ class _Templater:
                     if (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name)
                             and node.node.name in ("lookup", "query", "q")):
                         has_lookup = True
-                        break
+                        if not node.args or not isinstance(node.args[0], nodes.Const):
+                            dynamic_plugin = True
+                            break
                     pending.extend(node.iter_child_nodes())
             except RecursionError:
                 # The parser may succeed later with a shallower call stack.
@@ -2166,13 +2186,33 @@ class _Templater:
             except jinja2.TemplateSyntaxError:
                 # Report a parser error only if the value is used.
                 pass
-            self._lookup_templates[text] = has_lookup
-        return self._lookup_templates[text]
+            self._lookup_templates[text] = has_lookup, dynamic_plugin
+        return self._lookup_templates[text][0]
 
-    def _contains_mixed_lookup(self, scope):
+    def _contains_mixed_lookup(self, scope, inherited):
         # Scope maps may contain an entire inventory. A template that can
         # access one needs lazy binding without inspecting the map itself.
-        pending = [value for key, value in scope.items() if key not in ("vars", "hostvars")]
+        cache = self._inherited_lookup_scans
+        for key in tuple(cache):
+            if inherited.get(key) is not cache[key][0]:
+                del cache[key]
+        for key, value in scope.items():
+            if key in ("vars", "hostvars"):
+                continue
+            # Facts can change in place. Task overlays can change the value
+            # under a name even when the inherited binding has not changed.
+            if key != "ansible_facts" and inherited.get(key) is value and isinstance(
+                    value, (dict, list, tuple)):
+                if key not in cache:
+                    cache[key] = value, self._value_needs_lookup_deferral(value)
+                if cache[key][1]:
+                    return True
+            elif self._value_needs_lookup_deferral(value):
+                return True
+        return False
+
+    def _value_needs_lookup_deferral(self, value):
+        pending = [value]
         seen = set()
         while pending:
             value = pending.pop()
@@ -2182,7 +2222,8 @@ class _Templater:
                 stripped = value.strip()
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
-                if self._has_lookup_call(stripped) and self._bare_lookup_expression(stripped) is None:
+                if self._has_lookup_call(stripped) and (
+                        self._lookup_templates[stripped][1] or self._bare_lookup_expression(stripped) is None):
                     return True
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
@@ -3190,7 +3231,7 @@ class Runtime:
         # loop bindings. Keep templates live until they are actually read.
         looped = task.get("type") != "include" and task.get("loop") is not None
         # Inherited lookups can be reached through aliases in task vars.
-        mixed_lookup = self.templater._contains_mixed_lookup({**ctx, **task_vars, **higher_vars})
+        mixed_lookup = self.templater._contains_mixed_lookup({**ctx, **task_vars, **higher_vars}, self.vars)
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
@@ -5629,17 +5670,34 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
-def _resolve_delegated_play_var(name, scope, templater):
+def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=None):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
-        rendered = scope[name]
-        if not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
-            rendered = templater.resolve_variable(name, rendered, scope)
+        if member is not None:
+            container, key = members[member]
+            rendered = container[key]
+        else:
+            rendered = scope[name]
+            if not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
+                rendered = templater.resolve_variable(name, rendered, scope)
+        if members is not None and isinstance(rendered, (dict, list, tuple)):
+            # Send the container's shape without reading any of its members.
+            def reserve(key):
+                index = len(members)
+                members.append((rendered, key))
+                return index
+
+            slots = ({key: reserve(key) for key in rendered} if isinstance(rendered, dict)
+                     else [reserve(index) for index in range(len(rendered))])
+        else:
+            slots = None
         undefined = []
         errors = []
         mapping_keys = []
-        value = _delegate_fallback_value(rendered, undefined, errors, mapping_keys)
+        value = _delegate_fallback_value(rendered if slots is None else slots, undefined, errors, mapping_keys)
         result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+        if slots is not None:
+            result["lazy_members"] = True
         if errors:
             result["errors"] = errors
         if mapping_keys:
@@ -5790,6 +5848,7 @@ def agent_main():
             if lazy_play:
                 frame["lazy_play_vars"] = sorted(lazy_play)
             requested_names = lazy_play or set()
+            members = [] if defer_template else None
             if defer_template:
                 requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
                 frame["lazy_template_vars"] = sorted(requested_names)
@@ -5797,9 +5856,12 @@ def agent_main():
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
                 name = reply.get("name")
+                member = reply.get("member")
                 fallback = None
-                if isinstance(name, str) and name in requested_names:
-                    fallback = _resolve_delegated_play_var(name, scope, templater)
+                if member is None and isinstance(name, str) and name in requested_names:
+                    fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
+                elif members is not None and type(member) is int and 0 <= member < len(members):
+                    fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)
                 _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
                 reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":

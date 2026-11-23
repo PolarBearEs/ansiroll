@@ -523,8 +523,8 @@ class StrategyModule(StrategyBase):
         included_vars_by_task = {}
         last_frame = time.monotonic()
 
-        def resolve_play_var(name):
-            chan.send({"t": "delegate_play_var", "name": name})
+        def resolve_play_var(name=None, *, member=None):
+            chan.send({"t": "delegate_play_var", "name": name, "member": member})
             reply = chan.recv()
             if not reply or reply.get("t") != "delegate_play_var_result":
                 raise RuntimeError("ansiroll: agent did not return a delegated play variable")
@@ -901,25 +901,41 @@ class StrategyModule(StrategyBase):
             }
             job_vars = dict(frame.get("vars") or {})
             if names := frame.get("lazy_template_vars"):
-                from ansiroll.runtime import _DEFER_LOOKUP_NAMES, _TaskVarTemplate, _captured, _mark_unsafe
+                from ansiroll.runtime import (
+                    _DEFER_LOOKUP_NAMES,
+                    _AnsirollUndefined,
+                    _captured,
+                    _DelegatedTemplateValue,
+                    _lazy_container,
+                    _mark_unsafe,
+                )
 
-                def load_template_var(name):
-                    resolved = resolve_play_var(name) if resolve_play_var else None
+                def runtime_marker(message, missing=False):
+                    return _AnsirollUndefined(hint=message) if missing else _captured(message)
+
+                def load_template_var(name=None, *, member=None):
+                    resolved = resolve_play_var(name, member=member) if resolve_play_var else None
                     if resolved is None:
-                        return _captured("unable to resolve delegated template variable %r" % name)
+                        return _captured("unable to resolve delegated template value")
                     if "error" in resolved:
                         return _captured(resolved["error"])
-                    return self._restore_play_fallback(
+                    value = self._restore_play_fallback(
                         _mark_unsafe(resolved["value"]), resolved["undefined"], resolved.get("errors", ()),
-                        resolved.get("mapping_keys", ()), runtime_marker=_captured,
+                        resolved.get("mapping_keys", ()), runtime_marker=runtime_marker,
                     )
+                    if not resolved.get("lazy_members"):
+                        return value
 
-                bridge = _DelegatedPlayVariables(load_template_var)
-                bridge.names.extend(names)
-                job_vars["__ansiroll_delegated_play_vars"] = bridge
+                    def defer_member(index):
+                        return _DelegatedTemplateValue(lambda: load_template_var(member=index))
+
+                    items = ({key: defer_member(index) for key, index in value.items()}
+                             if isinstance(value, dict) else [defer_member(index) for index in value])
+                    return _lazy_container(items, rt, job_vars)
+
                 job_vars[_DEFER_LOOKUP_NAMES] = True
-                for index, name in enumerate(names):
-                    job_vars[name] = _TaskVarTemplate("{{ __ansiroll_delegated_play_vars[%d] }}" % index)
+                for name in names:
+                    job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
             return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
         finally:
             rt.become_user = previous_become_user
