@@ -1985,7 +1985,9 @@ def _linked_role_source_patterns(src):
         body = Environment(keep_trailing_newline=True).parse(src).body
     except TemplateSyntaxError:
         return None
-    if not body:
+    assignments = (nodes.Assign, nodes.AssignBlock)
+    output_nodes = [node for node in body if not isinstance(node, assignments)]
+    if not output_nodes:
         return None
 
     def literal(node, index):
@@ -1993,51 +1995,74 @@ def _linked_role_source_patterns(src):
             return node.nodes[index].data
         return ""
 
-    head = literal(body[0], 0)
-    if not (len(body) == 1 and isinstance(body[0], nodes.Output)) and not literal(body[-1], -1):
+    head = literal(output_nodes[0], 0)
+    if (not (len(output_nodes) == 1 and isinstance(output_nodes[0], nodes.Output))
+            and not literal(output_nodes[-1], -1)):
         return None
 
-    def expand(sequence):
-        paths = [""]
+    def expand(sequence, bindings):
+        paths = [("", bindings)]
         for node in sequence:
-            choices = expand_node(node)
-            if len(paths) * len(choices) > 128:
-                raise ValueError("too many linked source alternatives")
-            paths = [prefix + suffix for prefix in paths for suffix in choices]
+            variants = []
+            for prefix, current in paths:
+                choices = expand_node(node, current)
+                if len(variants) + len(choices) > 128:
+                    raise ValueError("too many linked source alternatives")
+                variants.extend((prefix + suffix, updated) for suffix, updated in choices)
+            paths = variants
         return paths
 
-    def expand_node(node):
+    def expand_assignment(node, bindings):
+        target = node.target
+        if not isinstance(target, nodes.Name):
+            unknown = {name.name: "\0" for name in target.find_all(nodes.Name)}
+            return [("", {**bindings, **unknown})]
+        if isinstance(node, nodes.Assign):
+            values = expand_node(node.node, bindings)
+        elif node.filter is None:
+            values = expand(node.body, bindings)
+        else:
+            values = [("\0", bindings)]
+        return [("", {**bindings, target.name: value}) for value, _ in values]
+
+    def expand_node(node, bindings):
+        if node is None:
+            # An inline conditional without an else emits an empty string
+            # when combined with the rest of a path.
+            return [("", bindings)]
         if isinstance(node, nodes.TemplateData):
-            return [node.data]
+            return [(node.data, bindings)]
         if isinstance(node, nodes.Const) and isinstance(node.value, str):
-            return [node.value]
+            return [(node.value, bindings)]
+        if isinstance(node, nodes.Name):
+            return [(bindings.get(node.name, "\0"), bindings)]
         if isinstance(node, (nodes.Output, nodes.Concat)):
-            return expand(node.nodes)
-        if isinstance(node, (nodes.Assign, nodes.AssignBlock)):
-            return [""]
+            return expand(node.nodes, bindings)
+        if isinstance(node, assignments):
+            return expand_assignment(node, bindings)
         if isinstance(node, nodes.If):
             choices = []
             for branch in (node, *node.elif_):
                 if not isinstance(branch.test, nodes.Const) or branch.test.value:
-                    choices.extend(expand(branch.body))
+                    choices.extend(expand(branch.body, bindings))
                 if isinstance(branch.test, nodes.Const) and branch.test.value:
                     return choices
-            return choices + expand(node.else_)
+            return choices + expand(node.else_, bindings)
         if isinstance(node, nodes.CondExpr):
             branches = (node.expr1, node.expr2)
             if isinstance(node.test, nodes.Const):
                 branches = (node.expr1 if node.test.value else node.expr2,)
-            return [path for branch in branches if branch is not None for path in expand_node(branch)]
+            return [path for branch in branches for path in expand_node(branch, bindings)]
         if isinstance(node, nodes.Expr):
-            return ["\0"]
+            return [("\0", bindings)]
         raise ValueError("unsupported linked source statement")
 
     try:
-        candidates = expand(body)
+        candidates = expand(body, {})
     except ValueError:
         return None
     patterns = []
-    for candidate in dict.fromkeys(candidates):
+    for candidate in dict.fromkeys(path for path, _ in candidates):
         if candidate and not os.path.isabs(candidate) and ".." not in candidate.split(os.sep):
             patterns.append((candidate.partition("\0")[0], _linked_role_source_pattern(candidate)))
     return (head, patterns) if patterns else None

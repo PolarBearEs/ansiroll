@@ -1428,10 +1428,13 @@ def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tm
     ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
      "report-alias/app.j2", "alias/other.j2"),
     ("sites/{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}/app.j2{% set unused = true %}", "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ group }}{% set stem = 'app' %}/{{ stem }}.j2",
-     "alias/app.j2", "alias/app.j2.bak"),
+     "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ group }}{% set stem %}app{% endset %}/{{ stem }}.j2",
-     "alias/app.j2", "alias/app.j2.bak"),
+     "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ ('staging/' if staged) ~ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ 'staging/' if staged }}{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ group }}/{% if staged %}stage{% endif %}//app.j2", "alias/app.j2", "alias/not-app.j2"),
     ("sites/{{ empty }}{{ suffix }}/alias/app.j2", "alias/app.j2", "alias/not-app.j2"),
 ])
@@ -1445,7 +1448,7 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
 - template: {src: "%s", dest: "output.txt"}
 """ % src, "roles/r/templates/sites/app.j2": "ordinary\n",
         "shared/app.j2": "linked\n", "shared/other.j2": "excluded\n",
-        "shared/not-app.j2": "excluded\n", "shared/app.j2.bak": "excluded\n"})
+        "shared/not-app.j2": "excluded\n"})
     sites = tmp_path / "roles/r/templates/sites"
     for name in ("alias", "report-alias"):
         (sites / name).symlink_to(tmp_path / "shared", target_is_directory=True)
@@ -1473,6 +1476,8 @@ def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkey
     "sites/{% if use_blue %}blue{% elif use_green %}green{% else %}orange{% endif %}/{{ name }}.j2",
     "sites/{{ 'blue' if use_blue else ('green' if use_green else 'orange') }}/{{ name }}.j2",
     "sites/{{ ('blue' if use_blue else ('green' if use_green else 'orange')) ~ '/' ~ name }}.j2",
+    "sites/{% if use_blue %}{% set color = 'blue' %}{% elif use_green %}{% set color = 'green' %}"
+    "{% else %}{% set color = 'orange' %}{% endif %}{{ color }}/{{ name }}.j2",
 ])
 def test_dynamic_role_template_bakes_only_conditional_directory_choices(tmp_path, src):
     _write(tmp_path, {"pb.yml": """
