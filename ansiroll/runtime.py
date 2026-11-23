@@ -3284,18 +3284,20 @@ class Runtime:
         parts = src.split("/")
         if parts[-1] in ("", ".", ".."):
             return src
+        normalized = os.path.normpath(src)
+        if ".." not in parts:
+            return (task.get("_baked_direct_sources") or {}).get(normalized, normalized)
         if ".." in parts:
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}
-            unresolved = set(task.get("_baked_tree_unresolved_aliases") or ())
             prefix = []
             for part in parts[:-1]:
                 if part in ("", "."):
                     continue
                 if part == "..":
-                    if not prefix or "/".join(prefix) in unresolved:
+                    if not prefix:
                         return src
                     prefix.pop()
                 else:
@@ -3309,7 +3311,7 @@ class Runtime:
             if "/".join(prefix + [parts[-1]]) not in (task.get("_baked") or {}):
                 return src
         # Ansible checks the original relative path, then normalizes it when reading.
-        return os.path.normpath(src)
+        return normalized
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
