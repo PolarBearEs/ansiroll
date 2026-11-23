@@ -752,6 +752,24 @@ def test_file_compile_checks_input_after_the_other_destination_lookup(monkeypatc
     assert destination.read_bytes() == original
 
 
+def test_file_compile_rechecks_input_after_pinning_output(monkeypatch, tmp_path, capsys):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    original = tmp_path / "original.yml"
+    output = tmp_path / "compiled.py"
+
+    def replace_input_during_pin(*args):
+        playbook.rename(original)
+        playbook.symlink_to(output)
+
+    monkeypatch.setattr(cli, "_pin_output_inode", replace_input_during_pin)
+    assert cli.main(["compile", str(playbook), "-o", str(output)]) == 2
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert playbook.read_bytes() == b""
+    assert original.read_text().startswith("- hosts: localhost\n")
+
+
 @pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
 def test_file_compile_preserves_destination_when_current_input_identity_is_unavailable(
         cli_os, tmp_path, capsys, error):
