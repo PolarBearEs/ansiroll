@@ -154,17 +154,20 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
 
 
 def _make_rewriting_loader(DataLoader):
-    """A DataLoader that revives the removed legacy ``include:`` keyword.
+    """Read legacy playbook and task includes using their modern keywords."""
+    import sys
 
-    Modern ansible-core rejects ``include:`` outright. As files are read we rewrite
-    it to ``import_tasks:`` (static, so it inlines) or ``include_tasks:`` when the
-    task loops, so playbooks written for older ansible still compile.
-    """
+    from ansible.playbook import Playbook
+
+    playbook_reader = Playbook._load_playbook_data.__code__
 
     class RewritingDataLoader(DataLoader):
         def load_from_file(self, *args, **kwargs):
+            # An include-only playbook and an include-only task file have the
+            # same YAML shape. Use the reader that requested the file.
+            playbook = sys._getframe(1).f_code is playbook_reader
             data = super(RewritingDataLoader, self).load_from_file(*args, **kwargs)
-            return _rewrite_includes(data)
+            return _rewrite_includes(data, playbook=playbook)
 
     return RewritingDataLoader()
 
@@ -172,11 +175,10 @@ def _make_rewriting_loader(DataLoader):
 _TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers", "block", "rescue", "always")
 
 
-def _rewrite_includes(data):
+def _rewrite_includes(data, *, playbook=False):
     # Rewrite in place: ansible-core's parsed containers carry origin tags
     # (task.get_path(), hence the file search path, comes from them), so they
-    # must not be replaced by plain copies. Only task lists are touched, since
-    # vars files go through this loader too.
+    # must not be replaced by plain copies.
     if not isinstance(data, list):
         return data
     for item in data:
@@ -185,8 +187,11 @@ def _rewrite_includes(data):
         for k in _TASK_LIST_KEYS:
             _rewrite_includes(item.get(k))
         if "include" in item and isinstance(item.get("include"), str):
-            dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
-            new_key = "include_tasks" if dynamic else "import_tasks"
+            if playbook:
+                new_key = "import_playbook"
+            else:
+                dynamic = any(k == "loop" or k.startswith("with_") or k == "loop_with" for k in item)
+                new_key = "include_tasks" if dynamic else "import_tasks"
             items = [(new_key if k == "include" else k, v) for k, v in item.items()]
             item.clear()
             item.update(items)

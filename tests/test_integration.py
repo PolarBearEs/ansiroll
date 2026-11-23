@@ -2251,6 +2251,27 @@ def test_legacy_include_is_rewritten_and_inlined(tmp_path):
         environment.from_string("{{ missing }}").render()
 
 
+@pytest.mark.parametrize("root_include", ["include", "import_playbook"])
+def test_legacy_playbook_includes_preserve_nested_task_includes(tmp_path, root_include):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- %s: sub/wrapper.yml\n" % root_include)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "wrapper.yml").write_text("- include: leaf.yml\n")
+    (sub / "leaf.yml").write_text("""
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include: tasks.yml
+""")
+    (sub / "tasks.yml").write_text("- include: final.yml\n")
+    (sub / "final.yml").write_text("- debug: {msg: legacy-playbook-leaf}\n")
+
+    source, manifest = compile_playbook(str(playbook))
+    assert "legacy-playbook-leaf" in json.dumps(_compiled_plays(source, tmp_path))
+    assert manifest["fallback_tasks"] == []
+
+
 def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):
     play = tmp_path / "play.yml"
     play.write_text("""
