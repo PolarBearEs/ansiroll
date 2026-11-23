@@ -770,6 +770,53 @@ def test_file_compile_rechecks_input_after_pinning_output(monkeypatch, tmp_path,
     assert original.read_text().startswith("- hosts: localhost\n")
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_file_compile_rechecks_input_before_writing_to_fifo(monkeypatch, cli_os, tmp_path, capsys):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    source = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(source)
+    original = tmp_path / "original.yml"
+    output = tmp_path / "compiled.pipe"
+    os.mkfifo(output)
+    compile_playbook = cli.compile_playbook
+    writer_fd = None
+    writer_checks = 0
+
+    def compile_small_output(*args, **kwargs):
+        _, manifest = compile_playbook(*args, **kwargs)
+        return "pass\n", manifest
+
+    def track_writer(path, flags, *args):
+        nonlocal writer_fd
+        fd = os.open(path, flags, *args)
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY:
+            writer_fd = fd
+        return fd
+
+    def replace_input_before_write(fd):
+        nonlocal writer_checks
+        if fd == writer_fd:
+            writer_checks += 1
+            if writer_checks == 2:
+                playbook.rename(original)
+                playbook.symlink_to(output)
+        return os.fstat(fd)
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_small_output)
+    cli_os.open = track_writer
+    cli_os.fstat = replace_input_before_write
+    reader = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        status = cli.main(["compile", str(playbook), "-o", str(output)])
+        assert (status, os.read(reader, 4096)) == (2, b"")
+    finally:
+        os.close(reader)
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert playbook.resolve() == output
+    assert original.read_text() == source
+
+
 @pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
 def test_file_compile_preserves_destination_when_current_input_identity_is_unavailable(
         cli_os, tmp_path, capsys, error):

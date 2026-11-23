@@ -447,7 +447,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
                 reference = _pin_output_inode(output_path, output.fileno(), output_stat)
                 if reference is not None:
                     output_reference.callback(os.close, reference)
-                validate_input(output_stat, "output path", output_path)
+            validate_input(output_stat, "output path", output_path)
             output.write(source)
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
