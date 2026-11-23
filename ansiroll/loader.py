@@ -1905,7 +1905,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     continue
                 meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
                              "mode": stat.S_IMODE(st.st_mode)}
-    assets, metadata, direct, excluded_prefixes = _bake_linked_role_sources(task, basedir, subdir, src, meta)
+    assets, metadata, direct = _bake_linked_role_sources(task, basedir, subdir, src, meta)
     baked.update(assets)
     meta.update(metadata)
     if not baked:
@@ -1915,8 +1915,6 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     node["_baked_tree"] = subdir
     if direct:
         node["_baked_direct_sources"] = direct
-    if excluded_prefixes:
-        node["_baked_excluded_source_prefixes"] = sorted(excluded_prefixes)
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
     for directory in list(directories):
         while directory not in ("", "."):
@@ -2063,20 +2061,24 @@ def _open_linked_role_source(resolved_path):
         os.close(parent)
 
 
+def _role_source_roots(task, basedir):
+    magic = _role_magic(task) or {}
+    return tuple(root for root in
+                 (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
+
+
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
     from collections import deque
 
     parsed = _linked_role_source_pattern(src)
     if parsed is None:
-        return {}, {}, {}, set()
+        return {}, {}, {}
     head, pattern = parsed
     prefix = os.path.normpath(head.rpartition(os.sep)[0])
     if prefix == ".":
         prefix = ""
-    magic = _role_magic(task) or {}
-    source_roots = tuple(root for root in
-                         (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
+    source_roots = _role_source_roots(task, basedir)
     real_roots = tuple(os.path.realpath(root) for root in source_roots)
 
     def visible(path):
@@ -2105,16 +2107,6 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         if is_subdir:
             yield os.path.join(subdir, relative)
 
-    excluded_prefixes = set()
-
-    def exclude_directory(path, base, is_subdir):
-        relative = os.path.relpath(path, base)
-        if relative == ".":
-            excluded_prefixes.add("")
-            return
-        for spelling in source_spellings(relative, is_subdir):
-            excluded_prefixes.update(lookup + os.sep for lookup in lookup_paths(spelling))
-
     direct, pending = {}, {}
     ordinary_by_path = {os.path.normpath(meta["fullpath"]): relative for relative, meta in ordinary.items()}
     for relative, meta in ordinary.items():
@@ -2138,8 +2130,6 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         tree = os.path.join(base, prefix)
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
-            if os.path.isdir(tree):
-                exclude_directory(tree, base, is_subdir)
             continue
         pending_dirs.append((tree, base, is_subdir))
     linked = False
@@ -2159,10 +2149,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         for name in sorted(dirs):
             path = os.path.join(root, name)
             target = os.path.realpath(path)
-            if name.startswith("."):
-                continue
-            if not visible(target):
-                exclude_directory(path, base, is_subdir)
+            if name.startswith(".") or not visible(target):
                 continue
             child_is_link = os.path.islink(path)
             queue = next_hop_dirs if child_is_link else pending_dirs
@@ -2182,6 +2169,8 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                     if _linked_role_source_matches(pattern, spelling):
                         for lookup_path in lookup_paths(spelling):
                             winner = source_for(lookup_path)
+                            if winner is None:
+                                continue
                             direct.setdefault(lookup_path, ordinary_by_path.get(winner))
                             if path == winner:
                                 paths_to_bake.append(lookup_path)
@@ -2215,7 +2204,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
                 if lookup_roots:
                     metadata[key]["lookup_roots"] = lookup_roots
             direct.update(dict.fromkeys(paths_to_bake, key))
-    return assets, metadata, direct, excluded_prefixes
+    return assets, metadata, direct
 
 
 def _only_item(src):

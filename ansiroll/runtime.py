@@ -3312,13 +3312,7 @@ class Runtime:
         if ".." in parts:
             return normalized
         lookup = Runtime._baked_direct_lookup(task["_baked_tree"], src, normalized)
-        direct = task.get("_baked_direct_sources") or {}
-        if lookup in direct:
-            return direct[lookup]
-        if normalized not in (task.get("_baked") or {}) and lookup.startswith(
-                tuple(task.get("_baked_excluded_source_prefixes") or ())):
-            return None
-        return normalized
+        return (task.get("_baked_direct_sources") or {}).get(lookup, normalized)
 
     @staticmethod
     def _baked_direct_lookup(subdir, src, normalized):
@@ -3830,9 +3824,13 @@ class Runtime:
             key = self._baked_source_key(task, src)
             raw = baked.get(key)
             meta = (task.get("_baked_meta") or {}).get(key) or {}
-            if raw is None and key is not None and self.controller_source_fn:
+            lookup_task_id = None
+            if task.get("_baked_tree") and isinstance(src, str) and not os.path.isabs(src) and ".." not in src.split("/"):
+                lookup_task_id = task.get("runtime_id")
+            if raw is None and self.controller_source_fn and (key is not None or lookup_task_id):
                 try:
-                    fetched = self.controller_source_fn(src)
+                    fetched = (self.controller_source_fn(src, lookup_task_id) if lookup_task_id
+                               else self.controller_source_fn(src))
                     raw = fetched.get("data")
                     meta = fetched.get("meta") or {}
                     if isinstance(raw, bytes):
@@ -5173,8 +5171,8 @@ def agent_main():
             return reply.get("result", {})
         rt.delegate_fn = _delegate
 
-        def _controller_source(path):
-            _chan_send(resp_fd, {"t": "source", "path": path})
+        def _controller_source(path, lookup_task_id=None):
+            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id})
             reply = _chan_recv()
             if not reply or reply.get("t") != "source_result":
                 raise RuntimeError("controller did not return a source result")

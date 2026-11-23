@@ -1183,8 +1183,10 @@ def test_dynamic_role_template_preserves_earlier_regular_directory(tmp_path):
     assert destination.read_text() == "role template\n"
 
 
-@pytest.mark.parametrize("fallbacks", ["regular", "linked", "filtered"])
-def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path, fallbacks):
+@pytest.mark.parametrize(("fallbacks", "alias"), [
+    ("regular", "alias"), ("linked", "alias"), ("filtered", "alias"), ("filtered", ".alias"),
+])
+def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path, fallbacks, alias):
     project = tmp_path / "project"
     destination = project / "rendered.txt"
     _write(project, {"pb.yml": """
@@ -1192,11 +1194,11 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {selection: alias/app}
+- set_fact: {selection: %s/app}
 - template: {src: "sites/{{ selection }}.j2", dest: "%s"}
-""" % destination, "roles/r/templates/.private/app.j2": "earlier source\n",
+""" % (alias, destination), "roles/r/templates/.private/app.j2": "earlier source\n",
         "roles/r/templates/sites/local.j2": "valid source\n"})
-    (project / "roles/r/templates/sites/alias").symlink_to("../.private", target_is_directory=True)
+    (project / "roles/r/templates/sites" / alias).symlink_to("../.private", target_is_directory=True)
     if fallbacks == "regular":
         _write(project, {"templates/sites/alias/app.j2": "later source\n",
                          "sites/alias/app.j2": "controller working directory source\n"})
@@ -1206,7 +1208,7 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
             path = project / parent
             path.mkdir(parents=True)
             _write(target_root / target, {"app.j2": "%s source\n" % target})
-            (path / "alias").symlink_to(target_root / target, target_is_directory=True)
+            (path / alias).symlink_to(target_root / target, target_is_directory=True)
 
     playbook = project / "pb.yml"
     _ansible(playbook, returncode=0)
@@ -1216,6 +1218,33 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
     assert not destination.exists()
     _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=2)
     assert not destination.exists()
+
+
+def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_empty(tmp_path):
+    project = tmp_path / "project"
+    generated = project / "sites/alias/generated.j2"
+    destination = project / "output.txt"
+    _write(project, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- copy: {content: generated, dest: "%s"}
+- set_fact: {selection: alias/generated}
+- template: {src: "sites/{{ selection }}.j2", dest: "%s"}
+""" % (generated, destination), "roles/r/templates/sites/local.j2": "ordinary template\n"})
+    generated.parent.mkdir(parents=True)
+    excluded = tmp_path / "excluded"
+    excluded.mkdir()
+    (project / "roles/r/templates/sites/alias").symlink_to(excluded, target_is_directory=True)
+
+    playbook = project / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "generated"
+    generated.unlink()
+    destination.unlink()
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=0) == expected
+    assert destination.read_text() == "generated"
 
 
 @pytest.mark.parametrize(("source", "selection", "alias", "target", "file_path"), [
