@@ -1089,8 +1089,8 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
                     if node.get("action", "").endswith("template"))
     contents = set(template["_baked_direct_sources"])
     assert {"sites/alias/app.j2", "sites/second/app.j2"} <= contents
-    for name in ("alias", "second"):
-        assert {path for path in contents if path.startswith("sites/" + name + "/")} == {"sites/" + name + "/app.j2"}
+    assert not any(path.endswith(("/unrelated.txt", "/hidden.j2")) for path in contents)
+    assert "sites/alias/back/alias/app.j2" not in contents
     assert not any(path.startswith("sites/project/") for path in contents)
     assert _ansiroll(playbook, tmp_path, returncode=0) == expected
     assert destination.read_text() == "from the shared template\n"
@@ -1193,7 +1193,8 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
 - set_fact: {selection: alias/app}
 - template: {src: "sites/{{ selection }}.j2", dest: "%s"}
 """ % destination, "roles/r/templates/.private/app.j2": "earlier source\n",
-        "templates/sites/alias/app.j2": "later source\n"})
+        "templates/sites/alias/app.j2": "later source\n",
+        "sites/alias/app.j2": "controller working directory source\n"})
     (tmp_path / "roles/r/templates/sites").mkdir()
     (tmp_path / "roles/r/templates/sites/alias").symlink_to("../.private", target_is_directory=True)
 
@@ -1203,6 +1204,34 @@ def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_pa
     destination.unlink()
     _ansiroll(playbook, tmp_path, returncode=1)
     assert not destination.exists()
+    _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=2)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(("source", "selection", "alias", "target", "file_path"), [
+    ("sites/{{ selection }}.j2", "alias/app", "alias", ".", "sites/app.j2"),
+    ("sites/{{ selection }}.j2", "alias/sub/app", "alias", ".", "sites/sub/app.j2"),
+    ("sites/{{ selection }}../app.j2", "client", "client..", "../shared", "shared/app.j2"),
+])
+def test_dynamic_role_template_resolves_finite_link_paths(tmp_path, source, selection, alias, target, file_path):
+    templates = tmp_path / "roles/r/templates"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: "%s"}
+- template: {src: "%s", dest: "output.txt"}
+""" % (selection, source), "roles/r/templates/" + file_path: "linked template\n"})
+    (templates / "sites").mkdir(exist_ok=True)
+    (templates / "sites" / alias).symlink_to(target, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
 
 
 @pytest.mark.parametrize(("prefix", "linked_first", "dynamic_subdir"), [

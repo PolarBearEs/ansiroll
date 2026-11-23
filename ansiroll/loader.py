@@ -2001,9 +2001,10 @@ def _linked_role_source_pattern(src):
         if not tail:
             return None
         parts = [head, "\0", tail]
-    if any(".." in part.split(os.sep) for part in parts):
+    joined = re.sub("\0+", "\0", "".join(parts))
+    if ".." in joined.split(os.sep):
         return None
-    segments = os.path.normpath(re.sub("\0+", "\0", "".join(parts))).split(os.sep)
+    segments = os.path.normpath(joined).split(os.sep)
     pattern = []
     for index, segment in enumerate(segments):
         directory = index < len(segments) - 1
@@ -2104,9 +2105,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         real_tree = os.path.realpath(tree)
         if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
             continue
-        paths = {tree: ({real_tree}, False)}
+        paths = {tree: (frozenset(), False)}
         for root, dirs, files in os.walk(tree, followlinks=True):
-            ancestors, linked = paths.pop(root)
+            visited_links, linked = paths.pop(root)
             if linked:
                 visits += 1
                 if visits > 4096:
@@ -2116,10 +2117,18 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
             for name in sorted(dirs):
                 path = os.path.join(root, name)
                 target = os.path.realpath(path)
-                if name.startswith(".") or target in ancestors or not visible(target):
+                if name.startswith(".") or not visible(target):
                     continue
+                is_link = os.path.islink(path)
+                links = visited_links
+                if is_link:
+                    # Allow a finite path through a link back to an ancestor.
+                    edge = os.path.join(os.path.realpath(root), name)
+                    if edge in visited_links:
+                        continue
+                    links = visited_links | {edge}
                 children.append(name)
-                paths[path] = (ancestors | {target}, linked or os.path.islink(path))
+                paths[path] = (links, linked or is_link)
             dirs[:] = children
             for name in sorted(files):
                 if name.startswith("."):

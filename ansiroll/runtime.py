@@ -3819,7 +3819,7 @@ class Runtime:
             key = self._baked_source_key(task, src)
             raw = baked.get(key)
             meta = (task.get("_baked_meta") or {}).get(key) or {}
-            if raw is None and self.controller_source_fn:
+            if raw is None and key is not None and self.controller_source_fn:
                 try:
                     fetched = self.controller_source_fn(src)
                     raw = fetched.get("data")
