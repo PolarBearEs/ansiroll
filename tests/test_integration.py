@@ -2019,7 +2019,9 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
 
 @pytest.mark.parametrize(("alias_value", "alias_error"), [
     ("{{ missing }}", None),
+    ("{{ missing | regex_replace('x', 'y') }}", None),
     ("{{ 'value' | unknown_filter }}", "unknown_filter"),
+    ({"nested": ["{{ 'value' | unknown_filter }}"]}, "unknown_filter"),
     ("{{ 1 / 0 }}", "division by zero"),
 ])
 def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeypatch, alias_value, alias_error):
@@ -2090,7 +2092,7 @@ runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
         "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
         "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
     }, "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
-        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": sys.argv[4],
+        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": json.loads(sys.argv[4]),
         "unused_agent_alias": "{{ missing_value }}"}]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
@@ -2115,7 +2117,7 @@ runtime.agent_main()
     serialized_vars = json.dumps(_tag_untrusted(original.get_vars()))
     serialized_play_vars = json.dumps(_tag_untrusted(play.vars))
     result = subprocess.run([sys.executable, "-c", agent, serialized_environment,
-                             serialized_vars, serialized_play_vars, alias_value],
+                             serialized_vars, serialized_play_vars, json.dumps(alias_value)],
                             input=replies * 2,
                             capture_output=True, timeout=15, check=True)
     stream = io.BytesIO(result.stdout)

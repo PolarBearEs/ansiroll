@@ -1581,7 +1581,7 @@ def _wrap_filter(fn):
         try:
             return fn(*a, **k)
         except Exception as e:
-            return _captured(str(e))
+            return _captured_jinja_error(e)
     return wrapped
 
 
@@ -5503,6 +5503,8 @@ def _delegate_fallback_value(value, undefined, path=()):
             missing = []
             try:
                 resolved[wire_key] = _delegate_fallback_value(value[key], missing, (*path, wire_key))
+            except _CapturedTemplateError:
+                raise
             except jinja2.UndefinedError:
                 continue
             missing_by_key[wire_key] = missing
@@ -5515,6 +5517,8 @@ def _delegate_fallback_value(value, undefined, path=()):
             member = (*path, index)
             try:
                 resolved.append(_delegate_fallback_value(value[index], undefined, member))
+            except _CapturedTemplateError:
+                raise
             except jinja2.UndefinedError:
                 undefined.append(member)
                 resolved.append(None)
