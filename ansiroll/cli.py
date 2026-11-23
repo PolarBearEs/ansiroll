@@ -121,8 +121,7 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
             return os.path.samestat(info, stream)
         return _same_stream(info, stream)
 
-    if (1 in (os.major(info.st_rdev), os.major(stream.st_rdev))
-            or (destination_alias and not stream_alias and not os.isatty(fd))):
+    if 1 in (os.major(info.st_rdev), os.major(stream.st_rdev)):
         return False
     probe_error = "cannot verify terminal for manifest path %s" % path
     stream_device = _linux_terminal_device(fd) if stream_alias else stream.st_rdev
@@ -134,8 +133,10 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
     def controls_terminal(terminal):
         try:
             os.tcgetpgrp(terminal)
-        except OSError:
-            return False
+        except OSError as ex:
+            if ex.errno == errno.ENOTTY:
+                return False
+            raise ValueError(probe_error) from ex
         return True
 
     with ExitStack() as stack:

@@ -161,7 +161,7 @@ def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch,
     stream = Namespace(st_rdev=alias_device if alias_fd == 2 else device, st_mode=stat.S_IFCHR)
     monkeypatch.setattr(os, "fstat", lambda fd: stream)
     monkeypatch.setattr(cli, "_linux_terminal_device", lambda fd: device)
-    monkeypatch.setattr(os, "isatty", lambda fd: True)
+    monkeypatch.setattr(os, "isatty", lambda fd: False)
     monkeypatch.setattr(os, "tcgetpgrp", lambda fd: fd + 123)  # A foreground job switch does not change identity.
     assert cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
 
@@ -172,6 +172,15 @@ def test_manifest_terminal_checks_session_when_device_numbers_match(monkeypatch,
 
     monkeypatch.setattr(os, "tcgetpgrp", outside_session)
     assert not cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
+
+    def denied_foreground_group(fd):
+        if fd == 2:
+            raise PermissionError(errno.EPERM, "terminal foreground group denied")
+        return 123
+
+    monkeypatch.setattr(os, "tcgetpgrp", denied_foreground_group)
+    with pytest.raises(ValueError, match="cannot verify terminal for manifest path"):
+        cli._same_manifest_stream("manifest", destination, 2, destination_fd=6)
 
     def no_controlling_session(fd):
         raise OSError(errno.ENOTTY, "compiler has no controlling session")
