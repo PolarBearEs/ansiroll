@@ -66,6 +66,19 @@ def test_stdout_compile_rejects_manifest_alias():
     assert b"manifest path points to stdout" in result.stderr
 
 
+def test_stdout_compile_rejects_manifest_aliasing_stderr(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    with manifest.open("wb") as diagnostics:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", "missing.yml", "-o", "-", "-m", str(manifest)],
+            stdout=subprocess.PIPE, stderr=diagnostics,
+        )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert manifest.read_text() == "ansiroll: manifest path points to stderr: %s\n" % manifest
+
+
 @pytest.mark.parametrize("destination", ["pipe", "file"])
 def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     path = tmp_path / "compiled.py"
@@ -115,20 +128,21 @@ raise SystemExit(cli.entrypoint())
     )
 
 
-def test_stdout_compile_rejects_manifest_replaced_with_alias(tmp_path):
+@pytest.mark.parametrize("alias", ["stdout", "stderr"])
+def test_stdout_compile_rejects_manifest_replaced_with_alias(tmp_path, alias):
     script = """
 import os
 import sys
 from ansiroll import cli
 
-output, manifest = sys.argv[1:]
+target, manifest = sys.argv[1:]
 cli.compile_playbook = lambda *a, **k: ("pass", {"modules": [], "fallback_tasks": []})
 open_fd = os.open
 
 def replace_manifest(path, flags, *args, **kwargs):
     if path == manifest:
         os.unlink(manifest)
-        os.symlink(output, manifest)
+        os.symlink(target, manifest)
     return open_fd(path, flags, *args, **kwargs)
 
 os.open = replace_manifest
@@ -139,15 +153,17 @@ raise SystemExit(cli.entrypoint())
     output.write_text("# existing output\n")
     manifest = tmp_path / "manifest.json"
     manifest.touch()
-    with output.open("r+b") as stream:
+    diagnostics = tmp_path / "diagnostics.txt"
+    target = output if alias == "stdout" else diagnostics
+    with output.open("r+b") as stream, diagnostics.open("wb") as errors:
         result = subprocess.run(
-            [sys.executable, "-c", script, str(output), str(manifest)],
-            stdout=stream, stderr=subprocess.PIPE,
+            [sys.executable, "-c", script, str(target), str(manifest)],
+            stdout=stream, stderr=errors,
         )
 
     assert result.returncode == 2
     assert output.read_text() == "# existing output\n"
-    assert b"manifest path points to stdout" in result.stderr
+    assert diagnostics.read_text() == "ansiroll: manifest path points to %s: %s\n" % (alias, manifest)
 
 
 @pytest.mark.parametrize("redirection", ['exec "$@" 2>&-', 'exec "$@" 2</dev/null'])

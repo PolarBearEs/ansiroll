@@ -81,11 +81,16 @@ def _manifest_for_stdout(path, stdout_fd):
         manifest_stat = os.stat(path)
     except FileNotFoundError:
         return path
-    if not _same_stream(manifest_stat, os.fstat(stdout_fd)):
-        return path
-    if _discard_stream(manifest_stat):
-        return os.devnull
-    raise ValueError("manifest path points to stdout: %s" % path)
+    return _validate_stdout_manifest(path, manifest_stat, stdout_fd)
+
+
+def _validate_stdout_manifest(path, info, stdout_fd):
+    for stream, fd in (("stdout", stdout_fd), ("stderr", 2)):
+        if _same_stream(info, os.fstat(fd)):
+            if _discard_stream(info):
+                return os.devnull
+            raise ValueError("manifest path points to %s: %s" % (stream, path))
+    return path
 
 
 def _truncation_unavailable(path, original_error):
@@ -215,8 +220,7 @@ def _write_stdout_manifest(path, manifest, stdout_fd):
     path = _manifest_for_stdout(path, stdout_fd)
 
     def validate(info):
-        if _same_stream(info, os.fstat(stdout_fd)) and not _discard_stream(info):
-            raise ValueError("manifest path points to stdout: %s" % path)
+        _validate_stdout_manifest(path, info, stdout_fd)
 
     with _open_compile_destination(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
