@@ -336,9 +336,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             method = call.node
             if not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
-        paths = (_selector_input_paths(expression, remaining) if selector else
-                 ((node.name, ()) for node in expression.find_all(nodes.Name) if node.ctx == "load"))
-        for name, path in paths:
+        for name, path in _selector_input_paths(expression, remaining):
             if name == "omit" or (name, path) in seen:
                 continue
             seen.add((name, path))
@@ -346,7 +344,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             if name not in variables:
                 continue
             value = variables[name]
-            container = selector and isinstance(value, (dict, list, tuple))
+            container = (selector or path) and isinstance(value, (dict, list, tuple))
             if not container and value is not None and not isinstance(value, (str, int, float, bool)):
                 return None
             scope[name] = _tag_untrusted(value)
@@ -642,9 +640,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
-        for index, (selected, checked_names) in order_deferred.items():
+        for index, (selected, checked_paths) in order_deferred.items():
             deferred[index]["files"].update(selected)
-            deferred[index]["checked_names"] = sorted(checked_names)
+            deferred[index]["checked_paths"] = checked_paths
             if selected:
                 deferred[index]["has_compile_selection"] = True
         result["deferred_vars_files"] = deferred
@@ -786,7 +784,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     for entry in _as_list(getattr(play, "vars_files", None)):
         defer_for_order = False
         selected = {}
-        checked_names = set()
+        checked_paths = {}
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
@@ -822,7 +820,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                         unresolved.append(entry)
                     break
             if ordered is not None:
-                checked_names.add(os.path.normpath(filename))
+                checked_paths[filename] = None
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
                 path = filename
@@ -837,13 +835,15 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             for item in mappings:
                 out = combine_vars(out, item)
             if defer_for_order:
-                selected[os.path.normpath(play._loader.path_dwim(path))] = _tag_untrusted(mappings)
+                selected_path = os.path.normpath(play._loader.path_dwim(path))
+                checked_paths[filename] = selected_path
+                selected[selected_path] = _tag_untrusted(mappings)
             elif ordered is not None:
                 ordered.append(_tag_untrusted(mappings))
             break
         if defer_for_order:
             if order_deferred is not None:
-                order_deferred[len(unresolved)] = (selected, checked_names)
+                order_deferred[len(unresolved)] = (selected, checked_paths)
             ordered.append(len(unresolved))
             unresolved.append(entry)
     # The variable manager has already applied extra vars and any parser-level

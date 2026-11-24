@@ -71,7 +71,7 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs"}
+                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members"}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -236,13 +236,26 @@ def _selector_input_paths(expression, remaining=()):
             root = root.node
         if isinstance(root, nodes.Name) and root.ctx == "load":
             yield root.name, tuple(reversed(path)) + suffix
+        elif path and isinstance(root, nodes.Filter) and root.name in ("default", "d"):
+            pending.append((root, tuple(reversed(path)) + suffix))
         else:
             pending.extend((child, ()) for child in node.iter_child_nodes())
 
 
 def _selector_projection_cycle(source, path, ancestors):
-    return any(alias == source and (previous == path or len(path) > len(previous))
-               for alias, previous in ancestors)
+    for alias, previous in ancestors:
+        if alias != source:
+            continue
+        if previous == path:
+            return True
+        if len(path) <= len(previous):
+            continue
+        # Growth in the same branch can keep inserting components without
+        # ever consuming the tail. A different branch may still terminate.
+        tail = previous[1:]
+        if not previous or (path[0] == previous[0] and (not tail or path[-len(tail):] == tail)):
+            return True
+    return False
 
 
 def _selector_template_sources(value, path=()):
@@ -1155,6 +1168,8 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
         value = _TaskVarTemplate(value)
     if type(value) is tuple and rt.templater._untrusted_task_interpolation is not None:
         return _LazyTplTuple(value, rt, ctx)
+    if isinstance(value, str) and ctx.get("__ansiroll_lazy_selector_members"):
+        return rt.templater.render_string(value, ctx, strict=rt._strict_var_resolution)
     if isinstance(value, (str, tuple)):
         if getattr(rt, "_strict_var_resolution", False):
             return rt.template(value, ctx, strict=True)
@@ -3155,7 +3170,9 @@ class Runtime:
                 for value in entry["static_vars"]:
                     selected = _f_combine(selected, value, recursive=merge_hashes)
                 continue
-            ctx = self.ctx(selected, self.extra_vars, magic, base=base)
+            ctx = self.ctx(selected, self.extra_vars, magic, base={
+                **base, "__ansiroll_lazy_selector_members": True,
+            })
             if not before_setup and index in early_files:
                 inputs, mappings = early_files[index]
                 if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
@@ -3196,22 +3213,31 @@ class Runtime:
                         if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
-                pattern = entry.get("glob_patterns", {}).get(raw)
-                covered = os.path.normpath(name) in entry.get("checked_names", ()) or (
-                    raw not in entry.get("unmodeled", ()) and
-                    (pattern is None or _vars_file_glob_covers(pattern, name)))
-                data = None
-                for candidate in map(os.path.normpath, candidates):
-                    if candidate in entry["files"]:
-                        data = entry["files"][candidate]
-                        break
-                    if not covered:
-                        break
-                if data is None and not covered:
-                    if before_setup:
-                        break
-                    raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
-                                         "make its selector resolvable at compile time" % (item,))
+                checked_paths = entry.get("checked_paths", {})
+                if name in checked_paths:
+                    path = checked_paths[name]
+                    if path is None:
+                        continue
+                    data = entry["files"][path]
+                else:
+                    pattern = entry.get("glob_patterns", {}).get(raw)
+                    covered = raw not in entry.get("unmodeled", ()) and (
+                        pattern is None or _vars_file_glob_covers(pattern, name))
+                    data = None
+                    if ".." not in name.split(os.path.sep) or not entry.get("glob_patterns"):
+                        for candidate in map(os.path.normpath, candidates):
+                            if candidate in entry["files"]:
+                                data = entry["files"][candidate]
+                                break
+                            if not covered:
+                                break
+                    else:
+                        covered = False
+                    if data is None and not covered:
+                        if before_setup:
+                            break
+                        raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
+                                             "make its selector resolvable at compile time" % (item,))
                 if data is not None:
                     if isinstance(data, dict):
                         if before_setup:
@@ -3249,9 +3275,7 @@ class Runtime:
                 method = call.node
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
-            paths = (_selector_input_paths(expression, remaining) if selector else
-                     ((node.name, ()) for node in expression.find_all(jinja2.nodes.Name) if node.ctx == "load"))
-            for name, path in paths:
+            for name, path in _selector_input_paths(expression, remaining):
                 if (name, path) in seen:
                     continue
                 seen.add((name, path))
@@ -3263,7 +3287,7 @@ class Runtime:
                     isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}
                     and isinstance(value["__ansiroll_unsafe__"], str)
                 )
-                container = selector and isinstance(value, (dict, list, tuple))
+                container = (selector or path) and isinstance(value, (dict, list, tuple))
                 if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
                     return None
                 inputs[name] = value
@@ -4967,6 +4991,7 @@ class Runtime:
         scope = self.ctx(template.get("timeout_defaults"), template["vars"], template.get("play_vars"),
                          vars_files, role_exports, self.extra_vars, base={
             "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
+            "__ansiroll_lazy_selector_members": True,
         })
         if self._pre_setup_template_inputs(template["source"], scope) is None:
             raise ValueError(

@@ -2728,7 +2728,8 @@ def test_ordered_vars_files_keep_intermediate_hash_replacement(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("selector", [
-    "magic", "mapping", "mapping_with_lookup", "mapping_alias", "mapping_default", "shrinking_alias",
+    "magic", "mapping", "mapping_with_lookup", "mapping_alias", "mapping_default",
+    "inline_default", "shrinking_alias", "branch_alias",
 ])
 def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp_path, monkeypatch, selector):
     playbook = tmp_path / "play.yml"
@@ -2741,7 +2742,7 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
         initial = {"config": {"flavor": "default"}}
         override = {"config": {"flavor": "runtime"}}
         prefix = "settings-"
-        if selector in ("mapping_with_lookup", "mapping_alias", "mapping_default"):
+        if selector in ("mapping_with_lookup", "mapping_alias", "mapping_default", "inline_default"):
             monkeypatch.delenv("ANSIROLL_TEST_UNUSED_SELECTOR", raising=False)
             initial["config"]["unused"] = "{{ lookup('env', 'ANSIROLL_TEST_UNUSED_SELECTOR') }}"
             override["config"]["unused"] = "{{ lookup('also_unavailable') }}"
@@ -2749,12 +2750,24 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
             filter_ = " | default({})" if selector == "mapping_default" else ""
             initial = {"config": "{{ settings" + filter_ + " }}", "settings": initial["config"]}
             override = {"config": "{{ runtime_settings" + filter_ + " }}", "runtime_settings": override["config"]}
+        if selector == "inline_default":
+            suffix = "{{ (settings | default({})).flavor }}"
+            initial = {"settings": initial["config"]}
+            override = {"settings": override["config"]}
         if selector == "shrinking_alias":
             suffix = "{{ config.nested.again.flavor }}"
             initial = {"config": "{{ settings }}", "settings": {
                 "flavor": "default", "nested": {"again": "{{ settings }}"},
             }}
-            override = {"config": {"nested": {"again": {"flavor": "runtime"}}}}
+            override = {"settings": {
+                "flavor": "runtime", "nested": {"again": "{{ settings }}"},
+            }}
+        if selector == "branch_alias":
+            suffix = "{{ config.again.flavor }}"
+            initial = {"config": "{{ settings }}", "other": "{{ settings }}", "settings": {
+                "again": "{{ other.first.second }}", "first": {"second": {"flavor": "default"}},
+            }}
+            override = {"config": {"again": {"flavor": "runtime"}}}
     playbook.write_text("""- hosts: localhost
   vars: %s
   vars_files: ['gather-{{ profile }}.yml', 'settings-%s.yml']
@@ -2772,7 +2785,7 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
-    if selector != "shrinking_alias":
+    if selector not in ("shrinking_alias", "branch_alias"):
         assert plan["gather_timeout"] == 23
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
@@ -2834,7 +2847,8 @@ def test_ordered_first_found_rejects_path_outside_glob_depth(tmp_path, monkeypat
         runtime.run_play(plan)
 
 
-def test_ordered_first_found_checks_unbundled_higher_priority_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compile_dir", ["default", "missing/.."])
+def test_ordered_first_found_checks_unbundled_higher_priority_path(tmp_path, monkeypatch, compile_dir):
     from ansiroll.loader import _core_version
     from ansiroll.runtime import VarsFilesError
 
@@ -2848,13 +2862,13 @@ def test_ordered_first_found_checks_unbundled_higher_priority_path(tmp_path, mon
     earlier.parent.mkdir(parents=True)
     earlier.write_text("selected: unbundled-higher-priority\n")
     playbook.write_text("""- hosts: localhost
-  vars: {config_dir: default}
+  vars: %s
   vars_files:
     - 'gather-{{ profile }}.yml'
     - ['profiles/{{ config_dir }}/final.yml', %s]
   gather_timeout: '{{ 23 }}'
   tasks: []
-""" % json.dumps(str(fallback)))
+""" % (json.dumps({"config_dir": compile_dir}), json.dumps(str(fallback))))
     (tmp_path / "gather-normal.yml").write_text("{}\n")
     (tmp_path / "gather-other.yml").write_text("config_dir: ''\n")
     source, _ = compile_playbook(str(playbook))
@@ -2866,6 +2880,30 @@ def test_ordered_first_found_checks_unbundled_higher_priority_path(tmp_path, mon
     runtime.extra_vars["profile"] = "other"
     with pytest.raises(VarsFilesError, match="path that was not bundled"):
         runtime.run_play(plan)
+
+
+@pytest.mark.parametrize("compile_default", [False, True])
+def test_ordered_timeout_reads_scalar_member_from_vars_file_mapping(tmp_path, monkeypatch, compile_default):
+    playbook = tmp_path / "play.yml"
+    initial = {"config": {"timeout": 23}} if compile_default else {}
+    playbook.write_text("""- hosts: localhost
+  vars: %s
+  vars_files: ['gather-{{ profile }}.yml']
+  gather_timeout: '{{ config.timeout }}'
+  tasks: []
+""" % json.dumps(initial))
+    (tmp_path / "gather-runtime.yml").write_text("""config:
+  timeout: 45
+  unused: "{{ lookup('unavailable') }}"
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
