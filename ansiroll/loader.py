@@ -261,7 +261,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
 
     play_vars = play.vars or {}
     magic = _gather_selector_magic(play)
-    selector_scope = {**defaults, **play_vars, **magic}
+    selector_scope = combine_vars(combine_vars(defaults, play_vars), magic)
     selector_names = set()
     timeout_names = set(runtime["names"]) if runtime is not None else set()
     file_aliases = {}
@@ -279,18 +279,18 @@ def _gather_timeout_file_scope(play, entries, runtime):
             for mapping in contents:
                 file_names.update(mapping)
                 for key, value in mapping.items():
-                    for source, _ in _selector_template_sources(value):
+                    for source, _, _ in _selector_template_sources(value):
                         file_aliases.setdefault(key, set()).add(source)
     for names, scope, shadowed in (
         (selector_names, selector_scope, {}),
-        (timeout_names, {**selector_scope, **exports}, exports),
+        (timeout_names, combine_vars(selector_scope, exports), exports),
     ):
         pending = list(names)
         while pending:
             key = pending.pop()
             sources = set() if key in shadowed else set(file_aliases.get(key, ()))
             value = scope.get(key)
-            sources.update(source for source, _ in _selector_template_sources(_tag_untrusted(value)))
+            sources.update(source for source, _, _ in _selector_template_sources(_tag_untrusted(value)))
             for source in sources:
                 dependencies = _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS)
                 if dependencies is not None:
@@ -319,15 +319,15 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
 
     env = Environment()
-    pending = [(source, (), ())]
+    pending = [(source, (), None, ())]
     scope = {}
     names = set()
     seen = set()
     while pending:
-        source, remaining, ancestors = pending.pop()
-        if _selector_projection_cycle(source, remaining, ancestors):
+        source, remaining, origin, ancestors = pending.pop()
+        if _selector_projection_cycle(origin, remaining, ancestors):
             return None
-        ancestors = (*ancestors, (source, remaining))
+        ancestors = (*ancestors, (origin, remaining))
         try:
             expression = env.parse(source)
         except TemplateSyntaxError:
@@ -348,8 +348,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             if not container and value is not None and not isinstance(value, (str, int, float, bool)):
                 return None
             scope[name] = _tag_untrusted(value)
-            pending.extend((alias, suffix, ancestors)
-                           for alias, suffix in _selector_template_sources(scope[name], path))
+            pending.extend((alias, suffix, (name, location), ancestors)
+                           for alias, suffix, location in _selector_template_sources(scope[name], path))
     return scope, names
 
 

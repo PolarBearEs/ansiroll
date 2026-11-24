@@ -235,16 +235,20 @@ def _selector_input_paths(expression, remaining=()):
                 break
             root = root.node
         if isinstance(root, nodes.Name) and root.ctx == "load":
-            yield root.name, tuple(reversed(path)) + suffix
+            path = tuple(reversed(path)) + suffix
+            if root.name == "vars" and path and isinstance(path[0], str):
+                yield path[0], path[1:]
+            else:
+                yield root.name, path
         elif path and isinstance(root, nodes.Filter) and root.name in ("default", "d"):
             pending.append((root, tuple(reversed(path)) + suffix))
         else:
             pending.extend((child, ()) for child in node.iter_child_nodes())
 
 
-def _selector_projection_cycle(source, path, ancestors):
-    for alias, previous in ancestors:
-        if alias != source:
+def _selector_projection_cycle(origin, path, ancestors):
+    for previous_origin, previous in ancestors:
+        if previous_origin != origin:
             continue
         if previous == path:
             return True
@@ -259,10 +263,10 @@ def _selector_projection_cycle(source, path, ancestors):
 
 
 def _selector_template_sources(value, path=()):
-    """Find trusted templates needed to read a selector input."""
+    """Yield each required template with its remaining path and its location in the input."""
     for index, key in enumerate(path):
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
-            yield value, path[index:]
+            yield value, path[index:], path[:index]
             return
         if isinstance(value, dict):
             if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
@@ -272,10 +276,10 @@ def _selector_template_sources(value, path=()):
             value = value[key]
         else:
             return
-    pending = [value]
+    pending = [(value, path)]
     seen = set()
     while pending:
-        value = pending.pop()
+        value, location = pending.pop()
         if isinstance(value, (dict, list, tuple)):
             if id(value) in seen:
                 continue
@@ -283,11 +287,11 @@ def _selector_template_sources(value, path=()):
             if isinstance(value, dict):
                 if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                     continue
-                pending.extend(value.values())
+                pending.extend((item, (*location, key)) for key, item in value.items())
             else:
-                pending.extend(value)
+                pending.extend((item, (*location, index)) for index, item in enumerate(value))
         elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
-            yield value, ()
+            yield value, (), location
 
 
 def _vars_file_glob_covers(pattern, name):
@@ -2891,11 +2895,12 @@ class Runtime:
         vars_file_magic = play.get("vars_file_magic") or {}
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
-            timeout_vars = {}
+            timeout_vars = None
+            blocked_timeout_inputs = set()
             if timeout_template and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files, vars_file_defaults,
-                    before_setup=True, merge_hashes=merge_vars_files, magic=vars_file_magic)
+                    blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
@@ -2906,6 +2911,7 @@ class Runtime:
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
+                blocked_timeout_inputs=blocked_timeout_inputs,
             )
             if not gathered:
                 self.failed = True
@@ -3156,8 +3162,9 @@ class Runtime:
         return ctx
 
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
-                                     before_setup=False, merge_hashes=False, magic=None):
+                                     blocked_inputs=None, merge_hashes=False, magic=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
+        before_setup = blocked_inputs is not None
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if before_setup:
             base = {key: self.vars[key] for key in ("__ansiroll_controller_env", "__ansiroll_controller_config")}
@@ -3186,6 +3193,11 @@ class Runtime:
                 if before_setup:
                     dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True)
                     if dependencies is None:
+                        # A selector we cannot evaluate here may still change inputs to setup.
+                        for mappings in entry["files"].values():
+                            if isinstance(mappings, list):
+                                for mapping in mappings:
+                                    blocked_inputs.update(mapping)
                         break
                     inputs.update(dependencies)
                 try:
@@ -3260,13 +3272,13 @@ class Runtime:
 
     def _pre_setup_template_inputs(self, source, ctx, *, selector=False):
         inputs = {}
-        pending = [(source, (), ())]
+        pending = [(source, (), None, ())]
         seen = set()
         while pending:
-            source, remaining, ancestors = pending.pop()
-            if _selector_projection_cycle(source, remaining, ancestors):
+            source, remaining, origin, ancestors = pending.pop()
+            if _selector_projection_cycle(origin, remaining, ancestors):
                 return None
-            ancestors = (*ancestors, (source, remaining))
+            ancestors = (*ancestors, (origin, remaining))
             try:
                 expression = self.templater.env.parse(source)
             except jinja2.TemplateSyntaxError:
@@ -3291,8 +3303,8 @@ class Runtime:
                 if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
                     return None
                 inputs[name] = value
-                pending.extend((alias, suffix, ancestors)
-                               for alias, suffix in _selector_template_sources(value, path))
+                pending.extend((alias, suffix, (name, location), ancestors)
+                               for alias, suffix, location in _selector_template_sources(value, path))
         return inputs
 
     def _task_ctx(self, task, overlay):
@@ -4981,19 +4993,27 @@ class Runtime:
             self._flushing = False
 
     # ---- facts -----------------------------------------------------------
-    def _gather_timeout_for_run(self, timeout, template, setup_ctx, vars_files=None):
+    def _gather_timeout_for_run(self, timeout, template, setup_ctx, vars_files=None, blocked_inputs=()):
         if not template:
             return timeout
         role_exports = template.get("role_exports") or {}
-        overrides = self.extra_vars.keys() | (vars_files or {}).keys()
+        config = setup_ctx.get("__ansiroll_controller_config", {})
+        merge_hashes = config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
+        blocked = set(blocked_inputs)
+        if not merge_hashes:
+            blocked.difference_update(role_exports, self.extra_vars)
+        overrides = self.extra_vars.keys() | (vars_files or {}).keys() | blocked
         if not (template.get("required") or template.get("file_names")) and overrides.isdisjoint(template["names"]):
             return timeout
-        scope = self.ctx(template.get("timeout_defaults"), template["vars"], template.get("play_vars"),
-                         vars_files, role_exports, self.extra_vars, base={
-            "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
+        play_vars = template.get("play_vars") if vars_files is None else vars_files
+        merged_vars = _f_combine(template.get("timeout_defaults"), template["vars"], play_vars,
+                                 role_exports, self.extra_vars, recursive=merge_hashes)
+        scope = self.ctx(merged_vars, base={
+            "__ansiroll_controller_config": config,
             "__ansiroll_lazy_selector_members": True,
         })
-        if self._pre_setup_template_inputs(template["source"], scope) is None:
+        inputs = self._pre_setup_template_inputs(template["source"], scope)
+        if inputs is None or not blocked.isdisjoint(set(template["names"]) | inputs.keys()):
             raise ValueError(
                 "gather_timeout requires a controller template that cannot be rendered before setup; "
                 "make its vars files and lookup inputs resolvable at compile time"
@@ -5020,7 +5040,7 @@ class Runtime:
 
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     gather_timeout=None, timeout_template=None, timeout_vars=None):
+                     gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=()):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -5047,7 +5067,8 @@ class Runtime:
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
             setup_args = {}
-            gather_timeout = self._gather_timeout_for_run(gather_timeout, timeout_template, ctx, timeout_vars)
+            gather_timeout = self._gather_timeout_for_run(
+                gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                 setup_args["gather_timeout"] = gather_timeout
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
