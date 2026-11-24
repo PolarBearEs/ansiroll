@@ -3437,11 +3437,13 @@ def test_timeout_dependency_scan_skips_unreachable_elif(tmp_path):
 @pytest.mark.parametrize("source_text", [
     "{% if true %}{{ first }}{% elif lookup('irrelevant') %}42{% endif %}",
     "{{ first if true else lookup('irrelevant') }}",
+    "{{ (flag and (lookup('env', 'COMPILED_TIMEOUT') | int)) or first }}",
+    "{{ first or (lookup('env', 'COMPILED_TIMEOUT') | int) }}",
 ])
 def test_timeout_override_ignores_unreachable_lookup(tmp_path, monkeypatch, source_text):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
-  vars: {first: 23}
+  vars: {first: 23, flag: false}
   gather_timeout: >-
     %s
   tasks: []
@@ -3451,6 +3453,33 @@ def test_timeout_override_ignores_unreachable_lookup(tmp_path, monkeypatch, sour
     assert plan["gather_timeout"] == 23
     called = []
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+@pytest.mark.parametrize("expression", ["cfg[key]", "array[index]", "vars['fast' if flag else 'slow']"])
+def test_timeout_override_can_change_a_computed_subscript(tmp_path, monkeypatch, expression):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars:
+    cfg: {slow: 23, fast: 45}
+    key: slow
+    array: [23, 45]
+    index: 0
+    slow: 23
+    fast: 45
+    flag: false
+  gather_timeout: "{{ %s }}"
+  tasks: []
+""" % expression)
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    overrides = {"key": "fast", "index": 1, "flag": True}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=overrides)
+    called = []
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)

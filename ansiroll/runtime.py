@@ -268,6 +268,15 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
                     else:
                         unreachable.add(id(arm))
             return
+        if isinstance(node, (nodes.And, nodes.Or)):
+            visit(node.left, names)
+            left = branch_value(node.left, names)
+            short_circuit_on = isinstance(node, nodes.Or)
+            if left is short_circuit_on:
+                unreachable.add(id(node.right))
+            else:
+                visit(node.right, names)
+            return
         if isinstance(node, nodes.For):
             visit(node.iter, names)
             local = names | target_names(node.target) | {"loop"}
@@ -334,6 +343,9 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
             pending.append((node.test, ()))
             pending.extend((arm, suffix) for arm in (node.expr1, node.expr2) if arm is not None)
             continue
+        if isinstance(node, (nodes.And, nodes.Or)):
+            pending.extend(((node.left, suffix), (node.right, suffix)))
+            continue
         if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
             pending.append((node.node, suffix))
             pending.extend((value, suffix if index == 0 else ()) for index, value in enumerate(node.args))
@@ -368,20 +380,19 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 path.append(root.attr)
             elif isinstance(root.arg, nodes.Const) and isinstance(root.arg.value, (str, int)):
                 path.append(root.arg.value)
-            elif isinstance(root.node, nodes.Name) and root.node.name == "vars":
-                if computed is not None:
+            else:
+                vars_access = isinstance(root.node, nodes.Name) and root.node.name == "vars"
+                if vars_access and computed is not None:
                     computed.add("vars")
                 pending.append((root.arg, ()))
                 key = resolve_key(root.arg, () if resolve_aliases else None)
-                if not isinstance(key, str):
-                    if unknown_lookup is not None:
+                if not isinstance(key, str if vars_access else (str, int)):
+                    if vars_access and unknown_lookup is not None:
                         unknown_lookup.add("vars")
-                    if computed is not None or unknown_lookup is not None:
+                    if vars_access and (computed is not None or unknown_lookup is not None):
                         root = None
                     break
                 path.append(key)
-            else:
-                break
             root = root.node
         if root is None:
             continue
@@ -391,7 +402,7 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 yield path[0], path[1:]
             else:
                 yield root.name, path
-        elif path and (isinstance(root, nodes.CondExpr)
+        elif path and (isinstance(root, (nodes.CondExpr, nodes.And, nodes.Or))
                        or isinstance(root, nodes.Filter) and root.name in ("default", "d")):
             pending.append((root, tuple(reversed(path)) + suffix))
         else:
@@ -404,6 +415,21 @@ def _selector_vars_key(node, variables, aliases=None):
     missing = _MISSING_VARS_FILE_INPUT
     if isinstance(node, jinja2.nodes.Const):
         return node.value
+    if isinstance(node, jinja2.nodes.CondExpr):
+        value = _selector_vars_key(node.test, variables, aliases)
+        if isinstance(value, (str, bool, int, float, type(None))):
+            return _selector_vars_key(node.expr1 if value else node.expr2, variables, aliases)
+    if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
+        left = _selector_vars_key(node.left, variables, aliases)
+        if isinstance(left, (str, bool, int, float, type(None))):
+            short_circuit_on = isinstance(node, jinja2.nodes.Or)
+            if bool(left) is short_circuit_on:
+                return left
+            return _selector_vars_key(node.right, variables, aliases)
+    if isinstance(node, jinja2.nodes.Not):
+        value = _selector_vars_key(node.node, variables, aliases)
+        if isinstance(value, (str, bool, int, float, type(None))):
+            return not value
     if isinstance(node, jinja2.nodes.Name):
         value = variables.get(node.name, missing)
         if value is None or value is missing:
