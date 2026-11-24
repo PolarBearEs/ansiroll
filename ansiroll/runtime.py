@@ -3041,7 +3041,7 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _pre_setup_vars_file_selector(self, source, ctx, blocked):
+    def _pre_setup_vars_file_selector(self, source, ctx):
         """Only attempt selectors that can safely render again after setup."""
         pending = [source]
         seen = set()
@@ -3068,13 +3068,12 @@ class Runtime:
                 nodes = jinja2.nodes
                 if (next(expr.find_all(nodes.Call), None) is not None
                         or any(node.name not in ("default", "d", "ternary", "lower", "upper", "trim", "replace",
-                                                 "capitalize", "title") for node in expr.find_all(nodes.Filter))
+                                                 "capitalize", "title", "length", "count")
+                               for node in expr.find_all(nodes.Filter))
                         or any(node.name not in ("defined", "undefined", "none", "boolean")
                                for node in expr.find_all(nodes.Test))):
                     return False
                 for node in expr.find_all(nodes.Name):
-                    if node.name in blocked:
-                        return False
                     if node.ctx == "load" and node.name in ctx:
                         pending.append(ctx[node.name])
         return True
@@ -3086,23 +3085,17 @@ class Runtime:
         merge_hashes = (play.get("controller_config") or {}).get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
-        blocked = set()
         for entry in play.get("deferred_vars_files") or ():
             if "static_vars" in entry:
                 play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes, encoded_vars=True)
-                if before_setup:
-                    for mapping in entry["static_vars"]:
-                        blocked.difference_update(key for key, value in mapping.items()
-                                                  if not merge_hashes or not isinstance(value, dict))
                 continue
             selector_vars = _f_combine(base, play_vars, self.extra_vars, recursive=merge_hashes, encoded_vars=True)
             selector_vars = {key: _PlayVarTemplate(value) if _looks_templated(value)
                              and not isinstance(value, _NO_TEMPLATE) else value for key, value in selector_vars.items()}
             ctx = self.ctx(base=selector_vars)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
-            selected = False
             for raw in entry["names"]:
-                if before_setup and (play.get("jinja_plugins") or not self._pre_setup_vars_file_selector(raw, ctx, blocked)):
+                if before_setup and (play.get("jinja_plugins") or not self._pre_setup_vars_file_selector(raw, ctx)):
                     break
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
@@ -3137,7 +3130,6 @@ class Runtime:
                             break
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
                     play_vars = _f_combine(play_vars, *data, recursive=merge_hashes, encoded_vars=True)
-                    selected = True
                     break
             else:
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
@@ -3147,9 +3139,6 @@ class Runtime:
                 if not before_setup:
                     sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                      % (item,))
-            if before_setup and not selected:
-                blocked.update(key for data in entry["files"].values() if isinstance(data, list)
-                               for mapping in data for key in mapping)
         return play_vars
 
     def _task_ctx(self, task, overlay):

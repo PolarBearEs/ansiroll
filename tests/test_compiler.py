@@ -275,7 +275,7 @@ def test_deferred_vars_file_can_change_a_later_selector(tmp_path):
     assert frame["result"]["msg"] == "custom"
 
 
-@pytest.mark.parametrize("selector", ["final_path", "path_alias", "path_template", "cfg.path"])
+@pytest.mark.parametrize("selector", ["final_path", "path_alias", "path_template", "absolute_path_template", "cfg.path"])
 def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch, selector):
     from ansible import constants as C
     from ansiroll.loader import parse_playbook
@@ -291,6 +291,7 @@ def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch
     final_path: config/default.yml
     path_alias: '{{ final_path }}'
     path_template: 'config/{{ variant }}.yml'
+    absolute_path_template: '{{ playbook_dir }}/config/{{ variant }}.yml'
     variant: default
     cfg: {path: config/default.yml}
   vars_files:
@@ -313,11 +314,33 @@ def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch
     assert [frame["result"]["msg"] for frame in frames] == ["final"]
 
 
+def test_deferred_vars_file_projects_duplicate_aliases_once(tmp_path, monkeypatch):
+    from jinja2 import Environment
+    from ansiroll.loader import _known_vars_file_choices
+
+    scope = {f"alias_{index}": "{{ alias_%d }}" % (index + 1) for index in range(9)}
+    scope["alias_9"] = "config/final.yml"
+    parse = Environment.parse
+    parsed = []
+
+    def record_parse(self, source, *args, **kwargs):
+        parsed.append(source)
+        return parse(self, source, *args, **kwargs)
+
+    monkeypatch.setattr(Environment, "parse", record_parse)
+    assert _known_vars_file_choices("{{ alias_0 }}", [scope, dict(scope)], str(tmp_path)) == (
+        ("config/final.yml",), False)
+    assert len(parsed) == len(set(parsed)) == 10
+
+
 @pytest.mark.parametrize("selector", [
     "final.yml",
     "config/{{ inventory_hostname_short | default('fallback') }}.yml",
     "config/{{ inventory_hostname_short | default('fallback') | lower }}.yml",
     "{{ 'config/' ~ (inventory_hostname_short | default('fallback') | lower) ~ '.yml' }}",
+    "{{ base_path }}/{{ inventory_hostname_short | default('fallback') }}.yml",
+    "config/{{ group_names | default([]) | length }}.yml",
+    "config/{{ group_names | count }}.yml",
 ])
 def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector):
     from ansiroll.loader import parse_playbook
@@ -326,6 +349,7 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: all
   gather_facts: true
+  vars: {base_path: config}
   vars_files:
     - 'first-{{ ansible_facts.profile }}.yml'
     - "%s"
@@ -335,11 +359,12 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
 """ % selector)
     (tmp_path / "first-runtime.yml").write_text("runtime_choice: first\n")
     (tmp_path / "config").mkdir()
-    for name in ("h", "H"):
+    for name in ("h", "H", "1"):
         (tmp_path / "config" / (name + ".yml")).write_text("setup_profile: final\n")
     (tmp_path / "final.yml").write_text("setup_profile: final\n")
     plays, _ = parse_playbook(str(playbook))
-    runtime = Runtime({}, "", {"inventory_hostname": "H", "inventory_hostname_short": "H"})
+    runtime = Runtime({}, "", {"inventory_hostname": "H", "inventory_hostname_short": "H",
+                               "group_names": ["workers"]})
     captured = []
     monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
 
@@ -351,6 +376,41 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
     runtime.run_play(plays[0])
     assert captured == [("ansible.builtin.setup", {"ANSIROLL_SETUP_PROFILE": "final"})]
     assert runtime.vars["runtime_choice"] == "first"
+
+
+@pytest.mark.parametrize("runtime_vars", ["variant: runtime\n", "- variant: ignored\n- variant: runtime\n"])
+def test_vars_file_uses_available_values_before_setup_and_replays_afterward(tmp_path, monkeypatch, runtime_vars):
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: true
+  vars: {variant: default}
+  vars_files:
+    - 'first-{{ ansible_facts.profile }}.yml'
+    - 'config/{{ variant }}.yml'
+  environment:
+    ANSIROLL_SETUP_PROFILE: '{{ setup_profile }}'
+  tasks: []
+""")
+    (tmp_path / "first-runtime.yml").write_text(runtime_vars)
+    (tmp_path / "config").mkdir()
+    for variant in ("default", "runtime"):
+        (tmp_path / "config" / (variant + ".yml")).write_text(f"setup_profile: {variant}\n")
+    plays, _ = parse_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    captured = []
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+
+    def run_setup(action, args, **kwargs):
+        captured.append((action, runtime._module_env))
+        return {"ansible_facts": {"profile": "runtime"}}
+
+    monkeypatch.setattr(runtime, "run_module", run_setup)
+    runtime.run_play(plays[0])
+    assert captured == [("ansible.builtin.setup", {"ANSIROLL_SETUP_PROFILE": "default"})]
+    assert runtime.vars["setup_profile"] == "runtime"
 
 
 @pytest.mark.parametrize("static_override", [True, False])

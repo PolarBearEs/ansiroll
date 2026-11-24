@@ -632,7 +632,7 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
-def _known_vars_file_choices(source, scopes):
+def _known_vars_file_choices(source, scopes, basedir):
     """Return literal or bounded wildcard paths without rendering selectors."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -646,7 +646,7 @@ def _known_vars_file_choices(source, scopes):
     parts = body[0].nodes
     dynamic = [part for part in parts if not isinstance(part, nodes.TemplateData)]
     if len(dynamic) != 1:
-        return (), False
+        return _known_vars_file_path_values(body[0], scopes, env, basedir), False
     choice = dynamic[0]
     values = []
     if isinstance(choice, nodes.CondExpr):
@@ -663,7 +663,7 @@ def _known_vars_file_choices(source, scopes):
             branches.pop()
     else:
         branches = ()
-        values.extend(_known_vars_file_path_values(choice, scopes, env))
+        values.extend(_known_vars_file_path_values(choice, scopes, env, basedir))
     if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches):
         return (), False
     values.extend(branch.value for branch in branches)
@@ -671,76 +671,114 @@ def _known_vars_file_choices(source, scopes):
     return paths, bool(branches)
 
 
-def _known_vars_file_path_values(expression, scopes, env, members=(), seen=frozenset()):
+def _known_vars_file_path_values(expression, scopes, env, basedir):
     """Follow aliases and keep literal filename components around variable values."""
     from jinja2 import TemplateSyntaxError, nodes
 
-    node = expression
-    while isinstance(node, (nodes.Getattr, nodes.Getitem)):
-        if isinstance(node, nodes.Getattr):
-            member = node.attr
-        elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, str):
-            member = node.arg.value
-        else:
-            return
-        members = (member, *members)
-        node = node.node
-    if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members:
-        paths = {""}
-        parts = (node.left, node.right) if isinstance(node, nodes.Add) else node.nodes
-        for part in parts:
-            if isinstance(part, nodes.TemplateData):
-                values = {part.data}
-            elif isinstance(part, nodes.Const) and isinstance(part.value, str):
-                values = {part.value}
-            else:
-                values = set(_known_vars_file_path_values(part, scopes, env, seen=seen)) | {"\0"}
-            if len(paths) * len(values) > 128:
-                return
-            paths = {prefix + suffix for prefix in paths for suffix in values}
-        yield from sorted(paths)
-        return
-    if isinstance(node, nodes.Filter) and not members and not (node.dyn_args or node.dyn_kwargs):
-        if node.name in ("lower", "upper", "trim") and not (node.args or node.kwargs):
-            method = "strip" if node.name == "trim" else node.name
-            yield from (getattr(value, method)() for value in
-                        _known_vars_file_path_values(node.node, scopes, env, seen=seen))
-        elif node.name in ("default", "d"):
-            yield from _known_vars_file_path_values(node.node, scopes, env, seen=seen)
-            fallback = node.args[0] if node.args else next(
-                (kw.value for kw in node.kwargs if kw.key == "default_value"), None)
-            if isinstance(fallback, nodes.Const) and isinstance(fallback.value, str):
-                yield fallback.value
-        return
-    if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
-        return
-    binding = node.name, members
-    if binding in seen:
-        return
-    for scope in scopes:
-        value = scope.get(node.name)
-        index = 0
-        while index < len(members) and isinstance(value, dict):
-            value = value.get(members[index])
-            index += 1
-        if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
-            literal = value["__ansiroll_unsafe__"]
-            if index == len(members) and isinstance(literal, str) and not _is_templated(literal):
-                yield literal
-            continue
-        if not isinstance(value, str):
-            continue
-        if not _is_templated(value):
-            if index == len(members):
-                yield value
-            continue
+    class ProjectionLimit(Exception):
+        pass
+
+    # Share the budget across all scopes and aliases for this selector.
+    remaining = 4096
+    parsed = {}
+
+    def consume(amount=1):
+        nonlocal remaining
+        remaining -= amount
+        if remaining < 0:
+            raise ProjectionLimit
+
+    def parse_alias(value):
         try:
             body = env.parse(value).body
         except TemplateSyntaxError:
-            continue
+            return None
         if len(body) == 1 and isinstance(body[0], nodes.Output):
-            selected = body[0].nodes[0] if len(body[0].nodes) == 1 else body[0]
-            yield from _known_vars_file_path_values(selected, scopes, env, members[index:], seen | {binding})
+            return body[0].nodes[0] if len(body[0].nodes) == 1 else body[0]
+        return None
+
+    def project(node, members=(), seen=frozenset()):
+        consume()
+        while isinstance(node, (nodes.Getattr, nodes.Getitem)):
+            consume()
+            if isinstance(node, nodes.Getattr):
+                member = node.attr
+            elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, str):
+                member = node.arg.value
+            else:
+                return
+            members = (member, *members)
+            node = node.node
+        if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members:
+            paths = {""}
+            parts = (node.left, node.right) if isinstance(node, nodes.Add) else node.nodes
+            for part in parts:
+                if isinstance(part, nodes.TemplateData):
+                    values = {part.data}
+                elif isinstance(part, nodes.Const) and isinstance(part.value, str):
+                    values = {part.value}
+                else:
+                    values = set(project(part, seen=seen)) | {"\0"}
+                combinations = len(paths) * len(values)
+                if combinations > 128:
+                    return
+                consume(combinations)
+                paths = {prefix + suffix for prefix in paths for suffix in values}
+            yield from sorted(paths)
+            return
+        if isinstance(node, nodes.Filter) and not members and not (node.dyn_args or node.dyn_kwargs):
+            if node.name in ("lower", "upper", "trim") and not (node.args or node.kwargs):
+                method = "strip" if node.name == "trim" else node.name
+                yield from (getattr(value, method)() for value in project(node.node, seen=seen))
+            elif node.name in ("default", "d"):
+                yield from project(node.node, seen=seen)
+                fallback = node.args[0] if node.args else next(
+                    (kw.value for kw in node.kwargs if kw.key == "default_value"), None)
+                if isinstance(fallback, nodes.Const) and isinstance(fallback.value, str):
+                    yield fallback.value
+            return
+        if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
+            return
+        if node.name == "playbook_dir":
+            if not members:
+                yield basedir
+            return
+        binding = node.name, members
+        if binding in seen:
+            return
+        aliases = set()
+        for scope in scopes:
+            consume()
+            value = scope.get(node.name)
+            index = 0
+            while index < len(members) and isinstance(value, dict):
+                value = value.get(members[index])
+                index += 1
+            if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+                literal = value["__ansiroll_unsafe__"]
+                if index == len(members) and isinstance(literal, str) and not _is_templated(literal):
+                    yield literal
+                continue
+            if not isinstance(value, str):
+                continue
+            if not _is_templated(value):
+                if index == len(members):
+                    yield value
+                continue
+            remaining_members = members[index:]
+            alias = value, remaining_members
+            if alias in aliases:
+                continue
+            aliases.add(alias)
+            if value not in parsed:
+                parsed[value] = parse_alias(value)
+            if parsed[value] is not None:
+                yield from project(parsed[value], remaining_members, seen | {binding})
+
+    try:
+        return tuple(dict.fromkeys(project(expression)))
+    except ProjectionLimit:
+        return ()
 
 
 def _deferred_vars_files(play, basedir, entries, *, scopes=()):
@@ -765,7 +803,7 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=()):
         unmodeled = []
         patterns_by_name = []
         for name in names:
-            choices, exhaustive = _known_vars_file_choices(name, scopes) if _is_templated(name) else ((), False)
+            choices, exhaustive = _known_vars_file_choices(name, scopes, basedir) if _is_templated(name) else ((), False)
             choices = [choice for choice in choices if choice and choice != "\0" and "\0" not in os.path.dirname(choice)]
             patterns_by_name.extend((choice, "*".join(glob.escape(part) for part in choice.split("\0")))
                                     for choice in choices)
@@ -814,12 +852,10 @@ def _bundled_vars_file(play, path):
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
-        preprocess_vars(loaded)
+        return _tag_untrusted(preprocess_vars(loaded))
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
-    return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
-            "a mapping" % path}
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars, deferred_writes=frozenset()):
