@@ -274,7 +274,9 @@ def _shadowed_var_names(plays):
         names.update(_loop_shadowed_names(node))
     for play in plays:
         for entry in play.get("deferred_vars_files") or ():
-            for data in entry["files"].values():
+            for item in entry.get("static_vars", ()):
+                names.update(item)
+            for data in entry.get("files", {}).values():
                 if isinstance(data, list):
                     for item in data:
                         names.update(item)

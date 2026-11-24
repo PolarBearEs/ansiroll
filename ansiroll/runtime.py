@@ -3040,9 +3040,13 @@ class Runtime:
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
         play_vars = dict(play.get("vars") or {})
+        merge_hashes = (play.get("controller_config") or {}).get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in play.get("deferred_vars_files") or ():
+            if "static_vars" in entry:
+                play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes)
+                continue
             ctx = self.ctx(play_vars, self.extra_vars, base=base)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             for raw in entry["names"]:
@@ -3072,8 +3076,7 @@ class Runtime:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    for value in data:
-                        play_vars.update(value)
+                    play_vars = _f_combine(play_vars, *data, recursive=merge_hashes)
                     break
             else:
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.

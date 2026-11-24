@@ -23,6 +23,7 @@ from .accelerated_modules import can_accelerate
 
 _STANDALONE_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names"))
 _STANDALONE_CONTEXT_NAMES = _STANDALONE_INVENTORY_NAMES | {"vars", "hostvars"}
+_DEFER_INVENTORY_VARS_FILE = object()
 
 # Actions that are coupled to the controller and cannot run inside the single file.
 CONTROLLER_COUPLED = {
@@ -547,6 +548,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
 
     out = dict(play.vars or {})
     use_search_stack = _core_version() >= (2, 12)
+    replay = False
     for entry in _as_list(getattr(play, "vars_files", None)):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
@@ -555,8 +557,11 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
-                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
-                if filename is None:
+                filename = None if replay else _template_vars_file_name(
+                    play, raw, dict(out, playbook_dir=basedir), all_vars)
+                if filename is _DEFER_INVENTORY_VARS_FILE:
+                    replay = True
+                if filename is None or filename is _DEFER_INVENTORY_VARS_FILE:
                     if unresolved is not None:
                         unresolved.append(entry)
                     break
@@ -570,8 +575,12 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
             except AnsibleFileNotFound:
                 # Like Ansible: only a missing file moves on to the next candidate.
                 continue
-            for item in _as_list(loaded) or []:
-                if isinstance(item, dict):
+            mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
+            if replay and unresolved is not None:
+                # Later files must take precedence over the deferred choice.
+                unresolved.append({"static_vars": _tag_untrusted(mappings)})
+            else:
+                for item in mappings:
                     out = combine_vars(out, item)
             break
     # The variable manager has already applied extra vars and any parser-level
@@ -602,6 +611,27 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
+def _literal_vars_file_choices(source):
+    """Return exact paths for a template with a single literal conditional choice."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    try:
+        body = Environment().parse(source).body
+    except TemplateSyntaxError:
+        return ()
+    if len(body) != 1 or not isinstance(body[0], nodes.Output):
+        return ()
+    parts = body[0].nodes
+    dynamic = [part for part in parts if not isinstance(part, nodes.TemplateData)]
+    if len(dynamic) != 1 or not isinstance(dynamic[0], nodes.CondExpr):
+        return ()
+    choice = dynamic[0]
+    branches = (choice.expr1, choice.expr2)
+    if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches):
+        return ()
+    return tuple("".join(branch.value if part is choice else part.data for part in parts) for branch in branches)
+
+
 def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -619,11 +649,23 @@ def _deferred_vars_files(play, basedir, entries):
     dirs = [os.path.normpath(d) for d in dirs]
     deferred = []
     for entry in entries:
+        if isinstance(entry, dict) and "static_vars" in entry:
+            deferred.append(entry)
+            continue
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
-        unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
+        unmodeled = []
+        patterns_by_name = []
         for name in names:
-            pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+            choices = _literal_vars_file_choices(name) if _is_templated(name) else ()
+            if choices:
+                patterns_by_name.extend((choice, glob.escape(choice)) for choice in choices if choice)
+            elif name.startswith(("{{", "{%")) and "/" in name:
+                unmodeled.append(name)
+            else:
+                pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+                patterns_by_name.append((name, pattern))
+        for name, pattern in patterns_by_name:
             if name.startswith(os.path.sep):
                 patterns = [pattern]
             else:
@@ -676,7 +718,7 @@ def _template_vars_file_name(play, filename, play_vars, all_vars):
     if all_vars is None:
         runtime_names = _STANDALONE_CONTEXT_NAMES - variables.keys()
         if _depends_on_vars(filename, variables, runtime_names.__contains__):
-            return None
+            return _DEFER_INVENTORY_VARS_FILE
     try:
         from ansible.template import Templar
         try:
@@ -1318,6 +1360,8 @@ def _template_include_filename(task, value, includes):
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
                   task_vars, role_params, include_params, extra_vars):
         variables = combine_vars(variables, layer)
+    runtime_inventory = (_STANDALONE_CONTEXT_NAMES - includes.play_vars.keys() - role_vars.keys()
+                         - task_vars.keys() - role_params.keys() - include_params.keys() - extra_vars.keys())
     # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
     above_vars_files = set(role_vars).union(task_vars, role_params, include_params)
 
@@ -1334,7 +1378,7 @@ def _template_include_filename(task, value, includes):
     def is_runtime(name):
         if name in loop_names:
             return True
-        if includes.all_vars is None and name in _STANDALONE_CONTEXT_NAMES and name not in variables:
+        if includes.all_vars is None and name in runtime_inventory:
             return True
         if (includes.incomplete and name not in extra_vars and name not in above_vars_files
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):

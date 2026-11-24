@@ -180,26 +180,35 @@ def test_freezing_allows_explicit_inventory_values(tmp_path, group_vars):
     assert manifest["tree_shake"]["frozen_var_names"] == ["deployment_group"]
 
 
-def test_standalone_vars_files_select_inventory_at_runtime(tmp_path):
+@pytest.mark.parametrize(("selector", "inventory", "fallback"), [
+    ("selection-{{ 'inventory' if group_names is defined else 'fallback' }}.yml",
+     "selection-inventory.yml", "selection-fallback.yml"),
+    ("{{ 'config/inventory.yml' if group_names is defined else 'config/fallback.yml' }}",
+     "config/inventory.yml", "config/fallback.yml"),
+])
+def test_standalone_vars_files_select_inventory_at_runtime(tmp_path, selector, inventory, fallback):
     from ansiroll import compile_playbook
 
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: all
   gather_facts: false
   vars_files:
-    - "selection-{{ 'inventory' if group_names is defined else 'fallback' }}.yml"
+    - "%s"
+    - final.yml
   tasks:
-    - debug: {msg: '{{ selected }}'}
-""")
-    (tmp_path / "selection-inventory.yml").write_text("selected: inventory\n")
-    (tmp_path / "selection-fallback.yml").write_text("selected: fallback\n")
+    - debug: {msg: '{{ selected }}/{{ precedence }}'}
+""" % selector)
+    (tmp_path / inventory).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / inventory).write_text("selected: inventory\nprecedence: earlier\n")
+    (tmp_path / fallback).write_text("selected: fallback\nprecedence: earlier\n")
+    (tmp_path / "final.yml").write_text("precedence: later\n")
     compiled = tmp_path / "compiled.py"
     compiled.write_text(compile_playbook(str(playbook))[0])
     env = dict(os.environ, ANSIROLL_RAW="1")
     completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
-    assert frame["result"]["msg"] == "inventory"
+    assert frame["result"]["msg"] == "inventory/later"
 
 
 def test_standalone_include_tasks_does_not_bake_inventory_fallback(tmp_path):
@@ -213,6 +222,22 @@ def test_standalone_include_tasks_does_not_bake_inventory_fallback(tmp_path):
 """)
     (tmp_path / "inventory.yml").write_text("- debug: {msg: inventory}\n")
     (tmp_path / "fallback.yml").write_text("- debug: {msg: fallback}\n")
+    _, manifest = compile_playbook(str(playbook))
+    assert len(manifest["fallback_tasks"]) == 1
+    assert "include_tasks" in manifest["fallback_tasks"][0]["reason"]
+
+
+def test_standalone_include_tasks_does_not_use_role_default_as_inventory(tmp_path):
+    from ansiroll import compile_playbook
+
+    role = tmp_path / "roles" / "fixture"
+    (role / "defaults").mkdir(parents=True)
+    (role / "tasks").mkdir()
+    (role / "defaults" / "main.yml").write_text("group_names: [workers]\n")
+    (role / "tasks" / "main.yml").write_text("- include_tasks: '{{ group_names[0] }}.yml'\n")
+    (role / "tasks" / "workers.yml").write_text("- debug: {msg: workers}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: all\n  gather_facts: false\n  roles: [fixture]\n")
     _, manifest = compile_playbook(str(playbook))
     assert len(manifest["fallback_tasks"]) == 1
     assert "include_tasks" in manifest["fallback_tasks"][0]["reason"]
