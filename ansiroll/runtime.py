@@ -1390,10 +1390,36 @@ class _ModernPlayVarView(_PlayVarView):
     __str__ = __repr__
 
 
+class _DeferredVarItems(ItemsView):
+    def __iter__(self):
+        for key in self._mapping:
+            yield key, self._mapping.iteration_value(key)
+
+    def __contains__(self, item):
+        key, value = item
+        if key not in self._mapping:
+            return False
+        current = self._mapping.iteration_value(key)
+        return current is value or current == value
+
+
+class _DeferredVarValues(ValuesView):
+    def __iter__(self):
+        for _, value in self._mapping.items():
+            yield value
+
+    def __contains__(self, value):
+        return any(current is value or current == value for current in self)
+
+
 class _DeferredPlayVarView(_ModernPlayVarView):
     """Read deferred agent and controller aliases through the magic vars mapping."""
 
     _preserve_legacy_sources = False
+
+    def __init__(self, snapshot, scope, loop_snapshot=False):
+        super().__init__(snapshot, scope, loop_snapshot)
+        self._legacy_iteration = not _core_at_least(2, 19)
 
     def __getitem__(self, key):
         if self._loop_snapshot:
@@ -1407,11 +1433,17 @@ class _DeferredPlayVarView(_ModernPlayVarView):
             return self.scope[key]
         return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
 
+    def iteration_value(self, key):
+        source = dict.__getitem__(self, key)
+        if isinstance(source, _PlayVarTemplate):
+            return str(source)
+        return self[key]
+
     def items(self):
-        return ItemsView(self)
+        return _DeferredVarItems(self) if self._legacy_iteration else ItemsView(self)
 
     def values(self):
-        return ValuesView(self)
+        return _DeferredVarValues(self) if self._legacy_iteration else ValuesView(self)
 
     def copy(self):
         return type(self)(dict(dict.items(self)), self.scope, self._loop_snapshot)
@@ -1648,7 +1680,8 @@ def _jinja_dict(*args, **kwargs):
 def _type_name(value):
     """type_debug: internal wrappers report the builtin type they stand for."""
     for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"),
-                           (_LazyTplList, "list"), (_LazyTplTuple, "tuple")):
+                           (_LazyTplList, "list"), (_LazyTplTuple, "tuple"),
+                           (_DeferredVarItems, "ItemsView"), (_DeferredVarValues, "ValuesView")):
         if isinstance(value, internal):
             return name
     if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
@@ -1668,7 +1701,8 @@ def _concretize(value):
     """Consume lazy iterators (selectattr/map/... results) so errors surface at
     template time, like Ansible's templar does."""
     import types
-    if isinstance(value, (types.GeneratorType, map, filter)) or type(value) in (ItemsView, ValuesView):
+    if isinstance(value, (types.GeneratorType, map, filter)) or type(value) in (
+            ItemsView, ValuesView, _DeferredVarItems, _DeferredVarValues):
         return list(value)
     return value
 

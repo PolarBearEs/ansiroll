@@ -234,6 +234,42 @@ def test_legacy_vars_methods_resolve_deferred_task_aliases(monkeypatch, loop):
     assert calls == []
 
 
+def test_legacy_vars_iteration_preserves_deferred_play_sources(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames, calls = [], []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "used"
+    source = "{{ lookup('source') }}/tail"
+    tasks = [
+        _task("keys", "Inspect keys", "debug", args={"msg": "{{ vars.items() | map(attribute=0) | list }}"}),
+        _task("source", "Inspect source", "debug", args={
+            "msg": "{{ (vars.items() | selectattr('0', 'equalto', 'payload') | first)[1] }}",
+        }),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": {"payload": source}})
+    assert "payload" in frames[0]["result"]["msg"]
+    assert frames[1]["result"]["msg"] == source
+    assert calls == []
+
+    tasks = [_task("read", "Read value", "debug", args={"msg": "{{ vars.payload }}"})]
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": {"payload": source}})
+    assert frames[2]["result"]["msg"] == "used/tail"
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize("version", ["2.12.10", "2.21.0"])
+def test_deferred_vars_keep_standard_mapping_view_type_names(monkeypatch, version):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    ctx = {"alias": "{{ 'value' }}", runtime_mod._DEFER_LOOKUP_NAMES: True}
+    assert rt.template("{{ vars.items() | type_debug }}", ctx) == "ItemsView"
+    assert rt.template("{{ vars.values() | type_debug }}", ctx) == "ValuesView"
+
+
 @pytest.mark.parametrize("argument", [
     '''"{{ lookup('source') }}/{{ suffix }}"''',
     '''"{{ lookup('source') }}" ~ "/{{ suffix }}"''',
