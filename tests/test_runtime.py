@@ -258,6 +258,33 @@ def test_hostvars_entries_keep_deferred_bindings_in_task_order():
     assert calls == ["number"]
 
 
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("entries == []", False), ("entries != []", True), ("[] == entries", False),
+    ("prefix == entries", False), ("entries != prefix", True),
+    ("entries < [18]", True), ("entries >= [18]", False), ("[18] > entries", True),
+    ("entries[:1] == [17]", True), ("entries > [17]", True),
+])
+def test_hostvars_comparisons_leave_unneeded_values_unread(expression, expected):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Compare hostvars entries", "debug", vars={
+        "unused": "{{ lookup('unused') }}/tail", "prefix": ["{{ lookup('unused') }}/tail"],
+    })
+    template = ("{% set entries = hostvars[inventory_hostname].copy().values() %}"
+                "{{ (" + expression + ") | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) is expected
+
+
+@pytest.mark.parametrize("hostvars", ["lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]"])
+def test_vars_lookup_preserves_lazy_hostvars_members(hostvars):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": "{{ seed }}"}},
+                                "seed": "ready"})
+    runtime.templater._lookup_loaded["unused"] = lambda *args, **kwargs: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Read a hostvars lookup member", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    expression = "{{ " + hostvars + "[inventory_hostname].copy().original }}"
+    assert runtime.template(expression, runtime._task_ctx(task, {})) == "ready"
+
+
 @pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
 def test_serializers_materialize_nested_lazy_hostvars_entries(filter_name):
     from ansiroll.runtime import _yaml_module

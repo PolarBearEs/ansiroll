@@ -212,6 +212,8 @@ def _looks_templated(value):
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
                  preserve_views=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
+    if isinstance(value, _LookupHostVars):
+        return value
     if preserve_included_vars and isinstance(value, _IncludedVars):
         return value
     if preserve_views and isinstance(value, (_LazyTplDict, _LazyTplList, _LazyTplTuple, _PlayVarView)):
@@ -1464,6 +1466,22 @@ class _ModernPlayVarView(_PlayVarView):
     __str__ = __repr__
 
 
+class _LookupHostVars(_LazyTplDict):
+    """Mark the result of the vars lookup as data on first access to each host."""
+
+    def __init__(self, hostvars):
+        def read(host):
+            value = hostvars[host]
+            if isinstance(value, _HostVarView):
+                view = value.copy()
+                view._lookup_data = True
+                return view
+            return _mark_unsafe(value)
+
+        sources = {host: _DelegatedTemplateValue(lambda host=host: read(host)) for host in hostvars}
+        super().__init__(sources, hostvars._rt, hostvars._render_ctx())
+
+
 class _HostVarView(_LazyTplDict):
     """Keep hostvars entries lazy until the template reads them."""
 
@@ -1477,7 +1495,16 @@ class _HostVarView(_LazyTplDict):
         dict.__init__(view, raw)
         return view
 
+    _lookup_data = False
+
+    def __getitem__(self, key):
+        return self._resolve(key, dict.__getitem__(self, key))
+
     def _resolve(self, key, value):
+        result = self._read_host_value(key, value)
+        return _mark_unsafe(result) if self._lookup_data else result
+
+    def _read_host_value(self, key, value):
         return _read_lazy_member(self, value)
 
     def items(self):
@@ -1503,10 +1530,7 @@ class _TaskHostVarView(_HostVarView):
         return key in scope.active_task_bindings or (
             isinstance(value, _TaskVarTemplate) and (key, value) in scope.templater._resolving)
 
-    def __getitem__(self, key):
-        return self._resolve(key, dict.__getitem__(self, key))
-
-    def _resolve(self, key, value):
+    def _read_host_value(self, key, value):
         templater = self._ctx.templater
         # A task alias can read the inventory value it shadows.
         if self._uses_inventory(self._ctx, key, value):
@@ -1614,19 +1638,26 @@ class _HostVarEntries(MutableSequence):
         return self
 
     def __eq__(self, other):
-        return list(self) == (list(other) if isinstance(other, _HostVarEntries) else other)
+        if not isinstance(other, (list, _HostVarEntries)):
+            return NotImplemented
+        return len(self) == len(other) and _compare_list_members(self, other, operator.eq)
+
+    def _compare_order(self, other, compare):
+        if not isinstance(other, (list, _HostVarEntries)):
+            return NotImplemented
+        return _compare_list_members(self, other, compare)
 
     def __lt__(self, other):
-        return list.__lt__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+        return self._compare_order(other, operator.lt)
 
     def __le__(self, other):
-        return list.__le__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+        return self._compare_order(other, operator.le)
 
     def __gt__(self, other):
-        return list.__gt__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+        return self._compare_order(other, operator.gt)
 
     def __ge__(self, other):
-        return list.__ge__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+        return self._compare_order(other, operator.ge)
 
     def __repr__(self):
         return repr(list(self))
@@ -1712,6 +1743,17 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         return dict.setdefault(self, key, default)
 
 
+def _compare_list_members(left, right, compare):
+    # Index only shared positions so a surplus deferred member stays unread.
+    left_len, right_len = len(left), len(right)
+    for index in range(min(left_len, right_len)):
+        first, second = left[index], right[index]
+        if first is second or first == second:
+            continue
+        return False if compare is operator.eq else compare(first, second)
+    return compare(left_len, right_len)
+
+
 class _LazyTplList(list):
     """A vars list whose items render only when accessed."""
 
@@ -1777,20 +1819,9 @@ class _LazyTplList(list):
         return isinstance(other, list) and (self._delegated or self._task_vars or (
             isinstance(other, _LazyTplList) and (other._delegated or other._task_vars)))
 
-    def _compare_members(self, other, compare):
-        left_len, right_len = len(self), len(other)
-        # Index only shared positions. Iterating both lists could read a
-        # surplus deferred member when the shorter iterator is exhausted.
-        for index in range(min(left_len, right_len)):
-            left, right = self[index], other[index]
-            if left is right or left == right:
-                continue
-            return False if compare is operator.eq else compare(left, right)
-        return compare(left_len, right_len)
-
     def _compare_order(self, other, compare, raw_compare):
         if self._compares_resolved_items(other):
-            return self._compare_members(other, compare)
+            return _compare_list_members(self, other, compare)
         return raw_compare(self, other)
 
     def __lt__(self, other):
@@ -1806,8 +1837,10 @@ class _LazyTplList(list):
         return self._compare_order(other, operator.ge, list.__ge__)
 
     def __eq__(self, other):
+        if isinstance(other, _HostVarEntries):
+            return NotImplemented
         if self._compares_resolved_items(other):
-            return len(self) == len(other) and self._compare_members(other, operator.eq)
+            return len(self) == len(other) and _compare_list_members(self, other, operator.eq)
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
 
     # list's C-level operations read the raw storage; render first, like
@@ -2248,7 +2281,8 @@ class _Templater:
         for term in terms:
             key = str(term)
             if key in ctx and not key.startswith("__ansiroll"):
-                view[key] = self.resolve_variable(key, ctx[key], ctx)
+                value = self.resolve_variable(key, ctx[key], ctx)
+                view[key] = _LookupHostVars(value) if key == "hostvars" and isinstance(value, _LazyTplDict) else value
         return view
 
     def _g_lookup(self, name, *a, **k):
