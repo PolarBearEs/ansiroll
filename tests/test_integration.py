@@ -2270,6 +2270,34 @@ def test_implicit_setup_passes_play_gather_timeout(tmp_path, monkeypatch, timeou
         assert calls == [("ansible.builtin.setup", expected)]
 
 
+def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  roles: [settings]
+  gather_timeout: '{{ lookup("file", timeout_file) }}'
+  tasks: []
+""")
+    defaults = tmp_path / "roles" / "settings" / "defaults"
+    defaults.mkdir(parents=True)
+    (defaults / "main.yml").write_text("timeout_file: fact-timeout\n")
+    (tmp_path / "fact-timeout").write_text("29\n")
+
+    source, _ = compile_playbook(str(playbook))
+    assert _compiled_plays(source, tmp_path)[0]["gather_timeout"] == 29
+
+
+def test_compile_does_not_expand_an_unsafe_gather_timeout(tmp_path):
+    from ansible.errors import AnsibleError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_timeout: !unsafe '{{ 23 }}'
+  tasks: []
+""")
+    with pytest.raises(AnsibleError, match="gather_timeout"):
+        compile_playbook(str(playbook))
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 

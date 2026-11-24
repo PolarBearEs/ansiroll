@@ -148,11 +148,30 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
         basedir = os.path.abspath(getattr(play, "_included_path", None) or pb_dir)
         loader.set_basedir(basedir)
         node = _convert_play(play, actions, basedir, runtime_writes=runtime_writes)
+        if "gather_timeout" in node:
+            node["gather_timeout"] = _compile_gather_timeout(play, vm, loader)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
         plays.append(node)
     return plays, actions
+
+
+def _compile_gather_timeout(play, variable_manager, loader):
+    """Validate the play keyword in the same controller scope as Ansible."""
+    if _core_version() >= (2, 19):
+        from ansible._internal._templating._engine import TemplateEngine as Templar
+    else:
+        from ansible.template import Templar
+
+    # Validate just the timeout. The other keywords belong to the compiler's
+    # normal paths and can depend on inputs it resolves separately.
+    timeout_play = type(play)()
+    timeout_play.hosts = ["all"]
+    timeout_play.gather_timeout = play.gather_timeout
+    variables = variable_manager.get_vars(play=play)
+    timeout_play.post_validate(Templar(loader=loader, variables=variables))
+    return timeout_play.gather_timeout
 
 
 def _make_rewriting_loader(DataLoader):

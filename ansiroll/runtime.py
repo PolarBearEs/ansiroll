@@ -17,7 +17,6 @@ installed Jinja2.
 
 import datetime as _dt
 import base64
-from decimal import Decimal
 import json
 import os
 import struct
@@ -4741,16 +4740,8 @@ class Runtime:
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
             setup_args = {}
-            if gather_timeout is not None:
-                timeout = _fail_on_undef(self.template(gather_timeout, ctx, strict=True))
-                if timeout is not None and timeout != _OMIT:
-                    if _core_at_least(2, 18) and not isinstance(timeout, int):
-                        timeout = Decimal(timeout)
-                        if not timeout.is_finite() or timeout != timeout.to_integral_value():
-                            raise ValueError("gather_timeout must be an integer")
-                    timeout = int(timeout)
-                    if timeout or _core_at_least(2, 13):
-                        setup_args["gather_timeout"] = timeout
+            if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
+                setup_args["gather_timeout"] = gather_timeout
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
