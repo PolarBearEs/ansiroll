@@ -240,12 +240,12 @@ def _gather_timeout_template(source, variables):
     paths, unknown_lookup = set(), set()
     if controller_only:
         dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS,
-                                                    allow_controller=True, paths=paths,
+                                                    allow_controller=True, computed=computed, paths=paths,
                                                     unknown_lookup=unknown_lookup)
     if dependencies is None:
         return None
     scope, names = dependencies
-    if not names and not unknown_lookup:
+    if not names and not (computed or unknown_lookup):
         return None
     runtime = {"source": source, "vars": scope, "names": sorted(names),
                "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
@@ -380,6 +380,11 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
 
     env = Environment()
+    resolve_aliases = computed is not None or unknown_lookup is not None
+    key_scope = variables
+    if resolve_aliases:
+        key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
+                     for key, value in variables.items()}
     pending = [(source, (), None, ())]
     scope = {}
     names = set()
@@ -397,7 +402,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
-        for name, path in _selector_input_paths(expression, remaining, variables, computed, unknown_lookup):
+        for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
+                                                resolve_aliases=resolve_aliases):
             if name == "omit" or (name, path) in seen:
                 continue
             if paths is not None:

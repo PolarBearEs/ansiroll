@@ -3343,6 +3343,48 @@ def test_computed_timeout_rechecks_value_selected_by_an_alias(tmp_path, monkeypa
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
+@pytest.mark.parametrize("target", ["timeout_var.strip()", "timeout_var | reverse | join"])
+def test_controller_timeout_detects_changed_computed_vars_target(tmp_path, monkeypatch, target):
+    monkeypatch.setenv("ANSIROLL_TIMEOUT_SUFFIX", "x")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars:
+    timeout_var: '{{ actual_key }}'
+    actual_key: %s
+    first: 23
+  gather_timeout: "{{ vars[%s] + (lookup('env', 'ANSIROLL_TIMEOUT_SUFFIX') | length) }}"
+  tasks: []
+""" % ("' first '" if target.endswith("strip()") else "tsrif", target))
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 24
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45}, on_result=frames.append)
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda *args, **kwargs: pytest.fail("setup must not run with a stale timeout"))
+    runtime.run_play(plan)
+    assert runtime.failed
+    assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+
+
+def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {first: 23}
+  gather_timeout: "{{ vars['first_x' | replace('_x', '')] }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 

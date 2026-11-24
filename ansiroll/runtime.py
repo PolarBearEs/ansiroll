@@ -259,7 +259,9 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 pending.append((root.arg, ()))
                 key = _selector_vars_key(root.arg, variables or {}, () if resolve_aliases else None)
                 if not isinstance(key, str):
-                    if computed is not None:
+                    if unknown_lookup is not None:
+                        unknown_lookup.add("vars")
+                    if computed is not None or unknown_lookup is not None:
                         root = None
                     break
                 path.append(key)
@@ -323,6 +325,13 @@ def _selector_vars_key(node, variables, aliases=None):
             if isinstance(value, str):
                 method = "strip" if node.name == "trim" else node.name
                 return getattr(value, method)()
+    if (isinstance(node, jinja2.nodes.Filter) and node.name == "replace"
+            and not (node.kwargs or node.dyn_args or node.dyn_kwargs) and len(node.args) in (2, 3)):
+        value = _selector_vars_key(node.node, variables, aliases)
+        old, new = (_selector_vars_key(arg, variables, aliases) for arg in node.args[:2])
+        count = _selector_vars_key(node.args[2], variables, aliases) if len(node.args) == 3 else -1
+        if all(isinstance(part, str) for part in (value, old, new)) and isinstance(count, int):
+            return str.replace(value, old, new, count)
     if isinstance(node, jinja2.nodes.Concat):
         parts = [_selector_vars_key(part, variables, aliases) for part in node.nodes]
         if all(isinstance(part, str) for part in parts):
