@@ -5,6 +5,7 @@ template/copy-with-content, so no Ansible or embedded modules are required.
 """
 
 import io
+import json
 import os
 import shlex
 from types import SimpleNamespace
@@ -240,6 +241,50 @@ def test_legacy_hostvars_entries_render_only_accessed_sources(monkeypatch, expre
     runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
     assert frames[0]["result"]["msg"] == "ready"
     assert not calls
+
+
+def test_hostvars_entries_keep_deferred_bindings_in_task_order():
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or 17
+    task = _task("1", "Read task entry", "debug", args={
+        "msg": "{{ hostvars[inventory_hostname].items()[1] }}",
+    }, vars={"alias": "{{ lookup('number') }}", "ordinary": 2, "unused": "{{ lookup('spare') }}/tail"})
+    ctx = runtime._task_ctx(task, {})
+    assert runtime.template(task["args"]["msg"], ctx) == ("alias", 17)
+    assert calls == ["number"]
+
+
+@pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
+def test_serializers_materialize_nested_lazy_hostvars_entries(filter_name):
+    from ansiroll.runtime import _yaml_module
+
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    task = _task("1", "Serialize entries", "debug", args={
+        "msg": "{{ {'values': hostvars[inventory_hostname].values()} | " + filter_name + " }}",
+    }, vars={"alias": "{{ lookup('source') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert not runtime.failed
+    serialized = frames[0]["result"]["msg"]
+    decoded = json.loads(serialized) if "json" in filter_name else _yaml_module().safe_load(serialized)
+    assert "rendered/tail" in decoded["values"]
+    assert calls == ["source"]
+
+
+def test_hostvars_item_membership_resolves_only_matching_keys():
+    frames, calls = [], []
+    hostvars = {"h": {"unused": "{{ lookup('unused') }}/tail"}}
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    task = _task("1", "Check entries", "debug", args={
+        "msg": "{% set entries = hostvars[inventory_hostname].items() %}{{ ["
+               "('absent', 0) in entries, ('absent', 0) in entries, ('alias', 'rendered/tail') in entries] | to_json }}",
+    }, vars={"alias": "{{ lookup('source') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert json.loads(frames[0]["result"]["msg"]) == [False, False, True]
+    assert calls == ["source"]
 
 
 @pytest.mark.parametrize("text", [

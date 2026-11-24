@@ -685,7 +685,7 @@ def _yaml_plain_key(k, memo):
 
 def _yaml_plain(v, memo=None, key_memo=None):
     """Materialize runtime wrappers (lazy vars, trusted strings) into the
-    built-in types PyYAML's SafeDumper can represent.
+    built-in types supported by the serializers.
 
     Shared and self-referencing containers keep their identity: each output
     container is registered before its children are converted, so PyYAML can
@@ -696,7 +696,7 @@ def _yaml_plain(v, memo=None, key_memo=None):
         memo, key_memo = {}, {}
     if isinstance(v, str):
         return "".join([v]) if type(v) is not str else v
-    if not isinstance(v, (dict, list, tuple)):
+    if not isinstance(v, (dict, list, tuple, _HostVarEntries)):
         return v
     # Lazy wrappers are rebuilt on every access; key them by the raw
     # container they wrap so recursion through them is still detected, plus
@@ -772,6 +772,7 @@ def _contains_vault(v):
 
 
 def _f_to_json(v, **kwargs):
+    v = _yaml_plain(v)
     if _contains_vault(v):
         raise ValueError("The variable contains an undecryptable variable")
     return json.dumps(v, **kwargs)
@@ -1259,9 +1260,10 @@ class _LoopVarsSnapshot(dict):
 class _TaskHostVars(dict):
     """Current-host values whose deferred task bindings share the render scope."""
 
-    def __init__(self, values, task_bindings):
+    def __init__(self, values, task_bindings, key_order):
         super().__init__(values)
         self.task_bindings = task_bindings
+        self.key_order = key_order
 
 
 class _PlayVarScope(dict):
@@ -1435,7 +1437,9 @@ class _TaskHostVarView(_LazyTplDict):
     def __init__(self, host, scope):
         bindings = {key: value for key, value in host.task_bindings.items()
                     if not self._uses_inventory(scope, key, value)}
-        super().__init__({**host, **bindings}, scope.templater._runtime, scope)
+        ordered = {key: bindings[key] if key in bindings else host[key]
+                   for key in host.key_order if key in bindings or key in host}
+        super().__init__(ordered, scope.templater._runtime, scope)
         self._host = host
 
     @staticmethod
@@ -1490,6 +1494,18 @@ class _HostVarEntries(Sequence):
 
     def __iter__(self):
         return (self._entry(key) for key in self._mapping)
+
+    def __contains__(self, item):
+        if not self._include_keys:
+            return super().__contains__(item)
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        key, expected = item
+        try:
+            value = self._mapping[key]
+        except (KeyError, TypeError):
+            return False
+        return value is expected or value == expected
 
     def __getitem__(self, index):
         keys = list(self._mapping)
@@ -3544,6 +3560,7 @@ class Runtime:
         # for every task while preserving other hosts from the snapshot.
         hostvars = dict(hostvars) if isinstance(hostvars, dict) else {}
         current = dict(hostvars.get(self.host) or {})
+        inventory_order = tuple(current)
         host_task_bindings = {}
         for key, value in ctx.items():
             if key in ("hostvars", "vars"):
@@ -3559,7 +3576,9 @@ class Runtime:
                     current[key] = self._module_fact_layer[key]
                 continue
             current[key] = value
-        hostvars[self.host] = _TaskHostVars(current, host_task_bindings) if host_task_bindings else current
+        if host_task_bindings:
+            current = _TaskHostVars(current, host_task_bindings, tuple(dict.fromkeys((*inventory_order, *ctx))))
+        hostvars[self.host] = current
         ctx["hostvars"] = hostvars
         if mixed_lookup:
             ctx[_DEFER_LOOKUP_NAMES] = True
