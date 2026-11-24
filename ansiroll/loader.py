@@ -152,8 +152,9 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         loader.set_basedir(basedir)
         node = _convert_play(play, actions, basedir, runtime_writes=runtime_writes)
         compiled_play_vars = node.pop("_gather_compile_vars", None)
+        hash_scope = node.pop("_gather_hash_scope", None)
         if compiled_play_vars is not None:
-            node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars))
+            node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope))
         if node.get("ordered_vars_files"):
             node.update(_gather_timeout_file_scope(
                 play, node["ordered_vars_files"], node.get("gather_timeout_template")))
@@ -164,7 +165,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
     return plays, actions
 
 
-def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars):
+def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, hash_scope=None):
     """Validate the play keyword in the same controller scope as Ansible."""
     from ansible.errors import AnsibleError, AnsibleUndefinedVariable
     from jinja2 import UndefinedError
@@ -182,7 +183,15 @@ def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars):
     scope_play = play.copy()
     scope_play.vars = compiled_play_vars
     scope_play.vars_files = []
-    variables = variable_manager.get_vars(play=scope_play)
+    if hash_scope is None:
+        variables = variable_manager.get_vars(play=scope_play)
+    else:
+        from ansible.utils.vars import combine_vars
+
+        variables = combine_vars(hash_scope, _gather_role_exports(_gather_public_roles(play)))
+        variables = combine_vars(variables, variable_manager.extra_vars)
+        variables = combine_vars(variables, _gather_selector_magic(play))
+        variables["vars"] = dict(variables)
     runtime = _gather_timeout_template(play.gather_timeout, variables)
     try:
         timeout_play.post_validate(Templar(loader=loader, variables=variables))
@@ -190,7 +199,7 @@ def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars):
         cause = error
         while cause is not None and not isinstance(cause, (AnsibleUndefinedVariable, UndefinedError)):
             cause = cause.__cause__ or getattr(cause, "orig_exc", None)
-        if runtime is None or cause is None:
+        if runtime is None or cause is None or "controller_inputs" in runtime:
             raise
         runtime["required"] = True
         timeout_play.gather_timeout = None
@@ -208,13 +217,22 @@ def _gather_timeout_template(source, variables):
     if not isinstance(source, str) or not _is_templated(source) or not isinstance(_tag_untrusted(source), str):
         return None
     dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS)
-    if dependencies is not None:
-        scope, names = dependencies
-        if names:
-            return {"source": source, "vars": scope, "names": sorted(names),
-                    "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
-                    "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
-    return None
+    controller_only = dependencies is None
+    if controller_only:
+        dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS,
+                                                    allow_controller=True)
+    if dependencies is None:
+        return None
+    scope, names = dependencies
+    if not names:
+        return None
+    runtime = {"source": source, "vars": scope, "names": sorted(names),
+               "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
+               "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
+    if controller_only:
+        runtime.pop("source")
+        runtime["controller_inputs"] = scope
+    return runtime
 
 
 def _gather_public_roles(play):
@@ -239,6 +257,18 @@ def _gather_role_defaults(roles):
     return defaults
 
 
+def _gather_role_exports(roles):
+    from ansible import constants as C
+    from ansible.utils.vars import combine_vars
+
+    exports = {}
+    if _core_version(include_patch=True) >= (2, 16, 3) or not C.DEFAULT_PRIVATE_ROLE_VARS:
+        export_args = {"only_exports": True} if _core_version() >= (2, 15) else {}
+        for role in roles:
+            exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
+    return exports
+
+
 def _gather_selector_magic(play):
     manager = play.get_variable_manager()
     magic_args = {"include_delegate_to": True} if _core_version() < (2, 15) else {}
@@ -247,17 +277,12 @@ def _gather_selector_magic(play):
 
 def _gather_timeout_file_scope(play, entries, runtime):
     """Keep original file order and the play layers needed by a runtime timeout."""
-    from ansible import constants as C
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
 
     roles = list(_gather_public_roles(play))
     defaults = _gather_role_defaults(roles)
-    exports = {}
-    if _core_version(include_patch=True) >= (2, 16, 3) or not C.DEFAULT_PRIVATE_ROLE_VARS:
-        export_args = {"only_exports": True} if _core_version() >= (2, 15) else {}
-        for role in roles:
-            exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
+    exports = _gather_role_exports(roles)
 
     play_vars = play.vars or {}
     magic = _gather_selector_magic(play)
@@ -292,7 +317,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
             value = scope.get(key)
             sources.update(source for source, _, _ in _selector_template_sources(_tag_untrusted(value)))
             for source in sources:
-                dependencies = _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS)
+                dependencies = _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS, allow_controller=True)
                 if dependencies is not None:
                     new_names = dependencies[1] - names
                     names.update(new_names)
@@ -313,7 +338,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
 
-def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, selector=False):
+def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, selector=False, allow_controller=False):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
@@ -334,9 +359,9 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             return None
         for call in expression.find_all(nodes.Call):
             method = call.node
-            if not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
+            if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
-        for name, path in _selector_input_paths(expression, remaining):
+        for name, path in _selector_input_paths(expression, remaining, variables):
             if name == "omit" or (name, path) in seen:
                 continue
             seen.add((name, path))
@@ -344,10 +369,10 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             if name not in variables:
                 continue
             value = variables[name]
-            container = (selector or path) and isinstance(value, (dict, list, tuple))
+            container = (selector or path or allow_controller) and isinstance(value, (dict, list, tuple))
             if not container and value is not None and not isinstance(value, (str, int, float, bool)):
                 return None
-            scope[name] = _tag_untrusted(value)
+            scope[name] = _tag_untrusted(value, template_syntax_only=allow_controller)
             pending.extend((alias, suffix, (name, location), ancestors)
                            for alias, suffix, location in _selector_template_sources(scope[name], path))
     return scope, names
@@ -561,8 +586,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
     ) else None
     order_deferred = {}
+    hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
-        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred)
+        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -686,6 +712,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     result["controller_config"] = controller_config
     if gather_facts is None and gather and "gather_timeout" in (play.get_ds() or {}):
         result["_gather_compile_vars"] = play_vars
+        result["_gather_hash_scope"] = hash_scope
     if ordered_vars_files and unresolved_vars_files:
         for entry in deferred:
             entry["glob_patterns"] = {
@@ -760,7 +787,7 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -779,6 +806,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
         compile_extra_vars = manager.extra_vars
         role_defaults = _gather_role_defaults(_gather_public_roles(play))
         selector_magic = _gather_selector_magic(play)
+    if hash_scope is not None:
+        hash_scope.update(combine_vars(role_defaults, out))
     bundled_inputs = set()
     scanned = 0
     for entry in _as_list(getattr(play, "vars_files", None)):
@@ -795,9 +824,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                 if ordered is not None and unresolved:
                     from .runtime import _GATHER_STRING_METHODS
 
+                    selector_vars = hash_scope if hash_scope is not None else {**role_defaults, **out}
                     dependencies = _gather_timeout_dependencies(
-                        filename, {**role_defaults, **out, **compile_extra_vars, **selector_magic},
-                        _GATHER_STRING_METHODS, selector=True)
+                        filename, combine_vars(combine_vars(selector_vars, compile_extra_vars), selector_magic),
+                        _GATHER_STRING_METHODS, selector=True, allow_controller=True)
                     if dependencies is not None:
                         earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
                         for index, previous in enumerate(earlier, start=scanned):
@@ -811,7 +841,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                         mutable_names = dependencies[1] - compile_extra_vars.keys() - selector_magic.keys()
                         defer_for_order |= bool(mutable_names & bundled_inputs)
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
-                selector_vars = combine_vars(role_defaults, dict(out, playbook_dir=basedir))
+                selector_vars = dict(hash_scope if hash_scope is not None else {**role_defaults, **out},
+                                     playbook_dir=basedir)
                 filename = _template_vars_file_name(play, raw, selector_vars, all_vars, selector_magic)
                 if filename is None:
                     if unresolved is not None and not defer_for_order:
@@ -834,6 +865,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
             for item in mappings:
                 out = combine_vars(out, item)
+                if hash_scope is not None:
+                    merged = combine_vars(hash_scope, item)
+                    hash_scope.clear()
+                    hash_scope.update(merged)
             if defer_for_order:
                 selected_path = os.path.normpath(play._loader.path_dwim(path))
                 checked_paths[filename] = selected_path

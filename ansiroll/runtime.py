@@ -207,7 +207,7 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_input_paths(expression, remaining=()):
+def _selector_input_paths(expression, remaining=(), variables=None):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
     pending = [(expression, ())]
@@ -224,6 +224,11 @@ def _selector_input_paths(expression, remaining=()):
             pending.extend((kw.value, suffix if kw.key == "default_value" else ()) for kw in node.kwargs)
             pending.extend((value, ()) for value in (node.dyn_args, node.dyn_kwargs) if value is not None)
             continue
+        if isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name) and node.node.name in (
+            "lookup", "query", "q",
+        ):
+            pending.extend((child, ()) for child in node.iter_child_nodes() if child is not node.node)
+            continue
         root = node
         path = []
         while isinstance(root, (nodes.Getattr, nodes.Getitem)):
@@ -231,6 +236,12 @@ def _selector_input_paths(expression, remaining=()):
                 path.append(root.attr)
             elif isinstance(root.arg, nodes.Const) and isinstance(root.arg.value, (str, int)):
                 path.append(root.arg.value)
+            elif isinstance(root.node, nodes.Name) and root.node.name == "vars":
+                pending.append((root.arg, ()))
+                key = _selector_vars_key(root.arg, variables or {})
+                if not isinstance(key, str):
+                    break
+                path.append(key)
             else:
                 break
             root = root.node
@@ -244,6 +255,23 @@ def _selector_input_paths(expression, remaining=()):
             pending.append((root, tuple(reversed(path)) + suffix))
         else:
             pending.extend((child, ()) for child in node.iter_child_nodes())
+
+
+def _selector_vars_key(node, variables):
+    """Resolve a vars key from scalar inputs without running template plugins."""
+    if isinstance(node, jinja2.nodes.Const):
+        return node.value
+    if isinstance(node, jinja2.nodes.Name):
+        value = variables.get(node.name)
+        if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+            return value["__ansiroll_unsafe__"]
+        if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
+            return value
+    if isinstance(node, jinja2.nodes.Concat):
+        parts = [_selector_vars_key(part, variables) for part in node.nodes]
+        if all(isinstance(part, str) for part in parts):
+            return "".join(parts)
+    return None
 
 
 def _selector_projection_cycle(origin, path, ancestors):
@@ -2899,7 +2927,8 @@ class Runtime:
             blocked_timeout_inputs = set()
             if timeout_template and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
-                    vars_file_play_vars, vars_files, early_files, vars_file_defaults,
+                    vars_file_play_vars, vars_files, early_files,
+                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {})},
                     blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
@@ -3170,29 +3199,43 @@ class Runtime:
             base = {key: self.vars[key] for key in ("__ansiroll_controller_env", "__ansiroll_controller_config")}
         else:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
-        base = {**defaults, **base}
         selected = dict(play_vars)
+        selector_vars = _f_combine(defaults, None if before_setup else base, selected, recursive=merge_hashes)
+        shadowed = {key for layer in (self.extra_vars, magic or {}) for key, value in layer.items()
+                    if not merge_hashes or not isinstance(value, dict)}
+
+        def apply_files(mappings):
+            nonlocal selected, selector_vars
+            for mapping in mappings:
+                if before_setup:
+                    blocked_inputs.difference_update(
+                        key for key, value in mapping.items() if not merge_hashes or not isinstance(value, dict))
+                else:
+                    selected = _f_combine(selected, mapping, recursive=merge_hashes)
+                selector_vars = _f_combine(selector_vars, mapping, recursive=merge_hashes)
+
         for index, entry in enumerate(entries):
             if "static_vars" in entry:
-                for value in entry["static_vars"]:
-                    selected = _f_combine(selected, value, recursive=merge_hashes)
+                apply_files(entry["static_vars"])
                 continue
-            ctx = self.ctx(selected, self.extra_vars, magic, base={
-                **base, "__ansiroll_lazy_selector_members": True,
+            ctx = self.ctx(_f_combine(selector_vars, self.extra_vars, magic, recursive=merge_hashes), base={
+                "__ansiroll_controller_env": base.get("__ansiroll_controller_env", {}),
+                "__ansiroll_controller_config": base.get("__ansiroll_controller_config", {}),
+                "__ansiroll_lazy_selector_members": True,
             })
             if not before_setup and index in early_files:
                 inputs, mappings = early_files[index]
                 if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
                        key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
                        for key, value in inputs.items()):
-                    selected = _f_combine(selected, *mappings, recursive=merge_hashes)
+                    apply_files(mappings)
                     continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             inputs = {}
             for raw in entry["names"]:
                 if before_setup:
                     dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True)
-                    if dependencies is None:
+                    if dependencies is None or blocked_inputs.difference(shadowed).intersection(dependencies):
                         # A selector we cannot evaluate here may still change inputs to setup.
                         for mappings in entry["files"].values():
                             if isinstance(mappings, list):
@@ -3255,7 +3298,7 @@ class Runtime:
                         if before_setup:
                             break
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    selected = _f_combine(selected, *data, recursive=merge_hashes)
+                    apply_files(data)
                     if before_setup:
                         early_files[index] = (inputs, data)
                     break
@@ -3268,7 +3311,7 @@ class Runtime:
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
                 sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                  % (item,))
-        return selected
+        return selector_vars if before_setup else selected
 
     def _pre_setup_template_inputs(self, source, ctx, *, selector=False):
         inputs = {}
@@ -3287,7 +3330,7 @@ class Runtime:
                 method = call.node
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
-            for name, path in _selector_input_paths(expression, remaining):
+            for name, path in _selector_input_paths(expression, remaining, ctx):
                 if (name, path) in seen:
                     continue
                 seen.add((name, path))
@@ -5000,24 +5043,33 @@ class Runtime:
         config = setup_ctx.get("__ansiroll_controller_config", {})
         merge_hashes = config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         blocked = set(blocked_inputs)
-        if not merge_hashes:
-            blocked.difference_update(role_exports, self.extra_vars)
+        blocked.difference_update(
+            key for layer in (role_exports, self.extra_vars) for key, value in layer.items()
+            if not merge_hashes or not isinstance(value, dict))
         overrides = self.extra_vars.keys() | (vars_files or {}).keys() | blocked
         if not (template.get("required") or template.get("file_names")) and overrides.isdisjoint(template["names"]):
             return timeout
         play_vars = template.get("play_vars") if vars_files is None else vars_files
-        merged_vars = _f_combine(template.get("timeout_defaults"), template["vars"], play_vars,
-                                 role_exports, self.extra_vars, recursive=merge_hashes)
+        defaults = template.get("timeout_defaults") if vars_files is None else None
+        merged_vars = _f_combine(defaults, template["vars"], play_vars, role_exports,
+                                 self.extra_vars, recursive=merge_hashes)
         scope = self.ctx(merged_vars, base={
             "__ansiroll_controller_config": config,
             "__ansiroll_lazy_selector_members": True,
         })
+        error = ("gather_timeout requires a controller template that cannot be rendered before setup; "
+                 "make its vars files and lookup inputs resolvable at compile time")
+        if "controller_inputs" in template:
+            compiled = template["controller_inputs"]
+            if blocked.isdisjoint(template["names"]) and all(
+                scope.get(key, _MISSING_VARS_FILE_INPUT) == compiled.get(key, _MISSING_VARS_FILE_INPUT)
+                for key in template["names"]
+            ):
+                return timeout
+            raise ValueError(error)
         inputs = self._pre_setup_template_inputs(template["source"], scope)
         if inputs is None or not blocked.isdisjoint(set(template["names"]) | inputs.keys()):
-            raise ValueError(
-                "gather_timeout requires a controller template that cannot be rendered before setup; "
-                "make its vars files and lookup inputs resolvable at compile time"
-            )
+            raise ValueError(error)
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))
         if value == _OMIT:
             return template["omit_default"]
