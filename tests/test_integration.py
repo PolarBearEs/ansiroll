@@ -2727,7 +2727,7 @@ def test_ordered_vars_files_keep_intermediate_hash_replacement(tmp_path, monkeyp
     assert runtime.template("{{ settings }}", runtime.ctx()) == {"final": True}
 
 
-@pytest.mark.parametrize("selector", ["magic", "mapping", "mapping_with_lookup"])
+@pytest.mark.parametrize("selector", ["magic", "mapping", "mapping_with_lookup", "mapping_alias"])
 def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp_path, monkeypatch, selector):
     playbook = tmp_path / "play.yml"
     if selector == "magic":
@@ -2739,10 +2739,13 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
         initial = {"config": {"flavor": "default"}}
         override = {"config": {"flavor": "runtime"}}
         prefix = "settings-"
-        if selector == "mapping_with_lookup":
+        if selector in ("mapping_with_lookup", "mapping_alias"):
             monkeypatch.delenv("ANSIROLL_TEST_UNUSED_SELECTOR", raising=False)
             initial["config"]["unused"] = "{{ lookup('env', 'ANSIROLL_TEST_UNUSED_SELECTOR') }}"
             override["config"]["unused"] = "{{ lookup('also_unavailable') }}"
+        if selector == "mapping_alias":
+            initial = {"config": "{{ settings }}", "settings": initial["config"]}
+            override = {"config": "{{ runtime_settings }}", "runtime_settings": override["config"]}
     playbook.write_text("""- hosts: localhost
   vars: %s
   vars_files: ['gather-{{ profile }}.yml', 'settings-%s.yml']
@@ -2791,7 +2794,8 @@ def test_ordered_first_found_does_not_skip_an_unbundled_earlier_path(tmp_path, m
         runtime.run_play(plan)
 
 
-def test_ordered_first_found_rejects_path_outside_glob_depth(tmp_path, monkeypatch):
+@pytest.mark.parametrize("config_dir", ["region/production", ""])
+def test_ordered_first_found_rejects_path_outside_glob_depth(tmp_path, monkeypatch, config_dir):
     from ansiroll.runtime import VarsFilesError
 
     playbook = tmp_path / "play.yml"
@@ -2803,12 +2807,12 @@ def test_ordered_first_found_rejects_path_outside_glob_depth(tmp_path, monkeypat
   gather_timeout: '{{ 23 }}'
   tasks: []
 """)
-    nested = tmp_path / "profiles" / "region" / "production"
+    nested = tmp_path / "profiles" / config_dir
     nested.mkdir(parents=True)
     (nested / "final.yml").write_text("selected: nested\n")
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
     (tmp_path / "gather-normal.yml").write_text("{}\n")
-    (tmp_path / "gather-other.yml").write_text("config_dir: region/production\n")
+    (tmp_path / "gather-other.yml").write_text(json.dumps({"config_dir": config_dir}))
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "normal"})

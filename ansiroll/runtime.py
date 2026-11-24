@@ -207,9 +207,15 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_input_paths(expression):
+def _selector_input_paths(expression, remaining=()):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
+    alias = None
+    if remaining and len(expression.body) == 1 and isinstance(expression.body[0], nodes.Output):
+        outputs = [node for node in expression.body[0].nodes
+                   if not isinstance(node, nodes.TemplateData) or node.data.strip()]
+        if len(outputs) == 1:
+            alias = outputs[0]
     pending = [expression]
     while pending:
         node = pending.pop()
@@ -224,16 +230,18 @@ def _selector_input_paths(expression):
                 break
             root = root.node
         if isinstance(root, nodes.Name) and root.ctx == "load":
-            yield root.name, tuple(reversed(path))
+            suffix = remaining if node is alias else ()
+            yield root.name, tuple(reversed(path)) + suffix
         else:
             pending.extend(node.iter_child_nodes())
 
 
 def _selector_template_sources(value, path=()):
     """Find trusted templates needed to read a selector input."""
-    for key in path:
-        if _looks_templated(value):
-            break
+    for index, key in enumerate(path):
+        if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+            yield value, path[index:]
+            return
         if isinstance(value, dict):
             if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                 return
@@ -257,7 +265,7 @@ def _selector_template_sources(value, path=()):
             else:
                 pending.extend(value)
         elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
-            yield value
+            yield value, ()
 
 
 def _vars_file_glob_covers(pattern, name):
@@ -267,7 +275,8 @@ def _vars_file_glob_covers(pattern, name):
     parts = name.split(os.path.sep)
     patterns = pattern.split(os.path.sep)
     return len(parts) == len(patterns) and all(
-        (not part.startswith(".") or segment.startswith(".")) and fnmatchcase(part, segment)
+        (part or not segment) and (not part.startswith(".") or segment.startswith("."))
+        and fnmatchcase(part, segment)
         for part, segment in zip(parts, patterns)
     )
 
@@ -3213,18 +3222,22 @@ class Runtime:
 
     def _pre_setup_template_inputs(self, source, ctx, *, selector=False):
         inputs = {}
-        pending = [source]
+        pending = [(source, (), ())]
         seen = set()
         while pending:
+            source, remaining, ancestors = pending.pop()
+            if source in ancestors:
+                return None
+            ancestors = (*ancestors, source)
             try:
-                expression = self.templater.env.parse(pending.pop())
+                expression = self.templater.env.parse(source)
             except jinja2.TemplateSyntaxError:
                 return None
             for call in expression.find_all(jinja2.nodes.Call):
                 method = call.node
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
-            paths = (_selector_input_paths(expression) if selector else
+            paths = (_selector_input_paths(expression, remaining) if selector else
                      ((node.name, ()) for node in expression.find_all(jinja2.nodes.Name) if node.ctx == "load"))
             for name, path in paths:
                 if (name, path) in seen:
@@ -3242,7 +3255,8 @@ class Runtime:
                 if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
                     return None
                 inputs[name] = value
-                pending.extend(_selector_template_sources(value, path))
+                pending.extend((alias, suffix, ancestors)
+                               for alias, suffix in _selector_template_sources(value, path))
         return inputs
 
     def _task_ctx(self, task, overlay):
