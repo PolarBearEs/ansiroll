@@ -4064,10 +4064,10 @@ class Runtime:
         parts = src.split("/")
         if parts[-1] in ("", ".", ".."):
             return src
+        normalized = os.path.normpath(src)
         if ".." in parts:
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
-            normalized = os.path.normpath(src)
             shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
             roots = task.get("_baked_tree_roots")
             if roots:
@@ -4090,16 +4090,28 @@ class Runtime:
             aliases = task.get("_baked_tree_aliases") or {}
             if Runtime._baked_role_path(parts, directories, aliases) not in (task.get("_baked") or {}):
                 return src
-        elif os.path.normpath(src) in (task.get("_baked_tree_shadowed") or {}):
-            normalized = os.path.normpath(src)
+            return normalized
+        lookup = Runtime._baked_direct_lookup(task["_baked_tree"], src, normalized)
+        direct = task.get("_baked_direct_sources") or {}
+        direct_key = direct.get(lookup)
+        if direct_key is not None:
+            return direct_key
+        if normalized in (task.get("_baked_tree_shadowed") or {}):
             for _, _, blocked, files in task["_baked_tree_roots"]:
                 if normalized in blocked:
                     break
                 if normalized in files:
-                    return files[normalized] or src
+                    return direct.get(lookup, files[normalized] or src)
             return "\0blocked"
-        # Ansible checks the original relative path, then normalizes it when reading.
-        return os.path.normpath(src)
+        return direct.get(lookup, normalized)
+
+    @staticmethod
+    def _baked_direct_lookup(subdir, src, normalized):
+        first = src.split("/", 1)[0]
+        if (first == "." and normalized.startswith("~")
+                or first != subdir and normalized.split("/", 1)[0] == subdir):
+            return "./" + normalized
+        return normalized
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
@@ -4604,9 +4616,15 @@ class Runtime:
             key = self._baked_source_key(task, src)
             raw = baked.get(key)
             meta = (task.get("_baked_meta") or {}).get(key) or {}
-            if raw is None and self.controller_source_fn:
+            lookup_task_id = None
+            direct_role_src = (task.get("_baked_tree") and isinstance(src, str)
+                               and not os.path.isabs(src) and ".." not in src.split("/"))
+            if direct_role_src:
+                lookup_task_id = task.get("runtime_id")
+            if raw is None and self.controller_source_fn and (key is not None or lookup_task_id):
                 try:
-                    fetched = self.controller_source_fn(src)
+                    fetched = (self.controller_source_fn(src, lookup_task_id) if lookup_task_id
+                               else self.controller_source_fn(src))
                     raw = fetched.get("data")
                     meta = fetched.get("meta") or {}
                     if isinstance(raw, bytes):
@@ -4624,6 +4642,10 @@ class Runtime:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
             fullpath = meta.get("fullpath", src)
+            if name == "template" and direct_role_src and meta.get("lookup_roots"):
+                lookup = self._baked_direct_lookup(task["_baked_tree"], src, os.path.normpath(src))
+                if lookup in meta["lookup_roots"]:
+                    fullpath = meta["lookup_roots"][lookup] + src
             source_display = fullpath
             source_rel = os.path.basename(str(fullpath))
             if args.get("mode") == "preserve":
@@ -6087,8 +6109,8 @@ def agent_main():
             return reply.get("result", {})
         rt.delegate_fn = _delegate
 
-        def _controller_source(path):
-            _chan_send(resp_fd, {"t": "source", "path": path})
+        def _controller_source(path, lookup_task_id=None):
+            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id})
             reply = _chan_recv()
             if not reply or reply.get("t") != "source_result":
                 raise RuntimeError("controller did not return a source result")
