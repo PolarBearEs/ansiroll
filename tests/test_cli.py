@@ -351,6 +351,37 @@ def test_compile_rejects_stderr_alias_with_separate_stdout(tmp_path, output_mode
     assert playbook.read_bytes() == original
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires descriptor access modes")
+@pytest.mark.parametrize("read_only", [True, False])
+def test_file_compile_checks_inherited_and_python_stderr_separately(tmp_path, read_only):
+    playbook = tmp_path / "play.yml"
+    original = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(original)
+    output = tmp_path / "compiled.py"
+    script = """
+import os
+import sys
+from ansiroll import cli
+
+playbook, output, read_only = sys.argv[1:]
+if read_only == 'True':
+    sys.stderr = open(os.devnull, 'w')
+    with open(playbook) as inherited:
+        os.dup2(inherited.fileno(), 2)
+else:
+    sys.stderr = open(playbook, 'a')
+cli.compile_playbook = lambda *args, **kwargs: ('pass\\n', {'modules': [], 'fallback_tasks': []})
+raise SystemExit(cli.main(['compile', playbook, '-o', output]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(playbook), str(output), str(read_only)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == (0 if read_only else 2), result.stderr
+    assert output.exists() == read_only
+    assert playbook.read_text() == original
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
 def test_merged_compile_diagnostics_leave_the_input_fifo_empty(tmp_path):
     playbook = tmp_path / "play.pipe"

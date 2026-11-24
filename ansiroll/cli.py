@@ -55,14 +55,8 @@ def main(argv=None, *, _standalone=False):
     if args.command == "compile":
         if args.output == "-" and _standalone:
             return _cmd_compile_stdout(args)
-        try:
-            stderr_stat = os.fstat(2)
-        except OSError as ex:
-            if ex.errno != errno.EBADF:
-                raise
-        else:
-            if _diagnostic_stream_may_be_playbook(stderr_stat, args.playbook):
-                return 2
+        if _stderr_may_be_playbook(args.playbook):
+            return 2
         if args.output == "-":
             parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
         return _cmd_compile(args)
@@ -536,12 +530,40 @@ def _diagnostic_stream_may_be_playbook(stream, playbook):
     return os.path.samestat(stream, source)
 
 
+def _fd_is_read_only(fd):
+    if os.name != "posix":
+        return False
+    from fcntl import F_GETFL, fcntl
+
+    return (fcntl(fd, F_GETFL) & os.O_ACCMODE) == os.O_RDONLY
+
+
+def _stderr_may_be_playbook(playbook):
+    descriptors = {2}
+    try:
+        descriptors.add(sys.stderr.fileno())
+    except (AttributeError, OSError, ValueError):
+        pass  # In-memory streams and closed streams have no descriptor.
+    for fd in descriptors:
+        try:
+            if _fd_is_read_only(fd):
+                continue
+            info = os.fstat(fd)
+        except OSError as ex:
+            if ex.errno != errno.EBADF:
+                raise
+            continue
+        if _diagnostic_stream_may_be_playbook(info, playbook):
+            return True
+    return False
+
+
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
         _prepare_compile_stderr()
         stderr_stat = os.fstat(2)
-        if _diagnostic_stream_may_be_playbook(stderr_stat, args.playbook):
+        if _stderr_may_be_playbook(args.playbook):
             return 2
         if os.isatty(1):
             raise ValueError("compile -o - requires redirected output: redirect stdout to a pipe or file")
@@ -562,11 +584,7 @@ def _cmd_compile_stdout(args):
 def _prepare_compile_stderr():
     try:
         os.fstat(2)
-        if os.name != "posix":
-            return
-        from fcntl import F_GETFL, fcntl
-
-        if (fcntl(2, F_GETFL) & os.O_ACCMODE) != os.O_RDONLY:
+        if not _fd_is_read_only(2):
             return
     except OSError as ex:
         if ex.errno != errno.EBADF:
