@@ -234,14 +234,20 @@ def test_legacy_vars_methods_resolve_deferred_task_aliases(monkeypatch, loop):
     assert calls == []
 
 
-def test_task_defers_mixed_lookup_in_a_lookup_argument():
+@pytest.mark.parametrize("argument", [
+    '''"{{ lookup('source') }}/{{ suffix }}"''',
+    '''"{{ lookup('source') }}" ~ "/{{ suffix }}"''',
+    '''"{" ~ "{ lookup('source') }}" ~ tail''',
+])
+def test_task_defers_mixed_lookup_in_a_lookup_argument(argument):
     frames, calls = [], []
     rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
     rt.templater._lookup_loaded["source"] = lambda terms, variables: calls.append("source") or ["first"]
     rt.templater._lookup_loaded["consume"] = lambda terms, variables: terms
     variables = {
-        "alias": '''{{ lookup('consume', "{{ lookup('source') }}/{{ suffix }}") }}''',
+        "alias": "{{ lookup('consume', %s) }}" % argument,
         "suffix": "second",
+        "tail": "/second",
     }
     tasks = [
         _task("skip", "Skip", "debug", vars=variables, when=[False], args={"msg": "{{ alias }}"}),
@@ -252,6 +258,18 @@ def test_task_defers_mixed_lookup_in_a_lookup_argument():
     assert [frame["status"] for frame in frames] == ["skipped", "ok", "ok"]
     assert frames[-1]["result"]["msg"] == "first/second"
     assert calls == ["source"]
+
+
+@pytest.mark.parametrize("method", ["items", "values"])
+def test_deferred_vars_methods_produce_loop_lists(method):
+    from ansiroll.runtime import _DEFER_LOOKUP_NAMES
+
+    rt = Runtime({}, "", {})
+    ctx = {"alias": "{{ 'value' }}", _DEFER_LOOKUP_NAMES: True}
+    expected = ("alias", "value") if method == "items" else "value"
+    items = rt._resolve_loop("{{ vars.%s() }}" % method, ctx)
+    assert isinstance(items, list)
+    assert items[0] == expected
 
 
 @pytest.mark.parametrize(

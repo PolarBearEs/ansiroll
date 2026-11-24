@@ -1668,7 +1668,7 @@ def _concretize(value):
     """Consume lazy iterators (selectattr/map/... results) so errors surface at
     template time, like Ansible's templar does."""
     import types
-    if isinstance(value, (types.GeneratorType, map, filter)):
+    if isinstance(value, (types.GeneratorType, map, filter)) or type(value) in (ItemsView, ValuesView):
         return list(value)
     return value
 
@@ -2274,29 +2274,33 @@ class _Templater:
             return False
         if text not in self._lookup_templates:
             nodes = jinja2.nodes
-            has_lookup = dynamic_plugin = False
-            template_args = []
+            has_lookup = defer_lookup = False
             try:
-                pending = [(self.env.parse(text), False)]
+                pending = [(self.env.parse(text), False, False)]
                 while pending:
-                    node, in_lookup = pending.pop()
+                    node, in_lookup, composed = pending.pop()
                     if (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name)
                             and node.node.name in ("lookup", "query", "q")):
                         has_lookup = True
                         in_lookup = True
                         if not node.args or not isinstance(node.args[0], nodes.Const):
-                            dynamic_plugin = True
+                            defer_lookup = True
                             break
-                    if in_lookup and isinstance(node, nodes.Const) and _looks_templated(node.value):
-                        template_args.append(node.value)
-                    pending.extend((child, in_lookup) for child in node.iter_child_nodes())
+                    if in_lookup and isinstance(node, nodes.Const) and isinstance(node.value, str):
+                        # Lookup terms are templated after Jinja constructs them.
+                        # Their rendered shape may differ from any single literal.
+                        if _looks_templated(node.value) or (composed and "{" in node.value):
+                            defer_lookup = True
+                            break
+                    composed = composed or (in_lookup and isinstance(node, (nodes.Concat, nodes.Add)))
+                    pending.extend((child, in_lookup, composed) for child in node.iter_child_nodes())
             except RecursionError:
                 # The parser may succeed later with a shallower call stack.
                 return False
             except jinja2.TemplateSyntaxError:
                 # Report a parser error only if the value is used.
                 pass
-            self._lookup_templates[text] = has_lookup, dynamic_plugin, template_args
+            self._lookup_templates[text] = has_lookup, defer_lookup
         return self._lookup_templates[text][0]
 
     def _contains_mixed_lookup(self, inherited, overrides, role_layers):
@@ -2340,10 +2344,8 @@ class _Templater:
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
                 if self._has_lookup_call(stripped):
-                    _, dynamic_plugin, template_args = self._lookup_templates[stripped]
-                    if dynamic_plugin or self._bare_lookup_expression(stripped) is None:
+                    if self._lookup_templates[stripped][1] or self._bare_lookup_expression(stripped) is None:
                         return True
-                    pending.extend(template_args)
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
                 if type(value) is dict:
