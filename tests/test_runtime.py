@@ -174,6 +174,28 @@ def test_deferred_task_alias_can_read_its_inventory_hostvar():
     assert frames[0]["result"]["msg"] == 17
 
 
+@pytest.mark.parametrize(("member", "template_value", "inventory_value"), [
+    ("key", {"key": "{{ hostvars[inventory_hostname].alias.key }}"}, {"key": 17}),
+    ("0", ["{{ hostvars[inventory_hostname].alias[0] }}"], [17]),
+])
+def test_deferred_task_container_can_read_its_inventory_hostvar(member, template_value, inventory_value):
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "alias": inventory_value}, on_result=frames.append)
+    task = _task("1", "Read inventory fallback", "debug", args={"msg": "{{ alias." + member + " }}"}, vars={
+        "alias": template_value,
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == 17
+
+
+@pytest.mark.parametrize("method", ["pop('alias')", "setdefault('alias')"])
+def test_current_hostvars_methods_resolve_deferred_task_aliases(method):
+    _, frames = run([_task("1", "Read hostvars", "debug", args={
+        "msg": "{{ hostvars[inventory_hostname]." + method + " }}",
+    }, vars={"number": 17, "alias": "{{ number }}"})])
+    assert frames[0]["result"]["msg"] == 17
+
+
 def test_custom_lookup_reads_deferred_task_alias_from_hostvars():
     frames = []
     runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
@@ -192,11 +214,14 @@ def test_legacy_hostvars_items_render_inventory_sources(monkeypatch):
     frames = []
     host_vars = {"inventory_hostname": "h", "hostvars": {"h": {"original": "{{ seed }}"}}, "seed": "ready"}
     runtime = Runtime({}, "", host_vars, on_result=frames.append)
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
     task = _task("1", "Iterate hostvars", "debug", args={
         "msg": "{{ (hostvars[inventory_hostname].items() | selectattr('0', 'equalto', 'original') | first)[1] }}",
     }, vars={"unused": "{{ lookup('unused') }}/tail"})
     runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
     assert frames[0]["result"]["msg"] == "ready"
+    assert not calls
 
 
 @pytest.mark.parametrize("text", [

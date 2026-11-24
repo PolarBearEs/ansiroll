@@ -1107,6 +1107,22 @@ def _observe_container_value(value, rt, render_ctx):
     return templater._observe_untrusted(value)
 
 
+def _read_lazy_member(container, value):
+    ctx = container._render_ctx()
+    binding = getattr(container, "_task_binding", None)
+    if binding is not None:
+        ctx.active_task_bindings.append(binding)
+    try:
+        resolved = _lazy_wrap(value, container._rt, ctx, container._dynamic,
+                              container._origin, container._task_vars)
+    finally:
+        if binding is not None:
+            ctx.active_task_bindings.pop()
+    if binding is not None and isinstance(resolved, (_LazyTplDict, _LazyTplList)):
+        resolved._task_binding = binding
+    return resolved
+
+
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
@@ -1129,9 +1145,7 @@ class _LazyTplDict(dict):
         return ctx
 
     def __getitem__(self, k):
-        return _lazy_wrap(
-            dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic,
-            self._origin, self._task_vars)
+        return _read_lazy_member(self, dict.__getitem__(self, k))
 
     def get(self, k, default=None):
         try:
@@ -1259,6 +1273,7 @@ class _PlayVarScope(dict):
         self.resolved = {}
         self.resolved_task = {}
         self.task_containers = {}
+        self.active_task_bindings = []
         self.resolved_snapshot = {}
         if ctx.get(_DEFER_LOOKUP_NAMES):
             view = _DeferredPlayVarView
@@ -1420,12 +1435,35 @@ class _TaskHostVarView(_LazyTplDict):
         self._host = host
 
     def __getitem__(self, key):
-        value = dict.__getitem__(self, key)
+        return self._resolve(key, dict.__getitem__(self, key))
+
+    def _resolve(self, key, value):
         templater = self._ctx.templater
         # A task alias can read the inventory value it shadows.
-        if isinstance(value, _TaskVarTemplate) and (key, value) in templater._resolving and key in self._host:
+        if key in self._ctx.active_task_bindings or (
+                isinstance(value, _TaskVarTemplate) and (key, value) in templater._resolving):
+            if key not in self._host:
+                return _captured("host variable %r is undefined" % key, missing=True)
             value = self._host[key]
         return templater.resolve_variable(key, value, self._ctx, strict=self._ctx.strict)
+
+    def pop(self, key, *default):
+        if key in self:
+            return self._resolve(key, dict.pop(self, key, *default))
+        return dict.pop(self, key, *default)
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        return key, self._resolve(key, value)
+
+    def setdefault(self, key, default=None):
+        return self[key] if key in self else dict.setdefault(self, key, default)
+
+    def items(self):
+        return ItemsView(self)
+
+    def values(self):
+        return ValuesView(self)
 
 
 class _DeferredVarItems(ItemsView):
@@ -1532,24 +1570,17 @@ class _LazyTplList(list):
     def __getitem__(self, i):
         v = list.__getitem__(self, i)
         if isinstance(i, slice):
-            return [
-                _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic,
-                           self._origin, self._task_vars)
-                for x in v
-            ]
-        return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
-                          self._origin, self._task_vars)
+            return [_read_lazy_member(self, x) for x in v]
+        return _read_lazy_member(self, v)
 
     def __iter__(self):
         for v in list.__iter__(self):
-            yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
-                             self._origin, self._task_vars)
+            yield _read_lazy_member(self, v)
 
     def pop(self, index=-1):
         value = list.pop(self, index)
         if self._task_vars:
-            return _lazy_wrap(value, self._rt, self._render_ctx(), self._dynamic,
-                              self._origin, self._task_vars)
+            return _read_lazy_member(self, value)
         return _observe_container_value(value, self._rt, self._render_ctx)
 
     def copy(self):
@@ -1557,7 +1588,9 @@ class _LazyTplList(list):
         if self._delegated:
             return _LazyTplList(values, self._rt, self._render_ctx(), delegated=True)
         if self._task_vars:
-            return _LazyTplList(values, self._rt, self._ctx, self._dynamic, self._origin, task_vars=True)
+            copied = _LazyTplList(values, self._rt, self._ctx, self._dynamic, self._origin, task_vars=True)
+            copied._task_binding = getattr(self, "_task_binding", None)
+            return copied
         return _observe_container_value(values, self._rt, self._render_ctx)
 
     def remove(self, item):
@@ -2185,7 +2218,10 @@ class _Templater:
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
-            return _lazy_wrap(value, value._rt, ctx)
+            resolved = _lazy_wrap(value, value._rt, ctx)
+            if value._task_vars and isinstance(ctx, _PlayVarScope):
+                resolved._task_binding = key
+            return resolved
         if self._runtime is not None:
             if type(value) in (dict, list, _LoopVarsSnapshot, _RegisteredResult):
                 return _lazy_wrap(value, self._runtime, ctx)
