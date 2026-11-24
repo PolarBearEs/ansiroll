@@ -1396,6 +1396,8 @@ class _DeferredVarItems(ItemsView):
             yield key, self._mapping.iteration_value(key)
 
     def __contains__(self, item):
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
         key, value = item
         if key not in self._mapping:
             return False
@@ -1437,7 +1439,10 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         source = dict.__getitem__(self, key)
         if isinstance(source, _PlayVarTemplate):
             return str(source)
-        return self[key]
+        if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
+                isinstance(source, (_LazyTplDict, _LazyTplList)) and source._task_vars):
+            return self[key]
+        return source
 
     def items(self):
         return _DeferredVarItems(self) if self._legacy_iteration else ItemsView(self)

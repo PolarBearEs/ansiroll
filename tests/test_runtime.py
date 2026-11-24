@@ -234,28 +234,40 @@ def test_legacy_vars_methods_resolve_deferred_task_aliases(monkeypatch, loop):
     assert calls == []
 
 
-def test_legacy_vars_iteration_preserves_deferred_play_sources(monkeypatch):
+@pytest.mark.parametrize("location", ["play", "inventory", "inventory_mapping", "inventory_list"])
+def test_legacy_vars_iteration_preserves_unresolved_sources(monkeypatch, location):
     import ansiroll.runtime as runtime_mod
 
     monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
     frames, calls = [], []
-    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
-    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "used"
     source = "{{ lookup('source') }}/tail"
+    host_vars = {"inventory_hostname": "h"}
+    payload, suffix = {
+        "play": (source, ""), "inventory": (source, ""),
+        "inventory_mapping": ({"nested": source}, ".nested"),
+        "inventory_list": ([source], "[0]"),
+    }[location]
+    if location != "play":
+        host_vars["payload"] = payload
+    play_vars = {"payload": payload} if location == "play" else {"another": "{{ 'value' }}"}
+    rt = Runtime({}, "", host_vars, on_result=frames.append)
+    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "used"
     tasks = [
         _task("keys", "Inspect keys", "debug", args={"msg": "{{ vars.items() | map(attribute=0) | list }}"}),
         _task("source", "Inspect source", "debug", args={
-            "msg": "{{ (vars.items() | selectattr('0', 'equalto', 'payload') | first)[1] }}",
+            "msg": "{{ (vars.items() | selectattr('0', 'equalto', 'payload') | first)[1]%s }}" % suffix,
         }),
+        _task("membership", "Inspect membership", "debug", args={"msg": "{{ 'payload' in vars.items() }}"}),
     ]
-    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": {"payload": source}})
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
     assert "payload" in frames[0]["result"]["msg"]
     assert frames[1]["result"]["msg"] == source
+    assert frames[2]["result"]["msg"] is False
     assert calls == []
 
-    tasks = [_task("read", "Read value", "debug", args={"msg": "{{ vars.payload }}"})]
-    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": {"payload": source}})
-    assert frames[2]["result"]["msg"] == "used/tail"
+    tasks = [_task("read", "Read value", "debug", args={"msg": "{{ vars.payload%s }}" % suffix})]
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
+    assert frames[3]["result"]["msg"] == "used/tail"
     assert calls == ["source"]
 
 
