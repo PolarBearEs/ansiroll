@@ -3367,13 +3367,14 @@ def test_controller_timeout_detects_changed_computed_vars_target(tmp_path, monke
     assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
 
 
-def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, monkeypatch):
+@pytest.mark.parametrize("selector", ["'first_x' | replace('_x', '')", "timeout_var | default('first')"])
+def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, monkeypatch, selector):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars: {first: 23}
-  gather_timeout: "{{ vars['first_x' | replace('_x', '')] }}"
+  gather_timeout: "{{ vars[%s] }}"
   tasks: []
-""")
+""" % selector)
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 23
@@ -3383,6 +3384,60 @@ def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, mo
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_controller_timeout_uses_local_computed_key_invalidation(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TIMEOUT_SUFFIX", "x")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {key: second, first: 23, second: 80}
+  gather_timeout: >-
+    {% set key = 'first' %}{{ vars[key] + (lookup('env', 'ANSIROLL_TIMEOUT_SUFFIX') | length) }}
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 24
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45}, on_result=frames.append)
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda *args, **kwargs: pytest.fail("setup must not run with a stale timeout"))
+    runtime.run_play(plan)
+    assert runtime.failed
+    assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+
+
+@pytest.mark.parametrize("profile", ["default", "runtime"])
+def test_indirect_timeout_selector_tracks_earlier_vars_file_writes(tmp_path, monkeypatch, profile):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: default, layer: default}
+  vars_files:
+    - "settings-{{ profile }}.yml"
+    - "timeout-{{ lookup('vars', 'reyal' | reverse | join) }}.yml"
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "settings-default.yml").write_text("{}\n")
+    (tmp_path / "settings-runtime.yml").write_text("layer: runtime\n")
+    (tmp_path / "timeout-default.yml").write_text("timeout_seconds: 23\n")
+    (tmp_path / "timeout-runtime.yml").write_text("timeout_seconds: 45\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile},
+                      on_result=frames.append)
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if profile == "runtime":
+        assert runtime.failed
+        assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+        assert not called
+    else:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):

@@ -881,8 +881,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     if portable is not None and not (filename.startswith(("{{", "{%")) and "/" in filename):
                         defer_for_order |= bool(portable[1] - compile_extra_vars.keys() - selector_magic.keys())
                     dependencies = portable
+                    paths, unknown_lookup = set(), set()
                     if portable is None:
-                        paths, unknown_lookup = set(), set()
                         dependencies = _gather_timeout_dependencies(
                             filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                             paths=paths, unknown_lookup=unknown_lookup)
@@ -898,8 +898,16 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                                     for mapping in contents:
                                         bundled_inputs.update(mapping)
                         scanned = len(unresolved)
-                        mutable_names = dependencies[1] - compile_extra_vars.keys() - selector_magic.keys()
-                        defer_for_order |= bool(mutable_names & bundled_inputs)
+                        selector_names = dependencies[1] | (bundled_inputs if unknown_lookup else set())
+                        mutable_names = selector_names - compile_extra_vars.keys() - selector_magic.keys()
+                        affected = mutable_names & bundled_inputs
+                        defer_for_order |= bool(affected)
+                        if unknown_lookup and affected:
+                            scope = dict(dependencies[0])
+                            scope.update({key: _tag_untrusted(inputs[key], template_syntax_only=True)
+                                          for key in affected if key in inputs})
+                            paths.update((key, ()) for key in affected)
+                            controller_inputs = {"inputs": scope, "paths": sorted(paths, key=repr)}
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 selector_vars = dict(hash_scope if hash_scope is not None else {**role_defaults, **out},
                                      playbook_dir=basedir)

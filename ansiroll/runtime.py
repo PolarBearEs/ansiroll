@@ -211,6 +211,12 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                           *, resolve_aliases=False):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
+    # A template binding can shadow a play variable. Do not guess the
+    # binding's value from the play scope.
+    local_names = {node.name for node in expression.find_all(nodes.Name) if node.ctx != "load"}
+    if local_names:
+        variables = dict(variables or {})
+        variables.update(dict.fromkeys(local_names))
     pending = [(expression, ())]
     if remaining and len(expression.body) == 1 and isinstance(expression.body[0], nodes.Output):
         outputs = [node for node in expression.body[0].nodes
@@ -319,6 +325,14 @@ def _selector_vars_key(node, variables, aliases=None):
         index = _selector_vars_key(node.arg, variables, aliases)
         if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
             return value[index]
+    if (isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d")
+            and not (node.kwargs or node.dyn_args or node.dyn_kwargs) and len(node.args) <= 2):
+        value = _selector_vars_key(node.node, variables, aliases)
+        missing = isinstance(node.node, jinja2.nodes.Name) and node.node.name not in variables
+        boolean = _selector_vars_key(node.args[1], variables, aliases) if len(node.args) == 2 else False
+        if missing or (value is not None and boolean and not value):
+            return _selector_vars_key(node.args[0], variables, aliases) if node.args else ""
+        return value if boolean is not None else None
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
         if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
             value = _selector_vars_key(node.node, variables, aliases)
