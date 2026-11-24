@@ -28,7 +28,7 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import Generator, ItemsView, KeysView, MutableSequence, ValuesView
+from collections.abc import Generator, ItemsView, KeysView, MutableMapping, MutableSequence, ValuesView
 from contextlib import contextmanager
 from functools import wraps
 from itertools import groupby
@@ -227,20 +227,20 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             return _UnsafeText(value)
         return value
-    if isinstance(value, (dict, list, tuple, _HostVarEntries)):
+    if isinstance(value, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
         if _seen is None:
             _seen = {}
         # Keep source containers alive because lazy views create temporary
         # wrappers whose object IDs could be reused during this traversal.
         if id(value) in _seen:
             return _seen[id(value)][1]
-        if isinstance(value, dict):
+        if isinstance(value, (dict, _RawSnapshotMapping)):
             out = {}
             _seen[id(value)] = (value, out)
             # Lazy views render on access; plain containers are read raw.
             if reject_vault and isinstance(value, _LazyTplDict):
                 items = ((key, value[key]) for key in value)
-            elif isinstance(value, (_LazyTplDict, _PlayVarView)):
+            elif isinstance(value, (_LazyTplDict, _PlayVarView, _RawSnapshotMapping)):
                 items = value.items()
             else:
                 items = dict.items(value)
@@ -250,10 +250,10 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
                 out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
                                                preserve_lookup_hostvars, reject_vault)
             return out
-        if isinstance(value, (list, _HostVarEntries)):
+        if isinstance(value, (list, _HostVarEntries, _RawSnapshotList)):
             out = []
             _seen[id(value)] = (value, out)
-            items = iter(value) if isinstance(value, (_LazyTplList, _HostVarEntries)) else list.__iter__(value)
+            items = iter(value) if isinstance(value, (_LazyTplList, _HostVarEntries, _RawSnapshotList)) else list.__iter__(value)
             out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
                                     preserve_lookup_hostvars, reject_vault) for v in items)
             return out
@@ -776,14 +776,16 @@ def _f_to_json(v, **kwargs):
     return json.dumps(_mark_unsafe(v, reject_vault=True), **kwargs)
 
 
-def _host_entries_json_options(options):
-    """Let the JSON encoder handle normal values and expand host entries on demand."""
+def _view_json_options(options):
+    """Expand the runtime's mapping and sequence views when encoding JSON."""
     options = dict(options)
 
     def expand(value, fallback):
-        if not isinstance(value, _HostVarEntries):
-            return fallback(value)
-        return list(value)
+        if isinstance(value, (_HostVarEntries, _RawSnapshotList)):
+            return list(value)
+        if isinstance(value, _RawSnapshotMapping):
+            return dict(value)
+        return fallback(value)
 
     fallback = options.get("default")
     if fallback is not None:
@@ -791,17 +793,17 @@ def _host_entries_json_options(options):
     else:
         encoder = options.get("cls") or json.JSONEncoder
 
-        class HostEntriesEncoder(encoder):
+        class ViewEncoder(encoder):
             def default(self, value):
                 return expand(value, super().default)
 
-        options["cls"] = HostEntriesEncoder
+        options["cls"] = ViewEncoder
     return options
 
 
 def _jinja_tojson(eval_ctx, value, indent=None):
     policies = eval_ctx.environment.policies
-    options = _host_entries_json_options(policies["json.dumps_kwargs"])
+    options = _view_json_options(policies["json.dumps_kwargs"])
     if indent is not None:
         options["indent"] = indent
     return jinja2.utils.htmlsafe_json_dumps(value, policies["json.dumps_function"], **options)
@@ -1293,22 +1295,143 @@ def _read_snapshot_member(container, value):
     return container._rt.templater._observe_untrusted(value)
 
 
-def _raw_inventory_snapshot(value, seen=None):
-    """Expose current writes without evaluating inventory templates."""
+def _raw_inventory_member(container, value):
+    """Read source data or a live view of an inherited nested container."""
+    if isinstance(value, _SnapshotBinding):
+        if type(value.source) in (dict, list):
+            container._read_member(value)
+        value = value.raw_value()
+    if isinstance(value, (_LazyMappingSnapshot, _LazyListSnapshot)) and value._inventory_snapshot:
+        return value._raw_view
+    return value
+
+
+class _RawSnapshotMapping(MutableMapping):
+    """Access a snapshot's mapping as literal data while sharing its storage."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __getitem__(self, key):
+        return _raw_inventory_member(self._owner, dict.__getitem__(self._owner, key))
+
+    def __setitem__(self, key, value):
+        self._owner[key] = value
+
+    def __delitem__(self, key):
+        del self._owner[key]
+
+    def __iter__(self):
+        return dict.__iter__(self._owner)
+
+    def __len__(self):
+        return len(self._owner)
+
+    def popitem(self):
+        key, value = dict.popitem(self._owner)
+        return key, _raw_inventory_member(self._owner, value)
+
+    def copy(self):
+        return dict(self)
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def __deepcopy__(self, memo):
+        return _deepcopy_snapshot_data(self._owner, memo)
+
+
+class _RawSnapshotList(MutableSequence):
+    """Access a snapshot's list as literal data while sharing its storage."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __getitem__(self, index):
+        value = list.__getitem__(self._owner, index)
+        if isinstance(index, slice):
+            return [_raw_inventory_member(self._owner, member) for member in value]
+        return _raw_inventory_member(self._owner, value)
+
+    def __setitem__(self, index, value):
+        self._owner[index] = value
+
+    def __delitem__(self, index):
+        del self._owner[index]
+
+    def __len__(self):
+        return len(self._owner)
+
+    def insert(self, index, value):
+        self._owner.insert(index, value)
+
+    def copy(self):
+        return list(self)
+
+    def sort(self, *, key=None, reverse=False):
+        def raw_key(value):
+            member = _raw_inventory_member(self._owner, value)
+            return key(member) if key is not None else member
+
+        list.sort(self._owner, key=raw_key, reverse=reverse)
+
+    def __eq__(self, other):
+        if not isinstance(other, (list, _RawSnapshotList)):
+            return NotImplemented
+        return len(self) == len(other) and _compare_list_members(self, other, operator.eq)
+
+    def _compare_order(self, other, compare):
+        if not isinstance(other, (list, _RawSnapshotList)):
+            return NotImplemented
+        return _compare_list_members(self, other, compare)
+
+    def __lt__(self, other):
+        return self._compare_order(other, operator.lt)
+
+    def __le__(self, other):
+        return self._compare_order(other, operator.le)
+
+    def __gt__(self, other):
+        return self._compare_order(other, operator.gt)
+
+    def __ge__(self, other):
+        return self._compare_order(other, operator.ge)
+
+    def __add__(self, other):
+        return list(self) + (list(other) if isinstance(other, _RawSnapshotList) else other)
+
+    def __radd__(self, other):
+        return other + list(self)
+
+    def __mul__(self, count):
+        return list(self) * count
+
+    __rmul__ = __mul__
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def __deepcopy__(self, memo):
+        return _deepcopy_snapshot_data(self._owner, memo)
+
+
+def _deepcopy_snapshot_data(value, memo):
+    """Copy source data and snapshot writes without copying a Jinja scope."""
+    from copy import deepcopy
+
     if isinstance(value, _SnapshotBinding):
         value = value.raw_value()
-    if not isinstance(value, (_LazyMappingSnapshot, _LazyListSnapshot)) or not value._inventory_snapshot:
-        return value
-    if seen is None:
-        seen = {}
-    if id(value) in seen:
-        return seen[id(value)]
+    if id(value) in memo:
+        return memo[id(value)]
     if isinstance(value, dict):
-        result = seen[id(value)] = {}
-        result.update((key, _raw_inventory_snapshot(member, seen)) for key, member in dict.items(value))
+        result = memo[id(value)] = {}
+        result.update((deepcopy(key, memo), _deepcopy_snapshot_data(member, memo))
+                      for key, member in dict.items(value))
+    elif isinstance(value, list):
+        result = memo[id(value)] = []
+        result.extend(_deepcopy_snapshot_data(member, memo) for member in list.__iter__(value))
     else:
-        result = seen[id(value)] = []
-        result.extend(_raw_inventory_snapshot(member, seen) for member in list.__iter__(value))
+        return deepcopy(value, memo)
     return result
 
 
@@ -1319,6 +1442,8 @@ class _LazyMappingSnapshot(_LazyTplDict):
         super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=source._task_vars)
         self._task_binding = getattr(source, "_task_binding", None)
         self._inventory_snapshot = inventory
+        if inventory:
+            self._raw_view = _RawSnapshotMapping(self)
 
     def _read_member(self, value):
         return _read_snapshot_member(self, value)
@@ -1829,7 +1954,9 @@ class _DeferredPlayVarView(_ModernPlayVarView):
             if not isinstance(source, _SnapshotBinding):
                 return self.scope.templater._observe_untrusted(source)
             if type(source.source) in (dict, list):
-                return _raw_inventory_snapshot(source)
+                resolved = self._resolve(key, source)
+                if isinstance(resolved, (_LazyMappingSnapshot, _LazyListSnapshot)) and resolved._inventory_snapshot:
+                    return resolved._raw_view
             source = source.source
         # Legacy iteration still exposes play template source, while accessed
         # containers retain their mutations in the snapshot.
@@ -1854,6 +1981,9 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         view._is_snapshot = True
         dict.__init__(view, raw)
         return view
+
+    def __deepcopy__(self, memo):
+        return _deepcopy_snapshot_data(self, memo)
 
     def pop(self, key, *default):
         if key in self:
@@ -1928,7 +2058,7 @@ class _LazyTplList(list):
         return _observe_container_value(values, self._rt, self._render_ctx)
 
     def remove(self, item):
-        if not (self._delegated or self._task_vars):
+        if not self._uses_lazy_members():
             return list.remove(self, item)
         for index, value in enumerate(self):
             if value is item or value == item:
@@ -1941,9 +2071,12 @@ class _LazyTplList(list):
             self[:] = list(self)
         list.sort(self, key=key, reverse=reverse)
 
+    def _uses_lazy_members(self):
+        return self._delegated or self._task_vars
+
     def _compares_resolved_items(self, other):
-        return isinstance(other, list) and (self._delegated or self._task_vars or (
-            isinstance(other, _LazyTplList) and (other._delegated or other._task_vars)))
+        return isinstance(other, list) and (self._uses_lazy_members() or (
+            isinstance(other, _LazyTplList) and other._uses_lazy_members()))
 
     def _compare_order(self, other, compare, raw_compare):
         if self._compares_resolved_items(other):
@@ -2018,12 +2151,24 @@ class _LazyListSnapshot(_LazyTplList):
                          task_vars=source._task_vars, delegated=source._delegated)
         self._task_binding = getattr(source, "_task_binding", None)
         self._inventory_snapshot = inventory
+        if inventory:
+            self._raw_view = _RawSnapshotList(self)
 
     def _read_member(self, value):
         return _read_snapshot_member(self, value)
 
     def pop(self, index=-1):
         return self._read_member(list.pop(self, index))
+
+    def _uses_lazy_members(self):
+        return True
+
+    def sort(self, *, key=None, reverse=False):
+        def resolved_key(value):
+            member = self._read_member(value)
+            return key(member) if key is not None else member
+
+        list.sort(self, key=resolved_key, reverse=reverse)
 
     def copy(self):
         return _LazyListSnapshot(self, list.copy(self), inventory=self._inventory_snapshot)
@@ -2108,8 +2253,9 @@ def _jinja_dict(*args, **kwargs):
 
 def _type_name(value):
     """type_debug: internal wrappers report the builtin type they stand for."""
-    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"),
-                           (_LazyTplList, "list"), (_HostVarEntries, "list"), (_LazyTplTuple, "tuple"),
+    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"), (_RawSnapshotMapping, "dict"),
+                           (_LazyTplList, "list"), (_HostVarEntries, "list"), (_RawSnapshotList, "list"),
+                           (_LazyTplTuple, "tuple"),
                            (_DeferredVarItems, "ItemsView"), (_DeferredVarValues, "ValuesView")):
         if isinstance(value, internal):
             return name
@@ -3044,7 +3190,7 @@ def _as_text(v):
     if v is None:
         return ""
     if isinstance(v, (dict, list, _HostVarEntries)):
-        return json.dumps(v, **_host_entries_json_options({}))
+        return json.dumps(v, **_view_json_options({}))
     if isinstance(v, bool):
         return "true" if v else "false"
     return str(v)
@@ -3269,7 +3415,7 @@ class Runtime:
             return tuple(self.template(v, ctx, _seen, strict) for v in value)
         if isinstance(value, str):
             out = self.templater.render_string(value, ctx, strict=strict)
-            if isinstance(out, (dict, list, tuple)) and out is not value:
+            if isinstance(out, (dict, list, tuple, _RawSnapshotMapping, _RawSnapshotList)) and out is not value:
                 # A bare expression returned a container that may hold lazy
                 # variable views -- resolve them now that it is used.  The
                 # result is data and is never templated again.

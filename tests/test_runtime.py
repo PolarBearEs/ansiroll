@@ -224,6 +224,61 @@ def test_legacy_vars_copy_iteration_keeps_unmodified_inventory_members_literal(m
     assert calls == ["inventory"]
 
 
+def test_legacy_vars_copy_list_operations_preserve_inventory_sources(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('number') }}"
+    runtime = Runtime({}, "", {"nums": [3, 1, literal]})
+    runtime.templater.env.globals["lookup"] = lambda name: 2 if name == "number" else pytest.fail(name)
+    task = _task("1", "Sort inventory list", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set ignored = copied.nums.sort() %}"
+                "{% set removed = copied.nums.remove(1) %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'nums') | first)[1] %}"
+                "{{ [copied.nums < [4], copied.nums, entry] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        True, [2, 3], [literal, 3],
+    ]
+
+
+@pytest.mark.parametrize("filter_name", ["to_json", "tojson"])
+def test_legacy_vars_copy_iteration_and_direct_reads_share_mutations(monkeypatch, filter_name):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('inventory') }}"
+    runtime = Runtime({}, "", {"payload": {"child": literal, "nested": [1]}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Mutate an iteration entry", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set payload = copied.payload %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set changed = entry.update(added=2) %}{% set appended = entry.nested.append(3) %}"
+                "{{ [copied.payload.added, payload.nested, entry] | " + filter_name + " }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        2, [1, 3], {"added": 2, "child": literal, "nested": [1, 3]},
+    ]
+
+
+def test_deep_copy_of_legacy_vars_detaches_data_without_resolving_unused_inputs(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"nested": [1]}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "deep_copy", "source": """
+from copy import deepcopy
+
+class FilterModule:
+    def filters(self):
+        return {'deep_copy': deepcopy}
+"""}])
+    task = _task("1", "Deep copy vars", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set seen = copied.payload.nested.append(2) %}"
+                "{% set detached = copied | deep_copy %}{% set changed = detached.payload.nested.append(3) %}"
+                "{{ [copied.payload.nested, detached.payload.nested] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [[1, 2], [1, 2, 3]]
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",
