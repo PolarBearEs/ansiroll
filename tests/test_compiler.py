@@ -435,7 +435,8 @@ def test_deferred_vars_file_projects_qualified_join_of_known_and_fallback_lists(
 
 
 @pytest.mark.parametrize("inventory_name", ["inventory_hostname", "inventory_hostname_short"])
-def test_standalone_vars_files_bundle_hostname_directories(tmp_path, monkeypatch, inventory_name):
+@pytest.mark.parametrize("prefix", ["", "hosts/"])
+def test_standalone_vars_files_bundle_hostname_directories(tmp_path, monkeypatch, inventory_name, prefix):
     from ansiroll import compile_playbook
     from ansiroll.loader import parse_playbook
 
@@ -445,25 +446,26 @@ def test_standalone_vars_files_bundle_hostname_directories(tmp_path, monkeypatch
     playbook.write_text("""- hosts: all
   gather_facts: false
   vars_files:
-    - "{{ %s | default('fallback') }}/settings.yml"
+    - "%s{{ %s | default('fallback') }}/settings.yml"
   tasks:
     - debug: {msg: '{{ selected }}'}
-""" % inventory_name)
+""" % (prefix, inventory_name))
+    host_root = project / prefix
     launcher_host = "worker.example.test"
     worker_dir = launcher_host if inventory_name == "inventory_hostname" else "worker"
     for directory in ("localhost", worker_dir, "fallback", "nested/deeper"):
-        path = project / directory / "settings.yml"
+        path = host_root / directory / "settings.yml"
         path.parent.mkdir(parents=True)
         path.write_text(f"selected: {directory}\n")
-    with (project / worker_dir / "settings.yml").open("a") as worker_vars:
+    with (host_root / worker_dir / "settings.yml").open("a") as worker_vars:
         worker_vars.write("unused: \"{{ lookup('env', 'ANSIROLL_UNSELECTED_HOST_SECRET') }}\"\n")
     monkeypatch.setenv("ANSIROLL_UNSELECTED_HOST_SECRET", "controller-only-value")
     (tmp_path / "external").mkdir()
     (tmp_path / "external" / "settings.yml").write_text("selected: external\n")
-    (project / "outside").symlink_to(tmp_path / "external", target_is_directory=True)
+    (host_root / "outside").symlink_to(tmp_path / "external", target_is_directory=True)
     plays, _ = parse_playbook(str(playbook))
     files = plays[0]["deferred_vars_files"][0]["files"]
-    assert set(files) == {str(project / directory / "settings.yml") for directory in ("localhost", worker_dir, "fallback")}
+    assert set(files) == {str(host_root / directory / "settings.yml") for directory in ("localhost", worker_dir, "fallback")}
     assert "ANSIROLL_UNSELECTED_HOST_SECRET" not in plays[0].get("controller_env", {})
     compiled = project / "compiled.py"
     compiled.write_text(compile_playbook(str(playbook))[0])
@@ -474,6 +476,39 @@ def test_standalone_vars_files_bundle_hostname_directories(tmp_path, monkeypatch
         frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
                   if line.startswith("__ANSIROLL_RESULT__ ")]
         assert frame["result"]["msg"] == expected
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_hostname_vars_file_provenance_follows_later_selectors(tmp_path, monkeypatch, independent):
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    monkeypatch.setenv("ANSIROLL_UNSELECTED_PROFILE_SECRET", "controller-only-value")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - 'hosts/{{ inventory_hostname_short }}/settings.yml'
+    - '{{ profile_path }}'
+    - '{{ followup_path }}'
+%s  tasks:
+    - debug: {msg: '{{ selected }}'}
+""" % ("    - profiles/worker.yml\n" if independent else ""))
+    worker = tmp_path / "hosts" / "worker"
+    worker.mkdir(parents=True)
+    (worker / "settings.yml").write_text("profile_path: profiles/first.yml\n")
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "first.yml").write_text("followup_path: profiles/worker.yml\n")
+    (profiles / "worker.yml").write_text(
+        "selected: worker\nunused: \"{{ lookup('env', 'ANSIROLL_UNSELECTED_PROFILE_SECRET') }}\"\n")
+    plays, _ = parse_playbook(str(playbook))
+    plan = plays[0]
+    env = plan.get("controller_env", {})
+    assert ("ANSIROLL_UNSELECTED_PROFILE_SECRET" in env) == independent
+    frames = []
+    Runtime({}, "", {"inventory_hostname_short": "worker"}, on_result=frames.append).run_play(plan)
+    assert [frame["result"]["msg"] for frame in frames] == ["worker"]
 
 
 def test_standalone_vars_files_keep_glob_for_overridden_ternary(tmp_path):
