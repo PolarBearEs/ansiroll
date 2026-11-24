@@ -470,17 +470,23 @@ class FilterModule:
     assert str(result) == "17"
 
 
-def test_custom_filter_macro_callback_keeps_hostvars_entries_lazy():
+@pytest.mark.parametrize("template", [
+    "{% macro selected() %}{{ hostvars.h.values()[0] }}{% endmacro %}{{ selected | invoke_callback }}",
+    ("{% for row in [[17]] recursive %}{% if row is number %}{{ hostvars.h.values()[0] }}"
+     "{% else %}{{ loop | invoke_callback(row) }}{% endif %}{% endfor %}"),
+    ("{% if false %}{% block selected %}{{ hostvars.h.values()[0] }}{% endblock %}{% endif %}"
+     "{{ self.selected | invoke_callback }}"),
+], ids=["macro", "recursive_loop", "block"])
+def test_custom_filter_jinja_callback_keeps_hostvars_entries_lazy(template):
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
     runtime.templater.register_plugins([{"kind": "filter", "name": "invoke", "source": """
 class FilterModule:
     def filters(self):
-        return {'invoke_macro': lambda macro: macro()}
+        return {'invoke_callback': lambda callback, *args: callback(*args)}
 """}])
     runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
-    task = _task("1", "Invoke a Jinja macro from a filter", "debug", loop=["sample"],
+    task = _task("1", "Invoke a Jinja callback from a filter", "debug", loop=["sample"],
                  vars={"unused": "{{ lookup('unused') }}/tail"})
-    template = "{% macro selected() %}{{ hostvars.h.values()[0] }}{% endmacro %}{{ selected | invoke_macro }}"
     result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
     assert result == "17"
 

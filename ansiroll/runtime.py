@@ -2087,13 +2087,13 @@ def _wrap_custom_plugin(fn, templater):
             kwargs = {key: _custom_plugin_arg(value, converted) for key, value in kwargs.items()}
             result = fn(*args, **kwargs)
         if isinstance(result, Generator):
-            return _resume_plugin_generator(result, templater, converted)
+            return _resume_scoped_generator(result, templater, converted)
         return result
     return wrapped
 
 
-class _PluginGenerator(Generator):
-    """Resume a Python plugin only while the generator executes its own code."""
+class _ScopedGenerator(Generator):
+    """Restore the caller's normalization scope while a generator is suspended."""
 
     def __init__(self, generator, templater, converted):
         self._generator = generator
@@ -2113,8 +2113,8 @@ class _PluginGenerator(Generator):
             return self._generator.close()
 
 
-def _resume_plugin_generator(generator, templater, converted):
-    return (yield from _PluginGenerator(generator, templater, converted))
+def _resume_scoped_generator(generator, templater, converted):
+    return (yield from _ScopedGenerator(generator, templater, converted))
 
 
 def _wrap_filter(fn):
@@ -2177,10 +2177,11 @@ class _ConditionalName:
 
 
 class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
-    def macro_def(self, macro_ref, frame):
-        self.write("environment._ansiroll_templater._wrap_macro(")
-        super().macro_def(macro_ref, frame)
-        self.write(")")
+    def func(self, name):
+        # A Python plugin can call back into any generated template body,
+        # including recursive loops and blocks, without a new render_string.
+        self.writeline("@environment._ansiroll_templater._wrap_jinja_callback")
+        return super().func(name)
 
 
 class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
@@ -2369,20 +2370,17 @@ class _Templater:
         finally:
             self._custom_plugin_args = previous
 
-    def _wrap_macro(self, macro):
-        # Keep Jinja's Macro object and its metadata while isolating the body
-        # from a Python plugin that calls it directly.
-        body = macro._func
-
+    def _wrap_jinja_callback(self, body):
         @wraps(body)
-        def wrapped(*args):
+        def wrapped(*args, **kwargs):
             if self._custom_plugin_args is None:
-                return body(*args)
+                return body(*args, **kwargs)
             with self._plugin_arg_scope(None):
-                return body(*args)
-
-        macro._func = wrapped
-        return macro
+                result = body(*args, **kwargs)
+            if isinstance(result, Generator):
+                return _resume_scoped_generator(result, self, None)
+            return result
+        return wrapped
 
     def _lookup_ctx(self, name, terms):
         """The vars lookup templates trusted values like a variable reference."""
