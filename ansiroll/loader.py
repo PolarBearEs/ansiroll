@@ -154,7 +154,8 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         compiled_play_vars = node.pop("_gather_compile_vars", None)
         hash_scope = node.pop("_gather_hash_scope", None)
         if compiled_play_vars is not None:
-            node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope))
+            node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope,
+                                                replay_files=bool(node.get("ordered_vars_files"))))
         if node.get("ordered_vars_files"):
             node.update(_gather_timeout_file_scope(
                 play, node["ordered_vars_files"], node.get("gather_timeout_template")))
@@ -165,7 +166,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
     return plays, actions
 
 
-def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, hash_scope=None):
+def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, hash_scope=None, *, replay_files=False):
     """Validate the play keyword in the same controller scope as Ansible."""
     from ansible.errors import AnsibleError, AnsibleUndefinedVariable
     from jinja2 import UndefinedError
@@ -188,11 +189,20 @@ def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, 
     else:
         from ansible.utils.vars import combine_vars
 
-        variables = combine_vars(hash_scope, _gather_role_exports(_gather_public_roles(play)))
+        variables = hash_scope
+        for export in _gather_role_exports(_gather_public_roles(play)):
+            variables = combine_vars(variables, export)
         variables = combine_vars(variables, variable_manager.extra_vars)
         variables = combine_vars(variables, _gather_selector_magic(play))
         variables["vars"] = dict(variables)
     runtime = _gather_timeout_template(play.gather_timeout, variables)
+    if runtime is not None and runtime.get("computed_vars") and not replay_files:
+        roles = list(_gather_public_roles(play))
+        available = compiled_play_vars.keys() | _gather_role_defaults(roles).keys()
+        for export in _gather_role_exports(roles):
+            available.update(export)
+        runtime["vars"].update({key: _tag_untrusted(variables[key])
+                                for key in sorted(available & variables.keys())})
     try:
         timeout_play.post_validate(Templar(loader=loader, variables=variables))
     except AnsibleError as error:
@@ -216,7 +226,8 @@ def _gather_timeout_template(source, variables):
 
     if not isinstance(source, str) or not _is_templated(source) or not isinstance(_tag_untrusted(source), str):
         return None
-    dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS)
+    computed = set()
+    dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS, computed=computed)
     controller_only = dependencies is None
     if controller_only:
         dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS,
@@ -232,6 +243,8 @@ def _gather_timeout_template(source, variables):
     if controller_only:
         runtime.pop("source")
         runtime["controller_inputs"] = scope
+    elif computed:
+        runtime["computed_vars"] = True
     return runtime
 
 
@@ -259,14 +272,11 @@ def _gather_role_defaults(roles):
 
 def _gather_role_exports(roles):
     from ansible import constants as C
-    from ansible.utils.vars import combine_vars
 
-    exports = {}
     if _core_version(include_patch=True) >= (2, 16, 3) or not C.DEFAULT_PRIVATE_ROLE_VARS:
         export_args = {"only_exports": True} if _core_version() >= (2, 15) else {}
         for role in roles:
-            exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
-    return exports
+            yield role.get_vars(include_params=False, **export_args)
 
 
 def _gather_selector_magic(play):
@@ -277,16 +287,23 @@ def _gather_selector_magic(play):
 
 def _gather_timeout_file_scope(play, entries, runtime):
     """Keep original file order and the play layers needed by a runtime timeout."""
+    from ansible import constants as C
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
 
     roles = list(_gather_public_roles(play))
     defaults = _gather_role_defaults(roles)
-    exports = _gather_role_exports(roles)
+    exports = list(_gather_role_exports(roles))
 
     play_vars = play.vars or {}
     magic = _gather_selector_magic(play)
     selector_scope = combine_vars(combine_vars(defaults, play_vars), magic)
+    timeout_scope = selector_scope
+    export_replacements = set()
+    for export in exports:
+        timeout_scope = combine_vars(timeout_scope, export)
+        export_replacements.update(key for key, value in export.items()
+                                   if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict))
     selector_names = set()
     timeout_names = set(runtime["names"]) if runtime is not None else set()
     file_aliases = {}
@@ -308,7 +325,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
                         file_aliases.setdefault(key, set()).add(source)
     for names, scope, shadowed in (
         (selector_names, selector_scope, {}),
-        (timeout_names, combine_vars(selector_scope, exports), exports),
+        (timeout_names, timeout_scope, export_replacements),
     ):
         pending = list(names)
         while pending:
@@ -330,15 +347,18 @@ def _gather_timeout_file_scope(play, entries, runtime):
         runtime["vars"] = {key: value for key, value in runtime["vars"].items() if key not in file_names}
         runtime["play_vars"] = _tag_untrusted(play_vars)
         runtime["timeout_defaults"] = _tag_untrusted(
-            {key: defaults[key] for key in sorted(timeout_names & defaults.keys())})
-        runtime["role_exports"] = _tag_untrusted(
-            {key: exports[key] for key in sorted(timeout_names & exports.keys())})
+            {key: value for key, value in defaults.items() if runtime.get("computed_vars") or key in timeout_names})
+        runtime["role_exports"] = _tag_untrusted([
+            {key: value for key, value in export.items() if runtime.get("computed_vars") or key in timeout_names}
+            for export in exports
+        ])
     return {
         "vars_file_defaults": _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())}),
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
 
-def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, selector=False, allow_controller=False):
+def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
+                                 selector=False, allow_controller=False, computed=None):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
@@ -361,7 +381,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
-        for name, path in _selector_input_paths(expression, remaining, variables):
+        for name, path in _selector_input_paths(expression, remaining, variables, computed):
             if name == "omit" or (name, path) in seen:
                 continue
             seen.add((name, path))

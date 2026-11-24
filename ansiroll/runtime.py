@@ -207,7 +207,7 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_input_paths(expression, remaining=(), variables=None):
+def _selector_input_paths(expression, remaining=(), variables=None, computed=None):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
     pending = [(expression, ())]
@@ -228,6 +228,11 @@ def _selector_input_paths(expression, remaining=(), variables=None):
             "lookup", "query", "q",
         ):
             pending.extend((child, ()) for child in node.iter_child_nodes() if child is not node.node)
+            if node.args and _selector_vars_key(node.args[0], variables or {}) in ("vars", "ansible.builtin.vars"):
+                for term in node.args[1:]:
+                    key = _selector_vars_key(term, variables or {})
+                    if isinstance(key, str):
+                        yield key, ()
             continue
         root = node
         path = []
@@ -237,6 +242,8 @@ def _selector_input_paths(expression, remaining=(), variables=None):
             elif isinstance(root.arg, nodes.Const) and isinstance(root.arg.value, (str, int)):
                 path.append(root.arg.value)
             elif isinstance(root.node, nodes.Name) and root.node.name == "vars":
+                if computed is not None:
+                    computed.add("vars")
                 pending.append((root.arg, ()))
                 key = _selector_vars_key(root.arg, variables or {})
                 if not isinstance(key, str):
@@ -272,6 +279,42 @@ def _selector_vars_key(node, variables):
         if all(isinstance(part, str) for part in parts):
             return "".join(parts)
     return None
+
+
+def _same_vars_input(left, right):
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return len(left) == len(right) and all(
+            _same_vars_input(a, b) for a, b in zip(left.items(), right.items()))
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(_same_vars_input(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _clear_vars_file_blocks(blocked, mapping, merge_hashes):
+    """Record which members a guaranteed assignment replaces."""
+    for key in blocked.keys() & mapping.keys():
+        value = mapping[key]
+        if not merge_hashes or not isinstance(value, dict):
+            del blocked[key]
+            continue
+        pending = [(value, ())]
+        replacements = set(blocked[key])
+        while pending:
+            member, path = pending.pop()
+            if isinstance(member, dict):
+                pending.extend((entry, (*path, name)) for name, entry in member.items())
+            else:
+                replacements.add(path)
+        blocked[key] = frozenset(replacements)
+
+
+def _vars_file_reads_blocked(blocked, inputs):
+    return any(name in blocked and not any(path[:len(prefix)] == prefix for prefix in blocked[name])
+               for name, path in inputs)
 
 
 def _selector_projection_cycle(origin, path, ancestors):
@@ -2924,7 +2967,7 @@ class Runtime:
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = None
-            blocked_timeout_inputs = set()
+            blocked_timeout_inputs = {}
             if timeout_template and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files,
@@ -3193,6 +3236,8 @@ class Runtime:
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
                                      blocked_inputs=None, merge_hashes=False, magic=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
+        # During early replay each blocked variable records the member paths
+        # that later assignments have definitely replaced.
         before_setup = blocked_inputs is not None
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if before_setup:
@@ -3201,15 +3246,12 @@ class Runtime:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         selected = dict(play_vars)
         selector_vars = _f_combine(defaults, None if before_setup else base, selected, recursive=merge_hashes)
-        shadowed = {key for layer in (self.extra_vars, magic or {}) for key, value in layer.items()
-                    if not merge_hashes or not isinstance(value, dict)}
 
         def apply_files(mappings):
             nonlocal selected, selector_vars
             for mapping in mappings:
                 if before_setup:
-                    blocked_inputs.difference_update(
-                        key for key, value in mapping.items() if not merge_hashes or not isinstance(value, dict))
+                    _clear_vars_file_blocks(blocked_inputs, mapping, merge_hashes)
                 else:
                     selected = _f_combine(selected, mapping, recursive=merge_hashes)
                 selector_vars = _f_combine(selector_vars, mapping, recursive=merge_hashes)
@@ -3225,22 +3267,28 @@ class Runtime:
             })
             if not before_setup and index in early_files:
                 inputs, mappings = early_files[index]
-                if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
-                       key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
+                if all(_same_vars_input(ctx.get(key, _MISSING_VARS_FILE_INPUT), value)
                        for key, value in inputs.items()):
                     apply_files(mappings)
                     continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             inputs = {}
+            if blocked_inputs:
+                selector_blocks = dict(blocked_inputs)
+                for layer in (self.extra_vars, magic or {}):
+                    _clear_vars_file_blocks(selector_blocks, layer, merge_hashes)
+            else:
+                selector_blocks = {}
             for raw in entry["names"]:
                 if before_setup:
-                    dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True)
-                    if dependencies is None or blocked_inputs.difference(shadowed).intersection(dependencies):
+                    paths = set()
+                    dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True, paths=paths)
+                    if dependencies is None or _vars_file_reads_blocked(selector_blocks, paths):
                         # A selector we cannot evaluate here may still change inputs to setup.
                         for mappings in entry["files"].values():
                             if isinstance(mappings, list):
                                 for mapping in mappings:
-                                    blocked_inputs.update(mapping)
+                                    blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
                         break
                     inputs.update(dependencies)
                 try:
@@ -3313,7 +3361,7 @@ class Runtime:
                                  % (item,))
         return selector_vars if before_setup else selected
 
-    def _pre_setup_template_inputs(self, source, ctx, *, selector=False):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None):
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -3331,6 +3379,8 @@ class Runtime:
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
             for name, path in _selector_input_paths(expression, remaining, ctx):
+                if paths is not None:
+                    paths.add((name, path))
                 if (name, path) in seen:
                     continue
                 seen.add((name, path))
@@ -5039,19 +5089,20 @@ class Runtime:
     def _gather_timeout_for_run(self, timeout, template, setup_ctx, vars_files=None, blocked_inputs=()):
         if not template:
             return timeout
-        role_exports = template.get("role_exports") or {}
+        role_exports = template.get("role_exports") or ()
+        if isinstance(role_exports, dict):
+            role_exports = (role_exports,)
         config = setup_ctx.get("__ansiroll_controller_config", {})
         merge_hashes = config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
-        blocked = set(blocked_inputs)
-        blocked.difference_update(
-            key for layer in (role_exports, self.extra_vars) for key, value in layer.items()
-            if not merge_hashes or not isinstance(value, dict))
-        overrides = self.extra_vars.keys() | (vars_files or {}).keys() | blocked
+        blocked = dict(blocked_inputs)
+        for layer in (*role_exports, self.extra_vars):
+            _clear_vars_file_blocks(blocked, layer, merge_hashes)
+        overrides = self.extra_vars.keys() | (vars_files or {}).keys() | blocked.keys()
         if not (template.get("required") or template.get("file_names")) and overrides.isdisjoint(template["names"]):
             return timeout
         play_vars = template.get("play_vars") if vars_files is None else vars_files
         defaults = template.get("timeout_defaults") if vars_files is None else None
-        merged_vars = _f_combine(defaults, template["vars"], play_vars, role_exports,
+        merged_vars = _f_combine(defaults, template["vars"], play_vars, *role_exports,
                                  self.extra_vars, recursive=merge_hashes)
         scope = self.ctx(merged_vars, base={
             "__ansiroll_controller_config": config,
@@ -5061,14 +5112,15 @@ class Runtime:
                  "make its vars files and lookup inputs resolvable at compile time")
         if "controller_inputs" in template:
             compiled = template["controller_inputs"]
-            if blocked.isdisjoint(template["names"]) and all(
-                scope.get(key, _MISSING_VARS_FILE_INPUT) == compiled.get(key, _MISSING_VARS_FILE_INPUT)
+            if blocked.keys().isdisjoint(template["names"]) and all(
+                _same_vars_input(scope.get(key, _MISSING_VARS_FILE_INPUT), compiled.get(key, _MISSING_VARS_FILE_INPUT))
                 for key in template["names"]
             ):
                 return timeout
             raise ValueError(error)
-        inputs = self._pre_setup_template_inputs(template["source"], scope)
-        if inputs is None or not blocked.isdisjoint(set(template["names"]) | inputs.keys()):
+        paths = set()
+        inputs = self._pre_setup_template_inputs(template["source"], scope, paths=paths)
+        if inputs is None or _vars_file_reads_blocked(blocked, paths):
             raise ValueError(error)
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))
         if value == _OMIT:
