@@ -1071,9 +1071,11 @@ def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False,
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
     if isinstance(value, _DelegatedTemplateValue):
         return value.resolve()
+    if isinstance(value, _TaskHostVars) and isinstance(ctx, _PlayVarScope):
+        return _DeferredPlayVarView({**value, **value.task_bindings}, ctx)
     if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
         # Dynamic containers resolve their members in the task's context.
-        return _lazy_container(value._raw, rt, ctx, task_vars=value._task_vars)
+        return _lazy_wrap(value._raw, rt, ctx, task_vars=value._task_vars)
     if isinstance(value, _UntrustedConditionValue):
         return rt.templater._observe_untrusted(value)
     if task_vars and type(value) is str and _looks_templated(value):
@@ -1088,6 +1090,11 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
         return rt.templater._observe_untrusted(_UntrustedConditionValue(value["__ansiroll_unsafe__"]))
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_vault__"}:
         return value
+    if task_vars and isinstance(ctx, _PlayVarScope) and isinstance(value, (dict, list)):
+        key = id(value)
+        if key not in ctx.task_containers:
+            ctx.task_containers[key] = _lazy_container(value, rt, ctx, dynamic, origin, task_vars)
+        return ctx.task_containers[key]
     return _lazy_container(value, rt, ctx, dynamic, origin, task_vars)
 
 
@@ -1233,6 +1240,14 @@ class _LoopVarsSnapshot(dict):
     """The task's magic vars mapping before its loop bindings were applied."""
 
 
+class _TaskHostVars(dict):
+    """Current-host values whose deferred task bindings share the render scope."""
+
+    def __init__(self, values, task_bindings):
+        super().__init__(values)
+        self.task_bindings = task_bindings
+
+
 class _PlayVarScope(dict):
     """Cache referenced play templates for a single Jinja evaluation."""
 
@@ -1243,6 +1258,7 @@ class _PlayVarScope(dict):
         self.resolving = set()
         self.resolved = {}
         self.resolved_task = {}
+        self.task_containers = {}
         self.resolved_snapshot = {}
         if ctx.get(_DEFER_LOOKUP_NAMES):
             view = _DeferredPlayVarView
@@ -3436,11 +3452,15 @@ class Runtime:
         # for every task while preserving other hosts from the snapshot.
         hostvars = dict(hostvars) if isinstance(hostvars, dict) else {}
         current = dict(hostvars.get(self.host) or {})
+        host_task_bindings = {}
         for key, value in ctx.items():
             if key in ("hostvars", "vars"):
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
+                if mixed_lookup and key in task_vars:
+                    host_task_bindings[key] = value
+                    continue
                 # A play alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
                     current.setdefault(key, self._initial_host_vars[key])
@@ -3448,7 +3468,7 @@ class Runtime:
                     current[key] = self._module_fact_layer[key]
                 continue
             current[key] = value
-        hostvars[self.host] = current
+        hostvars[self.host] = _TaskHostVars(current, host_task_bindings) if host_task_bindings else current
         ctx["hostvars"] = hostvars
         if mixed_lookup:
             ctx[_DEFER_LOOKUP_NAMES] = True
@@ -5926,7 +5946,7 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
             rendered = container[key]
         else:
             rendered = scope[name]
-            if not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
+            if name == "hostvars" or not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
                 rendered = templater.resolve_variable(name, rendered, scope)
         if members is not None and isinstance(rendered, (dict, list, tuple)):
             # Send the container's shape without reading any of its members.
@@ -6101,6 +6121,8 @@ def agent_main():
             members = [] if defer_template else None
             if defer_template:
                 requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+                if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
+                    requested_names.add("hostvars")
                 frame["lazy_template_vars"] = sorted(requested_names)
             _chan_send(resp_fd, frame)
             reply = _chan_recv()

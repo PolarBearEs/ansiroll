@@ -136,6 +136,34 @@ def test_sort_of_deferred_task_list_compares_rendered_members():
     assert calls == []
 
 
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("[row.sort(), row] | last", [2, 17]),
+    ("[row.pop(), vars.row] | last", [17]),
+    ("[vars.row.pop(), hostvars[inventory_hostname].row] | last", [17]),
+    ("[nested.rows.pop(), nested.rows] | last", [17]),
+])
+def test_deferred_task_container_mutations_share_a_render_view(expression, expected):
+    runtime, frames = run([_task("1", "Mutate row", "debug", args={"msg": "{{ " + expression + " }}"}, vars={
+        "row": [17, 2], "nested": {"rows": [17, 2]}, "spare": "{{ lookup('unused') }}/tail",
+    })])
+    assert not runtime.failed
+    assert frames[0]["result"]["msg"] == expected
+
+
+@pytest.mark.parametrize("scope", ["hostvars", "vars.hostvars"])
+def test_current_hostvars_resolve_deferred_task_aliases(scope):
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"alias": 1}}},
+                      on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or 17
+    task = _task("1", "Read alias", "debug", args={
+        "msg": "{{ [" + scope + "[inventory_hostname].alias, alias] }}",
+    }, vars={"alias": "{{ lookup('number') }}", "spare": "{{ lookup('unused') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == [17, 17]
+    assert calls == ["number"]
+
+
 @pytest.mark.parametrize("text", [
     "{{ lookup('source') }}/{{ missing.attribute }}",
     "{{ lookup('source') }}/{{ 1 // divisor }}",

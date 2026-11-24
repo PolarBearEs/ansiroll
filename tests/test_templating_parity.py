@@ -858,6 +858,24 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     assert output.read_text() == expected_text
 
 
+def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+      vars:
+        alias: "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/tail"
+""", {"sample.j2": "prefix={{ hostvars[inventory_hostname].alias }}\n"})
+    _, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert recap == ("1", "1", "0", "0", "0", "0", "0")
+    assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\n"
+
+
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost
