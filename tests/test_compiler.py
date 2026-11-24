@@ -30,6 +30,51 @@ def _module_zip(entries):
     return base64.b64encode(out.getvalue()).decode("ascii")
 
 
+@pytest.mark.parametrize(("hostname", "injected"), [
+    ("localhost", {}),
+    ("node.example.test", {}),
+    ("192.0.2.7", {}),
+    ("::ffff:192.0.2.7", {}),
+    ("launcher.example.test", {"inventory_hostname": "selected.example.test"}),
+    ("node.example.test", {"inventory_hostname_short": "alias", "group_names": ["workers", "blue"]}),
+    ("node.example.test", {"inventory_hostname_short": "", "group_names": []}),
+])
+def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
+    from ansible.inventory.host import Host
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  tasks:
+    - debug:
+        msg:
+          name: '{{ inventory_hostname }}'
+          short: '{{ inventory_hostname_short }}'
+          groups: '{{ group_names }}'
+""")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    env = dict(os.environ, ANSIROLL_HOST=hostname, ANSIROLL_RAW="1")
+    env.pop("ANSIROLL_EXTRA_VARS", None)
+    env.pop("ANSIROLL_VARS_FILE", None)
+    command = [sys.executable, str(compiled)]
+    if injected:
+        runner = ("import json, runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__', "
+                  "init_globals={'_INJECTED_VARS': json.loads(sys.argv[2])})")
+        command = [sys.executable, "-c", runner, str(compiled), json.dumps(injected)]
+    completed = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    name = injected.get("inventory_hostname", hostname)
+    short = Host(name).get_magic_vars()["inventory_hostname_short"]
+    assert frame["result"]["msg"] == {
+        "name": name, "short": injected.get("inventory_hostname_short", short),
+        "groups": injected.get("group_names", ["ungrouped"]),
+    }
+
+
 def test_bundle_union_deduplicates_identical_import_paths():
     shared = {"ansible/module_utils/shared.py": b"VALUE = 1\n"}
     modules = {

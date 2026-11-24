@@ -5267,6 +5267,20 @@ def _hostname():
         return "localhost"
 
 
+def _inventory_hostname_short(host):
+    name = str(host)
+    if _core_at_least(2, 13):
+        from ipaddress import ip_address
+
+        try:
+            ip_address(name)
+        except ValueError:
+            pass
+        else:
+            return name
+    return name.split(".", 1)[0]
+
+
 def _state_json_default(value):
     # The final state can include lazy play vars which were never resolved.
     return None if _is_undef(value) else str(value)
@@ -5278,10 +5292,13 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
          resource_reader=None, engine_bootstrap=None, native_only=False):
     runtime_started = time.monotonic()
     host_vars = dict(host_vars or {})
+    host = host_vars.get("inventory_hostname") or _hostname()
+    host_vars.setdefault("inventory_hostname", host)
+    host_vars.setdefault("inventory_hostname_short", _inventory_hostname_short(host))
+    host_vars.setdefault("group_names", ["ungrouped"])
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}
-    host = host_vars.get("inventory_hostname") or _hostname()
     profile_totals = {}
     task_profile_totals = {}
     task_wall_totals = {}
