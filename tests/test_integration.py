@@ -2236,6 +2236,40 @@ def test_gather_embeds_setup():
     assert any(m.endswith("setup") for m in manifest["modules"])
 
 
+@pytest.mark.parametrize("timeout", [None, 23])
+def test_implicit_setup_passes_play_gather_timeout(tmp_path, monkeypatch, timeout):
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
+    from ansible.vars.manager import VariableManager
+
+    playbook = tmp_path / "play.yml"
+    option = "" if timeout is None else "  gather_timeout: %d\n" % timeout
+    playbook.write_text("- hosts: localhost\n  gather_facts: true\n" + option + "  tasks: []\n")
+    expected = {} if timeout is None else {"gather_timeout": timeout}
+    source, _ = compile_playbook(str(playbook))
+    loader = DataLoader()
+    manager = VariableManager(loader=loader)
+    play = Playbook.load(str(playbook), variable_manager=manager, loader=loader).get_plays()[0]
+    strategy_type = _load_strategy_module().StrategyModule
+    strategy = strategy_type.__new__(strategy_type)
+    setup_args = {} if play.gather_timeout is None else {"gather_timeout": play.gather_timeout}
+    setup = SimpleNamespace(when=[], no_log=False, args=setup_args)
+    strategy_source, _, _ = strategy._compile(play, manager.get_vars(play=play), setup)
+
+    monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1" if timeout is not None else "0")
+    for compiled in (source, strategy_source):
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+        calls = []
+
+        def run_module(action, args, **kwargs):
+            calls.append((action, args))
+            return {"ansible_facts": {}}
+
+        monkeypatch.setattr(runtime, "run_module", run_module)
+        runtime.run_play(_compiled_plays(compiled, tmp_path)[0])
+        assert calls == [("ansible.builtin.setup", expected)]
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 

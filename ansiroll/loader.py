@@ -397,6 +397,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "tasks": tasks,
         "handlers": handlers,
     }
+    if gather and "gather_timeout" in (play.get_ds() or {}):
+        result["gather_timeout"] = play.gather_timeout
     if unresolved_vars_files:
         result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
     names = _controller_env_names(result)

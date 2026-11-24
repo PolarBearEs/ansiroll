@@ -17,6 +17,7 @@ installed Jinja2.
 
 import datetime as _dt
 import base64
+from decimal import Decimal
 import json
 import os
 import struct
@@ -2782,6 +2783,7 @@ class Runtime:
                 fact_schema=play.get("fact_schema"),
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
+                gather_timeout=play.get("gather_timeout"),
             )
             if not gathered:
                 self.failed = True
@@ -4711,7 +4713,8 @@ class Runtime:
 
     # ---- facts -----------------------------------------------------------
     def gather_facts(self, environment=None, become=False, become_user=None,
-                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False):
+                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
+                     gather_timeout=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -4737,8 +4740,19 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
+            setup_args = {}
+            if gather_timeout is not None:
+                timeout = _fail_on_undef(self.template(gather_timeout, ctx, strict=True))
+                if timeout is not None and timeout != _OMIT:
+                    if _core_at_least(2, 18) and not isinstance(timeout, int):
+                        timeout = Decimal(timeout)
+                        if not timeout.is_finite() or timeout != timeout.to_integral_value():
+                            raise ValueError("gather_timeout must be an integer")
+                    timeout = int(timeout)
+                    if timeout or _core_at_least(2, 13):
+                        setup_args["gather_timeout"] = timeout
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
-            if fast_facts in ("1", "true", "yes", "on"):
+            if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
                 from ansiroll.accelerated_modules.environment import module_environment
                 started = time.monotonic()
@@ -4764,7 +4778,7 @@ class Runtime:
                     res = self.run_module("ansible.builtin.setup", {}, become=become)
             else:
                 provenance = {"mode": "real-ansiballz"}
-                res = self.run_module("ansible.builtin.setup", {}, become=become)
+                res = self.run_module("ansible.builtin.setup", setup_args, become=become)
         except Exception as ex:
             provenance = {"mode": "native-agent"}
             res = {"failed": True, "changed": False,
