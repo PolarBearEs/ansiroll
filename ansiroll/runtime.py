@@ -3068,7 +3068,7 @@ class Runtime:
                 nodes = jinja2.nodes
                 if (next(expr.find_all(nodes.Call), None) is not None
                         or any(node.name not in ("default", "d", "ternary", "lower", "upper", "trim", "replace",
-                                                 "capitalize", "title", "length", "count")
+                                                 "capitalize", "title", "length", "count", "first", "last")
                                for node in expr.find_all(nodes.Filter))
                         or any(node.name not in ("defined", "undefined", "none", "boolean")
                                for node in expr.find_all(nodes.Test))):

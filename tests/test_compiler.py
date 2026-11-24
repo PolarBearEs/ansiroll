@@ -191,6 +191,8 @@ def test_freezing_allows_explicit_inventory_values(tmp_path, group_vars):
      "config/inventory.yml", "config/fallback.yml"),
     ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml', none_val='config/unknown.yml') }}",
      "config/inventory.yml", "config/fallback.yml"),
+    ("{{ conditional_path }}", "config/inventory.yml", "config/fallback.yml"),
+    ("{{ ternary_path }}", "config/inventory.yml", "config/fallback.yml"),
 ])
 def test_standalone_vars_files_select_inventory_at_runtime(tmp_path, selector, inventory, fallback):
     from ansiroll import compile_playbook
@@ -200,6 +202,8 @@ def test_standalone_vars_files_select_inventory_at_runtime(tmp_path, selector, i
   gather_facts: false
   vars:
     final_path: config/final.yml
+    conditional_path: "{{ 'config/inventory.yml' if group_names is defined else 'config/fallback.yml' }}"
+    ternary_path: "{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml') }}"
   vars_files:
     - 'first-{{ profile }}.yml'
     - middle.yml
@@ -341,6 +345,7 @@ def test_deferred_vars_file_projects_duplicate_aliases_once(tmp_path, monkeypatc
     "{{ base_path }}/{{ inventory_hostname_short | default('fallback') }}.yml",
     "config/{{ group_names | default([]) | length }}.yml",
     "config/{{ group_names | count }}.yml",
+    "config/{{ group_names | default(['fallback']) | first }}.yml",
 ])
 def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector):
     from ansiroll.loader import parse_playbook
@@ -359,7 +364,7 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
 """ % selector)
     (tmp_path / "first-runtime.yml").write_text("runtime_choice: first\n")
     (tmp_path / "config").mkdir()
-    for name in ("h", "H", "1"):
+    for name in ("h", "H", "1", "workers"):
         (tmp_path / "config" / (name + ".yml")).write_text("setup_profile: final\n")
     (tmp_path / "final.yml").write_text("setup_profile: final\n")
     plays, _ = parse_playbook(str(playbook))

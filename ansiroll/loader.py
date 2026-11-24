@@ -648,27 +648,33 @@ def _known_vars_file_choices(source, scopes, basedir):
     if len(dynamic) != 1:
         return _known_vars_file_path_values(body[0], scopes, env, basedir), False
     choice = dynamic[0]
-    values = []
-    if isinstance(choice, nodes.CondExpr):
-        branches = (choice.expr1, choice.expr2)
-    elif (isinstance(choice, nodes.Filter) and choice.name in ("ternary", "ansible.builtin.ternary",
-                                                              "ansible.legacy.ternary")
-          and not (choice.dyn_args or choice.dyn_kwargs) and len(choice.args) in (2, 3)):
-        branches = list(choice.args)
-        if choice.kwargs:
-            if len(branches) != 2 or len(choice.kwargs) != 1 or choice.kwargs[0].key != "none_val":
-                return (), False
-            branches.append(choice.kwargs[0].value)
-        if len(branches) == 3 and isinstance(branches[-1], nodes.Const) and branches[-1].value is None:
-            branches.pop()
-    else:
-        branches = ()
-        values.extend(_known_vars_file_path_values(choice, scopes, env, basedir))
-    if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches):
-        return (), False
-    values.extend(branch.value for branch in branches)
+    branches = _vars_file_choice_branches(choice)
+    exhaustive = bool(branches) and all(isinstance(branch, nodes.Const) and isinstance(branch.value, str)
+                                        for branch in branches)
+    values = ([branch.value for branch in branches] if exhaustive
+              else _known_vars_file_path_values(choice, scopes, env, basedir))
     paths = tuple(dict.fromkeys("".join(value if part is choice else part.data for part in parts) for value in values))
-    return paths, bool(branches)
+    return paths, exhaustive
+
+
+def _vars_file_choice_branches(node):
+    """Pull out possible path expressions without evaluating the test."""
+    from jinja2 import nodes
+
+    if isinstance(node, nodes.CondExpr):
+        return node.expr1, node.expr2
+    if not (isinstance(node, nodes.Filter) and node.name in ("ternary", "ansible.builtin.ternary",
+                                                            "ansible.legacy.ternary")
+            and not (node.dyn_args or node.dyn_kwargs) and len(node.args) in (2, 3)):
+        return ()
+    branches = list(node.args)
+    if node.kwargs:
+        if len(branches) != 2 or len(node.kwargs) != 1 or node.kwargs[0].key != "none_val":
+            return ()
+        branches.append(node.kwargs[0].value)
+    if len(branches) == 3 and isinstance(branches[-1], nodes.Const) and branches[-1].value is None:
+        branches.pop()
+    return branches
 
 
 def _known_vars_file_path_values(expression, scopes, env, basedir):
@@ -709,6 +715,16 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
                 return
             members = (member, *members)
             node = node.node
+        if isinstance(node, nodes.Const) and isinstance(node.value, str) and not members:
+            yield node.value
+            return
+        if isinstance(node, (nodes.CondExpr, nodes.Filter)):
+            branches = _vars_file_choice_branches(node)
+            if branches:
+                for branch in branches:
+                    if branch is not None:
+                        yield from project(branch, members, seen)
+                return
         if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members:
             paths = {""}
             parts = (node.left, node.right) if isinstance(node, nodes.Add) else node.nodes
