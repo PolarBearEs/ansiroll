@@ -363,7 +363,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files)
+    include_vars = {}
+    vars_file_writes = set()
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files,
+                                   include_vars=include_vars, deferred_writes=vars_file_writes)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -377,8 +380,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     for cache_name in ("_vars_cache", "_nonpersistent_fact_cache"):
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
-    includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes = _IncludeVariables(include_vars if all_vars is None else play_vars, all_vars, known_writes)
     includes.incomplete = bool(unresolved_vars_files)
+    if all_vars is None:
+        includes.vars_file_writes = vars_file_writes
+        includes.replayed_static_names = {key for entry in unresolved_vars_files
+                                          for mapping in entry.get("static_vars", ()) for key in mapping}
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -536,7 +543,7 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_vars=None, deferred_writes=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -548,7 +555,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
 
     out = dict(play.vars or {})
     selector_vars = out
-    deferred_writes = set()
+    if deferred_writes is None:
+        deferred_writes = set()
     use_search_stack = _core_version() >= (2, 12)
     for entry in _as_list(getattr(play, "vars_files", None)):
         replay = all_vars is None and bool(unresolved)
@@ -612,6 +620,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
         ):
             if key in all_vars:
                 out[key] = all_vars[key]
+    if include_vars is not None:
+        include_vars.update(selector_vars)
     return out
 
 
@@ -626,8 +636,9 @@ def _known_vars_file_choices(source, scopes):
     """Return exact paths from a literal condition or a projected variable."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
+    env = Environment()
     try:
-        body = Environment().parse(source).body
+        body = env.parse(source).body
     except TemplateSyntaxError:
         return (), False
     if len(body) != 1 or not isinstance(body[0], nodes.Output):
@@ -652,27 +663,56 @@ def _known_vars_file_choices(source, scopes):
             branches.pop()
     else:
         branches = ()
-        root = choice
-        members = []
-        while isinstance(root, nodes.Getattr) or (isinstance(root, nodes.Getitem)
-                                                 and isinstance(root.arg, nodes.Const)
-                                                 and isinstance(root.arg.value, str)):
-            members.append(root.attr if isinstance(root, nodes.Getattr) else root.arg.value)
-            root = root.node
-        if isinstance(root, nodes.Name):
-            for scope in scopes:
-                value = scope.get(root.name)
-                for member in reversed(members):
-                    value = value.get(member) if isinstance(value, dict) else None
-                if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
-                    value = value["__ansiroll_unsafe__"]
-                if isinstance(value, str) and not _is_templated(value):
-                    values.append(value)
+        values.extend(_known_vars_file_path_values(choice, scopes, env))
     if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches):
         return (), False
     values.extend(branch.value for branch in branches)
     paths = tuple(dict.fromkeys("".join(value if part is choice else part.data for part in parts) for value in values))
     return paths, bool(branches)
+
+
+def _known_vars_file_path_values(expression, scopes, env):
+    """Project names through possible file scopes and follow bare variable aliases."""
+    from jinja2 import TemplateSyntaxError, nodes
+
+    pending = [(expression, ())]
+    seen = set()
+    while pending:
+        node, members = pending.pop()
+        while isinstance(node, (nodes.Getattr, nodes.Getitem)):
+            if isinstance(node, nodes.Getattr):
+                member = node.attr
+            elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, str):
+                member = node.arg.value
+            else:
+                break
+            members = (member, *members)
+            node = node.node
+        if not isinstance(node, nodes.Name) or (node.name, members) in seen or len(members) > 64:
+            continue
+        seen.add((node.name, members))
+        for scope in scopes:
+            value = scope.get(node.name)
+            index = 0
+            while index < len(members) and isinstance(value, dict):
+                value = value.get(members[index])
+                index += 1
+            if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+                if index == len(members) and not _is_templated(value["__ansiroll_unsafe__"]):
+                    yield value["__ansiroll_unsafe__"]
+                continue
+            if not isinstance(value, str):
+                continue
+            if not _is_templated(value):
+                if index == len(members):
+                    yield value
+                continue
+            try:
+                body = env.parse(value).body
+            except TemplateSyntaxError:
+                continue
+            if len(body) == 1 and isinstance(body[0], nodes.Output) and len(body[0].nodes) == 1:
+                pending.append((body[0].nodes[0], members[index:]))
 
 
 def _deferred_vars_files(play, basedir, entries, *, scopes=()):
@@ -1089,6 +1129,8 @@ class _IncludeVariables:
         self.resolved_template = False
         # A vars file whose name is only known at runtime may redefine any play var.
         self.incomplete = False
+        self.vars_file_writes = set()
+        self.replayed_static_names = set()
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -1427,9 +1469,13 @@ def _template_include_filename(task, value, includes):
             return True
         if includes.all_vars is None and name in runtime_inventory:
             return True
-        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
-                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
-            return True
+        if includes.incomplete and name not in above_vars_files:
+            if name in includes.vars_file_writes and (name not in extra_vars or (
+                    DEFAULT_HASH_BEHAVIOUR == "merge" and isinstance(extra_vars[name], dict))):
+                return True
+            if (name not in includes.replayed_static_names and name not in extra_vars
+                    and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
+                return True
         if not _can_write_var(includes.runtime_writes, name):
             return False
         # A scalar extra var replaces any runtime value. A mapping under

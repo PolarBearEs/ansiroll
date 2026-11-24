@@ -2786,13 +2786,7 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         if play.get("gather_facts") and not gather_cached:
-            # Files selected during compilation are already available to setup.
-            # Runtime selectors are evaluated later, once gathered facts exist.
-            static_files = [mapping for entry in play.get("deferred_vars_files") or ()
-                            for mapping in entry.get("static_vars", ())]
-            merge_hashes = self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge"
-            setup_vars = _f_combine(play.get("vars"), *static_files, recursive=merge_hashes, encoded_vars=True)
-            setup_ctx = self._layered_ctx(self.ctx(setup_vars))
+            setup_ctx = self._layered_ctx(self.ctx(self._with_deferred_vars_files(play, before_setup=True)))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -3047,24 +3041,73 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _with_deferred_vars_files(self, play):
+    def _pre_setup_vars_file_selector(self, source, ctx, blocked):
+        """Only attempt selectors that can safely render again after setup."""
+        pending = [source]
+        seen = set()
+        containers = set()
+        while pending:
+            value = pending.pop()
+            if isinstance(value, (dict, list, tuple)):
+                if id(value) in containers:
+                    continue
+                containers.add(id(value))
+                if isinstance(value, dict):
+                    if dict.keys(value) not in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                        pending.extend(dict.values(value))
+                else:
+                    pending.extend(list.__iter__(value) if isinstance(value, list) else tuple.__iter__(value))
+            elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+                if value in seen:
+                    continue
+                seen.add(value)
+                try:
+                    expr = self.templater.env.parse(value)
+                except jinja2.TemplateSyntaxError:
+                    return False
+                nodes = jinja2.nodes
+                if (next(expr.find_all(nodes.Call), None) is not None
+                        or any(node.name not in ("default", "d", "ternary") for node in expr.find_all(nodes.Filter))
+                        or any(node.name not in ("defined", "undefined", "none", "boolean")
+                               for node in expr.find_all(nodes.Test))):
+                    return False
+                for node in expr.find_all(nodes.Name):
+                    if node.name in blocked:
+                        return False
+                    if node.ctx == "load" and node.name in ctx:
+                        pending.append(ctx[node.name])
+        return True
+
+    def _with_deferred_vars_files(self, play, *, before_setup=False):
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
         play_vars = dict(play.get("vars") or {})
         merge_hashes = (play.get("controller_config") or {}).get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        blocked = set()
         for entry in play.get("deferred_vars_files") or ():
             if "static_vars" in entry:
                 play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes, encoded_vars=True)
+                if before_setup:
+                    for mapping in entry["static_vars"]:
+                        blocked.difference_update(key for key, value in mapping.items()
+                                                  if not merge_hashes or not isinstance(value, dict))
                 continue
             selector_vars = _f_combine(base, play_vars, self.extra_vars, recursive=merge_hashes, encoded_vars=True)
+            selector_vars = {key: _PlayVarTemplate(value) if _looks_templated(value)
+                             and not isinstance(value, _NO_TEMPLATE) else value for key, value in selector_vars.items()}
             ctx = self.ctx(base=selector_vars)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
+            selected = False
             for raw in entry["names"]:
+                if before_setup and (play.get("jinja_plugins") or not self._pre_setup_vars_file_selector(raw, ctx, blocked)):
+                    break
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
+                    if before_setup:
+                        break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
                                              "vars_files item %r: %s" % (item, ex))
@@ -3072,6 +3115,8 @@ class Runtime:
                                      % (item,))
                     break
                 except Exception as ex:
+                    if before_setup:
+                        break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
                     continue
@@ -3087,16 +3132,23 @@ class Runtime:
                 if found:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
+                        if before_setup:
+                            break
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
                     play_vars = _f_combine(play_vars, *data, recursive=merge_hashes, encoded_vars=True)
+                    selected = True
                     break
             else:
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
-                if not _core_at_least(2, 15):
+                if not before_setup and not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
-                sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
-                                 % (item,))
+                if not before_setup:
+                    sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
+                                     % (item,))
+            if before_setup and not selected:
+                blocked.update(key for data in entry["files"].values() if isinstance(data, list)
+                               for mapping in data for key in mapping)
         return play_vars
 
     def _task_ctx(self, task, overlay):

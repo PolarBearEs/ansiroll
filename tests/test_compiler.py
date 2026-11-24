@@ -275,20 +275,21 @@ def test_deferred_vars_file_can_change_a_later_selector(tmp_path):
     assert frame["result"]["msg"] == "custom"
 
 
-@pytest.mark.parametrize("merge_hashes", [False, True])
-def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch, merge_hashes):
+@pytest.mark.parametrize("selector", ["final_path", "path_alias", "cfg.path"])
+def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch, selector):
     from ansible import constants as C
     from ansiroll.loader import parse_playbook
     from ansiroll.runtime import Runtime
 
+    merge_hashes = selector == "cfg.path"
     monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge" if merge_hashes else "replace")
     monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge" if merge_hashes else "replace")
-    selector = "cfg.path" if merge_hashes else "final_path"
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: all
   gather_facts: false
   vars:
     final_path: config/default.yml
+    path_alias: '{{ final_path }}'
     cfg: {path: config/default.yml}
   vars_files:
     - 'first-{{ profile }}.yml'
@@ -309,7 +310,8 @@ def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch
     assert [frame["result"]["msg"] for frame in frames] == ["final"]
 
 
-def test_static_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("selector", ["final.yml", "config/{{ inventory_hostname_short | default('fallback') }}.yml"])
+def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector):
     from ansiroll.loader import parse_playbook
     from ansiroll.runtime import Runtime
 
@@ -317,26 +319,60 @@ def test_static_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, m
     playbook.write_text("""- hosts: all
   gather_facts: true
   vars_files:
-    - 'first-{{ profile }}.yml'
-    - final.yml
+    - 'first-{{ ansible_facts.profile }}.yml'
+    - "%s"
   environment:
     ANSIROLL_SETUP_PROFILE: '{{ setup_profile }}'
   tasks: []
-""")
-    (tmp_path / "first-runtime.yml").write_text("setup_profile: first\n")
+""" % selector)
+    (tmp_path / "first-runtime.yml").write_text("runtime_choice: first\n")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "h.yml").write_text("setup_profile: final\n")
     (tmp_path / "final.yml").write_text("setup_profile: final\n")
     plays, _ = parse_playbook(str(playbook))
-    runtime = Runtime({}, "", {"inventory_hostname": "h"}, extra_vars={"profile": "runtime"})
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "inventory_hostname_short": "h"})
     captured = []
     monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
 
     def run_setup(action, args, **kwargs):
         captured.append((action, runtime._module_env))
-        return {"ansible_facts": {}}
+        return {"ansible_facts": {"profile": "runtime"}}
 
     monkeypatch.setattr(runtime, "run_module", run_setup)
     runtime.run_play(plays[0])
     assert captured == [("ansible.builtin.setup", {"ANSIROLL_SETUP_PROFILE": "final"})]
+    assert runtime.vars["runtime_choice"] == "first"
+
+
+@pytest.mark.parametrize("static_override", [True, False])
+def test_include_baking_accounts_for_inventory_vars_in_replay(tmp_path, static_override):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars: {inventory_hostname: earlier}
+  vars_files:
+    - 'first-{{ profile }}.yml'
+%s  tasks:
+    - include_tasks: '{{ inventory_hostname }}.yml'
+""" % ("    - final.yml\n" if static_override else ""))
+    (tmp_path / "first-runtime.yml").write_text("inventory_hostname: dynamic\n")
+    (tmp_path / "final.yml").write_text("inventory_hostname: later\n")
+    (tmp_path / "earlier.yml").write_text("- debug: {msg: earlier}\n")
+    (tmp_path / "later.yml").write_text("- debug: {msg: later}\n")
+    source, manifest = compile_playbook(str(playbook))
+    if not static_override:
+        assert any("include_tasks" in task["reason"] for task in manifest["fallback_tasks"])
+        return
+    assert manifest["fallback_tasks"] == []
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(source)
+    env = dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_EXTRA_VARS='{"profile": "runtime"}')
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frames = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert [frame["result"]["msg"] for frame in frames if frame["action"] == "debug"] == ["later"]
 
 
 def test_standalone_include_tasks_does_not_bake_inventory_fallback(tmp_path):
