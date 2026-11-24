@@ -212,7 +212,7 @@ def _pin_for_truncate(path, fd, original_error):
         raise _truncation_unavailable(path, original_error) from ex
 
 
-def _open_truncated_destination(path, reference, original_error, validate, prepare=None):
+def _open_truncated_destination(path, reference, original_error, validate, prepare=None, pin=None):
     fd_path = "/proc/self/fd/%d" % reference
     try:
         os.stat(fd_path)
@@ -224,7 +224,7 @@ def _open_truncated_destination(path, reference, original_error, validate, prepa
         validate(info, None)
         raise original_error
     if prepare is not None:
-        prepare(info, reference)
+        prepare(info, reference, pin)
     validate(info, None)
     return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
 
@@ -301,11 +301,12 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
                 raise original_error
         else:
             initial_pin.close()
+            reference = None
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
             validate(info, fd)
             if prepare is not None:
-                prepare(info, fd)
+                reference = prepare(info, fd)
                 prepare = None
                 info = os.fstat(fd)
                 validate(info, fd)
@@ -327,15 +328,16 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
                 if released_for_emfile:
                     raise
                 original_error = ex
-                reference = _pin_for_truncate(path, fd, ex)
-                stack.callback(os.close, reference)
+                if reference is None:
+                    reference = _pin_for_truncate(path, fd, ex)
+                    stack.callback(os.close, reference)
                 writer.close()
             else:
                 yield writer
                 return
 
         # Reopen the validated inode even if its pathname has since changed.
-        fd = _open_truncated_destination(path, reference, original_error, validate, prepare)
+        fd = _open_truncated_destination(path, reference, original_error, validate, prepare, initial_pin)
         with os.fdopen(fd, "w") as writer:
             yield writer
 
@@ -459,13 +461,17 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
         reference = None
         output_stat = None
 
-        def prepare_output(info, fd):
+        def prepare_output(info, fd, pin=None):
             nonlocal reference, output_stat
             output_stat = info
-            if stat.S_ISREG(output_stat.st_mode):
+            if pin is not None:
+                reference = fd
+                output_reference.callback(pin.pop_all().close)
+            elif stat.S_ISREG(output_stat.st_mode):
                 reference = _pin_output_inode(output_path, fd, output_stat)
                 if reference is not None:
                     output_reference.callback(os.close, reference)
+            return reference
 
         with _open_compile_destination(output_path, validate_output, prepare=prepare_output) as output:
             output.write(source)

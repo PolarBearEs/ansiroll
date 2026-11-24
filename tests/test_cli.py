@@ -1093,13 +1093,24 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
     open_fd, fdopen = os.open, os.fdopen
     append_fd = None
     reopened = []
+    active_fds = set()
 
     def open_append_only(path, flags, *args, **kwargs):
         nonlocal append_fd
         target = path == str(files[destination]) and flags & os.O_ACCMODE == os.O_WRONLY
         if target and failure == "open":
             raise OSError(error, "filesystem requires O_TRUNC", path)
+        if destination == "output" and not reopened:
+            for fd in active_fds.copy():
+                try:
+                    os.fstat(fd)
+                except OSError as ex:
+                    assert ex.errno == errno.EBADF
+                    active_fds.remove(fd)
+            if len(active_fds) == 2:
+                raise OSError(errno.EMFILE, "no slot for another output descriptor", path)
         fd = open_fd(path, flags, *args, **kwargs)
+        active_fds.add(fd)
         if target:
             append_fd = fd
         if str(path).startswith("/proc/self/fd/") and flags & os.O_TRUNC:
