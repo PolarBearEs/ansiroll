@@ -1747,8 +1747,24 @@ def _template_include_filename(task, value, includes):
                 value, variables, selector=True, allow_controller=True,
                 paths=paths, unknown_lookup=unknown_lookup, retain_mutable=True)
             include_paths = paths if dependencies is not None and not unknown_lookup else ()
-        reads = [(name, () if None in path else path) for key, path in include_paths if key == name]
-        return _vars_file_reads_blocked(vars_file_inputs, reads or [(name, ())])
+        reads = [path for key, path in include_paths if key == name]
+        for path in reads or [()]:
+            if None in path:
+                projection = path[:path.index(None)]
+                for layer in higher_layers:
+                    item = layer.get(name)
+                    for member in projection:
+                        item = item.get(member) if isinstance(item, dict) else None
+                    if isinstance(item, dict) and (path[-1] == "defined" or item):
+                        # A higher mapping guarantees presence, and a nonempty
+                        # one stays truthy even when it inherits other keys.
+                        break
+                else:
+                    if _vars_file_reads_blocked(vars_file_inputs, [(name, projection)]):
+                        return True
+            elif _vars_file_reads_blocked(vars_file_inputs, [(name, path)]):
+                return True
+        return False
 
     loop_names = set()
     parent = task

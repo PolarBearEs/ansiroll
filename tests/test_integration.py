@@ -3548,7 +3548,10 @@ def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, al
     ("{unrelated: 1}", True),
     ("{task_file: default.yml}", False),
 ])
-def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, monkeypatch, task_vars, fallback):
+@pytest.mark.parametrize("selector", ["cfg.task_file", "(cfg | default({})).task_file",
+                                       "(cfg | default({}, true)).task_file", "(cfg or {}).task_file"])
+def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, monkeypatch,
+                                                                    task_vars, fallback, selector):
     from ansible import constants as C
 
     monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
@@ -3560,16 +3563,51 @@ def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, 
     - "settings-{{ profile }}.yml"
   gather_timeout: "{{ seconds }}"
   tasks:
-    - include_tasks: "{{ cfg.task_file }}"
+    - include_tasks: "{{ %s }}"
       vars:
         cfg: %s
-""" % task_vars)
+""" % (selector, task_vars))
     (tmp_path / "settings-default.yml").write_text("seconds: 23\ncfg: {task_file: default.yml}\n")
     (tmp_path / "settings-alternate.yml").write_text("seconds: 45\ncfg: {task_file: alternate.yml}\n")
     (tmp_path / "default.yml").write_text("- debug: {msg: included-default}\n")
     (tmp_path / "alternate.yml").write_text("- debug: {msg: included-alternate}\n")
     _, manifest = compile_playbook(str(playbook))
     assert bool(manifest["fallback_tasks"]) == fallback
+
+
+@pytest.mark.parametrize(("template", "overrides", "expected"), [
+    ("{% set seconds = base %}{{ seconds }}", {}, 45),
+    ("{% if flag %}{% set seconds = base %}{% else %}{% set seconds = base %}{% endif %}{{ seconds }}",
+     {"flag": False}, 45),
+    ("{% if flag %}{% set seconds = base %}{% endif %}{{ seconds }}", {"flag": False}, None),
+])
+def test_ordered_timeout_ignores_vars_file_inputs_shadowed_by_a_local(tmp_path, monkeypatch,
+                                                                    template, overrides, expected):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: default, base: 23, flag: true}
+  vars_files: ['settings-{{ profile }}.yml']
+  gather_timeout: >-
+    %s
+  tasks: []
+""" % template)
+    (tmp_path / "settings-default.yml").write_text("seconds: 23\n")
+    (tmp_path / "settings-runtime.yml").write_text("seconds: \"{{ lookup('env', 'UNUSED_TIMEOUT') | int }}\"\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    frames = []
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "runtime", "base": 45, **overrides})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if expected is None:
+        assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+        assert not called
+    else:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
 
 
 @pytest.mark.parametrize("source_text", [
