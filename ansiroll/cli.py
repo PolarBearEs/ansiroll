@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 
 from .compiler import compile_playbook
 
@@ -53,10 +53,12 @@ def main(argv=None, *, _standalone=False):
     args = parser.parse_args(argv)
 
     if args.command == "compile":
-        if args.output == "-":
-            if not _standalone:
-                parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
+        if args.output == "-" and _standalone:
             return _cmd_compile_stdout(args)
+        if _stderr_may_be_playbook(args.playbook):
+            return 2
+        if args.output == "-":
+            parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -183,8 +185,16 @@ def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None):
     return path
 
 
+class _TruncatingReopenError(OSError):
+    pass
+
+
 def _truncation_unavailable(path, original_error):
-    return OSError(original_error.errno, "safe truncating reopen requires /proc/self/fd", path)
+    return _TruncatingReopenError(
+        original_error.errno,
+        "safe truncating reopen requires /proc/self/fd. Compile to a local staging file and copy the output",
+        path,
+    )
 
 
 def _pin_for_truncate(path, fd, original_error):
@@ -196,12 +206,20 @@ def _pin_for_truncate(path, fd, original_error):
         raise _truncation_unavailable(path, original_error) from ex
 
 
-def _open_truncated_destination(path, reference, original_error):
+def _open_truncated_destination(path, reference, original_error, validate, prepare=None, pin=None):
     fd_path = "/proc/self/fd/%d" % reference
     try:
         os.stat(fd_path)
     except OSError as ex:
         raise _truncation_unavailable(path, original_error) from ex
+    # Following the procfs link can block on the destination filesystem.
+    info = os.fstat(reference)
+    if not stat.S_ISREG(info.st_mode):
+        validate(info, None)
+        raise original_error
+    if prepare is not None:
+        prepare(info, reference, pin)
+    validate(info, None)
     return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
 
 
@@ -209,7 +227,7 @@ _TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
 
 
 @contextmanager
-def _open_compile_destination(path, validate, *, release_output=None):
+def _open_compile_destination(path, validate, *, release_output=None, prepare=None):
     with ExitStack() as stack, ExitStack() as initial_pin:
         # A failed create-open gives us no fd. Capture the existing inode
         # before trying it so a retry cannot truncate a replacement file.
@@ -253,7 +271,14 @@ def _open_compile_destination(path, validate, *, release_output=None):
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
             # check on the initial O_CREAT open in a sticky directory.
-            if ex.errno not in _TRUNCATING_RETRY_ERRORS or reference is None:
+            if ex.errno not in _TRUNCATING_RETRY_ERRORS:
+                raise
+            if reference is None:
+                # EPERM may be an ordinary permission denial.
+                current = _try_stat(path) if ex.errno != errno.EPERM else None
+                if current is not None and stat.S_ISREG(current.st_mode):
+                    validate(current, None)
+                    raise _truncation_unavailable(path, ex) from ex
                 raise
             original_error = ex
             # A failed create-open hasn't established permission to replace
@@ -270,9 +295,15 @@ def _open_compile_destination(path, validate, *, release_output=None):
                 raise original_error
         else:
             initial_pin.close()
+            reference = None
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
             validate(info, fd)
+            if prepare is not None:
+                reference = prepare(info, fd)
+                prepare = None
+                info = os.fstat(fd)
+                validate(info, fd)
             if created or not stat.S_ISREG(info.st_mode):
                 yield writer
                 return
@@ -283,34 +314,35 @@ def _open_compile_destination(path, validate, *, release_output=None):
                     raise
                 # An empty file can be written through the current handle
                 # without truncating it or opening another descriptor.
-                if os.fstat(fd).st_size == 0:
+                info = os.fstat(fd)
+                if info.st_size == 0:
+                    validate(info, fd)
                     yield writer
                     return
                 if released_for_emfile:
                     raise
                 original_error = ex
-                reference = _pin_for_truncate(path, fd, ex)
-                stack.callback(os.close, reference)
+                if reference is None:
+                    reference = _pin_for_truncate(path, fd, ex)
+                    stack.callback(os.close, reference)
                 writer.close()
             else:
                 yield writer
                 return
 
         # Reopen the validated inode even if its pathname has since changed.
-        info = os.fstat(reference)
-        validate(info, None)
-        if not stat.S_ISREG(info.st_mode):
-            raise original_error
-        fd = _open_truncated_destination(path, reference, original_error)
+        fd = _open_truncated_destination(path, reference, original_error, validate, prepare, initial_pin)
         with os.fdopen(fd, "w") as writer:
             yield writer
 
 
-def _write_stdout_manifest(path, manifest, stdout_fd):
+def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None):
     path = _manifest_for_stdout(path, stdout_fd)
 
     def validate(info, fd):
         _validate_stdout_manifest(path, info, stdout_fd, fd)
+        if validate_input is not None:
+            validate_input(info, "manifest path", path)
 
     with _open_compile_destination(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
@@ -408,31 +440,40 @@ def _make_output_executable(path, reference, output_stat, mode):
     os.chmod(path, mode)
 
 
-def _write_compile_files(output_path, manifest_path, source, manifest):
-    if not manifest_path:
-        with open(output_path, "w") as output:
-            output.write(source)
-        os.chmod(output_path, os.stat(output_path).st_mode | stat.S_IEXEC | stat.S_IXGRP)
-        return
-
+def _write_compile_files(output_path, manifest_path, source, manifest, validate_input):
     # Paths can change during compilation or between the check and open.
-    _check_file_destinations(output_path, manifest_path)
+    if manifest_path:
+        _check_file_destinations(output_path, manifest_path)
 
     def validate_output(info, _fd):
-        _check_manifest_path(manifest_path, info)
+        # The manifest lookup may block while the input pathname changes.
+        if manifest_path:
+            _check_manifest_path(manifest_path, info)
+        validate_input(info, "output path", output_path)
 
     with ExitStack() as output_reference:
         reference = None
-        with _open_compile_destination(output_path, validate_output) as output:
-            output_stat = os.fstat(output.fileno())
-            if stat.S_ISREG(output_stat.st_mode):
-                reference = _pin_output_inode(output_path, output.fileno(), output_stat)
+        output_stat = None
+
+        def prepare_output(info, fd, pin=None):
+            nonlocal reference, output_stat
+            output_stat = info
+            if pin is not None:
+                reference = fd
+                output_reference.callback(pin.pop_all().close)
+            elif stat.S_ISREG(output_stat.st_mode):
+                reference = _pin_output_inode(output_path, fd, output_stat)
                 if reference is not None:
                     output_reference.callback(os.close, reference)
+            return reference
+
+        with _open_compile_destination(output_path, validate_output, prepare=prepare_output) as output:
             output.write(source)
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
         _make_output_executable(output_path, reference, output_stat, mode)
+        if not manifest_path:
+            return
 
         def validate_manifest(info, _fd):
             try:
@@ -442,6 +483,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             if (_same_stream(output_stat, info)
                     or current_output is not None and _same_stream(current_output, info)):
                 raise ValueError("manifest path points to compiled output: %s" % manifest_path)
+            validate_input(info, "manifest path", manifest_path)
 
         # Reopen the current pathname after Python output succeeds.
         _check_file_destinations(output_path, manifest_path)
@@ -452,13 +494,80 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             json.dump(manifest, manifest_file, indent=2)
 
 
+def _diagnostic_stream_may_be_playbook(stream, playbook):
+    if not (stat.S_ISREG(stream.st_mode) or stat.S_ISFIFO(stream.st_mode)):
+        return False
+    path = os.path.abspath(playbook)
+    directory, name = os.path.split(playbook)
+    if not path.isascii() or "$" in playbook or "$" in path or name.startswith(("~", "'", "\"")):
+        # Ansible can emit diagnostics during import. Keep them off this
+        # stream until the input's identity is known.
+        try:
+            with open(os.devnull, "w") as sink, redirect_stderr(sink):
+                from ansible.parsing.quoting import unquote
+                from ansible.utils.path import unfrackpath
+
+                from .loader import _core_version, _playbook_read_path
+
+                # Mirror the loader's path resolution without loading its
+                # configuration, whose errors still need to reach safe stderr.
+                if not os.path.isabs(playbook) or _core_version() >= (2, 20):
+                    directory = os.path.abspath(directory)
+                name = unquote(name)
+                given = name if name.startswith((os.sep, "~")) else os.path.join(directory, name)
+                resolved = unfrackpath(given, follow=False)
+                path = _playbook_read_path(unfrackpath(resolved, follow=False))
+        except (Exception, SystemExit):
+            return True
+    try:
+        source = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, UnicodeError):
+        # The open stream may still reach the input even if its path cannot
+        # be inspected. Keep diagnostics off it unless we can rule out an alias.
+        return True
+    return os.path.samestat(stream, source)
+
+
+def _fd_is_read_only(fd):
+    if os.name != "posix":
+        return False
+    from fcntl import F_GETFL, fcntl
+
+    return (fcntl(fd, F_GETFL) & os.O_ACCMODE) == os.O_RDONLY
+
+
+def _stderr_may_be_playbook(playbook):
+    descriptors = {2}
+    try:
+        descriptors.add(sys.stderr.fileno())
+    except (AttributeError, OSError, ValueError):
+        pass  # In-memory streams and closed streams have no descriptor.
+    for fd in descriptors:
+        try:
+            if _fd_is_read_only(fd):
+                continue
+            info = os.fstat(fd)
+        except OSError as ex:
+            if ex.errno != errno.EBADF:
+                raise
+            continue
+        if _diagnostic_stream_may_be_playbook(info, playbook):
+            return True
+    return False
+
+
 def _cmd_compile_stdout(args):
     try:
         stdout_stat = os.fstat(1)
         _prepare_compile_stderr()
+        stderr_stat = os.fstat(2)
+        if _stderr_may_be_playbook(args.playbook):
+            return 2
         if os.isatty(1):
             raise ValueError("compile -o - requires redirected output: redirect stdout to a pipe or file")
-        if _same_stream(stdout_stat, os.fstat(2)) and not _discard_stream(stdout_stat):
+        if _same_stream(stdout_stat, stderr_stat) and not _discard_stream(stdout_stat):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
         with os.fdopen(os.dup(1), "wb") as stdout:
@@ -475,11 +584,7 @@ def _cmd_compile_stdout(args):
 def _prepare_compile_stderr():
     try:
         os.fstat(2)
-        if os.name != "posix":
-            return
-        from fcntl import F_GETFL, fcntl
-
-        if (fcntl(2, F_GETFL) & os.O_ACCMODE) != os.O_RDONLY:
+        if not _fd_is_read_only(2):
             return
     except OSError as ex:
         if ex.errno != errno.EBADF:
@@ -497,13 +602,51 @@ def _prepare_compile_stderr():
         sys.stderr = open(2, "w", closefd=False, errors="backslashreplace")
 
 
+def _try_stat(path):
+    try:
+        return os.stat(path)
+    except (OSError, UnicodeError):
+        # Let the compiler or destination open report inaccessible paths.
+        return None
+
+
 def _cmd_compile(args, stdout=None):
-    if stdout is None and args.manifest:
-        try:
+    input_path = None
+    input_stat = None
+
+    def validate_input(info, name, path):
+        if info is None or input_stat is None:
+            return
+        if not os.path.samestat(info, input_stat):
+            try:
+                current_input = os.stat(input_path)
+            except FileNotFoundError:
+                return
+            except (OSError, UnicodeError) as ex:
+                raise ValueError("cannot check current input playbook: %s" % ex) from ex
+            if not os.path.samestat(info, current_input):
+                return
+        raise ValueError("%s points to input playbook: %s" % (name, path))
+
+    def check_input_destinations():
+        if stdout is None:
+            validate_input(_try_stat(args.output), "output path", args.output)
+        else:
+            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
+        if args.manifest:
+            validate_input(_try_stat(args.manifest), "manifest path", args.manifest)
+
+    def on_playbook_open(path, info):
+        nonlocal input_path, input_stat
+        input_path, input_stat = path, info
+        check_input_destinations()
+
+    try:
+        if stdout is None and args.manifest:
             _check_file_destinations(args.output, args.manifest)
-        except ValueError as ex:
-            sys.stderr.write("ansiroll: %s\n" % ex)
-            return 2
+    except ValueError as ex:
+        sys.stderr.write("ansiroll: %s\n" % ex)
+        return 2
     try:
         extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
     except Exception as ex:
@@ -515,7 +658,8 @@ def _cmd_compile(args, stdout=None):
                                             extra_vars=extra_vars,
                                             tree_shake=args.tree_shake,
                                             freeze_playbook_vars=args.freeze_playbook_vars,
-                                            freeze_vars=args.freeze_var)
+                                            freeze_vars=args.freeze_var,
+                                            on_playbook_open=on_playbook_open)
     except Exception as ex:
         if not isinstance(ex, (ValueError,) + _ansible_errors()):
             raise
@@ -524,17 +668,20 @@ def _cmd_compile(args, stdout=None):
             message = "ansiroll: " + message
         sys.stderr.write(message + "\n")
         return 2
-    if stdout is None:
-        try:
-            _write_compile_files(args.output, args.manifest, source, manifest)
-        except ValueError as ex:
-            sys.stderr.write("ansiroll: %s\n" % ex)
-            return 2
-    else:
-        if args.manifest:
-            _write_stdout_manifest(args.manifest, manifest, stdout.fileno())
-        stdout.write(source.encode("utf-8"))
-        stdout.flush()
+    try:
+        check_input_destinations()
+        if stdout is None:
+            _write_compile_files(args.output, args.manifest, source, manifest, validate_input)
+        else:
+            if args.manifest:
+                _write_stdout_manifest(args.manifest, manifest, stdout.fileno(), validate_input=validate_input)
+            encoded = source.encode("utf-8")
+            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
+            stdout.write(encoded)
+            stdout.flush()
+    except (ValueError, _TruncatingReopenError) as ex:
+        sys.stderr.write("ansiroll: %s\n" % ex)
+        return 2
     sys.stderr.write(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
         % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),
