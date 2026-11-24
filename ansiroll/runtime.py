@@ -225,13 +225,15 @@ def _selector_local_bindings(expression, variables):
             scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
             fallthrough = True
             for branch in (node, *node.elif_):
+                if not fallthrough:
+                    break
                 visit(branch.test, names)
                 local = names.copy()
                 for child in branch.body:
                     visit(child, local)
                 test = _selector_vars_key(branch.test, scope)
                 known = isinstance(test, (bool, int, float, str, type(None)))
-                if fallthrough and (not known or test):
+                if not known or test:
                     after.update(local)
                 if known and test:
                     fallthrough = False
@@ -390,6 +392,24 @@ def _selector_vars_key(node, variables, aliases=None):
                     return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
                     return _selector_vars_key(body[0].nodes[0], variables, (*aliases, node.name))
+    if isinstance(node, jinja2.nodes.Compare):
+        # Delegate each comparison of known scalars to Jinja's own operator
+        # semantics. Evaluate chained operands only when needed.
+        left = _selector_vars_key(node.expr, variables, aliases)
+        for operand in node.ops:
+            right = _selector_vars_key(operand.expr, variables, aliases)
+            if not all(isinstance(value, (str, bool, int, float, type(None))) for value in (left, right)):
+                return unknown
+            compare = jinja2.nodes.Compare(
+                jinja2.nodes.Const(left), [jinja2.nodes.Operand(operand.op, jinja2.nodes.Const(right))])
+            compare.set_environment(node.environment)
+            try:
+                if not compare.as_const():
+                    return False
+            except jinja2.nodes.Impossible:
+                return unknown
+            left = right
+        return True
     if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
         method = node.node.attr
         if method in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None:
@@ -400,7 +420,7 @@ def _selector_vars_key(node, variables, aliases=None):
                                               for arg in (*args, *kwargs.values())):
                 try:
                     return getattr(str, method)(value, *args, **kwargs)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return unknown
     if isinstance(node, jinja2.nodes.Getitem):
         value = _selector_vars_key(node.node, variables, aliases)
@@ -434,7 +454,10 @@ def _selector_vars_key(node, variables, aliases=None):
         old, new = (_selector_vars_key(arg, variables, aliases) for arg in node.args[:2])
         count = _selector_vars_key(node.args[2], variables, aliases) if len(node.args) == 3 else -1
         if all(isinstance(part, str) for part in (value, old, new)) and isinstance(count, int):
-            return str.replace(value, old, new, count)
+            try:
+                return str.replace(value, old, new, count)
+            except OverflowError:
+                return unknown
     if isinstance(node, jinja2.nodes.Concat):
         parts = [_selector_vars_key(part, variables, aliases) for part in node.nodes]
         if all(isinstance(part, str) for part in parts):

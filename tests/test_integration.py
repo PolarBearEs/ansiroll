@@ -3396,6 +3396,7 @@ def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, mo
     "{{ vars[key] }}{% for key in [] %}{% endfor %}",
     "{% if flag %}{% set key = 'second' %}{% else %}{{ vars[key] }}{% endif %}",
     "{% if flag %}{% set key = 'second' %}{% endif %}{{ vars[key] }}",
+    "{% if flag == true %}{% set key = 'second' %}{% endif %}{{ vars[key] }}",
 ])
 def test_computed_timeout_uses_outer_key_despite_other_bindings(tmp_path, monkeypatch, template):
     playbook = tmp_path / "play.yml"
@@ -3418,6 +3419,17 @@ def test_computed_timeout_uses_outer_key_despite_other_bindings(tmp_path, monkey
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_timeout_dependency_scan_skips_unreachable_elif(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_timeout: >-
+    {% if true %}23{% elif 'a'.split(' ', maxsplit=99999999999999999999) %}42{% endif %}
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    assert _compiled_plays(source, tmp_path)[0]["gather_timeout"] == 23
 
 
 def test_controller_timeout_uses_local_computed_key_invalidation(tmp_path, monkeypatch):
