@@ -359,6 +359,52 @@ def test_json_preserves_independently_mutated_list_views(filter_name):
     assert json.loads(result) == [[1, 2], [1]]
 
 
+def test_template_writes_json_with_nested_hostvars_entries(monkeypatch):
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: "ready"
+    task = _task("1", "Write hostvars", "template", vars={"alias": "{{ lookup('source') }}/tail"})
+    source = "{{ {'values': hostvars[inventory_hostname].values()} }}"
+    monkeypatch.setattr(runtime, "_copy_single_file", lambda _task, _args, data, *_rest: data)
+    result = runtime._run_file_action(
+        "template", {**task, "_baked": {"out.j2": source}}, {"src": "out.j2", "dest": "/out"},
+        runtime._task_ctx(task, {}),
+    )
+    assert "ready/tail" in json.loads(result)["values"]
+
+
+def test_flatten_treats_lazy_hostvars_entries_as_lists():
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: "ready"
+    task = _task("1", "Flatten hostvars", "debug", vars={"alias": "{{ lookup('source') }}/tail"})
+    result = runtime.template("{{ [hostvars[inventory_hostname].values()] | flatten }}",
+                              runtime._task_ctx(task, {}))
+    assert "ready/tail" in result
+
+
+def test_delegated_hostvars_sequence_exposes_only_requested_members():
+    from ansiroll.runtime import _resolve_delegated_play_var
+
+    inventory = {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}}
+    runtime = Runtime({}, "", inventory)
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    task = _task("1", "Send hostvars alias", "template", vars={
+        "payload": "{{ {'values': hostvars[inventory_hostname].values()} }}",
+        "unused": "{{ lookup('source') }}/tail",
+    })
+    scope = runtime.templater._play_var_scope(runtime._task_ctx(task, {}), strict=False)
+    members = []
+    payload = _resolve_delegated_play_var("payload", scope, runtime.templater, members=members)
+    sequence = _resolve_delegated_play_var(None, scope, runtime.templater,
+                                          members=members, member=payload["value"]["values"])
+    assert sequence["lazy_members"]
+    assert isinstance(sequence["value"], list)
+    value = _resolve_delegated_play_var(None, scope, runtime.templater,
+                                       members=members, member=sequence["value"][0])
+    assert value["value"] == 17
+    assert not calls
+
+
 def test_lazy_hostvars_entries_compare_unordered_values_like_lists():
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": float("nan")}}})
     task = _task("1", "Compare unordered values", "debug", vars={"unused": "{{ lookup('source') }}/tail"})

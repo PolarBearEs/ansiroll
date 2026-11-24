@@ -870,10 +870,12 @@ def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch)
       delegate_to: localhost
       vars:
         alias: "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/tail"
-""", {"sample.j2": "prefix={{ hostvars[inventory_hostname].alias }}\n"})
+        payload: "{{ {'values': hostvars[inventory_hostname].values()} }}"
+""", {"sample.j2": "prefix={{ hostvars[inventory_hostname].alias }}\n"
+                      "type={{ payload['values'] | type_debug }}\n"})
     _, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
     assert recap == ("1", "1", "0", "0", "0", "0", "0")
-    assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\n"
+    assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\ntype=list\n"
 
 
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):

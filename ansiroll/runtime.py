@@ -376,7 +376,7 @@ def _fail_on_undef(value):
         for k, v in value.items():
             _fail_on_undef(k)
             _fail_on_undef(v)
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, (list, tuple, _HostVarEntries)):
         for v in value:
             _fail_on_undef(v)
     elif _is_undef(value):
@@ -645,7 +645,7 @@ def _f_unique(seq):
 def _f_flatten(seq, levels=None):
     out = []
     for x in seq or []:
-        if isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple, _HostVarEntries)):
             if levels is None or levels > 0:
                 out.extend(_f_flatten(x, None if levels is None else levels - 1))
             else:
@@ -2740,8 +2740,8 @@ def _as_text(v):
         v._fail_with_undefined_error()
     if v is None:
         return ""
-    if isinstance(v, (dict, list)):
-        return json.dumps(v)
+    if isinstance(v, (dict, list, _HostVarEntries)):
+        return json.dumps(v, **_host_entries_json_options({}))
     if isinstance(v, bool):
         return "true" if v else "false"
     return str(v)
@@ -6081,7 +6081,7 @@ def _delegate_template_value(value):
         return {"__ansiroll_unsafe__": str(value)}
     if isinstance(value, dict):
         return {key: _delegate_template_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, _HostVarEntries)):
         return [_delegate_template_value(item) for item in value]
     return value
 
@@ -6127,7 +6127,7 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
             mapping_keys.append((path, keys))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys, (*path, wire_key))
                 for wire_key, key in zip(wire_keys, keys)}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, _HostVarEntries)):
         return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys, (*path, index))
                 for index in range(len(value))]
     return _fail_on_undef(value)
@@ -6155,7 +6155,7 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
             rendered = scope[name]
             if name == "hostvars" or not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
                 rendered = templater.resolve_variable(name, rendered, scope)
-        if members is not None and isinstance(rendered, (dict, list, tuple)):
+        if members is not None and isinstance(rendered, (dict, list, tuple, _HostVarEntries)):
             # Send the container's shape without reading any of its members.
             def reserve(key):
                 index = len(members)
