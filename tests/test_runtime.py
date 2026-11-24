@@ -279,6 +279,75 @@ class FilterModule:
     assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [[1, 2], [1, 2, 3]]
 
 
+def test_legacy_inventory_views_work_in_collection_filters_and_dict_lookup(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"child": {"keep": 1}, "nested": [[1], [2, [3]]]}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Read raw inventory collections", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ [(entry | combine({'child': {'add': 2}}, recursive=true)).child,"
+                " entry.nested | flatten, query('dict', entry.child)] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        {"keep": 1, "add": 2}, [1, 2, 3], [{"key": "keep", "value": 1}],
+    ]
+
+
+@pytest.mark.parametrize("filter_name", ["to_yaml", "to_nice_yaml"])
+def test_legacy_inventory_views_serialize_yaml_and_keep_bindings_when_reversed(monkeypatch, filter_name):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('raw') }}"
+    runtime = Runtime({}, "", {"payload": {"nested": [literal, "plain"]}})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    task = _task("1", "Reverse raw inventory", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set ignored = entry.nested.reverse() %}"
+                "{{ [entry | " + filter_name + " | from_yaml, copied.payload.nested] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        {"nested": ["plain", literal]}, ["plain", "rendered"],
+    ]
+    assert calls == ["raw"]
+
+
+def test_custom_plugin_receives_builtin_inventory_collections_and_keeps_writes(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('raw') }}"
+    runtime = Runtime({}, "", {"payload": {"nested": [literal, "plain"]}})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    runtime.templater.register_plugins([{"kind": "filter", "name": "inspect_inventory", "source": """
+import json
+
+def inspect_inventory(entry):
+    assert type(entry) is dict
+    assert type(entry['nested']) is list
+    before = json.dumps(entry)
+    entry.update(added=2)
+    entry['nested'].reverse()
+    return before
+
+class FilterModule:
+    def filters(self):
+        return {'inspect_inventory': inspect_inventory}
+"""}])
+    task = _task("1", "Inspect raw inventory in Python", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set before = entry | inspect_inventory | from_json %}"
+                "{{ [before, copied.payload.added, copied.payload.nested] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        {"nested": [literal, "plain"]}, 2, ["plain", "rendered"],
+    ]
+    assert calls == ["raw"]
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",

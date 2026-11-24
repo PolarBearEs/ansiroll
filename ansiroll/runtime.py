@@ -551,7 +551,8 @@ def _f_combine(d, *others, **kwargs):
     def merge(a, b):
         out = dict(a.items())
         for k, v in b.items():
-            if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
+            if recursive and isinstance(out.get(k), (dict, _RawSnapshotMapping)) and isinstance(
+                    v, (dict, _RawSnapshotMapping)):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
@@ -656,7 +657,7 @@ def _f_unique(seq):
 def _f_flatten(seq, levels=None):
     out = []
     for x in seq or []:
-        if isinstance(x, (list, tuple, _HostVarEntries)):
+        if isinstance(x, (list, tuple, _HostVarEntries, _RawSnapshotList)):
             if levels is None or levels > 0:
                 out.extend(_f_flatten(x, None if levels is None else levels - 1))
             else:
@@ -707,7 +708,7 @@ def _yaml_plain(v, memo=None, key_memo=None):
         memo, key_memo = {}, {}
     if isinstance(v, str):
         return "".join([v]) if type(v) is not str else v
-    if not isinstance(v, (dict, list, tuple, _HostVarEntries)):
+    if not isinstance(v, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
         return v
     # Lazy wrappers are rebuilt on every access; key them by the raw
     # container they wrap so recursion through them is still detected, plus
@@ -718,7 +719,7 @@ def _yaml_plain(v, memo=None, key_memo=None):
     key = (id(getattr(v, "_raw", v)), id(origin) if origin is not None else None)
     if key in memo:
         return memo[key][1]
-    if isinstance(v, dict):
+    if isinstance(v, (dict, _RawSnapshotMapping)):
         out = {}
         memo[key] = (v, out)
         for k, x in v.items():
@@ -1029,7 +1030,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
 def _flatten_deep(terms):
     out = []
     for t in terms:
-        if isinstance(t, (list, tuple)):
+        if isinstance(t, (list, tuple, _RawSnapshotList)):
             out.extend(_flatten_deep(list(t)))
         elif t is not None:
             out.append(t)
@@ -1043,7 +1044,7 @@ def _loop_lookup(name, terms):
     if name == "items":
         out = []
         for t in terms:
-            if isinstance(t, list):
+            if isinstance(t, (list, _RawSnapshotList)):
                 out.extend(t)
             else:
                 out.append(t)
@@ -1054,17 +1055,17 @@ def _loop_lookup(name, terms):
         import itertools
         return [list(x) for x in itertools.zip_longest(*terms, fillvalue=None)]
     if name == "dict":
-        if len(terms) == 1 and isinstance(terms[0], dict):
+        if len(terms) == 1 and isinstance(terms[0], (dict, _RawSnapshotMapping)):
             return [{"key": k, "value": v} for k, v in terms[0].items()]
         raise RuntimeError("with_dict/dict lookup plugin expects a dictionary")
     if name == "nested":
         import itertools
-        lists = [t if isinstance(t, list) else [t] for t in terms]
+        lists = [t if isinstance(t, (list, _RawSnapshotList)) else [t] for t in terms]
         return [list(x) for x in itertools.product(*lists)]
     if name == "indexed_items":
         out = []
         for t in terms:
-            items = t if isinstance(t, list) else [t]
+            items = t if isinstance(t, (list, _RawSnapshotList)) else [t]
             out.extend(items)
         return [[i, item] for i, item in enumerate(out)]
     raise _UnsupportedLookup(name)
@@ -1367,6 +1368,9 @@ class _RawSnapshotList(MutableSequence):
 
     def copy(self):
         return list(self)
+
+    def reverse(self):
+        list.reverse(self._owner)
 
     def sort(self, *, key=None, reverse=False):
         def raw_key(value):
@@ -2330,6 +2334,54 @@ def _jinja_undef(hint=None):
     return _captured(hint or "Mandatory variable has not been overridden", missing=True)
 
 
+class _PluginInventoryArgument:
+    """Give Python plugins a built-in container and retain its snapshot bindings."""
+
+    def __init__(self, view):
+        self.view = view
+        self.value = {} if isinstance(view, _RawSnapshotMapping) else []
+        self.previous = None
+        self.previous_bindings = None
+
+    def populate(self, converted):
+        if isinstance(self.view, _RawSnapshotMapping):
+            self.value.update((key, _custom_plugin_arg(item, converted)) for key, item in self.view.items())
+        else:
+            self.value.extend(_custom_plugin_arg(item, converted) for item in self.view)
+            self.previous_bindings = list.copy(self.view._owner)
+        self.previous = self.value.copy()
+
+    def write_back(self, sources):
+        if self.previous is None:
+            return
+        owner = self.view._owner
+        if isinstance(self.view, _RawSnapshotMapping):
+            for key in self.previous.keys() - self.value.keys():
+                dict.pop(owner, key, None)
+            for key, value in self.value.items():
+                if key not in self.previous or self.previous[key] is not value:
+                    dict.__setitem__(owner, key, sources.get(id(value), value))
+        elif len(self.previous) != len(self.value) or any(a is not b for a, b in zip(self.previous, self.value)):
+            bindings = {}
+            for value, stored in zip(reversed(self.previous), reversed(self.previous_bindings)):
+                bindings.setdefault(id(value), []).append(stored)
+            members = []
+            for value in self.value:
+                retained = bindings.get(id(value))
+                members.append(retained.pop() if retained else sources.get(id(value), value))
+            list.__setitem__(owner, slice(None), members)
+            self.previous_bindings = members
+        self.previous = self.value.copy()
+
+
+def _write_back_plugin_inventory(converted):
+    if converted:
+        entries = [entry[2] for entry in converted.values() if len(entry) == 3]
+        sources = {id(entry.value): entry.view for entry in entries}
+        for entry in entries:
+            entry.write_back(sources)
+
+
 def _custom_plugin_arg(value, converted):
     if id(value) in converted:
         return converted[id(value)][1]
@@ -2337,6 +2389,11 @@ def _custom_plugin_arg(value, converted):
         entries = value._materialize()
         converted[id(value)] = value, entries
         return _custom_plugin_arg(entries, converted)
+    if isinstance(value, (_RawSnapshotMapping, _RawSnapshotList)):
+        entry = _PluginInventoryArgument(value)
+        converted[id(value)] = value, entry.value, entry
+        entry.populate(converted)
+        return entry.value
     # Hostvars wrappers normalize members when the plugin reads them.
     if type(value) is dict:
         converted[id(value)] = value, value
@@ -2367,6 +2424,9 @@ def _wrap_custom_plugin(fn, templater):
             result = fn(*args, **kwargs)
         if isinstance(result, Generator):
             return _resume_scoped_generator(result, templater, converted)
+        for entry in converted.values():
+            if len(entry) == 3 and result is entry[1]:
+                return entry[0]
         return result
     return wrapped
 
@@ -2643,11 +2703,16 @@ class _Templater:
     @contextmanager
     def _plugin_arg_scope(self, converted):
         previous = self._custom_plugin_args
+        if converted is not previous:
+            _write_back_plugin_inventory(previous)
         self._custom_plugin_args = converted
         try:
             yield
         finally:
-            self._custom_plugin_args = previous
+            try:
+                _write_back_plugin_inventory(converted)
+            finally:
+                self._custom_plugin_args = previous
 
     def _wrap_jinja_callback(self, body):
         @wraps(body)
