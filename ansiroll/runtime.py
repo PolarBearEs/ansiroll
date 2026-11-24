@@ -1158,6 +1158,8 @@ def _read_lazy_member(container, value):
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
+    _copy_reads = None
+
     def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
         dict.__init__(self, raw)
         self._raw = raw
@@ -1177,7 +1179,15 @@ class _LazyTplDict(dict):
         return ctx
 
     def __getitem__(self, k):
-        return _read_lazy_member(self, dict.__getitem__(self, k))
+        return self._read_member(k, dict.__getitem__(self, k))
+
+    def _read_member(self, key, value):
+        if self._copy_reads is None:
+            return _read_lazy_member(self, value)
+        binding = key, id(value)
+        if binding not in self._copy_reads:
+            self._copy_reads[binding] = value, _read_lazy_member(self, value)
+        return self._rt.templater._observe_untrusted(self._copy_reads[binding][1])
 
     def get(self, k, default=None):
         try:
@@ -1187,21 +1197,21 @@ class _LazyTplDict(dict):
 
     def pop(self, key, *default):
         if key in self:
-            return self._mutation_value(dict.pop(self, key, *default))
+            return self._mutation_value(key, dict.pop(self, key, *default))
         return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return self._rt.templater._observe_untrusted(key), self._mutation_value(value)
+        return self._rt.templater._observe_untrusted(key), self._mutation_value(key, value)
 
     def setdefault(self, key, default=None):
         if key in self:
-            return self._mutation_value(dict.__getitem__(self, key))
+            return self._mutation_value(key, dict.__getitem__(self, key))
         return dict.setdefault(self, key, default)
 
-    def _mutation_value(self, value):
+    def _mutation_value(self, key, value):
         if self._task_vars:
-            return _read_lazy_member(self, value)
+            return self._read_member(key, value)
         return _observe_container_value(value, self._rt, self._render_ctx)
 
     def keys(self):
@@ -1218,8 +1228,10 @@ class _LazyTplDict(dict):
     def copy(self):
         raw_items = dict.items(self)
         if self._task_vars:
-            copied = _LazyTplDict(dict(raw_items), self._rt, self._ctx, self._dynamic, self._origin, task_vars=True)
+            copied = _LazyTplDict(dict(raw_items), self._rt, self._render_ctx(), origin=self._origin, task_vars=True)
             copied._task_binding = getattr(self, "_task_binding", None)
+            # A copy of a snapshot keeps the result of each original binding.
+            copied._copy_reads = self._copy_reads if self._copy_reads is not None else {}
             return copied
         if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
             return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())

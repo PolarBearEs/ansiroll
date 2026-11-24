@@ -145,6 +145,51 @@ def test_copy_of_deferred_task_mapping_renders_only_selected_member(expression):
     assert calls == ["chosen"]
 
 
+@pytest.mark.parametrize("body", [
+    "{{ copied.used }}/{{ copied.used }}",
+    "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",
+    "{% set other = copied.copy() %}{{ copied.used }}/{{ other.used }}",
+])
+def test_task_mapping_copy_reuses_the_first_resolved_member(body):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+
+    def lookup(name):
+        calls.append(name)
+        return len(calls)
+
+    runtime.templater.env.globals["lookup"] = lookup
+    task = _task("1", "Read a copied setting twice", "debug", loop=["sample"], vars={
+        "settings": {"used": "{{ lookup('chosen') }}:{{ item }}", "unused": "{{ lookup('unused') }}/tail"},
+    })
+    template = "{% set copied = settings.copy() %}" + body
+    result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
+    assert result.split("/") == ["1:sample"] * body.count("{{")
+    assert calls == ["chosen"]
+
+
+def test_task_mapping_copy_reuses_a_captured_lookup_error():
+    from ansiroll.runtime import _captured, _is_undef
+
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+
+    def lookup(name):
+        calls.append(name)
+        return _captured("failed lookup")
+
+    runtime.templater.env.globals["lookup"] = lookup
+    task = _task("1", "Read a failed setting twice", "debug", loop=["sample"], vars={
+        "settings": {"used": "{{ lookup('chosen') }}/tail", "unused": "{{ lookup('unused') }}/tail"},
+    })
+    ctx = runtime._task_ctx(task, {"item": "sample"})
+    copied = runtime.templater.render_string("{{ settings.copy() }}", ctx)
+    first = copied["used"]
+    assert _is_undef(first)
+    assert copied["used"] is first
+    assert calls == ["chosen"]
+
+
 def test_sort_of_deferred_task_list_compares_rendered_members():
     frames, calls = [], []
     runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
