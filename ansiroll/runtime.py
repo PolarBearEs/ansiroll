@@ -1218,8 +1218,7 @@ class _LazyTplDict(dict):
     def copy(self):
         raw_items = dict.items(self)
         if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
-            view = _HostVarView if isinstance(self, _HostVarView) else _LazyTplDict
-            return view(dict(raw_items), self._rt, self._render_ctx())
+            return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())
         return {k: self[k] for k in self}
 
     def __iter__(self):
@@ -1467,6 +1466,16 @@ class _ModernPlayVarView(_PlayVarView):
 
 class _HostVarView(_LazyTplDict):
     """Keep hostvars entries lazy until the template reads them."""
+
+    def copy(self):
+        # Copy the current bindings without resolving them or rebuilding the
+        # view from its original host data. Preserve its existing resolver.
+        raw = dict(dict.items(self))
+        view = dict.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        view._raw = raw
+        dict.__init__(view, raw)
+        return view
 
     def _resolve(self, key, value):
         return _read_lazy_member(self, value)

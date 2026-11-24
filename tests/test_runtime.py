@@ -221,12 +221,14 @@ def test_custom_lookup_reads_deferred_task_alias_from_hostvars():
     assert frames[0]["result"]["msg"] == "17/tail"
 
 
+@pytest.mark.parametrize("copy", [False, True], ids=["direct", "copy"])
 @pytest.mark.parametrize("expression", [
-    "(hostvars[inventory_hostname].items() | selectattr('0', 'equalto', 'original') | first)[1]",
-    "hostvars[inventory_hostname].items()[0][1]",
-    "hostvars[inventory_hostname].values()[0]",
+    "({view}.items() | selectattr('0', 'equalto', 'original') | first)[1]",
+    "{view}.items()[0][1]",
+    "{view}.values()[0]",
+    "{view}.original",
 ])
-def test_legacy_hostvars_entries_render_only_accessed_sources(monkeypatch, expression):
+def test_legacy_hostvars_entries_render_only_accessed_sources(monkeypatch, expression, copy):
     import ansiroll.runtime as runtime_mod
 
     monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
@@ -235,8 +237,9 @@ def test_legacy_hostvars_entries_render_only_accessed_sources(monkeypatch, expre
     runtime = Runtime({}, "", host_vars, on_result=frames.append)
     calls = []
     runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    view = "hostvars[inventory_hostname].copy()" if copy else "hostvars[inventory_hostname]"
     task = _task("1", "Iterate hostvars", "debug", args={
-        "msg": "{{ " + expression + " }}",
+        "msg": "{{ " + expression.format(view=view) + " }}",
     }, vars={"unused": "{{ lookup('unused') }}/tail"})
     runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
     assert frames[0]["result"]["msg"] == "ready"
@@ -354,6 +357,18 @@ def test_lazy_hostvars_entries_preserve_the_mapping_snapshot():
                   "{% set inserted = current.setdefault('added', 18) %}"
                   "{{ [entries[0], ('original', 17) in entries, ('added', 18) in entries] | to_json }}")
     assert json.loads(runtime.template(expression, runtime._task_ctx(task, {}))) == [["original", 17], True, False]
+
+
+def test_lazy_hostvars_copy_uses_current_bindings_and_mutates_independently():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    task = _task("1", "Copy hostvar bindings", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    expression = ("{% set current = hostvars[inventory_hostname] %}"
+                  "{% set removed = current.pop('original') %}"
+                  "{% set added = current.setdefault('new', 18) %}"
+                  "{% set snapshot = current.copy() %}"
+                  "{% set copied = snapshot.pop('new') %}"
+                  "{{ [copied, 'original' in snapshot, 'new' in snapshot, current.new] | to_json }}")
+    assert json.loads(runtime.template(expression, runtime._task_ctx(task, {}))) == [18, False, False, 18]
 
 
 def test_jinja_tojson_escapes_values_in_nested_lazy_hostvars_entries():
