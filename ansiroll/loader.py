@@ -2484,12 +2484,17 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         if rel in shadowed:
             for root_index, full in candidates:
                 bake_source(full, rel, root_index, alternate=True)
+    assets, metadata, direct = _bake_linked_role_sources(task, basedir, subdir, src, meta)
+    baked.update(assets)
+    meta.update(metadata)
     if not baked:
         return False
     node["_baked"] = baked
     meta.update(alternate_meta)
     node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
+    if direct:
+        node["_baked_direct_sources"] = direct
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
     node["_baked_tree_dirs"] = sorted(directories)
     if aliases:
@@ -2558,6 +2563,364 @@ def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
         dirs.append((os.path.join(base, subdir), True))
     dirs.append((base, False))
     return dirs if tagged else [d for d, _ in dirs]
+
+
+def _linked_role_source_patterns(src):
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    try:
+        parsed = Environment(keep_trailing_newline=True).parse(src)
+    except TemplateSyntaxError:
+        return None
+    body = parsed.body
+    assignments = (nodes.Assign, nodes.AssignBlock)
+    output_nodes = [node for node in body if not isinstance(node, assignments)]
+    if not output_nodes:
+        return None
+
+    def literal(node, index):
+        if isinstance(node, nodes.Output) and node.nodes and isinstance(node.nodes[index], nodes.TemplateData):
+            return node.nodes[index].data
+        return ""
+
+    head = literal(output_nodes[0], 0)
+    if (not (len(output_nodes) == 1 and isinstance(output_nodes[0], nodes.Output))
+            and not literal(output_nodes[-1], -1)):
+        return None
+    referenced = {name.name for name in parsed.find_all(nodes.Name) if name.ctx == "load"}
+
+    def expand(sequence, bindings):
+        paths = [("", bindings)]
+        for node in sequence:
+            variants = []
+            for prefix, current in paths:
+                choices = expand_node(node, current)
+                if len(variants) + len(choices) > 128:
+                    raise ValueError("too many linked source alternatives")
+                for suffix, updated in choices:
+                    if len(prefix) + len(suffix) > 4096:
+                        raise OverflowError("expanded linked source pattern is too long")
+                    variants.append((prefix + suffix, updated))
+            paths = variants
+        return paths
+
+    def expand_assignment(node, bindings):
+        target = node.target
+        if not isinstance(target, nodes.Name):
+            unknown = {name.name: "\0" for name in target.find_all(nodes.Name)}
+            return [("", {**bindings, **unknown})]
+        if target.name not in referenced:
+            return [("", bindings)]
+        if isinstance(node, nodes.Assign):
+            values = expand_node(node.node, bindings)
+        else:
+            values = [("\0", bindings)]
+            if node.filter is None:
+                try:
+                    values = expand(node.body, bindings)
+                except ValueError:
+                    # Captured output does not otherwise affect the path.
+                    pass
+        return [("", {**bindings, target.name: value}) for value, _ in values]
+
+    def expand_node(node, bindings):
+        if node is None:
+            # An inline conditional without an else emits an empty string
+            # when combined with the rest of a path.
+            return [("", bindings)]
+        if isinstance(node, nodes.TemplateData):
+            return [(node.data, bindings)]
+        if isinstance(node, nodes.Const) and isinstance(node.value, str):
+            return [(node.value, bindings)]
+        if isinstance(node, nodes.Name):
+            return [(bindings.get(node.name, "\0"), bindings)]
+        if isinstance(node, nodes.Add):
+            # When an operand is a string, a successful addition preserves its
+            # literal text even if the other operand is dynamic.
+            return expand((node.left, node.right), bindings)
+        if isinstance(node, (nodes.Output, nodes.Concat)):
+            return expand(node.nodes, bindings)
+        if isinstance(node, assignments):
+            return expand_assignment(node, bindings)
+        if isinstance(node, nodes.If):
+            choices = []
+            for branch in (node, *node.elif_):
+                if not isinstance(branch.test, nodes.Const) or branch.test.value:
+                    choices.extend(expand(branch.body, bindings))
+                if isinstance(branch.test, nodes.Const) and branch.test.value:
+                    return choices
+            return choices + expand(node.else_, bindings)
+        if isinstance(node, nodes.CondExpr):
+            branches = (node.expr1, node.expr2)
+            if isinstance(node.test, nodes.Const):
+                branches = (node.expr1 if node.test.value else node.expr2,)
+            return [path for branch in branches for path in expand_node(branch, bindings)]
+        if isinstance(node, nodes.Expr):
+            return [("\0", bindings)]
+        raise ValueError("unsupported linked source statement")
+
+    try:
+        candidates = expand(body, {})
+    except (ValueError, OverflowError):
+        return None
+    patterns = []
+    for candidate in dict.fromkeys(path for path, _ in candidates):
+        if not candidate or os.path.isabs(candidate) or ".." in candidate.split(os.sep):
+            continue
+        # These spellings require a directory, even after the variables render.
+        if candidate.endswith((os.sep, os.sep + ".")):
+            continue
+        patterns.append((candidate.partition("\0")[0], _linked_role_source_pattern(candidate)))
+    return (head, patterns) if patterns else None
+
+
+def _linked_role_source_pattern(candidate):
+    segments = os.path.normpath(re.sub("\0+", "\0", candidate)).split(os.sep)
+    pattern = []
+    for index, segment in enumerate(segments):
+        directory = index < len(segments) - 1
+        # A substitution can supply a separator before or after a literal dot.
+        segment = re.sub(r"\x00(?:\.\x00)+", "\0", segment)
+        if segment.startswith(".\0"):
+            segment = segment[1:]
+        if directory and segment.endswith("\0."):
+            segment = segment[:-1]
+        optional = directory and "\0" in segment and segment.replace("\0", "") in ("", ".")
+        if optional:
+            # A wildcard may emit a directory followed by the dot component
+            # that normalization removes, or leave the whole component empty.
+            tokens = ("\0", "/")
+        else:
+            tokens = tuple(part for part in re.split("(\0)", segment) if part)
+            if directory:
+                tokens += ("/",)
+        pattern.append((tokens, optional))
+    return pattern
+
+
+def _linked_role_source_matches(pattern, relative):
+    # At most one position per character is retained after each token.
+    positions = {0}
+    for tokens, optional in pattern:
+        # Empty and dot components can vanish on normalization.
+        skipped = positions if optional else ()
+        for token in tokens:
+            if token == "\0":
+                positions = set(range(min(positions), len(relative) + 1))
+            else:
+                positions = {index + len(token) for index in positions if relative.startswith(token, index)}
+            if not positions:
+                break
+        positions.update(skipped)
+        if not positions:
+            return False
+    return len(relative) in positions
+
+
+def _linked_role_source_prefix(pattern):
+    """Return the literal prefix and whether the pattern can extend it."""
+    prefix = ""
+    for tokens, optional in pattern:
+        if optional:
+            return prefix, True
+        literal, dynamic, _ = "".join(tokens).partition("\0")
+        prefix += literal
+        if dynamic:
+            return prefix, True
+    return prefix, False
+
+
+def _open_linked_role_source(resolved_path):
+    """Open a validated real path without following replacement symlinks."""
+    *directories, filename = resolved_path.split(os.sep)[1:]
+    directory_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open(os.sep, directory_flags)
+    try:
+        for directory in directories:
+            child = os.open(directory, directory_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        return os.open(filename, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def _role_source_roots(task, basedir):
+    magic = _role_magic(task) or {}
+    return tuple(root for root in
+                 (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
+
+
+def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
+    """Bake direct lookup candidates separately from the legacy parent-path map."""
+    from collections import deque
+    from pathlib import Path
+
+    # A direct override requires Ansible to resolve the task's search path.
+    if getattr(task, "_loader", None) is None:
+        return {}, {}, {}
+    parsed = _linked_role_source_patterns(src)
+    if parsed is None:
+        return {}, {}, {}
+    head, patterns = parsed
+    possible_prefixes = {_linked_role_source_prefix(pattern) for _, pattern in patterns}
+    prefix = os.path.normpath(head.rpartition(os.sep)[0])
+    if prefix == ".":
+        prefix = ""
+    source_roots = _role_source_roots(task, basedir)
+    real_roots = tuple(os.path.realpath(root) for root in source_roots)
+
+    def visible(path):
+        return any(_visible_below(path, root) for root in real_roots)
+
+    winners = {}
+
+    def source_for(relative):
+        if relative not in winners:
+            winners[relative] = _find_needle(task, subdir, relative)
+        winner = winners[relative]
+        return os.path.normpath(winner) if winner else None
+
+    def lookup_paths(relative):
+        matching_heads = [prefix for prefix, pattern in patterns if _linked_role_source_matches(pattern, relative)]
+        if not matching_heads:
+            return
+        if relative.startswith("~") or relative.split(os.sep, 1)[0] == subdir:
+            # A leading "." changes action-subdir and home-path handling.
+            if any(not prefix.startswith(".") for prefix in matching_heads):
+                yield relative
+            if any(not prefix or prefix.startswith(".") for prefix in matching_heads):
+                yield "./" + relative
+        else:
+            yield relative
+
+    def source_spellings(relative, is_subdir):
+        yield relative
+        if is_subdir:
+            yield os.path.join(subdir, relative)
+
+    direct, pending = {}, {}
+    ordinary_by_path = {os.path.normpath(meta["fullpath"]): relative for relative, meta in ordinary.items()}
+    for relative, meta in ordinary.items():
+        for lookup_path in lookup_paths(relative):
+            winner = source_for(lookup_path)
+            if os.path.normpath(meta["fullpath"]) != winner:
+                direct[lookup_path] = ordinary_by_path.get(winner)
+                if winner is not None and direct[lookup_path] is None:
+                    pending.setdefault(winner, []).append(lookup_path)
+
+    # An ordinary spelling may resolve to a known winner under a different
+    # spelling. Keep its ancestors even when that path misses the pattern.
+    pending_parents = {str(parent) for winner in pending for parent in Path(winner).parents}
+
+    def may_have_sources(path, base, is_subdir):
+        if ("", True) in possible_prefixes or os.path.normpath(path) in pending_parents:
+            return True
+        relative = os.path.relpath(path, base)
+        if relative == ".":
+            return True
+        for spelling in source_spellings(relative, is_subdir):
+            directory = spelling + os.sep
+            if any(prefix.startswith(directory) or (can_extend and directory.startswith(prefix))
+                   for prefix, can_extend in possible_prefixes):
+                return True
+        return False
+
+    assets, metadata, contents = {}, {}, {}
+    newline = "" if subdir == "files" else None
+    remaining_linked_visits = 4096
+    # Finish paths with the current number of symlinks before expanding paths
+    # with one more, even when a path has many ordinary directories.
+    pending_dirs, next_hop_dirs = deque(), deque()
+    for base, is_subdir in dict.fromkeys(_search_dirs(task, basedir, subdir, tagged=True)):
+        if not prefix and not is_subdir:
+            continue
+        tree = os.path.join(base, prefix)
+        if not may_have_sources(tree, base, is_subdir):
+            continue
+        real_tree = os.path.realpath(tree)
+        if not any(_visible_below(tree, root) for root in source_roots) or not visible(real_tree):
+            continue
+        # The fixed prefix can require linked lookup before the walk expands
+        # any additional symlinks.
+        pending_dirs.append((tree, base, is_subdir, real_tree != os.path.abspath(tree)))
+    expanding_aliases = False
+    while pending_dirs or next_hop_dirs:
+        if not pending_dirs:
+            pending_dirs, next_hop_dirs = next_hop_dirs, pending_dirs
+            expanding_aliases = True
+        if expanding_aliases:
+            if not remaining_linked_visits:
+                break
+            remaining_linked_visits -= 1
+        root, base, is_subdir, linked = pending_dirs.popleft()
+        step = next(os.walk(root), None)
+        if step is None:
+            continue
+        _, dirs, files = step
+        for name in sorted(dirs):
+            path = os.path.join(root, name)
+            if name.startswith(".") or not may_have_sources(path, base, is_subdir):
+                continue
+            target = os.path.realpath(path)
+            if not visible(target):
+                continue
+            child_is_link = os.path.islink(path)
+            queue = next_hop_dirs if child_is_link else pending_dirs
+            if (expanding_aliases or child_is_link) and len(queue) >= remaining_linked_visits:
+                continue
+            queue.append((path, base, is_subdir, linked or child_is_link))
+        for name in sorted(files):
+            if name.startswith("."):
+                continue
+            path = os.path.normpath(os.path.join(root, name))
+            relative = os.path.relpath(path, base)
+            # A linked root may need an action-prefixed spelling for an asset
+            # already baked by the ordinary walk.
+            if not linked and path in ordinary_by_path:
+                continue
+            paths_to_bake = list(pending.get(path, ()))
+            if linked:
+                for spelling in source_spellings(relative, is_subdir):
+                    for lookup_path in lookup_paths(spelling):
+                        winner = source_for(lookup_path)
+                        if winner is None:
+                            continue
+                        winner_key = ordinary_by_path.get(winner)
+                        direct.setdefault(lookup_path, winner_key)
+                        if path == winner and winner_key is None:
+                            paths_to_bake.append(lookup_path)
+            if not paths_to_bake:
+                continue
+            resolved_path = os.path.realpath(path)
+            if not visible(resolved_path) or not os.path.isfile(resolved_path):
+                continue
+            key = "\0" + paths_to_bake[0]  # Cannot collide with a filesystem pathname.
+            try:
+                fd = _open_linked_role_source(resolved_path)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    if identity not in contents:
+                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape", newline=newline,
+                                       closefd=False) as file:
+                            contents[identity] = file.read()
+                    assets[key] = contents[identity]
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+            metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
+                             "mode": stat.S_IMODE(info.st_mode)}
+            direct.update(dict.fromkeys(paths_to_bake, key))
+    if subdir == "templates":
+        for spelling, key in direct.items():
+            if key is not None and winners[spelling].endswith(os.sep + spelling):
+                meta = metadata[key] if key in metadata else ordinary[key]
+                meta.setdefault("lookup_roots", {})[spelling] = winners[spelling][:-len(spelling)]
+    return assets, metadata, direct
 
 
 def _only_item(src):

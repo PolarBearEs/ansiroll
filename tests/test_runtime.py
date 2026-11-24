@@ -1949,6 +1949,33 @@ def test_copy_content_writes_file(tmp_path):
     assert run_copy()[0]["status"] == "ok"
 
 
+@pytest.mark.parametrize(("src", "expected"), [
+    ("./templates//app.j2", "/role/./templates//app.j2"),
+    ("sub/../templates/app.j2", "/role/templates/templates/app.j2"),
+])
+def test_role_template_fullpath_uses_lookup_root_only_for_direct_sources(monkeypatch, src, expected):
+    rt = Runtime({}, "", {"inventory_hostname": "h"})
+    key = "templates/app.j2"
+    task = {
+        "_baked_tree": "templates",
+        "_baked_tree_dirs": ["nested/templates"],
+        "_baked_tree_aliases": {"sub": "nested/sub"},
+        "_baked_direct_sources": {"./templates/app.j2": key},
+        "_baked": {key: "rendered from {{ template_fullpath }}", "nested/templates/app.j2": "other asset"},
+        "_baked_meta": {key: {"fullpath": "/role/templates/templates/app.j2",
+                              "lookup_roots": {"./templates/app.j2": "/role/"}}},
+    }
+
+    def copy_file(task, args, data, source_rel, source_display, *rest):
+        return {"body": data.decode(), "src": source_display}
+
+    monkeypatch.setattr(rt, "_copy_single_file", copy_file)
+    assert rt._run_file_action("template", task, {"src": src, "dest": "/out"}, {}) == {
+        "body": "rendered from " + expected,
+        "src": expected,
+    }
+
+
 def test_copy_without_embedded_modules_fails_clearly(tmp_path):
     dest = tmp_path / "out.txt"
     rt = Runtime({}, "", {"inventory_hostname": "h"})
