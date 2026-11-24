@@ -633,7 +633,7 @@ def _load_vars_file(play, path):
 
 
 def _known_vars_file_choices(source, scopes):
-    """Return exact paths from a literal condition or a projected variable."""
+    """Return literal or bounded wildcard paths without rendering selectors."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     env = Environment()
@@ -671,48 +671,76 @@ def _known_vars_file_choices(source, scopes):
     return paths, bool(branches)
 
 
-def _known_vars_file_path_values(expression, scopes, env):
-    """Project names through possible file scopes and follow bare variable aliases."""
+def _known_vars_file_path_values(expression, scopes, env, members=(), seen=frozenset()):
+    """Follow aliases and keep literal filename components around variable values."""
     from jinja2 import TemplateSyntaxError, nodes
 
-    pending = [(expression, ())]
-    seen = set()
-    while pending:
-        node, members = pending.pop()
-        while isinstance(node, (nodes.Getattr, nodes.Getitem)):
-            if isinstance(node, nodes.Getattr):
-                member = node.attr
-            elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, str):
-                member = node.arg.value
+    node = expression
+    while isinstance(node, (nodes.Getattr, nodes.Getitem)):
+        if isinstance(node, nodes.Getattr):
+            member = node.attr
+        elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, str):
+            member = node.arg.value
+        else:
+            return
+        members = (member, *members)
+        node = node.node
+    if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members:
+        paths = {""}
+        parts = (node.left, node.right) if isinstance(node, nodes.Add) else node.nodes
+        for part in parts:
+            if isinstance(part, nodes.TemplateData):
+                values = {part.data}
+            elif isinstance(part, nodes.Const) and isinstance(part.value, str):
+                values = {part.value}
             else:
-                break
-            members = (member, *members)
-            node = node.node
-        if not isinstance(node, nodes.Name) or (node.name, members) in seen or len(members) > 64:
+                values = set(_known_vars_file_path_values(part, scopes, env, seen=seen)) | {"\0"}
+            if len(paths) * len(values) > 128:
+                return
+            paths = {prefix + suffix for prefix in paths for suffix in values}
+        yield from sorted(paths)
+        return
+    if isinstance(node, nodes.Filter) and not members and not (node.dyn_args or node.dyn_kwargs):
+        if node.name in ("lower", "upper", "trim") and not (node.args or node.kwargs):
+            method = "strip" if node.name == "trim" else node.name
+            yield from (getattr(value, method)() for value in
+                        _known_vars_file_path_values(node.node, scopes, env, seen=seen))
+        elif node.name in ("default", "d"):
+            yield from _known_vars_file_path_values(node.node, scopes, env, seen=seen)
+            fallback = node.args[0] if node.args else next(
+                (kw.value for kw in node.kwargs if kw.key == "default_value"), None)
+            if isinstance(fallback, nodes.Const) and isinstance(fallback.value, str):
+                yield fallback.value
+        return
+    if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
+        return
+    binding = node.name, members
+    if binding in seen:
+        return
+    for scope in scopes:
+        value = scope.get(node.name)
+        index = 0
+        while index < len(members) and isinstance(value, dict):
+            value = value.get(members[index])
+            index += 1
+        if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+            literal = value["__ansiroll_unsafe__"]
+            if index == len(members) and isinstance(literal, str) and not _is_templated(literal):
+                yield literal
             continue
-        seen.add((node.name, members))
-        for scope in scopes:
-            value = scope.get(node.name)
-            index = 0
-            while index < len(members) and isinstance(value, dict):
-                value = value.get(members[index])
-                index += 1
-            if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
-                if index == len(members) and not _is_templated(value["__ansiroll_unsafe__"]):
-                    yield value["__ansiroll_unsafe__"]
-                continue
-            if not isinstance(value, str):
-                continue
-            if not _is_templated(value):
-                if index == len(members):
-                    yield value
-                continue
-            try:
-                body = env.parse(value).body
-            except TemplateSyntaxError:
-                continue
-            if len(body) == 1 and isinstance(body[0], nodes.Output) and len(body[0].nodes) == 1:
-                pending.append((body[0].nodes[0], members[index:]))
+        if not isinstance(value, str):
+            continue
+        if not _is_templated(value):
+            if index == len(members):
+                yield value
+            continue
+        try:
+            body = env.parse(value).body
+        except TemplateSyntaxError:
+            continue
+        if len(body) == 1 and isinstance(body[0], nodes.Output):
+            selected = body[0].nodes[0] if len(body[0].nodes) == 1 else body[0]
+            yield from _known_vars_file_path_values(selected, scopes, env, members[index:], seen | {binding})
 
 
 def _deferred_vars_files(play, basedir, entries, *, scopes=()):
@@ -738,7 +766,9 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=()):
         patterns_by_name = []
         for name in names:
             choices, exhaustive = _known_vars_file_choices(name, scopes) if _is_templated(name) else ((), False)
-            patterns_by_name.extend((choice, glob.escape(choice)) for choice in choices if choice)
+            choices = [choice for choice in choices if choice and choice != "\0" and "\0" not in os.path.dirname(choice)]
+            patterns_by_name.extend((choice, "*".join(glob.escape(part) for part in choice.split("\0")))
+                                    for choice in choices)
             if exhaustive:
                 continue
             if name.startswith(("{{", "{%")) and "/" in name:

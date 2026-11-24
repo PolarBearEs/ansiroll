@@ -275,7 +275,7 @@ def test_deferred_vars_file_can_change_a_later_selector(tmp_path):
     assert frame["result"]["msg"] == "custom"
 
 
-@pytest.mark.parametrize("selector", ["final_path", "path_alias", "cfg.path"])
+@pytest.mark.parametrize("selector", ["final_path", "path_alias", "path_template", "cfg.path"])
 def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch, selector):
     from ansible import constants as C
     from ansiroll.loader import parse_playbook
@@ -290,6 +290,8 @@ def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch
   vars:
     final_path: config/default.yml
     path_alias: '{{ final_path }}'
+    path_template: 'config/{{ variant }}.yml'
+    variant: default
     cfg: {path: config/default.yml}
   vars_files:
     - 'first-{{ profile }}.yml'
@@ -297,7 +299,8 @@ def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch
   tasks:
     - debug: {msg: '{{ selected }}'}
 """ % selector)
-    (tmp_path / "first-runtime.yml").write_text("final_path: config/final.yml\ncfg: {path: config/final.yml}\n")
+    (tmp_path / "first-runtime.yml").write_text(
+        "final_path: config/final.yml\nvariant: final\ncfg: {path: config/final.yml}\n")
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "default.yml").write_text("selected: default\n")
     (tmp_path / "config" / "final.yml").write_text("selected: final\n")
@@ -310,7 +313,12 @@ def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch
     assert [frame["result"]["msg"] for frame in frames] == ["final"]
 
 
-@pytest.mark.parametrize("selector", ["final.yml", "config/{{ inventory_hostname_short | default('fallback') }}.yml"])
+@pytest.mark.parametrize("selector", [
+    "final.yml",
+    "config/{{ inventory_hostname_short | default('fallback') }}.yml",
+    "config/{{ inventory_hostname_short | default('fallback') | lower }}.yml",
+    "{{ 'config/' ~ (inventory_hostname_short | default('fallback') | lower) ~ '.yml' }}",
+])
 def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector):
     from ansiroll.loader import parse_playbook
     from ansiroll.runtime import Runtime
@@ -327,10 +335,11 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
 """ % selector)
     (tmp_path / "first-runtime.yml").write_text("runtime_choice: first\n")
     (tmp_path / "config").mkdir()
-    (tmp_path / "config" / "h.yml").write_text("setup_profile: final\n")
+    for name in ("h", "H"):
+        (tmp_path / "config" / (name + ".yml")).write_text("setup_profile: final\n")
     (tmp_path / "final.yml").write_text("setup_profile: final\n")
     plays, _ = parse_playbook(str(playbook))
-    runtime = Runtime({}, "", {"inventory_hostname": "h", "inventory_hostname_short": "h"})
+    runtime = Runtime({}, "", {"inventory_hostname": "H", "inventory_hostname_short": "H"})
     captured = []
     monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
 
