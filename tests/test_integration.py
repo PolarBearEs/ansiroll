@@ -3079,16 +3079,18 @@ def test_controller_timeout_lookup_rejects_changed_input_without_running_lookup(
 
 
 @pytest.mark.parametrize("compile_key", [True, False])
-def test_computed_timeout_can_select_another_play_var(tmp_path, monkeypatch, compile_key):
+@pytest.mark.parametrize("projection", ["timeout_var", "timeout_var.strip()"])
+def test_computed_timeout_can_select_another_play_var(tmp_path, monkeypatch, compile_key, projection):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars: {%sfirst: 23, second: 45}
-  gather_timeout: "{{ vars[timeout_var] }}"
+  gather_timeout: "{{ vars[%s] }}"
   tasks: []
-""" % ("timeout_var: first, " if compile_key else ""))
+""" % ("timeout_var: first, " if compile_key else "", projection))
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
-    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"timeout_var": "second"})
+    key = " second " if projection.endswith("strip()") else "second"
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"timeout_var": key})
     called = []
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
@@ -3135,6 +3137,11 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
 @pytest.mark.parametrize(("expression", "play_vars", "override", "expected"), [
     ("lookup('env', 'ANSIROLL_TIMEOUT_' ~ key) | length", "{key: 1}", {"key": True}, 3),
     ("lookup('env', 'ANSIROLL_TIMEOUT_' ~ key[0]) | length", "{key: [1]}", {"key": [True]}, 3),
+    ("lookup('env', 'ANSIROLL_TIMEOUT_' ~ key[0]) | length", "{key: abc}", {"key": "xbc"}, 3),
+    ("lookup('vars', *timeout_names)", "{timeout_names: [timeout_seconds], timeout_seconds: 23}",
+     {"timeout_seconds": 45}, 23),
+    ("lookup('var' | replace('var', 'vars'), 'timeout_seconds')", "{timeout_seconds: 23}",
+     {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_seconds')", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'TIMEOUT_SECONDS' | lower)", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_value' | replace('value', 'seconds'))", "{timeout_seconds: 23}",
@@ -3145,6 +3152,7 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
 def test_controller_timeout_detects_type_and_vars_lookup_dependencies(
         tmp_path, monkeypatch, expression, play_vars, override, expected):
     monkeypatch.setenv("ANSIROLL_TIMEOUT_1", "abc")
+    monkeypatch.setenv("ANSIROLL_TIMEOUT_a", "abc")
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars: %s
@@ -3262,6 +3270,43 @@ def test_controller_timeout_compares_only_read_mapping_members(tmp_path, monkeyp
         assert not called
     else:
         assert called == [("ansible.builtin.setup", {"gather_timeout": 3})]
+
+
+@pytest.mark.parametrize("changed_input", [False, True])
+def test_timeout_replay_reuses_compile_time_controller_candidate_miss(tmp_path, monkeypatch, changed_input):
+    monkeypatch.setenv("ANSIROLL_GATHER_PROFILE", "absent")
+    monkeypatch.setenv("ANSIROLL_GATHER_OTHER", "present")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: first, controller_env_name: ANSIROLL_GATHER_PROFILE}
+  vars_files:
+    - ["primary-{{ lookup('env', controller_env_name) }}.yml", "fallback-{{ profile }}.yml"]
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "primary-present.yml").write_text("timeout_seconds: 60\n")
+    (tmp_path / "fallback-first.yml").write_text("timeout_seconds: 23\n")
+    (tmp_path / "fallback-second.yml").write_text("timeout_seconds: 45\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    overrides = {"profile": "second"}
+    if changed_input:
+        overrides["controller_env_name"] = "ANSIROLL_GATHER_OTHER"
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=overrides, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda *_: pytest.fail("controller lookup must not run during replay")
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if changed_input:
+        assert runtime.failed
+        assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+        assert not called
+    else:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+        assert runtime.vars["timeout_seconds"] == 45
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):

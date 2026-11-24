@@ -702,9 +702,11 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
-        for index, (selected, checked_paths) in order_deferred.items():
+        for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
             deferred[index]["files"].update(selected)
             deferred[index]["checked_paths"] = checked_paths
+            if controller_candidates:
+                deferred[index]["controller_candidates"] = controller_candidates
             if selected:
                 deferred[index]["has_compile_selection"] = True
         result["deferred_vars_files"] = deferred
@@ -850,11 +852,14 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
         defer_for_order = False
         selected = {}
         checked_paths = {}
+        controller_candidates = {}
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
             raw = filename
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
+            candidate_source = filename
+            controller_inputs = None
             if _is_templated(filename):
                 # A deferred file may change a later selector's inputs.
                 if ordered is not None:
@@ -867,8 +872,14 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     # filename glob. Keep its known choice unless order requires replay.
                     if portable is not None and not (filename.startswith(("{{", "{%")) and "/" in filename):
                         defer_for_order |= bool(portable[1] - compile_extra_vars.keys() - selector_magic.keys())
-                    dependencies = (portable if portable is not None else _gather_timeout_dependencies(
-                        filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True))
+                    dependencies = portable
+                    if portable is None:
+                        paths, unknown_lookup = set(), set()
+                        dependencies = _gather_timeout_dependencies(
+                            filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
+                            paths=paths, unknown_lookup=unknown_lookup)
+                        if dependencies is not None and not unknown_lookup:
+                            controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
                     if unresolved and dependencies is not None:
                         earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
                         for index, previous in enumerate(earlier, start=scanned):
@@ -893,6 +904,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     break
             if ordered is not None:
                 checked_paths[filename] = None
+                if controller_inputs is not None:
+                    controller_candidates[candidate_source] = dict(controller_inputs, name=filename)
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
                 path = filename
@@ -919,7 +932,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             break
         if defer_for_order:
             if order_deferred is not None:
-                order_deferred[len(unresolved)] = (selected, checked_paths)
+                order_deferred[len(unresolved)] = (selected, checked_paths, controller_candidates)
             ordered.append(len(unresolved))
             unresolved.append(entry)
     # The variable manager has already applied extra vars and any parser-level

@@ -228,7 +228,11 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
             "lookup", "query", "q",
         ):
             pending.extend((child, ()) for child in node.iter_child_nodes() if child is not node.node)
-            if node.args and _selector_vars_key(node.args[0], variables or {}) in ("vars", "ansible.builtin.vars"):
+            plugin = _selector_vars_key(node.args[0], variables or {}) if node.args else None
+            if unknown_lookup is not None and (plugin is None or
+                    plugin in ("vars", "ansible.builtin.vars") and node.dyn_args is not None):
+                unknown_lookup.add("vars")
+            if plugin in ("vars", "ansible.builtin.vars"):
                 for term in node.args[1:]:
                     key = _selector_vars_key(term, variables or {})
                     if isinstance(key, str):
@@ -280,6 +284,24 @@ def _selector_vars_key(node, variables):
             return value["__ansiroll_unsafe__"]
         if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
             return value
+        if isinstance(value, (int, float)):
+            return value
+    if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
+        method = node.node.attr
+        if method in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None:
+            value = _selector_vars_key(node.node.node, variables)
+            args = [_selector_vars_key(arg, variables) for arg in node.args]
+            kwargs = {kw.key: _selector_vars_key(kw.value, variables) for kw in node.kwargs}
+            if isinstance(value, str) and all(arg is not None for arg in (*args, *kwargs.values())):
+                try:
+                    return getattr(str, method)(value, *args, **kwargs)
+                except (TypeError, ValueError):
+                    return None
+    if isinstance(node, jinja2.nodes.Getitem):
+        value = _selector_vars_key(node.node, variables)
+        index = _selector_vars_key(node.arg, variables)
+        if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
+            return value[index]
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
         if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
             value = _selector_vars_key(node.node, variables)
@@ -300,12 +322,14 @@ def _vars_input_at(scope, name, path):
             if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                 break
             value = value.get(member, _MISSING_VARS_FILE_INPUT)
-        elif isinstance(value, (list, tuple)) and isinstance(member, int) and -len(value) <= member < len(value):
-            value = value[member]
+        elif (_looks_templated(value) and not isinstance(value, _NO_TEMPLATE)):
+            # The dependency scan also records the projection through this source.
+            return value
+        elif isinstance(value, (list, tuple, str)) and isinstance(member, int):
+            value = value[member] if -len(value) <= member < len(value) else _MISSING_VARS_FILE_INPUT
         else:
-            # Compare the template source itself. The dependency scan also
-            # records the projection made through the source.
-            return value if _looks_templated(value) else _MISSING_VARS_FILE_INPUT
+            # An unsupported projection must not hide a changed input.
+            return value
     return value
 
 
@@ -3308,9 +3332,17 @@ class Runtime:
             else:
                 selector_blocks = {}
             for raw in entry["names"]:
+                checked = entry.get("controller_candidates", {}).get(raw)
+                paths = {(key, tuple(path)) for key, path in checked["paths"]} if checked else set()
+                reuse_checked = checked and not _vars_file_reads_blocked(selector_blocks, paths) and all(
+                    _same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
+                    for key, path in paths
+                )
                 if before_setup:
-                    paths = set()
-                    dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True, paths=paths)
+                    if reuse_checked:
+                        dependencies = {key: ctx.get(key, _MISSING_VARS_FILE_INPUT) for key, _ in paths}
+                    else:
+                        dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True, paths=paths)
                     if dependencies is None or _vars_file_reads_blocked(selector_blocks, paths):
                         # A selector we cannot evaluate here may still change inputs to setup.
                         for mappings in entry["files"].values():
@@ -3320,7 +3352,7 @@ class Runtime:
                         break
                     inputs.update(dependencies)
                 try:
-                    name = _fail_on_undef(self.template(raw, ctx))
+                    name = checked["name"] if reuse_checked else _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
                     if before_setup:
                         break
