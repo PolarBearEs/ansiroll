@@ -208,11 +208,25 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
+def _selector_local_values(bindings):
+    """Use constant bindings while keeping other local values opaque."""
+    values = dict.fromkeys(bindings, _UNRESOLVED_SELECTOR_KEY)
+    for name, sources in bindings.items():
+        if len(sources) == 1:
+            source, = sources
+            if isinstance(source, jinja2.nodes.Const):
+                literal = source.value
+                values[name] = _UnsafeText(literal) if isinstance(literal, str) else literal
+    return values
+
+
 def _selector_scope(expression, variables, *, retain_mutable=False):
     nodes = jinja2.nodes
     bindings = {}
     unreachable = set()
     calls = []
+    external = frozenset({None})
+    unknown_local = frozenset({_UNRESOLVED_SELECTOR_KEY})
 
     def target_names(target):
         if isinstance(target, nodes.Name):
@@ -220,17 +234,20 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
         return {name.name for name in target.find_all(nodes.Name) if name.ctx != "load"}
 
     def branch_value(test, names):
-        if retain_mutable and (isinstance(test, nodes.Name) or next(test.find_all(nodes.Name), None) is not None):
-            return None
-        scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
+        if retain_mutable:
+            variables_in_test = (test,) if isinstance(test, nodes.Name) else test.find_all(nodes.Name)
+            if any(node.name not in names for node in variables_in_test):
+                return None
+        scope = {**variables, **_selector_local_values(names)} if names else variables
         value = _selector_vars_key(test, scope, ())
         return _selector_truth(value)
 
-    def visit(node, names):
+    def visit(node, names, top=None):
         if names:
             bindings[id(node)] = names.copy()
         if isinstance(node, nodes.Call):
             calls.append(node)
+        context = names if top is None else top
         if isinstance(node, nodes.If):
             outcomes = []
             fallthrough = True
@@ -238,12 +255,12 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
                 if not fallthrough:
                     unreachable.add(id(branch))
                     continue
-                visit(branch.test, names)
+                visit(branch.test, names, top)
                 test = branch_value(branch.test, names)
                 if test is not False:
                     local = names.copy()
                     for child in branch.body:
-                        visit(child, local)
+                        visit(child, local, top)
                     outcomes.append(local)
                 else:
                     unreachable.update(map(id, branch.body))
@@ -252,81 +269,86 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
             if fallthrough:
                 local = names.copy()
                 for child in node.else_:
-                    visit(child, local)
+                    visit(child, local, top)
                 outcomes.append(local)
             else:
                 unreachable.update(map(id, node.else_))
-            # A name is definitely local only if every reachable branch binds it.
-            names.update({name: all(outcome.get(name, False) for outcome in outcomes)
+            # Keep the possible definitions, including the outer variable on
+            # paths that leave a name unassigned.
+            names.update({name: frozenset().union(*(outcome.get(name, external) for outcome in outcomes))
                           for name in set().union(*outcomes)})
             return
         if isinstance(node, nodes.CondExpr):
-            visit(node.test, names)
+            visit(node.test, names, top)
             test = branch_value(node.test, names)
             for arm, selected in ((node.expr1, True), (node.expr2, False)):
                 if arm is not None:
                     if test is None or test is selected:
-                        visit(arm, names)
+                        visit(arm, names, top)
                     else:
                         unreachable.add(id(arm))
             return
         if isinstance(node, (nodes.And, nodes.Or)):
-            visit(node.left, names)
+            visit(node.left, names, top)
             left = branch_value(node.left, names)
             short_circuit_on = isinstance(node, nodes.Or)
             if left is short_circuit_on:
                 unreachable.add(id(node.right))
             else:
-                visit(node.right, names)
+                visit(node.right, names, top)
             return
         if isinstance(node, nodes.For):
-            visit(node.iter, names)
-            local = {**names, **dict.fromkeys(target_names(node.target), True)}
+            visit(node.iter, names, top)
+            local = {**names, **dict.fromkeys(target_names(node.target), unknown_local)}
             if node.test is not None:
-                visit(node.test, local.copy())
-            local["loop"] = True
+                visit(node.test, local.copy(), context)
+            local["loop"] = unknown_local
             for child in node.body:
-                visit(child, local)
+                visit(child, local, context)
             local = names.copy()
             for child in node.else_:
-                visit(child, local)
+                visit(child, local, context)
             return
         if isinstance(node, nodes.With):
             for value in node.values:
-                visit(value, names)
+                visit(value, names, top)
             targets = set().union(*(target_names(target) for target in node.targets))
-            local = {**names, **dict.fromkeys(targets, True)}
+            local = {**names, **dict.fromkeys(targets, unknown_local)}
             for child in node.body:
-                visit(child, local)
+                visit(child, local, context)
             return
         local = names
         if isinstance(node, (nodes.Macro, nodes.CallBlock)):
             if isinstance(node, nodes.CallBlock):
-                visit(node.call, names)
+                visit(node.call, names, top)
             for default in node.defaults:
-                visit(default, names)
+                visit(default, names, top)
             parameters = {arg.name for arg in node.args} | {"caller", "kwargs", "varargs"}
             if isinstance(node, nodes.Macro):
                 parameters.add(node.name)
-            local = {**names, **dict.fromkeys(parameters, True)}
+            local = {**names, **dict.fromkeys(parameters, unknown_local)}
             for child in node.body:
-                visit(child, local)
+                visit(child, local, context)
             if isinstance(node, nodes.Macro):
-                names[node.name] = True
+                names[node.name] = unknown_local
             return
         elif isinstance(node, nodes.Block) and not node.scoped:
-            local = dict.fromkeys(names, False)
+            local = context.copy()
         elif isinstance(node, (nodes.Block, nodes.Scope, nodes.FilterBlock, nodes.AssignBlock,
                                nodes.OverlayScope)):
             local = names.copy()
         for child in node.iter_child_nodes():
-            visit(child, local)
-        if isinstance(node, (nodes.Assign, nodes.AssignBlock)):
-            names.update(dict.fromkeys(target_names(node.target), True))
+            visit(child, local, top if local is names else context)
+        if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(
+                node.node, (nodes.Name, nodes.Const)):
+            names[node.target.name] = frozenset({node.node})
+        elif isinstance(node, (nodes.Assign, nodes.AssignBlock)):
+            names.update(dict.fromkeys(target_names(node.target), unknown_local))
         elif isinstance(node, nodes.Import):
-            names[node.target] = True
+            names[node.target] = unknown_local
         elif isinstance(node, nodes.FromImport):
-            names.update(dict.fromkeys((name[1] if isinstance(name, tuple) else name for name in node.names), True))
+            names.update(dict.fromkeys((name[1] if isinstance(name, tuple) else name for name in node.names),
+                                       unknown_local))
 
     visit(expression, {})
     return bindings, unreachable, calls
@@ -342,7 +364,7 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
         local = bindings.get(id(node))
         scope = variables or {}
         if local:
-            scope = {**scope, **dict.fromkeys(local, _UNRESOLVED_SELECTOR_KEY)}
+            scope = {**scope, **_selector_local_values(local)}
         return _selector_vars_key(node, scope, aliases)
 
     pending = [(expression, ())]
@@ -351,9 +373,16 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                    if not isinstance(node, nodes.TemplateData) or node.data.strip()]
         if len(outputs) == 1:
             pending = [(outputs[0], remaining)]
+    visited = set()
     while pending:
         node, suffix = pending.pop()
-        if id(node) in unreachable:
+        if id(node) in unreachable or (id(node), suffix) in visited:
+            continue
+        visited.add((id(node), suffix))
+        if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(node.node, nodes.Name):
+            # Resolving the assignment reads the binding. Members of a lazy
+            # mapping are read only where the alias is used.
+            pending.append((node.node, (None, "defined")))
             continue
         if isinstance(node, nodes.CondExpr):
             pending.append((node.test, ()))
@@ -441,9 +470,11 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
         if root is None:
             continue
         if isinstance(root, nodes.Name) and root.ctx == "load":
-            if bindings.get(id(root), {}).get(root.name):
-                continue
             path = tuple(reversed(path)) + suffix
+            local = bindings.get(id(root), {}).get(root.name, ())
+            pending.extend((source, path) for source in local if isinstance(source, nodes.Name))
+            if local and None not in local:
+                continue
             if root.name == "vars" and path and isinstance(path[0], str):
                 yield path[0], path[1:]
             else:

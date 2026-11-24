@@ -3577,6 +3577,10 @@ def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, 
 
 @pytest.mark.parametrize(("template", "overrides", "expected"), [
     ("{% set seconds = base %}{{ seconds }}", {}, 45),
+    ("{% set seconds = base %}{% block timeout %}{{ seconds }}{% endblock %}", {}, 45),
+    ("{% set flag = true %}{{ base if flag else seconds }}", {"flag": False}, 45),
+    ("{% set local_cfg = cfg %}{{ local_cfg.seconds }}", {}, 45),
+    ("{% set local_cfg = cfg %}{% set alias = local_cfg %}{{ alias.seconds }}", {}, 45),
     ("{% if flag %}{% set seconds = base %}{% else %}{% set seconds = base %}{% endif %}{{ seconds }}",
      {"flag": False}, 45),
     ("{% if flag %}{% set seconds = base %}{% endif %}{{ seconds }}", {"flag": False}, None),
@@ -3591,8 +3595,12 @@ def test_ordered_timeout_ignores_vars_file_inputs_shadowed_by_a_local(tmp_path, 
     %s
   tasks: []
 """ % template)
-    (tmp_path / "settings-default.yml").write_text("seconds: 23\n")
-    (tmp_path / "settings-runtime.yml").write_text("seconds: \"{{ lookup('env', 'UNUSED_TIMEOUT') | int }}\"\n")
+    (tmp_path / "settings-default.yml").write_text("seconds: 23\ncfg: {seconds: 23}\n")
+    (tmp_path / "settings-runtime.yml").write_text("""seconds: "{{ lookup('env', 'UNUSED_TIMEOUT') | int }}"
+cfg:
+  seconds: 45
+  unused: "{{ lookup('env', 'UNUSED_TIMEOUT') | int }}"
+""")
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 23
