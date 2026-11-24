@@ -2727,7 +2727,7 @@ def test_ordered_vars_files_keep_intermediate_hash_replacement(tmp_path, monkeyp
     assert runtime.template("{{ settings }}", runtime.ctx()) == {"final": True}
 
 
-@pytest.mark.parametrize("selector", ["magic", "mapping"])
+@pytest.mark.parametrize("selector", ["magic", "mapping", "mapping_with_lookup"])
 def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp_path, monkeypatch, selector):
     playbook = tmp_path / "play.yml"
     if selector == "magic":
@@ -2739,6 +2739,10 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
         initial = {"config": {"flavor": "default"}}
         override = {"config": {"flavor": "runtime"}}
         prefix = "settings-"
+        if selector == "mapping_with_lookup":
+            monkeypatch.delenv("ANSIROLL_TEST_UNUSED_SELECTOR", raising=False)
+            initial["config"]["unused"] = "{{ lookup('env', 'ANSIROLL_TEST_UNUSED_SELECTOR') }}"
+            override["config"]["unused"] = "{{ lookup('also_unavailable') }}"
     playbook.write_text("""- hosts: localhost
   vars: %s
   vars_files: ['gather-{{ profile }}.yml', 'settings-%s.yml']
@@ -2776,6 +2780,35 @@ def test_ordered_first_found_does_not_skip_an_unbundled_earlier_path(tmp_path, m
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
     (tmp_path / "gather-normal.yml").write_text("{}\n")
     (tmp_path / "gather-other.yml").write_text("config_dir: " + str(tmp_path / "unbundled") + "\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "normal"})
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "fallback"
+    runtime.extra_vars["profile"] = "other"
+    with pytest.raises(VarsFilesError, match="path that was not bundled"):
+        runtime.run_play(plan)
+
+
+def test_ordered_first_found_rejects_path_outside_glob_depth(tmp_path, monkeypatch):
+    from ansiroll.runtime import VarsFilesError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {config_dir: default}
+  vars_files:
+    - 'gather-{{ profile }}.yml'
+    - ['profiles/{{ config_dir }}/final.yml', 'fallback.yml']
+  gather_timeout: '{{ 23 }}'
+  tasks: []
+""")
+    nested = tmp_path / "profiles" / "region" / "production"
+    nested.mkdir(parents=True)
+    (nested / "final.yml").write_text("selected: nested\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    (tmp_path / "gather-normal.yml").write_text("{}\n")
+    (tmp_path / "gather-other.yml").write_text("config_dir: region/production\n")
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "normal"})

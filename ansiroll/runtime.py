@@ -207,8 +207,41 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_template_sources(value):
-    """Find trusted template sources inside selector inputs."""
+def _selector_input_paths(expression):
+    """Yield variable names and literal member paths read by a selector."""
+    nodes = jinja2.nodes
+    pending = [expression]
+    while pending:
+        node = pending.pop()
+        root = node
+        path = []
+        while isinstance(root, (nodes.Getattr, nodes.Getitem)):
+            if isinstance(root, nodes.Getattr):
+                path.append(root.attr)
+            elif isinstance(root.arg, nodes.Const) and isinstance(root.arg.value, (str, int)):
+                path.append(root.arg.value)
+            else:
+                break
+            root = root.node
+        if isinstance(root, nodes.Name) and root.ctx == "load":
+            yield root.name, tuple(reversed(path))
+        else:
+            pending.extend(node.iter_child_nodes())
+
+
+def _selector_template_sources(value, path=()):
+    """Find trusted templates needed to read a selector input."""
+    for key in path:
+        if _looks_templated(value):
+            break
+        if isinstance(value, dict):
+            if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                return
+            value = value.get(key)
+        elif isinstance(value, (list, tuple)) and isinstance(key, int) and -len(value) <= key < len(value):
+            value = value[key]
+        else:
+            return
     pending = [value]
     seen = set()
     while pending:
@@ -225,6 +258,18 @@ def _selector_template_sources(value):
                 pending.extend(value)
         elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             yield value
+
+
+def _vars_file_glob_covers(pattern, name):
+    """Match the same path components as glob.glob, without filesystem reads."""
+    from fnmatch import fnmatchcase
+
+    parts = name.split(os.path.sep)
+    patterns = pattern.split(os.path.sep)
+    return len(parts) == len(patterns) and all(
+        (not part.startswith(".") or segment.startswith(".")) and fnmatchcase(part, segment)
+        for part, segment in zip(parts, patterns)
+    )
 
 
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
@@ -3134,8 +3179,13 @@ class Runtime:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
                 found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
-                if not found and raw in entry.get("unmodeled", ()) and (
-                        os.path.normpath(name) not in entry.get("checked_names", ())):
+                if not found and os.path.normpath(name) not in entry.get("checked_names", ()):
+                    pattern = entry.get("glob_patterns", {}).get(raw)
+                    unbundled = raw in entry.get("unmodeled", ()) or (
+                        pattern is not None and not _vars_file_glob_covers(pattern, name))
+                else:
+                    unbundled = False
+                if unbundled:
                     if before_setup:
                         break
                     raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
@@ -3164,6 +3214,7 @@ class Runtime:
     def _pre_setup_template_inputs(self, source, ctx, *, selector=False):
         inputs = {}
         pending = [source]
+        seen = set()
         while pending:
             try:
                 expression = self.templater.env.parse(pending.pop())
@@ -3173,21 +3224,25 @@ class Runtime:
                 method = call.node
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
-            for node in expression.find_all(jinja2.nodes.Name):
-                if node.ctx == "load" and node.name not in inputs:
-                    if node.name not in ctx:
-                        inputs[node.name] = _MISSING_VARS_FILE_INPUT
-                        continue
-                    value = ctx[node.name]
-                    unsafe_scalar = (
-                        isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}
-                        and isinstance(value["__ansiroll_unsafe__"], str)
-                    )
-                    container = selector and isinstance(value, (dict, list, tuple))
-                    if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
-                        return None
-                    inputs[node.name] = value
-                    pending.extend(_selector_template_sources(value))
+            paths = (_selector_input_paths(expression) if selector else
+                     ((node.name, ()) for node in expression.find_all(jinja2.nodes.Name) if node.ctx == "load"))
+            for name, path in paths:
+                if (name, path) in seen:
+                    continue
+                seen.add((name, path))
+                if name not in ctx:
+                    inputs[name] = _MISSING_VARS_FILE_INPUT
+                    continue
+                value = ctx[name]
+                unsafe_scalar = (
+                    isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}
+                    and isinstance(value["__ansiroll_unsafe__"], str)
+                )
+                container = selector and isinstance(value, (dict, list, tuple))
+                if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
+                    return None
+                inputs[name] = value
+                pending.extend(_selector_template_sources(value, path))
         return inputs
 
     def _task_ctx(self, task, overlay):

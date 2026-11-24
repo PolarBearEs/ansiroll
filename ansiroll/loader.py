@@ -316,12 +316,13 @@ def _gather_timeout_file_scope(play, entries, runtime):
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, selector=False):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import _selector_template_sources
+    from .runtime import _selector_input_paths, _selector_template_sources
 
     env = Environment()
     pending = [source]
     scope = {}
     names = set()
+    seen = set()
     while pending:
         try:
             expression = env.parse(pending.pop())
@@ -331,9 +332,12 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             method = call.node
             if not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
-        for name in {node.name for node in expression.find_all(nodes.Name) if node.ctx == "load"} - names:
-            if name == "omit":
+        paths = (_selector_input_paths(expression) if selector else
+                 ((node.name, ()) for node in expression.find_all(nodes.Name) if node.ctx == "load"))
+        for name, path in paths:
+            if name == "omit" or (name, path) in seen:
                 continue
+            seen.add((name, path))
             names.add(name)
             if name not in variables:
                 continue
@@ -342,7 +346,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
             if not container and value is not None and not isinstance(value, (str, int, float, bool)):
                 return None
             scope[name] = _tag_untrusted(value)
-            pending.extend(_selector_template_sources(scope[name]))
+            pending.extend(_selector_template_sources(scope[name], path))
     return scope, names
 
 
@@ -635,8 +639,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
         for index, (selected, checked_names) in order_deferred.items():
             deferred[index]["files"].update(selected)
-            if deferred[index].get("unmodeled"):
-                deferred[index]["checked_names"] = sorted(checked_names)
+            deferred[index]["checked_names"] = sorted(checked_names)
             if selected:
                 deferred[index]["has_compile_selection"] = True
         result["deferred_vars_files"] = deferred
@@ -681,6 +684,11 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if gather_facts is None and gather and "gather_timeout" in (play.get_ds() or {}):
         result["_gather_compile_vars"] = play_vars
     if ordered_vars_files and unresolved_vars_files:
+        for entry in deferred:
+            entry["glob_patterns"] = {
+                name: _vars_file_glob_pattern(name) for name in entry["names"]
+                if _is_templated(name) and name not in entry.get("unmodeled", ())
+            }
         result["ordered_vars_files"] = [
             deferred[entry] if isinstance(entry, int) else {"static_vars": entry}
             for entry in ordered_vars_files
@@ -861,6 +869,12 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
+def _vars_file_glob_pattern(name):
+    import glob
+
+    return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+
+
 def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -884,7 +898,7 @@ def _deferred_vars_files(play, basedir, entries):
         for name in names:
             if name in unmodeled:
                 continue
-            pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+            pattern = _vars_file_glob_pattern(name)
             if name.startswith(os.path.sep):
                 patterns = [pattern]
             else:
