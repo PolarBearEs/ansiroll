@@ -573,9 +573,15 @@ class StrategyModule(StrategyBase):
                               % (host.name, time.monotonic() - delegate_started,
                                  frame.get("name") or frame.get("action")))
             elif t == "source":
+                lookup_task_id = frame.get("lookup_task_id")
+                role_task = task_map.get(lookup_task_id) if lookup_task_id else None
+                if lookup_task_id and role_task is None:
+                    source_result = {"error": "could not identify the role source's task"}
+                else:
+                    source_result = self._read_controller_source(frame.get("path"), role_task=role_task)
                 chan.send({
                     "t": "source_result",
-                    "source": self._read_controller_source(frame.get("path")),
+                    "source": source_result,
                 })
             elif t == "warning":
                 display.warning(frame["message"])
@@ -590,25 +596,56 @@ class StrategyModule(StrategyBase):
         return host_failed
 
     @staticmethod
-    def _read_controller_source(path):
+    def _read_controller_source(path, *, role_task=None):
         """Read a runtime-created controller file for in-memory target transfer."""
-        if not path or not os.path.isfile(path):
+        if not path or (role_task is None and not os.path.isfile(path)):
             return {"error": "controller source %r is not a regular file" % path}
+        fd = None
         try:
-            with open(path, "rb") as fh:
-                data = fh.read()
+            if role_task is None:
+                source = open(path, "rb")
+                fullpath = os.path.abspath(path)
+            else:
+                from ansiroll.loader import _open_linked_role_source, _role_source_roots, _visible_below
+
+                loader = role_task._loader
+                subdir = "templates" if role_task.action.rsplit(".", 1)[-1] == "template" else "files"
+                fullpath = loader.path_dwim_relative_stack(role_task.get_search_path(), subdir, path)
+                realpath = os.path.realpath(fullpath)
+                absolute = os.path.abspath(fullpath)
+                if realpath != absolute:
+                    roots = {os.path.abspath(root): os.path.realpath(root)
+                             for root in _role_source_roots(role_task, loader.get_basedir())}
+                    # Declared roots may themselves be reached through links.
+                    ordinary = any(
+                        os.path.commonpath((absolute, root)) == root
+                        and os.path.join(real_root, os.path.relpath(absolute, root)) == realpath
+                        for root, real_root in roots.items()
+                    )
+                    if not ordinary and (not any(_visible_below(fullpath, root) for root in roots)
+                                         or not any(_visible_below(realpath, root) for root in roots.values())):
+                        return {"error": "controller role source %r is excluded" % path}
+                fd = _open_linked_role_source(realpath)
+                source = os.fdopen(fd, "rb", closefd=False)
+            with source as fh:
                 st = os.fstat(fh.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    return {"error": "controller source %r is not a regular file" % path}
+                data = fh.read()
             return {
                 "data": base64.b64encode(data).decode("ascii"),
                 "meta": {
-                    "fullpath": os.path.abspath(path),
+                    "fullpath": fullpath,
                     "mtime": st.st_mtime,
                     "uid": st.st_uid,
                     "mode": stat.S_IMODE(st.st_mode),
                 },
             }
-        except OSError as ex:
+        except (OSError, AnsibleError) as ex:
             return {"error": "could not read controller source %r: %s" % (path, ex)}
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _profile(self, msg):
         if getattr(self, "_profile_enabled", False):

@@ -1799,6 +1799,778 @@ def test_role_copy_with_dynamic_src_and_remote_src_bakes_role_files(tmp_path, pr
             assert _ansible(playbook, strategy="ansiroll.core.ansiroll") == expected
 
 
+@pytest.mark.parametrize(("shared_dir", "prefix", "ending"), [
+    ("roles/r/templates/shared", "sites/", ""),
+    ("shared", "sites//./", ""),
+    ("shared", "././sites/", "{% if staged %}.staging{% endif %}"),
+    ("roles/r/templates/shared", "sites/{{ group }}/", ""),
+    ("roles/r/templates/shared", "sites/{{ group }}./", ""),
+])
+def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_dir, prefix, ending):
+    destination = tmp_path / "rendered.txt"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app, group: '', staged: false}
+- template: {src: "%s{{ selection }}%s.j2", dest: "%s"}
+""" % (prefix, ending, destination),
+        "roles/r/templates/sites/local.j2": "local\n",
+        shared_dir + "/app.j2": "from the shared template\n{{ template_fullpath }}\n",
+        shared_dir + "/unrelated.txt": "ordinary data\n",
+        shared_dir + "/.private/hidden.j2": "hidden data\n"})
+    templates = tmp_path / "roles/r/templates"
+    shared = tmp_path / shared_dir
+    (templates / "sites/alias").symlink_to(shared, target_is_directory=True)
+    (templates / "sites/second").symlink_to(shared, target_is_directory=True)
+    (templates / "sites/project").symlink_to(tmp_path, target_is_directory=True)
+    (shared / "back").symlink_to(templates / "sites", target_is_directory=True)
+    if shared_dir == "shared" and hasattr(os, "mkfifo"):
+        os.mkfifo(shared / "blocked.j2")
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    expected_content = destination.read_text()
+    assert expected_content.startswith("from the shared template\n")
+    destination.unlink()
+    artifact = tmp_path / "probe.py"
+    subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
+                   cwd=ROOT, env=_env(), capture_output=True, check=True, timeout=15)
+    template = next(node for node in _task_nodes(_bundle_json(artifact.read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    contents = set(template["_baked_direct_sources"])
+    assert {"sites/alias/app.j2", "sites/second/app.j2"} <= contents
+    assert not any(path.endswith(("/unrelated.txt", "/hidden.j2")) for path in contents)
+    assert not any(path.startswith("sites/project/") for path in contents)
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == expected_content
+
+    destination.unlink()
+    tasks = tmp_path / "roles/r/tasks/main.yml"
+    tasks.write_text(tasks.read_text().replace("alias/app", "alias/../local"))
+    assert _ansiroll(playbook, tmp_path, returncode=1)[1] == _ansible(playbook, returncode=2)[1]
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("action", ["copy", "unarchive"])
+def test_dynamic_linked_role_file_preserves_binary_content(tmp_path, action):
+    import tarfile
+
+    payload = b"one\r\ntwo\rthree\xff\n"
+    destination = tmp_path / "output"
+    extension = ".bin" if action == "copy" else ".tar"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- %s: {src: "sites/{{ selection }}%s", dest: "%s"}
+""" % (action, extension, destination)})
+    files = tmp_path / "roles/r/files"
+    (files / "shared").mkdir(parents=True)
+    (files / "sites").mkdir()
+    (files / "sites/alias").symlink_to("../shared", target_is_directory=True)
+    source = files / "shared" / ("app" + extension)
+    if action == "copy":
+        source.write_bytes(payload)
+        extracted = destination
+    else:
+        with tarfile.open(source, "w") as archive:
+            member = tarfile.TarInfo("member.bin")
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        destination.mkdir()
+        extracted = destination / "member.bin"
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    assert extracted.read_bytes() == payload
+    extracted.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert extracted.read_bytes() == payload
+
+
+def test_dynamic_role_template_limits_dot_prefix_to_action_directories(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: local}
+- template: {src: "./{{ selection }}.j2", dest: "unused"}
+""", "roles/r/templates/local.j2": "ordinary template\n",
+        "roles/r/private/shared/app.j2": "unrelated template\n"})
+    private = tmp_path / "roles/r/private"
+    (private / "bare").mkdir()
+    (private / "bare/alias").symlink_to("../shared", target_is_directory=True)
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "local.j2" in template["_baked"]
+    assert "private/bare/alias/app.j2" not in (template.get("_baked_direct_sources") or {})
+
+
+def test_dynamic_role_template_preserves_earlier_regular_directory(tmp_path):
+    destination = tmp_path / "rendered.txt"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "%s"}
+""" % destination, "roles/r/templates/sites/app.j2": "role template\n",
+        "shared/unused.txt": "shared data\n"})
+    (tmp_path / "roles/r/templates/sites/alias").mkdir()
+    (tmp_path / "templates/sites").mkdir(parents=True)
+    (tmp_path / "templates/sites/alias").symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "role template\n"
+
+
+@pytest.mark.parametrize(("fallbacks", "alias"), [
+    ("regular", "alias"), ("linked", "alias"), ("filtered", "alias"), ("filtered", ".alias"),
+])
+def test_dynamic_role_template_does_not_replace_a_filtered_earlier_source(tmp_path, fallbacks, alias):
+    project = tmp_path / "project"
+    destination = project / "rendered.txt"
+    _write(project, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: %s/app}
+- template: {src: "sites/{{ selection }}.j2", dest: "%s"}
+""" % (alias, destination), "roles/r/templates/.private/app.j2": "earlier source\n",
+        "roles/r/templates/sites/local.j2": "valid source\n"})
+    (project / "roles/r/templates/sites" / alias).symlink_to("../.private", target_is_directory=True)
+    if fallbacks == "regular":
+        _write(project, {"templates/sites/alias/app.j2": "later source\n",
+                         "sites/alias/app.j2": "controller working directory source\n"})
+    else:
+        target_root = tmp_path if fallbacks == "filtered" else project
+        for parent, target in (("templates/sites", "later"), ("sites", "working")):
+            path = project / parent
+            path.mkdir(parents=True)
+            _write(target_root / target, {"app.j2": "%s source\n" % target})
+            (path / alias).symlink_to(target_root / target, target_is_directory=True)
+
+    playbook = project / "pb.yml"
+    _ansible(playbook, returncode=0)
+    assert destination.read_text() == "earlier source\n"
+    destination.unlink()
+    _ansiroll(playbook, tmp_path, returncode=1)
+    assert not destination.exists()
+    _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=2)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("name", ["generated", ".generated"])
+@pytest.mark.parametrize("linked_root", [False, True])
+def test_dynamic_role_template_fetches_generated_source_when_filtered_alias_is_empty(tmp_path, name, linked_root):
+    project = tmp_path / "project"
+    generated = project / ("sites/alias/%s.j2" % name)
+    destination = project / "output.txt"
+    _write(project, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- copy: {content: generated, dest: "%s"}
+- set_fact: {selection: alias/%s}
+- template: {src: "sites/{{ selection }}.j2", dest: "%s"}
+""" % (generated, name, destination), "roles/r/templates/sites/local.j2": "ordinary template\n"})
+    generated.parent.mkdir(parents=True)
+    excluded = tmp_path / "excluded"
+    excluded.mkdir()
+    (project / "roles/r/templates/sites/alias").symlink_to(excluded, target_is_directory=True)
+
+    root = tmp_path / "linked" if linked_root else project
+    if linked_root:
+        root.symlink_to(project, target_is_directory=True)
+    playbook = root / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "generated"
+    generated.unlink()
+    destination.unlink()
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=0) == expected
+    assert destination.read_text() == "generated"
+
+
+@pytest.mark.parametrize(("source", "selection", "alias", "target", "file_path"), [
+    ("sites/{{ selection }}.j2", "alias/app", "alias", ".", "sites/app.j2"),
+    ("sites/{{ selection }}.j2", "alias/alias/app", "alias", ".", "sites/app.j2"),
+    ("sites/{{ selection }}.j2", "alias/sub/app", "alias", ".", "sites/sub/app.j2"),
+    ("sites/{{ selection }}../app.j2", "client", "client..", "../shared", "shared/app.j2"),
+])
+def test_dynamic_role_template_resolves_finite_link_paths(tmp_path, source, selection, alias, target, file_path):
+    templates = tmp_path / "roles/r/templates"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: "%s"}
+- template: {src: "%s", dest: "output.txt"}
+""" % (selection, source), "roles/r/templates/" + file_path: "linked template\n"})
+    (templates / "sites").mkdir(exist_ok=True)
+    (templates / "sites" / alias).symlink_to(target, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+@pytest.mark.parametrize(("source", "variables"), [
+    ("sites/.{{ extra }}app.j2", {"extra": "/alias/"}),
+    ("sites/{{ a }}.{{ b }}.{{ c }}app.j2", {"a": "alias/", "b": "/", "c": "/"}),
+])
+def test_dynamic_role_template_normalizes_computed_dot_components(tmp_path, source, variables):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: %s
+- template: {src: "%s", dest: output.txt}
+""" % (json.dumps(variables), source), "roles/r/templates/shared/app.j2": "linked template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir()
+    (sites / "alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "linked template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+@pytest.mark.parametrize("depth", [0, 11])
+def test_dynamic_role_template_reaches_later_search_root_with_cyclic_aliases(tmp_path, depth):
+    directory = "/".join(["nested"] * depth + ["alias"])
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: %s/app}
+- template: {src: "sites/{{ selection }}.j2", dest: output.txt}
+""" % directory, "roles/r/templates/sites/local.txt": "unrelated\n", "shared/app.j2": "linked template\n"})
+    earlier = tmp_path / "roles/r/templates/sites"
+    for name in ("cycle_a", "cycle_b"):
+        (earlier / name).symlink_to(".", target_is_directory=True)
+    alias = tmp_path / "templates/sites" / directory
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "linked template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+@pytest.mark.parametrize(("prefix", "linked_first", "dynamic_subdir"), [
+    ("", False, False), ("./", True, False), ("", True, False), ("", None, False), ("./", None, False),
+    ("", None, True), ("./", None, True), ("", True, True), ("./", True, True),
+])
+def test_dynamic_role_template_uses_core_search_order_for_explicit_subdir(tmp_path, prefix, linked_first, dynamic_subdir):
+    destination = tmp_path / "rendered.txt"
+    selection = prefix + "templates/sites/alias/app" if dynamic_subdir else "alias/app"
+    source = "{{ selection }}.j2" if dynamic_subdir else prefix + "templates/sites/{{ selection }}.j2"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: "%s"}
+- template: {src: "%s", dest: "%s"}
+""" % (selection, source, destination), "roles/r/templates/shared/app.j2": "linked path\n"})
+    templates = tmp_path / "roles/r/templates"
+    normal, prepended = templates / "sites", templates / "templates/sites"
+    linked, regular = (normal, prepended) if linked_first else (prepended, normal)
+    linked.mkdir(parents=True)
+    if linked_first is None:
+        (linked / "alias").mkdir()
+        (linked / "alias/app.j2").write_text("other regular path\n")
+    else:
+        (linked / "alias").symlink_to(templates / "shared", target_is_directory=True)
+    (regular / "alias").mkdir(parents=True)
+    (regular / "alias/app.j2").write_text("regular path\n")
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    expected_source = destination.read_text()
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == expected_source
+
+
+@pytest.mark.parametrize("prefix", ["", "./"])
+def test_dynamic_role_template_bakes_only_renderable_action_prefix(tmp_path, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "%stemplates/sites/{{ selection }}.j2", dest: output.txt}
+""" % prefix, "shared/first/app.j2": "direct template\n", "shared/second/app.j2": "prefixed template\n"})
+    templates = tmp_path / "roles/r/templates"
+    for parent, target in (("sites", "first"), ("templates/sites", "second")):
+        directory = templates / parent
+        directory.mkdir(parents=True)
+        (directory / "alias").symlink_to(tmp_path / "shared" / target, target_is_directory=True)
+
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert set(template["_baked_direct_sources"]) == {prefix + "templates/sites/alias/app.j2"}
+
+
+def test_linked_template_spelling_takes_precedence_over_ordinary_blocker(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: templates/sites/alias/app}
+- template: {src: "{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/shared/app.j2": "linked winner\n",
+        "templates/templates/sites/alias/app.j2": "later regular file\n"})
+    templates = tmp_path / "roles/r/templates"
+    (templates / "templates/sites/alias/app.j2").mkdir(parents=True)
+    (templates / "sites").mkdir()
+    (templates / "sites/alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "output.txt"
+    expected = _ansible(playbook)
+    contents = destination.read_text() if destination.exists() else None
+    if contents is not None:
+        destination.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert (destination.read_text() if destination.exists() else None) == contents
+
+
+def test_unbaked_direct_template_does_not_use_a_shadowed_ordinary_payload():
+    from ansiroll.runtime import Runtime
+
+    source = "templates/sites/alias/app.j2"
+    node = {"_baked_tree": "templates", "_baked_direct_sources": {source: None},
+            "_baked_tree_shadowed": {source: [0, 1]},
+            "_baked_tree_roots": [([], {}, {}, {source: source}), ([], {}, {source: True}, {})]}
+    assert Runtime._baked_source_key(node, source) is None
+
+
+def test_dynamic_role_template_preserves_dot_prefixed_tilde(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: draft}
+- template: {src: "./~{{ name }}.j2", dest: "output.txt"}
+""", "roles/r/templates/~draft.j2": "from the role\n"})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "from the role\n"
+
+
+@pytest.mark.parametrize("prefix", ["", "./"])
+def test_dynamic_role_template_resolves_action_prefix_with_only_linked_source(tmp_path, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: "%stemplates/sites/alias/app"}
+- template: {src: "{{ selection }}.j2", dest: "output.txt"}
+""" % prefix, "roles/r/templates/shared/app.j2": "linked source\n{{ template_fullpath }}\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir(parents=True)
+    (sites / "alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    expected_content = destination.read_text()
+    assert expected_content.startswith("linked source\n")
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == expected_content
+
+
+@pytest.mark.parametrize("selection", ["app", "templates/app", "templates//app"])
+def test_dynamic_role_template_reuses_asset_under_linked_action_root(tmp_path, selection):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: %s}
+- template: {src: "{{ selection }}.j2", dest: "output.txt"}
+""" % selection, "roles/r/shared/app.j2": "linked template\n{{ template_fullpath }}\n"})
+    role = tmp_path / "roles/r"
+    (role / "templates").symlink_to("shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    expected_content = destination.read_text()
+    assert expected_content.startswith("linked template\n")
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == expected_content
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert template["_baked_direct_sources"]["templates/app.j2"] == "app.j2"
+    assert set(template["_baked"]) == {"app.j2"}
+
+
+def test_dynamic_role_template_bakes_a_symlink_crossed_by_the_scan_prefix(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template:
+    src: "{% set stem = 'app' %}sites/alias/{{ stem }}.j2"
+    dest: output.txt
+""", "shared/app.j2": "linked template\n", "roles/r/templates/sites/unused": ""})
+    alias = tmp_path / "roles/r/templates/sites/alias"
+    alias.symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+def test_dynamic_role_template_keeps_link_budget_after_a_fixed_prefix(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: nested/app}
+- template: {src: "sites/alias/{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/sites/unused": "", "shared/nested/app.j2": "linked template\n"})
+    prefix = tmp_path / "shared/prefix"
+    prefix.mkdir()
+    for index in range(4095):
+        (prefix / ("dir-%d" % index)).mkdir()
+    (prefix / "nested").symlink_to("../nested", target_is_directory=True)
+    (tmp_path / "roles/r/templates/sites/alias").symlink_to(prefix, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+@pytest.mark.parametrize(("source", "unrelated_alias"), [
+    ("sites/{{ 'blue/' + name }}.j2", "aaa"),
+    ("sites/{{ 'aaa' if use_aaa else 'blue/nested/app' }}.j2", "aaa.j2.bak"),
+])
+def test_dynamic_role_template_excludes_unrelated_aliases_from_the_visit_budget(tmp_path, source, unrelated_alias):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: nested/app, use_aaa: false}
+- template: {src: "%s", dest: output.txt}
+""" % source, "shared/leaf/app.j2": "linked template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir(parents=True)
+    blue = tmp_path / "shared/blue"
+    blue.mkdir()
+    (blue / "nested").symlink_to("../leaf", target_is_directory=True)
+    (sites / "blue").symlink_to(blue, target_is_directory=True)
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    for index in range(4095):
+        (unrelated / ("dir-%d" % index)).mkdir()
+    (sites / unrelated_alias).symlink_to(unrelated, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+
+
+@pytest.mark.parametrize(("src", "matched", "excluded"), [
+    ("sites/{{ 'a' + ('li' + 'as') }}/app.j2", "alias/app.j2", "report-alias/app.j2"),
+    ("sites/{{ 'alias/' + name }}.j2", "alias/app.j2", "report-alias/app.j2"),
+    ("sites/{{ 'report-' + group }}/app.j2", "report-alias/app.j2", "alias/app.j2"),
+    ("sites/{{ group + '-alias/app' }}.j2", "report-alias/app.j2", "alias/app.j2"),
+    ("sites/report-{{ name }}{% if staged %}.staging{% endif %}.j2",
+     "report-alias/app.j2", "alias/other.j2"),
+    ("sites/{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}/app.j2{% set unused = true %}", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}{% set stem = 'app' %}/{{ stem }}.j2",
+     "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}{% set stem %}app{% endset %}/{{ stem }}.j2",
+     "alias/app.j2", "alias/not-app.j2"),
+    ("{% set unused %}{% for value in [1] %}discard{% endfor %}{% endset %}sites/{{ group }}/app.j2",
+     "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}/{% set folder %}{% for value in [] %}{{ value }}{% endfor %}{% endset %}{{ folder }}/app.j2",
+     "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ ('staging/' if staged) ~ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ 'staging/' if staged }}{{ group }}/app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ group }}/{% if staged %}stage{% endif %}//app.j2", "alias/app.j2", "alias/not-app.j2"),
+    ("sites/{{ empty }}{{ suffix }}/alias/app.j2", "alias/app.j2", "alias/not-app.j2"),
+])
+def test_dynamic_role_template_keeps_literal_pattern_boundaries(tmp_path, monkeypatch, src, matched, excluded):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: alias/app, group: alias, staged: false, empty: '', suffix: ''}
+- template: {src: "%s", dest: "output.txt"}
+""" % src, "roles/r/templates/sites/app.j2": "ordinary\n",
+        "shared/app.j2": "linked\n", "shared/other.j2": "excluded\n",
+        "shared/not-app.j2": "excluded\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for name in ("alias", "report-alias"):
+        (sites / name).symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    linked_stat = (tmp_path / "shared/app.j2").stat()
+    reads = []
+    original_fdopen = os.fdopen
+
+    def track_linked_read(fd, *args, **kwargs):
+        if os.path.samestat(os.fstat(fd), linked_stat):
+            reads.append(fd)
+        return original_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", track_linked_read)
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    direct = template["_baked_direct_sources"]
+    assert "sites/" + matched in direct
+    assert "sites/" + excluded not in direct
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("src", [
+    "sites/{% if use_blue %}blue{% elif use_green %}green{% else %}orange{% endif %}/{{ name }}.j2",
+    "sites/{{ 'blue' if use_blue else ('green' if use_green else 'orange') }}/{{ name }}.j2",
+    "sites/{{ ('blue' if use_blue else ('green' if use_green else 'orange')) ~ '/' ~ name }}.j2",
+    "sites/{% if use_blue %}{% set color = 'blue' %}{% elif use_green %}{% set color = 'green' %}"
+    "{% else %}{% set color = 'orange' %}{% endif %}{{ color }}/{{ name }}.j2",
+])
+def test_dynamic_role_template_bakes_only_conditional_directory_choices(tmp_path, src):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {name: app, use_blue: false, use_green: true}
+- template: {src: "%s", dest: output.txt}
+""" % src, "roles/r/templates/sites/local.j2": "ordinary template\n",
+        "shared/blue/app.j2": "blue template\n", "shared/green/app.j2": "green template\n",
+        "shared/orange/app.j2": "orange template\n", "shared/prod/client-key.j2": "unrelated input\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for name in ("blue", "green", "orange", "prod"):
+        (sites / name).symlink_to(tmp_path / "shared" / name, target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "green template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "green template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert set(template["_baked_direct_sources"]) == {"sites/%s/app.j2" % name for name in ("blue", "green", "orange")}
+
+
+def test_dynamic_role_template_pattern_handles_many_repeated_literals():
+    from ansiroll.loader import _linked_role_source_matches, _linked_role_source_patterns
+
+    _, patterns = _linked_role_source_patterns("sites/" + "{{ name }}a" * 24 + "b{{ name }}.j2")
+    (_, pattern), = patterns
+    path = "sites/" + "a" * 100
+    assert not _linked_role_source_matches(pattern, path + ".j2")
+    assert _linked_role_source_matches(pattern, path + "b.j2")
+
+
+def test_dynamic_role_template_bounds_expansion_of_assigned_path_parts():
+    from ansiroll.loader import _linked_role_source_patterns
+
+    setup = "{% set prefix = 'abcdefghijklmnop' %}"
+    doubling = "{% set prefix = prefix ~ prefix %}"
+    path = "sites/{{ prefix }}-{{ name }}.j2"
+    assert _linked_role_source_patterns(setup + doubling * 4 + path) is not None
+    assert _linked_role_source_patterns(setup + doubling * 14 + path) is None
+
+
+@pytest.mark.parametrize(("literal_directory", "prefix"), [("", "alias/"), ("alias", "/")])
+def test_dynamic_role_template_preserves_directory_before_computed_dot(tmp_path, literal_directory, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {prefix: "%s"}
+- template: {src: "sites/%s{{ prefix }}./app.j2", dest: "output.txt"}
+""" % (prefix, literal_directory), "roles/r/templates/shared/app.j2": "linked template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    sites.mkdir()
+    (sites / "alias").symlink_to("../shared", target_is_directory=True)
+    (sites / "other").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "linked template\n"
+    if literal_directory:
+        template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                        if node.get("action", "").endswith("template"))
+        assert "sites/other/app.j2" not in template["_baked_direct_sources"]
+
+
+def test_dynamic_role_template_rejects_link_target_replaced_during_open(tmp_path, monkeypatch):
+    from ansiroll import loader
+
+    project = tmp_path / "project"
+    _write(project, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "sites/{{ selection }}.j2", dest: "unused"}
+""", "roles/r/templates/sites/local.j2": "local\n",
+        "shared/app.j2": "allowed\n"})
+    _write(tmp_path, {"outside/app.j2": "outside\n"})
+    shared = project / "shared"
+    (project / "roles/r/templates/sites/alias").symlink_to(shared, target_is_directory=True)
+
+    opened = []
+    open_linked_source = loader._open_linked_role_source
+
+    def replace_target(path):
+        if path == str(shared / "app.j2") and not opened:
+            opened.append(path)
+            shared.rename(project / "moved")
+            shared.symlink_to(tmp_path / "outside", target_is_directory=True)
+        return open_linked_source(path)
+
+    monkeypatch.setattr(loader, "_open_linked_role_source", replace_target)
+    source, _manifest = compile_playbook(str(project / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert opened == [str(shared / "app.j2")]
+    assert set(template["_baked"]) == {"sites/local.j2"}
+
+
+@pytest.mark.parametrize("src", [
+    "sites/.private/{{ selection }}.j2",
+    "sites/{{ selection }}{% if staged %}.staging{% else %}.j2{% endif %}",
+    "sites/{{ selection }}.j2/",
+    "sites/{{ selection }}.j2/.",
+])
+def test_dynamic_role_template_skips_excluded_or_unusable_linked_candidates(tmp_path, src):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: alias/app, staged: false}
+- template: {src: "%s", dest: "unused"}
+""" % src, "roles/r/templates/sites/local.j2": "ordinary\n",
+        "shared/alias/app.j2": "linked\n",
+        "links/app.j2": "nested linked\n",
+        "links/unrelated.txt": "never bundle this\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    (sites / ".private").symlink_to(tmp_path / "shared", target_is_directory=True)
+    (sites / "alias").symlink_to(tmp_path / "links", target_is_directory=True)
+    (tmp_path / "shared/alias/nested").symlink_to(tmp_path / "links", target_is_directory=True)
+
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "_baked_direct_sources" not in template
+
+
+def test_dynamic_role_template_keeps_ordinary_sources_at_link_limit(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: local}
+- template: {src: "sites/{{ selection }}.j2", dest: "unused"}
+""", "roles/r/templates/sites/local.j2": "ordinary\n",
+        "shared/unrelated.txt": "unrelated\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for index in range(4097):
+        (sites / str(index)).symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "sites/local.j2" in template["_baked"]
+    assert "_baked_direct_sources" not in template
+
+
+def test_dynamic_role_template_counts_duplicate_search_roots_once(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": "- include_tasks: sub/entry.yml\n",
+        "roles/r/tasks/sub/entry.yml": """
+- set_fact: {selection: alias/app}
+- template: {src: "sites/{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/sites/local.txt": "unrelated\n",
+        "unused/data.txt": "unrelated alias target\n", "shared/app.j2": "playbook template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    for index in range(2048):
+        (sites / str(index)).symlink_to(tmp_path / "unused", target_is_directory=True)
+    later = tmp_path / "templates/sites"
+    later.mkdir(parents=True)
+    (later / "alias").symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "output.txt"
+    assert destination.read_text() == "playbook template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "playbook template\n"
+
+
 def test_compiles_are_identical_across_hash_seeds_and_cwds(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
