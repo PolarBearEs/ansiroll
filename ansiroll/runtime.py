@@ -1513,7 +1513,11 @@ class _LazyTplList(list):
                              self._origin, self._task_vars)
 
     def pop(self, index=-1):
-        return _observe_container_value(list.pop(self, index), self._rt, self._render_ctx)
+        value = list.pop(self, index)
+        if self._task_vars:
+            return _lazy_wrap(value, self._rt, self._render_ctx(), self._dynamic,
+                              self._origin, self._task_vars)
+        return _observe_container_value(value, self._rt, self._render_ctx)
 
     def copy(self):
         values = list.copy(self)
@@ -1524,7 +1528,7 @@ class _LazyTplList(list):
         return _observe_container_value(values, self._rt, self._render_ctx)
 
     def remove(self, item):
-        if not self._delegated:
+        if not (self._delegated or self._task_vars):
             return list.remove(self, item)
         for index, value in enumerate(self):
             if value is item or value == item:
@@ -2015,7 +2019,7 @@ class _Templater:
     def _g_lookup(self, name, *a, **k):
         try:
             a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: self._template_lookup_arg(value) for key, value in k.items()}
+            k = {key: self._template_lookup_option(value) for key, value in k.items()}
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
                 _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
@@ -2035,7 +2039,7 @@ class _Templater:
     def _g_query(self, name, *a, **k):
         try:
             a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: self._template_lookup_arg(value) for key, value in k.items()}
+            k = {key: self._template_lookup_option(value) for key, value in k.items()}
             return _mark_unsafe(
                 _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
@@ -2050,6 +2054,11 @@ class _Templater:
         rendered = self._template_lookup_arg(value)
         if _is_undef(rendered):
             rendered._fail_with_undefined_error()
+        return rendered
+
+    def _template_lookup_option(self, value):
+        rendered = self._template_lookup_arg(value)
+        _raise_captured_template_error(rendered)
         return rendered
 
     def _template_lookup_arg(self, value):
@@ -5961,7 +5970,7 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
     for key, value in (ctx or {}).items():
-        if key in ("vars", _DEFER_LOOKUP_NAMES):
+        if key in ("vars", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT):
             continue
         if key == "omit" and deferred is not None and key not in resolve_keys:
             continue
@@ -6065,6 +6074,8 @@ def agent_main():
             # Only the agent has the play's bundled filters and lookup plugins.
             # Synchronize also reads connection and executable vars directly.
             action = (task.get("action") or "").rsplit(".", 1)[-1]
+            if action == "template":
+                ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
             defer_template = action == "template" and ctx.get(_DEFER_LOOKUP_NAMES)

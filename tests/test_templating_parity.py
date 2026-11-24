@@ -834,6 +834,30 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
     assert messages == ["first/second", "first/" + null_suffix]
 
 
+def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "true")
+    monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    empty: null
+    alias: "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/{{ empty }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+""", {"sample.j2": "prefix={{ alias }}\n"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    expected_text = output.read_text()
+    assert expected_text == "prefix=controller/\n"
+    output.unlink()
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost

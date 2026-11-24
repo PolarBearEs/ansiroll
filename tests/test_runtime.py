@@ -103,15 +103,20 @@ def test_template_file_interpolates_null_as_empty_in_legacy_native_mode(monkeypa
     assert runtime.templater.render_string(source, context) == "controller/None"
 
 
-def test_copy_of_deferred_task_list_renders_only_selected_member():
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("vars.row.copy()[0]", 17),
+    ("vars.row.copy().pop(0)", 17),
+    ("[rows.remove(17), rows | length] | last", 1),
+])
+def test_copy_of_deferred_task_list_renders_only_selected_member(expression, expected):
     frames, calls = [], []
     runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
     runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
-    task = _task("1", "Copy row", "debug", args={"msg": "{{ vars.row.copy()[0] }}"}, vars={
-        "number": 17, "row": ["{{ number }}", "{{ lookup('source') }}/tail"],
+    task = _task("1", "Copy row", "debug", args={"msg": "{{ " + expression + " }}"}, vars={
+        "number": 17, "row": ["{{ number }}", "{{ lookup('source') }}/tail"], "rows": "{{ vars.row.copy() }}",
     })
     runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
-    assert frames[0]["result"]["msg"] == 17
+    assert frames[0]["result"]["msg"] == expected
     assert calls == []
 
 
@@ -1805,6 +1810,21 @@ def test_vars_lookup_default_preserves_evaluation_errors():
     result = templater.render_string(text, {"value": "{{ 1 / divisor }}", "divisor": 0})
     with pytest.raises(_CapturedTemplateError, match="division by zero"):
         _fail_on_undef(result)
+
+
+@pytest.mark.parametrize(("call", "expected"), [("lookup", "present"), ("query", ["present"])])
+def test_vars_lookup_preserves_captured_default_errors(call, expected, tmp_path):
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ " + call + "('vars', 'value', default=fallback) }}"
+    assert templater.render_string(text, {"value": "present"}) == expected
+    context = {"value": "present", "fallback": "{{ 1 // divisor }}", "divisor": 0}
+    with pytest.raises(_CapturedTemplateError, match="integer division or modulo by zero"):
+        _fail_on_undef(templater.render_string(text, context))
+    context.update(fallback="{{ lookup('file', path) }}", path=str(tmp_path / "missing"))
+    with pytest.raises(_CapturedTemplateError, match="No such file"):
+        _fail_on_undef(templater.render_string(text, context))
 
 
 def test_loop_set_fact_is_visible_to_next_iteration():
