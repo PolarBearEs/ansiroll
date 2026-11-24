@@ -307,6 +307,32 @@ def test_whole_vars_lookup_hostvars_result_resolves_once(expression):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("filter_name", [None, "to_json", "to_nice_json"])
+def test_hostvars_lookup_is_read_once_by_legacy_debug_and_json(monkeypatch, filter_name):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.12.10")
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
+        "original": "{{ lookup('counting') }}",
+    }}}, on_result=frames.append)
+
+    def counting(*args, **kwargs):
+        calls.append(None)
+        return [len(calls)]
+
+    runtime.templater._lookup_loaded["counting"] = counting
+    expression = "lookup('vars', 'hostvars')"
+    args = {"msg": "{{ " + expression + " | " + filter_name + " }}"} if filter_name else {"var": expression}
+    task = _task("1", "Read the whole hostvars lookup", "debug", args=args, vars={
+        "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["status"] == "ok"
+    result = frames[0]["result"]
+    rendered = json.loads(result["msg"]) if filter_name else result[expression]
+    assert rendered["h"]["original"] == 1
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
 def test_serializers_materialize_nested_lazy_hostvars_entries(filter_name):
     from ansiroll.runtime import _yaml_module

@@ -392,7 +392,7 @@ def _fail_on_undef(value):
 def _debug_var_value(value):
     if not _core_at_least(2, 19):
         try:
-            return _fail_on_undef(value)
+            return _fail_on_undef(_mark_unsafe(value))
         except jinja2.UndefinedError:
             return "VARIABLE IS NOT DEFINED!"
 
@@ -777,22 +777,20 @@ def _contains_vault(v):
 
 
 def _f_to_json(v, **kwargs):
-    if _contains_vault(v):
+    snapshot = _mark_unsafe(v)
+    if _contains_vault(snapshot):
         raise ValueError("The variable contains an undecryptable variable")
-    return json.dumps(v, **_host_entries_json_options(kwargs, reject_vault=True))
+    return json.dumps(snapshot, **kwargs)
 
 
-def _host_entries_json_options(options, *, reject_vault=False):
+def _host_entries_json_options(options):
     """Let the JSON encoder handle normal values and expand host entries on demand."""
     options = dict(options)
 
     def expand(value, fallback):
         if not isinstance(value, _HostVarEntries):
             return fallback(value)
-        entries = list(value)
-        if reject_vault and _contains_vault(entries):
-            raise ValueError("The variable contains an undecryptable variable")
-        return entries
+        return list(value)
 
     fallback = options.get("default")
     if fallback is not None:
