@@ -217,25 +217,40 @@ def _gather_timeout_template(source, variables):
     return None
 
 
+def _gather_public_roles(play):
+    from ansible import constants as C
+
+    core_version = _core_version()
+    uses_role_public = _core_version(include_patch=True) >= (2, 16, 3)
+    for role in play.get_roles():
+        if uses_role_public and not role.public:
+            continue
+        if not uses_role_public and core_version >= (2, 15) and (C.DEFAULT_PRIVATE_ROLE_VARS or not role.static):
+            continue
+        yield role
+
+
+def _gather_role_defaults(roles):
+    from ansible.utils.vars import combine_vars
+
+    defaults = {}
+    for role in roles:
+        defaults = combine_vars(defaults, role.get_default_vars())
+    return defaults
+
+
 def _gather_timeout_file_scope(play, entries, runtime):
     """Keep original file order and the play layers needed by a runtime timeout."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS
 
-    core_version = _core_version()
-    uses_role_public = _core_version(include_patch=True) >= (2, 16, 3)
-    private_role_vars = not uses_role_public and C.DEFAULT_PRIVATE_ROLE_VARS
-    export_args = {"only_exports": True} if core_version >= (2, 15) else {}
-    defaults, exports = {}, {}
-    for role in play.get_roles():
-        if uses_role_public:
-            if not role.public:
-                continue
-        elif core_version >= (2, 15) and (private_role_vars or not role.static):
-            continue
-        defaults = combine_vars(defaults, role.get_default_vars())
-        if not private_role_vars:
+    roles = list(_gather_public_roles(play))
+    defaults = _gather_role_defaults(roles)
+    exports = {}
+    if _core_version(include_patch=True) >= (2, 16, 3) or not C.DEFAULT_PRIVATE_ROLE_VARS:
+        export_args = {"only_exports": True} if _core_version() >= (2, 15) else {}
+        for role in roles:
             exports = combine_vars(exports, role.get_vars(include_params=False, **export_args))
 
     play_vars = play.vars or {}
@@ -606,6 +621,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
         for index, selected in order_deferred.items():
             deferred[index]["files"].update(selected)
+            if selected:
+                deferred[index]["has_compile_selection"] = True
         result["deferred_vars_files"] = deferred
     # Replaying a selector after an earlier deferred file may bundle new
     # candidates. Their lookup names do not authorize copying controller data.
@@ -727,7 +744,16 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
 
     out = dict(play.vars or {})
     use_search_stack = _core_version() >= (2, 12)
-    compile_extra_vars = play.get_variable_manager().extra_vars if ordered is not None else {}
+    compile_extra_vars = {}
+    selector_magic = {}
+    role_defaults = {}
+    if ordered is not None:
+        manager = play.get_variable_manager()
+        compile_extra_vars = manager.extra_vars
+        role_defaults = _gather_role_defaults(_gather_public_roles(play))
+        magic_args = {"include_delegate_to": True} if _core_version() < (2, 15) else {}
+        selector_magic = manager._get_magic_variables(
+            play=play, host=None, task=None, include_hostvars=True, **magic_args)
     bundled_inputs = set()
     scanned = 0
     for entry in _as_list(getattr(play, "vars_files", None)):
@@ -744,7 +770,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     from .runtime import _GATHER_STRING_METHODS
 
                     dependencies = _gather_timeout_dependencies(
-                        filename, {**out, **compile_extra_vars}, _GATHER_STRING_METHODS)
+                        filename, {**role_defaults, **out, **compile_extra_vars, **selector_magic},
+                        _GATHER_STRING_METHODS)
                     if dependencies is not None:
                         earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
                         for index, previous in enumerate(earlier, start=scanned):
@@ -754,10 +781,11 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                                     for mapping in contents:
                                         bundled_inputs.update(mapping)
                         scanned = len(unresolved)
-                        mutable_names = dependencies[1] - compile_extra_vars.keys()
+                        mutable_names = dependencies[1] - compile_extra_vars.keys() - selector_magic.keys()
                         defer_for_order |= bool(mutable_names & bundled_inputs)
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
-                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
+                selector_vars = combine_vars(role_defaults, dict(out, playbook_dir=basedir))
+                filename = _template_vars_file_name(play, raw, selector_vars, all_vars, selector_magic)
                 if filename is None:
                     if unresolved is not None and not defer_for_order:
                         if ordered is not None:
@@ -778,7 +806,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             for item in mappings:
                 out = combine_vars(out, item)
             if defer_for_order:
-                selected[os.path.normpath(path)] = _tag_untrusted(mappings)
+                selected[os.path.normpath(play._loader.path_dwim(path))] = _tag_untrusted(mappings)
             elif ordered is not None:
                 ordered.append(_tag_untrusted(mappings))
             break
@@ -836,6 +864,8 @@ def _deferred_vars_files(play, basedir, entries):
         files = {}
         unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
+            if name in unmodeled:
+                continue
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
             if name.startswith(os.path.sep):
                 patterns = [pattern]
@@ -881,11 +911,12 @@ def _bundled_vars_file(play, path):
             "a mapping" % path}
 
 
-def _template_vars_file_name(play, filename, play_vars, all_vars):
+def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
     from ansible.utils.vars import combine_vars
 
     variables = combine_vars(play_vars, all_vars or {})
     variables = combine_vars(variables, play.get_variable_manager().extra_vars)
+    variables = combine_vars(variables, magic_vars)
     try:
         from ansible.template import Templar
         try:

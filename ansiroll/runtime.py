@@ -2813,9 +2813,8 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        file_vars = self._resolve_deferred_vars_files(
+        play_vars = self._resolve_deferred_vars_files(
             vars_file_play_vars, vars_files, early_files, vars_file_defaults, merge_hashes=merge_vars_files)
-        play_vars = _f_combine(vars_file_play_vars, file_vars, recursive=merge_vars_files)
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -3065,20 +3064,19 @@ class Runtime:
         else:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         base = {**defaults, **base}
-        selected = {}
+        selected = dict(play_vars)
         for index, entry in enumerate(entries):
             if "static_vars" in entry:
                 for value in entry["static_vars"]:
                     selected = _f_combine(selected, value, recursive=merge_hashes)
                 continue
-            variables = _f_combine(play_vars, selected, recursive=merge_hashes)
-            ctx = self.ctx(variables, self.extra_vars, base=base)
+            ctx = self.ctx(selected, self.extra_vars, base=base)
             if not before_setup and index in early_files:
-                inputs, values = early_files[index]
+                inputs, mappings = early_files[index]
                 if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
                        key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
                        for key, value in inputs.items()):
-                    selected = _f_combine(selected, values, recursive=merge_hashes)
+                    selected = _f_combine(selected, *mappings, recursive=merge_hashes)
                     continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             inputs = {}
@@ -3100,6 +3098,8 @@ class Runtime:
                                      % (item,))
                     break
                 except Exception as ex:
+                    if before_setup:
+                        break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
                     continue
@@ -3115,17 +3115,19 @@ class Runtime:
                 if found:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
+                        if before_setup:
+                            break
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    values = {}
-                    for value in data:
-                        values = _f_combine(values, value, recursive=merge_hashes)
-                    selected = _f_combine(selected, values, recursive=merge_hashes)
+                    selected = _f_combine(selected, *data, recursive=merge_hashes)
                     if before_setup:
-                        early_files[index] = (inputs, values)
+                        early_files[index] = (inputs, data)
                     break
             else:
                 if before_setup:
                     continue
+                if entry.get("unmodeled"):
+                    raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
+                                         "make its selector resolvable at compile time" % (item,))
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
                 if not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))

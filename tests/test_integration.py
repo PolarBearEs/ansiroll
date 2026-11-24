@@ -2631,6 +2631,102 @@ def test_ordered_task_vars_files_merge_with_compile_only_timeout(tmp_path, monke
     }
 
 
+@pytest.mark.parametrize("selector", ["ansible_playbook_python | basename", "role_directory"])
+def test_compile_timeout_vars_file_selector_uses_controller_scope(tmp_path, selector):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  roles: [settings]
+  vars_files: ['profile-{{ %s }}.yml']
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""" % selector)
+    defaults = tmp_path / "roles" / "settings" / "defaults"
+    defaults.mkdir(parents=True)
+    (defaults / "main.yml").write_text("role_directory: role-default\n")
+    role_vars = defaults.parent / "vars"
+    role_vars.mkdir()
+    (role_vars / "main.yml").write_text("role_directory: role-export\n")
+    (tmp_path / ("profile-" + os.path.basename(sys.executable) + ".yml")).write_text("timeout_seconds: 23\n")
+    (tmp_path / "profile-role-default.yml").write_text("timeout_seconds: 23\n")
+    source, _ = compile_playbook(str(playbook))
+    assert _compiled_plays(source, tmp_path)[0]["gather_timeout"] == 23
+
+
+def test_ordered_timeout_defers_vars_file_error_until_after_gathering(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {timeout_seconds: 23}
+  vars_files:
+    - "settings-{{ profile }}{{ ansible_os_family | default('') }}.yml"
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "settings-runtime.yml").write_text("$ANSIBLE_VAULT;1.1;AES256\n")
+    (tmp_path / "settings-runtimeExample.yml").write_text("selected: after-setup\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        return {"ansible_facts": {"ansible_os_family": "Example"}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
+    assert runtime.vars["selected"] == "after-setup"
+
+
+def test_ordered_vars_files_can_use_compile_selected_directory(tmp_path, monkeypatch):
+    from ansiroll.runtime import VarsFilesError
+
+    playbook = tmp_path / "play.yml"
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "final.yml").write_text("selected: compile-default\n")
+    playbook.write_text("""- hosts: localhost
+  vars: %s
+  vars_files: ['gather-{{ profile }}.yml', '{{ config_dir }}/final.yml']
+  gather_timeout: '{{ 23 }}'
+  tasks: []
+""" % json.dumps({"config_dir": str(config)}))
+    (tmp_path / "gather-normal.yml").write_text("{}\n")
+    (tmp_path / "gather-other.yml").write_text("config_dir: " + str(tmp_path / "unbundled") + "\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "normal"})
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "compile-default"
+    runtime.extra_vars["profile"] = "other"
+    with pytest.raises(VarsFilesError, match="path that was not bundled"):
+        runtime.run_play(plan)
+
+
+def test_ordered_vars_files_keep_intermediate_hash_replacement(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {settings: {play: true}}
+  vars_files: ['profile-{{ profile }}.yml', 'reset.yml', 'final.yml']
+  gather_timeout: '{{ 23 }}'
+  tasks: []
+""")
+    (tmp_path / "profile-runtime.yml").write_text("{}\n")
+    (tmp_path / "reset.yml").write_text("settings: reset\n")
+    (tmp_path / "final.yml").write_text("settings: {final: true}\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.template("{{ settings }}", runtime.ctx()) == {"final": True}
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 
