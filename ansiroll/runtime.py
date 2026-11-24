@@ -1218,7 +1218,8 @@ class _LazyTplDict(dict):
     def copy(self):
         raw_items = dict.items(self)
         if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
-            return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())
+            view = _HostVarView if isinstance(self, _HostVarView) else _LazyTplDict
+            return view(dict(raw_items), self._rt, self._render_ctx())
         return {k: self[k] for k in self}
 
     def __iter__(self):

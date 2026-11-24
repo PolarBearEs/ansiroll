@@ -1938,7 +1938,9 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
           {{ alias.child | default('fallback') }}|
           {%- set current = hostvars[inventory_hostname] -%}
           {%- set first_key = current.keys() | first -%}
-          {{ current.values()[0] == current[first_key] }}|{{ current.items()[0][0] == first_key }}
+          {{ current.values()[0] == current[first_key] }}|{{ current.items()[0][0] == first_key }}|
+          {%- set snapshot = current.copy() -%}
+          {{ snapshot.values()[0] == current[first_key] }}|{{ snapshot.items()[0][0] == first_key }}
     - template:
         src: "{{ playbook_dir }}/runtime.j2"
         dest: "{{ playbook_dir }}/output.txt"
@@ -1959,7 +1961,7 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
     _, recap = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
     assert recap == ("2", "2", "0", "0", "0", "0", "0")
     assert (tmp_path / "output.txt").read_text() == (
-        "hello/tail| hello/tail| hello/tail|untouched| fallback|True|True"
+        "hello/tail| hello/tail| hello/tail|untouched| fallback|True|True|True|True"
     )
     assert (tmp_path / "lookups").read_text() == "used"
 
