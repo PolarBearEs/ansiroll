@@ -42,6 +42,7 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # compiler bakes it into the generated source; target hosts usually have no
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
+_GATHER_STRING_METHODS = {"split", "rsplit", "strip", "lstrip", "rstrip"}
 
 
 def _core_at_least(major, minor):
@@ -2780,16 +2781,22 @@ class Runtime:
         saved_facts = self.vars.get("ansible_facts")
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
+        timeout_template = play.get("gather_timeout_template") or {}
         play_vars = dict(play.get("vars") or {})
         vars_files = play.get("deferred_vars_files") or ()
+        timeout_files = timeout_template.get("vars_files", vars_files)
+        vars_file_defaults = timeout_template.get("vars_file_defaults") or {}
         early_files = {}
-        timeout_template = play.get("gather_timeout_template")
-        vars_file_defaults = (timeout_template or {}).get("vars_file_defaults") or {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = {}
-            if timeout_template and vars_files:
+            if timeout_template and timeout_files:
                 timeout_vars = self._resolve_deferred_vars_files(
-                    play_vars, vars_files, early_files, vars_file_defaults, before_setup=True)
+                    timeout_template.get("play_vars", play_vars), timeout_files, early_files,
+                    vars_file_defaults, before_setup=True)
+                if timeout_files is not vars_files:
+                    # The task resolver's plan skips the static entries.
+                    deferred_positions = (i for i, entry in enumerate(timeout_files) if "static_vars" not in entry)
+                    early_files = {i: early_files[pos] for i, pos in enumerate(deferred_positions) if pos in early_files}
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
@@ -3057,6 +3064,10 @@ class Runtime:
         base = {**defaults, **base}
         selected = {}
         for index, entry in enumerate(entries):
+            if "static_vars" in entry:
+                for value in entry["static_vars"]:
+                    selected.update(value)
+                continue
             ctx = self.ctx(play_vars, selected, self.extra_vars, base=base)
             if not before_setup and index in early_files:
                 inputs, values = early_files[index]
@@ -3126,8 +3137,10 @@ class Runtime:
                 expression = self.templater.env.parse(pending.pop())
             except jinja2.TemplateSyntaxError:
                 return None
-            if next(expression.find_all(jinja2.nodes.Call), None) is not None:
-                return None
+            for call in expression.find_all(jinja2.nodes.Call):
+                method = call.node
+                if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
+                    return None
             for node in expression.find_all(jinja2.nodes.Name):
                 if node.ctx == "load" and node.name not in inputs:
                     if node.name not in ctx:
@@ -4829,12 +4842,12 @@ class Runtime:
     def _gather_timeout_for_run(self, timeout, template, setup_ctx, vars_files=None):
         if not template:
             return timeout
-        role_exports = set(template.get("role_exports", ()))
-        vars_files = {key: value for key, value in (vars_files or {}).items() if key not in role_exports}
-        overrides = self.extra_vars.keys() | vars_files.keys()
+        role_exports = template.get("role_exports") or {}
+        overrides = self.extra_vars.keys() | (vars_files or {}).keys()
         if not template.get("required") and overrides.isdisjoint(template["names"]):
             return timeout
-        scope = self.ctx(template["vars"], vars_files, self.extra_vars, base={
+        scope = self.ctx(template.get("timeout_defaults"), template["vars"], template.get("play_vars"),
+                         vars_files, role_exports, self.extra_vars, base={
             "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
         })
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))

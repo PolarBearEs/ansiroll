@@ -2400,6 +2400,49 @@ def test_legacy_runtime_timeout_treats_bare_null_as_omitted(monkeypatch):
         runtime._gather_timeout_for_run(23, template, context)
 
 
+@pytest.mark.parametrize(("files", "profile", "role_alias", "expected"), [
+    (['gather-{{ profile.split(":") | first }}.yml'], "runtime:extra", False, 45),
+    (["gather-{{ profile }}.yml"], "runtime", True, 55),
+    (["gather-{{ profile }}.yml", "final.yml"], "runtime", False, 20),
+    (["final.yml", "gather-{{ profile }}.yml"], "runtime", False, 45),
+    (["gather-{{ profile }}.yml", ["final.yml", "unused.yml"]], "runtime", False, 20),
+    (["gather-{{ profile }}.yml", '{{ lookup("env", "ANSIROLL_TIMEOUT_STATIC_FILE") }}'], "runtime", False, 20),
+])
+def test_standalone_timeout_uses_ordered_vars_files_and_resolves_aliases(
+        tmp_path, monkeypatch, files, profile, role_alias, expected):
+    playbook = tmp_path / "play.yml"
+    roles = ""
+    if role_alias:
+        roles = "  roles: [settings]\n"
+        role = tmp_path / "roles" / "settings" / "vars"
+        role.mkdir(parents=True)
+        (role / "main.yml").write_text("fallback: 55\n")
+    playbook.write_text("""- hosts: localhost
+%s  vars: {fallback: 45}
+  vars_files: %s
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""" % (roles, json.dumps(files)))
+    (tmp_path / "gather-runtime.yml").write_text("timeout_seconds: '{{ fallback }}'\n")
+    (tmp_path / "final.yml").write_text("timeout_seconds: 20\n")
+    (tmp_path / "unused.yml").write_text("test_canary: unselected-timeout-alternative\n")
+    monkeypatch.setenv("ANSIROLL_TIMEOUT_STATIC_FILE", "final.yml")
+
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "unselected-timeout-alternative" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile})
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        return {"ansible_facts": {}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 
