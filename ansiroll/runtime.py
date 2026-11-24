@@ -30,6 +30,7 @@ import re
 import shlex
 from collections.abc import ItemsView, KeysView, MutableSequence, ValuesView
 from contextlib import contextmanager
+from functools import wraps
 from itertools import groupby
 from numbers import Number
 
@@ -2043,25 +2044,27 @@ def _jinja_undef(hint=None):
     return _captured(hint or "Mandatory variable has not been overridden", missing=True)
 
 
-def _custom_filter_arg(value, converted):
+def _custom_plugin_arg(value, converted):
     if id(value) in converted:
         return converted[id(value)]
     if isinstance(value, _HostVarEntries):
         entries = value._materialize()
         converted[id(value)] = entries
-        return _custom_filter_arg(entries, converted)
-    # Keep unrelated lazy template containers lazy. Plain containers may
-    # carry entry views through Jinja literals or through another filter.
-    if type(value) is dict:
+        return _custom_plugin_arg(entries, converted)
+    # A hostvars copy can store a view directly. Read its raw bindings
+    # so unrelated lookups still run only when the plugin reads them.
+    if type(value) is dict or isinstance(value, _HostVarView):
         converted[id(value)] = value
-        for key, item in value.items():
-            value[key] = _custom_filter_arg(item, converted)
+        for key, item in dict.items(value):
+            normalized = _custom_plugin_arg(item, converted)
+            if normalized is not item:
+                dict.__setitem__(value, key, normalized)
     elif type(value) is list:
         converted[id(value)] = value
         for index, item in enumerate(value):
-            value[index] = _custom_filter_arg(item, converted)
+            value[index] = _custom_plugin_arg(item, converted)
     elif type(value) is tuple:
-        items = tuple(_custom_filter_arg(item, converted) for item in value)
+        items = tuple(_custom_plugin_arg(item, converted) for item in value)
         if all(item is original for item, original in zip(items, value)):
             items = value
         # A mutable member can lead back to this tuple during conversion.
@@ -2069,14 +2072,20 @@ def _custom_filter_arg(value, converted):
     return value
 
 
-def _wrap_filter(fn, *, custom=False):
+def _wrap_custom_plugin(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        converted = {}
+        args = tuple(_custom_plugin_arg(value, converted) for value in args)
+        kwargs = {key: _custom_plugin_arg(value, converted) for key, value in kwargs.items()}
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+def _wrap_filter(fn):
     """Filter errors are captured, not raised (they surface when used)."""
     def wrapped(*a, **k):
         try:
-            if custom:
-                converted = {}
-                a = tuple(_custom_filter_arg(value, converted) for value in a)
-                k = {key: _custom_filter_arg(value, converted) for key, value in k.items()}
             return fn(*a, **k)
         except Exception as e:
             return _captured_jinja_error(e)
@@ -2402,7 +2411,8 @@ class _Templater:
                 except Exception as e:
                     self._plugin_errors[kind][pname] = str(e)
                     continue
-                target[pname] = _wrap_filter(fn, custom=True) if kind == "filter" else fn
+                wrapped = _wrap_custom_plugin(fn)
+                target[pname] = _wrap_filter(wrapped) if kind == "filter" else wrapped
 
     def _plugin_lookup(self, name, args, kwargs):
         """Run a baked lookup plugin; errors come back captured."""

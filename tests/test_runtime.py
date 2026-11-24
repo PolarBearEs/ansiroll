@@ -357,8 +357,8 @@ def test_json_vault_error_does_not_resolve_later_hostvars(filter_name):
         str(runtime.template(expression, runtime._task_ctx(task, {})))
 
 
-@pytest.mark.parametrize("nested", [False, True])
-def test_custom_filter_receives_hostvars_values_as_a_list(nested):
+@pytest.mark.parametrize("container", ["list", "dict", "hostvars_copy"])
+def test_custom_filter_receives_hostvars_values_as_a_list(container):
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
     runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
 import json
@@ -371,11 +371,44 @@ class FilterModule:
         "alias": "{{ lookup('sample') }}/tail",
     })
     ctx = runtime._task_ctx(task, {})
-    value = "{'values': hostvars.h.values()}" if nested else "hostvars.h.values()"
-    result = json.loads(runtime.template("{{ " + value + " | dump_hostvars }}", ctx))
-    values = result["values"] if nested else result
+    templates = {
+        "list": "{{ hostvars.h.values() | dump_hostvars }}",
+        "dict": "{{ {'values': hostvars.h.values()} | dump_hostvars }}",
+        "hostvars_copy": ("{% set snapshot = hostvars.h.copy() %}"
+                          "{% set unused = snapshot.update({'values': hostvars.h.values()}) %}"
+                          "{{ snapshot | dump_hostvars }}"),
+    }
+    result = json.loads(runtime.template(templates[container], ctx))
+    values = result if container == "list" else result["values"]
     assert values[0] == 17
     assert "value/tail" in values
+
+
+def test_custom_jinja_tests_receive_hostvars_lists_without_loading_other_bindings():
+    hostvars = {"h": {"original": 17}, "other": {"value": 23}}
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars})
+    runtime.templater.register_plugins([{"kind": "test", "name": "python_list", "source": """
+import jinja2
+
+@((getattr(jinja2, 'pass_context', None) or jinja2.contextfunction))
+def python_list(ctx, value):
+    return ctx['inventory_hostname'] == 'h' and isinstance(value, list)
+
+def nested_list(snapshot):
+    return isinstance(snapshot['nested'], list)
+
+class TestModule:
+    def tests(self):
+        return {'python_list': python_list, 'nested_list': nested_list}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Inspect hostvars inputs", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    ctx = runtime._task_ctx(task, {})
+    assert runtime.template("{{ hostvars.other.values() is python_list }}", ctx) is True
+    expression = ("{% set snapshot = hostvars.h.copy() %}"
+                  "{% set unused = snapshot.update({'nested': hostvars.other.values()}) %}"
+                  "{{ snapshot is nested_list }}")
+    assert runtime.template(expression, ctx) == "True"
 
 
 def test_custom_filter_mutates_saved_hostvars_values():
