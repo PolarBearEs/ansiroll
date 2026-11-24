@@ -1804,7 +1804,7 @@ class _LazyTplList(list):
     def __add__(self, other):
         if isinstance(other, _LazyTplList):
             other = list(iter(other))
-        return list.__add__(list(iter(self)), other)
+        return list(iter(self)) + other
 
     def __radd__(self, other):
         if not isinstance(other, list):
@@ -2279,13 +2279,13 @@ class _Templater:
         if isinstance(value, dict):
             return {self._template_lookup_arg(k): self._template_lookup_arg(v)
                     for k, v in value.items()}
-        if isinstance(value, list):
+        if isinstance(value, (list, _HostVarEntries)):
             return [self._template_lookup_arg(v) for v in value]
         if isinstance(value, tuple):
             return tuple(self._template_lookup_arg(v) for v in value)
         if isinstance(value, str):
             value = self.render_string(value, self._current_ctx)
-            if isinstance(value, (dict, list, tuple)):
+            if isinstance(value, (dict, list, tuple, _HostVarEntries)):
                 return self._template_lookup_arg(value)
         _raise_captured_template_error(value)
         return value

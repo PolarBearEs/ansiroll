@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from ansiroll.runtime import (
-    ConditionalError, Runtime, UntrustedConditional, _parse_output,
+    _OMIT, ConditionalError, Runtime, UntrustedConditional, _parse_output,
 )
 
 
@@ -290,6 +290,7 @@ def test_hostvars_item_membership_resolves_only_matching_keys():
 @pytest.mark.parametrize(("expression", "expected"), [
     ("(hostvars[inventory_hostname].items() + [('extra', 1)])[-1]", ("extra", 1)),
     ("(['extra'] + hostvars[inventory_hostname].values())[0]", "extra"),
+    ("(prefix_list + hostvars[inventory_hostname].values())[0:3]", ["extra", "h", 17]),
     ("hostvars[inventory_hostname].values().copy()[1]", 17),
     ("(hostvars[inventory_hostname].values() * 2)[1]", 17),
     ("hostvars[inventory_hostname].values() > []", True),
@@ -298,10 +299,26 @@ def test_lazy_hostvars_entries_support_list_operations(expression, expected):
     runtime = Runtime({}, "", {"inventory_hostname": "h"})
     runtime.templater.env.globals["lookup"] = lambda name: 17
     task = _task("1", "Use hostvar entries as lists", "debug", vars={
-        "alias": "{{ lookup('source') }}", "unused": "{{ lookup('source') }}/tail",
+        "alias": "{{ lookup('source') }}", "unused": "{{ lookup('source') }}/tail", "prefix_list": ["extra"],
     })
     ctx = runtime._task_ctx(task, {})
     assert runtime.template("{{ " + expression + " }}", ctx) == expected
+
+
+@pytest.mark.parametrize(("plugin", "expected"), [
+    ("items", ["h", 17, "17/tail", _OMIT]),
+    ("flattened", ["h", 17, "17/tail", _OMIT]),
+    ("indexed_items", [[0, "h"], [1, 17], [2, "17/tail"], [3, _OMIT]]),
+    ("nested", [["h"], [17], ["17/tail"], [_OMIT]]),
+])
+def test_loop_lookups_consume_lazy_hostvars_values(plugin, expected):
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater._lookup_loaded["source"] = lambda terms, variables: [17]
+    task = _task("1", "Pass hostvar values to a lookup", "debug", vars={
+        "alias": "{{ lookup('source') }}", "mixed": "{{ lookup('source') }}/tail",
+    })
+    expression = "{{ query('" + plugin + "', hostvars[inventory_hostname].values()) }}"
+    assert runtime.template(expression, runtime._task_ctx(task, {})) == expected
 
 
 def test_lazy_hostvars_entries_keep_mutations_on_the_list():
