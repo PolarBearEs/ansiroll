@@ -185,6 +185,26 @@ def test_magic_mapping_copy_keeps_written_values_literal(mapping, mutation, read
     assert not calls
 
 
+@pytest.mark.parametrize(("nested", "mutation", "expected"), [
+    (["original"], "copied.nested.append('added')", ["original", "added"]),
+    ({"original": 1}, "copied.nested.update(added=2)", {"original": 1, "added": 2}),
+])
+@pytest.mark.parametrize("read", [
+    "copied.nested",
+    "copied.copy().get('nested')",
+    "(copied.items() | selectattr('0', 'equalto', 'nested') | first)[1]",
+])
+def test_vars_copy_preserves_nested_mutations(nested, mutation, expected, read):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "nested": nested})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("looked up " + name)
+    task = _task("1", "Mutate a copied variable", "debug", vars={
+        "unused": "{{ lookup('unread') }}/tail",
+    })
+    template = ("{% set copied = vars.copy() %}{% set ignored = " + mutation + " %}"
+                "{{ " + read + " | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == expected
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",

@@ -1758,9 +1758,12 @@ class _DeferredPlayVarView(_ModernPlayVarView):
 
     def _resolve(self, key, value):
         if self._is_snapshot:
-            if not isinstance(value, _SnapshotBinding):
-                return self.scope.templater._observe_untrusted(value)
-            value = value.source
+            if isinstance(value, _SnapshotBinding):
+                value = value.resolve(lambda source: self._resolve_inherited(key, source))
+            return self.scope.templater._observe_untrusted(value)
+        return self._resolve_inherited(key, value)
+
+    def _resolve_inherited(self, key, value):
         if self._loop_snapshot:
             return self._read_variable(key, value)
         if key == "vars":
@@ -1773,13 +1776,17 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         if not self._legacy_iteration:
             return self[key]
         source = dict.__getitem__(self, key)
+        resolved = False
         if self._is_snapshot:
             if not isinstance(source, _SnapshotBinding):
                 return self.scope.templater._observe_untrusted(source)
+            resolved = source._resolved
             source = source.source
+        # Legacy iteration still exposes play template source, while accessed
+        # containers retain their mutations in the snapshot.
         if isinstance(source, _PlayVarTemplate):
             return str(source)
-        if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
+        if resolved or isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
                 isinstance(source, (_LazyTplDict, _LazyTplList)) and source._task_vars):
             return self[key]
         return source
