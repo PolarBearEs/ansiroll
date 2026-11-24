@@ -563,7 +563,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
                     play, raw, dict(selector_vars, playbook_dir=basedir), all_vars, deferred_writes)
                 if filename is None:
                     if unresolved is not None:
-                        bundled, = _deferred_vars_files(play, basedir, [entry])
+                        scopes = [selector_vars, play.get_variable_manager().extra_vars]
+                        scopes.extend(mapping for previous in unresolved for data in previous.get("files", {}).values()
+                                      if isinstance(data, list) for mapping in data)
+                        bundled, = _deferred_vars_files(play, basedir, [entry], scopes=scopes)
                         unresolved.append(bundled)
                         for candidate in bundled["files"].values():
                             if isinstance(candidate, list):
@@ -619,35 +622,60 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
-def _literal_vars_file_choices(source):
-    """Return exact paths for a template with a single literal conditional choice."""
+def _known_vars_file_choices(source, scopes):
+    """Return exact paths from a literal condition or a projected variable."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     try:
         body = Environment().parse(source).body
     except TemplateSyntaxError:
-        return ()
+        return (), False
     if len(body) != 1 or not isinstance(body[0], nodes.Output):
-        return ()
+        return (), False
     parts = body[0].nodes
     dynamic = [part for part in parts if not isinstance(part, nodes.TemplateData)]
     if len(dynamic) != 1:
-        return ()
+        return (), False
     choice = dynamic[0]
+    values = []
     if isinstance(choice, nodes.CondExpr):
         branches = (choice.expr1, choice.expr2)
     elif (isinstance(choice, nodes.Filter) and choice.name in ("ternary", "ansible.builtin.ternary",
                                                               "ansible.legacy.ternary")
-          and len(choice.args) == 2 and not (choice.kwargs or choice.dyn_args or choice.dyn_kwargs)):
-        branches = choice.args
+          and not (choice.dyn_args or choice.dyn_kwargs) and len(choice.args) in (2, 3)):
+        branches = list(choice.args)
+        if choice.kwargs:
+            if len(branches) != 2 or len(choice.kwargs) != 1 or choice.kwargs[0].key != "none_val":
+                return (), False
+            branches.append(choice.kwargs[0].value)
+        if len(branches) == 3 and isinstance(branches[-1], nodes.Const) and branches[-1].value is None:
+            branches.pop()
     else:
-        return ()
+        branches = ()
+        root = choice
+        members = []
+        while isinstance(root, nodes.Getattr) or (isinstance(root, nodes.Getitem)
+                                                 and isinstance(root.arg, nodes.Const)
+                                                 and isinstance(root.arg.value, str)):
+            members.append(root.attr if isinstance(root, nodes.Getattr) else root.arg.value)
+            root = root.node
+        if isinstance(root, nodes.Name):
+            for scope in scopes:
+                value = scope.get(root.name)
+                for member in reversed(members):
+                    value = value.get(member) if isinstance(value, dict) else None
+                if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+                    value = value["__ansiroll_unsafe__"]
+                if isinstance(value, str) and not _is_templated(value):
+                    values.append(value)
     if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches):
-        return ()
-    return tuple("".join(branch.value if part is choice else part.data for part in parts) for branch in branches)
+        return (), False
+    values.extend(branch.value for branch in branches)
+    paths = tuple(dict.fromkeys("".join(value if part is choice else part.data for part in parts) for value in values))
+    return paths, bool(branches)
 
 
-def _deferred_vars_files(play, basedir, entries):
+def _deferred_vars_files(play, basedir, entries, *, scopes=()):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -669,11 +697,13 @@ def _deferred_vars_files(play, basedir, entries):
         unmodeled = []
         patterns_by_name = []
         for name in names:
-            choices = _literal_vars_file_choices(name) if _is_templated(name) else ()
-            if choices:
-                patterns_by_name.extend((choice, glob.escape(choice)) for choice in choices if choice)
-            elif name.startswith(("{{", "{%")) and "/" in name:
-                unmodeled.append(name)
+            choices, exhaustive = _known_vars_file_choices(name, scopes) if _is_templated(name) else ((), False)
+            patterns_by_name.extend((choice, glob.escape(choice)) for choice in choices if choice)
+            if exhaustive:
+                continue
+            if name.startswith(("{{", "{%")) and "/" in name:
+                if not choices:
+                    unmodeled.append(name)
             else:
                 pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
                 patterns_by_name.append((name, pattern))

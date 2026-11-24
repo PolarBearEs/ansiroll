@@ -2786,7 +2786,13 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         if play.get("gather_facts") and not gather_cached:
-            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
+            # Files selected during compilation are already available to setup.
+            # Runtime selectors are evaluated later, once gathered facts exist.
+            static_files = [mapping for entry in play.get("deferred_vars_files") or ()
+                            for mapping in entry.get("static_vars", ())]
+            merge_hashes = self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge"
+            setup_vars = _f_combine(play.get("vars"), *static_files, recursive=merge_hashes, encoded_vars=True)
+            setup_ctx = self._layered_ctx(self.ctx(setup_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -3052,7 +3058,8 @@ class Runtime:
             if "static_vars" in entry:
                 play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes, encoded_vars=True)
                 continue
-            ctx = self.ctx(play_vars, self.extra_vars, base=base)
+            selector_vars = _f_combine(base, play_vars, self.extra_vars, recursive=merge_hashes, encoded_vars=True)
+            ctx = self.ctx(base=selector_vars)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             for raw in entry["names"]:
                 try:

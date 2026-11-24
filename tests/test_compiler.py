@@ -187,6 +187,10 @@ def test_freezing_allows_explicit_inventory_values(tmp_path, group_vars):
      "config/inventory.yml", "config/fallback.yml"),
     ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml') }}",
      "config/inventory.yml", "config/fallback.yml"),
+    ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml', 'config/unknown.yml') }}",
+     "config/inventory.yml", "config/fallback.yml"),
+    ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml', none_val='config/unknown.yml') }}",
+     "config/inventory.yml", "config/fallback.yml"),
 ])
 def test_standalone_vars_files_select_inventory_at_runtime(tmp_path, selector, inventory, fallback):
     from ansiroll import compile_playbook
@@ -269,6 +273,70 @@ def test_deferred_vars_file_can_change_a_later_selector(tmp_path):
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
     assert frame["result"]["msg"] == "custom"
+
+
+@pytest.mark.parametrize("merge_hashes", [False, True])
+def test_deferred_vars_file_can_select_a_known_nested_path(tmp_path, monkeypatch, merge_hashes):
+    from ansible import constants as C
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge" if merge_hashes else "replace")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge" if merge_hashes else "replace")
+    selector = "cfg.path" if merge_hashes else "final_path"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    final_path: config/default.yml
+    cfg: {path: config/default.yml}
+  vars_files:
+    - 'first-{{ profile }}.yml'
+    - '{{ %s }}'
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""" % selector)
+    (tmp_path / "first-runtime.yml").write_text("final_path: config/final.yml\ncfg: {path: config/final.yml}\n")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "default.yml").write_text("selected: default\n")
+    (tmp_path / "config" / "final.yml").write_text("selected: final\n")
+    extra = {"cfg": {"flag": True}} if merge_hashes else {}
+    plays, _ = parse_playbook(str(playbook), extra_vars=extra)
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, extra_vars={**extra, "profile": "runtime"},
+                      on_result=frames.append)
+    runtime.run_play(plays[0])
+    assert [frame["result"]["msg"] for frame in frames] == ["final"]
+
+
+def test_static_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: true
+  vars_files:
+    - 'first-{{ profile }}.yml'
+    - final.yml
+  environment:
+    ANSIROLL_SETUP_PROFILE: '{{ setup_profile }}'
+  tasks: []
+""")
+    (tmp_path / "first-runtime.yml").write_text("setup_profile: first\n")
+    (tmp_path / "final.yml").write_text("setup_profile: final\n")
+    plays, _ = parse_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, extra_vars={"profile": "runtime"})
+    captured = []
+    monkeypatch.delenv("ANSIROLL_FAST_FACTS", raising=False)
+
+    def run_setup(action, args, **kwargs):
+        captured.append((action, runtime._module_env))
+        return {"ansible_facts": {}}
+
+    monkeypatch.setattr(runtime, "run_module", run_setup)
+    runtime.run_play(plays[0])
+    assert captured == [("ansible.builtin.setup", {"ANSIROLL_SETUP_PROFILE": "final"})]
 
 
 def test_standalone_include_tasks_does_not_bake_inventory_fallback(tmp_path):
