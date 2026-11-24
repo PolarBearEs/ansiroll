@@ -220,6 +220,19 @@ def _selector_local_bindings(expression):
     def visit(node, names):
         if names:
             bindings[id(node)] = frozenset(names)
+        if isinstance(node, nodes.If):
+            after = names.copy()
+            for branch in (node, *node.elif_):
+                visit(branch.test, names)
+                local = names.copy()
+                for child in branch.body:
+                    visit(child, local)
+                after.update(local)
+            local = names.copy()
+            for child in node.else_:
+                visit(child, local)
+            names.update(after, local)
+            return
         if isinstance(node, nodes.For):
             visit(node.iter, names)
             local = names | target_names(node.target) | {"loop"}

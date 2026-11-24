@@ -3392,14 +3392,22 @@ def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, mo
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
-def test_computed_timeout_uses_outer_key_despite_loop_binding(tmp_path, monkeypatch):
+@pytest.mark.parametrize("template", [
+    "{{ vars[key] }}{% for key in [] %}{% endfor %}",
+    "{% if flag %}{% set key = 'second' %}{% else %}{{ vars[key] }}{% endif %}",
+])
+def test_computed_timeout_uses_outer_key_despite_other_bindings(tmp_path, monkeypatch, template):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
-  vars: {key: first, first: 23}
+  vars:
+    key: first
+    first: 23
+    flag: false
+    unused: "{{ lookup('irrelevant') }}"
   gather_timeout: >-
-    {{ vars[key] }}{% for key in [] %}{% endfor %}
+    %s
   tasks: []
-""")
+""" % template)
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 23
