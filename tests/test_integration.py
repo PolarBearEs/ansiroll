@@ -2454,23 +2454,32 @@ def test_standalone_timeout_uses_ordered_vars_files_and_resolves_aliases(
         assert runtime.vars["timeout_seconds"] == 81
 
 
-@pytest.mark.parametrize("input_known", [True, False])
-def test_standalone_timeout_compiles_lookups_in_selected_vars_file(tmp_path, monkeypatch, input_known):
+@pytest.mark.parametrize(("select_at_compile", "alias_in_play"), [
+    (False, False), (False, True), (True, False),
+])
+def test_standalone_timeout_requires_compile_time_selection_for_lookups(
+        tmp_path, monkeypatch, select_at_compile, alias_in_play):
     playbook = tmp_path / "play.yml"
-    playbook.write_text("""- hosts: localhost
-  vars_files:
-    - 'gather-{{ profile }}.yml'
-  gather_timeout: '{{ timeout_seconds }}'
-  tasks: []
-""")
+    lookup = '{{ lookup("env", timeout_env_name) }}'
+    play_vars = {"timeout_source": lookup} if alias_in_play else {}
+    playbook.write_text(
+        "- hosts: localhost\n  vars: %s\n  vars_files: ['gather-{{ profile }}.yml']\n"
+        "  gather_timeout: '{{ timeout_input | length }}'\n  tasks: []\n" % json.dumps(play_vars)
+    )
     (tmp_path / "gather-runtime.yml").write_text(
-        """timeout_seconds: '{{ lookup("env", timeout_env_name) | length }}'
-""")
+        "timeout_input: %s\n" % json.dumps("{{ timeout_source }}" if alias_in_play else lookup))
+    hook = tmp_path / "unexpected"
+    import shlex
+    (tmp_path / "gather-unused.yml").write_text("timeout_input: %s\n" % json.dumps(
+        "{{ lookup('pipe', " + repr("touch " + shlex.quote(str(hook))) + ") }}"))
     extra_vars = {"timeout_env_name": "ANSIROLL_TEST_TIMEOUT_INPUT"}
-    monkeypatch.setenv("ANSIROLL_TEST_TIMEOUT_INPUT", "12345")
-    source, _ = compile_playbook(str(playbook), extra_vars=extra_vars if input_known else None)
+    if select_at_compile:
+        extra_vars["profile"] = "runtime"
+    monkeypatch.setenv("ANSIROLL_TEST_TIMEOUT_INPUT", "controller-only-canary")
+    source, _ = compile_playbook(str(playbook), extra_vars=extra_vars)
     plan = _compiled_plays(source, tmp_path)[0]
-    assert "12345" not in json.dumps(plan)
+    assert "controller-only-canary" not in json.dumps(plan)
+    assert not hook.exists()
     monkeypatch.setenv("ANSIROLL_TEST_TIMEOUT_INPUT", "123")
     results = []
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=results.append,
@@ -2479,12 +2488,30 @@ def test_standalone_timeout_compiles_lookups_in_selected_vars_file(tmp_path, mon
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
-    if input_known:
-        assert called == [("ansible.builtin.setup", {"gather_timeout": 5})]
+    if select_at_compile:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": len("controller-only-canary")})]
     else:
         assert runtime.failed
         assert called == []
-        assert "provide its inputs at compile time" in results[0]["result"]["msg"]
+        assert "make its vars files and lookup inputs resolvable at compile time" in results[0]["result"]["msg"]
+    assert not hook.exists()
+
+
+def test_compile_timeout_keeps_late_selector_fixed_by_extra_vars(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars_files: ['gather-{{ profile }}.yml', '{{ config_dir }}/final.yml']
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "final.yml").write_text("timeout_seconds: 20\n")
+    (tmp_path / "gather-runtime.yml").write_text("timeout_seconds: 45\n")
+    source, _ = compile_playbook(str(playbook), extra_vars={"config_dir": str(config)})
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 20
+    assert len(plan["deferred_vars_files"]) == 1
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):

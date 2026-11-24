@@ -3071,18 +3071,17 @@ class Runtime:
                 continue
             ctx = self.ctx(play_vars, selected, self.extra_vars, base=base)
             if not before_setup and index in early_files:
-                inputs, path = early_files[index]
+                inputs, values = early_files[index]
                 if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
                        key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
                        for key, value in inputs.items()):
-                    for mapping in entry["files"][path]:
-                        selected.update(mapping)
+                    selected.update(values)
                     continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             inputs = {}
             for raw in entry["names"]:
                 if before_setup:
-                    dependencies = self._vars_file_inputs_before_setup(raw, ctx)
+                    dependencies = self._pre_setup_template_inputs(raw, ctx)
                     if dependencies is None:
                         break
                     inputs.update(dependencies)
@@ -3119,7 +3118,7 @@ class Runtime:
                         values.update(value)
                     selected.update(values)
                     if before_setup:
-                        early_files[index] = (inputs, found[0])
+                        early_files[index] = (inputs, values)
                     break
             else:
                 if before_setup:
@@ -3132,7 +3131,7 @@ class Runtime:
                                  % (item,))
         return selected
 
-    def _vars_file_inputs_before_setup(self, source, ctx):
+    def _pre_setup_template_inputs(self, source, ctx):
         inputs = {}
         pending = [source]
         while pending:
@@ -4854,11 +4853,11 @@ class Runtime:
                          vars_files, role_exports, self.extra_vars, base={
             "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
         })
-        for key, alias in scope.items():
-            if isinstance(alias, dict) and alias.get("__ansiroll_timeout_alias_error__") == key:
-                scope[key] = _captured(
-                    "gather_timeout cannot resolve vars-file alias %r with the available controller inputs; "
-                    "provide its inputs at compile time" % key)
+        if self._pre_setup_template_inputs(template["source"], scope) is None:
+            raise ValueError(
+                "gather_timeout requires a controller template that cannot be rendered before setup; "
+                "make its vars files and lookup inputs resolvable at compile time"
+            )
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))
         if value == _OMIT:
             return template["omit_default"]

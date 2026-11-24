@@ -191,7 +191,7 @@ def _compile_gather_timeout(play, variable_manager, loader, ordered_vars_files):
     result = {"gather_timeout": timeout_play.gather_timeout}
     if runtime is not None:
         if ordered_vars_files:
-            _gather_timeout_file_scope(play, ordered_vars_files, runtime, variables)
+            _gather_timeout_file_scope(play, ordered_vars_files, runtime)
         result["gather_timeout_template"] = runtime
     return result
 
@@ -213,10 +213,9 @@ def _gather_timeout_template(source, variables):
     return None
 
 
-def _gather_timeout_file_scope(play, entries, runtime, variables):
+def _gather_timeout_file_scope(play, entries, runtime):
     """Keep original file order and the play layers needed by a runtime timeout."""
     from ansible import constants as C
-    from ansible.template import Templar
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS
 
@@ -266,37 +265,7 @@ def _gather_timeout_file_scope(play, entries, runtime, variables):
                     names.update(new_names)
                     pending.extend(new_names)
     runtime["names"] = sorted(timeout_names)
-    compile_extra_vars = play.get_variable_manager().extra_vars
-    file_timeout_names = timeout_names - exports.keys() - compile_extra_vars.keys()
-    def compile_timeout_aliases(contents):
-        if not isinstance(contents, list):
-            return contents
-        file_vars = {}
-        for mapping in contents:
-            file_vars = combine_vars(file_vars, mapping)
-        aliases = {}
-        for key in sorted(file_timeout_names & file_vars.keys()):
-            source = file_vars[key]
-            if not isinstance(source, str) or not _is_templated(source):
-                continue
-            if _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS) is not None:
-                continue
-            templar = Templar(loader=play._loader, variables={
-                **variables, **file_vars, **exports, **compile_extra_vars,
-            })
-            try:
-                aliases[key] = _tag_untrusted(templar.template(source, fail_on_undefined=True))
-            except Exception:
-                # Report unavailable controller inputs only if the runtime
-                # selects this file and consumes the alias.
-                aliases[key] = {"__ansiroll_timeout_alias_error__": key}
-        return [*contents, aliases] if aliases else contents
-
-    runtime["vars_files"] = [
-        {"static_vars": compile_timeout_aliases(entry["static_vars"])} if "static_vars" in entry else
-        {**entry, "files": {path: compile_timeout_aliases(contents) for path, contents in entry["files"].items()}}
-        for entry in entries
-    ]
+    runtime["vars_files"] = entries
     runtime["play_vars"] = _tag_untrusted(play_vars)
     runtime["vars_file_defaults"] = _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())})
     runtime["timeout_defaults"] = _tag_untrusted({key: defaults[key] for key in sorted(timeout_names & defaults.keys())})
@@ -731,6 +700,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
 
     out = dict(play.vars or {})
     use_search_stack = _core_version() >= (2, 12)
+    compile_extra_vars = play.get_variable_manager().extra_vars if ordered is not None else {}
     for entry in _as_list(getattr(play, "vars_files", None)):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
@@ -743,7 +713,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
                     from .runtime import _GATHER_STRING_METHODS
 
                     dependencies = _gather_timeout_dependencies(filename, {}, _GATHER_STRING_METHODS)
-                    if dependencies is not None and dependencies[1]:
+                    if dependencies is not None and dependencies[1] - compile_extra_vars.keys():
                         ordered.append(len(unresolved))
                         unresolved.append(entry)
                         break

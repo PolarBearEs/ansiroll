@@ -90,6 +90,8 @@ Without `--tree-shake`, compilation remains generic. `-e` accepts Ansible-style
 Frozen and `-e` values are recorded as fixed build-time values, and conflicting
 runtime overrides are rejected. Values passed with `-e` are embedded in the
 artifact, including values used only to resolve a controller-side lookup.
+When a standalone play's `gather_timeout` uses a controller lookup, supply the
+lookup inputs and any vars-file selectors it depends on at compile time.
 
 ### Run a playbook locally (compile + execute)
 
