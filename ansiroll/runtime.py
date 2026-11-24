@@ -772,14 +772,43 @@ def _contains_vault(v):
 
 
 def _f_to_json(v, **kwargs):
-    v = _yaml_plain(v)
     if _contains_vault(v):
         raise ValueError("The variable contains an undecryptable variable")
-    return json.dumps(v, **kwargs)
+    return json.dumps(v, **_host_entries_json_options(kwargs, reject_vault=True))
+
+
+def _host_entries_json_options(options, *, reject_vault=False):
+    """Let the JSON encoder handle normal values and expand host entries on demand."""
+    options = dict(options)
+
+    def expand(value, fallback):
+        if not isinstance(value, _HostVarEntries):
+            return fallback(value)
+        entries = list(value)
+        if reject_vault and _contains_vault(entries):
+            raise ValueError("The variable contains an undecryptable variable")
+        return entries
+
+    fallback = options.get("default")
+    if fallback is not None:
+        options["default"] = lambda value: expand(value, fallback)
+    else:
+        encoder = options.get("cls") or json.JSONEncoder
+
+        class HostEntriesEncoder(encoder):
+            def default(self, value):
+                return expand(value, super().default)
+
+        options["cls"] = HostEntriesEncoder
+    return options
 
 
 def _jinja_tojson(eval_ctx, value, indent=None):
-    return jinja2.filters.do_tojson(eval_ctx, _yaml_plain(value), indent=indent)
+    policies = eval_ctx.environment.policies
+    options = _host_entries_json_options(policies["json.dumps_kwargs"])
+    if indent is not None:
+        options["indent"] = indent
+    return jinja2.utils.htmlsafe_json_dumps(value, policies["json.dumps_function"], **options)
 
 
 def _f_unvault(v, secret):

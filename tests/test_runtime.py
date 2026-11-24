@@ -350,6 +350,15 @@ def test_jinja_tojson_escapes_values_in_nested_lazy_hostvars_entries():
     assert r"\u003cscript\u003e" in result
 
 
+@pytest.mark.parametrize("filter_name", ["tojson", "to_json", "to_nice_json"])
+def test_json_preserves_independently_mutated_list_views(filter_name):
+    runtime = Runtime({}, "", {})
+    expression = ("{% set a = data['values'] %}{% set b = data['values'] %}"
+                  "{% set unused = a.append(2) %}{{ [a, b] | " + filter_name + " }}")
+    result = runtime.template(expression, {"data": {"values": [1]}})
+    assert json.loads(result) == [[1, 2], [1]]
+
+
 def test_lazy_hostvars_entries_compare_unordered_values_like_lists():
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": float("nan")}}})
     task = _task("1", "Compare unordered values", "debug", vars={"unused": "{{ lookup('source') }}/tail"})
