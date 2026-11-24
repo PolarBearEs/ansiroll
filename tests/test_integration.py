@@ -3434,19 +3434,48 @@ def test_timeout_dependency_scan_skips_unreachable_elif(tmp_path):
     assert _compiled_plays(source, tmp_path)[0]["gather_timeout"] == 23
 
 
-def test_timeout_override_ignores_lookup_in_unreachable_elif(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source_text", [
+    "{% if true %}{{ first }}{% elif lookup('irrelevant') %}42{% endif %}",
+    "{{ first if true else lookup('irrelevant') }}",
+])
+def test_timeout_override_ignores_unreachable_lookup(tmp_path, monkeypatch, source_text):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars: {first: 23}
   gather_timeout: >-
-    {% if true %}{{ first }}{% elif lookup('irrelevant') %}42{% endif %}
+    %s
   tasks: []
-""")
+""" % source_text)
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 23
     called = []
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+@pytest.mark.parametrize("source_text", [
+    "{% if flag %}{{ first }}{% else %}{{ second }}{% endif %}",
+    "{{ first if flag else second }}",
+    "{{ lookup('env', 'COMPILED_TIMEOUT') | int if flag else second }}",
+])
+def test_timeout_override_can_select_a_branch_unused_at_compile_time(tmp_path, monkeypatch, source_text):
+    monkeypatch.setenv("COMPILED_TIMEOUT", "23")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {flag: true, first: 23, second: 45}
+  gather_timeout: >-
+    %s
+  tasks: []
+""" % source_text)
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"flag": False})
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)

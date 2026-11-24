@@ -245,14 +245,21 @@ def _gather_timeout_template(source, variables):
     if dependencies is None:
         return None
     scope, names = dependencies
+    active_scope = dict(scope)
+    # Runtime overrides can choose arms that were inactive at compilation.
+    alternatives = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS,
+                                                 allow_controller=True, computed=computed, retain_mutable=True)
+    if alternatives is not None:
+        alternative_scope, alternative_names = alternatives
+        scope = {**alternative_scope, **scope}
+        names |= alternative_names
     if not names and not (computed or unknown_lookup):
         return None
     runtime = {"source": source, "vars": scope, "names": sorted(names),
                "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
                "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
     if controller_only:
-        runtime.pop("source")
-        runtime["controller_inputs"] = dict(scope)
+        runtime["controller_inputs"] = active_scope
         runtime["controller_paths"] = sorted(paths, key=repr)
         if unknown_lookup:
             runtime["controller_wildcard"] = True
@@ -374,7 +381,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None):
+                                 unknown_lookup=None, retain_mutable=False):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_scope, _selector_template_sources
@@ -396,7 +403,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             expression = env.parse(source)
         except TemplateSyntaxError:
             return None
-        analysis = _selector_scope(expression, key_scope)
+        analysis = _selector_scope(expression, key_scope, retain_mutable=retain_mutable)
         for call in analysis[2]:
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):

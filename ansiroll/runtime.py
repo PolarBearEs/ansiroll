@@ -208,7 +208,7 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_scope(expression, variables):
+def _selector_scope(expression, variables, *, retain_mutable=False):
     nodes = jinja2.nodes
     bindings = {}
     unreachable = set()
@@ -219,6 +219,13 @@ def _selector_scope(expression, variables):
             return {target.name}
         return {name.name for name in target.find_all(nodes.Name) if name.ctx != "load"}
 
+    def branch_value(test, names):
+        if retain_mutable and (isinstance(test, nodes.Name) or next(test.find_all(nodes.Name), None) is not None):
+            return None
+        scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
+        value = _selector_vars_key(test, scope, ())
+        return bool(value) if isinstance(value, (bool, int, float, str, type(None))) else None
+
     def visit(node, names):
         if names:
             bindings[id(node)] = frozenset(names)
@@ -226,23 +233,21 @@ def _selector_scope(expression, variables):
             calls.append(node)
         if isinstance(node, nodes.If):
             after = names.copy()
-            scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
             fallthrough = True
             for branch in (node, *node.elif_):
                 if not fallthrough:
                     unreachable.add(id(branch))
                     continue
                 visit(branch.test, names)
-                test = _selector_vars_key(branch.test, scope, ())
-                known = isinstance(test, (bool, int, float, str, type(None)))
-                if not known or test:
+                test = branch_value(branch.test, names)
+                if test is not False:
                     local = names.copy()
                     for child in branch.body:
                         visit(child, local)
                     after.update(local)
                 else:
                     unreachable.update(map(id, branch.body))
-                if known and test:
+                if test is True:
                     fallthrough = False
             if fallthrough:
                 local = names.copy()
@@ -252,6 +257,16 @@ def _selector_scope(expression, variables):
             else:
                 unreachable.update(map(id, node.else_))
             names.update(after)
+            return
+        if isinstance(node, nodes.CondExpr):
+            visit(node.test, names)
+            test = branch_value(node.test, names)
+            for arm, selected in ((node.expr1, True), (node.expr2, False)):
+                if arm is not None:
+                    if test is None or test is selected:
+                        visit(arm, names)
+                    else:
+                        unreachable.add(id(arm))
             return
         if isinstance(node, nodes.For):
             visit(node.iter, names)
@@ -314,6 +329,10 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
     while pending:
         node, suffix = pending.pop()
         if id(node) in unreachable:
+            continue
+        if isinstance(node, nodes.CondExpr):
+            pending.append((node.test, ()))
+            pending.extend((arm, suffix) for arm in (node.expr1, node.expr2) if arm is not None)
             continue
         if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
             pending.append((node.node, suffix))
@@ -5356,7 +5375,8 @@ class Runtime:
                 for key, path in paths
             ):
                 return timeout
-            raise ValueError(error)
+            if "source" not in template:
+                raise ValueError(error)
         paths = set()
         inputs = self._pre_setup_template_inputs(template["source"], scope, paths=paths)
         if inputs is None or _vars_file_reads_blocked(blocked, paths):
