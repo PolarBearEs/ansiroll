@@ -1738,6 +1738,32 @@ def test_literal_false_when_does_not_hide_loop_evaluation_error():
     assert "division by zero" in frames[0]["result"]["msg"]
 
 
+@pytest.mark.parametrize("expression", ["query('file', missing_path)", "query('vars', 'missing_items')"])
+def test_literal_false_when_can_skip_loop_with_undefined_lookup_inputs(expression):
+    task = _task("1", "undefined lookup", "debug", loop="{{ %s }}" % expression, when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "skipped"
+
+
+def test_literal_false_when_does_not_hide_lookup_file_errors(tmp_path):
+    task = _task("1", "broken lookup", "debug", loop="{{ query('file', path) }}",
+                 vars={"path": str(tmp_path / "missing")}, when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "failed"
+    assert "No such file" in frames[0]["result"]["msg"]
+
+
+def test_vars_lookup_default_preserves_evaluation_errors():
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ lookup('vars', 'value', default='fallback') }}"
+    assert templater.render_string(text, {}) == "fallback"
+    result = templater.render_string(text, {"value": "{{ 1 / divisor }}", "divisor": 0})
+    with pytest.raises(_CapturedTemplateError, match="division by zero"):
+        _fail_on_undef(result)
+
+
 def test_loop_set_fact_is_visible_to_next_iteration():
     tasks = [
         _task(

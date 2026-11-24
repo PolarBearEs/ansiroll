@@ -933,12 +933,16 @@ def _lookup_values(name, args, kwargs, ctx=None):
         vals = []
         for a in args:
             key = str(a)
-            if ctx is not None and key in ctx and not _is_undef(ctx[key]):
-                vals.append(ctx[key])
-            elif "default" in kwargs:
+            if ctx is not None and key in ctx:
+                value = ctx[key]
+                _raise_captured_template_error(value)
+                if not _is_undef(value):
+                    vals.append(value)
+                    continue
+            if "default" in kwargs:
                 vals.append(kwargs["default"])
             else:
-                raise RuntimeError("lookup vars: no variable named %r" % key)
+                raise jinja2.UndefinedError("lookup vars: no variable named %r" % key)
         return vals
     if name == "env":
         default = kwargs.get("default", "")
@@ -1734,10 +1738,14 @@ def _captured(msg, *, missing=False):
     return jinja2.StrictUndefined(hint=msg, exc=error_type)
 
 
+def _raise_captured_template_error(value):
+    if _is_undef(value) and value._undefined_exception is _CapturedTemplateError:
+        value._fail_with_undefined_error()
+
+
 def _preserve_captured_errors(function):
     def checked(value, *args, **kwargs):
-        if _is_undef(value) and value._undefined_exception is _CapturedTemplateError:
-            value._fail_with_undefined_error()
+        _raise_captured_template_error(value)
         return function(value, *args, **kwargs)
 
     return checked
@@ -2015,6 +2023,8 @@ class _Templater:
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
+        except jinja2.UndefinedError as e:
+            return _captured_jinja_error(e)
         except Exception as e:
             return _captured(str(e))
 
@@ -2027,6 +2037,8 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)
+        except jinja2.UndefinedError as e:
+            return _captured_jinja_error(e)
         except Exception as e:
             return _captured(str(e))
 
