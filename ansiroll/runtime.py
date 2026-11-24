@@ -1915,7 +1915,7 @@ def _bare_template_expression(text, *, lex=None):
     if not (stripped.startswith("{{") and stripped.endswith("}}")):
         return None
     inner = stripped[2:-2]
-    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith("-") or inner.endswith("-")):
+    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+")) or inner.endswith("-")):
         return inner.strip()
     try:
         tokens = iter((lex or jinja2.Environment().lex)(stripped))
@@ -3682,6 +3682,8 @@ class Runtime:
             return None, None, False
         try:
             return self._resolve_loop(loop, ctx), None, False
+        except _CapturedTemplateError as ex:
+            result = {"failed": True, "changed": False, "msg": str(ex)}
         except jinja2.UndefinedError as ex:
             # Only undefined loop values are deferred until the task's
             # condition has had a chance to skip it.

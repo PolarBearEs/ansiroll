@@ -52,6 +52,14 @@ def test_lookup_followed_by_another_template_segment_renders_as_text():
     assert calls == ["source"] * 3
 
 
+def test_bare_expression_honors_the_plus_opening_delimiter():
+    templater = Runtime({}, "", {}).templater
+    text = "{{+ 'hello' }}"
+    if next(templater.env.lex(text))[2] != "{{+":
+        pytest.skip("Jinja does not support the plus opening delimiter")
+    assert templater.render_string(text, {}) == "hello"
+
+
 @pytest.mark.parametrize(("opening", "closing"), [("{{", "}}"), ("{{-", "}}"), ("{{", "-}}"), ("{{-", "-}}")])
 def test_single_lookup_with_a_quoted_template_keeps_its_native_value(opening, closing):
     templater = Runtime({}, "", {}).templater
@@ -1720,6 +1728,14 @@ def test_literal_false_when_short_circuits_undefined_loop_once():
     assert frames[0]["status"] == "skipped"
     assert frames[0]["is_item"] is False
     assert rt.vars["result"]["skipped"] is True
+
+
+def test_literal_false_when_does_not_hide_loop_evaluation_error():
+    task = _task("1", "broken loop", "debug", loop="{{ [1 / divisor] }}",
+                 vars={"divisor": 0}, when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "failed"
+    assert "division by zero" in frames[0]["result"]["msg"]
 
 
 def test_loop_set_fact_is_visible_to_next_iteration():
