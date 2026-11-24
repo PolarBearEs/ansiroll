@@ -322,6 +322,8 @@ def _gather_timeout_file_scope(play, entries, runtime):
     file_aliases = {}
     file_names = set()
     for entry in entries:
+        for candidate in entry.get("controller_candidates", {}).values():
+            selector_names.update(name for name, _ in candidate["paths"])
         for source in entry.get("names", ()):
             dependencies = _gather_timeout_dependencies(
                 source, selector_scope, _GATHER_STRING_METHODS, selector=True)

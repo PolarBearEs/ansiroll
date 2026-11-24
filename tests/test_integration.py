@@ -3143,6 +3143,9 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
     ("lookup('var' | replace('var', 'vars'), 'timeout_seconds')", "{timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_seconds')", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
+    ("lookup('ansible.legacy.vars', 'timeout_seconds')", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
+    ("lookup('env', 'ANSIROLL_TIMEOUT_' ~ (settings.keys() | list | first)) | length",
+     "{settings: {a: 1}}", {"settings": {"b": 1}}, 3),
     ("lookup('vars', 'TIMEOUT_SECONDS' | lower)", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_value' | replace('value', 'seconds'))", "{timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
@@ -3273,18 +3276,28 @@ def test_controller_timeout_compares_only_read_mapping_members(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("changed_input", [False, True])
-def test_timeout_replay_reuses_compile_time_controller_candidate_miss(tmp_path, monkeypatch, changed_input):
+@pytest.mark.parametrize("role_magic", [False, True])
+def test_timeout_replay_reuses_compile_time_controller_candidate_miss(
+        tmp_path, monkeypatch, changed_input, role_magic):
     monkeypatch.setenv("ANSIROLL_GATHER_PROFILE", "absent")
     monkeypatch.setenv("ANSIROLL_GATHER_OTHER", "present")
     playbook = tmp_path / "play.yml"
+    magic = "{{ ansible_playbook_python | basename }}-" if role_magic else ""
+    options = "  vars: {profile: first, controller_env_name: ANSIROLL_GATHER_PROFILE}"
+    if role_magic:
+        defaults = tmp_path / "roles" / "settings" / "defaults"
+        defaults.mkdir(parents=True)
+        (defaults / "main.yml").write_text("controller_env_name: ANSIROLL_GATHER_PROFILE\n")
+        options = "  vars: {profile: first}\n  roles: [settings]"
     playbook.write_text("""- hosts: localhost
-  vars: {profile: first, controller_env_name: ANSIROLL_GATHER_PROFILE}
+%s
   vars_files:
-    - ["primary-{{ lookup('env', controller_env_name) }}.yml", "fallback-{{ profile }}.yml"]
+    - ["primary-%s{{ lookup('env', controller_env_name) }}.yml", "fallback-{{ profile }}.yml"]
   gather_timeout: '{{ timeout_seconds }}'
   tasks: []
-""")
-    (tmp_path / "primary-present.yml").write_text("timeout_seconds: 60\n")
+""" % (options, magic))
+    present = "primary-" + ((os.path.basename(sys.executable) + "-") if role_magic else "") + "present.yml"
+    (tmp_path / present).write_text("timeout_seconds: 60\n")
     (tmp_path / "fallback-first.yml").write_text("timeout_seconds: 23\n")
     (tmp_path / "fallback-second.yml").write_text("timeout_seconds: 45\n")
     source, _ = compile_playbook(str(playbook))
@@ -3307,6 +3320,27 @@ def test_timeout_replay_reuses_compile_time_controller_candidate_miss(tmp_path, 
     else:
         assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
         assert runtime.vars["timeout_seconds"] == 45
+
+
+def test_computed_timeout_rechecks_value_selected_by_an_alias(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars:
+    timeout_var: '{{ actual_key }}'
+    actual_key: ' first '
+    first: 23
+  gather_timeout: '{{ vars[timeout_var.strip()] }}'
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
