@@ -2403,6 +2403,8 @@ def test_legacy_runtime_timeout_treats_bare_null_as_omitted(monkeypatch):
 @pytest.mark.parametrize(("files", "profile", "role_alias", "expected"), [
     (['gather-{{ profile.split(":") | first }}.yml'], "runtime:extra", False, 45),
     (["gather-{{ profile }}.yml"], "runtime", True, 55),
+    (["gather-{{ profile }}{{ ansible_os_family | default('') }}.yml"], "runtime", False, 45),
+    (["gather-{{ profile }}.yml", "{{ flavor }}.yml"], "runtime", False, 30),
     (["gather-{{ profile }}.yml", "final.yml"], "runtime", False, 20),
     (["final.yml", "gather-{{ profile }}.yml"], "runtime", False, 45),
     (["gather-{{ profile }}.yml", ["final.yml", "unused.yml"]], "runtime", False, 20),
@@ -2418,29 +2420,71 @@ def test_standalone_timeout_uses_ordered_vars_files_and_resolves_aliases(
         role.mkdir(parents=True)
         (role / "main.yml").write_text("fallback: 55\n")
     playbook.write_text("""- hosts: localhost
-%s  vars: {fallback: 45}
+%s  vars: {fallback: 45, flavor: default}
   vars_files: %s
   gather_timeout: '{{ timeout_seconds }}'
   tasks: []
 """ % (roles, json.dumps(files)))
-    (tmp_path / "gather-runtime.yml").write_text("timeout_seconds: '{{ fallback }}'\n")
+    (tmp_path / "gather-runtime.yml").write_text("timeout_seconds: '{{ fallback }}'\nflavor: custom\n")
+    reselect_after_setup = "ansible_os_family" in files[0]
+    if reselect_after_setup:
+        (tmp_path / "gather-runtimeExample.yml").write_text("timeout_seconds: 81\n")
+    if "{{ flavor }}.yml" in files:
+        (tmp_path / "default.yml").write_text("timeout_seconds: 15\n")
+        (tmp_path / "custom.yml").write_text("timeout_seconds: 30\n")
     (tmp_path / "final.yml").write_text("timeout_seconds: 20\n")
     (tmp_path / "unused.yml").write_text("test_canary: unselected-timeout-alternative\n")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_STATIC_FILE", "final.yml")
 
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
-    assert "unselected-timeout-alternative" not in json.dumps(plan)
+    if "{{ flavor }}.yml" not in files:
+        assert "unselected-timeout-alternative" not in json.dumps(plan)
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile})
     called = []
 
     def run_module(action, args, **kwargs):
         called.append((action, args))
-        return {"ansible_facts": {}}
+        return {"ansible_facts": {"ansible_os_family": "Example"}}
 
     monkeypatch.setattr(runtime, "run_module", run_module)
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
+    if reselect_after_setup:
+        assert runtime.vars["timeout_seconds"] == 81
+
+
+@pytest.mark.parametrize("input_known", [True, False])
+def test_standalone_timeout_compiles_lookups_in_selected_vars_file(tmp_path, monkeypatch, input_known):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars_files:
+    - 'gather-{{ profile }}.yml'
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "gather-runtime.yml").write_text(
+        """timeout_seconds: '{{ lookup("env", timeout_env_name) | length }}'
+""")
+    extra_vars = {"timeout_env_name": "ANSIROLL_TEST_TIMEOUT_INPUT"}
+    monkeypatch.setenv("ANSIROLL_TEST_TIMEOUT_INPUT", "12345")
+    source, _ = compile_playbook(str(playbook), extra_vars=extra_vars if input_known else None)
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "12345" not in json.dumps(plan)
+    monkeypatch.setenv("ANSIROLL_TEST_TIMEOUT_INPUT", "123")
+    results = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=results.append,
+                      extra_vars={**extra_vars, "profile": "runtime"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if input_known:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": 5})]
+    else:
+        assert runtime.failed
+        assert called == []
+        assert "provide its inputs at compile time" in results[0]["result"]["msg"]
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):

@@ -153,6 +153,7 @@ class _Omit(str):
 
 _OMIT = _Omit("__omit_place_holder__ansiroll")
 _NO_CONDITIONAL_LIST = object()
+_MISSING_VARS_FILE_INPUT = object()
 
 
 class _UnsafeTemplate(str):
@@ -3070,10 +3071,12 @@ class Runtime:
                 continue
             ctx = self.ctx(play_vars, selected, self.extra_vars, base=base)
             if not before_setup and index in early_files:
-                inputs, values = early_files[index]
-                if all(key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
+                inputs, path = early_files[index]
+                if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
+                       key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
                        for key, value in inputs.items()):
-                    selected.update(values)
+                    for mapping in entry["files"][path]:
+                        selected.update(mapping)
                     continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             inputs = {}
@@ -3116,7 +3119,7 @@ class Runtime:
                         values.update(value)
                     selected.update(values)
                     if before_setup:
-                        early_files[index] = (inputs, values)
+                        early_files[index] = (inputs, found[0])
                     break
             else:
                 if before_setup:
@@ -3144,7 +3147,8 @@ class Runtime:
             for node in expression.find_all(jinja2.nodes.Name):
                 if node.ctx == "load" and node.name not in inputs:
                     if node.name not in ctx:
-                        return None
+                        inputs[node.name] = _MISSING_VARS_FILE_INPUT
+                        continue
                     value = ctx[node.name]
                     if not isinstance(value, (str, int, float, bool, type(None))):
                         return None
@@ -4850,6 +4854,11 @@ class Runtime:
                          vars_files, role_exports, self.extra_vars, base={
             "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
         })
+        for key, alias in scope.items():
+            if isinstance(alias, dict) and alias.get("__ansiroll_timeout_alias_error__") == key:
+                scope[key] = _captured(
+                    "gather_timeout cannot resolve vars-file alias %r with the available controller inputs; "
+                    "provide its inputs at compile time" % key)
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))
         if value == _OMIT:
             return template["omit_default"]

@@ -191,7 +191,7 @@ def _compile_gather_timeout(play, variable_manager, loader, ordered_vars_files):
     result = {"gather_timeout": timeout_play.gather_timeout}
     if runtime is not None:
         if ordered_vars_files:
-            _gather_timeout_file_scope(play, ordered_vars_files, runtime)
+            _gather_timeout_file_scope(play, ordered_vars_files, runtime, variables)
         result["gather_timeout_template"] = runtime
     return result
 
@@ -213,9 +213,10 @@ def _gather_timeout_template(source, variables):
     return None
 
 
-def _gather_timeout_file_scope(play, entries, runtime):
+def _gather_timeout_file_scope(play, entries, runtime, variables):
     """Keep original file order and the play layers needed by a runtime timeout."""
     from ansible import constants as C
+    from ansible.template import Templar
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS
 
@@ -236,7 +237,6 @@ def _gather_timeout_file_scope(play, entries, runtime):
 
     play_vars = play.vars or {}
     selector_scope = {**defaults, **play_vars}
-    timeout_scope = {**selector_scope, **exports}
     selector_names = set()
     timeout_names = set(runtime["names"])
     file_aliases = {}
@@ -253,20 +253,50 @@ def _gather_timeout_file_scope(play, entries, runtime):
                 for key, source in mapping.items():
                     if isinstance(source, str) and _is_templated(source):
                         file_aliases.setdefault(key, set()).add(source)
-    for names, scope in ((selector_names, selector_scope), (timeout_names, timeout_scope)):
+    for names, shadowed in ((selector_names, ()), (timeout_names, exports)):
         pending = list(names)
         while pending:
             key = pending.pop()
-            if scope is timeout_scope and key in exports:
+            if key in shadowed:
                 continue
             for source in file_aliases.get(key, ()):
-                dependencies = _gather_timeout_dependencies(source, scope, _GATHER_STRING_METHODS)
+                dependencies = _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS)
                 if dependencies is not None:
                     new_names = dependencies[1] - names
                     names.update(new_names)
                     pending.extend(new_names)
     runtime["names"] = sorted(timeout_names)
-    runtime["vars_files"] = entries
+    compile_extra_vars = play.get_variable_manager().extra_vars
+    file_timeout_names = timeout_names - exports.keys() - compile_extra_vars.keys()
+    def compile_timeout_aliases(contents):
+        if not isinstance(contents, list):
+            return contents
+        file_vars = {}
+        for mapping in contents:
+            file_vars = combine_vars(file_vars, mapping)
+        aliases = {}
+        for key in sorted(file_timeout_names & file_vars.keys()):
+            source = file_vars[key]
+            if not isinstance(source, str) or not _is_templated(source):
+                continue
+            if _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS) is not None:
+                continue
+            templar = Templar(loader=play._loader, variables={
+                **variables, **file_vars, **exports, **compile_extra_vars,
+            })
+            try:
+                aliases[key] = _tag_untrusted(templar.template(source, fail_on_undefined=True))
+            except Exception:
+                # Report unavailable controller inputs only if the runtime
+                # selects this file and consumes the alias.
+                aliases[key] = {"__ansiroll_timeout_alias_error__": key}
+        return [*contents, aliases] if aliases else contents
+
+    runtime["vars_files"] = [
+        {"static_vars": compile_timeout_aliases(entry["static_vars"])} if "static_vars" in entry else
+        {**entry, "files": {path: compile_timeout_aliases(contents) for path, contents in entry["files"].items()}}
+        for entry in entries
+    ]
     runtime["play_vars"] = _tag_untrusted(play_vars)
     runtime["vars_file_defaults"] = _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())})
     runtime["timeout_defaults"] = _tag_untrusted({key: defaults[key] for key in sorted(timeout_names & defaults.keys())})
@@ -506,7 +536,11 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    ordered_vars_files = [] if gather_facts is None and "gather_timeout" in (play.get_ds() or {}) else None
+    ordered_vars_files = [] if (
+        gather_facts is None and play.gather_facts is not False
+        and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
+        and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
+    ) else None
     play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
     hosts = play.hosts
     if isinstance(hosts, list):
@@ -704,6 +738,15 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
             raw = filename
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
+                # A deferred file may change a later selector's inputs.
+                if ordered is not None and unresolved:
+                    from .runtime import _GATHER_STRING_METHODS
+
+                    dependencies = _gather_timeout_dependencies(filename, {}, _GATHER_STRING_METHODS)
+                    if dependencies is not None and dependencies[1]:
+                        ordered.append(len(unresolved))
+                        unresolved.append(entry)
+                        break
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
                 if filename is None:
