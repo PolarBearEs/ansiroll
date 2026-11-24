@@ -1738,11 +1738,21 @@ def test_literal_false_when_does_not_hide_loop_evaluation_error():
     assert "division by zero" in frames[0]["result"]["msg"]
 
 
-@pytest.mark.parametrize("expression", ["query('file', missing_path)", "query('vars', 'missing_items')"])
+@pytest.mark.parametrize("expression", [
+    "query('file', missing_path)", "query('vars', 'missing_items')",
+    "query('dict', missing_mapping)", "lookup('dict', missing_mapping, wantlist=true)",
+])
 def test_literal_false_when_can_skip_loop_with_undefined_lookup_inputs(expression):
     task = _task("1", "undefined lookup", "debug", loop="{{ %s }}" % expression, when=[False])
     _rt, frames = run([task])
     assert frames[0]["status"] == "skipped"
+
+
+def test_literal_false_when_does_not_hide_lookup_type_errors():
+    task = _task("1", "broken dict lookup", "debug", loop="{{ query('dict', 42) }}", when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "failed"
+    assert "expects a dictionary" in frames[0]["result"]["msg"]
 
 
 def test_literal_false_when_does_not_hide_lookup_file_errors(tmp_path):
