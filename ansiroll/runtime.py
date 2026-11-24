@@ -1187,18 +1187,22 @@ class _LazyTplDict(dict):
 
     def pop(self, key, *default):
         if key in self:
-            return _observe_container_value(dict.pop(self, key, *default), self._rt, self._render_ctx)
+            return self._mutation_value(dict.pop(self, key, *default))
         return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return (self._rt.templater._observe_untrusted(key),
-                _observe_container_value(value, self._rt, self._render_ctx))
+        return self._rt.templater._observe_untrusted(key), self._mutation_value(value)
 
     def setdefault(self, key, default=None):
         if key in self:
-            return _observe_container_value(dict.__getitem__(self, key), self._rt, self._render_ctx)
+            return self._mutation_value(dict.__getitem__(self, key))
         return dict.setdefault(self, key, default)
+
+    def _mutation_value(self, value):
+        if self._task_vars:
+            return _read_lazy_member(self, value)
+        return _observe_container_value(value, self._rt, self._render_ctx)
 
     def keys(self):
         if self._rt.templater._untrusted_task_interpolation is None:
@@ -1213,6 +1217,10 @@ class _LazyTplDict(dict):
 
     def copy(self):
         raw_items = dict.items(self)
+        if self._task_vars:
+            copied = _LazyTplDict(dict(raw_items), self._rt, self._ctx, self._dynamic, self._origin, task_vars=True)
+            copied._task_binding = getattr(self, "_task_binding", None)
+            return copied
         if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
             return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())
         return {k: self[k] for k in self}
@@ -2374,9 +2382,12 @@ class _Templater:
         @wraps(body)
         def wrapped(*args, **kwargs):
             if self._custom_plugin_args is None:
-                return body(*args, **kwargs)
-            with self._plugin_arg_scope(None):
                 result = body(*args, **kwargs)
+            else:
+                with self._plugin_arg_scope(None):
+                    result = body(*args, **kwargs)
+            # Jinja can create the generator before a plugin enters its scope,
+            # then advance it from that plugin (for example loop.nextitem).
             if isinstance(result, Generator):
                 return _resume_scoped_generator(result, self, None)
             return result

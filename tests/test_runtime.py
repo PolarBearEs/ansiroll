@@ -126,6 +126,25 @@ def test_copy_of_deferred_task_list_renders_only_selected_member(expression, exp
     assert calls == []
 
 
+@pytest.mark.parametrize("expression", [
+    "settings.copy().used",
+    "settings.copy().setdefault('used')",
+    "settings.copy().pop('used')",
+    "settings.copy().popitem()[1]",
+])
+def test_copy_of_deferred_task_mapping_renders_only_selected_member(expression):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Read a copied setting", "debug", loop=["sample"], vars={
+        "suffix": "{{ item }}",
+        "settings": {"unused": "{{ lookup('unused') }}/{{ suffix }}",
+                     "used": "{{ lookup('chosen') }}/{{ suffix }}"},
+    })
+    assert runtime.template("{{ " + expression + " }}", runtime._task_ctx(task, {"item": "sample"})) == "chosen/sample"
+    assert calls == ["chosen"]
+
+
 def test_sort_of_deferred_task_list_compares_rendered_members():
     frames, calls = [], []
     runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
@@ -489,6 +508,22 @@ class FilterModule:
                  vars={"unused": "{{ lookup('unused') }}/tail"})
     result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
     assert result == "17"
+
+
+def test_custom_filter_lookahead_keeps_filtered_loop_predicates_lazy():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "next_item", "source": """
+class FilterModule:
+    def filters(self):
+        return {'next_item': lambda loop: '' if loop.index0 else loop.nextitem}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Look ahead in a filtered loop", "debug", loop=["sample"],
+                 vars={"unused": "{{ lookup('unused') }}/tail"})
+    template = ("{% for value in [1, 2] if hostvars.h.values()[0] == 17 recursive %}"
+                "{{ loop | next_item }}{% endfor %}")
+    result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
+    assert result == "2"
 
 
 def test_custom_filter_mutates_saved_hostvars_values():
