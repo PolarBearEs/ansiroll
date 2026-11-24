@@ -115,7 +115,7 @@ def load_adjacent_group_vars(playbook_path, vault_password_file=None):
     return _tag_untrusted(merged)
 
 
-def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
+def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbook_open=None):
     """Return (plays, actions) where actions is the set of module names to embed."""
     init_loader()
     from ansible.parsing.dataloader import DataLoader
@@ -133,6 +133,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
     if extra_vars:
         # Ansible can share its cached CLI extra vars across variable managers.
         vm._extra_vars = combine_vars(vm.extra_vars, extra_vars)
+    loader.on_playbook_open = on_playbook_open
     pb = Playbook.load(path, variable_manager=vm, loader=loader)
 
     pb_dir = os.path.abspath(getattr(pb, "_basedir", None)
@@ -157,6 +158,14 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None):
     return plays, actions
 
 
+def _playbook_read_path(path):
+    if _core_version() < (2, 19):
+        from ansible.module_utils.common.text.converters import to_bytes
+
+        return to_bytes(path)
+    return path
+
+
 def _make_rewriting_loader(DataLoader):
     """Read legacy playbook and task includes using their modern keywords."""
     import sys
@@ -172,7 +181,35 @@ def _make_rewriting_loader(DataLoader):
     class RewritingDataLoader(DataLoader):
         def __init__(self):
             super().__init__()
+            self.on_playbook_open = None
             self._deferred_import_fields = {}
+
+        def _get_file_contents(self, file_name):
+            observe = self.on_playbook_open
+            if observe is None:
+                return super()._get_file_contents(file_name)
+            self.on_playbook_open = None
+
+            from ansible.errors import AnsibleFileNotFound, AnsibleParserError
+
+            # Match Ansible's filename representation and decryption on either
+            # side of the loader's switch to tagged source data.
+            path = _playbook_read_path(self.path_dwim(file_name))
+            try:
+                with open(path, "rb") as stream:
+                    observe(path, os.fstat(stream.fileno()))
+                    data = stream.read()
+            except FileNotFoundError as ex:
+                raise AnsibleFileNotFound("Unable to retrieve file contents", file_name=file_name) from ex
+            except OSError as ex:
+                raise AnsibleParserError("An error occurred while trying to read the file %r: %s" %
+                                         (file_name, ex)) from ex
+            if isinstance(path, bytes):
+                return self._decrypt_if_vault_data(data, path)
+
+            from ansible._internal._datatag._tags import Origin
+
+            return self._decrypt_if_vault_data(Origin(path=path).tag(data))
 
         def load_from_file(self, *args, **kwargs):
             # Playbooks, task files, and vars files can have the same YAML shape.

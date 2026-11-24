@@ -106,10 +106,10 @@ if __name__ == "__main__":
 def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
                      vault_password_file=None, *, extra_vars=None,
                      tree_shake=False, freeze_playbook_vars=False,
-                     freeze_vars=None):
+                     freeze_vars=None, on_playbook_open=None):
     """Parse, embed modules, and return (source_text, manifest_dict)."""
     plays, actions = parse_playbook(playbook_path, vault_password_file=vault_password_file,
-                                   extra_vars=extra_vars)
+                                   extra_vars=extra_vars, on_playbook_open=on_playbook_open)
     for play in plays:
         for entry in play.get("deferred_vars_files") or ():
             if entry.get("unmodeled"):
