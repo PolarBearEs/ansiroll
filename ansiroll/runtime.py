@@ -210,7 +210,7 @@ def _looks_templated(value):
 
 
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
-                 preserve_views=False, preserve_lookup_hostvars=False):
+                 preserve_views=False, preserve_lookup_hostvars=False, reject_vault=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
     if preserve_lookup_hostvars and isinstance(value, _LookupHostVars):
         return value
@@ -218,15 +218,15 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
         return value
     if preserve_views and isinstance(value, (_LazyTplDict, _LazyTplList, _LazyTplTuple, _PlayVarView)):
         return value
-    if isinstance(value, _HostVarEntries):
-        value = list(value)
+    if reject_vault and isinstance(value, dict) and dict.keys(value) == {"__ansiroll_vault__"}:
+        raise ValueError("The variable contains an undecryptable variable")
     if isinstance(value, str):
         if condition_text and not isinstance(value, _TrustedAsTemplateValue):
             return _UntrustedConditionValue(value)
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             return _UnsafeText(value)
         return value
-    if isinstance(value, (dict, list, tuple)):
+    if isinstance(value, (dict, list, tuple, _HostVarEntries)):
         if _seen is None:
             _seen = {}
         # Keep source containers alive because lazy views create temporary
@@ -237,22 +237,27 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             out = {}
             _seen[id(value)] = (value, out)
             # Lazy views render on access; plain containers are read raw.
-            items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
+            if reject_vault and isinstance(value, _LazyTplDict):
+                items = ((key, value[key]) for key in value)
+            elif isinstance(value, (_LazyTplDict, _PlayVarView)):
+                items = value.items()
+            else:
+                items = dict.items(value)
             for key, item in items:
-                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views)
+                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views,
+                                          reject_vault=reject_vault)
                 out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
-                                               preserve_lookup_hostvars)
+                                               preserve_lookup_hostvars, reject_vault)
             return out
-        if isinstance(value, list):
+        if isinstance(value, (list, _HostVarEntries)):
             out = []
             _seen[id(value)] = (value, out)
-            items = (iter(value) if isinstance(value, _LazyTplList)
-                     else list.__iter__(value))
+            items = iter(value) if isinstance(value, (_LazyTplList, _HostVarEntries)) else list.__iter__(value)
             out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
-                                    preserve_lookup_hostvars) for v in items)
+                                    preserve_lookup_hostvars, reject_vault) for v in items)
             return out
         return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
-                                  preserve_lookup_hostvars) for v in value)
+                                  preserve_lookup_hostvars, reject_vault) for v in value)
     return value
 
 
@@ -766,21 +771,8 @@ def _f_quote(v):
         return _to_text_str(v)
 
 
-def _contains_vault(v):
-    if isinstance(v, dict):
-        if set(v.keys()) == {"__ansiroll_vault__"}:
-            return True
-        return any(_contains_vault(x) for x in v.values())
-    if isinstance(v, (list, tuple)):
-        return any(_contains_vault(x) for x in v)
-    return False
-
-
 def _f_to_json(v, **kwargs):
-    snapshot = _mark_unsafe(v)
-    if _contains_vault(snapshot):
-        raise ValueError("The variable contains an undecryptable variable")
-    return json.dumps(snapshot, **kwargs)
+    return json.dumps(_mark_unsafe(v, reject_vault=True), **kwargs)
 
 
 def _host_entries_json_options(options):
@@ -1475,7 +1467,7 @@ class _LookupHostVars(_LazyTplDict):
             value = hostvars[host]
             if isinstance(value, _HostVarView):
                 view = value.copy()
-                view._lookup_data = True
+                view._lookup_values = {}
                 return view
             return _mark_unsafe(value)
 
@@ -1496,14 +1488,19 @@ class _HostVarView(_LazyTplDict):
         dict.__init__(view, raw)
         return view
 
-    _lookup_data = False
+    _lookup_values = None
 
     def __getitem__(self, key):
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
-        result = self._read_host_value(key, value)
-        return _mark_unsafe(result) if self._lookup_data else result
+        if self._lookup_values is None:
+            return self._read_host_value(key, value)
+        binding = key, id(value)
+        if binding not in self._lookup_values:
+            result = _mark_unsafe(self._read_host_value(key, value))
+            self._lookup_values[binding] = value, result
+        return self._lookup_values[binding][1]
 
     def _read_host_value(self, key, value):
         return _read_lazy_member(self, value)

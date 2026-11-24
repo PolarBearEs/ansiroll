@@ -287,7 +287,8 @@ def test_vars_lookup_preserves_lazy_hostvars_members(hostvars):
 
 
 @pytest.mark.parametrize("expression", ["lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]"])
-def test_whole_vars_lookup_hostvars_result_resolves_once(expression):
+@pytest.mark.parametrize("whole_result", [True, False])
+def test_vars_lookup_hostvars_resolves_each_value_once(expression, whole_result):
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
         "original": "{{ lookup('counting') }}",
     }}})
@@ -301,9 +302,14 @@ def test_whole_vars_lookup_hostvars_result_resolves_once(expression):
     task = _task("1", "Read the whole hostvars lookup", "debug", vars={
         "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
     })
-    result = runtime.template("{{ " + expression + " }}", runtime._task_ctx(task, {}))
-    assert type(result) is dict
-    assert json.loads(json.dumps(result))["h"]["original"] == 1
+    ctx = runtime._task_ctx(task, {})
+    if whole_result:
+        result = runtime.template("{{ " + expression + " }}", ctx)
+        assert type(result) is dict
+        assert json.loads(json.dumps(result))["h"]["original"] == 1
+    else:
+        template = "{% set hosts = " + expression + " %}{{ hosts.h.original }}/{{ hosts.h.original }}"
+        assert runtime.template(template, ctx) == "1/1"
     assert len(calls) == 1
 
 
@@ -331,6 +337,22 @@ def test_hostvars_lookup_is_read_once_by_legacy_debug_and_json(monkeypatch, filt
     rendered = json.loads(result["msg"]) if filter_name else result[expression]
     assert rendered["h"]["original"] == 1
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json"])
+def test_json_vault_error_does_not_resolve_later_hostvars(filter_name):
+    import jinja2
+
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
+        "original": "{{ lookup('unused') }}",
+    }}, "vault_value": {"__ansiroll_vault__": "ciphertext"}})
+    runtime.templater._lookup_loaded["unused"] = lambda *args, **kwargs: pytest.fail("unneeded lookup ran")
+    task = _task("1", "Serialize hostvars after vault", "debug", vars={
+        "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
+    })
+    expression = "{{ {'vault': vault_value, 'later': lookup('vars', 'hostvars').h} | " + filter_name + " }}"
+    with pytest.raises(jinja2.UndefinedError, match="undecryptable variable"):
+        str(runtime.template(expression, runtime._task_ctx(task, {})))
 
 
 @pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
