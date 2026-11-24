@@ -1070,12 +1070,10 @@ def _bundled_vars_file(play, path):
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
-        preprocess_vars(loaded)
+        return _tag_untrusted(preprocess_vars(loaded))
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
-    return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
-            "a mapping" % path}
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
@@ -1718,6 +1716,7 @@ def _template_include_filename(task, value, includes):
     from ansible.utils.vars import combine_vars
 
     from ansible.vars.reserved import is_reserved_name
+    from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
 
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
@@ -1727,8 +1726,29 @@ def _template_include_filename(task, value, includes):
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
                   task_vars, role_params, include_params, extra_vars):
         variables = combine_vars(variables, layer)
-    # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
-    above_vars_files = set(role_vars).union(task_vars, role_params, include_params)
+    # Higher mappings can inherit keys from vars_files when hashes are merged.
+    higher_layers = role_vars, task_vars, role_params, include_params, extra_vars
+    higher_names = set().union(*higher_layers)
+    replayed_names = higher_names if includes.incomplete else higher_names & includes.vars_file_writes
+    vars_file_inputs = dict.fromkeys(replayed_names, frozenset())
+    for layer in higher_layers:
+        _clear_vars_file_blocks(vars_file_inputs, layer, DEFAULT_HASH_BEHAVIOUR == "merge")
+    include_paths = None
+
+    def vars_file_can_change(name):
+        nonlocal include_paths
+        if name not in replayed_names:
+            return True
+        if name not in vars_file_inputs:
+            return False
+        if include_paths is None:
+            paths, unknown_lookup = set(), set()
+            dependencies = _gather_timeout_dependencies(
+                value, variables, selector=True, allow_controller=True,
+                paths=paths, unknown_lookup=unknown_lookup, retain_mutable=True)
+            include_paths = paths if dependencies is not None and not unknown_lookup else ()
+        reads = [(name, () if None in path else path) for key, path in include_paths if key == name]
+        return _vars_file_reads_blocked(vars_file_inputs, reads or [(name, ())])
 
     loop_names = set()
     parent = task
@@ -1744,8 +1764,8 @@ def _template_include_filename(task, value, includes):
         if name in loop_names:
             return True
         if ((includes.incomplete or name in includes.vars_file_writes)
-                and name not in extra_vars and name not in above_vars_files
-                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
+                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
+                and vars_file_can_change(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):
             return False

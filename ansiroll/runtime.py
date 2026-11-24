@@ -350,6 +350,25 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 pending.append((node.left, (None,)))
             continue
         if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
+            args = _selector_default_arguments(node)
+            if args is not None:
+                boolean_node = args.get("boolean")
+                boolean = resolve_key(boolean_node, ()) if boolean_node is not None else False
+                control = (None, "defined") if _selector_truth(boolean) is False else (None,)
+                pending.append((node.node, control))
+                if boolean_node is not None:
+                    pending.append((boolean_node, ()))
+                fallback = args.get("default_value")
+                use_fallback = None if retain_mutable else _selector_default_uses_fallback(
+                    resolve_key(node.node, ()), boolean)
+                if use_fallback is not True:
+                    pending.append((node.node, suffix))
+                if fallback is not None and (use_fallback is not False or
+                                             resolve_key(fallback, ()) is _UNRESOLVED_SELECTOR_KEY):
+                    # Jinja still evaluates the argument. A known mapping only
+                    # reads one of its members if it is the selected operand.
+                    pending.append((fallback, suffix))
+                continue
             pending.append((node.node, suffix))
             pending.extend((value, suffix if index == 0 else ()) for index, value in enumerate(node.args))
             pending.extend((kw.value, suffix if kw.key == "default_value" else ()) for kw in node.kwargs)
@@ -422,6 +441,30 @@ def _selector_truth(value):
     if isinstance(value, (str, bool, int, float, type(None), dict, list, tuple)):
         return bool(value)
     return None
+
+
+def _selector_default_arguments(node):
+    if node.dyn_args is not None or node.dyn_kwargs is not None or len(node.args) > 2:
+        return None
+    parameters = ("default_value", "boolean")
+    arguments = dict(zip(parameters, node.args))
+    for keyword in node.kwargs:
+        if keyword.key not in parameters or keyword.key in arguments:
+            return None
+        arguments[keyword.key] = keyword.value
+    return arguments
+
+
+def _selector_default_uses_fallback(value, boolean):
+    if value is _MISSING_VARS_FILE_INPUT:
+        return True
+    if value is _UNRESOLVED_SELECTOR_KEY:
+        return None
+    boolean = _selector_truth(boolean)
+    if boolean is False:
+        return False
+    truth = _selector_truth(value)
+    return not truth if boolean is True and truth is not None else None
 
 
 def _selector_vars_key(node, variables, aliases=None):
@@ -500,21 +543,16 @@ def _selector_vars_key(node, variables, aliases=None):
         index = _selector_vars_key(node.arg, variables, aliases)
         if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
             return value[index]
-    if (isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d")
-            and not (node.dyn_args or node.dyn_kwargs) and len(node.args) <= 2):
-        parameters = ("default_value", "boolean")
-        arguments = dict(zip(parameters, node.args))
-        for keyword in node.kwargs:
-            if keyword.key not in parameters or keyword.key in arguments:
-                return unknown
-            arguments[keyword.key] = keyword.value
+    if isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d"):
+        arguments = _selector_default_arguments(node)
+        if arguments is None:
+            return unknown
         value = _selector_vars_key(node.node, variables, aliases)
         boolean = _selector_vars_key(arguments["boolean"], variables, aliases) if "boolean" in arguments else False
-        if value is unknown or boolean is unknown or boolean is missing:
-            return unknown
-        if value is missing or (boolean and not value):
+        fallback = _selector_default_uses_fallback(value, boolean)
+        if fallback is True:
             return _selector_vars_key(arguments["default_value"], variables, aliases) if "default_value" in arguments else ""
-        return value
+        return value if fallback is False else unknown
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
         if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
             value = _selector_vars_key(node.node, variables, aliases)
@@ -551,11 +589,13 @@ def _vars_input_at(scope, name, path):
     for member in path:
         value = _literal_vars_input(value)
         if member is None:
-            # None is reserved for an input used only for its truthiness.
-            if not (_looks_templated(value) and not isinstance(value, _NO_TEMPLATE)):
-                truth = _selector_truth(value)
-                return value if truth is None else truth
-            return value
+            # None marks a branch choice rather than a member lookup.
+            if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+                return value
+            if path[-1] == "defined":
+                return value is not _MISSING_VARS_FILE_INPUT
+            truth = _selector_truth(value)
+            return value if truth is None else truth
         if isinstance(value, dict):
             if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                 break
