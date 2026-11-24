@@ -207,6 +207,26 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
+def _selector_template_sources(value):
+    """Find trusted template sources inside selector inputs."""
+    pending = [value]
+    seen = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, (dict, list, tuple)):
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if isinstance(value, dict):
+                if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                    continue
+                pending.extend(value.values())
+            else:
+                pending.extend(value)
+        elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+            yield value
+
+
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
                  preserve_views=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
@@ -2789,14 +2809,15 @@ class Runtime:
         vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
         merge_vars_files = (ordered_files is not None and
                             self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
-        vars_file_defaults = timeout_template.get("vars_file_defaults") or {}
+        vars_file_defaults = play.get("vars_file_defaults", timeout_template.get("vars_file_defaults")) or {}
+        vars_file_magic = play.get("vars_file_magic") or {}
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = {}
             if timeout_template and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files, vars_file_defaults,
-                    before_setup=True, merge_hashes=merge_vars_files)
+                    before_setup=True, merge_hashes=merge_vars_files, magic=vars_file_magic)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
@@ -2814,7 +2835,8 @@ class Runtime:
                 return
         # Play templates resolve when consumed, after task precedence is applied.
         play_vars = self._resolve_deferred_vars_files(
-            vars_file_play_vars, vars_files, early_files, vars_file_defaults, merge_hashes=merge_vars_files)
+            vars_file_play_vars, vars_files, early_files, vars_file_defaults,
+            merge_hashes=merge_vars_files, magic=vars_file_magic)
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -3056,7 +3078,7 @@ class Runtime:
         return ctx
 
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
-                                     before_setup=False, merge_hashes=False):
+                                     before_setup=False, merge_hashes=False, magic=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if before_setup:
@@ -3070,7 +3092,7 @@ class Runtime:
                 for value in entry["static_vars"]:
                     selected = _f_combine(selected, value, recursive=merge_hashes)
                 continue
-            ctx = self.ctx(selected, self.extra_vars, base=base)
+            ctx = self.ctx(selected, self.extra_vars, magic, base=base)
             if not before_setup and index in early_files:
                 inputs, mappings = early_files[index]
                 if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
@@ -3082,7 +3104,7 @@ class Runtime:
             inputs = {}
             for raw in entry["names"]:
                 if before_setup:
-                    dependencies = self._pre_setup_template_inputs(raw, ctx)
+                    dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True)
                     if dependencies is None:
                         break
                     inputs.update(dependencies)
@@ -3112,6 +3134,12 @@ class Runtime:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
                 found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
+                if not found and raw in entry.get("unmodeled", ()) and (
+                        os.path.normpath(name) not in entry.get("checked_names", ())):
+                    if before_setup:
+                        break
+                    raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
+                                         "make its selector resolvable at compile time" % (item,))
                 if found:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
@@ -3125,9 +3153,6 @@ class Runtime:
             else:
                 if before_setup:
                     continue
-                if entry.get("unmodeled"):
-                    raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
-                                         "make its selector resolvable at compile time" % (item,))
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
                 if not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))
@@ -3136,7 +3161,7 @@ class Runtime:
                                  % (item,))
         return selected
 
-    def _pre_setup_template_inputs(self, source, ctx):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False):
         inputs = {}
         pending = [source]
         while pending:
@@ -3158,11 +3183,11 @@ class Runtime:
                         isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}
                         and isinstance(value["__ansiroll_unsafe__"], str)
                     )
-                    if not unsafe_scalar and not isinstance(value, (str, int, float, bool, type(None))):
+                    container = selector and isinstance(value, (dict, list, tuple))
+                    if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
                         return None
                     inputs[node.name] = value
-                    if not unsafe_scalar and _looks_templated(value):
-                        pending.append(value)
+                    pending.extend(_selector_template_sources(value))
         return inputs
 
     def _task_ctx(self, task, overlay):

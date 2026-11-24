@@ -2727,6 +2727,66 @@ def test_ordered_vars_files_keep_intermediate_hash_replacement(tmp_path, monkeyp
     assert runtime.template("{{ settings }}", runtime.ctx()) == {"final": True}
 
 
+@pytest.mark.parametrize("selector", ["magic", "mapping"])
+def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp_path, monkeypatch, selector):
+    playbook = tmp_path / "play.yml"
+    if selector == "magic":
+        suffix = "{{ ansible_playbook_python | basename }}-{{ flavor }}"
+        initial, override = {"flavor": "default"}, {"flavor": "runtime"}
+        prefix = "settings-" + os.path.basename(sys.executable) + "-"
+    else:
+        suffix = "{{ config.flavor }}"
+        initial = {"config": {"flavor": "default"}}
+        override = {"config": {"flavor": "runtime"}}
+        prefix = "settings-"
+    playbook.write_text("""- hosts: localhost
+  vars: %s
+  vars_files: ['gather-{{ profile }}.yml', 'settings-%s.yml']
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""" % (json.dumps(initial), suffix))
+    (tmp_path / "gather-runtime.yml").write_text(json.dumps(override))
+    (tmp_path / (prefix + "default.yml")).write_text("timeout_seconds: 23\n")
+    (tmp_path / (prefix + "runtime.yml")).write_text("timeout_seconds: 45\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    extras = {"profile": "runtime", "ansible_playbook_python": "incorrect-target-value"}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extras)
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert plan["gather_timeout"] == 23
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_ordered_first_found_does_not_skip_an_unbundled_earlier_path(tmp_path, monkeypatch):
+    from ansiroll.runtime import VarsFilesError
+
+    playbook = tmp_path / "play.yml"
+    default_dir = tmp_path / "compile-default"
+    playbook.write_text("""- hosts: localhost
+  vars: %s
+  vars_files:
+    - 'gather-{{ profile }}.yml'
+    - ['{{ config_dir }}/final.yml', 'fallback.yml']
+  gather_timeout: '{{ 23 }}'
+  tasks: []
+""" % json.dumps({"config_dir": str(default_dir)}))
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    (tmp_path / "gather-normal.yml").write_text("{}\n")
+    (tmp_path / "gather-other.yml").write_text("config_dir: " + str(tmp_path / "unbundled") + "\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "normal"})
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "fallback"
+    runtime.extra_vars["profile"] = "other"
+    with pytest.raises(VarsFilesError, match="path that was not bundled"):
+        runtime.run_play(plan)
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 
