@@ -154,6 +154,7 @@ class _Omit(str):
 _OMIT = _Omit("__omit_place_holder__ansiroll")
 _NO_CONDITIONAL_LIST = object()
 _MISSING_VARS_FILE_INPUT = object()
+_UNRESOLVED_SELECTOR_KEY = object()
 
 
 class _UnsafeTemplate(str):
@@ -207,16 +208,70 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
+def _selector_local_bindings(expression):
+    nodes = jinja2.nodes
+    bindings = {}
+
+    def target_names(target):
+        if isinstance(target, nodes.Name):
+            return {target.name}
+        return {name.name for name in target.find_all(nodes.Name) if name.ctx != "load"}
+
+    def visit(node, names):
+        if names:
+            bindings[id(node)] = frozenset(names)
+        if isinstance(node, nodes.For):
+            visit(node.iter, names)
+            local = names | target_names(node.target) | {"loop"}
+            if node.test is not None:
+                visit(node.test, local.copy())
+            for child in node.body:
+                visit(child, local)
+            local = names.copy()
+            for child in node.else_:
+                visit(child, local)
+            return
+        if isinstance(node, nodes.With):
+            for value in node.values:
+                visit(value, names)
+            local = names.union(*(target_names(target) for target in node.targets))
+            for child in node.body:
+                visit(child, local)
+            return
+        local = names
+        if isinstance(node, (nodes.Macro, nodes.CallBlock)):
+            local = names | {arg.name for arg in node.args} | {"caller", "kwargs", "varargs"}
+            if isinstance(node, nodes.Macro):
+                local.add(node.name)
+        elif isinstance(node, (nodes.Block, nodes.Scope, nodes.FilterBlock, nodes.AssignBlock,
+                               nodes.OverlayScope)):
+            local = names.copy()
+        for child in node.iter_child_nodes():
+            visit(child, local)
+        if isinstance(node, (nodes.Assign, nodes.AssignBlock)):
+            names.update(target_names(node.target))
+        elif isinstance(node, (nodes.Macro, nodes.Import)):
+            names.add(node.name if isinstance(node, nodes.Macro) else node.target)
+        elif isinstance(node, nodes.FromImport):
+            names.update(name[1] if isinstance(name, tuple) else name for name in node.names)
+
+    visit(expression, set())
+    return bindings
+
+
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
                           *, resolve_aliases=False):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
-    # A template binding can shadow a play variable. Do not guess the
-    # binding's value from the play scope.
-    local_names = {node.name for node in expression.find_all(nodes.Name) if node.ctx != "load"}
-    if local_names:
-        variables = dict(variables or {})
-        variables.update(dict.fromkeys(local_names))
+    bindings = _selector_local_bindings(expression)
+
+    def resolve_key(node, aliases=None):
+        local = bindings.get(id(node))
+        scope = variables or {}
+        if local:
+            scope = {**scope, **dict.fromkeys(local, _UNRESOLVED_SELECTOR_KEY)}
+        return _selector_vars_key(node, scope, aliases)
+
     pending = [(expression, ())]
     if remaining and len(expression.body) == 1 and isinstance(expression.body[0], nodes.Output):
         outputs = [node for node in expression.body[0].nodes
@@ -235,13 +290,13 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
             "lookup", "query", "q",
         ):
             pending.extend((child, ()) for child in node.iter_child_nodes() if child is not node.node)
-            plugin = _selector_vars_key(node.args[0], variables or {}) if node.args else None
+            plugin = resolve_key(node.args[0]) if node.args else None
             vars_lookup = plugin in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
-            if unknown_lookup is not None and (plugin is None or vars_lookup and node.dyn_args is not None):
+            if unknown_lookup is not None and (not isinstance(plugin, str) or vars_lookup and node.dyn_args is not None):
                 unknown_lookup.add("vars")
             if vars_lookup:
                 for term in node.args[1:]:
-                    key = _selector_vars_key(term, variables or {})
+                    key = resolve_key(term)
                     if isinstance(key, str):
                         yield key, ()
                     elif unknown_lookup is not None:
@@ -263,7 +318,7 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 if computed is not None:
                     computed.add("vars")
                 pending.append((root.arg, ()))
-                key = _selector_vars_key(root.arg, variables or {}, () if resolve_aliases else None)
+                key = resolve_key(root.arg, () if resolve_aliases else None)
                 if not isinstance(key, str):
                     if unknown_lookup is not None:
                         unknown_lookup.add("vars")
@@ -290,10 +345,14 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
 
 def _selector_vars_key(node, variables, aliases=None):
     """Resolve a vars key from scalar inputs without running template plugins."""
+    unknown = _UNRESOLVED_SELECTOR_KEY
+    missing = _MISSING_VARS_FILE_INPUT
     if isinstance(node, jinja2.nodes.Const):
         return node.value
     if isinstance(node, jinja2.nodes.Name):
-        value = variables.get(node.name)
+        value = variables.get(node.name, missing)
+        if value is None or value is missing:
+            return value
         if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
             return value["__ansiroll_unsafe__"]
         if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
@@ -306,7 +365,7 @@ def _selector_vars_key(node, variables, aliases=None):
                 try:
                     body = jinja2.Environment().parse("{{ " + source + " }}").body
                 except jinja2.TemplateSyntaxError:
-                    return None
+                    return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
                     return _selector_vars_key(body[0].nodes[0], variables, (*aliases, node.name))
     if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
@@ -315,24 +374,32 @@ def _selector_vars_key(node, variables, aliases=None):
             value = _selector_vars_key(node.node.node, variables, aliases)
             args = [_selector_vars_key(arg, variables, aliases) for arg in node.args]
             kwargs = {kw.key: _selector_vars_key(kw.value, variables, aliases) for kw in node.kwargs}
-            if isinstance(value, str) and all(arg is not None for arg in (*args, *kwargs.values())):
+            if isinstance(value, str) and all(arg is not unknown and arg is not missing
+                                              for arg in (*args, *kwargs.values())):
                 try:
                     return getattr(str, method)(value, *args, **kwargs)
                 except (TypeError, ValueError):
-                    return None
+                    return unknown
     if isinstance(node, jinja2.nodes.Getitem):
         value = _selector_vars_key(node.node, variables, aliases)
         index = _selector_vars_key(node.arg, variables, aliases)
         if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
             return value[index]
     if (isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d")
-            and not (node.kwargs or node.dyn_args or node.dyn_kwargs) and len(node.args) <= 2):
+            and not (node.dyn_args or node.dyn_kwargs) and len(node.args) <= 2):
+        parameters = ("default_value", "boolean")
+        arguments = dict(zip(parameters, node.args))
+        for keyword in node.kwargs:
+            if keyword.key not in parameters or keyword.key in arguments:
+                return unknown
+            arguments[keyword.key] = keyword.value
         value = _selector_vars_key(node.node, variables, aliases)
-        missing = isinstance(node.node, jinja2.nodes.Name) and node.node.name not in variables
-        boolean = _selector_vars_key(node.args[1], variables, aliases) if len(node.args) == 2 else False
-        if missing or (value is not None and boolean and not value):
-            return _selector_vars_key(node.args[0], variables, aliases) if node.args else ""
-        return value if boolean is not None else None
+        boolean = _selector_vars_key(arguments["boolean"], variables, aliases) if "boolean" in arguments else False
+        if value is unknown or boolean is unknown or boolean is missing:
+            return unknown
+        if value is missing or (boolean and not value):
+            return _selector_vars_key(arguments["default_value"], variables, aliases) if "default_value" in arguments else ""
+        return value
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
         if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
             value = _selector_vars_key(node.node, variables, aliases)
@@ -350,7 +417,7 @@ def _selector_vars_key(node, variables, aliases=None):
         parts = [_selector_vars_key(part, variables, aliases) for part in node.nodes]
         if all(isinstance(part, str) for part in parts):
             return "".join(parts)
-    return None
+    return unknown
 
 
 def _literal_vars_input(value):

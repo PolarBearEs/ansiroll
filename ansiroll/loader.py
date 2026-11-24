@@ -839,6 +839,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
     appended to ``unresolved``.
     """
+    from ansible import constants as C
     from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
@@ -850,6 +851,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     if ordered is not None:
         manager = play.get_variable_manager()
         compile_extra_vars = manager.extra_vars
+        extra_replacements = {key for key, value in compile_extra_vars.items()
+                              if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict)}
         role_defaults = _gather_role_defaults(_gather_public_roles(play))
         selector_magic = _gather_selector_magic(play)
     if hash_scope is not None:
@@ -879,7 +882,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     # A templated leading directory cannot be bundled by the
                     # filename glob. Keep its known choice unless order requires replay.
                     if portable is not None and not (filename.startswith(("{{", "{%")) and "/" in filename):
-                        defer_for_order |= bool(portable[1] - compile_extra_vars.keys() - selector_magic.keys())
+                        defer_for_order |= bool(portable[1] - extra_replacements - selector_magic.keys())
                     dependencies = portable
                     paths, unknown_lookup = set(), set()
                     if portable is None:
@@ -899,7 +902,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                                         bundled_inputs.update(mapping)
                         scanned = len(unresolved)
                         selector_names = dependencies[1] | (bundled_inputs if unknown_lookup else set())
-                        mutable_names = selector_names - compile_extra_vars.keys() - selector_magic.keys()
+                        mutable_names = selector_names - extra_replacements - selector_magic.keys()
                         affected = mutable_names & bundled_inputs
                         defer_for_order |= bool(affected)
                         if unknown_lookup and affected:
@@ -936,9 +939,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             for item in mappings:
                 out = combine_vars(out, item)
                 if hash_scope is not None:
-                    merged = combine_vars(hash_scope, item)
-                    hash_scope.clear()
-                    hash_scope.update(merged)
+                    hash_scope.update(combine_vars(hash_scope, item))
             if defer_for_order:
                 selected_path = os.path.normpath(play._loader.path_dwim(path))
                 checked_paths[filename] = selected_path

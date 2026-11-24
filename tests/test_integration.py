@@ -3367,14 +3367,39 @@ def test_controller_timeout_detects_changed_computed_vars_target(tmp_path, monke
     assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
 
 
-@pytest.mark.parametrize("selector", ["'first_x' | replace('_x', '')", "timeout_var | default('first')"])
-def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, monkeypatch, selector):
+@pytest.mark.parametrize(("selector", "selector_vars"), [
+    ("'first_x' | replace('_x', '')", ""),
+    ("timeout_var | default('first')", ""),
+    ("timeout_var | default(default_value='first')", ""),
+    ("timeout_var | default('first', true)", ", timeout_var: null"),
+    ("timeout_var | default(default_value='first', boolean=true)", ", timeout_var: null"),
+])
+def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, monkeypatch, selector, selector_vars):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
-  vars: {first: 23}
+  vars: {first: 23%s}
   gather_timeout: "{{ vars[%s] }}"
   tasks: []
-""" % selector)
+""" % (selector_vars, selector))
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_computed_timeout_uses_outer_key_despite_loop_binding(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {key: first, first: 23}
+  gather_timeout: >-
+    {{ vars[key] }}{% for key in [] %}{% endfor %}
+  tasks: []
+""")
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 23
@@ -3428,6 +3453,44 @@ def test_indirect_timeout_selector_tracks_earlier_vars_file_writes(tmp_path, mon
     frames = []
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile},
                       on_result=frames.append)
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if profile == "runtime":
+        assert runtime.failed
+        assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+        assert not called
+    else:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
+
+
+@pytest.mark.parametrize("profile", ["default", "runtime"])
+def test_indirect_timeout_selector_tracks_hash_merged_vars_file_writes(tmp_path, monkeypatch, profile):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: default, config: {layer: default}}
+  vars_files:
+    - "settings-{{ profile }}.yml"
+    - "timeout-{{ lookup('vars', 'gifnoc' | reverse | join).layer }}.yml"
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "settings-default.yml").write_text("{}\n")
+    (tmp_path / "settings-runtime.yml").write_text("config: {layer: runtime}\n")
+    (tmp_path / "timeout-default.yml").write_text("timeout_seconds: 23\n")
+    (tmp_path / "timeout-runtime.yml").write_text("timeout_seconds: 45\n")
+    extras = {"config": {"unrelated": 1}}
+    source, _ = compile_playbook(str(playbook), extra_vars=extras)
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"},
+                      extra_vars={**extras, "profile": profile}, on_result=frames.append)
     called = []
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
