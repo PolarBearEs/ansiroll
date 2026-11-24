@@ -28,7 +28,7 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import ItemsView, KeysView, MutableSequence, ValuesView
+from collections.abc import Generator, ItemsView, KeysView, MutableSequence, ValuesView
 from contextlib import contextmanager
 from functools import wraps
 from itertools import groupby
@@ -2081,15 +2081,40 @@ def _custom_plugin_arg(value, converted):
 def _wrap_custom_plugin(fn, templater):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        previous = templater._custom_plugin_args
-        converted = templater._custom_plugin_args = {}
-        try:
+        converted = {}
+        with templater._plugin_arg_scope(converted):
             args = tuple(_custom_plugin_arg(value, converted) for value in args)
             kwargs = {key: _custom_plugin_arg(value, converted) for key, value in kwargs.items()}
-            return fn(*args, **kwargs)
-        finally:
-            templater._custom_plugin_args = previous
+            result = fn(*args, **kwargs)
+        if isinstance(result, Generator):
+            return _resume_plugin_generator(result, templater, converted)
+        return result
     return wrapped
+
+
+class _PluginGenerator(Generator):
+    """Resume a Python plugin only while the generator executes its own code."""
+
+    def __init__(self, generator, templater, converted):
+        self._generator = generator
+        self._templater = templater
+        self._converted = converted
+
+    def send(self, value):
+        with self._templater._plugin_arg_scope(self._converted):
+            return self._generator.send(value)
+
+    def throw(self, *args):
+        with self._templater._plugin_arg_scope(self._converted):
+            return self._generator.throw(*args)
+
+    def close(self):
+        with self._templater._plugin_arg_scope(self._converted):
+            return self._generator.close()
+
+
+def _resume_plugin_generator(generator, templater, converted):
+    return (yield from _PluginGenerator(generator, templater, converted))
 
 
 def _wrap_filter(fn):
@@ -2151,7 +2176,14 @@ class _ConditionalName:
         self.key = key
 
 
-class _ConditionalCodeGenerator(jinja2.compiler.CodeGenerator):
+class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
+    def macro_def(self, macro_ref, frame):
+        self.write("environment._ansiroll_templater._wrap_macro(")
+        super().macro_def(macro_ref, frame)
+        self.write(")")
+
+
+class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
     """Observe external names at their use sites in conditional templates."""
 
     def get_resolve_func(self):
@@ -2294,6 +2326,7 @@ class _Templater:
             finalize=(getattr(jinja2, "pass_context", None) or jinja2.contextfunction)(_finalize_text_segment),
         )
         self.env.context_class = _AnsirollContext
+        self.env.code_generator_class = _AnsirollCodeGenerator
         self.env._ansiroll_templater = self
         self._resolving = []        # variable templates being rendered (cycles)
         self._runtime = None        # bound by Runtime for lazy containers
@@ -2326,6 +2359,30 @@ class _Templater:
         self._conditional_env = self.env.overlay()
         self._conditional_env.code_generator_class = _ConditionalCodeGenerator
         self._strict_conditional_env = self._conditional_env.overlay(undefined=_StrictAnsirollUndefined)
+
+    @contextmanager
+    def _plugin_arg_scope(self, converted):
+        previous = self._custom_plugin_args
+        self._custom_plugin_args = converted
+        try:
+            yield
+        finally:
+            self._custom_plugin_args = previous
+
+    def _wrap_macro(self, macro):
+        # Keep Jinja's Macro object and its metadata while isolating the body
+        # from a Python plugin that calls it directly.
+        body = macro._func
+
+        @wraps(body)
+        def wrapped(*args):
+            if self._custom_plugin_args is None:
+                return body(*args)
+            with self._plugin_arg_scope(None):
+                return body(*args)
+
+        macro._func = wrapped
+        return macro
 
     def _lookup_ctx(self, name, terms):
         """The vars lookup templates trusted values like a variable reference."""

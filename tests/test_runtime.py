@@ -424,7 +424,8 @@ class FilterModule:
 
 
 @pytest.mark.parametrize("method", ["values", "items"])
-def test_custom_filter_can_serialize_hostvars_methods(method):
+@pytest.mark.parametrize("filter_expression", ["encode_entries", "encode_entries_lazily"])
+def test_custom_filter_can_serialize_hostvars_methods(method, filter_expression):
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
     runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
 import json
@@ -432,14 +433,19 @@ import json
 def encode(host, method):
     return json.dumps(getattr(host, method)())
 
+def encode_lazily(host, method):
+    yield encode(host, method)
+
 class FilterModule:
     def filters(self):
-        return {'encode_entries': encode}
+        return {'encode_entries': encode, 'encode_entries_lazily': encode_lazily}
 """}])
     runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["sample"]
     task = _task("1", "Serialize hostvars entries", "debug", vars={"mixed": "{{ lookup('sample') }}/tail"})
-    entries = json.loads(runtime.template("{{ hostvars.h | encode_entries('%s') }}" % method,
-                                          runtime._task_ctx(task, {})))
+    expression = "hostvars.h | %s('%s')" % (filter_expression, method)
+    if filter_expression == "encode_entries_lazily":
+        expression += " | first"
+    entries = json.loads(runtime.template("{{ " + expression + " }}", runtime._task_ctx(task, {})))
     if method == "items":
         assert dict(entries)["mixed"] == "sample/tail"
     else:
@@ -462,6 +468,21 @@ class FilterModule:
     })
     result = runtime.template("{{ hostvars.h.copy() | selected_hostvar }}", runtime._task_ctx(task, {}))
     assert str(result) == "17"
+
+
+def test_custom_filter_macro_callback_keeps_hostvars_entries_lazy():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "invoke", "source": """
+class FilterModule:
+    def filters(self):
+        return {'invoke_macro': lambda macro: macro()}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Invoke a Jinja macro from a filter", "debug", loop=["sample"],
+                 vars={"unused": "{{ lookup('unused') }}/tail"})
+    template = "{% macro selected() %}{{ hostvars.h.values()[0] }}{% endmacro %}{{ selected | invoke_macro }}"
+    result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
+    assert result == "17"
 
 
 def test_custom_filter_mutates_saved_hostvars_values():
