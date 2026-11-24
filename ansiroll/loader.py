@@ -200,6 +200,7 @@ def _gather_timeout_template(source, variables):
     if not isinstance(source, str) or not _is_templated(source) or not isinstance(_tag_untrusted(source), str):
         return None
     env = Environment()
+    scalar_methods = {"split", "rsplit", "strip", "lstrip", "rstrip"}
     pending = [source]
     scope = {}
     names = set()
@@ -208,8 +209,11 @@ def _gather_timeout_template(source, variables):
             expression = env.parse(pending.pop())
         except TemplateSyntaxError:
             return None
-        if next(expression.find_all(nodes.Call), None) is not None:
-            return None
+        for call in expression.find_all(nodes.Call):
+            method = call.node
+            if not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods
+                    and isinstance(method.node, nodes.Name)):
+                return None
         for name in {node.name for node in expression.find_all(nodes.Name) if node.ctx == "load"} - names:
             if name == "omit":
                 continue

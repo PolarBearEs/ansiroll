@@ -88,7 +88,8 @@ Without `--tree-shake`, compilation remains generic. `-e` accepts Ansible-style
 `--freeze-var NAME` to make selected play/group variables immutable, or
 `--freeze-playbook-vars` to freeze every safely resolvable top-level play variable.
 Frozen and `-e` values are recorded as fixed build-time values, and conflicting
-runtime overrides are rejected.
+runtime overrides are rejected. Values passed with `-e` are embedded in the
+artifact, including values used only to resolve a controller-side lookup.
 
 ### Run a playbook locally (compile + execute)
 

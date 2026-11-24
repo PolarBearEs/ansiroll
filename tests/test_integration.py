@@ -2312,14 +2312,19 @@ def test_compile_does_not_bundle_controller_timeout_input(tmp_path, monkeypatch)
     assert "only-the-length-is-needed" not in json.dumps(plan)
 
 
-@pytest.mark.parametrize("default_filter", ["", " | default(23)"])
-def test_standalone_gather_timeout_uses_run_extra_vars(tmp_path, monkeypatch, default_filter):
+@pytest.mark.parametrize(("expression", "play_vars", "override"), [
+    ("override_timeout", "", 45),
+    ("override_timeout | default(23)", "", 45),
+    ('override_timeout.split(":") | first', "", "45:override"),
+    ('override_timeout.split(":") | first', "  vars: {override_timeout: '23:base'}\n", "45:override"),
+])
+def test_standalone_gather_timeout_uses_run_extra_vars(tmp_path, monkeypatch, expression, play_vars, override):
     playbook = tmp_path / "play.yml"
-    playbook.write_text("- hosts: localhost\n  gather_timeout: '{{ override_timeout%s }}'\n  tasks: []\n"
-                        % default_filter)
+    playbook.write_text("- hosts: localhost\n%s  gather_timeout: '{{ %s }}'\n  tasks: []\n"
+                        % (play_vars, expression))
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
-    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"override_timeout": 45})
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"override_timeout": override})
     called = []
 
     def run_module(action, args, **kwargs):
