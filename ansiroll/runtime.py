@@ -1265,24 +1265,69 @@ class _SnapshotBinding:
             self._resolved = True
         return self._value
 
+    def raw_value(self):
+        if (self._resolved and isinstance(self._value, (_LazyMappingSnapshot, _LazyListSnapshot))
+                and self._value._inventory_snapshot):
+            return self._value
+        return self.source
+
+
+def _inventory_snapshot(value):
+    if type(value) is _LazyTplDict:
+        bindings = {key: _SnapshotBinding(source) for key, source in dict.items(value)}
+        return _LazyMappingSnapshot(value, bindings, inventory=True)
+    if type(value) is _LazyTplList:
+        return _LazyListSnapshot(value, [_SnapshotBinding(source) for source in list.__iter__(value)], inventory=True)
+    return value
+
+
+def _read_snapshot_member(container, value):
+    if isinstance(value, _SnapshotBinding):
+        def read(source):
+            member = _read_lazy_member(container, source)
+            if container._inventory_snapshot and type(source) in (dict, list):
+                member = _inventory_snapshot(member)
+            return member
+
+        value = value.resolve(read)
+    return container._rt.templater._observe_untrusted(value)
+
+
+def _raw_inventory_snapshot(value, seen=None):
+    """Expose current writes without evaluating inventory templates."""
+    if isinstance(value, _SnapshotBinding):
+        value = value.raw_value()
+    if not isinstance(value, (_LazyMappingSnapshot, _LazyListSnapshot)) or not value._inventory_snapshot:
+        return value
+    if seen is None:
+        seen = {}
+    if id(value) in seen:
+        return seen[id(value)]
+    if isinstance(value, dict):
+        result = seen[id(value)] = {}
+        result.update((key, _raw_inventory_snapshot(member, seen)) for key, member in dict.items(value))
+    else:
+        result = seen[id(value)] = []
+        result.extend(_raw_inventory_snapshot(member, seen) for member in list.__iter__(value))
+    return result
+
 
 class _LazyMappingSnapshot(_LazyTplDict):
     """A shallow copy with deferred source bindings and ordinary dict writes."""
 
-    def __init__(self, source, bindings):
+    def __init__(self, source, bindings, *, inventory=False):
         super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=source._task_vars)
         self._task_binding = getattr(source, "_task_binding", None)
+        self._inventory_snapshot = inventory
 
     def _read_member(self, value):
-        if isinstance(value, _SnapshotBinding):
-            value = value.resolve(super()._read_member)
-        return self._rt.templater._observe_untrusted(value)
+        return _read_snapshot_member(self, value)
 
     def _mutation_value(self, key, value):
         return self._read_member(value)
 
     def copy(self):
-        return _LazyMappingSnapshot(self, dict(dict.items(self)))
+        return _LazyMappingSnapshot(self, dict(dict.items(self)), inventory=self._inventory_snapshot)
 
 
 class _HandlerNameVars(_LazyTplDict):
@@ -1759,7 +1804,11 @@ class _DeferredPlayVarView(_ModernPlayVarView):
     def _resolve(self, key, value):
         if self._is_snapshot:
             if isinstance(value, _SnapshotBinding):
-                value = value.resolve(lambda source: self._resolve_inherited(key, source))
+                def read(source):
+                    member = self._resolve_inherited(key, source)
+                    return _inventory_snapshot(member) if type(source) in (dict, list) else member
+
+                value = value.resolve(read)
             return self.scope.templater._observe_untrusted(value)
         return self._resolve_inherited(key, value)
 
@@ -1776,17 +1825,17 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         if not self._legacy_iteration:
             return self[key]
         source = dict.__getitem__(self, key)
-        resolved = False
         if self._is_snapshot:
             if not isinstance(source, _SnapshotBinding):
                 return self.scope.templater._observe_untrusted(source)
-            resolved = source._resolved
+            if type(source.source) in (dict, list):
+                return _raw_inventory_snapshot(source)
             source = source.source
         # Legacy iteration still exposes play template source, while accessed
         # containers retain their mutations in the snapshot.
         if isinstance(source, _PlayVarTemplate):
             return str(source)
-        if resolved or isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
+        if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
                 isinstance(source, (_LazyTplDict, _LazyTplList)) and source._task_vars):
             return self[key]
         return source
@@ -1964,21 +2013,20 @@ class _LazyTplList(list):
 class _LazyListSnapshot(_LazyTplList):
     """A shallow copy that resolves inherited list members on demand."""
 
-    def __init__(self, source, bindings):
+    def __init__(self, source, bindings, *, inventory=False):
         super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin,
                          task_vars=source._task_vars, delegated=source._delegated)
         self._task_binding = getattr(source, "_task_binding", None)
+        self._inventory_snapshot = inventory
 
     def _read_member(self, value):
-        if isinstance(value, _SnapshotBinding):
-            value = value.resolve(super()._read_member)
-        return self._rt.templater._observe_untrusted(value)
+        return _read_snapshot_member(self, value)
 
     def pop(self, index=-1):
         return self._read_member(list.pop(self, index))
 
     def copy(self):
-        return _LazyListSnapshot(self, list.copy(self))
+        return _LazyListSnapshot(self, list.copy(self), inventory=self._inventory_snapshot)
 
 
 class _LazyTplTuple(tuple):

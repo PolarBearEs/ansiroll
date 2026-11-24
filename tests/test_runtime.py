@@ -205,6 +205,25 @@ def test_vars_copy_preserves_nested_mutations(nested, mutation, expected, read):
     assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == expected
 
 
+def test_legacy_vars_copy_iteration_keeps_unmodified_inventory_members_literal(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('inventory') }}"
+    runtime = Runtime({}, "", {"payload": {"child": literal, "nested": {"items": ["original"]}}})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Iterate a copied variable", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set loaded = copied.payload.child %}"
+                "{% set ignored = copied.payload.nested['items'].append('added') %}"
+                "{% set iterated = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ [loaded, copied.payload.nested['items'], iterated] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        "inventory", ["original", "added"], {"child": literal, "nested": {"items": ["original", "added"]}},
+    ]
+    assert calls == ["inventory"]
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",
