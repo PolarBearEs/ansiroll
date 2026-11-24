@@ -2784,15 +2784,19 @@ class Runtime:
                          and saved_facts.get("_ansible_facts_gathered"))
         timeout_template = play.get("gather_timeout_template") or {}
         play_vars = dict(play.get("vars") or {})
-        vars_files = timeout_template.get("vars_files", play.get("deferred_vars_files") or ())
-        vars_file_play_vars = timeout_template.get("play_vars", play_vars)
+        ordered_files = play.get("ordered_vars_files", timeout_template.get("vars_files"))
+        vars_files = ordered_files if ordered_files is not None else play.get("deferred_vars_files") or ()
+        vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
+        merge_vars_files = (ordered_files is not None and
+                            self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
         vars_file_defaults = timeout_template.get("vars_file_defaults") or {}
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = {}
             if timeout_template and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
-                    vars_file_play_vars, vars_files, early_files, vars_file_defaults, before_setup=True)
+                    vars_file_play_vars, vars_files, early_files, vars_file_defaults,
+                    before_setup=True, merge_hashes=merge_vars_files)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
@@ -2809,8 +2813,9 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        play_vars.update(self._resolve_deferred_vars_files(
-            vars_file_play_vars, vars_files, early_files, vars_file_defaults))
+        file_vars = self._resolve_deferred_vars_files(
+            vars_file_play_vars, vars_files, early_files, vars_file_defaults, merge_hashes=merge_vars_files)
+        play_vars = _f_combine(vars_file_play_vars, file_vars, recursive=merge_vars_files)
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -3051,7 +3056,8 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *, before_setup=False):
+    def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
+                                     before_setup=False, merge_hashes=False):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if before_setup:
@@ -3063,15 +3069,16 @@ class Runtime:
         for index, entry in enumerate(entries):
             if "static_vars" in entry:
                 for value in entry["static_vars"]:
-                    selected.update(value)
+                    selected = _f_combine(selected, value, recursive=merge_hashes)
                 continue
-            ctx = self.ctx(play_vars, selected, self.extra_vars, base=base)
+            variables = _f_combine(play_vars, selected, recursive=merge_hashes)
+            ctx = self.ctx(variables, self.extra_vars, base=base)
             if not before_setup and index in early_files:
                 inputs, values = early_files[index]
                 if all(key not in ctx if value is _MISSING_VARS_FILE_INPUT else
                        key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
                        for key, value in inputs.items()):
-                    selected.update(values)
+                    selected = _f_combine(selected, values, recursive=merge_hashes)
                     continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             inputs = {}
@@ -3111,8 +3118,8 @@ class Runtime:
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
                     values = {}
                     for value in data:
-                        values.update(value)
-                    selected.update(values)
+                        values = _f_combine(values, value, recursive=merge_hashes)
+                    selected = _f_combine(selected, values, recursive=merge_hashes)
                     if before_setup:
                         early_files[index] = (inputs, values)
                     break
@@ -4847,7 +4854,7 @@ class Runtime:
             return timeout
         role_exports = template.get("role_exports") or {}
         overrides = self.extra_vars.keys() | (vars_files or {}).keys()
-        if not template.get("required") and overrides.isdisjoint(template["names"]):
+        if not (template.get("required") or template.get("file_names")) and overrides.isdisjoint(template["names"]):
             return timeout
         scope = self.ctx(template.get("timeout_defaults"), template["vars"], template.get("play_vars"),
                          vars_files, role_exports, self.extra_vars, base={

@@ -151,9 +151,10 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         basedir = os.path.abspath(getattr(play, "_included_path", None) or pb_dir)
         loader.set_basedir(basedir)
         node = _convert_play(play, actions, basedir, runtime_writes=runtime_writes)
-        ordered_vars_files = node.pop("_ordered_gather_vars_files", ())
-        if node["gather_facts"] and "gather_timeout" in (play.get_ds() or {}):
-            node.update(_compile_gather_timeout(play, vm, loader, ordered_vars_files))
+        compiled_play_vars = node.pop("_gather_compile_vars", None)
+        if compiled_play_vars is not None:
+            node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars,
+                                                node.get("ordered_vars_files", ())))
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -161,7 +162,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
     return plays, actions
 
 
-def _compile_gather_timeout(play, variable_manager, loader, ordered_vars_files):
+def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, ordered_vars_files):
     """Validate the play keyword in the same controller scope as Ansible."""
     from ansible.errors import AnsibleError, AnsibleUndefinedVariable
     from jinja2 import UndefinedError
@@ -176,7 +177,10 @@ def _compile_gather_timeout(play, variable_manager, loader, ordered_vars_files):
     timeout_play = type(play)()
     timeout_play.hosts = ["all"]
     timeout_play.gather_timeout = play.gather_timeout
-    variables = variable_manager.get_vars(play=play)
+    scope_play = play.copy()
+    scope_play.vars = compiled_play_vars
+    scope_play.vars_files = []
+    variables = variable_manager.get_vars(play=scope_play)
     runtime = _gather_timeout_template(play.gather_timeout, variables)
     try:
         timeout_play.post_validate(Templar(loader=loader, variables=variables))
@@ -239,6 +243,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
     selector_names = set()
     timeout_names = set(runtime["names"])
     file_aliases = {}
+    file_names = set()
     for entry in entries:
         for source in entry.get("names", ()):
             dependencies = _gather_timeout_dependencies(source, selector_scope, _GATHER_STRING_METHODS)
@@ -249,6 +254,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
             if not isinstance(contents, list):
                 continue
             for mapping in contents:
+                file_names.update(mapping)
                 for key, source in mapping.items():
                     if isinstance(source, str) and _is_templated(source):
                         file_aliases.setdefault(key, set()).add(source)
@@ -270,7 +276,10 @@ def _gather_timeout_file_scope(play, entries, runtime):
                     names.update(new_names)
                     pending.extend(new_names)
     runtime["names"] = sorted(timeout_names)
-    runtime["vars_files"] = entries
+    runtime["file_names"] = sorted(timeout_names & file_names)
+    # Vars files are replayed before setup. Do not reuse a variable from
+    # the compiler's default selection when the run picks a different file.
+    runtime["vars"] = {key: value for key, value in runtime["vars"].items() if key not in file_names}
     runtime["play_vars"] = _tag_untrusted(play_vars)
     runtime["vars_file_defaults"] = _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())})
     runtime["timeout_defaults"] = _tag_untrusted({key: defaults[key] for key in sorted(timeout_names & defaults.keys())})
@@ -515,7 +524,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
         and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
     ) else None
-    order_deferred = set()
+    order_deferred = {}
     play_vars = _resolved_play_vars(
         play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred)
     hosts = play.hosts
@@ -594,12 +603,15 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "handlers": handlers,
     }
     if unresolved_vars_files:
-        result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
+        deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
+        for index, selected in order_deferred.items():
+            deferred[index]["files"].update(selected)
+        result["deferred_vars_files"] = deferred
     # Replaying a selector after an earlier deferred file may bundle new
     # candidates. Their lookup names do not authorize copying controller data.
     environment_sources = {**result, "deferred_vars_files": [
-        entry for index, entry in enumerate(result.get("deferred_vars_files", ()))
-        if index not in order_deferred
+        order_deferred.get(index, entry)
+        for index, entry in enumerate(result.get("deferred_vars_files", ()))
     ]}
     names = _controller_env_names(environment_sources)
     if names:
@@ -633,12 +645,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for path in connection_loader.all(path_only=True)
     })
     result["controller_config"] = controller_config
+    if gather_facts is None and gather and "gather_timeout" in (play.get_ds() or {}):
+        result["_gather_compile_vars"] = play_vars
     if ordered_vars_files and unresolved_vars_files:
-        deferred = result["deferred_vars_files"]
-        result["_ordered_gather_vars_files"] = [
+        result["ordered_vars_files"] = [
             deferred[entry] if isinstance(entry, int) else {"static_vars": entry}
             for entry in ordered_vars_files
         ]
+        result["vars_file_play_vars"] = _tag_untrusted(play.vars or {})
     return result
 
 
@@ -717,6 +731,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     bundled_inputs = set()
     scanned = 0
     for entry in _as_list(getattr(play, "vars_files", None)):
+        defer_for_order = False
+        selected = {}
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
@@ -730,23 +746,20 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     dependencies = _gather_timeout_dependencies(
                         filename, {**out, **compile_extra_vars}, _GATHER_STRING_METHODS)
                     if dependencies is not None:
-                        for previous in _deferred_vars_files(play, basedir, unresolved[scanned:]):
+                        earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
+                        for index, previous in enumerate(earlier, start=scanned):
+                            previous["files"].update((order_deferred or {}).get(index, {}))
                             for contents in previous["files"].values():
                                 if isinstance(contents, list):
                                     for mapping in contents:
                                         bundled_inputs.update(mapping)
                         scanned = len(unresolved)
                         mutable_names = dependencies[1] - compile_extra_vars.keys()
-                        if mutable_names & bundled_inputs:
-                            if order_deferred is not None:
-                                order_deferred.add(len(unresolved))
-                            ordered.append(len(unresolved))
-                            unresolved.append(entry)
-                            break
+                        defer_for_order |= bool(mutable_names & bundled_inputs)
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
                 if filename is None:
-                    if unresolved is not None:
+                    if unresolved is not None and not defer_for_order:
                         if ordered is not None:
                             ordered.append(len(unresolved))
                         unresolved.append(entry)
@@ -764,9 +777,16 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
             for item in mappings:
                 out = combine_vars(out, item)
-            if ordered is not None:
+            if defer_for_order:
+                selected[os.path.normpath(path)] = _tag_untrusted(mappings)
+            elif ordered is not None:
                 ordered.append(_tag_untrusted(mappings))
             break
+        if defer_for_order:
+            if order_deferred is not None:
+                order_deferred[len(unresolved)] = selected
+            ordered.append(len(unresolved))
+            unresolved.append(entry)
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
     # and unrelated inventory state are not baked into every play.

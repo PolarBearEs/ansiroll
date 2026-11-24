@@ -2523,6 +2523,114 @@ def test_compile_timeout_keeps_late_selector_with_known_directory(tmp_path, comp
     assert len(plan["deferred_vars_files"]) == 1
 
 
+def test_compile_timeout_reuses_nondeterministic_file_selection(tmp_path, monkeypatch):
+    from itertools import cycle
+    from types import SimpleNamespace
+
+    from ansible.plugins.filter import core
+
+    choices = cycle(("first", "second"))
+    monkeypatch.setattr(core, "SystemRandom", lambda: SimpleNamespace(choice=lambda values: next(choices)))
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars_files:
+    - '{{ ["first", "second"] | random }}.yml'
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "first.yml").write_text("timeout_seconds: 15\n")
+    (tmp_path / "second.yml").write_text("timeout_seconds: 30\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] in (15, 30)
+    assert plan["gather_timeout"] == plan["vars"]["timeout_seconds"]
+
+
+def test_ordered_timeout_plan_preserves_compile_selected_vault_file_and_env(tmp_path, monkeypatch):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {flavor: default}
+  vars_files: ['gather-{{ profile }}.yml', 'settings-{{ flavor }}.yml']
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "gather-custom.yml").write_text("flavor: custom\n")
+    (tmp_path / "gather-runtime.yml").write_text("{}\n")
+    password = tmp_path / "vault-password"
+    password.write_text("password\n")
+    vault = VaultLib([("default", VaultSecret(b"password"))])
+    selected = """timeout_seconds: 15
+environment_value: '{{ lookup("env", "ANSIROLL_SELECTED_GATHER_INPUT") }}'
+"""
+    (tmp_path / "settings-default.yml").write_bytes(vault.encrypt(selected))
+    (tmp_path / "settings-custom.yml").write_bytes(vault.encrypt("timeout_seconds: 30\n"))
+    monkeypatch.setenv("ANSIROLL_SELECTED_GATHER_INPUT", "controller")
+    source, _ = compile_playbook(str(playbook), vault_password_file=str(password))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    monkeypatch.setenv("ANSIROLL_SELECTED_GATHER_INPUT", "target")
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 15})]
+    assert runtime.template("{{ environment_value }}", runtime.ctx()) == "controller"
+
+
+def test_ordered_timeout_does_not_keep_unselected_compile_value(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {flavor: default}
+  vars_files: ['gather-{{ profile }}.yml', 'settings-{{ flavor }}.yml']
+  gather_timeout: '{{ timeout_seconds | default(20) }}'
+  tasks: []
+""")
+    (tmp_path / "gather-runtime.yml").write_text("flavor: custom\n")
+    (tmp_path / "settings-default.yml").write_text("timeout_seconds: 15\n")
+    (tmp_path / "settings-custom.yml").write_text("{}\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert plan["gather_timeout"] == 15
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 20})]
+
+
+def test_ordered_task_vars_files_merge_with_compile_only_timeout(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {flavor: default, settings: {play: true}}
+  vars_files: ['first.yml', 'gather-{{ profile }}.yml', 'settings-{{ flavor }}.yml', 'final.yml']
+  gather_timeout: '{{ 23 }}'
+  tasks: []
+""")
+    (tmp_path / "first.yml").write_text("settings: {first: true}\n")
+    (tmp_path / "gather-runtime.yml").write_text("flavor: custom\n")
+    (tmp_path / "settings-default.yml").write_text("settings: {unselected: true}\n")
+    (tmp_path / "settings-custom.yml").write_text("settings: {custom: true, winner: middle}\n")
+    (tmp_path / "final.yml").write_text("settings: {final: true, winner: final}\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
+    assert runtime.template("{{ settings }}", runtime.ctx()) == {
+        "play": True, "first": True, "custom": True, "final": True, "winner": "final",
+    }
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 
