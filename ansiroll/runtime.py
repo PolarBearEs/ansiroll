@@ -210,9 +210,9 @@ def _looks_templated(value):
 
 
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
-                 preserve_views=False):
+                 preserve_views=False, preserve_lookup_hostvars=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
-    if isinstance(value, _LookupHostVars):
+    if preserve_lookup_hostvars and isinstance(value, _LookupHostVars):
         return value
     if preserve_included_vars and isinstance(value, _IncludedVars):
         return value
@@ -240,16 +240,19 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
             for key, item in items:
                 marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views)
-                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views)
+                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
+                                               preserve_lookup_hostvars)
             return out
         if isinstance(value, list):
             out = []
             _seen[id(value)] = (value, out)
             items = (iter(value) if isinstance(value, _LazyTplList)
                      else list.__iter__(value))
-            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views) for v in items)
+            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
+                                    preserve_lookup_hostvars) for v in items)
             return out
-        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views) for v in value)
+        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
+                                  preserve_lookup_hostvars) for v in value)
     return value
 
 
@@ -1878,7 +1881,8 @@ class _LazyTplList(list):
     __str__ = __repr__
 
     def __ne__(self, other):
-        return not self.__eq__(other)
+        equal = self.__eq__(other)
+        return NotImplemented if equal is NotImplemented else not equal
 
     __hash__ = None
 
@@ -2291,7 +2295,7 @@ class _Templater:
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
-                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
+                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k), preserve_lookup_hostvars=True)
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
@@ -2310,7 +2314,7 @@ class _Templater:
             a = tuple(self._template_lookup_term(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             return _mark_unsafe(
-                _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
+                _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k), preserve_lookup_hostvars=True)
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)

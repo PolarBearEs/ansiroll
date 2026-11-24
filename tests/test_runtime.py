@@ -261,6 +261,7 @@ def test_hostvars_entries_keep_deferred_bindings_in_task_order():
 @pytest.mark.parametrize(("expression", "expected"), [
     ("entries == []", False), ("entries != []", True), ("[] == entries", False),
     ("prefix == entries", False), ("entries != prefix", True),
+    ("prefix != entries", True),
     ("entries < [18]", True), ("entries >= [18]", False), ("[18] > entries", True),
     ("entries[:1] == [17]", True), ("entries > [17]", True),
 ])
@@ -283,6 +284,27 @@ def test_vars_lookup_preserves_lazy_hostvars_members(hostvars):
     task = _task("1", "Read a hostvars lookup member", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
     expression = "{{ " + hostvars + "[inventory_hostname].copy().original }}"
     assert runtime.template(expression, runtime._task_ctx(task, {})) == "ready"
+
+
+@pytest.mark.parametrize("expression", ["lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]"])
+def test_whole_vars_lookup_hostvars_result_resolves_once(expression):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
+        "original": "{{ lookup('counting') }}",
+    }}})
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(None)
+        return [len(calls)]
+
+    runtime.templater._lookup_loaded["counting"] = counting
+    task = _task("1", "Read the whole hostvars lookup", "debug", vars={
+        "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
+    })
+    result = runtime.template("{{ " + expression + " }}", runtime._task_ctx(task, {}))
+    assert type(result) is dict
+    assert json.loads(json.dumps(result))["h"]["original"] == 1
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
