@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -312,6 +313,163 @@ def test_stdout_compile_rejects_merged_diagnostic_stream(tmp_path, destination):
     assert output == b"ansiroll: compile -o - requires separate stdout and stderr streams\n"
 
 
+@pytest.mark.parametrize("alias", ["same", "hardlink", "expanded"])
+def test_merged_compile_diagnostics_leave_the_input_playbook_intact(tmp_path, alias):
+    if alias == "expanded":
+        pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    destination = playbook
+    if alias == "hardlink":
+        destination = tmp_path / "diagnostics"
+        os.link(playbook, destination)
+    source = tmp_path / "$ANSIROLL_INPUT" if alias == "expanded" else playbook
+    with destination.open("ab") as stream:
+        result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(source), "-o", "-"],
+                                stdout=stream, stderr=subprocess.STDOUT, timeout=10,
+                                env=dict(os.environ, ANSIROLL_INPUT=playbook.name))
+    assert result.returncode == 2
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.parametrize("output_mode", ["file", "stdout"])
+def test_compile_rejects_stderr_alias_with_separate_stdout(tmp_path, output_mode):
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    output = tmp_path / "compiled.py"
+    with playbook.open("ab") as diagnostics:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+             "-o", "-" if output_mode == "stdout" else str(output)],
+            stdout=subprocess.PIPE, stderr=diagnostics, timeout=10,
+        )
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert not output.exists()
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires descriptor access modes")
+@pytest.mark.parametrize("read_only", [True, False])
+def test_file_compile_checks_inherited_and_python_stderr_separately(tmp_path, read_only):
+    playbook = tmp_path / "play.yml"
+    original = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(original)
+    output = tmp_path / "compiled.py"
+    script = """
+import os
+import sys
+from ansiroll import cli
+
+playbook, output, read_only = sys.argv[1:]
+if read_only == 'True':
+    sys.stderr = open(os.devnull, 'w')
+    with open(playbook) as inherited:
+        os.dup2(inherited.fileno(), 2)
+else:
+    sys.stderr = open(playbook, 'a')
+cli.compile_playbook = lambda *args, **kwargs: ('pass\\n', {'modules': [], 'fallback_tasks': []})
+raise SystemExit(cli.main(['compile', playbook, '-o', output]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(playbook), str(output), str(read_only)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == (0 if read_only else 2), result.stderr
+    assert output.exists() == read_only
+    assert playbook.read_text() == original
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_merged_compile_diagnostics_leave_the_input_fifo_empty(tmp_path):
+    playbook = tmp_path / "play.pipe"
+    os.mkfifo(playbook)
+    with os.fdopen(os.open(playbook, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
+        with playbook.open("wb") as stream:
+            result = subprocess.run(
+                [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+                stdout=stream, stderr=subprocess.STDOUT, timeout=10,
+            )
+        assert reader.read() == b""
+    assert result.returncode == 2
+
+
+@pytest.mark.parametrize("output_mode", ["file", "stdout"])
+def test_compile_reports_input_with_a_nondirectory_component(tmp_path, output_mode):
+    pytest.importorskip("ansible")
+    parent = tmp_path / "regular-file"
+    parent.touch()
+    playbook = parent / "play.yml"
+    output = tmp_path / "compiled.py"
+    result = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+         "-o", "-" if output_mode == "stdout" else str(output)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 2
+    assert "play.yml" in result.stderr
+    assert result.stdout == ""
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("component", ["filename", "directory"])
+def test_merged_compile_diagnostics_use_legacy_filename_encoding(monkeypatch, cli_os, tmp_path, component):
+    pytest.importorskip("ansible")
+    from ansiroll import loader
+
+    folder = tmp_path / "café" if component == "directory" else tmp_path
+    folder.mkdir(exist_ok=True)
+    path = folder / ("play-é.yml" if component == "filename" else "play.yml")
+    path.write_text("input playbook")
+    monkeypatch.chdir(folder)
+    monkeypatch.setattr(loader, "_core_version", lambda: (2, 10))
+    stream = path.stat()
+
+    def stat_legacy_path(candidate):
+        if candidate == str(path).encode("utf-8"):
+            return stream
+        raise FileNotFoundError(candidate)
+
+    monkeypatch.setattr(cli_os, "stat", stat_legacy_path)
+    assert cli._diagnostic_stream_may_be_playbook(stream, path.name)
+
+
+def test_merged_compile_diagnostics_fail_closed_if_sink_cannot_open(monkeypatch, tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("input playbook")
+
+    def exhausted_sink(*args, **kwargs):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(cli, "open", exhausted_sink, raising=False)
+    assert cli._diagnostic_stream_may_be_playbook(playbook.stat(), "$ANSIROLL_INPUT")
+
+
+@pytest.mark.parametrize(("error", "emits_diagnostic"), [(errno.ENOENT, True), (errno.EACCES, False), (errno.EIO, False)])
+def test_merged_compile_diagnostics_handle_failed_input_stat(monkeypatch, cli_os, tmp_path, capsys,
+                                                       error, emits_diagnostic):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("input playbook")
+    stream = playbook.stat()
+    cli_os.fstat = lambda fd: stream
+    cli_os.isatty = lambda fd: False
+    monkeypatch.setattr(cli, "_prepare_compile_stderr", lambda: None, raising=False)
+
+    def unreadable_input(path):
+        assert path == str(playbook)
+        raise OSError(error, os.strerror(error), path)
+
+    cli_os.stat = unreadable_input
+    assert cli.main(["compile", str(playbook), "-o", "-"], _standalone=True) == 2
+    diagnostic = capsys.readouterr().err
+    if emits_diagnostic:
+        assert "requires separate stdout and stderr" in diagnostic
+    else:
+        assert diagnostic == ""
+
+
 def test_stdout_compile_requires_redirected_output():
     pty = pytest.importorskip("pty")
     master, slave = pty.openpty()
@@ -429,6 +587,353 @@ def test_compile_writes_executable_file(monkeypatch, tmp_path, capsys, with_mani
     assert stat.S_IMODE(output.stat().st_mode) == 0o750
     if with_manifest:
         assert manifest_path.read_text() == json.dumps(manifest, indent=2)
+
+
+@pytest.mark.parametrize("alias", ["same", "symlink", "hardlink"])
+@pytest.mark.parametrize("destination", ["output", "manifest", "stdout-manifest"])
+def test_compile_rejects_destinations_aliasing_the_playbook(tmp_path, alias, destination):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    playbook.chmod(0o640)
+    target = playbook if alias == "same" else tmp_path / "alias"
+    if alias == "symlink":
+        target.symlink_to(playbook)
+    elif alias == "hardlink":
+        os.link(playbook, target)
+
+    output = tmp_path / "compiled.py"
+    args = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook)]
+    if destination == "output":
+        args.extend(["-o", str(target)])
+    else:
+        args.extend(["-o", "-" if destination == "stdout-manifest" else str(output), "-m", str(target)])
+    result = subprocess.run(args, capture_output=True, timeout=10)
+
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert not result.stdout
+    assert playbook.read_bytes() == original
+    assert stat.S_IMODE(playbook.stat().st_mode) == 0o640
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("name", ["play.yml", "$ANSIROLL_PLAYBOOK_BASENAME"])
+def test_compile_checks_the_expanded_playbook_path(tmp_path, monkeypatch, name):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    monkeypatch.setenv("ANSIROLL_INPUT_NAME", name)
+    monkeypatch.setenv("ANSIROLL_PLAYBOOK_BASENAME", playbook.name)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile",
+                             str(tmp_path / "$ANSIROLL_INPUT_NAME"), "-o", str(playbook)],
+                            capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+def test_compile_checks_absolute_input_with_expansion_and_parent_traversal(tmp_path, monkeypatch):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+
+    monkeypatch.setenv("ANSIROLL_INPUT_DIR", "parent/child")
+    directory = tmp_path / "$ANSIROLL_INPUT_DIR" / ".."
+    loader = DataLoader()
+    loader.set_basedir(str(directory))
+    playbook = Path(loader.path_dwim("play.yml"))
+    playbook.parent.mkdir(exist_ok=True)
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(directory / "play.yml"),
+                             "-o", str(playbook)], capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.skipif(os.name != "posix", reason="filename contains quotes and a backslash")
+def test_compile_preserves_a_literal_playbook_name_with_an_escaped_final_quote(tmp_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / '"play\\"'
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(playbook)],
+                            capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+@pytest.mark.parametrize("destination", ["output-only", "output-with-manifest", "manifest"])
+def test_compile_checks_destination_inode_after_open(monkeypatch, tmp_path, capsys, destination):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(original)
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    open_fd = os.open
+
+    target = manifest if destination == "manifest" else output
+
+    def replace_destination_before_open(path, flags, *args, **kwargs):
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY and not target.exists():
+            target.symlink_to(playbook)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_destination_before_open)
+    args = ["compile", str(playbook), "-o", str(output)]
+    if destination != "output-only":
+        args.extend(["-m", str(manifest)])
+
+    assert cli.main(args) == 2
+    assert "points to input playbook" in capsys.readouterr().err
+    assert playbook.read_text() == original
+    if destination == "manifest":
+        assert output.read_text().startswith("#!")
+    else:
+        assert not manifest.exists()
+
+
+def test_compile_preserves_the_inode_it_read_when_the_playbook_symlink_changes(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+
+    original = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    initial, selected, final = (tmp_path / name for name in ("first.yml", "selected.yml", "final.yml"))
+    for path in (initial, selected, final):
+        path.write_text(original)
+    playbook = tmp_path / "play.yml"
+    playbook.symlink_to(initial)
+    load_from_file = DataLoader.load_from_file
+
+    def load_after_replacing_link(loader, path, *args, **kwargs):
+        if path != playbook.name:
+            return load_from_file(loader, path, *args, **kwargs)
+        playbook.unlink()
+        playbook.symlink_to(selected)
+        try:
+            return load_from_file(loader, path, *args, **kwargs)
+        finally:
+            playbook.unlink()
+            playbook.symlink_to(final)
+
+    monkeypatch.setattr(DataLoader, "load_from_file", load_after_replacing_link)
+    assert cli.main(["compile", str(playbook), "-o", str(selected)]) == 2
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert selected.read_text() == original
+    assert playbook.resolve() == final
+
+
+def test_compile_reports_ansible_configuration_errors_for_an_expanded_input(tmp_path):
+    release = pytest.importorskip("ansible.release")
+    output = tmp_path / "compiled.py"
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", "$ANSIROLL_INPUT", "-o", str(output)],
+                            env=dict(os.environ, ANSIBLE_VERBOSITY="bogus", ANSIROLL_INPUT="input.yml"),
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2
+    if tuple(map(int, release.__version__.split(".")[:2])) >= (2, 16):
+        assert "Traceback" not in result.stderr
+    assert "DEFAULT_VERBOSITY" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires the Linux C locale")
+def test_legacy_compile_checks_ansible_filename_bytes_in_an_ascii_locale(tmp_path):
+    release = pytest.importorskip("ansible.release")
+    if tuple(map(int, release.__version__.split(".")[:2])) >= (2, 17):
+        pytest.skip("newer Ansible requires a UTF-8 locale")
+
+    playbook = tmp_path / "play-é.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile",
+                             str(tmp_path / "$ANSIROLL_INPUT"), "-o", str(playbook)],
+                            env=dict(os.environ, LC_ALL="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0",
+                                     ANSIROLL_INPUT=playbook.name),
+                            capture_output=True, timeout=10)
+    assert result.returncode == 2
+    assert b"output path points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_bytes(original)
+    with playbook.open("ab") as destination:
+        result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", "-"],
+                                stdout=destination, stderr=subprocess.PIPE, timeout=10)
+    assert result.returncode == 2
+    assert b"stdout points to input playbook" in result.stderr
+    assert playbook.read_bytes() == original
+
+
+def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
+    playbook = tmp_path / "play.yml"
+    destination = tmp_path / "stdout"
+    playbook.write_bytes(b"input playbook")
+    destination.write_bytes(b"")
+
+    def compile_playbook(path, *, on_playbook_open, **kwargs):
+        on_playbook_open(path, playbook.stat())
+        return "pass\n", {"modules": [], "fallback_tasks": []}
+
+    def write_manifest(*args, **kwargs):
+        playbook.unlink()
+        playbook.symlink_to(destination)
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_playbook)
+    monkeypatch.setattr(cli, "_write_stdout_manifest", write_manifest)
+    args = Namespace(playbook=str(playbook), output="-", manifest=str(tmp_path / "manifest.json"),
+                     interpreter="python3", extra_vars=[], vault_password_file=None, tree_shake=False,
+                     freeze_playbook_vars=False, freeze_var=[])
+    with destination.open("ab") as stdout:
+        assert cli._cmd_compile(args, stdout) == 2
+    assert "stdout points to input playbook" in capsys.readouterr().err
+    assert destination.read_bytes() == b""
+
+
+@pytest.mark.parametrize("target", ["output", "manifest"])
+def test_file_compile_checks_input_after_the_other_destination_lookup(monkeypatch, cli_os, tmp_path, capsys, target):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    output, manifest = (tmp_path / name for name in ("compiled.py", "manifest.json"))
+    destination, other = (output, manifest) if target == "output" else (manifest, output)
+    original = b"existing destination\n"
+    destination.write_bytes(original)
+    opened = replaced = False
+
+    def track_write_open(path, flags, *args, **kwargs):
+        nonlocal opened
+        fd = os.open(path, flags, *args, **kwargs)
+        if path == str(destination) and flags & os.O_ACCMODE == os.O_WRONLY:
+            opened = True
+        return fd
+
+    def replace_input_on_lookup(path, *args, **kwargs):
+        nonlocal replaced
+        if opened and not replaced and path == str(other):
+            playbook.rename(tmp_path / "original.yml")
+            playbook.symlink_to(destination)
+            replaced = True
+        return os.stat(path, *args, **kwargs)
+
+    cli_os.open = track_write_open
+    cli_os.stat = replace_input_on_lookup
+    status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert replaced
+    assert status == 2
+    assert "points to input playbook" in capsys.readouterr().err
+    assert destination.read_bytes() == original
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_file_compile_rechecks_input_after_pinning_output(monkeypatch, tmp_path, capsys, existing):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    original = tmp_path / "original.yml"
+    output = tmp_path / "compiled.py"
+    previous = b"previous artifact\n" if existing else b""
+    if existing:
+        output.write_bytes(previous)
+
+    def replace_input_during_pin(*args):
+        playbook.rename(original)
+        playbook.symlink_to(output)
+
+    monkeypatch.setattr(cli, "_pin_output_inode", replace_input_during_pin)
+    assert cli.main(["compile", str(playbook), "-o", str(output)]) == 2
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert playbook.read_bytes() == previous
+    assert original.read_text().startswith("- hosts: localhost\n")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_file_compile_rechecks_input_before_writing_to_fifo(monkeypatch, cli_os, tmp_path, capsys):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    source = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(source)
+    original = tmp_path / "original.yml"
+    output = tmp_path / "compiled.pipe"
+    os.mkfifo(output)
+    compile_playbook = cli.compile_playbook
+    writer_fd = None
+    writer_checks = 0
+
+    def compile_small_output(*args, **kwargs):
+        _, manifest = compile_playbook(*args, **kwargs)
+        return "pass\n", manifest
+
+    def track_writer(path, flags, *args):
+        nonlocal writer_fd
+        fd = os.open(path, flags, *args)
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY:
+            writer_fd = fd
+        return fd
+
+    def replace_input_before_write(fd):
+        nonlocal writer_checks
+        if fd == writer_fd:
+            writer_checks += 1
+            if writer_checks == 2:
+                playbook.rename(original)
+                playbook.symlink_to(output)
+        return os.fstat(fd)
+
+    monkeypatch.setattr(cli, "compile_playbook", compile_small_output)
+    cli_os.open = track_writer
+    cli_os.fstat = replace_input_before_write
+    reader = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        status = cli.main(["compile", str(playbook), "-o", str(output)])
+        assert (status, os.read(reader, 4096)) == (2, b"")
+    finally:
+        os.close(reader)
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert playbook.resolve() == output
+    assert original.read_text() == source
+
+
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
+def test_file_compile_preserves_destination_when_current_input_identity_is_unavailable(
+        cli_os, tmp_path, capsys, error):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    output, manifest = (tmp_path / name for name in ("compiled.py", "manifest.json"))
+    original = b"existing destination\n"
+    output.write_bytes(original)
+    replaced = False
+
+    def replace_input_on_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY and not replaced:
+            playbook.rename(tmp_path / "original.yml")
+            playbook.symlink_to(output)
+            replaced = True
+        return os.open(path, flags, *args, **kwargs)
+
+    def unavailable_input(path, *args, **kwargs):
+        if replaced and os.fsdecode(path) == str(playbook):
+            raise OSError(error, os.strerror(error), path)
+        return os.stat(path, *args, **kwargs)
+
+    cli_os.open = replace_input_on_open
+    cli_os.stat = unavailable_input
+    status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert replaced
+    assert status == 2
+    assert "cannot check current input playbook" in capsys.readouterr().err
+    assert output.read_bytes() == original
+    assert not manifest.exists()
 
 
 @pytest.mark.parametrize("alias", ["missing", "dangling", "same", "symlink", "hardlink", "replaced"])
@@ -619,13 +1124,24 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
     open_fd, fdopen = os.open, os.fdopen
     append_fd = None
     reopened = []
+    active_fds = set()
 
     def open_append_only(path, flags, *args, **kwargs):
         nonlocal append_fd
         target = path == str(files[destination]) and flags & os.O_ACCMODE == os.O_WRONLY
         if target and failure == "open":
             raise OSError(error, "filesystem requires O_TRUNC", path)
+        if destination == "output" and not reopened:
+            for fd in active_fds.copy():
+                try:
+                    os.fstat(fd)
+                except OSError as ex:
+                    assert ex.errno == errno.EBADF
+                    active_fds.remove(fd)
+            if len(active_fds) == 2:
+                raise OSError(errno.EMFILE, "no slot for another output descriptor", path)
         fd = open_fd(path, flags, *args, **kwargs)
+        active_fds.add(fd)
         if target:
             append_fd = fd
         if str(path).startswith("/proc/self/fd/") and flags & os.O_TRUNC:
@@ -660,6 +1176,41 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
     assert json.loads(manifest.read_text()) == data
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
+                    reason="requires reopening a metadata-only descriptor")
+def test_compile_rechecks_input_after_procfs_lookup(monkeypatch, cli_os, tmp_path, capsys):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    original = "previous output\n"
+    output.write_text(original)
+    replaced = False
+
+    def require_truncate(path, flags, *args, **kwargs):
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY:
+            raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
+        return os.open(path, flags, *args, **kwargs)
+
+    def replace_on_procfs_lookup(path, *args, **kwargs):
+        nonlocal replaced
+        if str(path).startswith("/proc/self/fd/") and not replaced:
+            playbook.rename(tmp_path / "original.yml")
+            playbook.symlink_to(output)
+            replaced = True
+        return os.stat(path, *args, **kwargs)
+
+    cli_os.open = require_truncate
+    cli_os.stat = replace_on_procfs_lookup
+    status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert replaced
+    assert status == 2
+    assert "output path points to input playbook" in capsys.readouterr().err
+    assert output.read_text() == original
+    assert not manifest.exists()
+
+
 @pytest.mark.parametrize("through_symlinks", [False, True])
 def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_path, through_symlinks):
     output = tmp_path / "compiled.py"
@@ -690,6 +1241,62 @@ def test_compile_writes_new_files_without_truncation_or_procfs(monkeypatch, tmp_
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert output.read_text() == "pass\n"
     assert json.loads(manifest.read_text()) == data
+
+
+@pytest.mark.parametrize("mode", ["stdout", "file"])
+def test_compile_rechecks_input_after_preparing_manifest_writer(cli_os, tmp_path, capsys, mode):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    source = "- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    playbook.write_text(source)
+    original = tmp_path / "original.yml"
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    manifest.touch()
+    writer_fd = None
+    truncate_failed = replaced = False
+
+    def track_manifest_writer(path, flags, *args):
+        nonlocal writer_fd
+        fd = os.open(path, flags, *args)
+        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+            writer_fd = fd
+        return fd
+
+    def cannot_truncate(_size):
+        nonlocal truncate_failed
+        truncate_failed = True
+        raise OSError(errno.EOPNOTSUPP, "standalone truncation unavailable")
+
+    def wrap_writer(fd, mode):
+        file = os.fdopen(fd, mode)
+        if fd == writer_fd:
+            file.truncate = cannot_truncate
+        return file
+
+    def replace_input_on_empty_file_check(fd):
+        nonlocal replaced
+        if fd == writer_fd and truncate_failed and not replaced:
+            playbook.rename(original)
+            playbook.symlink_to(manifest)
+            replaced = True
+        return os.fstat(fd)
+
+    cli_os.open = track_manifest_writer
+    cli_os.fdopen = wrap_writer
+    cli_os.fstat = replace_input_on_empty_file_check
+    if mode == "stdout":
+        args = Namespace(playbook=str(playbook), output="-", manifest=str(manifest),
+                         interpreter="python3", extra_vars=[], vault_password_file=None, tree_shake=False,
+                         freeze_playbook_vars=False, freeze_var=[])
+        with output.open("wb") as stdout:
+            status = cli._cmd_compile(args, stdout)
+    else:
+        status = cli.main(["compile", str(playbook), "-o", str(output), "-m", str(manifest)])
+    assert status == 2 and replaced
+    assert "manifest path points to input playbook" in capsys.readouterr().err
+    assert manifest.read_bytes() == b""
+    assert original.read_text() == source
 
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
@@ -802,14 +1409,16 @@ def test_manifest_open_can_release_output_pin(monkeypatch, tmp_path, manifest_pi
 
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires metadata-only file descriptors")
-def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_path):
+@pytest.mark.parametrize("destination", ["stdout-manifest", "output"])
+def test_compile_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_path, capsys, destination):
     output = tmp_path / "stdout"
     manifest = tmp_path / "manifest.json"
-    manifest.write_text("previous manifest")
+    target = output if destination == "output" else manifest
+    target.write_text("previous content")
     open_fd, stat_path = os.open, os.stat
 
     def require_truncate(path, flags, *args, **kwargs):
-        if path == str(manifest) and flags & os.O_ACCMODE == os.O_WRONLY:
+        if path == str(target) and flags & os.O_ACCMODE == os.O_WRONLY:
             raise PermissionError(errno.EPERM, "filesystem requires O_TRUNC", path)
         return open_fd(path, flags, *args, **kwargs)
 
@@ -820,10 +1429,42 @@ def test_manifest_truncating_reopen_reports_unavailable_procfs(monkeypatch, tmp_
 
     monkeypatch.setattr(os, "open", require_truncate)
     monkeypatch.setattr(os, "stat", stat_without_procfs)
-    with output.open("w") as stream:
-        with pytest.raises(PermissionError, match="safe truncating reopen requires /proc/self/fd"):
-            cli._write_stdout_manifest(str(manifest), {}, stream.fileno())
-    assert manifest.read_text() == "previous manifest"
+    if destination == "output":
+        monkeypatch.setattr(cli, "compile_playbook", lambda *args, **kwargs: ("pass\n", {}))
+        assert cli.main(["compile", "play.yml", "-o", str(output)]) == 2
+        assert "Compile to a local staging file" in capsys.readouterr().err
+    else:
+        with output.open("w") as stream:
+            with pytest.raises(OSError, match="safe truncating reopen requires /proc/self/fd"):
+                cli._write_stdout_manifest(str(manifest), {}, stream.fileno())
+    assert target.read_text() == "previous content"
+
+
+@pytest.mark.parametrize("error", [errno.EINVAL, errno.EOPNOTSUPP, errno.EACCES, errno.EPERM])
+def test_compile_handles_a_failed_output_open_without_a_metadata_pin(monkeypatch, cli_os, tmp_path, capsys, error):
+    output = tmp_path / "compiled.py"
+    original = "previous Python"
+    output.write_text(original)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *args, **kwargs: ("pass\n", {}))
+    monkeypatch.delattr(cli_os, "O_PATH", raising=False)
+    open_fd = cli_os.open
+
+    def require_truncate(path, flags, *args, **kwargs):
+        if path == str(output) and flags & os.O_ACCMODE == os.O_WRONLY and not flags & os.O_EXCL:
+            raise OSError(error, os.strerror(error), path)
+        return open_fd(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(cli_os, "open", require_truncate)
+    args = ["compile", "play.yml", "-o", str(output)]
+    if error in (errno.EACCES, errno.EPERM):
+        with pytest.raises(PermissionError) as failure:
+            cli.main(args)
+        assert failure.value.errno == error
+        assert not capsys.readouterr().err
+    else:
+        assert cli.main(args) == 2
+        assert "Compile to a local staging file" in capsys.readouterr().err
+    assert output.read_text() == original
 
 
 @pytest.mark.parametrize("destination", ["output", "manifest"])
