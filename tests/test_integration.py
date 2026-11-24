@@ -3395,6 +3395,7 @@ def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, mo
 @pytest.mark.parametrize("template", [
     "{{ vars[key] }}{% for key in [] %}{% endfor %}",
     "{% if flag %}{% set key = 'second' %}{% else %}{{ vars[key] }}{% endif %}",
+    "{% if flag %}{% set key = 'second' %}{% endif %}{{ vars[key] }}",
 ])
 def test_computed_timeout_uses_outer_key_despite_other_bindings(tmp_path, monkeypatch, template):
     playbook = tmp_path / "play.yml"

@@ -208,7 +208,7 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_local_bindings(expression):
+def _selector_local_bindings(expression, variables):
     nodes = jinja2.nodes
     bindings = {}
 
@@ -222,16 +222,25 @@ def _selector_local_bindings(expression):
             bindings[id(node)] = frozenset(names)
         if isinstance(node, nodes.If):
             after = names.copy()
+            scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
+            fallthrough = True
             for branch in (node, *node.elif_):
                 visit(branch.test, names)
                 local = names.copy()
                 for child in branch.body:
                     visit(child, local)
-                after.update(local)
+                test = _selector_vars_key(branch.test, scope)
+                known = isinstance(test, (bool, int, float, str, type(None)))
+                if fallthrough and (not known or test):
+                    after.update(local)
+                if known and test:
+                    fallthrough = False
             local = names.copy()
             for child in node.else_:
                 visit(child, local)
-            names.update(after, local)
+            if fallthrough:
+                after.update(local)
+            names.update(after)
             return
         if isinstance(node, nodes.For):
             visit(node.iter, names)
@@ -276,7 +285,7 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                           *, resolve_aliases=False):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
-    bindings = _selector_local_bindings(expression)
+    bindings = _selector_local_bindings(expression, variables or {})
 
     def resolve_key(node, aliases=None):
         local = bindings.get(id(node))
