@@ -365,8 +365,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     unresolved_vars_files = []
     include_vars = {}
     vars_file_writes = set()
+    jinja_plugins = _collect_jinja_plugins(play, basedir)
     play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files,
-                                   include_vars=include_vars, deferred_writes=vars_file_writes)
+                                   include_vars=include_vars, deferred_writes=vars_file_writes,
+                                   ternary_builtin=not any(plugin["kind"] == "filter" for plugin in jinja_plugins or ()))
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -424,7 +426,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     result = {
         "name": play.name or "",
         "hosts": hosts,
-        "jinja_plugins": _collect_jinja_plugins(play, basedir),
+        "jinja_plugins": jinja_plugins,
         "gather_facts": bool(gather),
         "smart_gathering": gather_facts is None and C.DEFAULT_GATHERING == "smart",
         "gather_when": _conditions(getattr(play, "_included_conditional", None)),
@@ -448,7 +450,17 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         result["deferred_vars_files"] = unresolved_vars_files
-    names = _controller_env_names(result)
+    # Searching possible launcher host directories does not authorize copying
+    # controller environment values mentioned only in those candidates.
+    environment_sources = dict(result)
+    if unresolved_vars_files:
+        environment_sources["deferred_vars_files"] = []
+        for entry in unresolved_vars_files:
+            hostname_candidates = entry.pop("hostname_candidates", ())
+            environment_sources["deferred_vars_files"].append({**entry, "files": {
+                name: data for name, data in entry.get("files", {}).items() if name not in hostname_candidates
+            }})
+    names = _controller_env_names(environment_sources)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -543,7 +555,8 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_vars=None, deferred_writes=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_vars=None, deferred_writes=None,
+                        ternary_builtin=True):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -573,12 +586,18 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_var
                     if unresolved is not None:
                         scopes = [selector_vars, play.get_variable_manager().extra_vars]
                         if all_vars is None:
-                            from .runtime import _STANDALONE_DEFAULT_GROUP
+                            from .runtime import _STANDALONE_DEFAULT_GROUP, _STANDALONE_DEFAULT_HOST
 
-                            scopes.append({"group_names": [_STANDALONE_DEFAULT_GROUP]})
+                            scopes.extend((
+                                {"group_names": [_STANDALONE_DEFAULT_GROUP],
+                                 "inventory_hostname": _STANDALONE_DEFAULT_HOST,
+                                 "inventory_hostname_short": _STANDALONE_DEFAULT_HOST},
+                                dict.fromkeys(("inventory_hostname", "inventory_hostname_short"), _HOSTNAME_COMPONENT),
+                            ))
                         scopes.extend(mapping for previous in unresolved for data in previous.get("files", {}).values()
                                       if isinstance(data, list) for mapping in data)
-                        bundled, = _deferred_vars_files(play, basedir, [entry], scopes=scopes)
+                        bundled, = _deferred_vars_files(
+                            play, basedir, [entry], scopes=scopes, ternary_builtin=ternary_builtin)
                         unresolved.append(bundled)
                         for candidate in bundled["files"].values():
                             if isinstance(candidate, list):
@@ -636,7 +655,10 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
-def _known_vars_file_choices(source, scopes, basedir):
+_HOSTNAME_COMPONENT = "\1"
+
+
+def _known_vars_file_choices(source, scopes, basedir, *, ternary_builtin=True):
     """Return literal or bounded wildcard paths without rendering selectors."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -653,8 +675,8 @@ def _known_vars_file_choices(source, scopes, basedir):
         return _known_vars_file_path_values(body[0], scopes, env, basedir), False
     choice = dynamic[0]
     branches = _vars_file_choice_branches(choice)
-    exhaustive = bool(branches) and all(isinstance(branch, nodes.Const) and isinstance(branch.value, str)
-                                        for branch in branches)
+    exhaustive = (bool(branches) and (ternary_builtin or isinstance(choice, nodes.CondExpr))
+                  and all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches))
     values = ([branch.value for branch in branches] if exhaustive
               else _known_vars_file_path_values(choice, scopes, env, basedir))
     paths = tuple(dict.fromkeys("".join(value if part is choice else part.data for part in parts) for value in values))
@@ -776,10 +798,12 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
                 arguments = [*node.args, *(kw.value for kw in node.kwargs if kw.key == "d")]
                 if len(arguments) != len(node.args) + len(node.kwargs) or len(arguments) > 1:
                     return
-                if arguments and not (isinstance(arguments[0], nodes.Const) and isinstance(arguments[0].value, str)):
-                    return
-                delimiter = arguments[0].value if arguments else ""
-                yield from (delimiter.join(items) for items in project(node.node, seen=seen, sequence=True))
+                delimiters = (tuple(dict.fromkeys(project(arguments[0], seen=seen))) if arguments else ("",))
+                for items in project(node.node, seen=seen, sequence=True):
+                    for delimiter in delimiters:
+                        if "\0" not in delimiter and _HOSTNAME_COMPONENT not in delimiter:
+                            consume()
+                            yield delimiter.join(items)
             return
         if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
             return
@@ -836,7 +860,7 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
         return ()
 
 
-def _deferred_vars_files(play, basedir, entries, *, scopes=()):
+def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=True):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -855,36 +879,51 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=()):
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
+        hostname_candidates = set()
+        regular_candidates = set()
         unmodeled = []
         patterns_by_name = []
         for name in names:
-            choices, exhaustive = _known_vars_file_choices(name, scopes, basedir) if _is_templated(name) else ((), False)
-            choices = [choice for choice in choices if choice and choice != "\0" and "\0" not in os.path.dirname(choice)]
-            patterns_by_name.extend((choice, "*".join(glob.escape(part) for part in choice.split("\0")))
+            choices, exhaustive = (_known_vars_file_choices(name, scopes, basedir, ternary_builtin=ternary_builtin)
+                                   if _is_templated(name) else ((), False))
+            choices = [choice for choice in choices if choice not in ("", "\0", _HOSTNAME_COMPONENT)
+                       and "\0" not in os.path.dirname(choice)]
+            patterns_by_name.extend((choice, "*".join(glob.escape(part) for part in
+                                                      choice.replace(_HOSTNAME_COMPONENT, "\0").split("\0")))
                                     for choice in choices)
             if exhaustive:
                 continue
-            if name.startswith(("{{", "{%")) and "/" in name:
+            pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+            if name.startswith(("{{", "{%")) and "/" in pattern:
                 if not choices:
                     unmodeled.append(name)
             else:
-                pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
                 patterns_by_name.append((name, pattern))
         for name, pattern in patterns_by_name:
             if name.startswith(os.path.sep):
-                patterns = [pattern]
+                patterns = [(pattern, os.path.dirname(name.split(_HOSTNAME_COMPONENT, 1)[0]))]
             else:
                 patterns = []
                 for d in dirs:
                     if subdir and name.split("/")[0] != subdir:
-                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
-                    patterns.append(os.path.join(glob.escape(d), pattern))
-            for path in patterns:
+                        patterns.append((os.path.join(glob.escape(d), subdir, pattern), os.path.join(d, subdir)))
+                    patterns.append((os.path.join(glob.escape(d), pattern), d))
+            for path, root in patterns:
+                bounded_host = _HOSTNAME_COMPONENT in name
+                if bounded_host:
+                    root = os.path.realpath(root)
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
-                    if found not in files and os.path.isfile(found):
-                        files[found] = _bundled_vars_file(play, found)
+                    if bounded_host and os.path.commonpath([root, os.path.realpath(found)]) != root:
+                        continue
+                    if found in files or os.path.isfile(found):
+                        (hostname_candidates if bounded_host else regular_candidates).add(found)
+                        if found not in files:
+                            files[found] = _bundled_vars_file(play, found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
+        hostname_candidates.difference_update(regular_candidates)
+        if hostname_candidates:
+            entry["hostname_candidates"] = hostname_candidates
         if unmodeled:
             entry["unmodeled"] = unmodeled
         deferred.append(entry)

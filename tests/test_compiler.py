@@ -427,11 +427,78 @@ def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, gro
 def test_deferred_vars_file_projects_qualified_join_of_known_and_fallback_lists(tmp_path):
     from ansiroll.loader import _known_vars_file_choices
 
-    scopes = [{"groups_alias": "{{ config.groups }}", "config": {"groups": ["web", "prod"]}}]
-    selector = "{{ groups_alias | default(['ungrouped', 'local']) | ansible.builtin.join(d='-') }}/settings.yml"
+    scopes = [{"groups_alias": "{{ config.groups }}", "config": {"groups": ["web", "prod"]}, "separator": "-"}]
+    selector = "{{ groups_alias | default(['ungrouped', 'local']) | ansible.builtin.join(d=separator) }}/settings.yml"
     choices, exhaustive = _known_vars_file_choices(selector, scopes, str(tmp_path))
     assert set(choices) == {"web-prod/settings.yml", "ungrouped-local/settings.yml"}
     assert not exhaustive
+
+
+@pytest.mark.parametrize("inventory_name", ["inventory_hostname", "inventory_hostname_short"])
+def test_standalone_vars_files_bundle_hostname_directories(tmp_path, monkeypatch, inventory_name):
+    from ansiroll import compile_playbook
+    from ansiroll.loader import parse_playbook
+
+    project = tmp_path / "project"
+    project.mkdir()
+    playbook = project / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - "{{ %s | default('fallback') }}/settings.yml"
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""" % inventory_name)
+    launcher_host = "worker.example.test"
+    worker_dir = launcher_host if inventory_name == "inventory_hostname" else "worker"
+    for directory in ("localhost", worker_dir, "fallback", "nested/deeper"):
+        path = project / directory / "settings.yml"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"selected: {directory}\n")
+    with (project / worker_dir / "settings.yml").open("a") as worker_vars:
+        worker_vars.write("unused: \"{{ lookup('env', 'ANSIROLL_UNSELECTED_HOST_SECRET') }}\"\n")
+    monkeypatch.setenv("ANSIROLL_UNSELECTED_HOST_SECRET", "controller-only-value")
+    (tmp_path / "external").mkdir()
+    (tmp_path / "external" / "settings.yml").write_text("selected: external\n")
+    (project / "outside").symlink_to(tmp_path / "external", target_is_directory=True)
+    plays, _ = parse_playbook(str(playbook))
+    files = plays[0]["deferred_vars_files"][0]["files"]
+    assert set(files) == {str(project / directory / "settings.yml") for directory in ("localhost", worker_dir, "fallback")}
+    assert "ANSIROLL_UNSELECTED_HOST_SECRET" not in plays[0].get("controller_env", {})
+    compiled = project / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    monkeypatch.delenv("ANSIROLL_HOST", raising=False)
+    for overrides, expected in (({}, "localhost"), ({"ANSIROLL_HOST": launcher_host}, worker_dir)):
+        env = dict(os.environ, ANSIROLL_RAW="1", **overrides)
+        completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+        frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+                  if line.startswith("__ANSIROLL_RESULT__ ")]
+        assert frame["result"]["msg"] == expected
+
+
+def test_standalone_vars_files_keep_glob_for_overridden_ternary(tmp_path):
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    plugins = tmp_path / "filter_plugins"
+    plugins.mkdir()
+    (plugins / "custom.py").write_text("""class FilterModule:
+    def filters(self):
+        return {'ternary': lambda value, yes, no: 'custom.yml'}
+""")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - "{{ (group_names is defined) | ternary('a.yml', 'b.yml') }}"
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""")
+    (tmp_path / "custom.yml").write_text("selected: custom\n")
+    plays, _ = parse_playbook(str(playbook))
+    frames = []
+    Runtime({}, "", {"group_names": ["ungrouped"]}, on_result=frames.append).run_play(plays[0])
+    assert [frame["result"]["msg"] for frame in frames] == ["custom"]
 
 
 @pytest.mark.parametrize(("kind", "plugin", "selector"), [

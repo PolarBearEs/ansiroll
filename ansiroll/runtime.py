@@ -42,6 +42,7 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
 _STANDALONE_DEFAULT_GROUP = "ungrouped"
+_STANDALONE_DEFAULT_HOST = "localhost"
 _ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 
 
