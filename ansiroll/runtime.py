@@ -928,6 +928,12 @@ _ANSIBLE_TESTS = {
     ),
 }
 
+_SETUP_VARS_FILE_FILTERS = (
+    "default", "d", "ternary", "lower", "upper", "trim", "replace", "capitalize", "title",
+    "length", "count", "first", "last",
+)
+_SETUP_VARS_FILE_TESTS = ("defined", "undefined", "none", "boolean")
+
 
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name).rsplit(".", 1)[-1]
@@ -1777,6 +1783,28 @@ class _Templater:
             self.env.filters.setdefault(fname, _wrap_filter(func))
         for tname, tfunc in _ANSIBLE_TESTS.items():
             self.env.tests.setdefault(tname, tfunc)
+        for name in (_ANSIBLE_FILTERS.keys() | set(_SETUP_VARS_FILE_FILTERS)):
+            filters.setdefault("ansible.builtin." + name, filters[name])
+            if name in _ANSIBLE_FILTERS or name == "d":
+                filters.setdefault("ansible.legacy." + name, filters[name])
+        for name in _SETUP_VARS_FILE_TESTS:
+            if name in tests:
+                tests.setdefault("ansible.builtin." + name, tests[name])
+                tests.setdefault("ansible.legacy." + name, tests[name])
+        # Remember which implementations may be run twice. Adjacent plugins
+        # can replace an individual filter or test without affecting the rest.
+        self._setup_vars_file_filters = {
+            prefix + name: filters[prefix + name]
+            for prefix in ("", "ansible.builtin.", "ansible.legacy.")
+            for name in _SETUP_VARS_FILE_FILTERS
+            if prefix + name in filters
+        }
+        self._setup_vars_file_tests = {
+            prefix + name: tests[prefix + name]
+            for prefix in ("", "ansible.builtin.", "ansible.legacy.")
+            for name in _SETUP_VARS_FILE_TESTS
+            if prefix + name in tests
+        }
         self.env.filters["ansible._protomatter.dump_object"] = _dump_object
         # Bind the render context so context-dependent lookups ('vars') work.
         self.env.globals.setdefault("lookup", self._g_lookup)
@@ -1874,7 +1902,12 @@ class _Templater:
                 except Exception as e:
                     self._plugin_errors[kind][pname] = str(e)
                     continue
-                target[pname] = _wrap_filter(fn) if kind == "filter" else fn
+                registered = _wrap_filter(fn) if kind == "filter" else fn
+                target[pname] = registered
+                if isinstance(pname, str):
+                    legacy_name = "ansible.legacy." + pname
+                    if dict.__contains__(target, legacy_name):
+                        target[legacy_name] = registered
 
     def _plugin_lookup(self, name, args, kwargs):
         """Run a baked lookup plugin; errors come back captured."""
@@ -3043,6 +3076,9 @@ class Runtime:
 
     def _pre_setup_vars_file_selector(self, source, ctx):
         """Only attempt selectors that can safely render again after setup."""
+        env = self.templater.env
+        safe_filters = self.templater._setup_vars_file_filters
+        safe_tests = self.templater._setup_vars_file_tests
         pending = [source]
         seen = set()
         containers = set()
@@ -3062,15 +3098,14 @@ class Runtime:
                     continue
                 seen.add(value)
                 try:
-                    expr = self.templater.env.parse(value)
+                    expr = env.parse(value)
                 except jinja2.TemplateSyntaxError:
                     return False
                 nodes = jinja2.nodes
                 if (next(expr.find_all(nodes.Call), None) is not None
-                        or any(node.name not in ("default", "d", "ternary", "lower", "upper", "trim", "replace",
-                                                 "capitalize", "title", "length", "count", "first", "last")
+                        or any(node.name not in safe_filters or dict.get(env.filters, node.name) is not safe_filters[node.name]
                                for node in expr.find_all(nodes.Filter))
-                        or any(node.name not in ("defined", "undefined", "none", "boolean")
+                        or any(node.name not in safe_tests or dict.get(env.tests, node.name) is not safe_tests[node.name]
                                for node in expr.find_all(nodes.Test))):
                     return False
                 for node in expr.find_all(nodes.Name):
@@ -3095,7 +3130,7 @@ class Runtime:
             ctx = self.ctx(base=selector_vars)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             for raw in entry["names"]:
-                if before_setup and (play.get("jinja_plugins") or not self._pre_setup_vars_file_selector(raw, ctx)):
+                if before_setup and not self._pre_setup_vars_file_selector(raw, ctx):
                     break
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))

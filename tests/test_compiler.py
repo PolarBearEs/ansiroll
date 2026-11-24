@@ -187,6 +187,10 @@ def test_freezing_allows_explicit_inventory_values(tmp_path, group_vars):
      "config/inventory.yml", "config/fallback.yml"),
     ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml') }}",
      "config/inventory.yml", "config/fallback.yml"),
+    ("{{ (group_names is defined) | ansible.builtin.ternary('config/inventory.yml', 'config/fallback.yml') }}",
+     "config/inventory.yml", "config/fallback.yml"),
+    ("{{ (group_names is defined) | ansible.legacy.ternary('config/inventory.yml', 'config/fallback.yml') }}",
+     "config/inventory.yml", "config/fallback.yml"),
     ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml', 'config/unknown.yml') }}",
      "config/inventory.yml", "config/fallback.yml"),
     ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml', none_val='config/unknown.yml') }}",
@@ -337,20 +341,25 @@ def test_deferred_vars_file_projects_duplicate_aliases_once(tmp_path, monkeypatc
     assert len(parsed) == len(set(parsed)) == 10
 
 
-@pytest.mark.parametrize("selector", [
-    "final.yml",
-    "config/{{ inventory_hostname_short | default('fallback') }}.yml",
-    "config/{{ inventory_hostname_short | default('fallback') | lower }}.yml",
-    "{{ 'config/' ~ (inventory_hostname_short | default('fallback') | lower) ~ '.yml' }}",
-    "{{ base_path }}/{{ inventory_hostname_short | default('fallback') }}.yml",
-    "config/{{ group_names | default([]) | length }}.yml",
-    "config/{{ group_names | count }}.yml",
-    "config/{{ group_names | default(['fallback']) | first }}.yml",
+@pytest.mark.parametrize(("selector", "adjacent_lookup"), [
+    ("final.yml", False),
+    ("config/{{ inventory_hostname_short | default('fallback') }}.yml", False),
+    ("config/{{ inventory_hostname_short | default('fallback') | lower }}.yml", False),
+    ("{{ 'config/' ~ (inventory_hostname_short | default('fallback') | lower) ~ '.yml' }}", False),
+    ("{{ base_path }}/{{ inventory_hostname_short | default('fallback') }}.yml", False),
+    ("config/{{ group_names | default([]) | length }}.yml", False),
+    ("config/{{ group_names | count }}.yml", False),
+    ("config/{{ group_names | default(['fallback']) | first }}.yml", True),
+    ("{{ (group_names is defined) | ansible.builtin.ternary('final.yml', 'fallback.yml') }}", False),
 ])
-def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector):
+def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector, adjacent_lookup):
     from ansiroll.loader import parse_playbook
     from ansiroll.runtime import Runtime
 
+    if adjacent_lookup:
+        lookup_dir = tmp_path / "lookup_plugins"
+        lookup_dir.mkdir()
+        (lookup_dir / "unused.py").write_text("raise AssertionError('unused plugin loaded')\n")
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: all
   gather_facts: true
@@ -381,6 +390,52 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
     runtime.run_play(plays[0])
     assert captured == [("ansible.builtin.setup", {"ANSIROLL_SETUP_PROFILE": "final"})]
     assert runtime.vars["runtime_choice"] == "first"
+
+
+@pytest.mark.parametrize("group_selector", [
+    "(group_names | default(['ungrouped']))[0]",
+    "(group_names | default(['ungrouped']))[-1]",
+    "group_names | ansible.builtin.default(['ungrouped']) | ansible.builtin.first",
+])
+def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, group_selector):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - "{{ %s }}/settings.yml"
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""" % group_selector)
+    (tmp_path / "ungrouped").mkdir()
+    (tmp_path / "ungrouped" / "settings.yml").write_text("selected: group defaults\n")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    env = dict(os.environ, ANSIROLL_RAW="1")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "group defaults"
+
+
+@pytest.mark.parametrize(("kind", "plugin", "selector"), [
+    ("filter", "first", "{{ groups | first }}"),
+    ("filter", "ternary", "{{ true | ansible.legacy.ternary('a', 'b') }}"),
+    ("test", "defined", "{{ groups is defined }}"),
+])
+def test_vars_file_setup_safety_skips_overridden_plugins(kind, plugin, selector):
+    from ansiroll.runtime import Runtime
+
+    runtime = Runtime({}, "", {})
+    ctx = {"groups": ["workers"]}
+    assert runtime._pre_setup_vars_file_selector(selector, ctx)
+    runtime.templater.register_plugins([{"kind": kind, "name": plugin, "source": f"""
+class {kind.title()}Module:
+    def {kind}s(self):
+        return {{'{plugin}': lambda value: value}}
+"""}])
+    assert not runtime._pre_setup_vars_file_selector(selector, ctx)
 
 
 @pytest.mark.parametrize("runtime_vars", ["variant: runtime\n", "- variant: ignored\n- variant: runtime\n"])

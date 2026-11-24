@@ -709,14 +709,21 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
             consume()
             if isinstance(node, nodes.Getattr):
                 member = node.attr
-            elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, str):
+            elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, (str, int)):
                 member = node.arg.value
+            elif (isinstance(node.arg, nodes.Neg) and isinstance(node.arg.node, nodes.Const)
+                  and isinstance(node.arg.node.value, int)):
+                member = -node.arg.node.value
             else:
                 return
             members = (member, *members)
             node = node.node
         if isinstance(node, nodes.Const) and isinstance(node.value, str) and not members:
             yield node.value
+            return
+        if isinstance(node, (nodes.List, nodes.Tuple)):
+            if members and isinstance(members[0], int) and -len(node.items) <= members[0] < len(node.items):
+                yield from project(node.items[members[0]], members[1:], seen)
             return
         if isinstance(node, (nodes.CondExpr, nodes.Filter)):
             branches = _vars_file_choice_branches(node)
@@ -742,16 +749,21 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
                 paths = {prefix + suffix for prefix in paths for suffix in values}
             yield from sorted(paths)
             return
-        if isinstance(node, nodes.Filter) and not members and not (node.dyn_args or node.dyn_kwargs):
-            if node.name in ("lower", "upper", "trim") and not (node.args or node.kwargs):
-                method = "strip" if node.name == "trim" else node.name
+        if isinstance(node, nodes.Filter) and not (node.dyn_args or node.dyn_kwargs):
+            name = node.name
+            if name.startswith(("ansible.builtin.", "ansible.legacy.")):
+                name = name.split(".", 2)[2]
+            if not members and name in ("lower", "upper", "trim") and not (node.args or node.kwargs):
+                method = "strip" if name == "trim" else name
                 yield from (getattr(value, method)() for value in project(node.node, seen=seen))
-            elif node.name in ("default", "d"):
-                yield from project(node.node, seen=seen)
+            elif name in ("default", "d"):
+                yield from project(node.node, members, seen)
                 fallback = node.args[0] if node.args else next(
                     (kw.value for kw in node.kwargs if kw.key == "default_value"), None)
-                if isinstance(fallback, nodes.Const) and isinstance(fallback.value, str):
-                    yield fallback.value
+                if fallback is not None:
+                    yield from project(fallback, members, seen)
+            elif name in ("first", "last") and not (node.args or node.kwargs):
+                yield from project(node.node, (0 if name == "first" else -1, *members), seen)
             return
         if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
             return
@@ -767,8 +779,14 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
             consume()
             value = scope.get(node.name)
             index = 0
-            while index < len(members) and isinstance(value, dict):
-                value = value.get(members[index])
+            while index < len(members):
+                member = members[index]
+                if isinstance(value, dict):
+                    value = value.get(member)
+                elif isinstance(value, (list, tuple)) and isinstance(member, int) and -len(value) <= member < len(value):
+                    value = value[member]
+                else:
+                    break
                 index += 1
             if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
                 literal = value["__ansiroll_unsafe__"]
