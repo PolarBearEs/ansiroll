@@ -41,6 +41,7 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # compiler bakes it into the generated source; target hosts usually have no
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
+_STANDALONE_DEFAULT_GROUP = "ungrouped"
 _ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 
 
@@ -930,7 +931,7 @@ _ANSIBLE_TESTS = {
 
 _SETUP_VARS_FILE_FILTERS = (
     "default", "d", "ternary", "lower", "upper", "trim", "replace", "capitalize", "title",
-    "length", "count", "first", "last",
+    "length", "count", "first", "last", "join",
 )
 _SETUP_VARS_FILE_TESTS = ("defined", "undefined", "none", "boolean")
 
@@ -1783,10 +1784,10 @@ class _Templater:
             self.env.filters.setdefault(fname, _wrap_filter(func))
         for tname, tfunc in _ANSIBLE_TESTS.items():
             self.env.tests.setdefault(tname, tfunc)
-        for name in (_ANSIBLE_FILTERS.keys() | set(_SETUP_VARS_FILE_FILTERS)):
-            filters.setdefault("ansible.builtin." + name, filters[name])
-            if name in _ANSIBLE_FILTERS or name == "d":
-                filters.setdefault("ansible.legacy." + name, filters[name])
+        for name, function in tuple(filters.items()):
+            filters.setdefault("ansible.builtin." + name, function)
+        for name in _ANSIBLE_FILTERS.keys() | {"d"}:
+            filters.setdefault("ansible.legacy." + name, filters[name])
         for name in _SETUP_VARS_FILE_TESTS:
             if name in tests:
                 tests.setdefault("ansible.builtin." + name, tests[name])
@@ -5382,7 +5383,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     host = host_vars.get("inventory_hostname") or _hostname()
     host_vars["inventory_hostname"] = _mark_unsafe(host)
     host_vars.setdefault("inventory_hostname_short", _mark_unsafe(_inventory_hostname_short(host)))
-    host_vars.setdefault("group_names", ["ungrouped"])
+    host_vars.setdefault("group_names", [_STANDALONE_DEFAULT_GROUP])
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}

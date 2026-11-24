@@ -572,6 +572,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_var
                 if filename is None:
                     if unresolved is not None:
                         scopes = [selector_vars, play.get_variable_manager().extra_vars]
+                        if all_vars is None:
+                            from .runtime import _STANDALONE_DEFAULT_GROUP
+
+                            scopes.append({"group_names": [_STANDALONE_DEFAULT_GROUP]})
                         scopes.extend(mapping for previous in unresolved for data in previous.get("files", {}).values()
                                       if isinstance(data, list) for mapping in data)
                         bundled, = _deferred_vars_files(play, basedir, [entry], scopes=scopes)

@@ -350,6 +350,7 @@ def test_deferred_vars_file_projects_duplicate_aliases_once(tmp_path, monkeypatc
     ("config/{{ group_names | default([]) | length }}.yml", False),
     ("config/{{ group_names | count }}.yml", False),
     ("config/{{ group_names | default(['fallback']) | first }}.yml", True),
+    ("config/{{ group_names | default(['fallback']) | ansible.builtin.join('-') }}.yml", False),
     ("{{ (group_names is defined) | ansible.builtin.ternary('final.yml', 'fallback.yml') }}", False),
 ])
 def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypatch, selector, adjacent_lookup):
@@ -393,9 +394,9 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("group_selector", [
-    "(group_names | default(['ungrouped']))[0]",
-    "(group_names | default(['ungrouped']))[-1]",
-    "group_names | ansible.builtin.default(['ungrouped']) | ansible.builtin.first",
+    "(group_names | default(['fallback']))[0]",
+    "(group_names | default(['fallback']))[-1]",
+    "group_names | ansible.builtin.default(['fallback']) | ansible.builtin.first",
 ])
 def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, group_selector):
     from ansiroll import compile_playbook
@@ -410,6 +411,8 @@ def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, gro
 """ % group_selector)
     (tmp_path / "ungrouped").mkdir()
     (tmp_path / "ungrouped" / "settings.yml").write_text("selected: group defaults\n")
+    (tmp_path / "fallback").mkdir()
+    (tmp_path / "fallback" / "settings.yml").write_text("selected: fallback defaults\n")
     compiled = tmp_path / "compiled.py"
     compiled.write_text(compile_playbook(str(playbook))[0])
     env = dict(os.environ, ANSIROLL_RAW="1")
