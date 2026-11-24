@@ -707,7 +707,7 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
             return body[0].nodes[0] if len(body[0].nodes) == 1 else body[0]
         return None
 
-    def project(node, members=(), seen=frozenset()):
+    def project(node, members=(), seen=frozenset(), *, sequence=False):
         consume()
         while isinstance(node, (nodes.Getattr, nodes.Getitem)):
             consume()
@@ -722,21 +722,25 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
                 return
             members = (member, *members)
             node = node.node
-        if isinstance(node, nodes.Const) and isinstance(node.value, str) and not members:
+        if isinstance(node, nodes.Const) and isinstance(node.value, str) and not members and not sequence:
             yield node.value
             return
         if isinstance(node, (nodes.List, nodes.Tuple)):
             if members and isinstance(members[0], int) and -len(node.items) <= members[0] < len(node.items):
-                yield from project(node.items[members[0]], members[1:], seen)
+                yield from project(node.items[members[0]], members[1:], seen, sequence=sequence)
+            elif sequence and not members:
+                consume(len(node.items))
+                if all(isinstance(item, nodes.Const) and isinstance(item.value, str) for item in node.items):
+                    yield tuple(item.value for item in node.items)
             return
         if isinstance(node, (nodes.CondExpr, nodes.Filter)):
             branches = _vars_file_choice_branches(node)
             if branches:
                 for branch in branches:
                     if branch is not None:
-                        yield from project(branch, members, seen)
+                        yield from project(branch, members, seen, sequence=sequence)
                 return
-        if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members:
+        if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members and not sequence:
             paths = {""}
             parts = (node.left, node.right) if isinstance(node, nodes.Add) else node.nodes
             for part in parts:
@@ -757,25 +761,33 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
             name = node.name
             if name.startswith(("ansible.builtin.", "ansible.legacy.")):
                 name = name.split(".", 2)[2]
-            if not members and name in ("lower", "upper", "trim") and not (node.args or node.kwargs):
+            if not (members or sequence or node.args or node.kwargs) and name in ("lower", "upper", "trim"):
                 method = "strip" if name == "trim" else name
                 yield from (getattr(value, method)() for value in project(node.node, seen=seen))
             elif name in ("default", "d"):
-                yield from project(node.node, members, seen)
+                yield from project(node.node, members, seen, sequence=sequence)
                 fallback = node.args[0] if node.args else next(
                     (kw.value for kw in node.kwargs if kw.key == "default_value"), None)
                 if fallback is not None:
-                    yield from project(fallback, members, seen)
+                    yield from project(fallback, members, seen, sequence=sequence)
             elif name in ("first", "last") and not (node.args or node.kwargs):
-                yield from project(node.node, (0 if name == "first" else -1, *members), seen)
+                yield from project(node.node, (0 if name == "first" else -1, *members), seen, sequence=sequence)
+            elif name == "join" and not (members or sequence):
+                arguments = [*node.args, *(kw.value for kw in node.kwargs if kw.key == "d")]
+                if len(arguments) != len(node.args) + len(node.kwargs) or len(arguments) > 1:
+                    return
+                if arguments and not (isinstance(arguments[0], nodes.Const) and isinstance(arguments[0].value, str)):
+                    return
+                delimiter = arguments[0].value if arguments else ""
+                yield from (delimiter.join(items) for items in project(node.node, seen=seen, sequence=True))
             return
         if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
             return
         if node.name == "playbook_dir":
-            if not members:
+            if not members and not sequence:
                 yield basedir
             return
-        binding = node.name, members
+        binding = node.name, members, sequence
         if binding in seen:
             return
         aliases = set()
@@ -792,15 +804,20 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
                 else:
                     break
                 index += 1
+            if sequence and index == len(members) and isinstance(value, (list, tuple)):
+                consume(len(value))
+                if all(isinstance(item, str) and not _is_templated(item) for item in value):
+                    yield tuple(value)
+                continue
             if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
                 literal = value["__ansiroll_unsafe__"]
-                if index == len(members) and isinstance(literal, str) and not _is_templated(literal):
+                if not sequence and index == len(members) and isinstance(literal, str) and not _is_templated(literal):
                     yield literal
                 continue
             if not isinstance(value, str):
                 continue
             if not _is_templated(value):
-                if index == len(members):
+                if not sequence and index == len(members):
                     yield value
                 continue
             remaining_members = members[index:]
@@ -811,7 +828,7 @@ def _known_vars_file_path_values(expression, scopes, env, basedir):
             if value not in parsed:
                 parsed[value] = parse_alias(value)
             if parsed[value] is not None:
-                yield from project(parsed[value], remaining_members, seen | {binding})
+                yield from project(parsed[value], remaining_members, seen | {binding}, sequence=sequence)
 
     try:
         return tuple(dict.fromkeys(project(expression)))

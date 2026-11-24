@@ -349,6 +349,7 @@ def test_deferred_vars_file_projects_duplicate_aliases_once(tmp_path, monkeypatc
     ("{{ base_path }}/{{ inventory_hostname_short | default('fallback') }}.yml", False),
     ("config/{{ group_names | default([]) | length }}.yml", False),
     ("config/{{ group_names | count }}.yml", False),
+    ("{{ 'final.yml' if group_names | default([]) | length | int else 'fallback.yml' }}", False),
     ("config/{{ group_names | default(['fallback']) | first }}.yml", True),
     ("config/{{ group_names | default(['fallback']) | ansible.builtin.join('-') }}.yml", False),
     ("{{ (group_names is defined) | ansible.builtin.ternary('final.yml', 'fallback.yml') }}", False),
@@ -397,6 +398,7 @@ def test_vars_file_after_a_deferred_entry_is_visible_to_setup(tmp_path, monkeypa
     "(group_names | default(['fallback']))[0]",
     "(group_names | default(['fallback']))[-1]",
     "group_names | ansible.builtin.default(['fallback']) | ansible.builtin.first",
+    "group_names | default(['fallback']) | ansible.builtin.join('-')",
 ])
 def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, group_selector):
     from ansiroll import compile_playbook
@@ -420,6 +422,16 @@ def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, gro
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
     assert frame["result"]["msg"] == "group defaults"
+
+
+def test_deferred_vars_file_projects_qualified_join_of_known_and_fallback_lists(tmp_path):
+    from ansiroll.loader import _known_vars_file_choices
+
+    scopes = [{"groups_alias": "{{ config.groups }}", "config": {"groups": ["web", "prod"]}}]
+    selector = "{{ groups_alias | default(['ungrouped', 'local']) | ansible.builtin.join(d='-') }}/settings.yml"
+    choices, exhaustive = _known_vars_file_choices(selector, scopes, str(tmp_path))
+    assert set(choices) == {"web-prod/settings.yml", "ungrouped-local/settings.yml"}
+    assert not exhaustive
 
 
 @pytest.mark.parametrize(("kind", "plugin", "selector"), [
