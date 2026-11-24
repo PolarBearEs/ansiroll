@@ -1190,19 +1190,19 @@ class _LazyTplDict(dict):
 
     def pop(self, key, *default):
         if key in self:
-            return self._mutation_value(dict.pop(self, key, *default))
+            return self._mutation_value(key, dict.pop(self, key, *default))
         return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return self._rt.templater._observe_untrusted(key), self._mutation_value(value)
+        return self._rt.templater._observe_untrusted(key), self._mutation_value(key, value)
 
     def setdefault(self, key, default=None):
         if key in self:
-            return self._mutation_value(dict.__getitem__(self, key))
+            return self._mutation_value(key, dict.__getitem__(self, key))
         return dict.setdefault(self, key, default)
 
-    def _mutation_value(self, value):
+    def _mutation_value(self, key, value):
         if self._task_vars:
             return self._read_member(value)
         return _observe_container_value(value, self._rt, self._render_ctx)
@@ -1220,10 +1220,8 @@ class _LazyTplDict(dict):
 
     def copy(self):
         raw_items = dict.items(self)
-        if self._task_vars:
-            return _TaskMappingSnapshot(self, {key: _TaskMappingMember(value) for key, value in raw_items})
-        if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
-            return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())
+        if self._task_vars or any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
+            return _LazyMappingSnapshot(self, {key: _SnapshotBinding(value) for key, value in raw_items})
         return {k: self[k] for k in self}
 
     def __iter__(self):
@@ -1253,35 +1251,38 @@ class _LazyTplDict(dict):
     __hash__ = None
 
 
-class _TaskMappingMember:
-    """An inherited binding whose first result is shared by snapshot copies."""
+class _SnapshotBinding:
+    """Distinguish inherited bindings from values written into a copy."""
 
     _resolved = False
 
     def __init__(self, value):
-        self._value = value
+        self.source = value
 
-    def resolve(self, snapshot):
+    def resolve(self, read):
         if not self._resolved:
-            self._value = _read_lazy_member(snapshot, self._value)
+            self._value = read(self.source)
             self._resolved = True
         return self._value
 
 
-class _TaskMappingSnapshot(_LazyTplDict):
+class _LazyMappingSnapshot(_LazyTplDict):
     """A shallow copy with deferred source bindings and ordinary dict writes."""
 
     def __init__(self, source, bindings):
-        super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=True)
+        super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=source._task_vars)
         self._task_binding = getattr(source, "_task_binding", None)
 
     def _read_member(self, value):
-        if isinstance(value, _TaskMappingMember):
-            value = value.resolve(self)
+        if isinstance(value, _SnapshotBinding):
+            value = value.resolve(super()._read_member)
         return self._rt.templater._observe_untrusted(value)
 
+    def _mutation_value(self, key, value):
+        return self._read_member(value)
+
     def copy(self):
-        return _TaskMappingSnapshot(self, dict(dict.items(self)))
+        return _LazyMappingSnapshot(self, dict(dict.items(self)))
 
 
 class _HandlerNameVars(_LazyTplDict):
@@ -1444,7 +1445,9 @@ class _PlayVarView(dict):
             self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
 
     def __getitem__(self, key):
-        value = dict.__getitem__(self, key)
+        return self._read_variable(key, dict.__getitem__(self, key))
+
+    def _read_variable(self, key, value):
         if key == "vars":
             return value
         if not self._loop_snapshot:
@@ -1523,7 +1526,8 @@ class _HostVarView(_LazyTplDict):
     def copy(self):
         # Copy the current bindings without resolving them or rebuilding the
         # view from its original host data. Preserve its existing resolver.
-        raw = dict(dict.items(self))
+        raw = (dict(dict.items(self)) if self._resolved_values is not None else
+               {key: _SnapshotBinding(value) for key, value in dict.items(self)})
         view = dict.__new__(type(self))
         view.__dict__.update(self.__dict__)
         view._raw = raw
@@ -1539,18 +1543,27 @@ class _HostVarView(_LazyTplDict):
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
+        templater = self._rt.templater
         if self._resolved_values is None:
             result = self._read_host_value(key, value)
+        elif not isinstance(value, _SnapshotBinding):
+            result = templater._observe_untrusted(value)
         else:
-            binding = key, id(value)
+            source = value.source
+            binding = key, id(source)
             if binding not in self._resolved_values:
-                result = self._read_host_value(key, value)
+                result = self._read_host_value(key, source)
                 if self._mark_lookup_data:
                     result = _mark_unsafe(result)
-                self._resolved_values[binding] = value, result
-            result = self._resolved_values[binding][1]
-        converted = self._rt.templater._custom_plugin_args
+                self._resolved_values[binding] = source, result
+            result = templater._observe_untrusted(self._resolved_values[binding][1])
+        converted = templater._custom_plugin_args
         return _custom_plugin_arg(result, converted) if converted is not None else result
+
+    def _mutation_value(self, key, value):
+        if self._resolved_values is not None:
+            return self._resolve(key, value)
+        return super()._mutation_value(key, value)
 
     def _read_host_value(self, key, value):
         return _read_lazy_member(self, value)
@@ -1591,17 +1604,8 @@ class _TaskHostVarView(_HostVarView):
             value = self._host[key]
         return templater.resolve_variable(key, value, self._ctx, strict=self._ctx.strict)
 
-    def pop(self, key, *default):
-        if key in self:
-            return self._resolve(key, dict.pop(self, key, *default))
-        return dict.pop(self, key, *default)
-
-    def popitem(self):
-        key, value = dict.popitem(self)
-        return key, self._resolve(key, value)
-
-    def setdefault(self, key, default=None):
-        return self[key] if key in self else dict.setdefault(self, key, default)
+    def _mutation_value(self, key, value):
+        return self._resolve(key, value)
 
 
 class _HostVarEntries(MutableSequence):
@@ -1743,17 +1747,22 @@ class _DeferredPlayVarView(_ModernPlayVarView):
     """Read deferred agent and controller aliases through the magic vars mapping."""
 
     _preserve_legacy_sources = False
+    _is_snapshot = False
 
     def __init__(self, snapshot, scope, loop_snapshot=False):
         super().__init__(snapshot, scope, loop_snapshot)
         self._legacy_iteration = not _core_at_least(2, 19)
 
     def __getitem__(self, key):
-        if self._loop_snapshot:
-            return super().__getitem__(key)
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
+        if self._is_snapshot:
+            if not isinstance(value, _SnapshotBinding):
+                return self.scope.templater._observe_untrusted(value)
+            value = value.source
+        if self._loop_snapshot:
+            return self._read_variable(key, value)
         if key == "vars":
             return value
         if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
@@ -1764,6 +1773,10 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         if not self._legacy_iteration:
             return self[key]
         source = dict.__getitem__(self, key)
+        if self._is_snapshot:
+            if not isinstance(source, _SnapshotBinding):
+                return self.scope.templater._observe_untrusted(source)
+            source = source.source
         if isinstance(source, _PlayVarTemplate):
             return str(source)
         if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
@@ -1778,7 +1791,13 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         return _DeferredVarValues(self) if self._legacy_iteration else ValuesView(self)
 
     def copy(self):
-        return type(self)(dict(dict.items(self)), self.scope, self._loop_snapshot)
+        raw = (dict(dict.items(self)) if self._is_snapshot else
+               {key: _SnapshotBinding(value) for key, value in dict.items(self)})
+        view = dict.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        view._is_snapshot = True
+        dict.__init__(view, raw)
+        return view
 
     def pop(self, key, *default):
         if key in self:
@@ -1830,27 +1849,26 @@ class _LazyTplList(list):
     def __getitem__(self, i):
         v = list.__getitem__(self, i)
         if isinstance(i, slice):
-            return [_read_lazy_member(self, x) for x in v]
-        return _read_lazy_member(self, v)
+            return [self._read_member(x) for x in v]
+        return self._read_member(v)
+
+    def _read_member(self, value):
+        return _read_lazy_member(self, value)
 
     def __iter__(self):
         for v in list.__iter__(self):
-            yield _read_lazy_member(self, v)
+            yield self._read_member(v)
 
     def pop(self, index=-1):
         value = list.pop(self, index)
         if self._task_vars:
-            return _read_lazy_member(self, value)
+            return self._read_member(value)
         return _observe_container_value(value, self._rt, self._render_ctx)
 
     def copy(self):
         values = list.copy(self)
-        if self._delegated:
-            return _LazyTplList(values, self._rt, self._render_ctx(), delegated=True)
-        if self._task_vars:
-            copied = _LazyTplList(values, self._rt, self._ctx, self._dynamic, self._origin, task_vars=True)
-            copied._task_binding = getattr(self, "_task_binding", None)
-            return copied
+        if self._delegated or self._task_vars:
+            return _LazyListSnapshot(self, [_SnapshotBinding(value) for value in values])
         return _observe_container_value(values, self._rt, self._render_ctx)
 
     def remove(self, item):
@@ -1934,6 +1952,26 @@ class _LazyTplList(list):
         return NotImplemented if equal is NotImplemented else not equal
 
     __hash__ = None
+
+
+class _LazyListSnapshot(_LazyTplList):
+    """A shallow copy that resolves inherited list members on demand."""
+
+    def __init__(self, source, bindings):
+        super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin,
+                         task_vars=source._task_vars, delegated=source._delegated)
+        self._task_binding = getattr(source, "_task_binding", None)
+
+    def _read_member(self, value):
+        if isinstance(value, _SnapshotBinding):
+            value = value.resolve(super()._read_member)
+        return self._rt.templater._observe_untrusted(value)
+
+    def pop(self, index=-1):
+        return self._read_member(list.pop(self, index))
+
+    def copy(self):
+        return _LazyListSnapshot(self, list.copy(self))
 
 
 class _LazyTplTuple(tuple):

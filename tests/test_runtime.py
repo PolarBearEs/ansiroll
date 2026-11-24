@@ -145,6 +145,46 @@ def test_copy_of_deferred_task_mapping_renders_only_selected_member(expression):
     assert calls == ["chosen"]
 
 
+@pytest.mark.parametrize(("mutation", "read"), [
+    ("copied.append(source)", "copied[-1]"),
+    ("copied.extend([source])", "copied.copy().pop()"),
+    ("copied.insert(0, source)", "(copied[:1] | first)"),
+])
+def test_task_list_copy_keeps_written_values_literal(mutation, read):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Write a copied list", "debug", loop=["sample"], vars={
+        "rows": ["{{ lookup('unread') }}/tail", "{{ item }}"],
+    })
+    template = ("{% set copied = rows.copy() %}{{ copied[1] }}|"
+                "{% set source = \"{{ lookup('written') }}\" %}"
+                "{% set ignored = " + mutation + " %}{{ " + read + " }}")
+    assert runtime.template(template, runtime._task_ctx(task, {"item": "sample"})) == (
+        "sample|{{ lookup('written') }}")
+    assert not calls
+
+
+@pytest.mark.parametrize("mapping", ["vars", "hostvars[inventory_hostname]", "hostvars.other"])
+@pytest.mark.parametrize(("mutation", "read"), [
+    ("copied.setdefault('new', source)", "copied.new"),
+    ("copied.update({'original': source})", "copied.copy().pop('original')"),
+])
+def test_magic_mapping_copy_keeps_written_values_literal(mapping, mutation, read):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "original": 17,
+                               "hostvars": {"h": {"original": 17}, "other": {"original": 17}}})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Write copied magic variables", "debug", vars={
+        "unused": "{{ lookup('unread') }}/tail",
+    })
+    template = ("{% set copied = " + mapping + ".copy() %}{{ copied.original }}|"
+                "{% set source = \"{{ lookup('written') }}\" %}"
+                "{% set ignored = " + mutation + " %}{{ " + read + " }}")
+    assert runtime.template(template, runtime._task_ctx(task, {})) == "17|{{ lookup('written') }}"
+    assert not calls
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",
@@ -1526,6 +1566,28 @@ def test_conditional_rendering_tracks_marked_list_reads(expression):
     ctx["item"] = "sample"
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_delegated_container_copies_keep_written_values_literal(mapping):
+    from ansiroll.runtime import _DelegatedTemplateValue, _lazy_container
+
+    runtime = Runtime({}, "", {})
+    reads = []
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("looked up " + name)
+    member = _DelegatedTemplateValue(lambda: reads.append("source") or 17)
+    literal = "{{ lookup('written') }}"
+    raw = {"source": member} if mapping else [member]
+    copied = _lazy_container(raw, runtime, {}, delegated=True).copy()
+    if mapping:
+        copied.update(written=literal)
+        assert copied.copy()["written"] == literal
+    else:
+        copied.append(literal)
+        assert copied.copy()[-1] == literal
+    assert not reads
+    assert copied["source" if mapping else 0] == 17
+    assert reads == ["source"]
 
 
 def test_delegated_list_mutations_compare_resolved_values():
