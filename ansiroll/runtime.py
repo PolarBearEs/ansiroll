@@ -17,6 +17,7 @@ installed Jinja2.
 
 import datetime as _dt
 import base64
+from decimal import Decimal
 import json
 import os
 import struct
@@ -2789,6 +2790,7 @@ class Runtime:
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
+                timeout_template=play.get("gather_timeout_template"),
             )
             if not gathered:
                 self.failed = True
@@ -4748,9 +4750,35 @@ class Runtime:
             self._flushing = False
 
     # ---- facts -----------------------------------------------------------
+    def _gather_timeout_for_run(self, timeout, template, setup_ctx):
+        if not template or not (template.get("required") or self.extra_vars.keys() & template["names"]):
+            return timeout
+        scope = self.ctx(template["vars"], self.extra_vars, base={
+            "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
+        })
+        value = _fail_on_undef(self.template(template["source"], scope, strict=True))
+        if value == _OMIT:
+            return template["omit_default"]
+        if value is None:
+            if not _legacy_non_native(scope):
+                return None
+            # Legacy Ansible returns a bare null variable directly. Other
+            # expressions that yield null render as an empty, invalid timeout.
+            bare = re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", template["source"])
+            if not (bare and bare[1] in scope and scope[bare[1]] is None):
+                raise ValueError("gather_timeout must be an integer")
+            value = template.get("null_representation")
+            if value is None:
+                return None
+        if _core_at_least(2, 18) and not isinstance(value, int):
+            value = Decimal(value)
+            if not value.is_finite() or value != value.to_integral_value():
+                raise ValueError("gather_timeout must be an integer")
+        return int(value)
+
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     gather_timeout=None):
+                     gather_timeout=None, timeout_template=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -4777,6 +4805,7 @@ class Runtime:
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
             setup_args = {}
+            gather_timeout = self._gather_timeout_for_run(gather_timeout, timeout_template, ctx)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                 setup_args["gather_timeout"] = gather_timeout
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()

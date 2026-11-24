@@ -151,8 +151,8 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         basedir = os.path.abspath(getattr(play, "_included_path", None) or pb_dir)
         loader.set_basedir(basedir)
         node = _convert_play(play, actions, basedir, runtime_writes=runtime_writes)
-        if "gather_timeout" in node:
-            node["gather_timeout"] = _compile_gather_timeout(play, vm, loader)
+        if node["gather_facts"] and "gather_timeout" in (play.get_ds() or {}):
+            node.update(_compile_gather_timeout(play, vm, loader))
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -162,6 +162,9 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
 
 def _compile_gather_timeout(play, variable_manager, loader):
     """Validate the play keyword in the same controller scope as Ansible."""
+    from ansible.errors import AnsibleError, AnsibleUndefinedVariable
+    from jinja2 import UndefinedError
+
     if _core_version() >= (2, 19):
         from ansible._internal._templating._engine import TemplateEngine as Templar
     else:
@@ -173,8 +176,59 @@ def _compile_gather_timeout(play, variable_manager, loader):
     timeout_play.hosts = ["all"]
     timeout_play.gather_timeout = play.gather_timeout
     variables = variable_manager.get_vars(play=play)
-    timeout_play.post_validate(Templar(loader=loader, variables=variables))
-    return timeout_play.gather_timeout
+    runtime = _gather_timeout_template(play.gather_timeout, variables)
+    try:
+        timeout_play.post_validate(Templar(loader=loader, variables=variables))
+    except AnsibleError as error:
+        cause = error
+        while cause is not None and not isinstance(cause, (AnsibleUndefinedVariable, UndefinedError)):
+            cause = cause.__cause__ or getattr(cause, "orig_exc", None)
+        if runtime is None or cause is None:
+            raise
+        runtime["required"] = True
+        timeout_play.gather_timeout = None
+    result = {"gather_timeout": timeout_play.gather_timeout}
+    if runtime is not None:
+        result["gather_timeout_template"] = runtime
+    return result
+
+
+def _gather_timeout_template(source, variables):
+    """Keep variable expressions that can render without controller calls."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    if not isinstance(source, str) or not _is_templated(source) or not isinstance(_tag_untrusted(source), str):
+        return None
+    env = Environment()
+    pending = [source]
+    scope = {}
+    names = set()
+    while pending:
+        try:
+            expression = env.parse(pending.pop())
+        except TemplateSyntaxError:
+            return None
+        if next(expression.find_all(nodes.Call), None) is not None:
+            return None
+        for name in {node.name for node in expression.find_all(nodes.Name) if node.ctx == "load"} - names:
+            if name == "omit":
+                continue
+            names.add(name)
+            if name not in variables:
+                continue
+            value = variables[name]
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                return None
+            scope[name] = _tag_untrusted(value)
+            if isinstance(scope[name], str) and _is_templated(value):
+                pending.append(value)
+    if names:
+        from ansible import constants as C
+
+        return {"source": source, "vars": scope, "names": sorted(names),
+                "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
+                "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
+    return None
 
 
 def _playbook_read_path(path):
@@ -455,8 +509,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "tasks": tasks,
         "handlers": handlers,
     }
-    if gather and "gather_timeout" in (play.get_ds() or {}):
-        result["gather_timeout"] = play.gather_timeout
     if unresolved_vars_files:
         result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
     names = _controller_env_names(result)

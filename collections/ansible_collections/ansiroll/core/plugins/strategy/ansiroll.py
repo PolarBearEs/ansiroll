@@ -395,7 +395,7 @@ class StrategyModule(StrategyBase):
         if gather_task is not None:
             play_node["gather_when"] = _conditions(gather_task.when)
             play_node["gather_no_log"] = gather_task.no_log
-            if "gather_timeout" in play_node:
+            if "gather_timeout" in (play.get_ds() or {}):
                 play_node["gather_timeout"] = gather_task.args.get("gather_timeout")
 
         embedder = ModuleEmbedder()

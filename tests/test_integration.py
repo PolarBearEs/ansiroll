@@ -2298,6 +2298,54 @@ def test_compile_does_not_expand_an_unsafe_gather_timeout(tmp_path):
         compile_playbook(str(playbook))
 
 
+def test_compile_does_not_bundle_controller_timeout_input(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TEST_TIMEOUT_INPUT", "only-the-length-is-needed")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_timeout: '{{ lookup("env", "ANSIROLL_TEST_TIMEOUT_INPUT") | length }}'
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == len("only-the-length-is-needed")
+    assert "ANSIROLL_TEST_TIMEOUT_INPUT" not in json.dumps(plan)
+    assert "only-the-length-is-needed" not in json.dumps(plan)
+
+
+@pytest.mark.parametrize("default_filter", ["", " | default(23)"])
+def test_standalone_gather_timeout_uses_run_extra_vars(tmp_path, monkeypatch, default_filter):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_timeout: '{{ override_timeout%s }}'\n  tasks: []\n"
+                        % default_filter)
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"override_timeout": 45})
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        return {"ansible_facts": {}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_legacy_runtime_timeout_treats_bare_null_as_omitted(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {}, extra_vars={"override_timeout": None})
+    context = {"__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": False}}
+    template = {"source": "{{ override_timeout }}", "vars": {}, "names": ["override_timeout"]}
+    assert runtime._gather_timeout_for_run(23, template, context) is None
+    template["null_representation"] = "42"
+    assert runtime._gather_timeout_for_run(23, template, context) == 42
+    template["source"] = "{{ override_timeout | default(23) }}"
+    with pytest.raises(ValueError, match="gather_timeout must be an integer"):
+        runtime._gather_timeout_for_run(23, template, context)
+
+
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):
     import jinja2
 
