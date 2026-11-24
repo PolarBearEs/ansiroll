@@ -8,10 +8,12 @@ inlined runtime can interpret. This module runs only at compile time.
 
 from __future__ import annotations
 
+import errno
 import os
 import pkgutil
 import re
 import stat
+import time
 from copy import copy
 from functools import lru_cache
 
@@ -1909,6 +1911,22 @@ def _find_needle(task, subdir, rel):
     return path if os.path.isfile(path) else None
 
 
+class _RoleSourceLeaseError(ValueError):
+    pass
+
+
+def _open_role_source(path):
+    for attempt in range(5):
+        try:
+            return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as ex:
+            if ex.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+            if attempt == 4:
+                raise _RoleSourceLeaseError("cannot bake role source %r while a write lease is active" % path) from ex
+            time.sleep(0.05)
+
+
 def _bake_absolute_tree(node, src, basedir, with_meta):
     """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
     separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
@@ -1979,6 +1997,165 @@ def _literal_head(src):
     return src[:m.start()] if m else src
 
 
+def _literal_role_source_tail(src):
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    from .runtime import _bare_template_expression
+
+    if _bare_template_expression(src) is not None:
+        return ""
+    try:
+        body = Environment(keep_trailing_newline=True).parse(src).body
+    except TemplateSyntaxError:
+        return ""
+    if body and isinstance(body[-1], nodes.Output):
+        output = body[-1].nodes
+        if output and isinstance(output[-1], nodes.TemplateData):
+            return output[-1].data
+    return ""
+
+
+def _role_source_layout(base, walk):
+    """Record directory traversal for a role search root."""
+    real_base = os.path.realpath(base)
+    directories, aliases = set(), {}
+    for root, dirs, _ in walk:
+        directory = os.path.relpath(root, base)
+        while directory not in directories:
+            directories.add(directory)
+            directory = os.path.dirname(directory) or "."
+        for name in dirs:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                aliases[os.path.relpath(path, base)] = os.path.relpath(os.path.realpath(path), real_base)
+    return directories, aliases
+
+
+def _role_source_mode(path):
+    try:
+        return os.stat(path).st_mode
+    except OSError:
+        return None
+
+
+def _role_traversal_duplicates(claimed, special_paths, directories, aliases, literal_tail):
+    """Find normalized files whose spelling can traverse a special file."""
+    if not special_paths:
+        return set()
+
+    from collections import deque
+
+    children, parents = {}, {}
+    for path in (directories | aliases.keys()) - {"."}:
+        parent, name = os.path.split(path)
+        parent = parent or "."
+        target = aliases.get(path, path)
+        children.setdefault(parent, {})[name] = target
+        parents.setdefault(target, set()).add(parent)
+
+    def parent_of(path):
+        return (os.path.dirname(path) or ".") if path != "." else None
+
+    # A child/parent pair leaves the normalized path unchanged. Only explore
+    # nontrivial pairs and ancestors that can contain them.
+    affected = {parent_of(path) for path, target in aliases.items()
+                if target != "." and parent_of(path) != parent_of(target)}
+    if all(path.count(os.sep) == target.count(os.sep) and target != "." for path, target in aliases.items()):
+        # A depth-preserving walk can only end elsewhere if an alias leaves
+        # the subtree of the starting directory.
+        affected = {ancestor for path, target in aliases.items()
+                    for ancestor in _role_directory_parents(path)
+                    if ancestor != "." and not target.startswith(ancestor + os.sep)}
+    else:
+        pending = list(affected)
+        while pending:
+            for parent in parents.get(pending.pop(), ()):
+                if parent not in affected:
+                    affected.add(parent)
+                    pending.append(parent)
+
+    arrivals, seen, waiting, work = {}, {}, {}, deque()
+
+    def add(start, end):
+        if end not in seen.setdefault(start, set()):
+            seen[start].add(end)
+            arrivals.setdefault(start, []).append(end)
+            work.append((start, end))
+
+    def destinations(start):
+        if start not in affected:
+            yield start
+            return
+        add(start, start)
+        index = 0
+        while index < len(arrivals[start]) or work:
+            if index < len(arrivals[start]):
+                yield arrivals[start][index]
+                index += 1
+                continue
+            origin, current = work.popleft()
+            if current != ".":
+                for outer in waiting.get(origin, ()):
+                    add(outer, parent_of(current))
+            for child in children.get(current, {}).values():
+                if child not in affected:
+                    parent = parent_of(child)
+                    if parent is not None:
+                        add(origin, parent)
+                    continue
+                waiters = waiting.setdefault(child, set())
+                if origin in waiters:
+                    continue
+                waiters.add(origin)
+                add(child, child)
+                # A child may have been visited before this query needed it.
+                for reached in tuple(arrivals[child]):
+                    if reached != ".":
+                        add(origin, parent_of(reached))
+
+    normalized_tail = os.path.normpath(os.sep.join(literal_tail)).split(os.sep) if literal_tail else []
+    pops = 0
+    while pops < len(normalized_tail) and normalized_tail[pops] == "..":
+        pops += 1
+    ending = normalized_tail[pops:]
+    special_names = {os.path.basename(path) for path in special_paths}
+
+    def reaches_special(parent, tail):
+        for part in tail[:-1]:
+            if part == "..":
+                parent = parent_of(parent)
+            elif part not in ("", "."):
+                parent = children.get(parent, {}).get(part)
+            if parent is None:
+                return False
+        return os.path.normpath(os.path.join(parent, tail[-1])) in special_paths
+
+    duplicates = set()
+    for path in claimed:
+        parts = path.split(os.sep)
+        if parts[-1] not in special_names or (ending and parts[-len(ending):] != ending):
+            continue
+        prefix = parts[:-(len(ending) or 1)]
+        current = {"."}
+        for component in prefix:
+            current = {child for start in current for parent in destinations(start)
+                       if (child := children.get(parent, {}).get(component))}
+        # The fixed tail may pop directories supplied by the variable.
+        for _ in range(pops):
+            current = {child for start in current for parent in destinations(start)
+                       for child in children.get(parent, {}).values()}
+        tail = literal_tail or parts[-1:]
+        if any(reaches_special(parent, tail) for start in current for parent in destinations(start)):
+            duplicates.add(path)
+    return duplicates
+
+
+def _role_directory_parents(path):
+    while path != ".":
+        path = os.path.dirname(path) or "."
+        yield path
+
+
 def _bake_search_tree(node, task, basedir, subdir, src):
     """Bake every file a dynamic role src could resolve to under the action's search dirs, keyed by path relative to
     its search dir; the first dir wins, as in _find_needle. Without a literal subdir in the src, only the templates/
@@ -1993,51 +2170,227 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             return False
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
-    baked = {}
-    meta = {}
+    tail = _literal_role_source_tail(src)
+    fixed_path = ""
+    literal_tail = ()
+    if os.sep in tail:
+        trailing_components = tail.partition(os.sep)[2].split(os.sep)
+        basename = trailing_components[-1]
+        if basename not in ("", ".", ".."):
+            # Extra separators are no-ops inside this relative suffix.
+            literal_tail = tuple(part for part in trailing_components if part)
+            # Parent traversal can change the starting directory, but the
+            # literal components after the last ".." still constrain the path.
+            start = max((index + 1 for index, part in enumerate(literal_tail) if part == ".."), default=0)
+            suffix = os.sep.join(literal_tail[start:])
+            fixed_path = os.sep + os.path.normpath(suffix).lstrip(os.sep)
+    trees = []
     directories = set()
     aliases = {}
+    # Before 2.21 Ansible compared the byte path component to a text dirname.
+    explicit_subdir = _literal_head(src).startswith(subdir + "/") and _core_version() >= (2, 21)
+    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True, explicit_subdir=explicit_subdir):
+        walk = []
+        if prefix or is_subdir:
+            for root, dirs, files in os.walk(os.path.join(base, prefix)):
+                dirs.sort()
+                if fixed_path:
+                    files = [basename] if basename in files else []
+                walk.append((root, dirs, files))
+        root_dirs, root_aliases = _role_source_layout(base, walk)
+        trees.append((base, is_subdir, walk, root_dirs, root_aliases))
+        directories.update(root_dirs)
+        for relative, target in root_aliases.items():
+            aliases.setdefault(relative, target)
+    aliases = {path: target for path, target in aliases.items() if target in directories}
+    suffix = fixed_path[1:].split(os.sep) if os.sep in fixed_path[1:] else ()
+
+    def matches_suffix(relative, filename, alias_candidates):
+        if fixed_path and not ((os.sep + relative).endswith(fixed_path) or relative in alias_candidates):
+            return False
+        return os.sep in tail or filename.endswith(tail)
+
+    baked, meta = {}, {}
+    alternate_meta = {}
+    claimed = set()
     skipped = []
-    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True):
+    deferred_duplicates = {}
+    blockers, shadowed, source_roots = {}, {}, []
+
+    def bake_source(full, rel, root_index, alternate):
+        _, _, root_blocks, root_files = source_roots[root_index]
+        claimed.add(rel)
+        key = "\0%d\0%s" % (root_index, rel) if alternate else rel
+        root_files[rel] = key
+        if rel in blockers:
+            shadowed.setdefault(rel, set()).add(root_index)
+        try:
+            # The path may have become a FIFO after the file check.
+            try:
+                fd = _open_role_source(full)
+            except OSError as ex:
+                # A replacement special file can fail open before fstat.
+                if ex.errno not in (errno.ENXIO, errno.EACCES):
+                    raise
+                mode = os.stat(full).st_mode
+                if stat.S_ISREG(mode):
+                    raise
+            else:
+                try:
+                    st = os.fstat(fd)
+                    mode = st.st_mode
+                    if stat.S_ISREG(mode):
+                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape",
+                                       closefd=False) as fh:
+                            baked[key] = fh.read()
+                finally:
+                    os.close(fd)
+        except _RoleSourceLeaseError as ex:
+            baked[key] = {"__ansiroll_source_error__": str(ex)}
+            shadowed.setdefault(rel, set()).add(root_index)
+            return
+        except OSError as ex:
+            if not isinstance(ex, (FileNotFoundError, NotADirectoryError)) and ex.errno != errno.ELOOP:
+                baked[key] = {"__ansiroll_source_error__": str(ex)}
+                shadowed.setdefault(rel, set()).add(root_index)
+                return
+            if not alternate:
+                claimed.remove(rel)
+                shadowed.pop(rel, None)
+            elif rel in shadowed:
+                shadowed[rel].discard(root_index)
+            del root_files[rel]
+            return
+        if not stat.S_ISREG(mode):
+            if not alternate:
+                claimed.remove(rel)
+            del root_files[rel]
+            root_blocks[rel] = stat.S_ISDIR(mode)
+            blockers.setdefault(rel, set()).add(root_index)
+            if rel in shadowed:
+                shadowed[rel].discard(root_index)
+            return
+        if alternate:
+            alternate_meta[key] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime,
+                                   "uid": st.st_uid, "mode": stat.S_IMODE(st.st_mode)}
+            return
+        meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
+                     "mode": stat.S_IMODE(st.st_mode)}
+
+    for base, is_subdir, walk, root_dirs, root_aliases in trees:
+        root_index = len(source_roots)
+        # The blocker's flag records whether copy would recurse into it.
+        root_blocks, root_files = {}, {}
+        source_roots.append((root_dirs, root_aliases, root_blocks, root_files))
         if not prefix and not is_subdir:
-            skipped.append(base)
+            skipped.append((base, root_index))
             continue
-        real_base = os.path.realpath(base)
-        for root, dirs, files in os.walk(os.path.join(base, prefix)):
-            dirs.sort()
-            directories.add(os.path.relpath(root, base))
+        alias_candidates = set()
+        if suffix and root_aliases:
+            # The rendered prefix can reach any directory in this search root.
+            # Follow the literal suffix with this root's aliases.
+            reachable = root_dirs
+            for component in suffix[:-1]:
+                children = (os.path.normpath(os.path.join(directory, component)) for directory in reachable)
+                reachable = {target for child in children if (target := root_aliases.get(child, child)) in root_dirs}
+            alias_candidates = {os.path.normpath(os.path.join(directory, suffix[-1])) for directory in reachable}
+        special_paths = set()
+        # Canceling a sibling alias with ".." returns to the same parent.
+        # A walked regular file can only differ from the traversed source
+        # after a symlink changes the parent reached by "..".
+        redirects_parent = any(os.path.dirname(path) != os.path.dirname(target)
+                               for path, target in root_aliases.items())
+        if redirects_parent and claimed:
+            claimed_names = {os.path.basename(relative) for relative in claimed}
+            # A traversed special file and its normalized payload have the
+            # same basename, even when a symlink changes their parent path.
+            for directory, _, files in walk:
+                for filename in claimed_names.intersection(files):
+                    path = os.path.join(directory, filename)
+                    relative = os.path.relpath(path, base)
+                    if matches_suffix(relative, filename, alias_candidates):
+                        mode = _role_source_mode(path)
+                        if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                            special_paths.add(relative)
+        traversal_duplicates = _role_traversal_duplicates(claimed, special_paths, root_dirs, root_aliases, literal_tail)
+        for root, dirs, files in walk:
             for dirname in dirs:
-                full = os.path.join(root, dirname)
-                if os.path.islink(full):
-                    aliases.setdefault(os.path.relpath(full, base), os.path.relpath(os.path.realpath(full), real_base))
+                path = os.path.join(root, dirname)
+                mode = _role_source_mode(path)
+                if mode is None:
+                    continue
+                if stat.S_ISREG(mode):
+                    files.append(dirname)
+                    continue
+                relative = os.path.relpath(path, base)
+                root_blocks[relative] = stat.S_ISDIR(mode)
+                blockers.setdefault(relative, set()).add(root_index)
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if rel in baked or any(os.path.isfile(os.path.join(d, rel)) for d in skipped):
+                if not matches_suffix(rel, fn, alias_candidates):
                     continue
-                try:
-                    with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
-                        baked[rel] = fh.read()
-                    st = os.stat(full)
-                except OSError:
+                mode = _role_source_mode(full)
+                if mode is None:
                     continue
-                meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
-                             "mode": stat.S_IMODE(st.st_mode)}
+                earlier_sources = []
+                for earlier_base, earlier_index in skipped:
+                    earlier_path = os.path.join(earlier_base, rel)
+                    earlier_mode = _role_source_mode(earlier_path)
+                    if earlier_mode is not None:
+                        earlier_sources.append((earlier_base, earlier_index, earlier_path, earlier_mode))
+                if any(stat.S_ISREG(earlier_mode) for _, _, _, earlier_mode in earlier_sources):
+                    continue
+                if not stat.S_ISREG(mode):
+                    root_blocks[rel] = stat.S_ISDIR(mode)
+                    blockers.setdefault(rel, set()).add(root_index)
+                    continue
+                alternate = rel in claimed
+                if alternate and rel not in shadowed and rel not in traversal_duplicates:
+                    # Traversal can select this root via a different path than
+                    # the normalized path whose payload Ansible reads.
+                    root_files[rel] = None
+                    deferred_duplicates.setdefault(rel, []).append((root_index, full))
+                    continue
+                for earlier_base, earlier_index, earlier_path, earlier_mode in earlier_sources:
+                    earlier_dirs, earlier_aliases, earlier_blocks, _ = source_roots[earlier_index]
+                    if not earlier_dirs:
+                        found_dirs, found_aliases = _role_source_layout(earlier_base, os.walk(earlier_base))
+                        earlier_dirs.update(found_dirs)
+                        earlier_aliases.update(found_aliases)
+                    is_directory = stat.S_ISDIR(earlier_mode)
+                    earlier_blocks[rel] = is_directory
+                    resolved_rel = os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base))
+                    earlier_blocks[resolved_rel] = is_directory
+                    blockers.setdefault(rel, set()).add(earlier_index)
+                bake_source(full, rel, root_index, alternate)
+    # A later blocker or special traversal can make an earlier duplicate
+    # selectable. Read those payloads only after the search layout is known.
+    for rel, candidates in deferred_duplicates.items():
+        if rel in shadowed:
+            for root_index, full in candidates:
+                bake_source(full, rel, root_index, alternate=True)
     if not baked:
         return False
     node["_baked"] = baked
+    meta.update(alternate_meta)
     node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
-    for directory in list(directories):
-        while directory not in ("", "."):
-            directory = os.path.dirname(directory)
-            directories.add(directory or ".")
     node["_baked_tree_dirs"] = sorted(directories)
-    # Capture links to directories already in the tree without walking them.
-    aliases = {path: target for path, target in aliases.items() if target in directories}
     if aliases:
         node["_baked_tree_aliases"] = aliases
+    if shadowed:
+        node["_baked_tree_shadowed"] = {rel: sorted(blockers.get(rel, set()) | roots) for rel, roots in shadowed.items()}
+    has_special_traversal = any(root_aliases and False in root_blocks.values()
+                                for _, root_aliases, root_blocks, _ in source_roots)
+    if shadowed or has_special_traversal:
+        baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
+        node["_baked_tree_roots"] = [
+            (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
+             dict(sorted(root_blocks.items())), root_files)
+            for root_dirs, root_aliases, root_blocks, root_files in source_roots
+        ]
     return True
 
 
@@ -2050,7 +2403,7 @@ def _raw_search_path(task, basedir):
     return stack or [basedir]
 
 
-def _search_dirs(task, basedir, subdir, tagged=False):
+def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
     a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
     call it: each task search path (role-aware), then the loader basedir.
@@ -2080,13 +2433,15 @@ def _search_dirs(task, basedir, subdir, tagged=False):
         if is_role and pb_base_dir.endswith("/tasks"):
             dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True))
             dirs.append((pb_base_dir, False))
-        dirs.append((os.path.join(upath, subdir), True))
+        if not explicit_subdir:
+            dirs.append((os.path.join(upath, subdir), True))
         dirs.append((upath, False))
     try:
         base = loader.get_basedir()
     except Exception:
         base = basedir
-    dirs.append((os.path.join(base, subdir), True))
+    if not explicit_subdir:
+        dirs.append((os.path.join(base, subdir), True))
     dirs.append((base, False))
     return dirs if tagged else [d for d, _ in dirs]
 
