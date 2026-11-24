@@ -3397,6 +3397,7 @@ def test_computed_timeout_with_constant_key_replays_target_override(tmp_path, mo
     "{% if flag %}{% set key = 'second' %}{% else %}{{ vars[key] }}{% endif %}",
     "{% if flag %}{% set key = 'second' %}{% endif %}{{ vars[key] }}",
     "{% if flag == true %}{% set key = 'second' %}{% endif %}{{ vars[key] }}",
+    "{% if flag_alias == true %}{% set key = 'second' %}{% endif %}{{ vars[key] }}",
 ])
 def test_computed_timeout_uses_outer_key_despite_other_bindings(tmp_path, monkeypatch, template):
     playbook = tmp_path / "play.yml"
@@ -3405,6 +3406,7 @@ def test_computed_timeout_uses_outer_key_despite_other_bindings(tmp_path, monkey
     key: first
     first: 23
     flag: false
+    flag_alias: '{{ flag }}'
     unused: "{{ lookup('irrelevant') }}"
   gather_timeout: >-
     %s
@@ -3430,6 +3432,25 @@ def test_timeout_dependency_scan_skips_unreachable_elif(tmp_path):
 """)
     source, _ = compile_playbook(str(playbook))
     assert _compiled_plays(source, tmp_path)[0]["gather_timeout"] == 23
+
+
+def test_timeout_override_ignores_lookup_in_unreachable_elif(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {first: 23}
+  gather_timeout: >-
+    {% if true %}{{ first }}{% elif lookup('irrelevant') %}42{% endif %}
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"first": 45})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
 def test_controller_timeout_uses_local_computed_key_invalidation(tmp_path, monkeypatch):

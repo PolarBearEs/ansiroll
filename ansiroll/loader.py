@@ -377,14 +377,12 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  unknown_lookup=None):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
+    from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_scope, _selector_template_sources
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
-    key_scope = variables
-    if resolve_aliases:
-        key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
-                     for key, value in variables.items()}
+    key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
+                 for key, value in variables.items()}
     pending = [(source, (), None, ())]
     scope = {}
     names = set()
@@ -398,12 +396,13 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             expression = env.parse(source)
         except TemplateSyntaxError:
             return None
-        for call in expression.find_all(nodes.Call):
+        analysis = _selector_scope(expression, key_scope)
+        for call in analysis[2]:
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
-                                                resolve_aliases=resolve_aliases):
+                                                resolve_aliases=resolve_aliases, analysis=analysis):
             if name == "omit" or (name, path) in seen:
                 continue
             if paths is not None:

@@ -208,9 +208,11 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_local_bindings(expression, variables):
+def _selector_scope(expression, variables):
     nodes = jinja2.nodes
     bindings = {}
+    unreachable = set()
+    calls = []
 
     def target_names(target):
         if isinstance(target, nodes.Name):
@@ -220,28 +222,35 @@ def _selector_local_bindings(expression, variables):
     def visit(node, names):
         if names:
             bindings[id(node)] = frozenset(names)
+        if isinstance(node, nodes.Call):
+            calls.append(node)
         if isinstance(node, nodes.If):
             after = names.copy()
             scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
             fallthrough = True
             for branch in (node, *node.elif_):
                 if not fallthrough:
-                    break
+                    unreachable.add(id(branch))
+                    continue
                 visit(branch.test, names)
-                local = names.copy()
-                for child in branch.body:
-                    visit(child, local)
-                test = _selector_vars_key(branch.test, scope)
+                test = _selector_vars_key(branch.test, scope, ())
                 known = isinstance(test, (bool, int, float, str, type(None)))
                 if not known or test:
+                    local = names.copy()
+                    for child in branch.body:
+                        visit(child, local)
                     after.update(local)
+                else:
+                    unreachable.update(map(id, branch.body))
                 if known and test:
                     fallthrough = False
-            local = names.copy()
-            for child in node.else_:
-                visit(child, local)
             if fallthrough:
+                local = names.copy()
+                for child in node.else_:
+                    visit(child, local)
                 after.update(local)
+            else:
+                unreachable.update(map(id, node.else_))
             names.update(after)
             return
         if isinstance(node, nodes.For):
@@ -280,14 +289,14 @@ def _selector_local_bindings(expression, variables):
             names.update(name[1] if isinstance(name, tuple) else name for name in node.names)
 
     visit(expression, set())
-    return bindings
+    return bindings, unreachable, calls
 
 
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
-                          *, resolve_aliases=False):
+                          *, resolve_aliases=False, analysis=None):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
-    bindings = _selector_local_bindings(expression, variables or {})
+    bindings, unreachable, _ = analysis if analysis is not None else _selector_scope(expression, variables or {})
 
     def resolve_key(node, aliases=None):
         local = bindings.get(id(node))
@@ -304,6 +313,8 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
             pending = [(outputs[0], remaining)]
     while pending:
         node, suffix = pending.pop()
+        if id(node) in unreachable:
+            continue
         if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
             pending.append((node.node, suffix))
             pending.extend((value, suffix if index == 0 else ()) for index, value in enumerate(node.args))
@@ -3594,11 +3605,13 @@ class Runtime:
                 expression = self.templater.env.parse(source)
             except jinja2.TemplateSyntaxError:
                 return None
-            for call in expression.find_all(jinja2.nodes.Call):
+            analysis = _selector_scope(expression, ctx)
+            for call in analysis[2]:
                 method = call.node
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
-            for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True):
+            for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
+                                                    analysis=analysis):
                 if paths is not None:
                     paths.add((name, path))
                 if (name, path) in seen:
