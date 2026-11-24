@@ -212,7 +212,7 @@ def _pin_for_truncate(path, fd, original_error):
         raise _truncation_unavailable(path, original_error) from ex
 
 
-def _open_truncated_destination(path, reference, original_error, validate):
+def _open_truncated_destination(path, reference, original_error, validate, prepare=None):
     fd_path = "/proc/self/fd/%d" % reference
     try:
         os.stat(fd_path)
@@ -220,9 +220,12 @@ def _open_truncated_destination(path, reference, original_error, validate):
         raise _truncation_unavailable(path, original_error) from ex
     # Following the procfs link can block on the destination filesystem.
     info = os.fstat(reference)
-    validate(info, None)
     if not stat.S_ISREG(info.st_mode):
+        validate(info, None)
         raise original_error
+    if prepare is not None:
+        prepare(info, reference)
+    validate(info, None)
     return os.open(fd_path, os.O_WRONLY | os.O_TRUNC)
 
 
@@ -230,7 +233,7 @@ _TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
 
 
 @contextmanager
-def _open_compile_destination(path, validate, *, release_output=None):
+def _open_compile_destination(path, validate, *, release_output=None, prepare=None):
     with ExitStack() as stack, ExitStack() as initial_pin:
         # A failed create-open gives us no fd. Capture the existing inode
         # before trying it so a retry cannot truncate a replacement file.
@@ -301,6 +304,11 @@ def _open_compile_destination(path, validate, *, release_output=None):
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
             validate(info, fd)
+            if prepare is not None:
+                prepare(info, fd)
+                prepare = None
+                info = os.fstat(fd)
+                validate(info, fd)
             if created or not stat.S_ISREG(info.st_mode):
                 yield writer
                 return
@@ -311,7 +319,9 @@ def _open_compile_destination(path, validate, *, release_output=None):
                     raise
                 # An empty file can be written through the current handle
                 # without truncating it or opening another descriptor.
-                if os.fstat(fd).st_size == 0:
+                info = os.fstat(fd)
+                if info.st_size == 0:
+                    validate(info, fd)
                     yield writer
                     return
                 if released_for_emfile:
@@ -325,7 +335,7 @@ def _open_compile_destination(path, validate, *, release_output=None):
                 return
 
         # Reopen the validated inode even if its pathname has since changed.
-        fd = _open_truncated_destination(path, reference, original_error, validate)
+        fd = _open_truncated_destination(path, reference, original_error, validate, prepare)
         with os.fdopen(fd, "w") as writer:
             yield writer
 
@@ -339,8 +349,6 @@ def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None):
             validate_input(info, "manifest path", path)
 
     with _open_compile_destination(path, validate) as fh:
-        if validate_input is not None:
-            validate_input(os.fstat(fh.fileno()), "manifest path", path)
         json.dump(manifest, fh, indent=2)
 
 
@@ -449,13 +457,17 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
 
     with ExitStack() as output_reference:
         reference = None
-        with _open_compile_destination(output_path, validate_output) as output:
-            output_stat = os.fstat(output.fileno())
+        output_stat = None
+
+        def prepare_output(info, fd):
+            nonlocal reference, output_stat
+            output_stat = info
             if stat.S_ISREG(output_stat.st_mode):
-                reference = _pin_output_inode(output_path, output.fileno(), output_stat)
+                reference = _pin_output_inode(output_path, fd, output_stat)
                 if reference is not None:
                     output_reference.callback(os.close, reference)
-            validate_input(output_stat, "output path", output_path)
+
+        with _open_compile_destination(output_path, validate_output, prepare=prepare_output) as output:
             output.write(source)
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
@@ -479,7 +491,6 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
         with _open_compile_destination(
             manifest_path, validate_manifest, release_output=release_output,
         ) as manifest_file:
-            validate_input(os.fstat(manifest_file.fileno()), "manifest path", manifest_path)
             json.dump(manifest, manifest_file, indent=2)
 
 
