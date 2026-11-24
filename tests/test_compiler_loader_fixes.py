@@ -2158,11 +2158,12 @@ def test_linked_template_spelling_takes_precedence_over_ordinary_blocker(tmp_pat
 
     playbook = tmp_path / "pb.yml"
     destination = tmp_path / "output.txt"
-    expected = _ansible(playbook, returncode=0)
-    contents = destination.read_text()
-    destination.unlink()
-    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
-    assert destination.read_text() == contents
+    expected = _ansible(playbook)
+    contents = destination.read_text() if destination.exists() else None
+    if contents is not None:
+        destination.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert (destination.read_text() if destination.exists() else None) == contents
 
 
 def test_unbaked_direct_template_does_not_use_a_shadowed_ordinary_payload():

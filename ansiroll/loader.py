@@ -2679,6 +2679,9 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     from collections import deque
     from pathlib import Path
 
+    # A direct override requires Ansible to resolve the task's search path.
+    if getattr(task, "_loader", None) is None:
+        return {}, {}, {}
     parsed = _linked_role_source_patterns(src)
     if parsed is None:
         return {}, {}, {}
