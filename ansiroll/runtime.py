@@ -28,7 +28,7 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import ItemsView, KeysView, ValuesView
+from collections.abc import ItemsView, KeysView, Sequence, ValuesView
 from contextlib import contextmanager
 from itertools import groupby
 from numbers import Number
@@ -216,6 +216,8 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
         return value
     if preserve_views and isinstance(value, (_LazyTplDict, _LazyTplList, _LazyTplTuple, _PlayVarView)):
         return value
+    if isinstance(value, _HostVarEntries):
+        value = list(value)
     if isinstance(value, str):
         if condition_text and not isinstance(value, _TrustedAsTemplateValue):
             return _UntrustedConditionValue(value)
@@ -1431,8 +1433,15 @@ class _TaskHostVarView(_LazyTplDict):
     """Resolve current-host bindings with hostvars' rendered iteration rules."""
 
     def __init__(self, host, scope):
-        super().__init__({**host, **host.task_bindings}, scope.templater._runtime, scope)
+        bindings = {key: value for key, value in host.task_bindings.items()
+                    if not self._uses_inventory(scope, key, value)}
+        super().__init__({**host, **bindings}, scope.templater._runtime, scope)
         self._host = host
+
+    @staticmethod
+    def _uses_inventory(scope, key, value):
+        return key in scope.active_task_bindings or (
+            isinstance(value, _TaskVarTemplate) and (key, value) in scope.templater._resolving)
 
     def __getitem__(self, key):
         return self._resolve(key, dict.__getitem__(self, key))
@@ -1440,10 +1449,9 @@ class _TaskHostVarView(_LazyTplDict):
     def _resolve(self, key, value):
         templater = self._ctx.templater
         # A task alias can read the inventory value it shadows.
-        if key in self._ctx.active_task_bindings or (
-                isinstance(value, _TaskVarTemplate) and (key, value) in templater._resolving):
+        if self._uses_inventory(self._ctx, key, value):
             if key not in self._host:
-                return _captured("host variable %r is undefined" % key, missing=True)
+                raise KeyError(key)
             value = self._host[key]
         return templater.resolve_variable(key, value, self._ctx, strict=self._ctx.strict)
 
@@ -1460,10 +1468,40 @@ class _TaskHostVarView(_LazyTplDict):
         return self[key] if key in self else dict.setdefault(self, key, default)
 
     def items(self):
-        return ItemsView(self)
+        return _HostVarEntries(self, include_keys=True)
 
     def values(self):
-        return ValuesView(self)
+        return _HostVarEntries(self, include_keys=False)
+
+
+class _HostVarEntries(Sequence):
+    """Keep hostvars entries indexable while rendering only the values read."""
+
+    def __init__(self, mapping, *, include_keys):
+        self._mapping = mapping
+        self._include_keys = include_keys
+
+    def _entry(self, key):
+        value = self._mapping[key]
+        return (key, value) if self._include_keys else value
+
+    def __len__(self):
+        return len(self._mapping)
+
+    def __iter__(self):
+        return (self._entry(key) for key in self._mapping)
+
+    def __getitem__(self, index):
+        keys = list(self._mapping)
+        if isinstance(index, slice):
+            return [self._entry(key) for key in keys[index]]
+        return self._entry(keys[index])
+
+    def __eq__(self, other):
+        return list(self) == (list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __repr__(self):
+        return repr(list(self))
 
 
 class _DeferredVarItems(ItemsView):
@@ -1764,7 +1802,7 @@ def _jinja_dict(*args, **kwargs):
 def _type_name(value):
     """type_debug: internal wrappers report the builtin type they stand for."""
     for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"),
-                           (_LazyTplList, "list"), (_LazyTplTuple, "tuple"),
+                           (_LazyTplList, "list"), (_HostVarEntries, "list"), (_LazyTplTuple, "tuple"),
                            (_DeferredVarItems, "ItemsView"), (_DeferredVarValues, "ValuesView")):
         if isinstance(value, internal):
             return name
@@ -1786,7 +1824,7 @@ def _concretize(value):
     template time, like Ansible's templar does."""
     import types
     if isinstance(value, (types.GeneratorType, map, filter)) or type(value) in (
-            ItemsView, ValuesView, _DeferredVarItems, _DeferredVarValues):
+            ItemsView, ValuesView, _DeferredVarItems, _DeferredVarValues, _HostVarEntries):
         return list(value)
     return value
 
@@ -1997,7 +2035,8 @@ def _bare_template_expression(text, *, lex=None):
     if not (stripped.startswith("{{") and stripped.endswith("}}")):
         return None
     inner = stripped[2:-2]
-    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+")) or inner.endswith("-")):
+    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
+            or inner.endswith(("-", "}"))):
         return inner.strip()
     try:
         tokens = iter((lex or jinja2.Environment().lex)(stripped))

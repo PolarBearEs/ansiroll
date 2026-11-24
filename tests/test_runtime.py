@@ -73,6 +73,8 @@ def test_lookup_with_literal_closing_braces_and_null_suffix():
     templater = Runtime({}, "", {}).templater
     templater.env.globals["lookup"] = lambda _name: "first"
     assert templater.render_string("{{ lookup('source') }}/literal}}", {}) == "first/literal}}"
+    assert templater.render_string("{{ lookup('source') }}}", {}) == "first}"
+    assert templater.render_string('{{ {"x": 1}}}', {}) == {"x": 1}
     assert templater.render_string("{{ lookup('source') }}/{{ suffix }}", {"suffix": None}) == "first/"
     assert templater.render_string("{{ suffix }}", {"suffix": None}) is None
 
@@ -188,6 +190,17 @@ def test_deferred_task_container_can_read_its_inventory_hostvar(member, template
     assert frames[0]["result"]["msg"] == 17
 
 
+def test_deferred_task_container_can_default_a_missing_inventory_hostvar():
+    runtime, frames = run([_task("1", "Default missing inventory", "debug", args={
+        "msg": "{{ [alias.value, alias.available] }}",
+    }, vars={"alias": {
+        "value": "{{ hostvars[inventory_hostname].alias.b | default(17) }}",
+        "available": "{{ hostvars[inventory_hostname].alias.b is defined }}",
+    }})])
+    assert not runtime.failed
+    assert frames[0]["result"]["msg"] == [17, False]
+
+
 @pytest.mark.parametrize("method", ["pop('alias')", "setdefault('alias')"])
 def test_current_hostvars_methods_resolve_deferred_task_aliases(method):
     _, frames = run([_task("1", "Read hostvars", "debug", args={
@@ -207,7 +220,12 @@ def test_custom_lookup_reads_deferred_task_alias_from_hostvars():
     assert frames[0]["result"]["msg"] == "17/tail"
 
 
-def test_legacy_hostvars_items_render_inventory_sources(monkeypatch):
+@pytest.mark.parametrize("expression", [
+    "(hostvars[inventory_hostname].items() | selectattr('0', 'equalto', 'original') | first)[1]",
+    "hostvars[inventory_hostname].items()[0][1]",
+    "hostvars[inventory_hostname].values()[0]",
+])
+def test_legacy_hostvars_entries_render_only_accessed_sources(monkeypatch, expression):
     import ansiroll.runtime as runtime_mod
 
     monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
@@ -217,7 +235,7 @@ def test_legacy_hostvars_items_render_inventory_sources(monkeypatch):
     calls = []
     runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
     task = _task("1", "Iterate hostvars", "debug", args={
-        "msg": "{{ (hostvars[inventory_hostname].items() | selectattr('0', 'equalto', 'original') | first)[1] }}",
+        "msg": "{{ " + expression + " }}",
     }, vars={"unused": "{{ lookup('unused') }}/tail"})
     runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
     assert frames[0]["result"]["msg"] == "ready"
