@@ -403,7 +403,7 @@ def _debug_var_value(value):
                 return "<< error %d - %s >>" % (error_count, ex)
         if isinstance(v, dict):
             return {k: replace(x) for k, x in v.items()}
-        if isinstance(v, (list, tuple)):
+        if isinstance(v, (list, tuple, _HostVarEntries)):
             return [replace(x) for x in v]
         return v
 
@@ -1464,7 +1464,20 @@ class _ModernPlayVarView(_PlayVarView):
     __str__ = __repr__
 
 
-class _TaskHostVarView(_LazyTplDict):
+class _HostVarView(_LazyTplDict):
+    """Keep hostvars entries lazy until the template reads them."""
+
+    def _resolve(self, key, value):
+        return _read_lazy_member(self, value)
+
+    def items(self):
+        return _HostVarEntries(self, include_keys=True)
+
+    def values(self):
+        return _HostVarEntries(self, include_keys=False)
+
+
+class _TaskHostVarView(_HostVarView):
     """Resolve current-host bindings with hostvars' rendered iteration rules."""
 
     def __init__(self, host, scope):
@@ -1503,12 +1516,6 @@ class _TaskHostVarView(_LazyTplDict):
 
     def setdefault(self, key, default=None):
         return self[key] if key in self else dict.setdefault(self, key, default)
-
-    def items(self):
-        return _HostVarEntries(self, include_keys=True)
-
-    def values(self):
-        return _HostVarEntries(self, include_keys=False)
 
 
 class _HostVarEntries(MutableSequence):
@@ -6173,6 +6180,8 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
         result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
         if slots is not None:
             result["lazy_members"] = True
+            if isinstance(rendered, _HostVarView):
+                result["hostvar_view"] = True
         if errors:
             result["errors"] = errors
         if mapping_keys:

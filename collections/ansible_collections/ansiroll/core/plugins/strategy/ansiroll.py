@@ -943,6 +943,7 @@ class StrategyModule(StrategyBase):
                     _AnsirollUndefined,
                     _captured,
                     _DelegatedTemplateValue,
+                    _HostVarView,
                     _lazy_container,
                     _mark_unsafe,
                 )
@@ -968,6 +969,8 @@ class StrategyModule(StrategyBase):
 
                     items = ({key: defer_member(index) for key, index in value.items()}
                              if isinstance(value, dict) else [defer_member(index) for index in value])
+                    if resolved.get("hostvar_view"):
+                        return _HostVarView(items, rt, job_vars)
                     return _lazy_container(items, rt, job_vars, delegated=True)
 
                 job_vars[_DEFER_LOOKUP_NAMES] = True

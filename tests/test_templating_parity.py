@@ -1935,7 +1935,10 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
           {{ (vars.copy().settings.rows.copy() | first).copy().used }}|
           {{ (vars.items() | selectattr('0', 'equalto', 'settings') | first)[1].rows.copy().pop(0).setdefault('used') }}|
           {{ settings.rows[0].pop('used') }}|{{ 'untouched' if true else unused }}|
-          {{ alias.child | default('fallback') }}
+          {{ alias.child | default('fallback') }}|
+          {%- set current = hostvars[inventory_hostname] -%}
+          {%- set first_key = current.keys() | first -%}
+          {{ current.values()[0] == current[first_key] }}|{{ current.items()[0][0] == first_key }}
     - template:
         src: "{{ playbook_dir }}/runtime.j2"
         dest: "{{ playbook_dir }}/output.txt"
@@ -1955,7 +1958,9 @@ def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path
 """)
     _, recap = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
     assert recap == ("2", "2", "0", "0", "0", "0", "0")
-    assert (tmp_path / "output.txt").read_text() == "hello/tail| hello/tail| hello/tail|untouched| fallback"
+    assert (tmp_path / "output.txt").read_text() == (
+        "hello/tail| hello/tail| hello/tail|untouched| fallback|True|True"
+    )
     assert (tmp_path / "lookups").read_text() == "used"
 
 

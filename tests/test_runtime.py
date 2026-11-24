@@ -2319,6 +2319,20 @@ def test_delegated_debug_remains_a_runtime_special_action():
     assert frames[0]["result"]["msg"] == "hello"
 
 
+def test_modern_debug_var_formats_undefined_lazy_hostvars_entries(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    monkeypatch.setenv("ANSIROLL_DEBUG_HOSTVARS", "ready")
+    expression = "{'entries': hostvars[inventory_hostname].values()}"
+    task = _task("1", "Inspect hostvars entries", "debug", args={"var": expression}, vars={
+        "alias": "{{ lookup('env', 'ANSIROLL_DEBUG_HOSTVARS') }}/tail",
+    })
+    _, frames = run([task], host_vars={
+        "inventory_hostname": "h", "hostvars": {"h": {"broken": "{{ missing }}"}},
+    })
+    assert frames[0]["status"] == "ok"
+    assert "<< error 1 - 'missing' is undefined >>" in frames[0]["result"][expression]["entries"]
+
+
 def test_inventory_refresh_vars_are_absorbed_without_leaking_result_key():
     task = _task("1", "group", "group_by")
     task["special"] = None
