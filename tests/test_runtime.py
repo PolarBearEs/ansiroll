@@ -164,6 +164,41 @@ def test_current_hostvars_resolve_deferred_task_aliases(scope):
     assert calls == ["number"]
 
 
+def test_deferred_task_alias_can_read_its_inventory_hostvar():
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "alias": 17}, on_result=frames.append)
+    task = _task("1", "Read inventory fallback", "debug", args={"msg": "{{ alias }}"}, vars={
+        "alias": "{{ hostvars[inventory_hostname].alias }}",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == 17
+
+
+def test_custom_lookup_reads_deferred_task_alias_from_hostvars():
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater._lookup_loaded["host_alias"] = lambda terms, variables: [variables["hostvars"]["h"]["alias"]]
+    task = _task("1", "Read hostvar in lookup", "debug", args={"msg": "{{ payload }}"}, vars={
+        "alias": "{{ number }}", "number": 17, "payload": "{{ lookup('host_alias') }}/tail",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == "17/tail"
+
+
+def test_legacy_hostvars_items_render_inventory_sources(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames = []
+    host_vars = {"inventory_hostname": "h", "hostvars": {"h": {"original": "{{ seed }}"}}, "seed": "ready"}
+    runtime = Runtime({}, "", host_vars, on_result=frames.append)
+    task = _task("1", "Iterate hostvars", "debug", args={
+        "msg": "{{ (hostvars[inventory_hostname].items() | selectattr('0', 'equalto', 'original') | first)[1] }}",
+    }, vars={"unused": "{{ lookup('unused') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == "ready"
+
+
 @pytest.mark.parametrize("text", [
     "{{ lookup('source') }}/{{ missing.attribute }}",
     "{{ lookup('source') }}/{{ 1 // divisor }}",

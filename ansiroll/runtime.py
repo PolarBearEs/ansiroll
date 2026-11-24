@@ -1072,7 +1072,7 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
     if isinstance(value, _DelegatedTemplateValue):
         return value.resolve()
     if isinstance(value, _TaskHostVars) and isinstance(ctx, _PlayVarScope):
-        return _DeferredPlayVarView({**value, **value.task_bindings}, ctx)
+        return _TaskHostVarView(value, ctx)
     if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
         # Dynamic containers resolve their members in the task's context.
         return _lazy_wrap(value._raw, rt, ctx, task_vars=value._task_vars)
@@ -1301,7 +1301,8 @@ class _LookupVars(dict):
 
     def _resolve(self, key, value):
         if isinstance(value, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
-                isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
+                isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic) or (
+                key == "hostvars" and isinstance(self.ctx, _PlayVarScope) and self.ctx.get(_DEFER_LOOKUP_NAMES)):
             return self.templater.resolve_variable(key, value, self.ctx)
         return self.templater._observe_untrusted(value)
 
@@ -1409,6 +1410,22 @@ class _ModernPlayVarView(_PlayVarView):
         return repr(dict(self.items()))
 
     __str__ = __repr__
+
+
+class _TaskHostVarView(_LazyTplDict):
+    """Resolve current-host bindings with hostvars' rendered iteration rules."""
+
+    def __init__(self, host, scope):
+        super().__init__({**host, **host.task_bindings}, scope.templater._runtime, scope)
+        self._host = host
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        templater = self._ctx.templater
+        # A task alias can read the inventory value it shadows.
+        if isinstance(value, _TaskVarTemplate) and (key, value) in templater._resolving and key in self._host:
+            value = self._host[key]
+        return templater.resolve_variable(key, value, self._ctx, strict=self._ctx.strict)
 
 
 class _DeferredVarItems(ItemsView):
@@ -3460,8 +3477,7 @@ class Runtime:
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
                 if mixed_lookup and key in task_vars:
                     host_task_bindings[key] = value
-                    continue
-                # A play alias can refer back to the host value it shadows.
+                # An alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
                     current.setdefault(key, self._initial_host_vars[key])
                 if key in self._module_fact_layer:
