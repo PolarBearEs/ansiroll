@@ -287,6 +287,47 @@ def test_hostvars_item_membership_resolves_only_matching_keys():
     assert calls == ["source"]
 
 
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("(hostvars[inventory_hostname].items() + [('extra', 1)])[-1]", ("extra", 1)),
+    ("(['extra'] + hostvars[inventory_hostname].values())[0]", "extra"),
+    ("hostvars[inventory_hostname].values().copy()[1]", 17),
+    ("(hostvars[inventory_hostname].values() * 2)[1]", 17),
+    ("hostvars[inventory_hostname].values() > []", True),
+])
+def test_lazy_hostvars_entries_support_list_operations(expression, expected):
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: 17
+    task = _task("1", "Use hostvar entries as lists", "debug", vars={
+        "alias": "{{ lookup('source') }}", "unused": "{{ lookup('source') }}/tail",
+    })
+    ctx = runtime._task_ctx(task, {})
+    assert runtime.template("{{ " + expression + " }}", ctx) == expected
+
+
+def test_lazy_hostvars_entries_keep_mutations_on_the_list():
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: 17
+    task = _task("1", "Mutate materialized entries", "debug", vars={"alias": "{{ lookup('source') }}/tail"})
+    ctx = runtime._task_ctx(task, {})
+    expression = ("{% set current = hostvars[inventory_hostname] %}"
+                  "{% set values = current.values() %}"
+                  "{% set unused = values.append('extra') %}"
+                  "{{ values[-1] }}/{{ current.values()[-1] == 'extra' }}")
+    assert runtime.template(expression, ctx) == "extra/False"
+
+
+def test_hostvars_item_membership_surfaces_matching_entry_render_failure():
+    frames = []
+    hostvars = {"h": {"broken": "prefix{{ 1 + 'str' }}"}}
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
+    task = _task("1", "Check broken entry", "debug", args={
+        "msg": "{{ ('broken', '') in hostvars[inventory_hostname].items() }}",
+    }, vars={"unused": "{{ lookup('source') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert runtime.failed
+    assert "unsupported operand type" in frames[0]["result"]["msg"]
+
+
 @pytest.mark.parametrize("text", [
     "{{ lookup('source') }}/{{ missing.attribute }}",
     "{{ lookup('source') }}/{{ 1 // divisor }}",

@@ -28,8 +28,9 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import ItemsView, KeysView, Sequence, ValuesView
+from collections.abc import ItemsView, KeysView, MutableSequence, ValuesView
 from contextlib import contextmanager
+from functools import total_ordering
 from itertools import groupby
 from numbers import Number
 
@@ -1478,43 +1479,96 @@ class _TaskHostVarView(_LazyTplDict):
         return _HostVarEntries(self, include_keys=False)
 
 
-class _HostVarEntries(Sequence):
+@total_ordering
+class _HostVarEntries(MutableSequence):
     """Keep hostvars entries indexable while rendering only the values read."""
 
     def __init__(self, mapping, *, include_keys):
         self._mapping = mapping
         self._include_keys = include_keys
+        self._keys = tuple(mapping)
+        self._entries = {}
+        self._values = None
 
     def _entry(self, key):
-        value = self._mapping[key]
-        return (key, value) if self._include_keys else value
+        if key not in self._entries:
+            value = self._mapping[key]
+            self._entries[key] = (key, value) if self._include_keys else value
+        return self._entries[key]
+
+    def _materialize(self):
+        if self._values is None:
+            self._values = list(self)
+        return self._values
 
     def __len__(self):
-        return len(self._mapping)
+        return len(self._keys if self._values is None else self._values)
 
     def __iter__(self):
-        return (self._entry(key) for key in self._mapping)
+        if self._values is not None:
+            return iter(self._values)
+        return (self._entry(key) for key in self._keys)
 
     def __contains__(self, item):
+        if self._values is not None:
+            return item in self._values
         if not self._include_keys:
             return super().__contains__(item)
         if not isinstance(item, tuple) or len(item) != 2:
             return False
         key, expected = item
         try:
-            value = self._mapping[key]
-        except (KeyError, TypeError):
+            present = key in self._mapping
+        except TypeError:
             return False
+        if not present:
+            return False
+        _, value = self._entry(key)
         return value is expected or value == expected
 
     def __getitem__(self, index):
-        keys = list(self._mapping)
+        if self._values is not None:
+            return self._values[index]
         if isinstance(index, slice):
-            return [self._entry(key) for key in keys[index]]
-        return self._entry(keys[index])
+            return [self._entry(key) for key in self._keys[index]]
+        return self._entry(self._keys[index])
+
+    def __setitem__(self, index, value):
+        self._materialize()[index] = value
+
+    def __delitem__(self, index):
+        del self._materialize()[index]
+
+    def insert(self, index, value):
+        self._materialize().insert(index, value)
+
+    def copy(self):
+        return list(self)
+
+    def sort(self, *, key=None, reverse=False):
+        self._materialize().sort(key=key, reverse=reverse)
+
+    def __add__(self, other):
+        return list(self) + (list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __radd__(self, other):
+        return other + list(self)
+
+    def __mul__(self, count):
+        return list(self) * count
+
+    __rmul__ = __mul__
+
+    def __imul__(self, count):
+        values = self._materialize()
+        values *= count
+        return self
 
     def __eq__(self, other):
         return list(self) == (list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __lt__(self, other):
+        return list(self) < (list(other) if isinstance(other, _HostVarEntries) else other)
 
     def __repr__(self):
         return repr(list(self))
