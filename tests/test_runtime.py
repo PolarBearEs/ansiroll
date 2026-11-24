@@ -328,6 +328,36 @@ def test_hostvars_item_membership_surfaces_matching_entry_render_failure():
     assert "unsupported operand type" in frames[0]["result"]["msg"]
 
 
+def test_lazy_hostvars_entries_preserve_the_mapping_snapshot():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    task = _task("1", "Save hostvar entries", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    expression = ("{% set current = hostvars[inventory_hostname] %}"
+                  "{% set entries = current.items() %}"
+                  "{% set removed = current.pop('original') %}"
+                  "{% set inserted = current.setdefault('added', 18) %}"
+                  "{{ [entries[0], ('original', 17) in entries, ('added', 18) in entries] | to_json }}")
+    assert json.loads(runtime.template(expression, runtime._task_ctx(task, {}))) == [["original", 17], True, False]
+
+
+def test_jinja_tojson_escapes_values_in_nested_lazy_hostvars_entries():
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    task = _task("1", "Serialize hostvars", "debug", vars={"alias": "{{ '<script>' }}",
+                                                         "unused": "{{ lookup('source') }}/tail"})
+    runtime.templater.env.globals["lookup"] = lambda name: "unused"
+    result = runtime.template("{{ {'values': hostvars[inventory_hostname].values()} | tojson }}",
+                              runtime._task_ctx(task, {}))
+    assert "<script>" in json.loads(result)["values"]
+    assert r"\u003cscript\u003e" in result
+
+
+def test_lazy_hostvars_entries_compare_unordered_values_like_lists():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": float("nan")}}})
+    task = _task("1", "Compare unordered values", "debug", vars={"unused": "{{ lookup('source') }}/tail"})
+    runtime.templater.env.globals["lookup"] = lambda name: "unused"
+    expression = "{{ hostvars[inventory_hostname].values() > [0] }}"
+    assert runtime.template(expression, runtime._task_ctx(task, {})) is False
+
+
 @pytest.mark.parametrize("text", [
     "{{ lookup('source') }}/{{ missing.attribute }}",
     "{{ lookup('source') }}/{{ 1 // divisor }}",

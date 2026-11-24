@@ -30,7 +30,6 @@ import re
 import shlex
 from collections.abc import ItemsView, KeysView, MutableSequence, ValuesView
 from contextlib import contextmanager
-from functools import total_ordering
 from itertools import groupby
 from numbers import Number
 
@@ -779,6 +778,10 @@ def _f_to_json(v, **kwargs):
     return json.dumps(v, **kwargs)
 
 
+def _jinja_tojson(eval_ctx, value, indent=None):
+    return jinja2.filters.do_tojson(eval_ctx, _yaml_plain(value), indent=indent)
+
+
 def _f_unvault(v, secret):
     """Decrypt an Ansible Vault AES256 scalar using its supplied secret."""
     if not (isinstance(v, dict) and set(v.keys()) == {"__ansiroll_vault__"}):
@@ -1479,20 +1482,20 @@ class _TaskHostVarView(_LazyTplDict):
         return _HostVarEntries(self, include_keys=False)
 
 
-@total_ordering
 class _HostVarEntries(MutableSequence):
     """Keep hostvars entries indexable while rendering only the values read."""
 
     def __init__(self, mapping, *, include_keys):
         self._mapping = mapping
         self._include_keys = include_keys
-        self._keys = tuple(mapping)
+        self._sources = dict(dict.items(mapping))
+        self._keys = tuple(self._sources)
         self._entries = {}
         self._values = None
 
     def _entry(self, key):
         if key not in self._entries:
-            value = self._mapping[key]
+            value = self._mapping._resolve(key, self._sources[key])
             self._entries[key] = (key, value) if self._include_keys else value
         return self._entries[key]
 
@@ -1518,7 +1521,7 @@ class _HostVarEntries(MutableSequence):
             return False
         key, expected = item
         try:
-            present = key in self._mapping
+            present = key in self._sources
         except TypeError:
             return False
         if not present:
@@ -1568,7 +1571,16 @@ class _HostVarEntries(MutableSequence):
         return list(self) == (list(other) if isinstance(other, _HostVarEntries) else other)
 
     def __lt__(self, other):
-        return list(self) < (list(other) if isinstance(other, _HostVarEntries) else other)
+        return list.__lt__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __le__(self, other):
+        return list.__le__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __gt__(self, other):
+        return list.__gt__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __ge__(self, other):
+        return list.__ge__(list(self), list(other) if isinstance(other, _HostVarEntries) else other)
 
     def __repr__(self):
         return repr(list(self))
@@ -2154,6 +2166,8 @@ class _Templater:
         filters = _PluginDict("filter", self._plugin_errors["filter"])
         filters.update(self.env.filters)
         self.env.filters = filters
+        eval_context_filter = getattr(jinja2, "pass_eval_context", None) or jinja2.evalcontextfilter
+        self.env.filters["tojson"] = eval_context_filter(_jinja_tojson)
         tests = _PluginDict("test", self._plugin_errors["test"])
         tests.update(self.env.tests)
         self.env.tests = tests
