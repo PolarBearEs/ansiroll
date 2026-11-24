@@ -1500,14 +1500,17 @@ class _HostVarView(_LazyTplDict):
 
     def _resolve(self, key, value):
         if self._resolved_values is None:
-            return self._read_host_value(key, value)
-        binding = key, id(value)
-        if binding not in self._resolved_values:
             result = self._read_host_value(key, value)
-            if self._mark_lookup_data:
-                result = _mark_unsafe(result)
-            self._resolved_values[binding] = value, result
-        return self._resolved_values[binding][1]
+        else:
+            binding = key, id(value)
+            if binding not in self._resolved_values:
+                result = self._read_host_value(key, value)
+                if self._mark_lookup_data:
+                    result = _mark_unsafe(result)
+                self._resolved_values[binding] = value, result
+            result = self._resolved_values[binding][1]
+        converted = self._rt.templater._custom_plugin_args
+        return _custom_plugin_arg(result, converted) if converted is not None else result
 
     def _read_host_value(self, key, value):
         return _read_lazy_member(self, value)
@@ -2046,21 +2049,20 @@ def _jinja_undef(hint=None):
 
 def _custom_plugin_arg(value, converted):
     if id(value) in converted:
-        return converted[id(value)]
+        return converted[id(value)][1]
     if isinstance(value, _HostVarEntries):
         entries = value._materialize()
-        converted[id(value)] = entries
+        converted[id(value)] = value, entries
         return _custom_plugin_arg(entries, converted)
-    # A hostvars copy can store a view directly. Read its raw bindings
-    # so unrelated lookups still run only when the plugin reads them.
-    if type(value) is dict or isinstance(value, _HostVarView):
-        converted[id(value)] = value
+    # Hostvars wrappers normalize members when the plugin reads them.
+    if type(value) is dict:
+        converted[id(value)] = value, value
         for key, item in dict.items(value):
             normalized = _custom_plugin_arg(item, converted)
             if normalized is not item:
                 dict.__setitem__(value, key, normalized)
     elif type(value) is list:
-        converted[id(value)] = value
+        converted[id(value)] = value, value
         for index, item in enumerate(value):
             value[index] = _custom_plugin_arg(item, converted)
     elif type(value) is tuple:
@@ -2068,17 +2070,21 @@ def _custom_plugin_arg(value, converted):
         if all(item is original for item, original in zip(items, value)):
             items = value
         # A mutable member can lead back to this tuple during conversion.
-        return converted.setdefault(id(value), items)
+        return converted.setdefault(id(value), (value, items))[1]
     return value
 
 
-def _wrap_custom_plugin(fn):
+def _wrap_custom_plugin(fn, templater):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        converted = {}
-        args = tuple(_custom_plugin_arg(value, converted) for value in args)
-        kwargs = {key: _custom_plugin_arg(value, converted) for key, value in kwargs.items()}
-        return fn(*args, **kwargs)
+        previous = templater._custom_plugin_args
+        converted = templater._custom_plugin_args = {}
+        try:
+            args = tuple(_custom_plugin_arg(value, converted) for value in args)
+            kwargs = {key: _custom_plugin_arg(value, converted) for key, value in kwargs.items()}
+            return fn(*args, **kwargs)
+        finally:
+            templater._custom_plugin_args = previous
     return wrapped
 
 
@@ -2273,6 +2279,7 @@ class _Templater:
         self._inherited_lookup_scans = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
+        self._custom_plugin_args = None
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -2411,7 +2418,7 @@ class _Templater:
                 except Exception as e:
                     self._plugin_errors[kind][pname] = str(e)
                     continue
-                wrapped = _wrap_custom_plugin(fn)
+                wrapped = _wrap_custom_plugin(fn, self)
                 target[pname] = _wrap_filter(wrapped) if kind == "filter" else wrapped
 
     def _plugin_lookup(self, name, args, kwargs):

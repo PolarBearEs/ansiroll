@@ -388,11 +388,8 @@ def test_custom_jinja_tests_receive_hostvars_lists_without_loading_other_binding
     hostvars = {"h": {"original": 17}, "other": {"value": 23}}
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars})
     runtime.templater.register_plugins([{"kind": "test", "name": "python_list", "source": """
-import jinja2
-
-@((getattr(jinja2, 'pass_context', None) or jinja2.contextfunction))
-def python_list(ctx, value):
-    return ctx['inventory_hostname'] == 'h' and isinstance(value, list)
+def python_list(value):
+    return isinstance(value, list)
 
 def nested_list(snapshot):
     return isinstance(snapshot['nested'], list)
@@ -411,6 +408,21 @@ class TestModule:
     assert runtime.template(expression, ctx) == "True"
 
 
+def test_custom_filter_leaves_unread_hostvars_entries_lazy():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "original", "source": """
+class FilterModule:
+    def filters(self):
+        return {'original_hostvar': lambda snapshot: snapshot['original']}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Read one hostvar", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    template = ("{% set snapshot = hostvars.h.copy() %}"
+                "{% set unused = snapshot.update({'nested': hostvars.h.values()}) %}"
+                "{{ snapshot | original_hostvar }}")
+    assert runtime.template(template, runtime._task_ctx(task, {})) == "17"
+
+
 def test_custom_filter_mutates_saved_hostvars_values():
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
     runtime.templater.register_plugins([{"kind": "filter", "name": "append", "source": """
@@ -418,9 +430,12 @@ def append(values):
     values.append('added')
     return ''
 
+def append_nested(snapshot):
+    return append(snapshot['nested'])
+
 class FilterModule:
     def filters(self):
-        return {'append_hostvar': append}
+        return {'append_hostvar': append, 'append_nested': append_nested}
 """}])
     task = _task("1", "Mutate hostvars entries through a custom filter", "debug", vars={
         "alias": "{{ lookup('sample') }}/tail",
@@ -428,6 +443,13 @@ class FilterModule:
     runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["value"]
     result = runtime.template(
         "{% set entries = hostvars.h.values() %}{{ entries | append_hostvar }}{{ entries[-1] }}",
+        runtime._task_ctx(task, {}),
+    )
+    assert result == "added"
+    result = runtime.template(
+        "{% set entries = hostvars.h.values() %}{% set snapshot = hostvars.h.copy() %}"
+        "{% set unused = snapshot.update({'nested': entries}) %}"
+        "{{ snapshot | append_nested }}{{ entries[-1] }}",
         runtime._task_ctx(task, {}),
     )
     assert result == "added"
