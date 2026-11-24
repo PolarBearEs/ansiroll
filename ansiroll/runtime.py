@@ -391,7 +391,8 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 yield path[0], path[1:]
             else:
                 yield root.name, path
-        elif path and isinstance(root, nodes.Filter) and root.name in ("default", "d"):
+        elif path and (isinstance(root, nodes.CondExpr)
+                       or isinstance(root, nodes.Filter) and root.name in ("default", "d")):
             pending.append((root, tuple(reversed(path)) + suffix))
         else:
             pending.extend((child, ()) for child in node.iter_child_nodes())

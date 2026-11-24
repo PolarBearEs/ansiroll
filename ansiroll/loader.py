@@ -208,7 +208,7 @@ def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, 
                 key: _tag_untrusted(variables[key], template_syntax_only=True)
                 for key in sorted(available & variables.keys())
             })
-        else:
+        if runtime.get("computed_vars") and not replay_files:
             runtime["vars"].update({key: _tag_untrusted(variables[key])
                                     for key in sorted(available & variables.keys())})
     try:
@@ -263,7 +263,7 @@ def _gather_timeout_template(source, variables):
         runtime["controller_paths"] = sorted(paths, key=repr)
         if unknown_lookup:
             runtime["controller_wildcard"] = True
-    elif computed:
+    if computed:
         runtime["computed_vars"] = True
     return runtime
 
@@ -333,7 +333,8 @@ def _gather_timeout_file_scope(play, entries, runtime):
             selector_names.update(name for name, _ in candidate["paths"])
         for source in entry.get("names", ()):
             dependencies = _gather_timeout_dependencies(
-                source, selector_scope, _GATHER_STRING_METHODS, selector=True)
+                source, selector_scope, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
+                retain_mutable=True)
             if dependencies is not None:
                 selector_names.update(dependencies[1])
         files = [entry["static_vars"]] if "static_vars" in entry else entry["files"].values()
@@ -356,7 +357,8 @@ def _gather_timeout_file_scope(play, entries, runtime):
             value = scope.get(key)
             sources.update(source for source, _, _ in _selector_template_sources(_tag_untrusted(value)))
             for source in sources:
-                dependencies = _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS, allow_controller=True)
+                dependencies = _gather_timeout_dependencies(
+                    source, {}, _GATHER_STRING_METHODS, allow_controller=True, retain_mutable=True)
                 if dependencies is not None:
                     new_names = dependencies[1] - names
                     names.update(new_names)
@@ -397,11 +399,16 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     while pending:
         source, remaining, origin, ancestors = pending.pop()
         if _selector_projection_cycle(origin, remaining, ancestors):
+            if retain_mutable:
+                # Runtime checks cycles on the selected path. Keep scanning its siblings.
+                continue
             return None
         ancestors = (*ancestors, (origin, remaining))
         try:
             expression = env.parse(source)
         except TemplateSyntaxError:
+            if retain_mutable:
+                continue
             return None
         analysis = _selector_scope(expression, key_scope, retain_mutable=retain_mutable)
         for call in analysis[2]:
@@ -421,6 +428,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             value = variables[name]
             container = (selector or path or allow_controller) and isinstance(value, (dict, list, tuple))
             if not container and value is not None and not isinstance(value, (str, int, float, bool)):
+                if retain_mutable:
+                    continue
                 return None
             scope[name] = _tag_untrusted(value, template_syntax_only=allow_controller)
             pending.extend((alias, suffix, (name, location), ancestors)

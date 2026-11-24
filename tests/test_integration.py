@@ -3461,16 +3461,59 @@ def test_timeout_override_ignores_unreachable_lookup(tmp_path, monkeypatch, sour
     "{% if flag %}{{ first }}{% else %}{{ second }}{% endif %}",
     "{{ first if flag else second }}",
     "{{ lookup('env', 'COMPILED_TIMEOUT') | int if flag else second }}",
+    "{{ first if flag else (bad.x if other else second) }}",
+    "{{ (primary if flag else secondary).timeout }}",
+    "{{ lookup('env', 'COMPILED_TIMEOUT') | int if flag else vars[key] }}",
 ])
 def test_timeout_override_can_select_a_branch_unused_at_compile_time(tmp_path, monkeypatch, source_text):
+    from ansiroll.loader import _core_version
+
+    if "bad.x if" in source_text and _core_version() < (2, 19):
+        pytest.skip("Legacy Ansible eagerly resolves recursive aliases during compiler validation")
     monkeypatch.setenv("COMPILED_TIMEOUT", "23")
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
-  vars: {flag: true, first: 23, second: 45}
+  vars:
+    flag: true
+    first: 23
+    second: 45
+    other: false
+    bad: '{{ bad.x }}'
+    primary: {timeout: 23}
+    secondary: {timeout: 45}
+    key: alpha
+    alpha: 25
+    beta: 45
   gather_timeout: >-
     %s
   tasks: []
 """ % source_text)
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"flag": False, "key": "beta"})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_timeout_vars_file_retains_role_defaults_for_alternate_selector_arm(tmp_path, monkeypatch):
+    defaults = tmp_path / "roles" / "settings" / "defaults"
+    defaults.mkdir(parents=True)
+    (defaults / "main.yml").write_text("first_profile: first\nsecond_profile: second\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  roles: [settings]
+  vars: {flag: true}
+  vars_files:
+    - 'timeouts-{{ first_profile if flag else second_profile }}.yml'
+  gather_timeout: '{{ secs }}'
+  tasks: []
+""")
+    (tmp_path / "timeouts-first.yml").write_text("secs: 23\n")
+    (tmp_path / "timeouts-second.yml").write_text("secs: 45\n")
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 23
