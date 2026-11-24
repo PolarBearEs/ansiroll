@@ -1537,13 +1537,13 @@ class _LazyTplList(list):
         raise ValueError("list.remove(x): x not in list")
 
     def sort(self, *, key=None, reverse=False):
-        if self._delegated:
+        if self._delegated or self._task_vars:
             self[:] = list(self)
         list.sort(self, key=key, reverse=reverse)
 
-    def _compares_delegated_items(self, other):
-        return isinstance(other, list) and (self._delegated or (
-            isinstance(other, _LazyTplList) and other._delegated))
+    def _compares_resolved_items(self, other):
+        return isinstance(other, list) and (self._delegated or self._task_vars or (
+            isinstance(other, _LazyTplList) and (other._delegated or other._task_vars)))
 
     def _compare_members(self, other, compare):
         left_len, right_len = len(self), len(other)
@@ -1557,7 +1557,7 @@ class _LazyTplList(list):
         return compare(left_len, right_len)
 
     def _compare_order(self, other, compare, raw_compare):
-        if self._compares_delegated_items(other):
+        if self._compares_resolved_items(other):
             return self._compare_members(other, compare)
         return raw_compare(self, other)
 
@@ -1574,7 +1574,7 @@ class _LazyTplList(list):
         return self._compare_order(other, operator.ge, list.__ge__)
 
     def __eq__(self, other):
-        if self._compares_delegated_items(other):
+        if self._compares_resolved_items(other):
             return len(self) == len(other) and self._compare_members(other, operator.eq)
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
 
@@ -2019,7 +2019,7 @@ class _Templater:
     def _g_lookup(self, name, *a, **k):
         try:
             a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: self._template_lookup_option(value) for key, value in k.items()}
+            k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
                 _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
@@ -2039,7 +2039,7 @@ class _Templater:
     def _g_query(self, name, *a, **k):
         try:
             a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: self._template_lookup_option(value) for key, value in k.items()}
+            k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             return _mark_unsafe(
                 _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
         except _UnsupportedLookup:
@@ -2056,13 +2056,8 @@ class _Templater:
             rendered._fail_with_undefined_error()
         return rendered
 
-    def _template_lookup_option(self, value):
-        rendered = self._template_lookup_arg(value)
-        _raise_captured_template_error(rendered)
-        return rendered
-
     def _template_lookup_arg(self, value):
-        """Render template constants nested inside lookup terms/options."""
+        """Render lookup arguments, preserving missing values and raising evaluation failures."""
         if isinstance(value, dict):
             return {self._template_lookup_arg(k): self._template_lookup_arg(v)
                     for k, v in value.items()}
@@ -2071,10 +2066,10 @@ class _Templater:
         if isinstance(value, tuple):
             return tuple(self._template_lookup_arg(v) for v in value)
         if isinstance(value, str):
-            rendered = self.render_string(value, self._current_ctx)
-            if rendered is not value and isinstance(rendered, (dict, list, tuple)):
-                return self._template_lookup_arg(rendered)
-            return rendered
+            value = self.render_string(value, self._current_ctx)
+            if isinstance(value, (dict, list, tuple)):
+                return self._template_lookup_arg(value)
+        _raise_captured_template_error(value)
         return value
 
     def register_plugins(self, plugins):

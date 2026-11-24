@@ -107,6 +107,9 @@ def test_template_file_interpolates_null_as_empty_in_legacy_native_mode(monkeypa
     ("vars.row.copy()[0]", 17),
     ("vars.row.copy().pop(0)", 17),
     ("[rows.remove(17), rows | length] | last", 1),
+    ("vars.row.copy() < [99, 99]", True),
+    ("[99, 99] > vars.row.copy()", True),
+    ("vars.row.copy() != [99, 99]", True),
 ])
 def test_copy_of_deferred_task_list_renders_only_selected_member(expression, expected):
     frames, calls = [], []
@@ -117,6 +120,19 @@ def test_copy_of_deferred_task_list_renders_only_selected_member(expression, exp
     })
     runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
     assert frames[0]["result"]["msg"] == expected
+    assert calls == []
+
+
+def test_sort_of_deferred_task_list_compares_rendered_members():
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    task = _task("1", "Sort row", "debug", args={"msg": "{{ [rows.sort(), rows] | last }}"}, vars={
+        "number": 17, "row": ["{{ number }}", 2], "rows": "{{ vars.row.copy() }}",
+        "spare": "{{ lookup('source') }}/tail",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == [2, 17]
     assert calls == []
 
 
@@ -1819,11 +1835,26 @@ def test_vars_lookup_preserves_captured_default_errors(call, expected, tmp_path)
     templater = Runtime({}, "", {}).templater
     text = "{{ " + call + "('vars', 'value', default=fallback) }}"
     assert templater.render_string(text, {"value": "present"}) == expected
-    context = {"value": "present", "fallback": "{{ 1 // divisor }}", "divisor": 0}
-    with pytest.raises(_CapturedTemplateError, match="integer division or modulo by zero"):
-        _fail_on_undef(templater.render_string(text, context))
+    assert templater.render_string(text, {"value": "present", "fallback": ["{{ missing }}"]}) == expected
+    context = {"value": "present", "divisor": 0}
+    broken = "{{ 1 // divisor }}"
+    for fallback in (broken, [broken], {"outer": (broken,)}):
+        context["fallback"] = fallback
+        with pytest.raises(_CapturedTemplateError, match="by zero"):
+            _fail_on_undef(templater.render_string(text, context))
     context.update(fallback="{{ lookup('file', path) }}", path=str(tmp_path / "missing"))
     with pytest.raises(_CapturedTemplateError, match="No such file"):
+        _fail_on_undef(templater.render_string(text, context))
+
+
+@pytest.mark.parametrize("call", ["query('list', term)", "lookup('list', term, wantlist=true)"])
+def test_lookup_preserves_captured_nested_term_errors(call):
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ (%s | first)[0] }}" % call
+    context = {"term": ["ok", "{{ 1 // divisor }}"], "divisor": 0}
+    with pytest.raises(_CapturedTemplateError, match="by zero"):
         _fail_on_undef(templater.render_string(text, context))
 
 
