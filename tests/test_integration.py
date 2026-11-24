@@ -2251,6 +2251,187 @@ def test_legacy_include_is_rewritten_and_inlined(tmp_path):
         environment.from_string("{{ missing }}").render()
 
 
+@pytest.mark.parametrize("root_include", ["include", "import_playbook"])
+def test_legacy_playbook_includes_preserve_nested_task_includes(tmp_path, root_include):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- %s: sub/wrapper.yml\n" % root_include)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "wrapper.yml").write_text("- include: leaf.yml\n")
+    (sub / "leaf.yml").write_text("""
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include: tasks.yml
+""")
+    (sub / "tasks.yml").write_text("- include: final.yml\n")
+    (sub / "final.yml").write_text("- debug: {msg: legacy-playbook-leaf}\n")
+
+    source, manifest = compile_playbook(str(playbook))
+    assert "legacy-playbook-leaf" in json.dumps(_compiled_plays(source, tmp_path))
+    assert manifest["fallback_tasks"] == []
+
+
+@pytest.mark.parametrize(("include", "greeting"), [
+    ("""- include: "{{ child_playbook }} greeting='hello world' tags=imported"\n""", "hello world"),
+    ("- include: >\n    {{ child_playbook }}\n", "original"),
+    ("- include: |\n    {{ child_playbook }}\n    greeting=hello\n", "hello"),
+])
+def test_legacy_playbook_include_preserves_inline_variables(tmp_path, include, greeting):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(include)
+    (tmp_path / "child.yml").write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars: {greeting: original}
+  tasks: []
+""")
+
+    plays, _ = parse_playbook(str(playbook), extra_vars={"child_playbook": "child.yml"})
+    assert plays[0]["vars"]["greeting"] == greeting
+    assert "tags" not in plays[0]["vars"]
+
+
+def test_legacy_playbook_include_preserves_explicit_raw_params(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- include: child.yml _raw_params=hello\n")
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+
+    plays, _ = parse_playbook(str(playbook))
+    assert plays[0]["vars"]["_raw_params"] == "hello"
+
+
+@pytest.mark.parametrize("parameters", ["trailing text", "_raw_params=hello trailing text"])
+def test_legacy_playbook_include_rejects_unassigned_parameters(tmp_path, parameters):
+    from ansible.errors import AnsibleParserError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"- include: child.yml {parameters}\n")
+
+    with pytest.raises(AnsibleParserError, match="must use key=value"):
+        parse_playbook(str(playbook))
+
+
+@pytest.mark.parametrize(("include", "tag"), [
+    ("- include: child.yml tags=inline\n  tags: explicit\n", "explicit"),
+    ("- tags: explicit\n  include: child.yml tags=inline\n", "inline"),
+])
+def test_legacy_playbook_include_uses_last_tag_declaration(tmp_path, include, tag):
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
+
+    from ansiroll.loader import _make_rewriting_loader
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(include)
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  tasks: []\n")
+
+    plays = Playbook.load(str(playbook), loader=_make_rewriting_loader(DataLoader)).get_plays()
+    assert plays[0].tags == [tag]
+
+
+@pytest.mark.parametrize("inline_tags", [False, True])
+def test_legacy_playbook_include_defers_import_fields(tmp_path, monkeypatch, inline_tags):
+    from ansiroll import loader
+
+    include = "child.yml tags='{{ deployment_tag }}'" if inline_tags else "child.yml"
+    tags = "" if inline_tags else '  tags: ["{{ deployment_tag }}"]\n'
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(
+        f'- include: "{include}"\n' + tags
+        + """  when: "{{ inventory_hostname == 'localhost' }}"\n"""
+    )
+    (tmp_path / "child.yml").write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars: {deployment_tag: rollout}
+  tasks:
+    - debug: {msg: imported-task}
+""")
+    original_convert = loader._convert_play
+
+    def check_tags(play, *args, **kwargs):
+        assert play.tags == ["{{ deployment_tag }}"]
+        return original_convert(play, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "_convert_play", check_tags)
+    source, _ = compile_playbook(str(playbook))
+    plans = _compiled_plays(source, tmp_path)
+    condition = {"__ansiroll_trusted_condition__": "{{ inventory_hostname == 'localhost' }}"}
+    assert plans[0]["gather_when"] == [condition]
+    task = next(task for block in plans[0]["tasks"] for task in block["block"] if task.get("action") == "debug")
+    assert task["when"] == [condition]
+    result = subprocess.run([sys.executable, str(tmp_path / "compiled.py")],
+                            capture_output=True, text=True, timeout=30, check=True)
+    assert "imported-task" in result.stdout
+
+
+def test_legacy_playbook_include_ignores_templated_import_name(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- name: "{{ deployment_name }}"
+  include: child.yml
+""")
+    (tmp_path / "child.yml").write_text("""
+- name: Child play
+  hosts: localhost
+  gather_facts: false
+  vars: {deployment_name: rollout}
+  tasks: []
+""")
+
+    plays, _ = parse_playbook(str(playbook))
+    assert [play["name"] for play in plays] == ["Child play"]
+
+
+@pytest.mark.parametrize("modern", ["import_playbook", "ansible.builtin.import_playbook", "ansible.legacy.import_playbook"])
+def test_legacy_playbook_include_rejects_conflicting_imports(tmp_path, modern):
+    from ansible.errors import AnsibleParserError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"- include: child.yml\n  {modern}: child.yml\n")
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  tasks: []\n")
+
+    with pytest.raises(AnsibleParserError, match="conflicting playbook include"):
+        parse_playbook(str(playbook))
+
+
+def test_legacy_playbook_include_keeps_aliased_mapping_in_later_vars(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- &imported
+  include: child.yml
+- hosts: localhost
+  gather_facts: false
+  vars: {settings: *imported}
+  tasks: []
+""")
+    (tmp_path / "child.yml").write_text("- hosts: localhost\n  tasks: []\n")
+
+    plays, _ = parse_playbook(str(playbook))
+    assert plays[1]["vars"]["settings"] == {"include": "child.yml"}
+
+
+def test_legacy_include_rewrite_preserves_list_form_vars_file_keys(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars_files: [vars.yml]
+  tasks:
+    - include: tasks.yml
+""")
+    (tmp_path / "vars.yml").write_text("- include: preserved\n")
+    (tmp_path / "tasks.yml").write_text('- debug: {msg: "{{ include }}"}\n')
+
+    source, manifest = compile_playbook(str(playbook))
+    assert not manifest["fallback_tasks"]
+    assert _compiled_plays(source, tmp_path)[0]["vars"]["include"] == "preserved"
+    result = subprocess.run([sys.executable, str(tmp_path / "compiled.py")],
+                            capture_output=True, text=True, timeout=30, check=True)
+    assert "preserved" in result.stdout
+
+
 def test_tree_shake_uses_known_extra_vars_and_drops_module(tmp_path):
     play = tmp_path / "play.yml"
     play.write_text("""

@@ -280,6 +280,7 @@ def test_deferred_vars_keep_standard_mapping_view_type_names(monkeypatch, versio
     ctx = {"alias": "{{ 'value' }}", runtime_mod._DEFER_LOOKUP_NAMES: True}
     assert rt.template("{{ vars.items() | type_debug }}", ctx) == "ItemsView"
     assert rt.template("{{ vars.values() | type_debug }}", ctx) == "ValuesView"
+    assert rt.template("{{ 'alias' in vars.items() }}", ctx) is False
 
 
 @pytest.mark.parametrize("argument", [
@@ -309,12 +310,14 @@ def test_task_defers_mixed_lookup_in_a_lookup_argument(argument):
 
 
 @pytest.mark.parametrize("method", ["items", "values"])
-def test_deferred_vars_methods_produce_loop_lists(method):
-    from ansiroll.runtime import _DEFER_LOOKUP_NAMES
+@pytest.mark.parametrize(("version", "value"), [("2.12.10", "{{ 'value' }}"), ("2.21.0", "value")])
+def test_deferred_vars_methods_produce_loop_lists(monkeypatch, method, version, value):
+    import ansiroll.runtime as runtime_mod
 
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
     rt = Runtime({}, "", {})
-    ctx = {"alias": "{{ 'value' }}", _DEFER_LOOKUP_NAMES: True}
-    expected = ("alias", "value") if method == "items" else "value"
+    ctx = {"alias": "{{ 'value' }}", runtime_mod._DEFER_LOOKUP_NAMES: True}
+    expected = ("alias", value) if method == "items" else value
     items = rt._resolve_loop("{{ vars.%s() }}" % method, ctx)
     assert isinstance(items, list)
     assert items[0] == expected

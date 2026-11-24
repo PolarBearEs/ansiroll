@@ -1436,6 +1436,8 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
 
     def iteration_value(self, key):
+        if not self._legacy_iteration:
+            return self[key]
         source = dict.__getitem__(self, key)
         if isinstance(source, _PlayVarTemplate):
             return str(source)
@@ -1445,7 +1447,7 @@ class _DeferredPlayVarView(_ModernPlayVarView):
         return source
 
     def items(self):
-        return _DeferredVarItems(self) if self._legacy_iteration else ItemsView(self)
+        return _DeferredVarItems(self)
 
     def values(self):
         return _DeferredVarValues(self) if self._legacy_iteration else ValuesView(self)
@@ -1908,6 +1910,29 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message, missing=missing)
 
 
+def _bare_template_expression(text, *, lex=None):
+    stripped = text.strip()
+    if not (stripped.startswith("{{") and stripped.endswith("}}")):
+        return None
+    inner = stripped[2:-2]
+    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith("-") or inner.endswith("-")):
+        return inner.strip()
+    try:
+        tokens = iter((lex or jinja2.Environment().lex)(stripped))
+        _, kind, opening = next(tokens, (None, None, None))
+        if kind != "variable_begin":
+            return None
+        for _, kind, closing in tokens:
+            if kind == "variable_end":
+                if next(tokens, None) is None:
+                    return stripped[len(opening):-len(closing)].strip()
+                break
+    except jinja2.TemplateSyntaxError:
+        # Rendering reports the error when the variable is consumed.
+        pass
+    return None
+
+
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
@@ -2290,24 +2315,6 @@ class _Templater:
             return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
-    def _bare_lookup_expression(self, stripped):
-        """Read the expression between the actual Jinja delimiters."""
-        try:
-            tokens = iter(self.env.lex(stripped))
-            _, kind, opening = next(tokens, (None, None, None))
-            if kind != "variable_begin":
-                return None
-            for _, kind, closing in tokens:
-                if kind != "variable_end":
-                    continue
-                if next(tokens, None) is None:
-                    return stripped[len(opening):-len(closing)].strip()
-                break
-        except jinja2.TemplateSyntaxError:
-            # Rendering reports the error when the variable is consumed.
-            pass
-        return None
-
     def _has_lookup_call(self, text):
         if not _looks_templated(text) or not self._LOOKUP_CALL.search(text):
             return False
@@ -2383,7 +2390,7 @@ class _Templater:
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
                 if self._has_lookup_call(stripped):
-                    if self._lookup_templates[stripped][1] or self._bare_lookup_expression(stripped) is None:
+                    if self._lookup_templates[stripped][1] or _bare_template_expression(stripped, lex=self.env.lex) is None:
                         return True
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
@@ -2406,17 +2413,12 @@ class _Templater:
         stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
-        expr = None
-        if has_lookup:
-            expr = self._bare_lookup_expression(stripped)
-        elif (stripped.startswith("{{") and stripped.endswith("}}")
-              and stripped.count("{{") == 1 and "{%" not in stripped):
-            expr = stripped[2:-2].strip()
+        expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is not None:
             expr_key = (expr, strict, lazy_names)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
-                    sequence = self._conditional_list(stripped, env, ctx, strict)
+                    sequence = self._conditional_list(text.strip(), env, ctx, strict)
                     if sequence is not _NO_CONDITIONAL_LIST:
                         return sequence
                 compiled = self._expr_cache.get(expr_key)
@@ -4008,6 +4010,26 @@ class Runtime:
         return res
 
     @staticmethod
+    def _baked_role_path(parts, directories, aliases):
+        prefix = []
+        for part in parts[:-1]:
+            if part in ("", "."):
+                continue
+            if part == "..":
+                if not prefix:
+                    return None
+                prefix.pop()
+            else:
+                prefix.append(part)
+                directory = "/".join(prefix)
+                if directory in aliases:
+                    target = aliases[directory]
+                    prefix = [] if target == "." else target.split("/")
+                elif directory not in directories:
+                    return None
+        return "/".join(prefix + [parts[-1]])
+
+    @staticmethod
     def _baked_source_key(task, src):
         if isinstance(src, str) and os.path.isabs(src):
             # Dynamic absolute sources are baked with repeated separators collapsed.
@@ -4025,26 +4047,37 @@ class Runtime:
         if ".." in parts:
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
+            normalized = os.path.normpath(src)
+            shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
+            roots = task.get("_baked_tree_roots")
+            if roots:
+                is_copy = (task.get("action") or "").rsplit(".", 1)[-1] == "copy"
+                for directories, aliases, blocked, files in roots:
+                    path = Runtime._baked_role_path(parts, directories, aliases)
+                    if path not in blocked and path not in files:
+                        continue
+                    # Ansible reads the normalized path within the selected root,
+                    # but copy checks the traversed path before choosing whether to recurse.
+                    traversed_directory = blocked.get(path, False) if isinstance(blocked, dict) else path in blocked
+                    if not shadowed and (path not in blocked or traversed_directory):
+                        break
+                    if normalized in blocked or (is_copy and traversed_directory):
+                        return "\0blocked"
+                    return files.get(normalized) or src
+            if shadowed:
+                return src
             directories = set(task.get("_baked_tree_dirs") or ())
             aliases = task.get("_baked_tree_aliases") or {}
-            prefix = []
-            for part in parts[:-1]:
-                if part in ("", "."):
-                    continue
-                if part == "..":
-                    if not prefix:
-                        return src
-                    prefix.pop()
-                else:
-                    prefix.append(part)
-                    directory = "/".join(prefix)
-                    if directory in aliases:
-                        target = aliases[directory]
-                        prefix = [] if target == "." else target.split("/")
-                    elif directory not in directories:
-                        return src
-            if "/".join(prefix + [parts[-1]]) not in (task.get("_baked") or {}):
+            if Runtime._baked_role_path(parts, directories, aliases) not in (task.get("_baked") or {}):
                 return src
+        elif os.path.normpath(src) in (task.get("_baked_tree_shadowed") or {}):
+            normalized = os.path.normpath(src)
+            for _, _, blocked, files in task["_baked_tree_roots"]:
+                if normalized in blocked:
+                    break
+                if normalized in files:
+                    return files[normalized] or src
+            return "\0blocked"
         # Ansible checks the original relative path, then normalizes it when reading.
         return os.path.normpath(src)
 
@@ -5100,6 +5133,8 @@ class Runtime:
         self._close_workers()
 
     def _asset_bytes(self, marker):
+        if isinstance(marker, dict) and "__ansiroll_source_error__" in marker:
+            raise RuntimeError(marker["__ansiroll_source_error__"])
         if not (isinstance(marker, dict)
                 and set(marker) == {"__ansiroll_asset__"}):
             if isinstance(marker, bytes):
@@ -5118,10 +5153,9 @@ class Runtime:
         return data
 
     def _asset_text(self, marker):
-        if not (isinstance(marker, dict)
-                and set(marker) == {"__ansiroll_asset__"}):
-            return marker
-        return self._asset_bytes(marker).decode("utf-8", "surrogateescape")
+        if isinstance(marker, dict) and set(marker) in ({"__ansiroll_asset__"}, {"__ansiroll_source_error__"}):
+            return self._asset_bytes(marker).decode("utf-8", "surrogateescape")
+        return marker
 
     def _module_params(self, args):
         module_args = dict(args)
