@@ -168,6 +168,28 @@ def test_task_mapping_copy_reuses_the_first_resolved_member(body):
     assert calls == ["chosen"]
 
 
+@pytest.mark.parametrize(("mutation", "expression"), [
+    ("copied.setdefault('new', source)", "copied.new"),
+    ("copied.update({'used': source})", "copied.used"),
+    ("copied.update(used=source)", "copied.copy().pop('used')"),
+    ("copied.update({'used': source})", "copied.setdefault('used')"),
+    ("copied.update({'used': source})", "copied.popitem()[1]"),
+])
+def test_task_mapping_copy_keeps_written_values_literal(mutation, expression):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Write a copied setting", "debug", loop=["sample"], vars={
+        "settings": {"kept": "{{ lookup('kept') }}/tail", "used": "{{ lookup('original') }}/tail"},
+    })
+    template = ("{% set copied = settings.copy() %}{{ copied.kept }}|"
+                "{% set source = \"{{ lookup('written') }}\" %}"
+                "{% set ignored = " + mutation + " %}{{ " + expression + " }}")
+    assert runtime.template(template, runtime._task_ctx(task, {"item": "sample"})) == (
+        "kept/tail|{{ lookup('written') }}")
+    assert calls == ["kept"]
+
+
 def test_task_mapping_copy_reuses_a_captured_lookup_error():
     from ansiroll.runtime import _captured, _is_undef
 

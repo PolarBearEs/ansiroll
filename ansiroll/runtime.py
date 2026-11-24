@@ -1158,8 +1158,6 @@ def _read_lazy_member(container, value):
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
-    _copy_reads = None
-
     def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
         dict.__init__(self, raw)
         self._raw = raw
@@ -1179,15 +1177,10 @@ class _LazyTplDict(dict):
         return ctx
 
     def __getitem__(self, k):
-        return self._read_member(k, dict.__getitem__(self, k))
+        return self._read_member(dict.__getitem__(self, k))
 
-    def _read_member(self, key, value):
-        if self._copy_reads is None:
-            return _read_lazy_member(self, value)
-        binding = key, id(value)
-        if binding not in self._copy_reads:
-            self._copy_reads[binding] = value, _read_lazy_member(self, value)
-        return self._rt.templater._observe_untrusted(self._copy_reads[binding][1])
+    def _read_member(self, value):
+        return _read_lazy_member(self, value)
 
     def get(self, k, default=None):
         try:
@@ -1197,21 +1190,21 @@ class _LazyTplDict(dict):
 
     def pop(self, key, *default):
         if key in self:
-            return self._mutation_value(key, dict.pop(self, key, *default))
+            return self._mutation_value(dict.pop(self, key, *default))
         return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return self._rt.templater._observe_untrusted(key), self._mutation_value(key, value)
+        return self._rt.templater._observe_untrusted(key), self._mutation_value(value)
 
     def setdefault(self, key, default=None):
         if key in self:
-            return self._mutation_value(key, dict.__getitem__(self, key))
+            return self._mutation_value(dict.__getitem__(self, key))
         return dict.setdefault(self, key, default)
 
-    def _mutation_value(self, key, value):
+    def _mutation_value(self, value):
         if self._task_vars:
-            return self._read_member(key, value)
+            return self._read_member(value)
         return _observe_container_value(value, self._rt, self._render_ctx)
 
     def keys(self):
@@ -1228,11 +1221,7 @@ class _LazyTplDict(dict):
     def copy(self):
         raw_items = dict.items(self)
         if self._task_vars:
-            copied = _LazyTplDict(dict(raw_items), self._rt, self._render_ctx(), origin=self._origin, task_vars=True)
-            copied._task_binding = getattr(self, "_task_binding", None)
-            # A copy of a snapshot keeps the result of each original binding.
-            copied._copy_reads = self._copy_reads if self._copy_reads is not None else {}
-            return copied
+            return _TaskMappingSnapshot(self, {key: _TaskMappingMember(value) for key, value in raw_items})
         if any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
             return _LazyTplDict(dict(raw_items), self._rt, self._render_ctx())
         return {k: self[k] for k in self}
@@ -1262,6 +1251,37 @@ class _LazyTplDict(dict):
         return not self.__eq__(other)
 
     __hash__ = None
+
+
+class _TaskMappingMember:
+    """An inherited binding whose first result is shared by snapshot copies."""
+
+    _resolved = False
+
+    def __init__(self, value):
+        self._value = value
+
+    def resolve(self, snapshot):
+        if not self._resolved:
+            self._value = _read_lazy_member(snapshot, self._value)
+            self._resolved = True
+        return self._value
+
+
+class _TaskMappingSnapshot(_LazyTplDict):
+    """A shallow copy with deferred source bindings and ordinary dict writes."""
+
+    def __init__(self, source, bindings):
+        super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=True)
+        self._task_binding = getattr(source, "_task_binding", None)
+
+    def _read_member(self, value):
+        if isinstance(value, _TaskMappingMember):
+            value = value.resolve(self)
+        return self._rt.templater._observe_untrusted(value)
+
+    def copy(self):
+        return _TaskMappingSnapshot(self, dict(dict.items(self)))
 
 
 class _HandlerNameVars(_LazyTplDict):
