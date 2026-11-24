@@ -207,7 +207,7 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_input_paths(expression, remaining=(), variables=None, computed=None):
+def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
     pending = [(expression, ())]
@@ -233,6 +233,8 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                     key = _selector_vars_key(term, variables or {})
                     if isinstance(key, str):
                         yield key, ()
+                    elif unknown_lookup is not None:
+                        unknown_lookup.add("vars")
             continue
         root = node
         path = []
@@ -247,11 +249,15 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 pending.append((root.arg, ()))
                 key = _selector_vars_key(root.arg, variables or {})
                 if not isinstance(key, str):
+                    if computed is not None:
+                        root = None
                     break
                 path.append(key)
             else:
                 break
             root = root.node
+        if root is None:
+            continue
         if isinstance(root, nodes.Name) and root.ctx == "load":
             path = tuple(reversed(path)) + suffix
             if root.name == "vars" and path and isinstance(path[0], str):
@@ -274,11 +280,33 @@ def _selector_vars_key(node, variables):
             return value["__ansiroll_unsafe__"]
         if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
             return value
+    if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
+        if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
+            value = _selector_vars_key(node.node, variables)
+            if isinstance(value, str):
+                method = "strip" if node.name == "trim" else node.name
+                return getattr(value, method)()
     if isinstance(node, jinja2.nodes.Concat):
         parts = [_selector_vars_key(part, variables) for part in node.nodes]
         if all(isinstance(part, str) for part in parts):
             return "".join(parts)
     return None
+
+
+def _vars_input_at(scope, name, path):
+    value = scope.get(name, _MISSING_VARS_FILE_INPUT)
+    for member in path:
+        if isinstance(value, dict):
+            if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                break
+            value = value.get(member, _MISSING_VARS_FILE_INPUT)
+        elif isinstance(value, (list, tuple)) and isinstance(member, int) and -len(value) <= member < len(value):
+            value = value[member]
+        else:
+            # Compare the template source itself. The dependency scan also
+            # records the projection made through the source.
+            return value if _looks_templated(value) else _MISSING_VARS_FILE_INPUT
+    return value
 
 
 def _same_vars_input(left, right):
@@ -5098,7 +5126,9 @@ class Runtime:
         for layer in (*role_exports, self.extra_vars):
             _clear_vars_file_blocks(blocked, layer, merge_hashes)
         overrides = self.extra_vars.keys() | (vars_files or {}).keys() | blocked.keys()
-        if not (template.get("required") or template.get("file_names")) and overrides.isdisjoint(template["names"]):
+        wildcard = template.get("controller_wildcard")
+        relevant = overrides if wildcard else overrides.intersection(template["names"])
+        if not (template.get("required") or template.get("file_names") or relevant):
             return timeout
         play_vars = template.get("play_vars") if vars_files is None else vars_files
         defaults = template.get("timeout_defaults") if vars_files is None else None
@@ -5112,9 +5142,13 @@ class Runtime:
                  "make its vars files and lookup inputs resolvable at compile time")
         if "controller_inputs" in template:
             compiled = template["controller_inputs"]
-            if blocked.keys().isdisjoint(template["names"]) and all(
-                _same_vars_input(scope.get(key, _MISSING_VARS_FILE_INPUT), compiled.get(key, _MISSING_VARS_FILE_INPUT))
-                for key in template["names"]
+            paths = {(key, tuple(path)) for key, path in template.get(
+                "controller_paths", [(key, ()) for key in template["names"]])}
+            if wildcard:
+                paths.update((key, ()) for key in overrides)
+            if not _vars_file_reads_blocked(blocked, paths) and all(
+                _same_vars_input(_vars_input_at(scope, key, path), _vars_input_at(compiled, key, path))
+                for key, path in paths
             ):
                 return timeout
             raise ValueError(error)

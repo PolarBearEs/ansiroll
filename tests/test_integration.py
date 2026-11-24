@@ -3078,13 +3078,14 @@ def test_controller_timeout_lookup_rejects_changed_input_without_running_lookup(
         assert called == [("ansible.builtin.setup", {"gather_timeout": 3})]
 
 
-def test_computed_timeout_can_select_another_play_var(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compile_key", [True, False])
+def test_computed_timeout_can_select_another_play_var(tmp_path, monkeypatch, compile_key):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
-  vars: {timeout_var: first, first: 23, second: 45}
+  vars: {%sfirst: 23, second: 45}
   gather_timeout: "{{ vars[timeout_var] }}"
   tasks: []
-""")
+""" % ("timeout_var: first, " if compile_key else ""))
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"timeout_var": "second"})
@@ -3135,6 +3136,9 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
     ("lookup('env', 'ANSIROLL_TIMEOUT_' ~ key) | length", "{key: 1}", {"key": True}, 3),
     ("lookup('env', 'ANSIROLL_TIMEOUT_' ~ key[0]) | length", "{key: [1]}", {"key": [True]}, 3),
     ("lookup('vars', 'timeout_seconds')", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
+    ("lookup('vars', 'TIMEOUT_SECONDS' | lower)", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
+    ("lookup('vars', 'timeout_value' | replace('value', 'seconds'))", "{timeout_seconds: 23}",
+     {"timeout_seconds": 45}, 23),
     ("lookup('ansible.builtin.vars', key)", "{key: timeout_seconds, timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
 ])
@@ -3186,6 +3190,78 @@ def test_timeout_hash_merge_applies_role_exports_in_order(tmp_path, monkeypatch)
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"gather_timeout": 20})]
+
+
+def test_timeout_replays_portable_vars_file_selected_during_compilation(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: first}
+  vars_files: ['gather-{{ profile }}.yml']
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "gather-first.yml").write_text("timeout_seconds: 23\n")
+    (tmp_path / "gather-second.yml").write_text("timeout_seconds: 45\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "second"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+    assert runtime.vars["timeout_seconds"] == 45
+
+
+def test_controller_timeout_ignores_alias_from_unselected_vars_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TIMEOUT_SELECTED", "abc")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {unrelated: unused, profile: first}
+  vars_files: ['choice-{{ stage }}.yml', 'gather-{{ profile }}.yml']
+  gather_timeout: '{{ lookup("env", timeout_env) | length }}'
+  tasks: []
+""")
+    (tmp_path / "gather-first.yml").write_text("timeout_env: ANSIROLL_TIMEOUT_SELECTED\n")
+    (tmp_path / "gather-other.yml").write_text('timeout_env: "{{ unrelated }}"\n')
+    (tmp_path / "gather-literal.yml").write_text("timeout_env: ANSIROLL_TIMEOUT_SELECTED\n")
+    (tmp_path / "choice-runtime.yml").write_text("profile: literal\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"stage": "runtime"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 3})]
+
+
+@pytest.mark.parametrize("rename", [False, True])
+def test_controller_timeout_compares_only_read_mapping_members(tmp_path, monkeypatch, rename):
+    monkeypatch.setenv("ANSIROLL_TIMEOUT_SELECTED", "abc")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {cfg: {name: ANSIROLL_TIMEOUT_SELECTED, label: initial}}
+  gather_timeout: '{{ lookup("env", cfg.name) | length }}'
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append, extra_vars={
+        "cfg": {"name": "ANSIROLL_TIMEOUT_DIFFERENT" if rename else "ANSIROLL_TIMEOUT_SELECTED", "label": "updated"},
+    })
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if rename:
+        assert runtime.failed
+        assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+        assert not called
+    else:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": 3})]
 
 
 def test_legacy_include_is_rewritten_and_inlined(tmp_path):

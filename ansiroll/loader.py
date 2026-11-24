@@ -196,13 +196,21 @@ def _compile_gather_timeout(play, variable_manager, loader, compiled_play_vars, 
         variables = combine_vars(variables, _gather_selector_magic(play))
         variables["vars"] = dict(variables)
     runtime = _gather_timeout_template(play.gather_timeout, variables)
-    if runtime is not None and runtime.get("computed_vars") and not replay_files:
+    if runtime is not None and (runtime.get("controller_wildcard")
+                                or runtime.get("computed_vars") and not replay_files):
         roles = list(_gather_public_roles(play))
         available = compiled_play_vars.keys() | _gather_role_defaults(roles).keys()
         for export in _gather_role_exports(roles):
             available.update(export)
-        runtime["vars"].update({key: _tag_untrusted(variables[key])
-                                for key in sorted(available & variables.keys())})
+        if runtime.get("controller_wildcard"):
+            available.update(variable_manager.extra_vars)
+            runtime["controller_inputs"].update({
+                key: _tag_untrusted(variables[key], template_syntax_only=True)
+                for key in sorted(available & variables.keys())
+            })
+        else:
+            runtime["vars"].update({key: _tag_untrusted(variables[key])
+                                    for key in sorted(available & variables.keys())})
     try:
         timeout_play.post_validate(Templar(loader=loader, variables=variables))
     except AnsibleError as error:
@@ -229,20 +237,25 @@ def _gather_timeout_template(source, variables):
     computed = set()
     dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS, computed=computed)
     controller_only = dependencies is None
+    paths, unknown_lookup = set(), set()
     if controller_only:
         dependencies = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS,
-                                                    allow_controller=True)
+                                                    allow_controller=True, paths=paths,
+                                                    unknown_lookup=unknown_lookup)
     if dependencies is None:
         return None
     scope, names = dependencies
-    if not names:
+    if not names and not unknown_lookup:
         return None
     runtime = {"source": source, "vars": scope, "names": sorted(names),
                "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
                "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
     if controller_only:
         runtime.pop("source")
-        runtime["controller_inputs"] = scope
+        runtime["controller_inputs"] = dict(scope)
+        runtime["controller_paths"] = sorted(paths, key=repr)
+        if unknown_lookup:
+            runtime["controller_wildcard"] = True
     elif computed:
         runtime["computed_vars"] = True
     return runtime
@@ -358,7 +371,8 @@ def _gather_timeout_file_scope(play, entries, runtime):
     }
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
-                                 selector=False, allow_controller=False, computed=None):
+                                 selector=False, allow_controller=False, computed=None, paths=None,
+                                 unknown_lookup=None):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
@@ -381,9 +395,11 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
-        for name, path in _selector_input_paths(expression, remaining, variables, computed):
+        for name, path in _selector_input_paths(expression, remaining, variables, computed, unknown_lookup):
             if name == "omit" or (name, path) in seen:
                 continue
+            if paths is not None:
+                paths.add((name, path))
             seen.add((name, path))
             names.add(name)
             if name not in variables:
@@ -841,14 +857,19 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 # A deferred file may change a later selector's inputs.
-                if ordered is not None and unresolved:
+                if ordered is not None:
                     from .runtime import _GATHER_STRING_METHODS
 
                     selector_vars = hash_scope if hash_scope is not None else {**role_defaults, **out}
-                    dependencies = _gather_timeout_dependencies(
-                        filename, combine_vars(combine_vars(selector_vars, compile_extra_vars), selector_magic),
-                        _GATHER_STRING_METHODS, selector=True, allow_controller=True)
-                    if dependencies is not None:
+                    inputs = combine_vars(combine_vars(selector_vars, compile_extra_vars), selector_magic)
+                    portable = _gather_timeout_dependencies(filename, inputs, _GATHER_STRING_METHODS, selector=True)
+                    # A templated leading directory cannot be bundled by the
+                    # filename glob. Keep its known choice unless order requires replay.
+                    if portable is not None and not (filename.startswith(("{{", "{%")) and "/" in filename):
+                        defer_for_order |= bool(portable[1] - compile_extra_vars.keys() - selector_magic.keys())
+                    dependencies = (portable if portable is not None else _gather_timeout_dependencies(
+                        filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True))
+                    if unresolved and dependencies is not None:
                         earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
                         for index, previous in enumerate(earlier, start=scanned):
                             if order_deferred and index in order_deferred:
