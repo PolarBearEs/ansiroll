@@ -2010,7 +2010,7 @@ class _Templater:
 
     def _g_lookup(self, name, *a, **k):
         try:
-            a = tuple(_fail_on_undef(self._template_lookup_arg(v)) for v in a)
+            a = tuple(self._template_lookup_term(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
@@ -2030,7 +2030,7 @@ class _Templater:
 
     def _g_query(self, name, *a, **k):
         try:
-            a = tuple(_fail_on_undef(self._template_lookup_arg(v)) for v in a)
+            a = tuple(self._template_lookup_term(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             return _mark_unsafe(
                 _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
@@ -2041,6 +2041,12 @@ class _Templater:
             return _captured_jinja_error(e)
         except Exception as e:
             return _captured(str(e))
+
+    def _template_lookup_term(self, value):
+        rendered = self._template_lookup_arg(value)
+        if _is_undef(rendered):
+            rendered._fail_with_undefined_error()
+        return rendered
 
     def _template_lookup_arg(self, value):
         """Render template constants nested inside lookup terms/options."""

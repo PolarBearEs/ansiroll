@@ -1755,6 +1755,13 @@ def test_literal_false_when_does_not_hide_lookup_type_errors():
     assert "expects a dictionary" in frames[0]["result"]["msg"]
 
 
+@pytest.mark.parametrize("call", ["query('list', ['ok', missing])",
+                                  "lookup('list', ['ok', missing], wantlist=true)"])
+def test_lookup_can_leave_unused_nested_terms_undefined(call):
+    templater = Runtime({}, "", {}).templater
+    assert templater.render_string("{{ (%s | first)[0] }}" % call, {}) == "ok"
+
+
 def test_literal_false_when_does_not_hide_lookup_file_errors(tmp_path):
     task = _task("1", "broken lookup", "debug", loop="{{ query('file', path) }}",
                  vars={"path": str(tmp_path / "missing")}, when=[False])
