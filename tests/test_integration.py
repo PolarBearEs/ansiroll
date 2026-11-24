@@ -3459,12 +3459,14 @@ def test_timeout_override_ignores_unreachable_lookup(tmp_path, monkeypatch, sour
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
-@pytest.mark.parametrize("expression", ["cfg[key]", "array[index]", "vars['fast' if flag else 'slow']"])
+@pytest.mark.parametrize("expression", ["cfg[key]", "cfg_alias[key]", "array[index]", "vars['fast' if flag else 'slow']"])
 def test_timeout_override_can_change_a_computed_subscript(tmp_path, monkeypatch, expression):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars:
-    cfg: {slow: 23, fast: 45}
+    cfg: {slow: 23, fast: '{{ fast_seconds }}'}
+    cfg_alias: '{{ cfg }}'
+    fast_seconds: 45
     key: slow
     array: [23, 45]
     index: 0
@@ -3484,6 +3486,58 @@ def test_timeout_override_can_change_a_computed_subscript(tmp_path, monkeypatch,
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+@pytest.mark.parametrize(("operand", "operator", "initial", "override"), [
+    ("cfg", "or", "{}", {"unrelated": 1}),
+    ("cfg_alias", "or", "{}", {"unrelated": 1}),
+    ("cfg", "and", "{unrelated: 1}", {}),
+])
+def test_controller_timeout_rechecks_projected_boolean_operand(tmp_path, monkeypatch, operand, operator,
+                                                                initial, override):
+    monkeypatch.setenv("COMPILED_TIMEOUT", "23")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars:
+    cfg: %s
+    cfg_alias: '{{ cfg }}'
+    fallback: {timeout: "{{ lookup('env', 'COMPILED_TIMEOUT') | int }}"}
+  gather_timeout: "{{ (%s %s fallback).timeout | default(45) }}"
+  tasks: []
+""" % (initial, operand, operator))
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"cfg": override})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+@pytest.mark.parametrize("alternate_vars, fallback", [
+    ("seconds: 45\n", False),
+    ("seconds: 45\ntask_file: other.yml\n", True),
+    ("seconds: [\n", True),
+])
+def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, alternate_vars, fallback):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: default, task_file: tasks.yml}
+  vars_files:
+    - "settings-{{ profile }}.yml"
+  gather_timeout: "{{ seconds }}"
+  tasks:
+    - include_tasks: "{{ task_file }}"
+""")
+    (tmp_path / "settings-default.yml").write_text("seconds: 23\n")
+    (tmp_path / "settings-alternate.yml").write_text(alternate_vars)
+    (tmp_path / "tasks.yml").write_text("- debug: {msg: included-marker}\n")
+    source, manifest = compile_playbook(str(playbook))
+    assert bool(manifest["fallback_tasks"]) == fallback
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert ("included-marker" in json.dumps(plan)) != fallback
 
 
 @pytest.mark.parametrize("source_text", [

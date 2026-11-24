@@ -416,7 +416,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
-                                                resolve_aliases=resolve_aliases, analysis=analysis):
+                                                resolve_aliases=resolve_aliases, analysis=analysis,
+                                                retain_mutable=retain_mutable):
             if name == "omit" or (name, path) in seen:
                 continue
             if paths is not None:
@@ -648,6 +649,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
         play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
+    deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
+    for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
+        deferred[index]["files"].update(selected)
+        deferred[index]["checked_paths"] = checked_paths
+        if controller_candidates:
+            deferred[index]["controller_candidates"] = controller_candidates
+        if selected:
+            deferred[index]["has_compile_selection"] = True
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -662,7 +671,15 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
-    includes.incomplete = bool(unresolved_vars_files)
+    for index, entry in enumerate(deferred):
+        if index not in order_deferred or entry.get("unmodeled"):
+            includes.incomplete = True
+        for data in entry["files"].values():
+            if not isinstance(data, list):
+                includes.incomplete = True
+                continue
+            for mapping in data:
+                includes.vars_file_writes.update(mapping)
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -723,15 +740,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "tasks": tasks,
         "handlers": handlers,
     }
-    if unresolved_vars_files:
-        deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
-        for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
-            deferred[index]["files"].update(selected)
-            deferred[index]["checked_paths"] = checked_paths
-            if controller_candidates:
-                deferred[index]["controller_candidates"] = controller_candidates
-            if selected:
-                deferred[index]["has_compile_selection"] = True
+    if deferred:
         result["deferred_vars_files"] = deferred
     # Replaying a selector after an earlier deferred file may bundle new
     # candidates. Their lookup names do not authorize copying controller data.
@@ -1396,7 +1405,9 @@ class _IncludeVariables:
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
         self.resolved_template = False
-        # A vars file whose name is only known at runtime may redefine any play var.
+        # Replay of a known vars file can only redefine keys found in its candidates.
+        self.vars_file_writes = set()
+        # When candidate contents are unknown, any play var can change.
         self.incomplete = False
 
     def record_writes(self, blocks):
@@ -1732,7 +1743,8 @@ def _template_include_filename(task, value, includes):
     def is_runtime(name):
         if name in loop_names:
             return True
-        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
+        if ((includes.incomplete or name in includes.vars_file_writes)
+                and name not in extra_vars and name not in above_vars_files
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
         if not _can_write_var(includes.runtime_writes, name):

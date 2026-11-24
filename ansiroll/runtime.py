@@ -224,7 +224,7 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
             return None
         scope = {**variables, **dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)} if names else variables
         value = _selector_vars_key(test, scope, ())
-        return bool(value) if isinstance(value, (bool, int, float, str, type(None))) else None
+        return _selector_truth(value)
 
     def visit(node, names):
         if names:
@@ -317,7 +317,7 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
 
 
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
-                          *, resolve_aliases=False, analysis=None):
+                          *, resolve_aliases=False, analysis=None, retain_mutable=False):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
     bindings, unreachable, _ = analysis if analysis is not None else _selector_scope(expression, variables or {})
@@ -345,6 +345,9 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
             continue
         if isinstance(node, (nodes.And, nodes.Or)):
             pending.extend(((node.left, suffix), (node.right, suffix)))
+            if suffix and suffix != (None,):
+                # A branch can change even when the projected member stays absent.
+                pending.append((node.left, (None,)))
             continue
         if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
             pending.append((node.node, suffix))
@@ -385,6 +388,12 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
                 if vars_access and computed is not None:
                     computed.add("vars")
                 pending.append((root.arg, ()))
+                if retain_mutable and not vars_access:
+                    # An override can select a different member. Scan every
+                    # member of this receiver for the aliases it may need.
+                    pending.append((root.node, ()))
+                    root = None
+                    break
                 key = resolve_key(root.arg, () if resolve_aliases else None)
                 if not isinstance(key, str if vars_access else (str, int)):
                     if vars_access and unknown_lookup is not None:
@@ -409,27 +418,34 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
             pending.extend((child, ()) for child in node.iter_child_nodes())
 
 
+def _selector_truth(value):
+    if isinstance(value, (str, bool, int, float, type(None), dict, list, tuple)):
+        return bool(value)
+    return None
+
+
 def _selector_vars_key(node, variables, aliases=None):
-    """Resolve a vars key from scalar inputs without running template plugins."""
+    """Resolve known values without running template plugins."""
     unknown = _UNRESOLVED_SELECTOR_KEY
     missing = _MISSING_VARS_FILE_INPUT
     if isinstance(node, jinja2.nodes.Const):
         return node.value
     if isinstance(node, jinja2.nodes.CondExpr):
-        value = _selector_vars_key(node.test, variables, aliases)
-        if isinstance(value, (str, bool, int, float, type(None))):
-            return _selector_vars_key(node.expr1 if value else node.expr2, variables, aliases)
+        truth = _selector_truth(_selector_vars_key(node.test, variables, aliases))
+        if truth is not None:
+            return _selector_vars_key(node.expr1 if truth else node.expr2, variables, aliases)
     if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
         left = _selector_vars_key(node.left, variables, aliases)
-        if isinstance(left, (str, bool, int, float, type(None))):
+        truth = _selector_truth(left)
+        if truth is not None:
             short_circuit_on = isinstance(node, jinja2.nodes.Or)
-            if bool(left) is short_circuit_on:
+            if truth is short_circuit_on:
                 return left
             return _selector_vars_key(node.right, variables, aliases)
     if isinstance(node, jinja2.nodes.Not):
-        value = _selector_vars_key(node.node, variables, aliases)
-        if isinstance(value, (str, bool, int, float, type(None))):
-            return not value
+        truth = _selector_truth(_selector_vars_key(node.node, variables, aliases))
+        if truth is not None:
+            return not truth
     if isinstance(node, jinja2.nodes.Name):
         value = variables.get(node.name, missing)
         if value is None or value is missing:
@@ -438,7 +454,7 @@ def _selector_vars_key(node, variables, aliases=None):
             return value["__ansiroll_unsafe__"]
         if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
             return value
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float, dict, list, tuple)):
             return value
         if aliases is not None and len(aliases) < 64 and node.name not in aliases and isinstance(value, str):
             source = _bare_template_expression(value)
@@ -534,6 +550,12 @@ def _vars_input_at(scope, name, path):
     value = scope.get(name, _MISSING_VARS_FILE_INPUT)
     for member in path:
         value = _literal_vars_input(value)
+        if member is None:
+            # None is reserved for an input used only for its truthiness.
+            if not (_looks_templated(value) and not isinstance(value, _NO_TEMPLATE)):
+                truth = _selector_truth(value)
+                return value if truth is None else truth
+            return value
         if isinstance(value, dict):
             if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                 break
@@ -607,6 +629,8 @@ def _selector_template_sources(value, path=()):
     for index, key in enumerate(path):
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             yield value, path[index:], path[:index]
+            return
+        if key is None:
             return
         if isinstance(value, dict):
             if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
