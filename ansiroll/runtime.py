@@ -208,7 +208,7 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_local_values(names, bindings):
+def _selector_local_values(names, bindings, variables=None):
     """Follow assignment-time names to constants, leaving other locals opaque."""
     values = dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)
     for name, sources in names.items():
@@ -223,6 +223,10 @@ def _selector_local_values(names, bindings):
                 break
             visited.add(id(source))
             sources = bindings.get(id(source), {}).get(source.name, ())
+            if not sources and variables is not None:
+                value = _selector_vars_key(source, variables, ())
+                if isinstance(value, (str, int, float, bool, type(None))):
+                    values[name] = value
     return values
 
 
@@ -231,6 +235,7 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
     bindings = {}
     unreachable = set()
     calls = []
+    closure_reads = set()
     external = frozenset({None})
     unknown_local = frozenset({_UNRESOLVED_SELECTOR_KEY})
     in_closure = False
@@ -245,12 +250,16 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
             variables_in_test = (test,) if isinstance(test, nodes.Name) else test.find_all(nodes.Name)
             if any(node.name not in names for node in variables_in_test):
                 return None
-        scope = {**variables, **_selector_local_values(names, bindings)} if names else variables
+        external_scalars = None if retain_mutable or in_closure else variables
+        scope = {**variables, **_selector_local_values(names, bindings, external_scalars)} if names else variables
         value = _selector_vars_key(test, scope, ())
         return _selector_truth(value)
 
     def visit(node, names, top=None):
         nonlocal in_closure
+        if in_closure and isinstance(node, nodes.Name) and node.ctx == "load" and (
+                None in names.get(node.name, external)):
+            closure_reads.add(node.name)
         if names:
             bindings[id(node)] = names.copy()
         if isinstance(node, nodes.Call):
@@ -365,21 +374,22 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
                                        unknown_local))
 
     visit(expression, {})
-    return bindings, unreachable, calls
+    return bindings, unreachable, calls, closure_reads
 
 
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
                           *, resolve_aliases=False, analysis=None, retain_mutable=False):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
-    bindings, unreachable, _ = analysis if analysis is not None else _selector_scope(expression, variables or {})
-    has_closures = next(expression.find_all((nodes.Macro, nodes.CallBlock)), None) is not None
+    bindings, unreachable, _, closure_reads = (
+        analysis if analysis is not None else _selector_scope(expression, variables or {}))
 
     def resolve_key(node, aliases=None):
         local = bindings.get(id(node))
         scope = variables or {}
         if local:
-            scope = {**scope, **_selector_local_values(local, bindings)}
+            external_scalars = None if retain_mutable or closure_reads else scope
+            scope = {**scope, **_selector_local_values(local, bindings, external_scalars)}
         return _selector_vars_key(node, scope, aliases)
 
     pending = [(expression, ())]
@@ -394,7 +404,8 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
         if id(node) in unreachable or (id(node), suffix) in visited:
             continue
         visited.add((id(node), suffix))
-        if (not has_closures and isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name)
+        if (isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name)
+                and node.target.name not in closure_reads
                 and isinstance(node.node, (nodes.Name, nodes.Getattr, nodes.Getitem))):
             # Resolving the assignment reads the binding. Members of a lazy
             # mapping are read only where the alias is used.
