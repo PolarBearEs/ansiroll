@@ -316,7 +316,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, selector=False):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import _selector_input_paths, _selector_template_sources
+    from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_template_sources
 
     env = Environment()
     pending = [(source, (), ())]
@@ -325,9 +325,9 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *, select
     seen = set()
     while pending:
         source, remaining, ancestors = pending.pop()
-        if source in ancestors:
+        if _selector_projection_cycle(source, remaining, ancestors):
             return None
-        ancestors = (*ancestors, source)
+        ancestors = (*ancestors, (source, remaining))
         try:
             expression = env.parse(source)
         except TemplateSyntaxError:

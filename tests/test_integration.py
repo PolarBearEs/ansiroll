@@ -2727,7 +2727,9 @@ def test_ordered_vars_files_keep_intermediate_hash_replacement(tmp_path, monkeyp
     assert runtime.template("{{ settings }}", runtime.ctx()) == {"final": True}
 
 
-@pytest.mark.parametrize("selector", ["magic", "mapping", "mapping_with_lookup", "mapping_alias"])
+@pytest.mark.parametrize("selector", [
+    "magic", "mapping", "mapping_with_lookup", "mapping_alias", "mapping_default", "shrinking_alias",
+])
 def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp_path, monkeypatch, selector):
     playbook = tmp_path / "play.yml"
     if selector == "magic":
@@ -2739,13 +2741,20 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
         initial = {"config": {"flavor": "default"}}
         override = {"config": {"flavor": "runtime"}}
         prefix = "settings-"
-        if selector in ("mapping_with_lookup", "mapping_alias"):
+        if selector in ("mapping_with_lookup", "mapping_alias", "mapping_default"):
             monkeypatch.delenv("ANSIROLL_TEST_UNUSED_SELECTOR", raising=False)
             initial["config"]["unused"] = "{{ lookup('env', 'ANSIROLL_TEST_UNUSED_SELECTOR') }}"
             override["config"]["unused"] = "{{ lookup('also_unavailable') }}"
-        if selector == "mapping_alias":
-            initial = {"config": "{{ settings }}", "settings": initial["config"]}
-            override = {"config": "{{ runtime_settings }}", "runtime_settings": override["config"]}
+        if selector in ("mapping_alias", "mapping_default"):
+            filter_ = " | default({})" if selector == "mapping_default" else ""
+            initial = {"config": "{{ settings" + filter_ + " }}", "settings": initial["config"]}
+            override = {"config": "{{ runtime_settings" + filter_ + " }}", "runtime_settings": override["config"]}
+        if selector == "shrinking_alias":
+            suffix = "{{ config.nested.again.flavor }}"
+            initial = {"config": "{{ settings }}", "settings": {
+                "flavor": "default", "nested": {"again": "{{ settings }}"},
+            }}
+            override = {"config": {"nested": {"again": {"flavor": "runtime"}}}}
     playbook.write_text("""- hosts: localhost
   vars: %s
   vars_files: ['gather-{{ profile }}.yml', 'settings-%s.yml']
@@ -2763,7 +2772,8 @@ def test_ordered_timeout_replays_selectors_with_controller_or_mapping_inputs(tmp
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
-    assert plan["gather_timeout"] == 23
+    if selector != "shrinking_alias":
+        assert plan["gather_timeout"] == 23
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
@@ -2819,6 +2829,40 @@ def test_ordered_first_found_rejects_path_outside_glob_depth(tmp_path, monkeypat
     monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
     runtime.run_play(plan)
     assert runtime.vars["selected"] == "fallback"
+    runtime.extra_vars["profile"] = "other"
+    with pytest.raises(VarsFilesError, match="path that was not bundled"):
+        runtime.run_play(plan)
+
+
+def test_ordered_first_found_checks_unbundled_higher_priority_path(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import VarsFilesError
+
+    if _core_version() < (2, 12):
+        pytest.skip("legacy vars files do not search a vars subdirectory")
+    playbook = tmp_path / "play.yml"
+    fallback = tmp_path / "profiles" / "final.yml"
+    fallback.parent.mkdir()
+    fallback.write_text("selected: bundled-lower-priority\n")
+    earlier = tmp_path / "vars" / "profiles" / "final.yml"
+    earlier.parent.mkdir(parents=True)
+    earlier.write_text("selected: unbundled-higher-priority\n")
+    playbook.write_text("""- hosts: localhost
+  vars: {config_dir: default}
+  vars_files:
+    - 'gather-{{ profile }}.yml'
+    - ['profiles/{{ config_dir }}/final.yml', %s]
+  gather_timeout: '{{ 23 }}'
+  tasks: []
+""" % json.dumps(str(fallback)))
+    (tmp_path / "gather-normal.yml").write_text("{}\n")
+    (tmp_path / "gather-other.yml").write_text("config_dir: ''\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "normal"})
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "bundled-lower-priority"
     runtime.extra_vars["profile"] = "other"
     with pytest.raises(VarsFilesError, match="path that was not bundled"):
         runtime.run_play(plan)

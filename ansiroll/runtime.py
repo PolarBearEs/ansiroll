@@ -210,15 +210,20 @@ def _looks_templated(value):
 def _selector_input_paths(expression, remaining=()):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
-    alias = None
+    pending = [(expression, ())]
     if remaining and len(expression.body) == 1 and isinstance(expression.body[0], nodes.Output):
         outputs = [node for node in expression.body[0].nodes
                    if not isinstance(node, nodes.TemplateData) or node.data.strip()]
         if len(outputs) == 1:
-            alias = outputs[0]
-    pending = [expression]
+            pending = [(outputs[0], remaining)]
     while pending:
-        node = pending.pop()
+        node, suffix = pending.pop()
+        if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
+            pending.append((node.node, suffix))
+            pending.extend((value, suffix if index == 0 else ()) for index, value in enumerate(node.args))
+            pending.extend((kw.value, suffix if kw.key == "default_value" else ()) for kw in node.kwargs)
+            pending.extend((value, ()) for value in (node.dyn_args, node.dyn_kwargs) if value is not None)
+            continue
         root = node
         path = []
         while isinstance(root, (nodes.Getattr, nodes.Getitem)):
@@ -230,10 +235,14 @@ def _selector_input_paths(expression, remaining=()):
                 break
             root = root.node
         if isinstance(root, nodes.Name) and root.ctx == "load":
-            suffix = remaining if node is alias else ()
             yield root.name, tuple(reversed(path)) + suffix
         else:
-            pending.extend(node.iter_child_nodes())
+            pending.extend((child, ()) for child in node.iter_child_nodes())
+
+
+def _selector_projection_cycle(source, path, ancestors):
+    return any(alias == source and (previous == path or len(path) > len(previous))
+               for alias, previous in ancestors)
 
 
 def _selector_template_sources(value, path=()):
@@ -3187,20 +3196,23 @@ class Runtime:
                         if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
-                found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
-                if not found and os.path.normpath(name) not in entry.get("checked_names", ()):
-                    pattern = entry.get("glob_patterns", {}).get(raw)
-                    unbundled = raw in entry.get("unmodeled", ()) or (
-                        pattern is not None and not _vars_file_glob_covers(pattern, name))
-                else:
-                    unbundled = False
-                if unbundled:
+                pattern = entry.get("glob_patterns", {}).get(raw)
+                covered = os.path.normpath(name) in entry.get("checked_names", ()) or (
+                    raw not in entry.get("unmodeled", ()) and
+                    (pattern is None or _vars_file_glob_covers(pattern, name)))
+                data = None
+                for candidate in map(os.path.normpath, candidates):
+                    if candidate in entry["files"]:
+                        data = entry["files"][candidate]
+                        break
+                    if not covered:
+                        break
+                if data is None and not covered:
                     if before_setup:
                         break
                     raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
                                          "make its selector resolvable at compile time" % (item,))
-                if found:
-                    data = entry["files"][found[0]]
+                if data is not None:
                     if isinstance(data, dict):
                         if before_setup:
                             break
@@ -3226,9 +3238,9 @@ class Runtime:
         seen = set()
         while pending:
             source, remaining, ancestors = pending.pop()
-            if source in ancestors:
+            if _selector_projection_cycle(source, remaining, ancestors):
                 return None
-            ancestors = (*ancestors, source)
+            ancestors = (*ancestors, (source, remaining))
             try:
                 expression = self.templater.env.parse(source)
             except jinja2.TemplateSyntaxError:
