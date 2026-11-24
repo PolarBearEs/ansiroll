@@ -67,13 +67,14 @@ def _legacy_non_native(ctx):
 
 
 _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
+_TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 
 
 def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", _DEFER_LOOKUP_NAMES}
+                "__ansiroll_search_dirs", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -1518,6 +1519,8 @@ class _LazyTplList(list):
         values = list.copy(self)
         if self._delegated:
             return _LazyTplList(values, self._rt, self._render_ctx(), delegated=True)
+        if self._task_vars:
+            return _LazyTplList(values, self._rt, self._ctx, self._dynamic, self._origin, task_vars=True)
         return _observe_container_value(values, self._rt, self._render_ctx)
 
     def remove(self, item):
@@ -1721,7 +1724,8 @@ def _concretize(value):
 def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
-        if not (_legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True):
+        if context.get(_TEMPLATE_FILE_TEXT) or not (
+                _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True):
             return ""
     return _concretize(value)
 
@@ -4656,6 +4660,7 @@ class Runtime:
                 lmode = "0%03o" % meta["mode"]
             if name == "template":
                 tctx = dict(ctx)
+                tctx[_TEMPLATE_FILE_TEXT] = True
                 try:
                     import platform
                     import pwd

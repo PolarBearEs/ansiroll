@@ -89,6 +89,32 @@ def test_null_interpolation_respects_legacy_native_mode(monkeypatch):
         assert templater.render_string(text, ctx) == "prefix/"
 
 
+def test_template_file_interpolates_null_as_empty_in_legacy_native_mode(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {})
+    source = "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/{{ empty }}"
+    context = {"empty": None, "__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": True},
+               "__ansiroll_controller_env": {"ANSIROLL_TEST_PREFIX": "controller"}}
+    monkeypatch.setattr(runtime, "_copy_single_file", lambda _task, _args, data, *_rest: data)
+    assert runtime._run_file_action("template", {"_baked": {"out.j2": source}},
+                                    {"src": "out.j2", "dest": "/out"}, context) == b"controller/"
+    assert runtime.templater.render_string(source, context) == "controller/None"
+
+
+def test_copy_of_deferred_task_list_renders_only_selected_member():
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    task = _task("1", "Copy row", "debug", args={"msg": "{{ vars.row.copy()[0] }}"}, vars={
+        "number": 17, "row": ["{{ number }}", "{{ lookup('source') }}/tail"],
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == 17
+    assert calls == []
+
+
 @pytest.mark.parametrize("text", [
     "{{ lookup('source') }}/{{ missing.attribute }}",
     "{{ lookup('source') }}/{{ 1 // divisor }}",
