@@ -3579,7 +3579,11 @@ def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, 
     ("{% set seconds = base %}{{ seconds }}", {}, 45),
     ("{% set seconds = base %}{% block timeout %}{{ seconds }}{% endblock %}", {}, 45),
     ("{% set flag = true %}{{ base if flag else seconds }}", {"flag": False}, 45),
+    ("{% set flag = true %}{% set use_base = flag %}{% set flag = false %}{{ base if use_base else seconds }}",
+     {}, 45),
     ("{% set local_cfg = cfg %}{{ local_cfg.seconds }}", {}, 45),
+    ("{% set local_cfg = cfg.group %}{{ local_cfg.seconds }}", {}, 45),
+    ("{% set local_cfg = cfg['group'] %}{{ local_cfg.seconds }}", {}, 45),
     ("{% set local_cfg = cfg %}{% set alias = local_cfg %}{{ alias.seconds }}", {}, 45),
     ("{% if flag %}{% set seconds = base %}{% else %}{% set seconds = base %}{% endif %}{{ seconds }}",
      {"flag": False}, 45),
@@ -3595,11 +3599,14 @@ def test_ordered_timeout_ignores_vars_file_inputs_shadowed_by_a_local(tmp_path, 
     %s
   tasks: []
 """ % template)
-    (tmp_path / "settings-default.yml").write_text("seconds: 23\ncfg: {seconds: 23}\n")
+    (tmp_path / "settings-default.yml").write_text("seconds: 23\ncfg: {seconds: 23, group: {seconds: 23}}\n")
     (tmp_path / "settings-runtime.yml").write_text("""seconds: "{{ lookup('env', 'UNUSED_TIMEOUT') | int }}"
 cfg:
   seconds: 45
   unused: "{{ lookup('env', 'UNUSED_TIMEOUT') | int }}"
+  group:
+    seconds: 45
+    unused: "{{ lookup('env', 'UNUSED_TIMEOUT') | int }}"
 """)
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
@@ -3616,6 +3623,27 @@ cfg:
         assert not called
     else:
         assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
+
+
+def test_controller_timeout_cache_tracks_macro_captures_at_call_time(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {base: 23, seconds: 60}
+  gather_timeout: >-
+    {% set flag = false %}{% macro timeout() %}{{ base if flag else seconds }}{% endmacro %}
+    {% set flag = true %}{{ timeout() }}
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"base": 45})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda *args, **kwargs: pytest.fail("setup must not run with the stale timeout"))
+    runtime.run_play(plan)
+    assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
 
 
 @pytest.mark.parametrize("source_text", [

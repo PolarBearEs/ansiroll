@@ -208,15 +208,21 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
-def _selector_local_values(bindings):
-    """Use constant bindings while keeping other local values opaque."""
-    values = dict.fromkeys(bindings, _UNRESOLVED_SELECTOR_KEY)
-    for name, sources in bindings.items():
-        if len(sources) == 1:
+def _selector_local_values(names, bindings):
+    """Follow assignment-time names to constants, leaving other locals opaque."""
+    values = dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)
+    for name, sources in names.items():
+        visited = set()
+        while len(sources) == 1:
             source, = sources
             if isinstance(source, jinja2.nodes.Const):
                 literal = source.value
                 values[name] = _UnsafeText(literal) if isinstance(literal, str) else literal
+                break
+            if not isinstance(source, jinja2.nodes.Name) or id(source) in visited:
+                break
+            visited.add(id(source))
+            sources = bindings.get(id(source), {}).get(source.name, ())
     return values
 
 
@@ -227,6 +233,7 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
     calls = []
     external = frozenset({None})
     unknown_local = frozenset({_UNRESOLVED_SELECTOR_KEY})
+    in_closure = False
 
     def target_names(target):
         if isinstance(target, nodes.Name):
@@ -234,15 +241,16 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
         return {name.name for name in target.find_all(nodes.Name) if name.ctx != "load"}
 
     def branch_value(test, names):
-        if retain_mutable:
+        if retain_mutable or in_closure:
             variables_in_test = (test,) if isinstance(test, nodes.Name) else test.find_all(nodes.Name)
             if any(node.name not in names for node in variables_in_test):
                 return None
-        scope = {**variables, **_selector_local_values(names)} if names else variables
+        scope = {**variables, **_selector_local_values(names, bindings)} if names else variables
         value = _selector_vars_key(test, scope, ())
         return _selector_truth(value)
 
     def visit(node, names, top=None):
+        nonlocal in_closure
         if names:
             bindings[id(node)] = names.copy()
         if isinstance(node, nodes.Call):
@@ -321,14 +329,20 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
         if isinstance(node, (nodes.Macro, nodes.CallBlock)):
             if isinstance(node, nodes.CallBlock):
                 visit(node.call, names, top)
+            # The closure can run after captured names are reassigned.
+            # Keep their possible outer reads and avoid folding their values.
+            captured = {name: sources | external for name, sources in names.items()}
+            captured_context = {name: sources | external for name, sources in context.items()}
+            was_in_closure, in_closure = in_closure, True
             for default in node.defaults:
-                visit(default, names, top)
+                visit(default, captured, captured_context)
             parameters = {arg.name for arg in node.args} | {"caller", "kwargs", "varargs"}
             if isinstance(node, nodes.Macro):
                 parameters.add(node.name)
-            local = {**names, **dict.fromkeys(parameters, unknown_local)}
+            local = {**captured, **dict.fromkeys(parameters, unknown_local)}
             for child in node.body:
-                visit(child, local, context)
+                visit(child, local, captured_context)
+            in_closure = was_in_closure
             if isinstance(node, nodes.Macro):
                 names[node.name] = unknown_local
             return
@@ -340,7 +354,7 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
         for child in node.iter_child_nodes():
             visit(child, local, top if local is names else context)
         if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(
-                node.node, (nodes.Name, nodes.Const)):
+                node.node, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Const)):
             names[node.target.name] = frozenset({node.node})
         elif isinstance(node, (nodes.Assign, nodes.AssignBlock)):
             names.update(dict.fromkeys(target_names(node.target), unknown_local))
@@ -359,12 +373,13 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
     bindings, unreachable, _ = analysis if analysis is not None else _selector_scope(expression, variables or {})
+    has_closures = next(expression.find_all((nodes.Macro, nodes.CallBlock)), None) is not None
 
     def resolve_key(node, aliases=None):
         local = bindings.get(id(node))
         scope = variables or {}
         if local:
-            scope = {**scope, **_selector_local_values(local)}
+            scope = {**scope, **_selector_local_values(local, bindings)}
         return _selector_vars_key(node, scope, aliases)
 
     pending = [(expression, ())]
@@ -379,7 +394,8 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
         if id(node) in unreachable or (id(node), suffix) in visited:
             continue
         visited.add((id(node), suffix))
-        if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(node.node, nodes.Name):
+        if (not has_closures and isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name)
+                and isinstance(node.node, (nodes.Name, nodes.Getattr, nodes.Getitem))):
             # Resolving the assignment reads the binding. Members of a lazy
             # mapping are read only where the alias is used.
             pending.append((node.node, (None, "defined")))
@@ -472,7 +488,8 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
         if isinstance(root, nodes.Name) and root.ctx == "load":
             path = tuple(reversed(path)) + suffix
             local = bindings.get(id(root), {}).get(root.name, ())
-            pending.extend((source, path) for source in local if isinstance(source, nodes.Name))
+            pending.extend((source, path) for source in local
+                           if isinstance(source, (nodes.Name, nodes.Getattr, nodes.Getitem)))
             if local and None not in local:
                 continue
             if root.name == "vars" and path and isinstance(path[0], str):
