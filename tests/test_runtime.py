@@ -423,6 +423,47 @@ class FilterModule:
     assert runtime.template(template, runtime._task_ctx(task, {})) == "17"
 
 
+@pytest.mark.parametrize("method", ["values", "items"])
+def test_custom_filter_can_serialize_hostvars_methods(method):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
+import json
+
+def encode(host, method):
+    return json.dumps(getattr(host, method)())
+
+class FilterModule:
+    def filters(self):
+        return {'encode_entries': encode}
+"""}])
+    runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["sample"]
+    task = _task("1", "Serialize hostvars entries", "debug", vars={"mixed": "{{ lookup('sample') }}/tail"})
+    entries = json.loads(runtime.template("{{ hostvars.h | encode_entries('%s') }}" % method,
+                                          runtime._task_ctx(task, {})))
+    if method == "items":
+        assert dict(entries)["mixed"] == "sample/tail"
+    else:
+        assert "sample/tail" in entries
+
+
+def test_custom_filter_can_read_a_lazy_hostvars_alias_without_eager_nested_render():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "selected", "source": """
+class FilterModule:
+    def filters(self):
+        return {'selected_hostvar': lambda snapshot: snapshot['selected']}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Read one entry through an alias", "debug", vars={
+        "unused": "{{ lookup('unused') }}/tail",
+        "selected": ("{% set inner = hostvars.h.copy() %}"
+                     "{% set ignored = inner.update({'nested': hostvars.h.values()}) %}"
+                     "{{ inner.nested[0] }}"),
+    })
+    result = runtime.template("{{ hostvars.h.copy() | selected_hostvar }}", runtime._task_ctx(task, {}))
+    assert str(result) == "17"
+
+
 def test_custom_filter_mutates_saved_hostvars_values():
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
     runtime.templater.register_plugins([{"kind": "filter", "name": "append", "source": """

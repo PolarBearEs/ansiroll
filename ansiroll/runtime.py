@@ -1516,10 +1516,14 @@ class _HostVarView(_LazyTplDict):
         return _read_lazy_member(self, value)
 
     def items(self):
-        return _HostVarEntries(self, include_keys=True)
+        entries = _HostVarEntries(self, include_keys=True)
+        converted = self._rt.templater._custom_plugin_args
+        return _custom_plugin_arg(entries, converted) if converted is not None else entries
 
     def values(self):
-        return _HostVarEntries(self, include_keys=False)
+        entries = _HostVarEntries(self, include_keys=False)
+        converted = self._rt.templater._custom_plugin_args
+        return _custom_plugin_arg(entries, converted) if converted is not None else entries
 
 
 class _TaskHostVarView(_HostVarView):
@@ -2524,10 +2528,14 @@ class _Templater:
         scope = ctx.get("vars")
         self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
         previous_interpolation = self._untrusted_task_interpolation
+        previous_plugin_args = self._custom_plugin_args
         alias = previous_interpolation is not None and isinstance(text, (_TaskVarTemplate, _PlayVarTemplate))
         if alias:
             self._untrusted_task_interpolation = False
         try:
+            # A Python plugin can read an alias that starts a nested template.
+            # Its Jinja expressions still need lazy hostvars entries.
+            self._custom_plugin_args = None
             result = self._render_string(text, ctx, strict)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
@@ -2540,6 +2548,7 @@ class _Templater:
                 else:
                     self._observe_untrusted(result)
         finally:
+            self._custom_plugin_args = previous_plugin_args
             if alias:
                 self._untrusted_task_interpolation |= previous_interpolation
             # A nested render (a lazily templated variable, a lookup term)
