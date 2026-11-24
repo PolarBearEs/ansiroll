@@ -2043,13 +2043,40 @@ def _jinja_undef(hint=None):
     return _captured(hint or "Mandatory variable has not been overridden", missing=True)
 
 
+def _custom_filter_arg(value, converted):
+    if id(value) in converted:
+        return converted[id(value)]
+    if isinstance(value, _HostVarEntries):
+        entries = value._materialize()
+        converted[id(value)] = entries
+        return _custom_filter_arg(entries, converted)
+    # Keep unrelated lazy template containers lazy. Plain containers may
+    # carry entry views through Jinja literals or through another filter.
+    if type(value) is dict:
+        converted[id(value)] = value
+        for key, item in value.items():
+            value[key] = _custom_filter_arg(item, converted)
+    elif type(value) is list:
+        converted[id(value)] = value
+        for index, item in enumerate(value):
+            value[index] = _custom_filter_arg(item, converted)
+    elif type(value) is tuple:
+        items = tuple(_custom_filter_arg(item, converted) for item in value)
+        if all(item is original for item, original in zip(items, value)):
+            items = value
+        # A mutable member can lead back to this tuple during conversion.
+        return converted.setdefault(id(value), items)
+    return value
+
+
 def _wrap_filter(fn, *, custom=False):
     """Filter errors are captured, not raised (they surface when used)."""
     def wrapped(*a, **k):
         try:
             if custom:
-                a = tuple(list(value) if isinstance(value, _HostVarEntries) else value for value in a)
-                k = {key: list(value) if isinstance(value, _HostVarEntries) else value for key, value in k.items()}
+                converted = {}
+                a = tuple(_custom_filter_arg(value, converted) for value in a)
+                k = {key: _custom_filter_arg(value, converted) for key, value in k.items()}
             return fn(*a, **k)
         except Exception as e:
             return _captured_jinja_error(e)

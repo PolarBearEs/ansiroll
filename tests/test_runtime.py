@@ -357,7 +357,8 @@ def test_json_vault_error_does_not_resolve_later_hostvars(filter_name):
         str(runtime.template(expression, runtime._task_ctx(task, {})))
 
 
-def test_custom_filter_receives_hostvars_values_as_a_list():
+@pytest.mark.parametrize("nested", [False, True])
+def test_custom_filter_receives_hostvars_values_as_a_list(nested):
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
     runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
 import json
@@ -370,9 +371,33 @@ class FilterModule:
         "alias": "{{ lookup('sample') }}/tail",
     })
     ctx = runtime._task_ctx(task, {})
-    result = runtime.template("{{ hostvars.h.values() | dump_hostvars }}", ctx)
-    assert json.loads(result)[0] == 17
-    assert "value/tail" in json.loads(result)
+    value = "{'values': hostvars.h.values()}" if nested else "hostvars.h.values()"
+    result = json.loads(runtime.template("{{ " + value + " | dump_hostvars }}", ctx))
+    values = result["values"] if nested else result
+    assert values[0] == 17
+    assert "value/tail" in values
+
+
+def test_custom_filter_mutates_saved_hostvars_values():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "append", "source": """
+def append(values):
+    values.append('added')
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'append_hostvar': append}
+"""}])
+    task = _task("1", "Mutate hostvars entries through a custom filter", "debug", vars={
+        "alias": "{{ lookup('sample') }}/tail",
+    })
+    runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["value"]
+    result = runtime.template(
+        "{% set entries = hostvars.h.values() %}{{ entries | append_hostvar }}{{ entries[-1] }}",
+        runtime._task_ctx(task, {}),
+    )
+    assert result == "added"
 
 
 @pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
