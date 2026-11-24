@@ -286,7 +286,9 @@ def test_vars_lookup_preserves_lazy_hostvars_members(hostvars):
     assert runtime.template(expression, runtime._task_ctx(task, {})) == "ready"
 
 
-@pytest.mark.parametrize("expression", ["lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]"])
+@pytest.mark.parametrize("expression", [
+    "lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]", "{inventory_hostname: hostvars.h.copy()}",
+])
 @pytest.mark.parametrize("whole_result", [True, False])
 def test_vars_lookup_hostvars_resolves_each_value_once(expression, whole_result):
     runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
@@ -353,6 +355,24 @@ def test_json_vault_error_does_not_resolve_later_hostvars(filter_name):
     expression = "{{ {'vault': vault_value, 'later': lookup('vars', 'hostvars').h} | " + filter_name + " }}"
     with pytest.raises(jinja2.UndefinedError, match="undecryptable variable"):
         str(runtime.template(expression, runtime._task_ctx(task, {})))
+
+
+def test_custom_filter_receives_hostvars_values_as_a_list():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
+import json
+class FilterModule:
+    def filters(self):
+        return {'dump_hostvars': json.dumps}
+"""}])
+    runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["value"]
+    task = _task("1", "Serialize hostvars through a custom filter", "debug", vars={
+        "alias": "{{ lookup('sample') }}/tail",
+    })
+    ctx = runtime._task_ctx(task, {})
+    result = runtime.template("{{ hostvars.h.values() | dump_hostvars }}", ctx)
+    assert json.loads(result)[0] == 17
+    assert "value/tail" in json.loads(result)
 
 
 @pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])

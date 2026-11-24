@@ -1467,7 +1467,8 @@ class _LookupHostVars(_LazyTplDict):
             value = hostvars[host]
             if isinstance(value, _HostVarView):
                 view = value.copy()
-                view._lookup_values = {}
+                view._resolved_values = {}
+                view._mark_lookup_data = True
                 return view
             return _mark_unsafe(value)
 
@@ -1485,22 +1486,27 @@ class _HostVarView(_LazyTplDict):
         view = dict.__new__(type(self))
         view.__dict__.update(self.__dict__)
         view._raw = raw
+        if view._resolved_values is None:
+            view._resolved_values = {}
         dict.__init__(view, raw)
         return view
 
-    _lookup_values = None
+    _resolved_values = None
+    _mark_lookup_data = False
 
     def __getitem__(self, key):
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
-        if self._lookup_values is None:
+        if self._resolved_values is None:
             return self._read_host_value(key, value)
         binding = key, id(value)
-        if binding not in self._lookup_values:
-            result = _mark_unsafe(self._read_host_value(key, value))
-            self._lookup_values[binding] = value, result
-        return self._lookup_values[binding][1]
+        if binding not in self._resolved_values:
+            result = self._read_host_value(key, value)
+            if self._mark_lookup_data:
+                result = _mark_unsafe(result)
+            self._resolved_values[binding] = value, result
+        return self._resolved_values[binding][1]
 
     def _read_host_value(self, key, value):
         return _read_lazy_member(self, value)
@@ -2037,10 +2043,13 @@ def _jinja_undef(hint=None):
     return _captured(hint or "Mandatory variable has not been overridden", missing=True)
 
 
-def _wrap_filter(fn):
+def _wrap_filter(fn, *, custom=False):
     """Filter errors are captured, not raised (they surface when used)."""
     def wrapped(*a, **k):
         try:
+            if custom:
+                a = tuple(list(value) if isinstance(value, _HostVarEntries) else value for value in a)
+                k = {key: list(value) if isinstance(value, _HostVarEntries) else value for key, value in k.items()}
             return fn(*a, **k)
         except Exception as e:
             return _captured_jinja_error(e)
@@ -2366,7 +2375,7 @@ class _Templater:
                 except Exception as e:
                     self._plugin_errors[kind][pname] = str(e)
                     continue
-                target[pname] = _wrap_filter(fn) if kind == "filter" else fn
+                target[pname] = _wrap_filter(fn, custom=True) if kind == "filter" else fn
 
     def _plugin_lookup(self, name, args, kwargs):
         """Run a baked lookup plugin; errors come back captured."""
