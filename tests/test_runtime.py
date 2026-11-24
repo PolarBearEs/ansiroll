@@ -208,6 +208,707 @@ def test_delegation_resolves_selected_action_variables():
     assert sent["unused"] == "{{ rsync_binary }}"
 
 
+def test_delegated_play_fallback_renders_each_member_once():
+    from ansiroll.runtime import _delegate_vars, _resolve_delegated_play_var
+
+    rt = Runtime({}, "", {})
+    calls = []
+
+    def label():
+        calls.append(True)
+        return "ready"
+
+    rt.templater.env.globals["label"] = label
+    values = rt.template_vars({"settings": {"label": "{{ label() }}", "optional": "{{ missing }}"}},
+                              {}, dynamic=True)
+    deferred = {}
+    lazy_play = set()
+    _delegate_vars(values, rt.templater, set(), deferred, lazy_play=lazy_play)
+    assert lazy_play == {"settings"}
+    assert calls == []
+    assert _resolve_delegated_play_var("settings", values, rt.templater) == {
+        "value": {"label": "ready", "optional": None}, "undefined": [("optional",)],
+    }
+    assert calls == [True]
+
+
+def test_delegated_play_fallback_preserves_typed_keys_and_undefined_paths():
+    from ansiroll.runtime import _resolve_delegated_play_var
+
+    rt = Runtime({}, "", {})
+    values = rt.template_vars({"settings": {1: ["{{ missing }}"], "1": "winner"}}, {}, dynamic=True)
+    assert _resolve_delegated_play_var("settings", values, rt.templater) == {
+        "value": {"0": [None], "1": "winner"}, "undefined": [("0", 0)],
+        "mapping_keys": [[[], [1, "1"]]],
+    }
+
+
+def test_delegated_play_requests_share_lookup_results():
+    from ansiroll.runtime import _resolve_delegated_play_var
+
+    rt = Runtime({}, "", {})
+    calls = []
+
+    def load_profile():
+        calls.append(True)
+        return "prod"
+
+    rt.templater.env.globals["load_profile"] = load_profile
+    variables = rt.template_vars({
+        "profile": "{{ load_profile() }}",
+        "first": "{{ profile ~ '-first' }}",
+        "second": "{{ profile ~ '-second' }}",
+    }, {}, dynamic=True)
+    scope = rt.templater._play_var_scope(variables, strict=False)
+    for name in ("first", "second"):
+        assert _resolve_delegated_play_var(name, scope, rt.templater) == {
+            "value": "prod-" + name, "undefined": [],
+        }
+    assert calls == [True]
+
+
+def test_delegated_loop_task_alias_uses_agent_filters():
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["agent_filter"] = str.upper
+    task = _task("template", "Template", None, loop=["sample"],
+                 vars={"alias": "{{ item | agent_filter }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert _delegate_vars(ctx, rt.templater)["alias"] == "SAMPLE"
+
+
+def test_delegated_synchronize_loop_sends_rendered_ssh_options():
+    from ansiroll.runtime import _SYNCHRONIZE_VARS, _delegate_vars
+
+    rt = Runtime({}, "", {})
+    rt.templater.env.filters["agent_filter"] = str.upper
+
+    def unexpected_lookup():
+        pytest.fail("unused synchronize alias was rendered")
+
+    rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
+    task = _task("sync", "Synchronize", None, loop=["sample"], vars={
+        "ansible_connection": "{{ item | lower }}",
+        "ansible_ssh_common_args": "-o HostKeyAlias={{ item | agent_filter }}",
+        "ansible_ssh_private_key_file": "/keys/{{ item | agent_filter }}",
+        "ansible_ssh_port": "{{ 2201 }}",
+        "ansible_ssh_user": "{{ item | agent_filter }}",
+        "ansible_ssh_password": "{{ item | reverse | join }}",
+        "ansible_ssh_timeout": "{{ 10 }}",
+        "ansible_ssh_retries": "{{ 2 }}",
+        "ansible_ssh_use_tty": "{{ item != 'sample' }}",
+        "ansible_podman_executable": "/usr/bin/{{ item | agent_filter }}",
+        "ansible_podman_extra_args": "--name {{ item | agent_filter }}",
+        "ansible_docker_extra_args": "--context {{ item | agent_filter }}",
+        "ansible_become": "{{ item == 'sample' }}",
+        "ansible_become_user": "{{ item | agent_filter }}",
+        "ansible_sudo_flags": "-H -u {{ item }}",
+        "ansible_private_key_file": "/other-keys/{{ item | agent_filter }}",
+        "unused": "{{ unexpected_lookup() }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    sent = _delegate_vars(ctx, rt.templater, _SYNCHRONIZE_VARS)
+    assert sent["ansible_connection"] == "sample"
+    assert sent["ansible_ssh_common_args"] == "-o HostKeyAlias=SAMPLE"
+    assert sent["ansible_ssh_private_key_file"] == "/keys/SAMPLE"
+    assert sent["ansible_ssh_port"] == 2201
+    assert sent["ansible_ssh_user"] == "SAMPLE"
+    assert sent["ansible_ssh_password"] == "elpmas"
+    assert sent["ansible_ssh_timeout"] == 10
+    assert sent["ansible_ssh_retries"] == 2
+    assert sent["ansible_ssh_use_tty"] is False
+    assert sent["ansible_podman_executable"] == "/usr/bin/SAMPLE"
+    assert sent["ansible_podman_extra_args"] == "--name SAMPLE"
+    assert sent["ansible_docker_extra_args"] == "--context SAMPLE"
+    assert sent["ansible_become"] is True
+    assert sent["ansible_become_user"] == "SAMPLE"
+    assert sent["ansible_sudo_flags"] == "-H -u sample"
+    assert sent["ansible_private_key_file"] == "/other-keys/SAMPLE"
+    assert sent["unused"] == "{{ unexpected_lookup() }}"
+
+
+def test_loop_task_magic_vars_keep_original_values_when_facts_change():
+    rt = Runtime({}, "", {"counter": 0})
+    rt.vars.update(rt.template_vars({"play_alias": "{{ 1 }}"}, {}, dynamic=True))
+    task = _task("increment", "Increment", None, loop=["first", "second"],
+                 vars={"alias": "{{ vars.counter }} / {{ counter }} / {{ item }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(item="second", counter=1)
+    assert rt.template("{{ alias }}", ctx) == "0 / 1 / second"
+
+
+@pytest.mark.parametrize("play_alias", [False, True])
+def test_loop_task_magic_vars_cache_captured_alias_during_render(play_alias):
+    rt = Runtime({}, "", {})
+    readings = iter([1, 2])
+    rt.templater.env.globals["next_reading"] = lambda: next(readings)
+    variables = {"alias": "{{ next_reading() }}"}
+    if play_alias:
+        rt.vars.update(rt.template_vars(variables, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=["sample"], vars={} if play_alias else variables)
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    assert rt.template("{{ vars.alias }} / {{ vars.alias }}", ctx) == "1 / 1"
+    assert rt.template("{{ vars.alias }}", ctx) == 2
+
+
+def test_loop_snapshot_shares_live_play_alias_cache_for_same_binding():
+    rt = Runtime({}, "", {})
+    readings = iter([1, 2])
+    rt.templater.env.globals["next_reading"] = lambda: next(readings)
+    rt.vars.update(rt.template_vars({"source": "{{ next_reading() }}"}, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    assert rt.template("{{ source }} / {{ vars.source }}", ctx) == "1 / 1"
+    assert rt.template("{{ vars.source }}", ctx) == 2
+
+
+@pytest.mark.parametrize("unsafe", [False, True])
+@pytest.mark.parametrize("alias, expected", [
+    ("{{ source }}", "sample"),
+    ("prefix-{{ source }}", "prefix-sample"),
+    ("{{ 'prefix-' ~ nested.source }}", "prefix-sample"),
+])
+def test_loop_task_conditional_interpolation_preserves_alias_trust(unsafe, alias, expected):
+    from ansiroll.runtime import UntrustedConditional
+
+    rt = Runtime({}, "", {})
+    value = {"__ansiroll_unsafe__": "sample"} if unsafe else "sample"
+    task = _task("task", "Task", None, loop=[expected],
+                 vars={"source": value, "nested": {"source": value}, "alias": alias})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = expected
+    condition = {"__ansiroll_trusted_condition__": "'{{ alias }}' == item"}
+    if unsafe:
+        with pytest.raises(UntrustedConditional):
+            rt.when([condition], ctx)
+    else:
+        assert rt.when([condition], ctx)
+
+
+@pytest.mark.parametrize("flag, expected", [("yes", True), ("no", False)])
+@pytest.mark.parametrize("condition", ["{{ enabled }}", "{{ enabled }} and true"])
+def test_loop_task_conditional_accepts_boolean_computed_from_unsafe_data(flag, expected, condition):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=[flag], vars={
+        "flag": {"__ansiroll_unsafe__": flag},
+        "enabled": "{{ flag == 'yes' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": condition}], ctx) is expected
+
+
+@pytest.mark.parametrize("reference", ["previous.stdout", "vars.previous.stdout"])
+def test_loop_task_condition_rejects_text_derived_from_registered_result(reference):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "previous"}, {"stdout": "sample"})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "'{{ " + reference + " }}' == '{{ item }}'",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
+
+
+@pytest.mark.parametrize("loop", ["{{ previous.stdout_lines }}", "{{ previous.data | list }}"])
+def test_loop_items_keep_provenance_of_registered_collections(loop):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "previous"}, {"stdout_lines": ["sample"], "data": {"sample": True}})
+    task = _task("task", "Task", None, loop=loop, vars={
+        "alias": "'{{ item }}' == 'sample'",
+    })
+    ctx = rt._task_ctx(task, {})
+    items = rt._resolve_loop(task["loop"], ctx)
+    ctx.update(rt._loop_item_vars(task, items, 0, ctx))
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }} and true"}], ctx)
+
+
+@pytest.mark.parametrize("keys", ["result.data", "result.data.keys()", "result.data.items() | map('first')"])
+def test_conditional_rendering_tracks_registered_mapping_keys(keys):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": {"sample": True}})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ (" + keys + " | list | first) ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", [
+    "result.data.pop('sample')",
+    "result.data.setdefault('sample', 'fallback')",
+    "result.data.popitem()[0]",
+    "result.data.popitem()[1]",
+    "result.pop('data').sample",
+])
+def test_conditional_rendering_tracks_marked_mapping_mutations(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": {"sample": "sample"}})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ " + expression + " ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", [
+    "result.data.pop()",
+    "result.data.copy()[0]",
+    "result.data | reverse | first",
+    "result.nested.pop().value",
+])
+def test_conditional_rendering_tracks_marked_list_reads(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": ["sample"], "nested": [{"value": "sample"}]})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ " + expression + " ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("expression", [
+    "result.data[0]",
+    "result.data | first",
+    "(result.data + ('other',))[0]",
+    "(('other',) + result.data)[1]",
+    "(result.data * 2)[1]",
+])
+def test_conditional_rendering_tracks_marked_tuple_reads(expression):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"data": ("sample",)})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ (" + expression + ") ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+def test_conditional_tuple_operations_render_members_and_keep_tuple_type():
+    rt = Runtime({}, "", {"value": "sample", "outer": {"data": ("{{ value }}",)}})
+    assert rt.templater.render_conditional_template(
+        "{{ outer.data == ('sample',) and (outer.data | type_debug) == 'tuple' }}", rt.ctx())
+
+
+@pytest.mark.parametrize("collection", ["('ok', result.text)", "['ok', result.text]"])
+def test_conditional_membership_only_observes_examined_members(collection):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"text": "registered"})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": "{{ " + collection + " }}",
+        "alias": "{{ 'ok' if 'ok' in checks else 'missing' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'ok'"}], ctx)
+
+
+def test_lookup_plugin_reads_nested_task_alias_with_loop_binding():
+    rt = Runtime({}, "", {})
+    rt.templater._lookup_loaded["read_settings"] = lambda terms, variables, **kwargs: [
+        variables["settings"]["name"],
+    ]
+    task = _task("task", "Task", None, loop=["alpha"], vars={
+        "settings": {"name": "{{ item | default('pre-loop') }}"},
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "alpha"
+    rendered = rt.template("{{ [settings.name, lookup('read_settings')] }}", ctx)
+    assert rendered == ["alpha", "alpha"]
+
+
+@pytest.mark.parametrize("expression", [
+    "'sample' if true else item",
+    "true and 'sample' or item",
+    "'sample' if true else unused_alias",
+])
+def test_loop_conditional_uses_only_selected_alias_branches(expression):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "alias": "{{ " + expression + " }}",
+        "unused_alias": "{{ item ~ ' value' }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = rt.template({"__ansiroll_unsafe__": "sample"}, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample'"}], ctx)
+
+
+def test_boolean_loop_conditions_read_only_the_selected_values():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "previous"}, {"stdout_lines": ["sample"]})
+    task = _task("task", "Task", None, loop="{{ previous.stdout_lines }}", vars={"label": "sample"})
+    ctx = rt._task_ctx(task, {})
+    items = rt._resolve_loop(task["loop"], ctx)
+    ctx.update(rt._loop_item_vars(task, items, 0, ctx))
+
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ vars.label == 'sample' }}"}], ctx)
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ item == 'sample' }}"}], ctx)
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "'{{ item }}' == 'sample'"}], ctx)
+
+
+@pytest.mark.parametrize("keyword", ["changed_when", "failed_when", "until", "loop_break_when"])
+def test_loop_alias_keeps_provenance_of_current_result(keyword, monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    condition = {"__ansiroll_trusted_condition__": "{{ alias }} and true"}
+    task = _task("task", "Task", "debug", loop=["sample"], register="result",
+                 args={"msg": "sample"}, vars={"alias": "'{{ result.msg }}' == '{{ item }}'"},
+                 **{keyword: [condition]})
+    _rt, frames = run([task])
+    assert any(frame["status"] == "failed" and "untrusted template or expression" in str(frame["result"])
+               for frame in frames)
+
+
+@pytest.mark.parametrize("keyword, expected", [
+    ("changed_when", "changed"),
+    ("failed_when", "ok"),
+    ("until", "ok"),
+    ("loop_break_when", "ok"),
+])
+def test_boolean_condition_can_read_current_registered_result(keyword, expected, monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    expected_msg = "unmatched" if keyword == "failed_when" else "sample"
+    condition = {"__ansiroll_trusted_condition__": "{{ result.msg == '" + expected_msg + "' }}"}
+    task = _task("task", "Task", "debug", loop=["sample"], register="result",
+                 args={"msg": "sample"}, **{keyword: [condition]})
+    _rt, frames = run([task])
+    assert any(frame["status"] == expected for frame in frames)
+    assert all(frame["status"] != "failed" for frame in frames)
+
+
+def test_loop_alias_reads_trusted_replacement_of_a_register():
+    tasks = [
+        _task("produce", "Produce", "debug", args={"msg": "initial"}, register="value"),
+        _task("replace", "Replace", "set_fact", args={"value": "sample"}),
+        _task("read", "Read", "debug", loop=["sample"],
+              vars={"alias": "'{{ value }}' == '{{ item }}'"},
+              when=[{"__ansiroll_trusted_condition__": "{{ alias }} and true"}]),
+    ]
+    _rt, frames = run(tasks)
+    assert by_name(frames, "Read")[0]["status"] == "ok"
+
+
+@pytest.mark.parametrize("second, trusted", [("'item == 1'", True), ("'item == ' ~ result.stdout", False)])
+def test_loop_assertion_tracks_trust_for_each_expression(second, trusted):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "alias": "{{ [result.stdout == '1', " + second + "] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    condition = {"__ansiroll_trusted_condition__": "{{ alias }}"}
+    if trusted:
+        assert rt.when([condition], ctx, keyword=None)
+    else:
+        with pytest.raises(UntrustedConditional):
+            rt.when([condition], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("composition", [
+    "[result.stdout == '1'] + checks",
+    "checks + [result.stdout == '1']",
+    "([result.stdout == '1'] + checks) + ['item is number']",
+])
+@pytest.mark.parametrize("trusted", [True, False])
+def test_loop_assertion_tracks_members_through_list_composition(composition, trusted):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    values = ["item == 1"] if trusted else ["item == {{ result.stdout }}"]
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": values,
+        "alias": "{{ " + composition + " }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    condition = {"__ansiroll_trusted_condition__": "{{ alias }}"}
+    if trusted:
+        assert rt.when([condition], ctx, keyword=None)
+    else:
+        with pytest.raises(UntrustedConditional):
+            rt.when([condition], ctx, keyword=None)
+
+
+def test_loop_assertion_members_share_resolved_task_aliases():
+    rt = Runtime({}, "", {})
+    reads = []
+
+    def next_reading():
+        reads.append(True)
+        return len(reads)
+
+    rt.templater.env.globals["next_reading"] = next_reading
+    task = _task("task", "Task", None, loop=[1], vars={"alias": "{{ next_reading() }}"})
+    ctx = rt._task_ctx(task, {})
+    cond = {"__ansiroll_trusted_condition__": "{{ [alias == 1, alias == 1] }}"}
+    assert rt.when([cond], ctx, keyword=None)
+    assert reads == [True]
+
+
+@pytest.mark.parametrize("take_branch", [True, False])
+@pytest.mark.parametrize("unselected", ["[unexpected_lookup()]", "[item | missing_branch_filter]"])
+def test_loop_assertion_tracks_only_members_of_selected_branch(take_branch, unselected):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"msg": "sample"})
+
+    def unexpected_lookup():
+        pytest.fail("an unselected assertion branch was rendered")
+
+    rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
+    selected = "[result.msg == 'sample', check]"
+    alternate = unselected
+    if not take_branch:
+        selected, alternate = alternate, selected
+    task = _task("task", "Task", None, loop=[1], vars={
+        "take_branch": take_branch,
+        "check": "item == 1",
+        "alias": "{{ " + selected + " if take_branch else " + alternate + " }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("access", [lambda values: values["alias"], lambda values: values.get("alias")])
+def test_custom_lookup_resolves_deferred_task_alias_with_current_loop_item(access):
+    rt = Runtime({}, "", {})
+
+    def read_alias(terms, variables, **kwargs):
+        return [access(variables)]
+
+    rt.templater._lookup_loaded["read_alias"] = read_alias
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item | upper }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert rt.template("{{ lookup('read_alias') }}", ctx) == "SAMPLE"
+
+
+@pytest.mark.parametrize("method", ["pop", "popitem", "setdefault"])
+def test_custom_lookup_mapping_mutations_resolve_existing_aliases(method):
+    rt = Runtime({}, "", {})
+
+    def read_alias(terms, variables, **kwargs):
+        if method == "setdefault":
+            value = variables.setdefault("alias", "fallback")
+            assert "alias" in variables
+            assert variables.setdefault("missing", "fallback") == "fallback"
+        elif method == "popitem":
+            for key in list(variables):
+                if key != "alias":
+                    del variables[key]
+            key, value = variables.popitem()
+            assert key == "alias" and not variables
+        else:
+            value = variables.pop("alias")
+            assert "alias" not in variables
+            assert variables.pop("missing", "fallback") == "fallback"
+        return [value]
+
+    rt.templater._lookup_loaded["read_alias"] = read_alias
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item | upper }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, ["sample"], 0, ctx))
+    assert rt.template("{{ lookup('read_alias') }}", ctx) == "SAMPLE"
+    assert "alias" in ctx
+
+
+def test_loop_assertion_observes_cached_play_alias_marker_on_each_read():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    rt.vars.update(rt.template_vars({"play_alias": "item == {{ result.stdout }}"}, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": "{{ [play_alias == 'item == 1', play_alias ~ ' and true'] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ checks }}"}], ctx, keyword=None)
+
+
+def test_loop_snapshot_preserves_provenance_when_a_play_alias_is_shadowed():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    rt.vars.update(rt.template_vars({"entry": "entry == {{ result.stdout }}"}, {}, dynamic=True))
+    task = _task("task", "Task", None, loop=[1], loop_var="entry", vars={
+        "checks": "{{ [vars.entry == 'entry == 1', vars.entry ~ ' and true'] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx.update(rt._loop_item_vars(task, [1], 0, ctx))
+    assert ctx["entry"] == 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ checks }}"}], ctx, keyword=None)
+
+
+def test_conditional_assertion_materializes_iterator_from_selected_branch():
+    rt = Runtime({}, "", {})
+    condition = {"__ansiroll_trusted_condition__": "{{ [false] if false else [true] | map('bool') }}"}
+    assert rt.when([condition], rt.ctx(), keyword=None)
+
+
+def test_conditional_list_does_not_replay_branch_that_returns_none():
+    rt = Runtime({}, "", {})
+    reads = []
+
+    def choose_branch():
+        reads.append(True)
+        return len(reads) > 1
+
+    rt.templater.env.globals["choose_branch"] = choose_branch
+    assert rt.templater.render_conditional_template(
+        "{{ [true] if choose_branch() else none }}", rt.ctx()) is None
+    assert reads == [True]
+
+
+def test_loop_assertion_preserves_unsafe_marker_in_cached_alias():
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"stdout": "1"})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "text": "item == {{ result.stdout }}",
+        "alias": "{{ [vars.text == 'item == 1', vars.text ~ ' and true'] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("expression", ["expressions[0]", "expressions[0] ~ ' and true'"])
+@pytest.mark.parametrize("expressions", [
+    "{{ result.parts | map('upper') | map('lower') | list }}",
+    "{{ [result.parts[0] | lower] }}",
+    "{{ (result.parts[0] | lower,) }}",
+])
+def test_loop_assertion_preserves_unsafe_marker_in_cached_alias_collection(expression, expressions):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"parts": ["item == 1"]})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "expressions": expressions,
+        "alias": "{{ [expressions[0] is string, " + expression + "] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+@pytest.mark.parametrize("mapping", [
+    "{'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower}",
+    "{'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower}.copy()",
+    "dict(computed=result.text is string, trusted='item == 1', derived=result.text | lower)",
+    "dict({'computed': result.text is string}, trusted='item == 1', derived=result.text | lower)",
+    "dict(**{'computed': result.text is string, 'trusted': 'item == 1', 'derived': result.text | lower})",
+])
+def test_loop_assertion_keeps_trusted_literal_fields_in_cached_mapping(mapping):
+    rt = Runtime({}, "", {})
+    rt._store_register({"register": "result"}, {"text": "item == 1"})
+    task = _task("task", "Task", None, loop=[1], vars={
+        "checks": "{{ " + mapping + " }}",
+        "alias": "{{ [checks.computed, checks.trusted] }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = 1
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ [checks.computed, checks.derived ~ ' and true'] }}"}],
+                ctx, keyword=None)
+
+
+def test_assertion_does_not_template_a_rendered_collection_member_again():
+    rt = Runtime({}, "", {})
+    condition = {"__ansiroll_trusted_condition__": "{{ ['{' ~ '{ true }' ~ '}'] }}"}
+    with pytest.raises(UntrustedConditional):
+        rt.when([condition], rt.ctx(), keyword=None)
+
+
+@pytest.mark.parametrize("reference", ["alias", "settings"])
+def test_loop_task_conditional_reads_only_used_mapping_members(reference):
+    rt = Runtime({}, "", {})
+
+    def unexpected_lookup():
+        pytest.fail("an unused mapping member was rendered")
+
+    rt.templater.env.globals["unexpected_lookup"] = unexpected_lookup
+    task = _task("task", "Task", None, loop=["sample"], vars={
+        "settings": {
+            "enabled": True,
+            "unused": "{{ unexpected_lookup() }}",
+            "text": {"__ansiroll_unsafe__": "sample"},
+        },
+        "alias": "{{ settings }}",
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ " + reference + ".enabled }}"}], ctx)
+    condition = {"__ansiroll_trusted_condition__": "'{{ " + reference + ".text }}' == 'sample'"}
+    with pytest.raises(UntrustedConditional):
+        rt.when([condition], ctx)
+
+
+@pytest.mark.parametrize("alias, access", [
+    ({"expression": "'prefix-{{ item }}' == 'prefix-sample'"}, "alias.expression"),
+    (["'prefix-{{ item }}' == 'prefix-sample'"], "alias[0]"),
+    ({"expressions": ["'prefix-{{ item }}' == 'prefix-sample'"]}, "alias.expressions[0]"),
+])
+def test_loop_task_container_members_keep_unsafe_interpolation_marker(alias, access):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": alias})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = rt.template({"__ansiroll_unsafe__": "sample"}, {})
+    condition = {"__ansiroll_trusted_condition__": "{{ " + access + " }} and true"}
+    with pytest.raises(UntrustedConditional):
+        rt.when([condition], ctx)
+
+
+@pytest.mark.parametrize("alias, expected", [
+    ("{{ [flag == 'yes'] }}", True),
+    ("{{ [flag == 'no'] }}", False),
+    (["{{ flag == 'yes' }}"], True),
+    (["{{ flag == 'no' }}"], False),
+])
+def test_loop_task_assertion_accepts_lists_of_computed_booleans(alias, expected):
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["yes"], vars={
+        "flag": {"__ansiroll_unsafe__": "yes"},
+        "alias": alias,
+    })
+    ctx = rt._task_ctx(task, {})
+    assert rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None) is expected
+
+
+def test_loop_task_assertion_rejects_lazy_list_of_untrusted_expressions():
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["yes"], vars={
+        "flag": {"__ansiroll_unsafe__": "yes"},
+        "alias": ["'{{ flag }}' == 'yes'"],
+    })
+    ctx = rt._task_ctx(task, {})
+    with pytest.raises(UntrustedConditional):
+        rt.when([{"__ansiroll_trusted_condition__": "{{ alias }}"}], ctx, keyword=None)
+
+
+def test_legacy_loop_task_vars_iteration_exposes_plain_strings(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.18.20")
+    rt = Runtime({}, "", {})
+    task = _task("task", "Task", None, loop=["sample"], vars={"alias": "{{ item | upper }}"})
+    ctx = rt._task_ctx(task, {})
+    ctx["item"] = "sample"
+    assert rt.template("{{ vars.alias }}", ctx) == "SAMPLE"
+    scope = rt.templater._play_var_scope(ctx, strict=False)
+    assert type(dict(scope["vars"].items())["alias"]) is str
+    assert any(type(value) is str and value == "{{ item | upper }}" for value in scope["vars"].values())
+
+
 @pytest.mark.parametrize("controller_snapshot", [False, True])
 def test_play_alias_can_read_shadowed_inventory_value(controller_snapshot):
     frames = []

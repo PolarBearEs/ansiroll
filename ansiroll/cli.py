@@ -81,11 +81,106 @@ def _manifest_for_stdout(path, stdout_fd):
         manifest_stat = os.stat(path)
     except FileNotFoundError:
         return path
-    if not _same_stream(manifest_stat, os.fstat(stdout_fd)):
-        return path
-    if _discard_stream(manifest_stat):
-        return os.devnull
-    raise ValueError("manifest path points to stdout: %s" % path)
+    return _validate_stdout_manifest(path, manifest_stat, stdout_fd)
+
+
+def _linux_terminal_device(fd):
+    import fcntl
+    import struct
+
+    # TIOCGDEV is _IOR('T', 0x32, unsigned int). Linux uses two read encodings.
+    machine = os.uname().machine.lower()
+    alternate = machine.startswith(("alpha", "hppa", "mips", "parisc", "powerpc", "ppc", "sparc"))
+    request = 0x40045432 if alternate else 0x80045432
+    try:
+        return struct.unpack("I", fcntl.ioctl(fd, request, bytes(4)))[0]
+    except OSError:
+        return None
+
+
+def _same_manifest_stream(path, info, fd, destination_fd=None):
+    stream = os.fstat(fd)
+    if not (sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode)):
+        return _same_stream(info, stream)
+
+    console_aliases = {os.makedev(4, 0), os.makedev(5, 1)}  # tty0, console
+    if info.st_rdev in console_aliases or stream.st_rdev in console_aliases:
+        # The Linux memory devices include null, zero and full.
+        if 1 in (os.major(info.st_rdev), os.major(stream.st_rdev)):
+            return False
+        # TIOCGDEV reports the tty opened, which can differ from the device
+        # receiving writes after a TIOCCONS redirection.
+        raise ValueError("cannot verify redirected console for manifest path %s" % path)
+
+    controlling_alias = os.makedev(5, 0)
+    destination_alias = info.st_rdev == controlling_alias
+    stream_alias = stream.st_rdev == controlling_alias
+    if not (destination_alias or stream_alias):
+        # Unix98 PTY slave numbers are allocated independently by devpts mounts.
+        if info.st_rdev == stream.st_rdev and 136 <= os.major(info.st_rdev) <= 143:
+            return os.path.samestat(info, stream)
+        return _same_stream(info, stream)
+
+    if 1 in (os.major(info.st_rdev), os.major(stream.st_rdev)):
+        return False
+    probe_error = "cannot verify terminal for manifest path %s" % path
+    stream_device = _linux_terminal_device(fd) if stream_alias else stream.st_rdev
+    if stream_device is None:
+        raise ValueError(probe_error)
+    if not destination_alias and info.st_rdev != stream_device:
+        return False  # In particular, do not open an unrelated character device.
+
+    def controls_terminal(terminal):
+        try:
+            os.tcgetpgrp(terminal)
+        except OSError as ex:
+            if ex.errno == errno.ENOTTY:
+                return False
+            raise ValueError(probe_error) from ex
+        return True
+
+    with ExitStack() as stack:
+        if destination_fd is None:
+            try:
+                pinned_fd = os.open(path, os.O_PATH)
+            except OSError as ex:
+                raise ValueError(probe_error) from ex
+            stack.callback(os.close, pinned_fd)
+            pinned = os.fstat(pinned_fd)
+            if not stat.S_ISCHR(pinned.st_mode) or not os.path.samestat(info, pinned):
+                return False  # Final validation uses the actual writable descriptor.
+            fd_path = "/proc/self/fd/%d" % pinned_fd
+            try:
+                destination_fd = os.open(fd_path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK)
+            except OSError as ex:
+                raise ValueError(probe_error) from ex
+            stack.callback(os.close, destination_fd)
+            opened = os.fstat(destination_fd)
+            if not os.path.samestat(info, opened) or not stat.S_ISCHR(opened.st_mode):
+                return False  # The final validation checks the destination actually opened for writing.
+        destination_device = _linux_terminal_device(destination_fd) if destination_alias else info.st_rdev
+        if destination_device is None:
+            raise ValueError(probe_error)
+        if destination_device != stream_device:
+            return False
+        if not 136 <= os.major(destination_device) <= 143:
+            return True
+        # Only the controlling session can query a PTY slave's foreground
+        # group. Use success, since the foreground group itself can change.
+        destination_controlled = controls_terminal(destination_fd)
+        stream_controlled = controls_terminal(fd)
+        if not (destination_controlled or stream_controlled):
+            raise ValueError("cannot distinguish terminal for manifest path %s from a redirected stream" % path)
+        return destination_controlled and stream_controlled
+
+
+def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None):
+    for stream, fd in (("stdout", stdout_fd), ("stderr", 2)):
+        if _same_manifest_stream(path, info, fd, destination_fd):
+            if _discard_stream(info):
+                return os.devnull
+            raise ValueError("manifest path points to %s: %s" % (stream, path))
+    return path
 
 
 def _truncation_unavailable(path, original_error):
@@ -151,7 +246,7 @@ def _open_compile_destination(path, validate, *, release_output=None):
                     # Retain the manifest pin, when available, for a safe
                     # truncating reopen after releasing the output pin.
                     if reference is not None:
-                        validate(os.fstat(reference))
+                        validate(os.fstat(reference), None)
                     release_output()
                 released_for_emfile = reference is None
                 fd = os.open(path, flags, 0o666)
@@ -171,13 +266,13 @@ def _open_compile_destination(path, validate, *, release_output=None):
             except OSError:
                 raise original_error
             if not os.path.samestat(info, current):
-                validate(current)
+                validate(current, None)
                 raise original_error
         else:
             initial_pin.close()
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
-            validate(info)
+            validate(info, fd)
             if created or not stat.S_ISREG(info.st_mode):
                 yield writer
                 return
@@ -203,7 +298,7 @@ def _open_compile_destination(path, validate, *, release_output=None):
 
         # Reopen the validated inode even if its pathname has since changed.
         info = os.fstat(reference)
-        validate(info)
+        validate(info, None)
         if not stat.S_ISREG(info.st_mode):
             raise original_error
         fd = _open_truncated_destination(path, reference, original_error)
@@ -214,9 +309,8 @@ def _open_compile_destination(path, validate, *, release_output=None):
 def _write_stdout_manifest(path, manifest, stdout_fd):
     path = _manifest_for_stdout(path, stdout_fd)
 
-    def validate(info):
-        if _same_stream(info, os.fstat(stdout_fd)) and not _discard_stream(info):
-            raise ValueError("manifest path points to stdout: %s" % path)
+    def validate(info, fd):
+        _validate_stdout_manifest(path, info, stdout_fd, fd)
 
     with _open_compile_destination(path, validate) as fh:
         json.dump(manifest, fh, indent=2)
@@ -324,7 +418,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
     # Paths can change during compilation or between the check and open.
     _check_file_destinations(output_path, manifest_path)
 
-    def validate_output(info):
+    def validate_output(info, _fd):
         _check_manifest_path(manifest_path, info)
 
     with ExitStack() as output_reference:
@@ -340,7 +434,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest):
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
         _make_output_executable(output_path, reference, output_stat, mode)
 
-        def validate_manifest(info):
+        def validate_manifest(info, _fd):
             try:
                 current_output = os.stat(output_path)
             except OSError:

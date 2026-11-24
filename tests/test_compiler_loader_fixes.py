@@ -123,6 +123,757 @@ class FilterModule(object):
     assert _ansiroll(tmp_path / "pb2.yml", tmp_path) == _ansible(tmp_path / "pb2.yml")
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+def test_compile_dynamic_role_sources_skips_unused_fifos(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: "sites/{{ selection }}.j2", dest: /unused}
+""", "roles/r/templates/sites/app.j2": "regular template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    os.mkfifo(sites / "unused.txt")
+    (sites / "linked.j2").symlink_to("unused.txt")
+
+    artifact = tmp_path / "compiled.py"
+    subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(tmp_path / "pb.yml"), "-o", str(artifact)],
+                   cwd=ROOT, env=_env(), capture_output=True, check=True, timeout=15)
+    template = next(node for node in _task_nodes(_bundle_json(artifact.read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert set(template["_baked"]) == {"sites/app.j2"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+@pytest.mark.parametrize("replacement", ["fifo", "denied-fifo", "directory", "socket"])
+def test_compile_dynamic_role_source_checks_opened_file(tmp_path, monkeypatch, replacement):
+    import errno
+    import socket
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/app.j2": "regular template\n",
+                      "earlier/sites/swap.j2": "previous regular file\n",
+                      "later/sites/swap.j2": "later template\n"})
+    (tmp_path / "later/sites/branch").mkdir()
+    target = tmp_path / "earlier/sites/swap.j2"
+    open_fd = os.open
+    opened = []
+    if replacement == "socket":
+        socket_path = target.with_name("s")
+        with monkeypatch.context() as patch, socket.socket(socket.AF_UNIX) as listener:
+            patch.chdir(socket_path.parent)
+            listener.bind(socket_path.name)
+
+    def swap_then_open(path, flags):
+        if path == str(target):
+            assert flags & os.O_NONBLOCK
+            target.unlink()
+            if replacement == "fifo":
+                os.mkfifo(target)
+            elif replacement == "denied-fifo":
+                os.mkfifo(target, mode=0)
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+            elif replacement == "socket":
+                os.rename(socket_path, path)
+            else:
+                target.mkdir()
+            fd = open_fd(path, flags)
+            opened.append(fd)
+            return fd
+        return open_fd(path, flags)
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    monkeypatch.setattr(os, "open", swap_then_open)
+    node = {}
+    task = SimpleNamespace(_role=object())
+    assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
+    assert node["_baked"]["sites/app.j2"] == "regular template\n"
+    direct = Runtime._baked_source_key(node, "sites/swap.j2")
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        Runtime({}, "", {})._asset_text(node["_baked"][direct])
+    traversed = Runtime._baked_source_key(node, "sites/branch/../swap.j2")
+    assert node["_baked"][traversed] == "later template\n"
+    if replacement in ("socket", "denied-fifo"):
+        assert not opened
+    else:
+        assert len(opened) == 1
+        with pytest.raises(OSError):
+            os.fstat(opened[0])
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+def test_compile_dynamic_role_source_does_not_substitute_later_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/keep.j2": "keep\n", "later/sites/app.j2": "wrong template\n"})
+    os.mkfifo(tmp_path / "earlier/sites/app.j2")
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    assert node["_baked"]["sites/keep.j2"] == "keep\n"
+    key = Runtime._baked_source_key(node, "sites/app.j2")
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        Runtime({}, "", {})._asset_text(node["_baked"][key])
+
+
+def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypatch):
+    import errno
+
+    from ansiroll import loader
+
+    source = tmp_path / "app.j2"
+    source.write_text("regular template\n")
+    open_fd = os.open
+    attempts = []
+
+    def busy_once(path, flags):
+        attempts.append(path)
+        if len(attempts) <= 2:
+            raise BlockingIOError(errno.EWOULDBLOCK, "write lease is active", path)
+        return open_fd(path, flags)
+
+    monkeypatch.setattr(os, "open", busy_once)
+    monkeypatch.setattr(loader.time, "sleep", lambda _seconds: None)
+    os.close(loader._open_role_source(str(source)))
+    assert attempts == [str(source)] * 3
+
+    def still_busy(path, flags):
+        raise BlockingIOError(errno.EWOULDBLOCK, "write lease is active", path)
+
+    monkeypatch.setattr(os, "open", still_busy)
+    with pytest.raises(ValueError, match="cannot bake role source .*app.j2"):
+        loader._open_role_source(str(source))
+
+
+@pytest.mark.parametrize(("template", "selected", "unrelated"), [
+    ("sites/{{ selection }}.j2", "sites/app.j2", "sites/notes.txt"),
+    ("sites/{{ selection -}}   .j2", "sites/app.j2", "sites/notes.txt"),
+    ("sites/{{ selection | default('}}') }}.j2", "sites/app.j2", "sites/notes.txt"),
+    ("sites/{{ selection }}.j2 ", "sites/app.j2 ", "sites/app.j2"),
+    ("sites/{{ selection }}.j2\n", "sites/app.j2\n", "sites/app.j2"),
+    ("sites/{{ selection }}/templates/app.j2", "sites/prod/templates/app.j2", "sites/notes/app.j2"),
+    ("sites/{{ selection }}/keep/../templates/app.j2", "sites/prod/templates/app.j2", "sites/notes.txt"),
+    ("sites/{{ selection }}/keep/../templates/app.j2", "sites/prod/templates/app.j2", "sites/notes/app.j2"),
+])
+def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, monkeypatch, template, selected, unrelated):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+
+    _write(tmp_path, {selected: "usable template\n", unrelated: "unrelated\n"})
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        assert path == str(tmp_path / selected), "an unrelated path reached the role source reader"
+        return original_open(path)
+
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: [(str(tmp_path), True)])
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    template)
+    assert node["_baked"] == {selected: "usable template\n"}
+
+
+def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: "{{ selection }} ", dest: "rendered.txt"}
+""", "roles/r/templates/app": "selected template\n"})
+
+    _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
+    assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+
+
+@pytest.mark.parametrize("prefix", ["templates/", "./templates/"])
+def test_compile_dynamic_role_source_respects_explicit_templates_prefix(tmp_path, prefix):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: "%s{{ selection }}.j2", dest: "rendered.txt"}
+""" % prefix, "roles/r/templates/app.j2": "selected template\n"})
+    (tmp_path / "roles/r/templates/templates/app.j2").mkdir(parents=True)
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    skips_subdirectory = prefix == "templates/" and _CORE >= (2, 21)
+    _ansible(playbook, returncode=0 if skips_subdirectory else 2)
+    if skips_subdirectory:
+        assert destination.read_text() == "selected template\n"
+        destination.unlink()
+    _ansiroll(playbook, tmp_path, returncode=0 if skips_subdirectory else 1)
+    if skips_subdirectory:
+        assert destination.read_text() == "selected template\n"
+
+
+@pytest.mark.parametrize("directory_target", [False, True])
+def test_compile_dynamic_role_source_selects_root_from_traversal_target(tmp_path, directory_target):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/other/app.j2": "earlier traversal target\n",
+        "roles/r/sites/app.j2": "selected template\n"})
+    (tmp_path / "roles/r/templates/sites/app.j2").mkdir()
+    later = tmp_path / "roles/r/sites"
+    (later / "other/branch").mkdir(parents=True)
+    target = later / "other/app.j2"
+    if directory_target:
+        target.mkdir()
+    else:
+        target.write_text("later traversal target\n")
+    (later / "link").symlink_to("other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "selected template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "selected template\n"
+
+
+@pytest.mark.parametrize("later_root", [False, True])
+def test_compile_dynamic_role_source_uses_nonregular_traversal_target_without_baking_it(tmp_path, later_root):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app, direct: app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+- template: {src: "sites/{{ direct }}.j2", dest: "direct.txt"}
+""", "roles/r/templates/sites/app.j2": "first template\n"})
+    sites = tmp_path / ("templates/sites" if later_root else "roles/r/templates/sites")
+    if later_root:
+        _write(sites, {"app.j2": "later template\n"})
+    (sites / "other/branch").mkdir(parents=True)
+    (sites / "other/app.j2").symlink_to(os.devnull)
+    (sites / "link").symlink_to("other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    selected = "later template\n" if later_root else "first template\n"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == selected
+    destination.unlink()
+    direct = tmp_path / "direct.txt"
+    assert direct.read_text() == "first template\n"
+    direct.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == selected
+    assert direct.read_text() == "first template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "sites/other/app.j2" not in template["_baked"]
+
+
+@pytest.mark.parametrize("traversed_type", ["directory", "socket"])
+def test_compile_dynamic_role_source_copy_distinguishes_traversed_file_types(tmp_path, monkeypatch, traversed_type):
+    destination = tmp_path / "output"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- copy: {src: "sites/{{ selection }}.j2", dest: "%s/", local_follow: true}
+""" % destination, "roles/r/sites/app.j2": "regular file at the normalized path\n",
+        "roles/r/sites/copied-content.txt": "from the traversed directory\n"})
+    (tmp_path / "roles/r/files/sites/app.j2").mkdir(parents=True)
+    later = tmp_path / "roles/r/sites"
+    (later / "other/branch").mkdir(parents=True)
+    if traversed_type == "directory":
+        (later / "other/app.j2").mkdir()
+        (later / "other/app.j2/contents.txt").symlink_to("../../copied-content.txt")
+    else:
+        import socket
+
+        with monkeypatch.context() as patch, socket.socket(socket.AF_UNIX) as source_socket:
+            patch.chdir(later / "other")
+            source_socket.bind("app.j2")
+    (later / "link").symlink_to("other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    copied = destination / "app.j2"
+    if traversed_type == "directory":
+        contents = copied / "contents.txt"
+        assert contents.read_text() == "from the traversed directory\n"
+        contents.unlink()
+        copied.rmdir()
+        _ansiroll(playbook, tmp_path, returncode=1)
+        assert not copied.exists()
+    else:
+        assert copied.read_text() == "regular file at the normalized path\n"
+        copied.unlink()
+        assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+        assert copied.read_text() == "regular file at the normalized path\n"
+
+
+def test_compile_dynamic_role_source_uses_alias_suffix_targets_from_each_root(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: base/link/..}
+- template: {src: "sites/{{ selection }}/live/app.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/first/app.j2": "earlier traversal target\n",
+        "templates/sites/second/app.j2": "later traversal target\n",
+        "templates/sites/base/live/app.j2": "selected template\n"})
+    earlier = tmp_path / "roles/r/templates/sites"
+    (earlier / "base/live/app.j2").mkdir(parents=True)
+    (earlier / "other").mkdir()
+    (earlier / "other/live").symlink_to("../first", target_is_directory=True)
+    later = tmp_path / "templates/sites"
+    (later / "other/branch").mkdir(parents=True)
+    (later / "other/live").symlink_to("../second", target_is_directory=True)
+    (later / "base/link").symlink_to("../other/branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "rendered.txt"
+    expected = _ansible(playbook, returncode=0)
+    assert destination.read_text() == "selected template\n"
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == "selected template\n"
+
+
+@pytest.mark.parametrize("suffix", ["live", "prod/live", "keep/../prod/live"])
+def test_compile_dynamic_role_source_retains_alias_traversal_dependencies(tmp_path, suffix):
+    resolved_suffix = os.path.normpath(suffix)
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: area/keep/..}
+- template: {src: "sites/{{ selection }}/%s/app.j2", dest: "rendered.txt"}
+""" % suffix, "roles/r/templates/sites/actual/app.j2": "selected template\n",
+        "templates/sites/area/" + resolved_suffix + "/app.j2": "selected template\n",
+        "roles/r/templates/sites/unrelated/app.j2": "unrelated template\n"})
+    area = tmp_path / "roles/r/templates/sites/area"
+    (area / "keep").mkdir(parents=True)
+    if resolved_suffix == "prod/live":
+        sites = area.parent
+        (sites / "staging").mkdir()
+        (area / "prod").symlink_to("../staging", target_is_directory=True)
+        (sites / "staging/live").symlink_to("../actual", target_is_directory=True)
+        _write(sites, {"private/app.j2": "unreachable template\n", "dev/keep.txt": "data\n"})
+        (sites / "dev/live").symlink_to("../private", target_is_directory=True)
+    else:
+        (area / "live").symlink_to("../actual", target_is_directory=True)
+    playbook = tmp_path / "pb.yml"
+
+    _ansiroll(playbook, tmp_path, returncode=0)
+    assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+    template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
+                    if node.get("action", "").endswith("template"))
+    assert "sites/actual/app.j2" in template["_baked"]
+    assert "sites/unrelated/app.j2" not in template["_baked"]
+    assert "sites/private/app.j2" not in template["_baked"]
+
+
+@pytest.mark.parametrize("earlier_has_branch", [False, True])
+@pytest.mark.parametrize("walks_earlier_root", [False, True])
+def test_compile_dynamic_role_source_checks_parent_traversal_per_root(tmp_path, earlier_has_branch, walks_earlier_root):
+    prefix = "sites/" if walks_earlier_root else ""
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: branch/../app}
+- template: {src: "%s{{ selection }}.j2", dest: "rendered.txt"}
+""" % prefix, "templates/" + prefix + "app.j2": "later template\n"})
+    earlier = tmp_path / ("roles/r/templates/sites" if walks_earlier_root else "roles/r")
+    (earlier / "app.j2").mkdir(parents=True)
+    if earlier_has_branch:
+        (earlier / "branch").mkdir()
+    (tmp_path / "templates" / prefix / "branch").mkdir()
+
+    playbook = tmp_path / "pb.yml"
+    _ansible(playbook, returncode=2 if earlier_has_branch else 0)
+    destination = tmp_path / "rendered.txt"
+    if destination.exists():
+        destination.unlink()
+    _ansiroll(playbook, tmp_path, returncode=1 if earlier_has_branch else 0)
+    if earlier_has_branch:
+        assert not destination.exists()
+    else:
+        assert destination.read_text() == "later template\n"
+
+
+@pytest.mark.parametrize("middle_has_branch", [False, True])
+def test_compile_dynamic_role_source_continues_past_unreachable_candidates(tmp_path, middle_has_branch):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: branch/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/sites/app.j2": "middle template\n",
+        "templates/sites/app.j2": "last template\n"})
+    (tmp_path / "roles/r/templates/sites/app.j2").mkdir(parents=True)
+    if middle_has_branch:
+        (tmp_path / "roles/r/sites/branch").mkdir()
+    (tmp_path / "templates/sites/branch").mkdir()
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    destination = tmp_path / "rendered.txt"
+    expected_content = "middle template\n" if middle_has_branch else "last template\n"
+    assert destination.read_text() == expected_content
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == expected_content
+
+
+def test_compile_dynamic_role_source_checks_a_traversed_directory_without_normalized_input(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: link/../app}
+- template: {src: "sites/{{ selection }}.j2", dest: "rendered.txt"}
+""", "templates/sites/app.j2": "last template\n"})
+    (tmp_path / "roles/r/templates/sites/app.j2").mkdir(parents=True)
+    middle = tmp_path / "roles/r/sites"
+    (middle / "nested/branch").mkdir(parents=True)
+    (middle / "nested/app.j2").mkdir()
+    (middle / "link").symlink_to("nested/branch", target_is_directory=True)
+    last = tmp_path / "templates/sites"
+    (last / "branch").mkdir()
+    (last / "link").symlink_to("branch", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    _ansible(playbook, returncode=2)
+    _ansiroll(playbook, tmp_path, returncode=1)
+    assert not (tmp_path / "rendered.txt").exists()
+
+
+@pytest.mark.parametrize("replacement", ["missing", "parent-file", "symlink-loop", "missing-on-recheck"])
+def test_compile_dynamic_role_source_uses_later_file_after_concurrent_removal(tmp_path, monkeypatch, replacement):
+    import errno
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+
+    _write(tmp_path, {"earlier/sites/app.j2": "removed\n", "later/sites/app.j2": "available\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if path == str(earlier):
+            if replacement == "parent-file":
+                earlier.parent.rename(tmp_path / "removed")
+                earlier.parent.write_text("no longer a directory")
+            else:
+                earlier.unlink()
+                if replacement == "symlink-loop":
+                    earlier.symlink_to(earlier.name)
+                elif replacement == "missing-on-recheck":
+                    raise OSError(errno.ENXIO, os.strerror(errno.ENXIO), path)
+        return original_open(path)
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    assert node["_baked"] == {"sites/app.j2": "available\n"}
+
+
+@pytest.mark.parametrize("earlier_has_branch", [False, True])
+def test_compile_dynamic_role_source_can_bypass_an_unreadable_earlier_file(tmp_path, monkeypatch, earlier_has_branch):
+    import errno
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/app.j2": "unreadable\n", "later/sites/app.j2": "available\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    (tmp_path / "later/sites/branch").mkdir()
+    if earlier_has_branch:
+        (earlier.parent / "branch").mkdir()
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if path == str(earlier):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), path)
+        return original_open(path)
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    runtime = Runtime({}, "", {})
+    direct = runtime._baked_source_key(node, "sites/app.j2")
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        runtime._asset_text(node["_baked"][direct])
+    traversed = runtime._baked_source_key(node, "sites/branch/../app.j2")
+    if earlier_has_branch:
+        with pytest.raises(RuntimeError, match="Permission denied"):
+            runtime._asset_text(node["_baked"][traversed])
+    else:
+        assert node["_baked"][traversed] == "available\n"
+
+
+@pytest.mark.parametrize("scenario", ["suffix_mismatch", "sibling_alias", "remote_redirect", "disappears", "chained"])
+def test_compile_dynamic_role_source_keeps_only_eligible_special_traversal_duplicates(tmp_path, monkeypatch, scenario):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    disappears = scenario == "disappears"
+    _write(tmp_path, {"earlier/sites/prod/app.j2": "first\n", "later/sites/prod/app.j2": "later\n"})
+    later = tmp_path / "later/sites"
+    if scenario == "chained":
+        special = later / "prod/middle/other"
+        alias = later / "prod/middle/link"
+        target = special / "branch"
+        (later / "prod/middle/branch").mkdir(parents=True)
+        (later / "prod/link").symlink_to("middle/branch", target_is_directory=True)
+    elif disappears:
+        special = later / "prod/other"
+        alias = later / "prod/link"
+        target = special / "branch"
+    elif scenario == "remote_redirect":
+        special = later / "isolated/prod"
+        alias = later / "elsewhere/from/link"
+        alias.parent.mkdir(parents=True)
+        target = later / "elsewhere/to/branch"
+    elif scenario == "sibling_alias":
+        special = later / "isolated/prod"
+        alias = later / "link"
+        target = later / "peer"
+    else:
+        special = later / "unrelated"
+        alias = later / "link"
+        target = special / "branch"
+    special.mkdir(parents=True)
+    target.mkdir(parents=True)
+    (special / "app.j2").symlink_to(os.devnull)
+    alias.symlink_to(target, target_is_directory=True)
+    duplicate = later / "prod/app.j2"
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if disappears and path == str(duplicate):
+            duplicate.unlink()
+        return original_open(path)
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    node = {}
+    source = ("sites/{{ selection }}.j2" if scenario in ("disappears", "chained")
+              else "sites/{{ selection }}/prod/app.j2")
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates", source)
+    assert node["_baked"]["sites/prod/app.j2"] == "first\n"
+    if scenario == "chained":
+        key = Runtime._baked_source_key(node, "sites/prod/link/../link/../app.j2")
+        assert node["_baked"][key] == "later\n"
+    else:
+        assert "later\n" not in node["_baked"].values()
+    assert duplicate.exists() is not disappears
+
+
+def test_compile_dynamic_role_source_retains_earlier_duplicate_after_later_blocker(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {
+        "first/sites/app.j2": "shared template\n",
+        "second/sites/app.j2": "shared template\n",
+        "last/sites/app.j2": "last template\n",
+    })
+    (tmp_path / "second/sites/branch").mkdir()
+    (tmp_path / "blocked/sites/app.j2").mkdir(parents=True)
+    last = tmp_path / "last/sites"
+    (last / "other/branch").mkdir(parents=True)
+    (last / "other/app.j2").symlink_to(os.devnull)
+    (last / "link").symlink_to("other/branch", target_is_directory=True)
+
+    roots = [(str(tmp_path / name), True) for name in ("first", "second", "blocked", "last")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    node = {}
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates",
+                                    "sites/{{ selection }}.j2")
+    direct = Runtime._baked_source_key(node, "sites/app.j2")
+    traversed = Runtime._baked_source_key(node, "sites/branch/../app.j2")
+    assert node["_baked_meta"][direct]["fullpath"] == str(tmp_path / "first/sites/app.j2")
+    assert node["_baked_meta"][traversed]["fullpath"] == str(tmp_path / "second/sites/app.j2")
+    assert node["_baked"][traversed] == "shared template\n"
+
+
+@pytest.mark.parametrize(("tail", "required_dir_exists", "retains_duplicate"), [
+    ("missing/../prod/app.j2", False, False),
+    ("missing/../prod/app.j2", True, True),
+    ("../prod/app.j2", False, True),
+    ("/prod//app.j2", False, True),
+])
+def test_compile_dynamic_role_source_checks_literal_traversal_before_retaining_duplicates(
+        tmp_path, monkeypatch, tail, required_dir_exists, retains_duplicate):
+    from types import SimpleNamespace
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/prod/app.j2": "first\n", "later/sites/prod/app.j2": "later\n"})
+    later = tmp_path / "later/sites"
+    (later / "other/branch").mkdir(parents=True)
+    (later / "other/prod").mkdir()
+    (later / "other/prod/app.j2").symlink_to(os.devnull)
+    (later / "link").symlink_to("other/branch", target_is_directory=True)
+    if required_dir_exists:
+        (later / "other/missing").mkdir()
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    node = {}
+    source = "sites/{{ selection }}/" + tail
+    assert loader._bake_search_tree(node, SimpleNamespace(_role=object()), str(tmp_path), "templates", source)
+    assert ("later\n" in node["_baked"].values()) is retains_duplicate
+    if retains_duplicate:
+        traversal = "sites/link/" + (tail if tail.startswith("../") else "../" + tail)
+        key = Runtime._baked_source_key(node, traversal)
+        assert node["_baked"][key] == "later\n"
+
+
+def test_compile_dynamic_role_source_uses_later_file_when_candidate_disappears_after_stat(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from ansible.parsing.dataloader import DataLoader
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"earlier/sites/app.j2": "removed\n", "later/sites/app.j2": "available\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    original_stat = os.stat
+
+    def stat_then_remove(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if path == str(earlier):
+            earlier.unlink()
+        return info
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    task = SimpleNamespace(_role=object(), _loader=DataLoader(), get_search_path=lambda: [base for base, _ in roots])
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", stat_then_remove)
+        node = {}
+        assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
+    assert not earlier.exists()
+    key = Runtime._baked_source_key(node, "sites/app.j2")
+    assert node["_baked"][key] == "available\n"
+
+
+@pytest.mark.parametrize("replace_with_file", [False, True])
+def test_compile_dynamic_role_source_rechecks_walked_directory(tmp_path, monkeypatch, replace_with_file):
+    from types import SimpleNamespace
+
+    from ansible.parsing.dataloader import DataLoader
+
+    from ansiroll import loader
+    from ansiroll.runtime import Runtime
+
+    _write(tmp_path, {"later/sites/app.j2": "later file\n"})
+    earlier = tmp_path / "earlier/sites/app.j2"
+    earlier.mkdir(parents=True)
+    original_walk = os.walk
+
+    def walk_then_replace(path, *args, **kwargs):
+        for directory, dirs, files in original_walk(path, *args, **kwargs):
+            if directory == str(earlier.parent) and earlier.name in dirs and earlier.is_dir():
+                earlier.rmdir()
+                if replace_with_file:
+                    earlier.write_text("replacement file\n")
+            yield directory, dirs, files
+
+    roots = [(str(tmp_path / name), True) for name in ("earlier", "later")]
+    task = SimpleNamespace(_role=object(), _loader=DataLoader(), get_search_path=lambda: [base for base, _ in roots])
+    monkeypatch.setattr(loader, "_search_dirs", lambda *args, **kwargs: roots)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "walk", walk_then_replace)
+        node = {}
+        assert loader._bake_search_tree(node, task, str(tmp_path), "templates", "sites/{{ selection }}.j2")
+    key = Runtime._baked_source_key(node, "sites/app.j2")
+    assert node["_baked"][key] == ("replacement file\n" if replace_with_file else "later file\n")
+
+
+@pytest.mark.parametrize("leased_source_exists_at_runtime", [False, True])
+def test_compile_dynamic_role_source_defers_lease_errors(tmp_path, monkeypatch, leased_source_exists_at_runtime):
+    from ansiroll import loader
+
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: {src: "sites/{{ selection }}/keep/../templates/app.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/prod/templates/app.j2": "usable template\n",
+        "roles/r/templates/sites/notes/templates/app.j2": "leased template\n"})
+    sites = tmp_path / "roles/r/templates/sites"
+    (sites / "prod/keep").mkdir()
+    if leased_source_exists_at_runtime:
+        (sites / "notes/keep").mkdir()
+    leased = str(sites / "notes/templates/app.j2")
+    original_open = loader._open_role_source
+
+    def open_source(path):
+        if path == leased:
+            raise loader._RoleSourceLeaseError("write lease is active")
+        return original_open(path)
+
+    monkeypatch.setattr(loader, "_open_role_source", open_source)
+    source, _manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True,
+                            env=dict(_env(), ANSIROLL_EXTRA_VARS='{"selection":"prod"}'), timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "rendered.txt").read_text() == "usable template\n"
+
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True,
+                            env=dict(_env(), ANSIROLL_EXTRA_VARS='{"selection":"notes"}'), timeout=15)
+    assert result.returncode == 1, result.stdout + result.stderr
+    expected = "write lease is active" if leased_source_exists_at_runtime else "was not baked"
+    assert expected in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("remote_src", ["true", "yes", "'1'"])
 def test_copy_remote_src_reads_target_at_runtime(tmp_path, remote_src):
     src = tmp_path / "remote.txt"
@@ -1388,6 +2139,40 @@ def test_dynamic_role_template_bakes_only_renderable_action_prefix(tmp_path, pre
     template = next(node for node in _task_nodes(_bundle_json(source)[0]["tasks"])
                     if node.get("action", "").endswith("template"))
     assert set(template["_baked_direct_sources"]) == {prefix + "templates/sites/alias/app.j2"}
+
+
+def test_linked_template_spelling_takes_precedence_over_ordinary_blocker(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: templates/sites/alias/app}
+- template: {src: "{{ selection }}.j2", dest: output.txt}
+""", "roles/r/templates/shared/app.j2": "linked winner\n",
+        "templates/templates/sites/alias/app.j2": "later regular file\n"})
+    templates = tmp_path / "roles/r/templates"
+    (templates / "templates/sites/alias/app.j2").mkdir(parents=True)
+    (templates / "sites").mkdir()
+    (templates / "sites/alias").symlink_to("../shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    destination = tmp_path / "output.txt"
+    expected = _ansible(playbook, returncode=0)
+    contents = destination.read_text()
+    destination.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert destination.read_text() == contents
+
+
+def test_unbaked_direct_template_does_not_use_a_shadowed_ordinary_payload():
+    from ansiroll.runtime import Runtime
+
+    source = "templates/sites/alias/app.j2"
+    node = {"_baked_tree": "templates", "_baked_direct_sources": {source: None},
+            "_baked_tree_shadowed": {source: [0, 1]},
+            "_baked_tree_roots": [([], {}, {}, {source: source}), ([], {}, {source: True}, {})]}
+    assert Runtime._baked_source_key(node, source) is None
 
 
 def test_dynamic_role_template_preserves_dot_prefixed_tilde(tmp_path):
