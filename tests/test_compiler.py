@@ -185,6 +185,8 @@ def test_freezing_allows_explicit_inventory_values(tmp_path, group_vars):
      "selection-inventory.yml", "selection-fallback.yml"),
     ("{{ 'config/inventory.yml' if group_names is defined else 'config/fallback.yml' }}",
      "config/inventory.yml", "config/fallback.yml"),
+    ("{{ (group_names is defined) | ternary('config/inventory.yml', 'config/fallback.yml') }}",
+     "config/inventory.yml", "config/fallback.yml"),
 ])
 def test_standalone_vars_files_select_inventory_at_runtime(tmp_path, selector, inventory, fallback):
     from ansiroll import compile_playbook
@@ -192,23 +194,81 @@ def test_standalone_vars_files_select_inventory_at_runtime(tmp_path, selector, i
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: all
   gather_facts: false
+  vars:
+    final_path: config/final.yml
   vars_files:
+    - 'first-{{ profile }}.yml'
+    - middle.yml
     - "%s"
-    - final.yml
+    - '{{ final_path }}'
   tasks:
-    - debug: {msg: '{{ selected }}/{{ precedence }}'}
+    - debug: {msg: '{{ selected }}/{{ precedence }}/{{ first_layer }}'}
 """ % selector)
     (tmp_path / inventory).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / inventory).write_text("selected: inventory\nprecedence: earlier\n")
     (tmp_path / fallback).write_text("selected: fallback\nprecedence: earlier\n")
-    (tmp_path / "final.yml").write_text("precedence: later\n")
+    (tmp_path / "first-runtime.yml").write_text("first_layer: first\nfinal_path: wrong.yml\n")
+    (tmp_path / "middle.yml").write_text("first_layer: middle\nfinal_path: config/final.yml\n")
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "final.yml").write_text("precedence: later\n")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    env = dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_EXTRA_VARS='{"profile": "runtime"}')
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "inventory/later/middle"
+
+
+def test_replayed_vars_file_unsafe_scalar_replaces_mapping(tmp_path, monkeypatch):
+    from ansible import constants as C
+    from ansiroll import compile_playbook
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - "selection-{{ 'inventory' if group_names is defined else 'fallback' }}.yml"
+    - final.yml
+  tasks:
+    - debug: {msg: '{{ auth }}'}
+""")
+    (tmp_path / "selection-inventory.yml").write_text("auth: {user: earlier}\n")
+    (tmp_path / "final.yml").write_text("auth: !unsafe '{{ literal }}'\n")
     compiled = tmp_path / "compiled.py"
     compiled.write_text(compile_playbook(str(playbook))[0])
     env = dict(os.environ, ANSIROLL_RAW="1")
     completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
-    assert frame["result"]["msg"] == "inventory/later"
+    assert frame["result"]["msg"] == "{{ literal }}"
+
+
+def test_deferred_vars_file_can_change_a_later_selector(tmp_path):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars: {flavor: default}
+  vars_files:
+    - 'gather-{{ profile }}.yml'
+    - '{{ flavor }}.yml'
+  tasks:
+    - debug: {msg: '{{ picked }}'}
+""")
+    (tmp_path / "gather-runtime.yml").write_text("flavor: custom\n")
+    (tmp_path / "default.yml").write_text("picked: default\n")
+    (tmp_path / "custom.yml").write_text("picked: custom\n")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    env = dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_EXTRA_VARS='{"profile": "runtime"}')
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "custom"
 
 
 def test_standalone_include_tasks_does_not_bake_inventory_fallback(tmp_path):

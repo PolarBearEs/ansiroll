@@ -23,7 +23,6 @@ from .accelerated_modules import can_accelerate
 
 _STANDALONE_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names"))
 _STANDALONE_CONTEXT_NAMES = _STANDALONE_INVENTORY_NAMES | {"vars", "hostvars"}
-_DEFER_INVENTORY_VARS_FILE = object()
 
 # Actions that are coupled to the controller and cannot run inside the single file.
 CONTROLLER_COUPLED = {
@@ -441,7 +440,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "handlers": handlers,
     }
     if unresolved_vars_files:
-        result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
+        result["deferred_vars_files"] = unresolved_vars_files
     names = _controller_env_names(result)
     if names:
         result["controller_env"] = {
@@ -541,15 +540,18 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
-    appended to ``unresolved``.
+    appended to ``unresolved`` with their bundled candidates.
     """
+    from ansible import constants as C
     from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
     out = dict(play.vars or {})
+    selector_vars = out
+    deferred_writes = set()
     use_search_stack = _core_version() >= (2, 12)
-    replay = False
     for entry in _as_list(getattr(play, "vars_files", None)):
+        replay = all_vars is None and bool(unresolved)
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
@@ -557,13 +559,16 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
-                filename = None if replay else _template_vars_file_name(
-                    play, raw, dict(out, playbook_dir=basedir), all_vars)
-                if filename is _DEFER_INVENTORY_VARS_FILE:
-                    replay = True
-                if filename is None or filename is _DEFER_INVENTORY_VARS_FILE:
+                filename = _template_vars_file_name(
+                    play, raw, dict(selector_vars, playbook_dir=basedir), all_vars, deferred_writes)
+                if filename is None:
                     if unresolved is not None:
-                        unresolved.append(entry)
+                        bundled, = _deferred_vars_files(play, basedir, [entry])
+                        unresolved.append(bundled)
+                        for candidate in bundled["files"].values():
+                            if isinstance(candidate, list):
+                                for mapping in candidate:
+                                    deferred_writes.update(mapping)
                     break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
@@ -576,12 +581,15 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
                 # Like Ansible: only a missing file moves on to the next candidate.
                 continue
             mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
-            if replay and unresolved is not None:
+            for item in mappings:
+                selector_vars = combine_vars(selector_vars, item)
+                deferred_writes.difference_update(key for key, value in item.items()
+                                                  if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict))
+            if replay:
                 # Later files must take precedence over the deferred choice.
                 unresolved.append({"static_vars": _tag_untrusted(mappings)})
             else:
-                for item in mappings:
-                    out = combine_vars(out, item)
+                out = selector_vars
             break
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
@@ -623,10 +631,17 @@ def _literal_vars_file_choices(source):
         return ()
     parts = body[0].nodes
     dynamic = [part for part in parts if not isinstance(part, nodes.TemplateData)]
-    if len(dynamic) != 1 or not isinstance(dynamic[0], nodes.CondExpr):
+    if len(dynamic) != 1:
         return ()
     choice = dynamic[0]
-    branches = (choice.expr1, choice.expr2)
+    if isinstance(choice, nodes.CondExpr):
+        branches = (choice.expr1, choice.expr2)
+    elif (isinstance(choice, nodes.Filter) and choice.name in ("ternary", "ansible.builtin.ternary",
+                                                              "ansible.legacy.ternary")
+          and len(choice.args) == 2 and not (choice.kwargs or choice.dyn_args or choice.dyn_kwargs)):
+        branches = choice.args
+    else:
+        return ()
     if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches):
         return ()
     return tuple("".join(branch.value if part is choice else part.data for part in parts) for branch in branches)
@@ -649,9 +664,6 @@ def _deferred_vars_files(play, basedir, entries):
     dirs = [os.path.normpath(d) for d in dirs]
     deferred = []
     for entry in entries:
-        if isinstance(entry, dict) and "static_vars" in entry:
-            deferred.append(entry)
-            continue
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
         unmodeled = []
@@ -710,15 +722,20 @@ def _bundled_vars_file(play, path):
             "a mapping" % path}
 
 
-def _template_vars_file_name(play, filename, play_vars, all_vars):
+def _template_vars_file_name(play, filename, play_vars, all_vars, deferred_writes=frozenset()):
+    from ansible import constants as C
     from ansible.utils.vars import combine_vars
 
+    extras = play.get_variable_manager().extra_vars
     variables = combine_vars(play_vars, all_vars or {})
-    variables = combine_vars(variables, play.get_variable_manager().extra_vars)
+    variables = combine_vars(variables, extras)
     if all_vars is None:
         runtime_names = _STANDALONE_CONTEXT_NAMES - variables.keys()
+        runtime_names.update(key for key in deferred_writes if key not in extras or (
+            C.DEFAULT_HASH_BEHAVIOUR == "merge" and isinstance(extras[key], dict)))
+        runtime_names.discard("playbook_dir")
         if _depends_on_vars(filename, variables, runtime_names.__contains__):
-            return _DEFER_INVENTORY_VARS_FILE
+            return None
     try:
         from ansible.template import Templar
         try:

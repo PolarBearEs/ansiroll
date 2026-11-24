@@ -529,12 +529,17 @@ def _boolean(value, strict=False):
 
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
+    encoded_vars = kwargs.get("encoded_vars", False)
+
+    def mapping(value):
+        return isinstance(value, dict) and (not encoded_vars or value.keys() not in (
+            {"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}))
 
     # Copy through items(): dict(lazy_view) bypasses rendering on Python 3.5.
     def merge(a, b):
         out = dict(a.items())
         for k, v in b.items():
-            if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
+            if recursive and mapping(out.get(k)) and mapping(v):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
@@ -3045,7 +3050,7 @@ class Runtime:
         base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in play.get("deferred_vars_files") or ():
             if "static_vars" in entry:
-                play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes)
+                play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes, encoded_vars=True)
                 continue
             ctx = self.ctx(play_vars, self.extra_vars, base=base)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
@@ -3076,7 +3081,7 @@ class Runtime:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    play_vars = _f_combine(play_vars, *data, recursive=merge_hashes)
+                    play_vars = _f_combine(play_vars, *data, recursive=merge_hashes, encoded_vars=True)
                     break
             else:
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
