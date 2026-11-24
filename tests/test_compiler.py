@@ -101,7 +101,12 @@ def test_freezing_keeps_inventory_dependent_play_vars_dynamic(tmp_path):
     assert frame["result"]["msg"] == "node"
 
 
-def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path):
+@pytest.mark.parametrize(("variables", "expression"), [
+    ("", "'no' if group_names is defined else true"),
+    ("  vars:\n    checksum_flag: \"{{ 'no' if group_names is defined else true }}\"\n",
+     "checksum_flag | default(true)"),
+])
+def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path, variables, expression):
     from ansiroll import compile_playbook
 
     source = tmp_path / "data"
@@ -109,13 +114,13 @@ def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path)
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: all
   gather_facts: false
-  tasks:
+%s  tasks:
     - ansible.builtin.stat:
         path: %s
-        get_checksum: "{{ 'no' if group_names is defined else true }}"
-""" % json.dumps(str(source)))
+        get_checksum: "{{ %s }}"
+""" % (variables, json.dumps(str(source)), expression))
     compiled = tmp_path / "compiled.py"
-    contents, manifest = compile_playbook(str(playbook), tree_shake=True)
+    contents, manifest = compile_playbook(str(playbook), tree_shake=True, freeze_playbook_vars=True)
     assert "ansible.builtin.stat" in manifest["modules"]
     assert "ansible.builtin.stat" not in manifest["accelerated_only_modules"]
     compiled.write_text(contents)
@@ -125,6 +130,30 @@ def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path)
               if line.startswith("__ANSIROLL_RESULT__ ")]
     assert frame["result"]["stat"]["exists"]
     assert "checksum" not in frame["result"]["stat"]
+
+
+@pytest.mark.parametrize("expression", ["group_names is defined", "play_flag | default(false)"])
+def test_tree_shaking_keeps_inventory_dependent_extra_var_condition(tmp_path, expression):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    play_flag: '{{ group_names is defined }}'
+  tasks:
+    - debug: {msg: inventory is available}
+      when: run_task
+""")
+    contents, _ = compile_playbook(str(playbook), tree_shake=True,
+                                   extra_vars={"run_task": "{{ " + expression + " }}"})
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(contents)
+    env = dict(os.environ, ANSIROLL_RAW="1")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "inventory is available"
 
 
 def test_bundle_union_deduplicates_identical_import_paths():

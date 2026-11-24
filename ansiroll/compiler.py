@@ -410,6 +410,14 @@ def _condition_value(condition, variables, templater):
         return None
     if _uses_nondeterministic_filter(parsed):
         return None
+    # A fixed variable can still contain a template. Its defaults and tests
+    # must see the runtime scope when a referenced name is absent here.
+    def is_runtime_input(name):
+        return name not in variables
+
+    if any(_depends_on_vars(variables[name], variables, is_runtime_input)
+           for name in referenced & variables.keys()):
+        return None
     if not referenced.issubset(variables):
         # A tracking StrictUndefined distinguishes an unknown value that Jinja
         # never evaluates due to boolean short-circuiting from one consumed by
@@ -699,12 +707,17 @@ def _specialize_accelerators(plays, variables):
 
     runtime = Runtime({}, "", {})
     count = 0
-    runtime_inventory = _RUNTIME_INVENTORY_NAMES - variables.keys()
+
+    def is_runtime_input(name):
+        return name not in variables
+
     for node in _walk_play_nodes(plays):
         if node.get("accelerator") != "dynamic":
             continue
         args = node.get("args") or {}
-        if _depends_on_vars(args, variables, runtime_inventory.__contains__):
+        # An unresolved alias can render to a valid default at build time
+        # even though the runtime arguments need the official module.
+        if _depends_on_vars(args, variables, is_runtime_input):
             continue
         try:
             resolved = runtime.template(args, dict(variables))
