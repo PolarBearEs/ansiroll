@@ -41,6 +41,7 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # compiler bakes it into the generated source; target hosts usually have no
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
+_ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 
 
 def _core_at_least(major, minor):
@@ -5269,15 +5270,9 @@ def _hostname():
 
 def _inventory_hostname_short(host):
     name = str(host)
-    if _core_at_least(2, 13):
-        from ipaddress import ip_address
-
-        try:
-            ip_address(name)
-        except ValueError:
-            pass
-        else:
-            return name
+    if _core_at_least(2, 13) and any(
+            re.match(pattern, name, flags) for pattern, flags in _ANSIROLL_INVENTORY_ADDRESS_PATTERNS):
+        return name
     return name.split(".", 1)[0]
 
 
@@ -5293,8 +5288,8 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     runtime_started = time.monotonic()
     host_vars = dict(host_vars or {})
     host = host_vars.get("inventory_hostname") or _hostname()
-    host_vars.setdefault("inventory_hostname", host)
-    host_vars.setdefault("inventory_hostname_short", _inventory_hostname_short(host))
+    host_vars["inventory_hostname"] = _mark_unsafe(host)
+    host_vars.setdefault("inventory_hostname_short", _mark_unsafe(_inventory_hostname_short(host)))
     host_vars.setdefault("group_names", ["ungrouped"])
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,

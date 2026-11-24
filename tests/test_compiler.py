@@ -34,12 +34,18 @@ def _module_zip(entries):
     ("localhost", {}),
     ("node.example.test", {}),
     ("192.0.2.7", {}),
+    ("127.000.000.001", {}),
     ("::ffff:192.0.2.7", {}),
+    ("::ffff:192.0.2.7%eth.1", {}),
+    ("{{ 2 + 2 }}.example.test", {}),
+    ("", {}),
     ("launcher.example.test", {"inventory_hostname": "selected.example.test"}),
     ("node.example.test", {"inventory_hostname_short": "alias", "group_names": ["workers", "blue"]}),
     ("node.example.test", {"inventory_hostname_short": "", "group_names": []}),
 ])
 def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
+    import socket
+
     from ansible.inventory.host import Host
     from ansiroll import compile_playbook
 
@@ -67,12 +73,58 @@ def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
     assert completed.returncode == 0, completed.stdout + completed.stderr
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
-    name = injected.get("inventory_hostname", hostname)
+    name = injected.get("inventory_hostname", hostname) or socket.gethostname()
     short = Host(name).get_magic_vars()["inventory_hostname_short"]
     assert frame["result"]["msg"] == {
         "name": name, "short": injected.get("inventory_hostname_short", short),
         "groups": injected.get("group_names", ["ungrouped"]),
     }
+
+
+def test_freezing_keeps_inventory_dependent_play_vars_dynamic(tmp_path):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    selected_name: "{{ inventory_hostname_short | default('fallback') }}"
+  tasks:
+    - debug: {msg: '{{ selected_name }}'}
+""")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook), freeze_playbook_vars=True)[0])
+    env = dict(os.environ, ANSIROLL_HOST="node.example.test", ANSIROLL_RAW="1")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "node"
+
+
+def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path):
+    from ansiroll import compile_playbook
+
+    source = tmp_path / "data"
+    source.write_text("checksum input\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  tasks:
+    - ansible.builtin.stat:
+        path: %s
+        get_checksum: "{{ 'no' if group_names is defined else true }}"
+""" % json.dumps(str(source)))
+    compiled = tmp_path / "compiled.py"
+    contents, manifest = compile_playbook(str(playbook), tree_shake=True)
+    assert "ansible.builtin.stat" in manifest["modules"]
+    assert "ansible.builtin.stat" not in manifest["accelerated_only_modules"]
+    compiled.write_text(contents)
+    env = dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_ACCELERATED_MODULES="stat")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["stat"]["exists"]
+    assert "checksum" not in frame["result"]["stat"]
 
 
 def test_bundle_union_deduplicates_identical_import_paths():

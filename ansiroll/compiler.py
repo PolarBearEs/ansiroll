@@ -46,6 +46,8 @@ _ACCELERATED_MODULES_PATH = os.path.join(
 )
 _JINJA_BUNDLE_MARKER = "# __ANSIROLL_JINJA_BUNDLE__"
 _WORKER_CODE_MARKER = "# __ANSIROLL_WORKER_CODE__"
+_RUNTIME_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names",
+                                      "vars", "hostvars"))
 
 _FOOTER = '''
 
@@ -293,6 +295,7 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
     skipped = {}
     frozen = {}
     shadowed = _shadowed_var_names(plays)
+    runtime_inventory = _RUNTIME_INVENTORY_NAMES - extra_vars.keys()
 
     def is_shadowed(name):
         return _can_write_var(shadowed, name)
@@ -331,7 +334,8 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
             context = dict(group_vars)
             context.update(play_vars)
             context.update(extra_vars)
-            if _depends_on_vars(raw, context, is_shadowed):
+            if _depends_on_vars(raw, context, lambda dependency: is_shadowed(dependency)
+                                or dependency in runtime_inventory):
                 reason = "shadowed dependency"
                 break
             value, known = _freeze_value(raw, context)
@@ -695,11 +699,15 @@ def _specialize_accelerators(plays, variables):
 
     runtime = Runtime({}, "", {})
     count = 0
+    runtime_inventory = _RUNTIME_INVENTORY_NAMES - variables.keys()
     for node in _walk_play_nodes(plays):
         if node.get("accelerator") != "dynamic":
             continue
+        args = node.get("args") or {}
+        if _depends_on_vars(args, variables, runtime_inventory.__contains__):
+            continue
         try:
-            resolved = runtime.template(node.get("args") or {}, dict(variables))
+            resolved = runtime.template(args, dict(variables))
         except Exception:
             continue
         if (
@@ -1030,6 +1038,12 @@ def _render_source(plays, modules, ansiballz_code, group_vars=None):
     )[0]
 
 
+def _controller_inventory_address_patterns():
+    from ansible.parsing.utils.addresses import patterns
+
+    return tuple((patterns[name].pattern, int(patterns[name].flags)) for name in ("ipv4", "ipv6"))
+
+
 def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
                               specialized_vars=None, frozen_vars=None):
     import_bundle, data_bundle, stats = _build_bundles(
@@ -1061,6 +1075,7 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         "\n\n# ===== embedded data =====\n",
         '_ANSIROLL_HOST = "localhost"\n',
         "_ANSIROLL_CORE_VERSION = " + repr(_controller_core_version()) + "\n",
+        "_ANSIROLL_INVENTORY_ADDRESS_PATTERNS = " + repr(_controller_inventory_address_patterns()) + "\n",
         "ANSIBALLZ_CODE = " + repr(ansiballz_code) + "\n",
         "_ANSIROLL_DATA_BUNDLE = " + repr(base64.b64encode(data_bundle)) + "\n",
         "_ansiroll_data_zip = _bundle_zipfile.ZipFile(_bundle_io.BytesIO("
