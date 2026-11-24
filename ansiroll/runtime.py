@@ -2343,24 +2343,31 @@ class _PluginInventoryArgument:
         self.previous = None
         self.previous_bindings = None
 
-    def populate(self, converted):
+    def populate(self, converted, inventory):
         if isinstance(self.view, _RawSnapshotMapping):
-            self.value.update((key, _custom_plugin_arg(item, converted)) for key, item in self.view.items())
+            self.value.clear()
+            self.value.update(
+                (key, _custom_plugin_arg(item, converted, inventory)) for key, item in self.view.items()
+            )
         else:
-            self.value.extend(_custom_plugin_arg(item, converted) for item in self.view)
+            self.value[:] = [_custom_plugin_arg(item, converted, inventory) for item in self.view]
             self.previous_bindings = list.copy(self.view._owner)
         self.previous = self.value.copy()
 
-    def write_back(self, sources):
+    def write_back(self, sources, restored):
         if self.previous is None:
             return
         owner = self.view._owner
         if isinstance(self.view, _RawSnapshotMapping):
-            for key in self.previous.keys() - self.value.keys():
-                dict.pop(owner, key, None)
-            for key, value in self.value.items():
-                if key not in self.previous or self.previous[key] is not value:
-                    dict.__setitem__(owner, key, sources.get(id(value), value))
+            if (tuple(self.previous) != tuple(self.value)
+                    or any(self.previous[key] is not value for key, value in self.value.items())):
+                members = {
+                    key: (dict.__getitem__(owner, key) if key in self.previous and self.previous[key] is value
+                          else _restore_plugin_argument(value, sources, restored))
+                    for key, value in self.value.items()
+                }
+                dict.clear(owner)
+                dict.update(owner, members)
         elif len(self.previous) != len(self.value) or any(a is not b for a, b in zip(self.previous, self.value)):
             bindings = {}
             for value, stored in zip(reversed(self.previous), reversed(self.previous_bindings)):
@@ -2368,45 +2375,92 @@ class _PluginInventoryArgument:
             members = []
             for value in self.value:
                 retained = bindings.get(id(value))
-                members.append(retained.pop() if retained else sources.get(id(value), value))
+                members.append(retained.pop() if retained else _restore_plugin_argument(value, sources, restored))
             list.__setitem__(owner, slice(None), members)
-            self.previous_bindings = members
-        self.previous = self.value.copy()
 
 
-def _write_back_plugin_inventory(converted):
+def _restore_plugin_argument(value, sources, restored):
+    if id(value) in sources:
+        return sources[id(value)]
+    if id(value) in restored:
+        return restored[id(value)][1]
+    if type(value) is dict:
+        restored[id(value)] = value, value
+        for key, item in dict.items(value):
+            value[key] = _restore_plugin_argument(item, sources, restored)
+    elif type(value) is list:
+        restored[id(value)] = value, value
+        for index, item in enumerate(value):
+            value[index] = _restore_plugin_argument(item, sources, restored)
+    elif type(value) is tuple:
+        items = tuple(_restore_plugin_argument(item, sources, restored) for item in value)
+        if all(item is original for item, original in zip(items, value)):
+            items = value
+        return restored.setdefault(id(value), (value, items))[1]
+    return value
+
+
+def _restore_plugin_arguments(converted):
     if converted:
         entries = [entry[2] for entry in converted.values() if len(entry) == 3]
         sources = {id(entry.value): entry.view for entry in entries}
-        for entry in entries:
-            entry.write_back(sources)
+        if sources:
+            restored = {}
+            for entry in entries:
+                entry.write_back(sources, restored)
+            for entry in converted.values():
+                if len(entry) == 2:
+                    _restore_plugin_argument(entry[1], sources, restored)
 
 
-def _custom_plugin_arg(value, converted):
+def _restore_plugin_result(result, converted):
+    if converted:
+        sources = {id(builtin): original for original, builtin, *_ in converted.values()
+                   if isinstance(original, (_RawSnapshotMapping, _RawSnapshotList))}
+        if sources:
+            return _restore_plugin_argument(result, sources, {})
+    return result
+
+
+def _refresh_plugin_arguments(converted):
+    # Reuse the containers held by suspended Python code, but read their new
+    # contents and bindings from the snapshots after Jinja has run.
+    if converted:
+        inventory = {key: entry[2] for key, entry in converted.items() if len(entry) == 3}
+        if inventory:
+            originals = [entry[0] for entry in converted.values()]
+            converted.clear()
+            for value in originals:
+                _custom_plugin_arg(value, converted, inventory)
+
+
+def _custom_plugin_arg(value, converted, inventory=None):
     if id(value) in converted:
         return converted[id(value)][1]
     if isinstance(value, _HostVarEntries):
         entries = value._materialize()
         converted[id(value)] = value, entries
-        return _custom_plugin_arg(entries, converted)
+        return _custom_plugin_arg(entries, converted, inventory)
     if isinstance(value, (_RawSnapshotMapping, _RawSnapshotList)):
-        entry = _PluginInventoryArgument(value)
+        entry = inventory.get(id(value)) if inventory else None
+        if entry is None:
+            entry = _PluginInventoryArgument(value)
         converted[id(value)] = value, entry.value, entry
-        entry.populate(converted)
+        entry.populate(converted, inventory)
         return entry.value
     # Hostvars wrappers normalize members when the plugin reads them.
     if type(value) is dict:
         converted[id(value)] = value, value
         for key, item in dict.items(value):
-            normalized = _custom_plugin_arg(item, converted)
+            normalized = _custom_plugin_arg(item, converted, inventory)
             if normalized is not item:
                 dict.__setitem__(value, key, normalized)
     elif type(value) is list:
         converted[id(value)] = value, value
         for index, item in enumerate(value):
-            value[index] = _custom_plugin_arg(item, converted)
+            value[index] = _custom_plugin_arg(item, converted, inventory)
     elif type(value) is tuple:
-        items = tuple(_custom_plugin_arg(item, converted) for item in value)
+        items = tuple(_custom_plugin_arg(item, converted, inventory) for item in value)
         if all(item is original for item, original in zip(items, value)):
             items = value
         # A mutable member can lead back to this tuple during conversion.
@@ -2424,10 +2478,7 @@ def _wrap_custom_plugin(fn, templater):
             result = fn(*args, **kwargs)
         if isinstance(result, Generator):
             return _resume_scoped_generator(result, templater, converted)
-        for entry in converted.values():
-            if len(entry) == 3 and result is entry[1]:
-                return entry[0]
-        return result
+        return _restore_plugin_result(result, converted)
     return wrapped
 
 
@@ -2441,11 +2492,13 @@ class _ScopedGenerator(Generator):
 
     def send(self, value):
         with self._templater._plugin_arg_scope(self._converted):
-            return self._generator.send(value)
+            result = self._generator.send(value)
+        return _restore_plugin_result(result, self._converted)
 
     def throw(self, *args):
         with self._templater._plugin_arg_scope(self._converted):
-            return self._generator.throw(*args)
+            result = self._generator.throw(*args)
+        return _restore_plugin_result(result, self._converted)
 
     def close(self):
         with self._templater._plugin_arg_scope(self._converted):
@@ -2703,16 +2756,20 @@ class _Templater:
     @contextmanager
     def _plugin_arg_scope(self, converted):
         previous = self._custom_plugin_args
-        if converted is not previous:
-            _write_back_plugin_inventory(previous)
+        if converted is previous:
+            yield
+            return
+        _restore_plugin_arguments(previous)
         self._custom_plugin_args = converted
         try:
+            _refresh_plugin_arguments(converted)
             yield
         finally:
             try:
-                _write_back_plugin_inventory(converted)
+                _restore_plugin_arguments(converted)
             finally:
                 self._custom_plugin_args = previous
+                _refresh_plugin_arguments(previous)
 
     def _wrap_jinja_callback(self, body):
         @wraps(body)
@@ -2832,7 +2889,12 @@ class _Templater:
         if name in self._lookup_loaded:
             try:
                 variables = _LookupVars(self._current_ctx or {}, self)
-                return list(self._lookup_loaded[name](list(args), variables, **kwargs))
+                converted = {}
+                with self._plugin_arg_scope(converted):
+                    terms = _custom_plugin_arg(list(args), converted)
+                    options = _custom_plugin_arg(kwargs, converted)
+                    result = list(self._lookup_loaded[name](terms, variables, **options))
+                return _restore_plugin_result(result, converted)
             except Exception as e:
                 return _captured("lookup plugin '%s' failed: %s" % (name, e))
         if name in self._lookup_errors:
@@ -2930,15 +2992,14 @@ class _Templater:
         scope = ctx.get("vars")
         self._current_ctx = scope if isinstance(scope, _HandlerNameVars) else ctx
         previous_interpolation = self._untrusted_task_interpolation
-        previous_plugin_args = self._custom_plugin_args
         alias = previous_interpolation is not None and isinstance(text, (_TaskVarTemplate, _PlayVarTemplate))
         if alias:
             self._untrusted_task_interpolation = False
         try:
             # A Python plugin can read an alias that starts a nested template.
             # Its Jinja expressions still need lazy hostvars entries.
-            self._custom_plugin_args = None
-            result = self._render_string(text, ctx, strict)
+            with self._plugin_arg_scope(None):
+                result = self._render_string(text, ctx, strict)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -2950,7 +3011,6 @@ class _Templater:
                 else:
                     self._observe_untrusted(result)
         finally:
-            self._custom_plugin_args = previous_plugin_args
             if alias:
                 self._untrusted_task_interpolation |= previous_interpolation
             # A nested render (a lazily templated variable, a lookup term)

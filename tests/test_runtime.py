@@ -348,6 +348,109 @@ class FilterModule:
     assert calls == ["raw"]
 
 
+@pytest.mark.parametrize("batch, member", [("[entry]", "0"), ("{'entry': entry}", "'entry'")])
+def test_custom_filter_keeps_inventory_views_in_caller_containers(monkeypatch, batch, member):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"count": 1}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "increment", "source": """
+def increment(batch, key):
+    assert type(batch[key]) is dict
+    batch[key]['count'] += 1
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'increment': increment}
+"""}])
+    task = _task("1", "Mutate a nested plugin argument twice", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set batch = " + batch + " %}"
+                "{{ batch | increment(" + member + ") }}{{ batch | increment(" + member + ") }}"
+                "{{ [copied.payload.count, entry.count, batch[" + member + "].count] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [3, 3, 3]
+
+
+def test_custom_filter_keeps_inventory_writes_from_jinja_callbacks(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "update_inventory", "source": """
+def update_inventory(values, callback):
+    values.append(2)
+    callback()
+    values.append(4)
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'update_inventory': update_inventory}
+"""}])
+    task = _task("1", "Update inventory around a Jinja callback", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% macro update() %}{% set ignored = entry.append(3) %}{% endmacro %}"
+                "{{ entry | update_inventory(update) }}"
+                "{{ [entry, copied.payload] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[1, 2, 3, 4]] * 2
+
+
+def test_custom_filter_writes_inventory_keys_in_the_final_order(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"a": 1, "b": 2}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "reorder_inventory", "source": """
+def reorder_inventory(entry):
+    entry['a'] = entry.pop('a')
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'reorder_inventory': reorder_inventory}
+"""}])
+    task = _task("1", "Reinsert a mapping key", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ entry | reorder_inventory }}"
+                "{{ [entry.keys() | list, copied.payload.keys() | list] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [["b", "a"]] * 2
+
+
+@pytest.mark.parametrize("lookup", ["lookup", "query"])
+def test_custom_lookups_receive_builtin_inventory_collections(monkeypatch, lookup):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"values": [1]}})
+    runtime.templater.register_plugins([{"kind": "lookup", "name": "encode_inventory", "source": """
+import json
+
+class LookupModule:
+    def run(self, terms, variables, **kwargs):
+        return [json.dumps([terms[0], kwargs['values']])]
+"""}])
+    task = _task("1", "Serialize an inventory lookup term", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    expression = lookup + "('encode_inventory', entry, values=entry['values'])"
+    if lookup == "query":
+        expression += " | first"
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ " + expression + " }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [{"values": [1]}, [1]]
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",
