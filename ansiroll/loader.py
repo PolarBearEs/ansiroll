@@ -152,7 +152,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         loader.set_basedir(basedir)
         node = _convert_play(play, actions, basedir, runtime_writes=runtime_writes)
         if node["gather_facts"] and "gather_timeout" in (play.get_ds() or {}):
-            node.update(_compile_gather_timeout(play, vm, loader))
+            node.update(_compile_gather_timeout(play, vm, loader, node))
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -160,7 +160,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
     return plays, actions
 
 
-def _compile_gather_timeout(play, variable_manager, loader):
+def _compile_gather_timeout(play, variable_manager, loader, node):
     """Validate the play keyword in the same controller scope as Ansible."""
     from ansible.errors import AnsibleError, AnsibleUndefinedVariable
     from jinja2 import UndefinedError
@@ -189,18 +189,62 @@ def _compile_gather_timeout(play, variable_manager, loader):
         timeout_play.gather_timeout = None
     result = {"gather_timeout": timeout_play.gather_timeout}
     if runtime is not None:
+        if node.get("deferred_vars_files"):
+            from ansible import constants as C
+            from ansible.utils.vars import combine_vars
+
+            core_version = _core_version()
+            uses_role_public = _core_version(include_patch=True) >= (2, 16, 3)
+            private_role_vars = not uses_role_public and C.DEFAULT_PRIVATE_ROLE_VARS
+            export_args = {"only_exports": True} if core_version >= (2, 15) else {}
+            exports = set()
+            defaults = {}
+            for role in play.get_roles():
+                if uses_role_public:
+                    if not role.public:
+                        continue
+                elif core_version >= (2, 15) and (private_role_vars or not role.static):
+                    continue
+                defaults = combine_vars(defaults, role.get_default_vars())
+                if not private_role_vars:
+                    exports.update(role.get_vars(include_params=False, **export_args))
+            runtime["role_exports"] = sorted(exports.intersection(runtime["names"]))
+            if defaults:
+                selector_vars = {**defaults, **(play.vars or {}), **(node.get("vars") or {})}
+                selector_names = set()
+                for entry in node["deferred_vars_files"]:
+                    for source in entry["names"]:
+                        dependencies = _gather_timeout_dependencies(source, selector_vars)
+                        if dependencies is not None:
+                            selector_names.update(dependencies[1])
+                runtime["vars_file_defaults"] = _tag_untrusted({
+                    key: defaults[key] for key in sorted(selector_names & defaults.keys())
+                })
         result["gather_timeout_template"] = runtime
     return result
 
 
 def _gather_timeout_template(source, variables):
     """Keep variable expressions that can render without controller calls."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from ansible import constants as C
 
     if not isinstance(source, str) or not _is_templated(source) or not isinstance(_tag_untrusted(source), str):
         return None
-    env = Environment()
     scalar_methods = {"split", "rsplit", "strip", "lstrip", "rstrip"}
+    dependencies = _gather_timeout_dependencies(source, variables, scalar_methods)
+    if dependencies is not None:
+        scope, names = dependencies
+        if names:
+            return {"source": source, "vars": scope, "names": sorted(names),
+                    "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
+                    "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
+    return None
+
+
+def _gather_timeout_dependencies(source, variables, scalar_methods=()):
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    env = Environment()
     pending = [source]
     scope = {}
     names = set()
@@ -211,8 +255,7 @@ def _gather_timeout_template(source, variables):
             return None
         for call in expression.find_all(nodes.Call):
             method = call.node
-            if not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods
-                    and isinstance(method.node, nodes.Name)):
+            if not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
         for name in {node.name for node in expression.find_all(nodes.Name) if node.ctx == "load"} - names:
             if name == "omit":
@@ -226,13 +269,7 @@ def _gather_timeout_template(source, variables):
             scope[name] = _tag_untrusted(value)
             if isinstance(scope[name], str) and _is_templated(value):
                 pending.append(value)
-    if names:
-        from ansible import constants as C
-
-        return {"source": source, "vars": scope, "names": sorted(names),
-                "omit_default": getattr(C, "DEFAULT_GATHER_TIMEOUT", None),
-                "null_representation": getattr(C, "DEFAULT_NULL_REPRESENTATION", None)}
-    return None
+    return scope, names
 
 
 def _playbook_read_path(path):

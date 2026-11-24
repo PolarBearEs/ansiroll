@@ -2317,6 +2317,8 @@ def test_compile_does_not_bundle_controller_timeout_input(tmp_path, monkeypatch)
     ("override_timeout | default(23)", "", 45),
     ('override_timeout.split(":") | first', "", "45:override"),
     ('override_timeout.split(":") | first', "  vars: {override_timeout: '23:base'}\n", "45:override"),
+    ('(override_timeout | default("23:base")).split(":") | first', "", "45:override"),
+    ('override_timeout.strip().split(":") | first', "", " 45:override "),
 ])
 def test_standalone_gather_timeout_uses_run_extra_vars(tmp_path, monkeypatch, expression, play_vars, override):
     playbook = tmp_path / "play.yml"
@@ -2334,6 +2336,53 @@ def test_standalone_gather_timeout_uses_run_extra_vars(tmp_path, monkeypatch, ex
     monkeypatch.setattr(runtime, "run_module", run_module)
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+@pytest.mark.parametrize(("facts_first", "profile_alias", "role_timeout"), [
+    (False, None, None), (True, None, None), (True, "play", None), (True, "role", None), (True, None, 17),
+])
+def test_standalone_timeout_resolves_early_vars_files_and_defers_fact_names(
+        tmp_path, monkeypatch, facts_first, profile_alias, role_timeout):
+    playbook = tmp_path / "play.yml"
+    names = ['gather-{{ profile }}.yml', 'facts-{{ ansible_facts.os_family }}.yml']
+    if facts_first:
+        names.reverse()
+    options = ''
+    if profile_alias == "play":
+        options += "  vars: {profile: '{{ profile_from_cli }}'}\n"
+    if profile_alias == "role" or role_timeout is not None:
+        options += "  roles: [settings]\n"
+    if profile_alias == "role":
+        defaults = tmp_path / "roles" / "settings" / "defaults"
+        defaults.mkdir(parents=True)
+        (defaults / "main.yml").write_text("profile: '{{ profile_from_cli }}'\n")
+    if role_timeout is not None:
+        role = tmp_path / "roles" / "settings" / "vars"
+        role.mkdir(parents=True)
+        (role / "main.yml").write_text(f"timeout_seconds: {role_timeout}\n")
+    playbook.write_text("""- hosts: localhost
+%s  vars_files: %s
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""" % (options, json.dumps(names)))
+    (tmp_path / "gather-runtime.yml").write_text("timeout_seconds: 45\n")
+    (tmp_path / "facts-Example.yml").write_text("loaded_after_setup: yes\ntimeout_seconds: 81\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    extra_vars = {"profile_from_cli" if profile_alias else "profile": "runtime"}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra_vars)
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        assert "loaded_after_setup" not in runtime.vars
+        return {"ansible_facts": {"ansible_os_family": "Example"}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": role_timeout or 45})]
+    assert runtime.vars["loaded_after_setup"] is True
+    assert runtime.vars["timeout_seconds"] == (45 if facts_first else 81)
 
 
 def test_legacy_runtime_timeout_treats_bare_null_as_omitted(monkeypatch):

@@ -2780,8 +2780,17 @@ class Runtime:
         saved_facts = self.vars.get("ansible_facts")
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
+        play_vars = dict(play.get("vars") or {})
+        vars_files = play.get("deferred_vars_files") or ()
+        early_files = {}
+        timeout_template = play.get("gather_timeout_template")
+        vars_file_defaults = (timeout_template or {}).get("vars_file_defaults") or {}
         if play.get("gather_facts") and not gather_cached:
-            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
+            timeout_vars = {}
+            if timeout_template and vars_files:
+                timeout_vars = self._resolve_deferred_vars_files(
+                    play_vars, vars_files, early_files, vars_file_defaults, before_setup=True)
+            setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -2790,14 +2799,14 @@ class Runtime:
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
-                timeout_template=play.get("gather_timeout_template"),
+                timeout_template=timeout_template, timeout_vars=timeout_vars,
             )
             if not gathered:
                 self.failed = True
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        play_vars = self._with_deferred_vars_files(play)
+        play_vars.update(self._resolve_deferred_vars_files(play_vars, vars_files, early_files, vars_file_defaults))
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -3038,19 +3047,36 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _with_deferred_vars_files(self, play):
-        """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
-        files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
-        play_vars = dict(play.get("vars") or {})
+    def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *, before_setup=False):
+        """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
-        base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
-        for entry in play.get("deferred_vars_files") or ():
-            ctx = self.ctx(play_vars, self.extra_vars, base=base)
+        if before_setup:
+            base = {key: self.vars[key] for key in ("__ansiroll_controller_env", "__ansiroll_controller_config")}
+        else:
+            base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        base = {**defaults, **base}
+        selected = {}
+        for index, entry in enumerate(entries):
+            ctx = self.ctx(play_vars, selected, self.extra_vars, base=base)
+            if not before_setup and index in early_files:
+                inputs, values = early_files[index]
+                if all(key in ctx and type(ctx[key]) is type(value) and ctx[key] == value
+                       for key, value in inputs.items()):
+                    selected.update(values)
+                    continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
+            inputs = {}
             for raw in entry["names"]:
+                if before_setup:
+                    dependencies = self._vars_file_inputs_before_setup(raw, ctx)
+                    if dependencies is None:
+                        break
+                    inputs.update(dependencies)
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
+                    if before_setup:
+                        break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
                                              "vars_files item %r: %s" % (item, ex))
@@ -3074,17 +3100,45 @@ class Runtime:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
+                    values = {}
                     for value in data:
-                        play_vars.update(value)
+                        values.update(value)
+                    selected.update(values)
+                    if before_setup:
+                        early_files[index] = (inputs, values)
                     break
             else:
+                if before_setup:
+                    continue
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
                 if not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
                 sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                  % (item,))
-        return play_vars
+        return selected
+
+    def _vars_file_inputs_before_setup(self, source, ctx):
+        inputs = {}
+        pending = [source]
+        while pending:
+            try:
+                expression = self.templater.env.parse(pending.pop())
+            except jinja2.TemplateSyntaxError:
+                return None
+            if next(expression.find_all(jinja2.nodes.Call), None) is not None:
+                return None
+            for node in expression.find_all(jinja2.nodes.Name):
+                if node.ctx == "load" and node.name not in inputs:
+                    if node.name not in ctx:
+                        return None
+                    value = ctx[node.name]
+                    if not isinstance(value, (str, int, float, bool, type(None))):
+                        return None
+                    inputs[node.name] = value
+                    if _looks_templated(value):
+                        pending.append(value)
+        return inputs
 
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < host vars/facts/play vars
@@ -4772,10 +4826,15 @@ class Runtime:
             self._flushing = False
 
     # ---- facts -----------------------------------------------------------
-    def _gather_timeout_for_run(self, timeout, template, setup_ctx):
-        if not template or not (template.get("required") or self.extra_vars.keys() & template["names"]):
+    def _gather_timeout_for_run(self, timeout, template, setup_ctx, vars_files=None):
+        if not template:
             return timeout
-        scope = self.ctx(template["vars"], self.extra_vars, base={
+        role_exports = set(template.get("role_exports", ()))
+        vars_files = {key: value for key, value in (vars_files or {}).items() if key not in role_exports}
+        overrides = self.extra_vars.keys() | vars_files.keys()
+        if not template.get("required") and overrides.isdisjoint(template["names"]):
+            return timeout
+        scope = self.ctx(template["vars"], vars_files, self.extra_vars, base={
             "__ansiroll_controller_config": setup_ctx.get("__ansiroll_controller_config", {}),
         })
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))
@@ -4800,7 +4859,7 @@ class Runtime:
 
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     gather_timeout=None, timeout_template=None):
+                     gather_timeout=None, timeout_template=None, timeout_vars=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -4827,7 +4886,7 @@ class Runtime:
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
             setup_args = {}
-            gather_timeout = self._gather_timeout_for_run(gather_timeout, timeout_template, ctx)
+            gather_timeout = self._gather_timeout_for_run(gather_timeout, timeout_template, ctx, timeout_vars)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                 setup_args["gather_timeout"] = gather_timeout
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
