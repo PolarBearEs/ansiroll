@@ -24,6 +24,8 @@ import zipfile
 from .embed import ModuleEmbedder
 from .loader import (
     COPY_ACTION_MODULES,
+    _STANDALONE_CONTEXT_NAMES,
+    _STANDALONE_INVENTORY_NAMES,
     _can_write_var,
     _depends_on_vars,
     _loop_binding_names,
@@ -46,8 +48,6 @@ _ACCELERATED_MODULES_PATH = os.path.join(
 )
 _JINJA_BUNDLE_MARKER = "# __ANSIROLL_JINJA_BUNDLE__"
 _WORKER_CODE_MARKER = "# __ANSIROLL_WORKER_CODE__"
-_RUNTIME_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names",
-                                      "vars", "hostvars"))
 
 _FOOTER = '''
 
@@ -295,7 +295,7 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
     skipped = {}
     frozen = {}
     shadowed = _shadowed_var_names(plays)
-    runtime_inventory = _RUNTIME_INVENTORY_NAMES - extra_vars.keys()
+    runtime_context = _STANDALONE_CONTEXT_NAMES - extra_vars.keys()
 
     def is_shadowed(name):
         return _can_write_var(shadowed, name)
@@ -334,6 +334,7 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
             context = dict(group_vars)
             context.update(play_vars)
             context.update(extra_vars)
+            runtime_inventory = runtime_context - (_STANDALONE_INVENTORY_NAMES & context.keys())
             if _depends_on_vars(raw, context, lambda dependency: is_shadowed(dependency)
                                 or dependency in runtime_inventory):
                 reason = "shadowed dependency"
@@ -404,10 +405,11 @@ def _condition_value(condition, variables, templater):
     # find_undeclared_variables omits environment globals, so look at the
     # names the expression actually loads.
     from jinja2 import nodes as jinja_nodes
-    if any(node.name not in variables and node.name in templater.env.globals
-           and node.name not in _DETERMINISTIC_GLOBALS
-           for node in parsed.find_all(jinja_nodes.Name)):
+    global_names = {node.name for node in parsed.find_all(jinja_nodes.Name)
+                    if node.ctx == "load" and node.name in templater.env.globals}
+    if global_names - variables.keys() - _DETERMINISTIC_GLOBALS:
         return None
+    referenced.update(global_names & variables.keys())
     if _uses_nondeterministic_filter(parsed):
         return None
     # A fixed variable can still contain a template. Its defaults and tests

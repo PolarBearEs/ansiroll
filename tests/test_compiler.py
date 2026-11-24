@@ -132,8 +132,12 @@ def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path,
     assert "checksum" not in frame["result"]["stat"]
 
 
-@pytest.mark.parametrize("expression", ["group_names is defined", "play_flag | default(false)"])
-def test_tree_shaking_keeps_inventory_dependent_extra_var_condition(tmp_path, expression):
+@pytest.mark.parametrize(("name", "expression"), [
+    ("run_task", "group_names is defined"),
+    ("run_task", "play_flag | default(false)"),
+    ("dict", "group_names is defined"),
+])
+def test_tree_shaking_keeps_inventory_dependent_extra_var_condition(tmp_path, name, expression):
     from ansiroll import compile_playbook
 
     playbook = tmp_path / "play.yml"
@@ -143,10 +147,10 @@ def test_tree_shaking_keeps_inventory_dependent_extra_var_condition(tmp_path, ex
     play_flag: '{{ group_names is defined }}'
   tasks:
     - debug: {msg: inventory is available}
-      when: run_task
-""")
+      when: %s
+""" % name)
     contents, _ = compile_playbook(str(playbook), tree_shake=True,
-                                   extra_vars={"run_task": "{{ " + expression + " }}"})
+                                   extra_vars={name: "{{ " + expression + " }}"})
     compiled = tmp_path / "compiled.py"
     compiled.write_text(contents)
     env = dict(os.environ, ANSIROLL_RAW="1")
@@ -154,6 +158,64 @@ def test_tree_shaking_keeps_inventory_dependent_extra_var_condition(tmp_path, ex
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
     assert frame["result"]["msg"] == "inventory is available"
+
+
+@pytest.mark.parametrize("group_vars", [False, True])
+def test_freezing_allows_explicit_inventory_values(tmp_path, group_vars):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    explicit_group = "group_names: [workers]"
+    if group_vars:
+        (tmp_path / "group_vars").mkdir()
+        (tmp_path / "group_vars" / "all.yml").write_text(explicit_group + "\n")
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+%s    deployment_group: '{{ group_names[0] }}'
+  tasks:
+    - debug: {msg: '{{ deployment_group }}'}
+""" % ("" if group_vars else "    " + explicit_group + "\n"))
+    _, manifest = compile_playbook(str(playbook), freeze_vars=["deployment_group"])
+    assert manifest["tree_shake"]["frozen_var_names"] == ["deployment_group"]
+
+
+def test_standalone_vars_files_select_inventory_at_runtime(tmp_path):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - "selection-{{ 'inventory' if group_names is defined else 'fallback' }}.yml"
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""")
+    (tmp_path / "selection-inventory.yml").write_text("selected: inventory\n")
+    (tmp_path / "selection-fallback.yml").write_text("selected: fallback\n")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    env = dict(os.environ, ANSIROLL_RAW="1")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "inventory"
+
+
+def test_standalone_include_tasks_does_not_bake_inventory_fallback(tmp_path):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  tasks:
+    - include_tasks: "{{ 'inventory.yml' if group_names is defined else 'fallback.yml' }}"
+""")
+    (tmp_path / "inventory.yml").write_text("- debug: {msg: inventory}\n")
+    (tmp_path / "fallback.yml").write_text("- debug: {msg: fallback}\n")
+    _, manifest = compile_playbook(str(playbook))
+    assert len(manifest["fallback_tasks"]) == 1
+    assert "include_tasks" in manifest["fallback_tasks"][0]["reason"]
 
 
 def test_bundle_union_deduplicates_identical_import_paths():

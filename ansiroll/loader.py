@@ -21,6 +21,9 @@ from .compat import init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
 from .accelerated_modules import can_accelerate
 
+_STANDALONE_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names"))
+_STANDALONE_CONTEXT_NAMES = _STANDALONE_INVENTORY_NAMES | {"vars", "hostvars"}
+
 # Actions that are coupled to the controller and cannot run inside the single file.
 CONTROLLER_COUPLED = {
     "fetch", "ansible.builtin.fetch",
@@ -670,6 +673,10 @@ def _template_vars_file_name(play, filename, play_vars, all_vars):
 
     variables = combine_vars(play_vars, all_vars or {})
     variables = combine_vars(variables, play.get_variable_manager().extra_vars)
+    if all_vars is None:
+        runtime_names = _STANDALONE_CONTEXT_NAMES - variables.keys()
+        if _depends_on_vars(filename, variables, runtime_names.__contains__):
+            return None
     try:
         from ansible.template import Templar
         try:
@@ -1326,6 +1333,8 @@ def _template_include_filename(task, value, includes):
 
     def is_runtime(name):
         if name in loop_names:
+            return True
+        if includes.all_vars is None and name in _STANDALONE_CONTEXT_NAMES and name not in variables:
             return True
         if (includes.incomplete and name not in extra_vars and name not in above_vars_files
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
