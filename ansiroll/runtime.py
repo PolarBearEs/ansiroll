@@ -2784,20 +2784,15 @@ class Runtime:
                          and saved_facts.get("_ansible_facts_gathered"))
         timeout_template = play.get("gather_timeout_template") or {}
         play_vars = dict(play.get("vars") or {})
-        vars_files = play.get("deferred_vars_files") or ()
-        timeout_files = timeout_template.get("vars_files", vars_files)
+        vars_files = timeout_template.get("vars_files", play.get("deferred_vars_files") or ())
+        vars_file_play_vars = timeout_template.get("play_vars", play_vars)
         vars_file_defaults = timeout_template.get("vars_file_defaults") or {}
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = {}
-            if timeout_template and timeout_files:
+            if timeout_template and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
-                    timeout_template.get("play_vars", play_vars), timeout_files, early_files,
-                    vars_file_defaults, before_setup=True)
-                if timeout_files is not vars_files:
-                    # The task resolver's plan skips the static entries.
-                    deferred_positions = (i for i, entry in enumerate(timeout_files) if "static_vars" not in entry)
-                    early_files = {i: early_files[pos] for i, pos in enumerate(deferred_positions) if pos in early_files}
+                    vars_file_play_vars, vars_files, early_files, vars_file_defaults, before_setup=True)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
@@ -2814,7 +2809,8 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        play_vars.update(self._resolve_deferred_vars_files(play_vars, vars_files, early_files, vars_file_defaults))
+        play_vars.update(self._resolve_deferred_vars_files(
+            vars_file_play_vars, vars_files, early_files, vars_file_defaults))
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -3149,10 +3145,14 @@ class Runtime:
                         inputs[node.name] = _MISSING_VARS_FILE_INPUT
                         continue
                     value = ctx[node.name]
-                    if not isinstance(value, (str, int, float, bool, type(None))):
+                    unsafe_scalar = (
+                        isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}
+                        and isinstance(value["__ansiroll_unsafe__"], str)
+                    )
+                    if not unsafe_scalar and not isinstance(value, (str, int, float, bool, type(None))):
                         return None
                     inputs[node.name] = value
-                    if _looks_templated(value):
+                    if not unsafe_scalar and _looks_templated(value):
                         pending.append(value)
         return inputs
 

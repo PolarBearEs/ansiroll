@@ -2404,7 +2404,8 @@ def test_legacy_runtime_timeout_treats_bare_null_as_omitted(monkeypatch):
     (['gather-{{ profile.split(":") | first }}.yml'], "runtime:extra", False, 45),
     (["gather-{{ profile }}.yml"], "runtime", True, 55),
     (["gather-{{ profile }}{{ ansible_os_family | default('') }}.yml"], "runtime", False, 45),
-    (["gather-{{ profile }}.yml", "{{ flavor }}.yml"], "runtime", False, 30),
+    (["gather-{{ profile }}.yml", "settings-{{ flavor }}.yml"], "runtime", False, 30),
+    (["gather-{{ profile }}.yml", "settings-{{ flavor }}.yml", "final.yml"], "runtime", False, 20),
     (["gather-{{ profile }}.yml", "final.yml"], "runtime", False, 20),
     (["final.yml", "gather-{{ profile }}.yml"], "runtime", False, 45),
     (["gather-{{ profile }}.yml", ["final.yml", "unused.yml"]], "runtime", False, 20),
@@ -2418,7 +2419,7 @@ def test_standalone_timeout_uses_ordered_vars_files_and_resolves_aliases(
         roles = "  roles: [settings]\n"
         role = tmp_path / "roles" / "settings" / "vars"
         role.mkdir(parents=True)
-        (role / "main.yml").write_text("fallback: 55\n")
+        (role / "main.yml").write_text("fallback: '{{ base_timeout }}'\nbase_timeout: 55\n")
     playbook.write_text("""- hosts: localhost
 %s  vars: {fallback: 45, flavor: default}
   vars_files: %s
@@ -2429,17 +2430,20 @@ def test_standalone_timeout_uses_ordered_vars_files_and_resolves_aliases(
     reselect_after_setup = "ansible_os_family" in files[0]
     if reselect_after_setup:
         (tmp_path / "gather-runtimeExample.yml").write_text("timeout_seconds: 81\n")
-    if "{{ flavor }}.yml" in files:
-        (tmp_path / "default.yml").write_text("timeout_seconds: 15\n")
-        (tmp_path / "custom.yml").write_text("timeout_seconds: 30\n")
+    if "settings-{{ flavor }}.yml" in files:
+        (tmp_path / "settings-default.yml").write_text("timeout_seconds: 15\n")
+        (tmp_path / "settings-custom.yml").write_text("timeout_seconds: !unsafe '30'\n")
+        (tmp_path / "settings-unused.yml").write_text(
+            """unused: '{{ lookup("env", "ANSIROLL_UNUSED_GATHER_INPUT") }}'\n""")
+    monkeypatch.setenv("ANSIROLL_UNUSED_GATHER_INPUT", "unused-controller-canary")
     (tmp_path / "final.yml").write_text("timeout_seconds: 20\n")
     (tmp_path / "unused.yml").write_text("test_canary: unselected-timeout-alternative\n")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_STATIC_FILE", "final.yml")
 
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
-    if "{{ flavor }}.yml" not in files:
-        assert "unselected-timeout-alternative" not in json.dumps(plan)
+    assert "unselected-timeout-alternative" not in json.dumps(plan)
+    assert "unused-controller-canary" not in json.dumps(plan)
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile})
     called = []
 
@@ -2452,6 +2456,8 @@ def test_standalone_timeout_uses_ordered_vars_files_and_resolves_aliases(
     assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
     if reselect_after_setup:
         assert runtime.vars["timeout_seconds"] == 81
+    if files[-2:] == ["settings-{{ flavor }}.yml", "final.yml"]:
+        assert runtime.vars["timeout_seconds"] == 20
 
 
 @pytest.mark.parametrize(("select_at_compile", "alias_in_play"), [
@@ -2497,18 +2503,21 @@ def test_standalone_timeout_requires_compile_time_selection_for_lookups(
     assert not hook.exists()
 
 
-def test_compile_timeout_keeps_late_selector_fixed_by_extra_vars(tmp_path):
+@pytest.mark.parametrize("compile_extra", [True, False])
+def test_compile_timeout_keeps_late_selector_with_known_directory(tmp_path, compile_extra):
     playbook = tmp_path / "play.yml"
+    config = tmp_path / "config"
+    config.mkdir()
+    extra = {"config_dir": str(config)}
     playbook.write_text("""- hosts: localhost
+  vars: %s
   vars_files: ['gather-{{ profile }}.yml', '{{ config_dir }}/final.yml']
   gather_timeout: '{{ timeout_seconds }}'
   tasks: []
-""")
-    config = tmp_path / "config"
-    config.mkdir()
+""" % json.dumps({} if compile_extra else extra))
     (config / "final.yml").write_text("timeout_seconds: 20\n")
     (tmp_path / "gather-runtime.yml").write_text("timeout_seconds: 45\n")
-    source, _ = compile_playbook(str(playbook), extra_vars={"config_dir": str(config)})
+    source, _ = compile_playbook(str(playbook), extra_vars=extra if compile_extra else None)
     plan = _compiled_plays(source, tmp_path)[0]
     assert plan["gather_timeout"] == 20
     assert len(plan["deferred_vars_files"]) == 1

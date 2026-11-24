@@ -252,13 +252,18 @@ def _gather_timeout_file_scope(play, entries, runtime):
                 for key, source in mapping.items():
                     if isinstance(source, str) and _is_templated(source):
                         file_aliases.setdefault(key, set()).add(source)
-    for names, shadowed in ((selector_names, ()), (timeout_names, exports)):
+    for names, scope, shadowed in (
+        (selector_names, selector_scope, {}),
+        (timeout_names, {**selector_scope, **exports}, exports),
+    ):
         pending = list(names)
         while pending:
             key = pending.pop()
-            if key in shadowed:
-                continue
-            for source in file_aliases.get(key, ()):
+            sources = set() if key in shadowed else set(file_aliases.get(key, ()))
+            value = scope.get(key)
+            if isinstance(value, str) and _is_templated(value) and isinstance(_tag_untrusted(value), str):
+                sources.add(value)
+            for source in sources:
                 dependencies = _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS)
                 if dependencies is not None:
                     new_names = dependencies[1] - names
@@ -510,7 +515,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
         and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
     ) else None
-    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files, ordered_vars_files)
+    order_deferred = set()
+    play_vars = _resolved_play_vars(
+        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -588,7 +595,13 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if unresolved_vars_files:
         result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
-    names = _controller_env_names(result)
+    # Replaying a selector after an earlier deferred file may bundle new
+    # candidates. Their lookup names do not authorize copying controller data.
+    environment_sources = {**result, "deferred_vars_files": [
+        entry for index, entry in enumerate(result.get("deferred_vars_files", ()))
+        if index not in order_deferred
+    ]}
+    names = _controller_env_names(environment_sources)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -689,7 +702,7 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -701,6 +714,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
     out = dict(play.vars or {})
     use_search_stack = _core_version() >= (2, 12)
     compile_extra_vars = play.get_variable_manager().extra_vars if ordered is not None else {}
+    bundled_inputs = set()
+    scanned = 0
     for entry in _as_list(getattr(play, "vars_files", None)):
         for filename in _as_list(entry):
             if not isinstance(filename, str):
@@ -712,11 +727,22 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None):
                 if ordered is not None and unresolved:
                     from .runtime import _GATHER_STRING_METHODS
 
-                    dependencies = _gather_timeout_dependencies(filename, {}, _GATHER_STRING_METHODS)
-                    if dependencies is not None and dependencies[1] - compile_extra_vars.keys():
-                        ordered.append(len(unresolved))
-                        unresolved.append(entry)
-                        break
+                    dependencies = _gather_timeout_dependencies(
+                        filename, {**out, **compile_extra_vars}, _GATHER_STRING_METHODS)
+                    if dependencies is not None:
+                        for previous in _deferred_vars_files(play, basedir, unresolved[scanned:]):
+                            for contents in previous["files"].values():
+                                if isinstance(contents, list):
+                                    for mapping in contents:
+                                        bundled_inputs.update(mapping)
+                        scanned = len(unresolved)
+                        mutable_names = dependencies[1] - compile_extra_vars.keys()
+                        if mutable_names & bundled_inputs:
+                            if order_deferred is not None:
+                                order_deferred.add(len(unresolved))
+                            ordered.append(len(unresolved))
+                            unresolved.append(entry)
+                            break
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
                 if filename is None:
