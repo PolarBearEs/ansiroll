@@ -1863,6 +1863,7 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
+    newline = None if name == "template" else ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
@@ -1880,7 +1881,7 @@ def _bake_sources(node, task, basedir):
         if isinstance(loop, list) and _only_item(src):
             for it in loop:
                 candidates.append(_ITEM_RE.sub(str(it), src))
-        elif _bake_absolute_tree(node, src, basedir, with_meta):
+        elif _bake_absolute_tree(node, src, basedir, with_meta, newline=newline):
             return
         # Baked search trees are keyed relative to a search dir, so they can never match a src that renders to an
         # absolute path, which a leading Jinja dir (e.g. "{{ some_dir }}/x") may well do.
@@ -1908,7 +1909,7 @@ def _bake_sources(node, task, basedir):
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
-        with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
             baked[rel] = fh.read()
         if not with_meta:
             continue
@@ -1964,7 +1965,7 @@ def _open_role_source(path):
             time.sleep(0.05)
 
 
-def _bake_absolute_tree(node, src, basedir, with_meta):
+def _bake_absolute_tree(node, src, basedir, with_meta, *, newline=None):
     """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
     separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
     below the src's static directory, so "{{ playbook_dir }}/templates/{{ item }}.j2" bakes nested .j2 files too.
@@ -2004,7 +2005,7 @@ def _bake_absolute_tree(node, src, basedir, with_meta):
                 size += st.st_size
                 if size > _ABSOLUTE_TREE_LIMIT:
                     return False
-                with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+                with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
                     baked[path] = fh.read()
             except OSError:
                 continue
@@ -2201,6 +2202,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked."""
     if getattr(task, "_role", None) is None:
         return False
+    newline = "" if subdir == "files" else None
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
@@ -2278,7 +2280,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     mode = st.st_mode
                     if stat.S_ISREG(mode):
                         with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape",
-                                       closefd=False) as fh:
+                                       newline=newline, closefd=False) as fh:
                             baked[key] = fh.read()
                 finally:
                     os.close(fd)

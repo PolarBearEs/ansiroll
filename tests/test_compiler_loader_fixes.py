@@ -1854,25 +1854,37 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
 
 
 @pytest.mark.parametrize("action", ["copy", "unarchive"])
-def test_dynamic_linked_role_file_preserves_binary_content(tmp_path, action):
+@pytest.mark.parametrize("source_layout", ["linked", "role", "absolute", "literal"])
+def test_baked_role_file_preserves_binary_content(tmp_path, action, source_layout):
     import tarfile
 
     payload = b"one\r\ntwo\rthree\xff\n"
     destination = tmp_path / "output"
     extension = ".bin" if action == "copy" else ".tar"
+    files = tmp_path / "roles/r/files"
+    selection = "app"
+    src = "sites/{{ selection }}" + extension
+    source = files / "sites" / ("app" + extension)
+    if source_layout == "linked":
+        (files / "shared").mkdir(parents=True)
+        (files / "sites").mkdir()
+        (files / "sites/alias").symlink_to("../shared", target_is_directory=True)
+        selection = "alias/app"
+        source = files / "shared" / ("app" + extension)
+    elif source_layout == "absolute":
+        src = "{{ playbook_dir }}/assets/{{ selection }}" + extension
+        source = tmp_path / "assets" / ("app" + extension)
+    elif source_layout == "literal":
+        src = "sites/app" + extension
+    source.parent.mkdir(parents=True, exist_ok=True)
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {selection: alias/app}
-- %s: {src: "sites/{{ selection }}%s", dest: "%s"}
-""" % (action, extension, destination)})
-    files = tmp_path / "roles/r/files"
-    (files / "shared").mkdir(parents=True)
-    (files / "sites").mkdir()
-    (files / "sites/alias").symlink_to("../shared", target_is_directory=True)
-    source = files / "shared" / ("app" + extension)
+- set_fact: {selection: "%s"}
+- %s: {src: "%s", dest: "%s"}
+""" % (selection, action, src, destination)})
     if action == "copy":
         source.write_bytes(payload)
         extracted = destination
