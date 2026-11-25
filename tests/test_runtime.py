@@ -1519,10 +1519,24 @@ def test_delegated_set_fact_is_visible_through_hostvars_only():
         _task("1", "route", "set_fact", args={"marker": "target value"},
               delegate_to="recipient", delegate_facts=True, register="issued"),
         _task("2", "show", "debug", args={"msg": "{{ hostvars.recipient.marker }}"}),
-    ])
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
     assert "marker" not in rt.vars
     assert rt.vars["issued"]["ansible_facts"]["marker"] == "target value"
     assert by_name(frames, "show")[0]["result"]["msg"] == "target value"
+
+
+def test_delegated_set_fact_publishes_only_after_a_successful_loop():
+    rt, frames = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item }}"},
+              delegate_to="recipient", delegate_facts="y", register="issued",
+              loop=[1, 2], failed_when=["item == 2"], ignore_errors=True),
+        _task("2", "local", "set_fact", args={"marker": "local"},
+              delegate_to="{{ missing | default(omit) }}", delegate_facts=True),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert rt.vars["hostvars"]["recipient"] == {}
+    assert rt.vars["issued"]["failed"]
+    assert rt.vars["marker"] == "local"
+    assert by_name(frames, "local")[0]["status"] == "ok"
 
 
 def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):

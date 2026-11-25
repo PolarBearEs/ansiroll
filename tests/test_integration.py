@@ -2027,6 +2027,95 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
+def test_controller_synchronize_uses_the_installed_task_executor(tmp_path):
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        delegated = task_vars.get("ansible_delegated_vars", {}).get(self._task.delegate_to, {})
+        return {
+            "changed": True,
+            "msg": self._task.args["label"],
+            "source": self._task.args.get("src"),
+            "delegate_endpoint": delegated.get("ansible_host"),
+            "delegate_port": delegated.get("ansible_port"),
+        }
+""")
+    inventory = tmp_path / "inventory.ini"
+    inventory.write_text(
+        "delegate_fixture ansible_host=192.0.2.42 ansible_port=2222 ansible_connection=local "
+        "ansible_password=synthetic-fixture-password\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    expected_label: !unsafe '{{ 1 + 1 }}'
+  tasks:
+    - synchronize:
+        label: !unsafe '{{ 1 + 1 }}'
+        src: __omit_place_holder__backup
+      delegate_to: "{{ item }}"
+      loop: [delegate_fixture]
+      register: synced
+    - assert:
+        that:
+          - synced.results[0].msg == expected_label
+          - synced.results[0].source == '__omit_place_holder__backup'
+          - synced.results[0].delegate_endpoint == '192.0.2.42'
+          - synced.results[0].delegate_port | int == 2222
+          - synced.results[0]._ansible_delegated_vars is undefined
+    - debug:
+        var: synced
+""", "-i", str(inventory))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "synthetic-fixture-password" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("looped", [False, True], ids=["single", "loop"])
+@pytest.mark.parametrize("ignore", [False, True], ids=["fatal", "ignored"])
+def test_controller_synchronize_tallies_unreachable(tmp_path, looped, ignore):
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.errors import AnsibleConnectionFailure
+from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        raise AnsibleConnectionFailure("fixture delegate was unreachable")
+""")
+    loop = "          loop: [first, second]" if looped else ""
+    result = _run_strategy_play(tmp_path, f"""- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - synchronize:
+            src: unused
+          ignore_unreachable: {str(ignore).lower()}
+{loop}
+      rescue:
+        - debug: msg=unexpected_rescue
+      always:
+        - debug: msg=always_task_ran
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - debug: msg=next_play_ran
+""")
+    assert result.returncode == (0 if ignore else 4), result.stdout + result.stderr
+    assert "UNREACHABLE!" in result.stdout
+    assert "failed=0" in result.stdout
+    assert "unexpected_rescue" not in result.stdout
+    assert ("always_task_ran" in result.stdout) == ignore
+    assert ("next_play_ran" in result.stdout) == ignore
+    if not ignore:
+        assert "unreachable=1" in result.stdout
+
+
 @pytest.mark.parametrize(("alias_value", "alias_member", "alias_error"), [
     ("{{ missing }}", "", None),
     ("{{ missing | regex_replace('x', 'y') }}", "", None),
@@ -4558,7 +4647,7 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,"):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -4568,7 +4657,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None):
     env["ANSIBLE_NOCOLOR"] = "1"
     env.update(environment or {})
     return subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", str(path), *args],
+        ["ansible-playbook", "-i", inventory, str(path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -4626,6 +4715,7 @@ def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
         cacheable: true
       delegate_to: localhost
       delegate_facts: true
+      no_log: true
       register: issued
     - set_fact:
         loop_fact: "{{ item.value }}"
@@ -4665,12 +4755,35 @@ def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
         that:
           - routed_fact is undefined
           - loop_fact == 'remote'
+          - hostvars['localhost'].routed_fact == 'one'
 """,
-        "-i", "origin,recipient",
+        inventory="origin,recipient,",
         environment={"ANSIROLL_PROVENANCE": "1"},
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert '"mode": "controller-fallback"' in proc.stdout
+    assert '"reason": "delegated set_fact requires task-lockstep scheduling"' in proc.stdout
+
+
+def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - command: /bin/true
+    - assert:
+        that: seeded is undefined
+    - set_fact:
+        seeded: during_task
+      when: inventory_hostname == 'alpha'
+      delegate_to: beta
+      delegate_facts: true
+    - assert:
+        that: seeded == 'during_task'
+      when: inventory_hostname == 'beta'
+""", inventory="alpha,beta,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_strategy_native_only_rejects_linear_fallback(tmp_path):

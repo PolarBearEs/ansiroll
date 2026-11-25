@@ -307,6 +307,13 @@ class StrategyModule(StrategyBase):
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
+        elif any(
+            str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
+            and getattr(task, "delegate_to", None)
+            and getattr(task, "delegate_facts", None)
+            for task in task_map.values()
+        ):
+            linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
                 "multi-host controller-only play requires task-lockstep scheduling"
@@ -322,8 +329,7 @@ class StrategyModule(StrategyBase):
                 % (play.name or play.get_name(), "; ".join(reasons))
             )
             return self._tqm.RUN_ERROR
-        if self._requires_linear_fallback or (
-                len(hosts) > 1 and self._controller_only_play):
+        if linear_reason:
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
             # scheduling. Reuse core linear for this compatibility-only case.
@@ -592,7 +598,11 @@ class StrategyModule(StrategyBase):
             elif t == "stats":
                 self._apply_stats(host, frame.get("stats", {}))
             elif t == "done":
-                host_failed = host_failed or frame.get("failed", False)
+                if frame.get("unreachable"):
+                    self._tqm._unreachable_hosts[host.name] = True
+                    self._cur_play._removed_hosts.append(host.name)
+                else:
+                    host_failed = host_failed or frame.get("failed", False)
                 break
             last_frame = now
         return host_failed
@@ -753,8 +763,16 @@ class StrategyModule(StrategyBase):
                        % frame.get("action"),
             }
         try:
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            from ansiroll.loader import _core_version
+
             concrete = task.copy()
-            concrete.args = _drop_omit_values(dict(frame.get("args") or {}))
+            omit_tokens = {"__omit_place_holder__ansiroll", (hv or {}).get("omit")}
+            concrete.args = _drop_omit_values(dict(frame.get("args") or {}), omit_tokens)
+            if _core_version() < (2, 19):
+                # The agent rendered these arguments before JSON removed their tags.
+                concrete.args = wrap_var(concrete.args)
             concrete.when = []
             concrete.loop = None
             concrete.loop_with = None
@@ -768,8 +786,6 @@ class StrategyModule(StrategyBase):
             job_vars = dict(hv or {})
             job_vars.update(frame.get("vars") or {})
             if deferred := frame.get("deferred_vars"):
-                from ansible.utils.unsafe_proxy import wrap_var
-
                 from ansiroll.loader import _tag_untrusted
 
                 # Restore the controller's tagged source for each deferred
@@ -834,10 +850,33 @@ class StrategyModule(StrategyBase):
 
             from ansible.executor.task_executor import TaskExecutor
             from ansible.plugins import loader as plugin_loader
-            executor = TaskExecutor(
-                host, concrete, job_vars, play_context, None, self._loader,
-                plugin_loader, _QuietQueue(), self._variable_manager)
-            return executor.run()
+            queue = _QuietQueue()
+            parameters = inspect.signature(TaskExecutor).parameters
+            if "task" in parameters:
+                delegate_vars = getattr(self._variable_manager, "_get_delegated_vars", None)
+                if getattr(concrete, "delegate_to", None) and delegate_vars is not None:
+                    job_vars["ansible_delegated_vars"], _ = delegate_vars(self._cur_play, concrete, job_vars)
+                args = [host, concrete, job_vars, play_context]
+                if "new_stdin" in parameters:
+                    args.append(None)
+                args.extend((self._loader, plugin_loader, queue))
+                if "variable_manager" in parameters:
+                    args.append(self._variable_manager)
+                result = TaskExecutor(*args).run()
+            else:
+                from ansible._internal._task import TaskContext
+
+                # Match the worker's ambient task context on newer ansible-core.
+                with TaskContext.create(task=concrete, task_vars=job_vars, host_name=host.name):
+                    concrete.squash()
+                    executor = TaskExecutor(host, play_context, self._loader, plugin_loader,
+                                            queue, self._variable_manager)
+                    result = executor.run().as_result_dict(for_round_trip=True)
+            if isinstance(delegated := result.get("_ansible_delegated_vars"), dict):
+                safe_keys = ("ansible_delegated_host", "ansible_host", "ansible_port",
+                             "ansible_user", "ansible_connection")
+                result["_ansible_delegated_vars"] = {key: delegated[key] for key in safe_keys if key in delegated}
+            return result
         except Exception as ex:
             return {
                 "failed": True,
@@ -1367,6 +1406,9 @@ class StrategyModule(StrategyBase):
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action == "synchronize":
+                    from ansiroll.runtime import _without_delegated_metadata
+                    registered_result = _without_delegated_metadata(result_data)
                 if action == "include_vars" and included_vars:
                     registered_result = _restore_included_vars(
                         result_data, included_vars, frame.get("included_vars_references"),
@@ -1379,7 +1421,6 @@ class StrategyModule(StrategyBase):
                 # The controller has already stored the original tagged values.
                 facts = None
             is_set_fact = action == "set_fact"
-            fact_host = frame.get("fact_host") if is_set_fact else None
             cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
             if isinstance(facts, dict):
                 # Match StrategyBase: cacheable set_fact results populate the
@@ -1387,11 +1428,11 @@ class StrategyModule(StrategyBase):
                 # the higher-precedence nonpersistent host-var copy.
                 if not is_set_fact or cacheable:
                     self._variable_manager.set_host_facts(
-                        fact_host or host.name, dict(facts)
+                        host.name, dict(facts)
                     )
                 if is_set_fact:
                     self._variable_manager.set_nonpersistent_facts(
-                        fact_host or host.name, dict(facts)
+                        host.name, dict(facts)
                     )
 
             # Linear shares a run_once task's registered result and facts with
@@ -1409,7 +1450,7 @@ class StrategyModule(StrategyBase):
                             other.name,
                             {reg: dict(registered_result) for reg in registers},
                         )
-                    if isinstance(facts, dict) and fact_host is None:
+                    if isinstance(facts, dict):
                         if not is_set_fact or cacheable:
                             self._variable_manager.set_host_facts(
                                 other.name, dict(facts)
@@ -1423,6 +1464,9 @@ class StrategyModule(StrategyBase):
         tr = self._make_result(host, task, result_data)
         is_item = frame.get("is_item")
         ignored = frame.get("ignored")
+        if status == "unreachable" and is_item:
+            # Ansible emits the task-level unreachable callback for the loop.
+            return False
 
         method = _callback_for(status, is_item)
         if status == "failed" and not is_item:
@@ -1705,6 +1749,9 @@ def _hostvars_snapshot(hostvars):
     out = {}
     try:
         names = list(hostvars)
+        implicit_local = getattr(getattr(hostvars, "_inventory", None), "localhost", None)
+        if implicit_local is not None and implicit_local.name not in names:
+            names.append(implicit_local.name)
     except Exception:
         return out
     for name in names:
@@ -1753,16 +1800,15 @@ def _conn_option(conn, name):
         return None
 
 
-def _drop_omit_values(value):
+def _drop_omit_values(value, omit_tokens):
     if isinstance(value, dict):
         return {
-            key: _drop_omit_values(item)
+            key: _drop_omit_values(item, omit_tokens)
             for key, item in value.items()
-            if not (isinstance(item, str)
-                    and item.startswith("__omit_place_holder__"))
+            if not (isinstance(item, str) and item in omit_tokens)
         }
     if isinstance(value, list):
-        return [_drop_omit_values(item) for item in value]
+        return [_drop_omit_values(item, omit_tokens) for item in value]
     return value
 
 
