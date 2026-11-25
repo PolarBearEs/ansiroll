@@ -1604,6 +1604,14 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _first_found_list_option(value):
+    if not isinstance(value, str):
+        return value
+    members = [part.strip() for part in value.split(",")]
+    return [part[1:-1] if len(part) > 1 and part[0] in ("'", '"') and part[-1] == part[0] else part
+            for part in members]
+
+
 def _first_found_vars_file(args, kwargs, selector):
     def split_terms(values, separators=None):
         for value in values:
@@ -1617,13 +1625,14 @@ def _first_found_vars_file(args, kwargs, selector):
     _fail_on_undef((args, dict(kwargs)))
     skip = _boolean(kwargs.get("skip", False), strict=True)
     modern = _core_at_least(2, 16)
-    paths = tuple(split_terms((kwargs["paths"],), "[,:;]")) if "paths" in kwargs else ()
-    if not modern and args and "files" in kwargs:
-        filenames = [tuple(split_terms((kwargs["files"],), "[,;]"))]
+    paths = tuple(split_terms((_first_found_list_option(kwargs.get("paths", ())),), "[,:;]"))
+    files = _first_found_list_option(kwargs.get("files", ()))
+    if not modern and args and (paths or files):
+        filenames = [tuple(split_terms((files,), "[,;]"))]
     else:
         terms = args
         if modern and not terms:
-            terms = (kwargs.get("files", ()),)
+            terms = (files,)
         filenames = [tuple(re.split("[,;]", term)) if modern else (term,) for term in split_terms(terms)]
     bundled = selector["files"]
     for group in filenames:

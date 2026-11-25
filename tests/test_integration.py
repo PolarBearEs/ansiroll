@@ -183,6 +183,46 @@ def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path):
         assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_first_found_vars_files_normalizes_string_options(tmp_path):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    if _core_version() < (2, 16):
+        pytest.skip("Core requires a positional first_found term")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - >-
+      {{ lookup('first_found', files='"prod.yml", fallback.yml', paths='A, "B"') }}
+  tasks:
+    - assert: {that: selected == 'production'}
+""")
+    (tmp_path / "A").mkdir()
+    (tmp_path / "B").mkdir()
+    (tmp_path / "A" / "fallback.yml").write_text("selected: fallback\n")
+    (tmp_path / "B" / "prod.yml").write_text("selected: production\n")
+    native = subprocess.run(ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(playbook)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert native.returncode == 0, native.stdout + native.stderr
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+def test_legacy_first_found_paths_without_files_have_no_candidates(monkeypatch):
+    import ansiroll.runtime as runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.12")
+    with pytest.raises(ValueError, match="No file was found"):
+        runtime._first_found_vars_file(
+            ("prod.yml",), {"paths": ["profiles"]},
+            {"roots": ["/test"], "files": ["/test/profiles/prod.yml"], "home": "/test", "patterns": ["profiles/*"]},
+        )
+
+
 @pytest.mark.parametrize("case", ["out-of-bounds", "directory", "missing", "skip"])
 def test_first_found_vars_files_never_falls_back_after_unverified_candidate(tmp_path, case):
     from ansiroll.loader import _core_version

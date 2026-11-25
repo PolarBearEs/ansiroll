@@ -1211,6 +1211,7 @@ def _vars_file_glob_pattern(name):
 def _vars_first_found_patterns(source, allow_short_name):
     """Model positional first_found filenames using bounded glob patterns."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
+    from .runtime import _first_found_list_option
 
     def term_patterns(term, separators="[;,]"):
         if isinstance(term, nodes.Const) and isinstance(term.value, str):
@@ -1226,6 +1227,12 @@ def _vars_first_found_patterns(source, allow_short_name):
             if all(len(part) == 1 for part in segments):
                 return ["".join(part[0] for part in segments)]
         raise ValueError("unmodeled first_found filename")
+
+    def option_patterns(term, separators):
+        if isinstance(term, nodes.Const) and isinstance(term.value, str):
+            return [pattern for value in _first_found_list_option(term.value)
+                    for pattern in term_patterns(nodes.Const(value), separators)]
+        return term_patterns(term, separators)
 
     try:
         parsed = Environment().parse(source).body
@@ -1246,13 +1253,18 @@ def _vars_first_found_patterns(source, allow_short_name):
         options = {keyword.key: keyword.value for keyword in call.kwargs}
         terms = call.args[1:]
         modern = _core_version() >= (2, 16)
-        use_file_option = "files" in options and ((modern and not terms) or (not modern and terms))
+        files = options.get("files")
+        has_files = files is not None and not (isinstance(files, (nodes.List, nodes.Tuple)) and not files.items)
+        use_file_option = has_files and ((modern and not terms) or (not modern and terms))
         if use_file_option:
-            terms = [options["files"]]
-        separator = "[;,]" if modern or use_file_option else None
-        filenames = [pattern for term in terms for pattern in term_patterns(term, separator)]
+            filenames = option_patterns(files, "[;,]")
+        else:
+            separator = "[;,]" if modern else None
+            filenames = [pattern for term in terms for pattern in term_patterns(term, separator)]
         paths = options.get("paths")
-        directories = term_patterns(paths, "[,:;]") if paths is not None else []
+        directories = option_patterns(paths, "[,:;]") if paths is not None else []
+        if not modern and not use_file_option:
+            return call.args[0].value, filenames
         path_terms = paths.items if isinstance(paths, (nodes.List, nodes.Tuple)) else [paths]
         if not directories or any(not isinstance(term, nodes.Const) for term in path_terms):
             directories.insert(0, "")
