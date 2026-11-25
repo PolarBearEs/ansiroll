@@ -2328,7 +2328,7 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
-    newline = None if name == "template" else ""
+    newline = ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
@@ -2667,7 +2667,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked."""
     if getattr(task, "_role", None) is None:
         return False
-    newline = "" if subdir == "files" else None
+    newline = ""
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
@@ -3217,7 +3217,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         return False
 
     assets, metadata, contents = {}, {}, {}
-    newline = "" if subdir == "files" else None
+    newline = ""
     remaining_linked_visits = 4096
     # Finish paths with the current number of symlinks before expanding paths
     # with one more, even when a path has many ordinary directories.

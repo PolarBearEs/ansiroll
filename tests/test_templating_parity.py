@@ -862,23 +862,32 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
-@pytest.mark.parametrize(("source", "expected"), [
-    ("{{ value }}\n", b"ready\n"),
-    ("{{ value }}\n\n", b"ready\n\n"),
-    ("\t{{ value }}  \n", b"\tready  \n"),
-    ("{{ value -}}\n", b"ready\n"),
+@pytest.mark.parametrize(("source", "value", "newline", "expected"), [
+    ("{{ value }}\n", "ready", "\n", b"ready\n"),
+    ("{{ value }}\n\n", "ready", "\n", b"ready\n\n"),
+    ("\t{{ value }}  \n", "ready", "\n", b"\tready  \n"),
+    ("{{ value -}}\n", "ready", "\n", b"ready\n"),
+    ("{{ value }}\n", "ready\n", "\n", b"ready\n"),
+    ("{{ value -}}\r\n\r\n", "ready\n", "\n", b"ready\n"),
+    ("{{ value -}}\n", "ready", "\r\n", b"ready\r\n"),
+    ("{{ value -}}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
+    (" {{ value }}\n", True, "\n", b" True\n"),
+    pytest.param(" {{ missing | default(omit) }}\n", None, "\n", b" \n",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native scalar omit semantics")),
 ])
-def test_template_file_preserves_single_expression_whitespace(tmp_path, delegated, source, expected):
+def test_template_file_preserves_single_expression_whitespace(tmp_path, delegated, source, value, newline, expected):
     path = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
   vars:
-    value: ready
+    value: TEMPLATE_VALUE
   tasks:
     - template:
         src: sample.j2
         dest: "{{ playbook_dir }}/rendered.txt"
-""" + ("      delegate_to: localhost\n" if delegated else ""), {"sample.j2": source})
+        newline_sequence: TEMPLATE_NEWLINE
+""".replace("TEMPLATE_VALUE", json.dumps(value)).replace("TEMPLATE_NEWLINE", json.dumps(newline))
+                  + ("      delegate_to: localhost\n" if delegated else ""), {"sample.j2": source})
     output = tmp_path / "rendered.txt"
     summary = _ansible(path, tmp_path)
     assert output.read_bytes() == expected
