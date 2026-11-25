@@ -1059,6 +1059,7 @@ class TaskFailed(Exception):
         super(TaskFailed, self).__init__(name)
         self.task = task or {"name": name}
         self.result = result or {"failed": True, "msg": str(name)}
+        self.pending_includes = None
 
 
 class MissingHandler(Exception):
@@ -4452,15 +4453,26 @@ class Runtime:
         # Reporting only; recap tallies are applied explicitly by the caller so
         # rescued/ignored/loop semantics match Ansible.
         emitted_result = result
+        include_register = None
+        include = node.get("type") == "include"
+        send_register = self.on_result and include and node.get("register") and not is_item
         if node.get("no_log"):
             emitted_result = {
                 "censored": ("the output has been hidden due to the fact that "
                              "'no_log: true' was specified for this result")
             }
-            if item is not None:
-                emitted_result["item"] = item
-            if isinstance(result, dict) and "_ansible_item_label" in result:
-                emitted_result["_ansible_item_label"] = result["_ansible_item_label"]
+            if is_item:
+                item = "(censored due to no_log)"
+                emitted_result["_ansible_item_label"] = item
+            if send_register:
+                include_register = _pack_include_value(result)
+        elif include and _contains_typed_mapping_keys((result, item)):
+            # Leave presentation JSON-safe and keep the original keys for register.
+            packed = _pack_include_value(result)
+            emitted_result = packed["value"]
+            item = _pack_include_value(item)["value"] if item is not None else None
+            if send_register:
+                include_register = packed
         if name is None:
             started_node, started_name = self._started_task_name
             name = started_name if started_node is node else self._node_name(node)
@@ -4482,6 +4494,8 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if include_register is not None:
+                frame["include_register"] = include_register
             if (not is_item and not node.get("no_log") and node.get("register")
                     and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
                 entries = result["results"] if "results" in result else [result]
@@ -4704,11 +4718,17 @@ class Runtime:
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
-        if items is not None and not items:
+        metadata_flags = None
+        if items:
+            try:
+                metadata_flags = self._loop_metadata_flags(node, base_ctx)
+            except (jinja2.UndefinedError, TypeError) as ex:
+                result = {"failed": True, "changed": False, "msg": str(ex)}
+                ignore = self._ignore_before_validation(node)
+        elif items is not None:
             result = {"changed": False, "skipped": True, "results": [],
                       "msg": "No items in the list"}
-        deferred_scopes = [] if items and handlers else None
-        if result is None and deferred_scopes is None:
+        if result is None and items is None:
             result, ignore = self._task_gate(node, base_ctx)
         if result is not None:
             self._store_register(node, result)
@@ -4724,38 +4744,97 @@ class Runtime:
         tally_ok = node.get("tally_include_ok", True)
         looped = items is not None
         invocation_params = node.get("include_params", node.get("vars")) or {}
-        # Ansible loads all successful role-loop handlers before running any body.
+        selected = []
+        results = []
+        ignore_loop = False
+        failed_items_ignored = True
+        legacy_failure = None
         for i, item in enumerate(items if looped else [None]):
             result = {"changed": False, "include": node.get("file")}
             loop_vars = {}
-            if looped:
-                loop_vars = self._loop_item_vars(node, items, i, base_ctx)
-                result["item"] = item
-            ctx = dict(base_ctx)
-            ctx.update(loop_vars)
+            if not looped:
+                selected.append((base_ctx, loop_vars, result, item))
+                break
+            try:
+                loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
+            except (jinja2.UndefinedError, TypeError) as ex:
+                legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)},
+                                  self._ignore_before_validation(node))
+                break
+            ctx = {**base_ctx, **loop_vars}
+            blocked, ignored = self._task_gate(node, ctx)
+            if blocked is not None:
+                if _result_failed(blocked) and not _core_at_least(2, 19):
+                    legacy_failure = (blocked, ignored)
+                    break
+                result = blocked
+            # Older executors added loop metadata directly to the result before
+            # aggregating item status. Newer executors keep status separately.
+            if not _core_at_least(2, 21):
+                result.update(loop_vars)
+            result.setdefault("failed", False)
             stop = False
-            if deferred_scopes is not None:
-                blocked, ignored = self._task_gate(node, ctx)
-                if node.get("loop_break_when"):
-                    break_ctx = dict(ctx)
-                    if node.get("register"):
-                        break_ctx[node["register"]] = _registered_result(
-                            node, blocked if blocked is not None else result)
-                    try:
-                        stop = self.when(node["loop_break_when"], break_ctx, keyword="break_when")
-                    except ConditionalError as ex:
-                        blocked = {"failed": True, "changed": False, "msg": str(ex)}
-                        stop = True
-                if blocked is not None:
-                    self.emit(node, _status_of(blocked), blocked, item=item,
-                              ignored=ignored, is_item=True, name=name)
-                    if not blocked.get("skipped"):
-                        if not ignored:
-                            raise TaskFailed(node.get("name"), node, blocked)
-                        self._tally("ignored")
-                    if stop:
+            if node.get("loop_break_when"):
+                break_ctx = dict(ctx)
+                if node.get("register"):
+                    break_ctx[node["register"]] = _registered_result(node, {**result, **loop_vars})
+                try:
+                    stop = self.when(node["loop_break_when"], break_ctx, keyword="break_when")
+                except ConditionalError as ex:
+                    if not _core_at_least(2, 21):
+                        legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)}, ignored)
                         break
-                    continue
+                    result.update(failed=True, break_when_result=str(ex))
+                    stop = True
+                else:
+                    if _core_at_least(2, 21):
+                        result["break_when_result"] = stop
+            ignore_loop = ignore_loop or ignored
+            if _result_failed(result):
+                failed_items_ignored = failed_items_ignored and ignored
+            reported = {**result, **loop_vars}
+            if not _result_failed(result) and not result.get("skipped"):
+                selected.append((ctx, loop_vars, reported, item))
+            results.append((item, result, reported))
+            if stop:
+                break
+
+        failure = None
+        if looped:
+            if legacy_failure is not None:
+                aggregate, ignored = legacy_failure
+                selected.clear()
+            else:
+                failed = any(_result_failed(outcome) for _, outcome, _ in results)
+                skipped = all(outcome.get("skipped") for _, outcome, _ in results)
+                aggregate = {"changed": False, "failed": failed,
+                             "results": [reported for _, _, reported in results]}
+                if failed:
+                    aggregate["msg"] = "One or more items failed"
+                elif skipped:
+                    aggregate.update(skipped=True, msg="All items skipped")
+                else:
+                    aggregate["msg"] = "All items completed"
+                ignored = ignore_loop if _core_at_least(2, 21) else failed_items_ignored
+                for item, outcome, reported in results:
+                    status = _status_of(outcome)
+                    if status != "ok":
+                        self.emit(node, status, reported, item=item, ignored=ignored, is_item=True, name=name)
+            self._store_register(node, aggregate)
+            status = _status_of(aggregate)
+            if status != "ok":
+                self.emit(node, status, aggregate, ignored=ignored, name=name)
+            if status == "failed":
+                if ignored:
+                    self._tally("ok")
+                    self._tally("ignored")
+                else:
+                    failure = TaskFailed(node.get("name"), node, aggregate)
+            elif status == "skipped":
+                self._tally("skipped")
+
+        scopes = []
+        for ctx, loop_vars, result, item in selected:
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
             params.update(loop_vars)
             scope = _with_high_vars(overlay, params)
@@ -4766,19 +4845,29 @@ class Runtime:
             include_params.update(loop_vars)
             scope[_INCLUDE_PARAMS_KEY] = include_params
             self.emit(node, "ok", result, item=item, is_item=looped, name=name)
+            if not looped:
+                self._store_register(node, result)
             if tally_ok:
                 self._tally("ok")
             self._add_handlers(handlers, scope, b)
-            if deferred_scopes is None:
-                yield self._node_steps(tasks, scope, b)
-            else:
-                deferred_scopes.append(scope)
-                if stop:
-                    break
-        if deferred_scopes == []:
-            self._tally("skipped")
-        for scope in deferred_scopes or ():
-            yield self._node_steps(tasks, scope, b)
+            scopes.append(scope)
+        if looped and status == "ok" and node.get("register"):
+            self.emit(node, status, aggregate, ignored=ignored, name=name)
+        if failure is not None:
+            if scopes:
+                failure.pending_includes = (tasks, scopes, b)
+            raise failure
+        yield from self._included_body_steps(tasks, scopes, b)
+
+    def _included_body_steps(self, tasks, scopes, become):
+        for scope in scopes:
+            yield self._node_steps(tasks, scope, become)
+
+    def _failed_include_steps(self, failure):
+        if failure is not None and failure.pending_includes is not None:
+            pending = failure.pending_includes
+            failure.pending_includes = None
+            yield from self._included_body_steps(*pending)
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
@@ -4813,6 +4902,7 @@ class Runtime:
                 }
                 self.vars.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
+                yield from self._failed_include_steps(ex)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
             if getattr(ex, "ends_play", False):
@@ -4820,8 +4910,10 @@ class Runtime:
             failed_exc = ex
         if block.get("always"):
             try:
+                yield from self._failed_include_steps(failed_exc)
                 yield self._node_steps(block["always"], scope, b_become)
-            except TaskFailed:
+            except TaskFailed as ex:
+                ex.pending_includes = None
                 # If always replaces a pending block/rescue failure, preserve
                 # the original count before propagating the new failure.
                 if (
@@ -4830,6 +4922,9 @@ class Runtime:
                     self._tally("failures")
                     failed_exc.counted = True
                 raise
+        elif failed_exc is not None:
+            # An outer block cannot insert tasks into a completed inner block.
+            failed_exc.pending_includes = None
         # `meta: clear_host_errors` (e.g. in the always section) forgives the
         # pending failure; the host still counts as failed once in the recap
         # (it was marked failed before being cleared, like Ansible).
@@ -5267,7 +5362,7 @@ class Runtime:
         result = {"failed": True, "changed": False, "msg": message}
         return result, self._ignore_before_validation(task)
 
-    def _loop_item_vars(self, task, items, i, ctx=None):
+    def _loop_item_vars(self, task, items, i, ctx=None, *, metadata_flags=None):
         """Per-item loop variables: loop_var, index_var and ansible_loop."""
         loop_var = task.get("loop_var") or "item"
         if "{{" in loop_var and ctx is not None:
@@ -5276,7 +5371,8 @@ class Runtime:
         if task.get("index_var"):
             out[task["index_var"]] = i
             out["ansible_index_var"] = task["index_var"]
-        if task.get("loop_extended"):
+        extended, allitems = metadata_flags or self._loop_metadata_flags(task, ctx)
+        if extended:
             n = len(items)
             loop_info = {
                 "index": i + 1, "index0": i,
@@ -5288,18 +5384,27 @@ class Runtime:
                 loop_info["previtem"] = items[i - 1]
             if i < n - 1:
                 loop_info["nextitem"] = items[i + 1]
-            if task.get("loop_extended_allitems", True):
+            if allitems:
                 loop_info["allitems"] = items
             out["ansible_loop"] = loop_info
         return out
+
+    def _loop_control_bool(self, task, key, default, ctx):
+        value = _fail_on_undef(self.template(task.get(key, default), ctx or {}))
+        return default if value is None or isinstance(value, _Omit) else _boolean(value, strict=True)
+
+    def _loop_metadata_flags(self, task, ctx):
+        return (self._loop_control_bool(task, "loop_extended", False, ctx),
+                self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
     def _run_loop(self, task, items, base_ctx, become=False, notifications=None):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
+        metadata_flags = self._loop_metadata_flags(task, base_ctx) if items else None
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
-            ctx.update(self._loop_item_vars(task, items, i, base_ctx))
+            ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
             res, ignore = self._task_gate(task, ctx)
@@ -7676,7 +7781,72 @@ def _encode_delegated_key(key):
         return {"date": key.isoformat()}
     if isinstance(key, bytes):
         return {"bytes": base64.b64encode(key).decode("ascii")}
+    if isinstance(key, range):
+        return {"range": [key.start, key.stop, key.step]}
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
+
+
+def _pack_delegated_value(value):
+    undefined, errors, mapping_keys = [], [], []
+    value = _delegate_fallback_value(value, undefined, errors, mapping_keys)
+    result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+    if errors:
+        result["errors"] = errors
+    if mapping_keys:
+        result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
+    return result
+
+
+def _contains_typed_mapping_keys(value):
+    pending = [value]
+    seen = set()
+    while pending:
+        member = pending.pop()
+        if isinstance(member, (dict, list, tuple)) and id(member) not in seen:
+            seen.add(id(member))
+            if isinstance(member, dict):
+                if any(not isinstance(key, str) for key in member):
+                    return True
+                pending.extend(member.values())
+            else:
+                pending.extend(member)
+    return False
+
+
+def _pack_include_value(value):
+    try:
+        return _pack_delegated_value(value)
+    except (TypeError, ValueError):
+        # A plugin can return arbitrary hashable objects. Such keys cannot
+        # cross the wire, but should not abort callbacks for an include.
+        return {"value": json.loads(json.dumps(value, default=str, skipkeys=True)), "undefined": []}
+
+
+def _restore_delegated_mapping_keys(value, mapping_keys):
+    def restore_key(key):
+        if isinstance(key, list):
+            return tuple(restore_key(part) for part in key)
+        if isinstance(key, dict):
+            from datetime import date, datetime
+
+            if "bytes" in key:
+                return base64.b64decode(key["bytes"], validate=True)
+            if "date" in key:
+                return date.fromisoformat(key["date"])
+            if "range" in key:
+                return range(*key["range"])
+            return datetime.fromisoformat(key["datetime"])
+        return key
+
+    # Decode inner mappings before changing the keys used to reach them.
+    for path, keys in reversed(mapping_keys):
+        container = value
+        for key in path:
+            container = container[key]
+        entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
+        container.clear()
+        container.update(entries)
+    return value
 
 
 def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=None):
@@ -7701,19 +7871,11 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
                      else [reserve(index) for index in range(len(rendered))])
         else:
             slots = None
-        undefined = []
-        errors = []
-        mapping_keys = []
-        value = _delegate_fallback_value(rendered if slots is None else slots, undefined, errors, mapping_keys)
-        result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+        result = _pack_delegated_value(rendered if slots is None else slots)
         if slots is not None:
             result["lazy_members"] = True
             if isinstance(rendered, _HostVarView):
                 result["hostvar_view"] = True
-        if errors:
-            result["errors"] = errors
-        if mapping_keys:
-            result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
         return result
     except _CapturedTemplateError as error:
         return {"error": str(error)}
@@ -7779,10 +7941,13 @@ def agent_main():
     host = g.get("_INJECTED_HOST") or _hostname()
     host_vars = {"inventory_hostname": host}
     host_vars.update(g.get("_BAKED_GROUP_VARS") or {})
-    if "_INJECTED_VARS" in g:
-        host_vars.update(g["_INJECTED_VARS"])
-    extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
+    injected_vars = g.get("_INJECTED_VARS") or {}
     host_var_overrides = g.get("_INJECTED_HOST_VAR_OVERRIDES") or {}
+    mapping_keys = g.get("_INJECTED_VAR_MAPPING_KEYS") or {}
+    _restore_delegated_mapping_keys(injected_vars, mapping_keys.get("host", ()))
+    _restore_delegated_mapping_keys(host_var_overrides, mapping_keys.get("overrides", ()))
+    host_vars.update(injected_vars)
+    extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
     specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
     specialized_vars.update(g.get("_FROZEN_VARS") or {})
     conflicts = sorted(k for k, value in specialized_vars.items()
