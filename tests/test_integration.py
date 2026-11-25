@@ -9,6 +9,7 @@ import getpass
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -4831,6 +4832,58 @@ def test_strategy_honors_play_level_local_connection(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ok=1" in proc.stdout
+
+
+def test_strategy_selects_vars_file_using_inventory_before_set_fact(tmp_path):
+    group_vars = tmp_path / "group_vars"
+    group_vars.mkdir()
+    (group_vars / "all.yml").write_text("setup_profile: inventory\n")
+    (tmp_path / "settings-inventory.yml").write_text("chosen: inventory\n")
+    (tmp_path / "settings-host-fact.yml").write_text("chosen: host-fact\n")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        setup_profile: host-fact
+
+- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files: ['settings-{{ setup_profile }}.yml']
+  tasks:
+    - assert:
+        that:
+          - chosen == 'inventory'
+          - setup_profile == 'host-fact'
+"""
+
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path):
+    (tmp_path / "settings-before.yml").write_text("before_gathering: old\n")
+    (tmp_path / ("settings-" + platform.system() + ".yml")).write_text(
+        'after_gathering: "{{ lookup(\'env\', \'ANSIROLL_TEST_FACT_SELECTED_ENV\') }}"\n')
+    playbook = """- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files:
+    - ['settings-{{ ansible_facts.system }}.yml', 'settings-before.yml']
+  tasks:
+    - assert:
+        that:
+          - before_gathering is undefined
+          - after_gathering == 'fact-selected'
+"""
+    proc = _run_strategy_play(
+        tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+        environment={"ANSIROLL_TEST_FACT_SELECTED_ENV": "fact-selected"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):

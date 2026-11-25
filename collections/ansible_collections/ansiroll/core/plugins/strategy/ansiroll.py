@@ -388,7 +388,7 @@ class StrategyModule(StrategyBase):
 
     # ---- compilation -----------------------------------------------------
     def _compile(self, play, play_vars, gather_task):
-        from ansiroll.loader import _conditions, _controller_config_names, _controller_env_names, _convert_play
+        from ansiroll.loader import _conditions, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
 
@@ -423,12 +423,9 @@ class StrategyModule(StrategyBase):
             from ansiroll.compiler import _mark_unsupported
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
-        self._deferred_lookup_paths = {
-            os.path.abspath(path)
-            for entry in play_node.get("deferred_vars_files", ())
-            for path, data in entry["files"].items()
-            if _controller_env_names(data) or _controller_config_names(data)
-        }
+        self._deferred_vars_file_keys = (
+            set(play_node.get("vars") or {}) if play_node.get("deferred_vars_files") else None
+        )
 
         self._ansiballz = embedder.ansiballz_code or ""
         source = _render_source([play_node], modules, self._ansiballz)
@@ -524,13 +521,14 @@ class StrategyModule(StrategyBase):
             chan.send_blob(agent_source)  # frame 1: the agent source
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
-                host, chan, task_map, hv, templar, become_pass, play_context)
+                host, chan, task_map, hv, templar, become_pass, play_context,
+                selected_vars_files=selected_vars_files)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
         finally:
             chan.close()
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, selected_vars_files=()):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -596,6 +594,9 @@ class StrategyModule(StrategyBase):
                     "t": "source_result",
                     "source": source_result,
                 })
+            elif t == "vars_files":
+                chan.send({"t": "vars_files_result",
+                           "result": self._resolved_vars_file_state(host, selected_vars_files)})
             elif t == "warning":
                 display.warning(frame["message"])
             elif t == "error":
@@ -1178,43 +1179,71 @@ class StrategyModule(StrategyBase):
 
     def _host_vars_and_lookup_sources(self, host):
         selected = []
-        if not self._deferred_lookup_paths:
-            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+        manager = self._variable_manager
+        if self._deferred_vars_file_keys is None:
+            return dict(manager.get_vars(host=host, play=self._cur_play)), selected
 
-        # Record the candidate mappings as Ansible selects them. The merged
-        # host vars alone lose inputs used by earlier selectors.
+        # Observe the vars_files reads made directly by this host's native
+        # variable manager. Inventory plugins can also use load_from_file.
         loader = self._loader
         load_from_file = loader.load_from_file
         original_override = vars(loader).get("load_from_file")
+        reader = manager.get_vars.__func__.__code__
 
         def capture(path, *args, **kwargs):
+            caller = sys._getframe(1)
+            selected_file = (caller.f_code is reader and caller.f_locals.get("host") is host
+                             and caller.f_locals.get("play") is self._cur_play)
             data = load_from_file(path, *args, **kwargs)
-            if path and os.path.abspath(os.fsdecode(path)) in self._deferred_lookup_paths:
+            if selected_file:
                 selected.append(data)
             return data
 
         loader.load_from_file = capture
         try:
-            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+            return dict(manager.get_vars(host=host, play=self._cur_play)), selected
         finally:
             if original_override is None:
                 del loader.load_from_file
             else:
                 loader.load_from_file = original_override
 
-    def _controller_lookup_header(self, selected_vars_files):
-        if not selected_vars_files:
-            return ""
+    def _resolved_vars_file_state(self, host, initial_files):
+        if self._deferred_vars_file_keys is None:
+            return {"error": "unexpected request for vars_files"}
+        try:
+            current_vars, files = self._host_vars_and_lookup_sources(host)
+        except AnsibleError as ex:
+            return {"error": str(ex)}
+        keys = set(self._deferred_vars_file_keys)
+        for loaded in (*initial_files, *files):
+            for mapping in loaded if isinstance(loaded, list) else (loaded,):
+                if isinstance(mapping, dict):
+                    keys.update(mapping)
+        mapping_keys = []
+        return {
+            "vars": _json_blob({key: current_vars[key] for key in keys & current_vars.keys()}, mapping_keys),
+            "missing": sorted(keys - current_vars.keys(), key=str),
+            "mapping_keys": mapping_keys,
+            "controller_lookups": self._controller_lookups(files),
+        }
+
+    @staticmethod
+    def _controller_lookups(selected_vars_files):
         from ansiroll.loader import _controller_config_names, _controller_config_values, _controller_env_names
 
         env_names = _controller_env_names(selected_vars_files)
         config_names = _controller_config_names(selected_vars_files)
-        lookups = {
+        return {
             "controller_env": {name: os.environ[name] for name in sorted(env_names) if name in os.environ},
             "controller_config": _controller_config_values(config_names),
         }
+
+    def _controller_lookup_header(self, selected_vars_files):
+        if not selected_vars_files:
+            return ""
         return "_INJECTED_CONTROLLER_LOOKUPS = __import__('json').loads(%r)\n" % json.dumps(
-            lookups, default=str)
+            self._controller_lookups(selected_vars_files), default=str)
 
     # ---- channel transport ----------------------------------------------
     def _open_channel(self, host, play_context, hv, templar):
