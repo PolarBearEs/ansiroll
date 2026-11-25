@@ -7827,6 +7827,11 @@ def agent_main():
         for play in plays:
             if not g.get("_INJECTED_GATHER_FACTS", True):
                 play = dict(play, gather_facts=False)
+            if controller_lookups := g.get("_INJECTED_CONTROLLER_LOOKUPS"):
+                play = {**play, **{
+                    key: {**(play.get(key) or {}), **values}
+                    for key, values in controller_lookups.items()
+                }}
             rt.run_play(play)
             failed = failed or rt.failed
             for k in total:
