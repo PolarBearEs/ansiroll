@@ -524,13 +524,35 @@ class StrategyModule(StrategyBase):
             chan.send_blob(agent_source)  # frame 1: the agent source
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
-                host, chan, task_map, hv, templar, become_pass, play_context)
+                host, chan, task_map, hv, templar, become_pass, play_context,
+                gather_task=task_map.get("__gather_facts__") if gather_facts else None)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
         finally:
             chan.close()
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
+    def _gather_setup_options(self, host, gather_task):
+        from ansiroll.loader import _core_version
+
+        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
+                   if key in gather_task.args}
+        if options.get("gather_subset") == ["all"] and "gather_subset" not in (self._cur_play.get_ds() or {}):
+            del options["gather_subset"]
+        error = None
+        if options:
+            try:
+                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+                values["ansible_search_path"] = gather_task.get_search_path()
+                options = self._mk_templar(values).template(options)
+                if _core_version() < (2, 19) and (omit := values.get("omit")):
+                    from ansible.executor.task_executor import remove_omit
+
+                    options = remove_omit(options, omit)
+            except AnsibleError as ex:
+                error = str(ex)
+        return {"options": options if error is None else {}, "error": error}
+
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -575,6 +597,11 @@ class StrategyModule(StrategyBase):
                 self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "gather_setup":
+                data = (self._gather_setup_options(host, gather_task) if gather_task is not None
+                        else {"error": "implicit setup was not scheduled"})
+                gather_task = None
+                chan.send({"t": "gather_setup_result", "setup": data})
             elif t == "delegate":
                 delegate_started = time.monotonic()
                 chan.send({"t": "delegate_result",
