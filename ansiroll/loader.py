@@ -158,9 +158,17 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                                                 replay_files=bool(node.get("ordered_vars_files"))))
         scoped_options = node.pop("_gather_setup_scoped", None)
         if node.get("ordered_vars_files") or scoped_options:
-            node.update(_gather_timeout_file_scope(
+            setup_layers = _gather_timeout_file_scope(
                 play, node.get("ordered_vars_files") or (), node.get("gather_timeout_template"),
-                scoped_options=scoped_options))
+                scoped_options=scoped_options)
+            lookups = setup_layers.pop("_setup_controller_lookups", {})
+            env_names = lookups.get("env", ())
+            if env_names:
+                node.setdefault("controller_env", {}).update({
+                    name: os.environ[name] for name in sorted(env_names) if name in os.environ
+                })
+            node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
+            node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -330,12 +338,16 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
     timeout_names = set(runtime["names"]) if runtime is not None else set()
     setup_names = set()
     computed = set()
+    setup_lookups = {"env": set(), "config": set()}
     for source, _, _ in _selector_template_sources(scoped_options or {}):
         dependencies = _gather_timeout_dependencies(
             source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
             computed=computed, retain_mutable=True)
         if dependencies is not None:
             setup_names.update(dependencies[1])
+        _gather_timeout_dependencies(
+            source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            computed=computed, lookups=setup_lookups)
     file_aliases = {}
     file_names = set()
     for entry in entries:
@@ -392,6 +404,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
     if scoped_options:
+        result["_setup_controller_lookups"] = setup_lookups
         result["gather_setup_scope"] = _tag_untrusted({
             "defaults": {key: value for key, value in defaults.items() if computed or key in setup_names},
             "role_exports": [
@@ -404,7 +417,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -438,6 +451,12 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
+            if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
+                    and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
+                plugin = call.args[0].value.rsplit(".", 1)[-1]
+                if plugin in lookups:
+                    lookups[plugin].update(arg.value for arg in call.args[1:]
+                                           if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
                                                 resolve_aliases=resolve_aliases, analysis=analysis,
                                                 retain_mutable=retain_mutable):
@@ -794,6 +813,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             entry for entry in (ordered_vars_files or ()) if deferred and not isinstance(entry, int)
         ],
     }
+    lookup_sources.pop("gather_setup_options", None)
+    lookup_sources.pop("_gather_setup_scoped", None)
     names = _controller_env_names(lookup_sources)
     if names:
         result["controller_env"] = {

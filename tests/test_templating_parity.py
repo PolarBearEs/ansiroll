@@ -127,11 +127,12 @@ def test_implicit_setup_resolves_options_in_their_native_scope(tmp_path, use_str
     subsets: ['!all', '!min', local]
     directory: "{{ playbook_dir }}/unselected"
   gather_subset: "{{ subsets }}"
-  fact_path: "{{ directory }}"
+  fact_path: "{{ PATH_EXPRESSION }}"
   tasks:
     - debug:
         msg: "{{ ansible_local.probe.value }}/{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"
-""", {"facts/probe.fact": '{"value":"early"}\n'}, use_strategy=use_strategy)
+""".replace("PATH_EXPRESSION", "vars.directory" if MODERN_TEMPLATING else "directory"),
+                                 {"facts/probe.fact": '{"value":"early"}\n'}, use_strategy=use_strategy)
     assert messages == ["early/subset"]
 
 
@@ -180,6 +181,27 @@ def test_strategy_resolves_implicit_fact_path_lookup_on_controller(tmp_path):
         "facts/probe.fact": '{"value":"controller"}\n',
     }, use_strategy=True)
     assert messages == ["controller"]
+
+
+def test_standalone_implicit_fact_path_uses_vars_file_selected_by_cached_facts(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', distribution]
+  tasks: []
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  vars_files: ["vars-{{ 'cached' if ansible_facts.os_family is defined else 'before' }}.yml"]
+  fact_path: "{{ directory }}"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {
+        "vars-cached.yml": 'directory: "{{ playbook_dir }}/facts"\n',
+        "vars-before.yml": 'directory: "{{ playbook_dir }}/missing"\n',
+        "facts/probe.fact": '{"value":"cached"}\n',
+    })
+    assert messages == ["cached"]
 
 
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
