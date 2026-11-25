@@ -229,10 +229,11 @@ agent keeps running the rest of the play with no interruption to its warm worker
 - `add_host`, `group_by`, and `include_vars` are serviced by the controller.
 - `delegate_to: <other host>` and other controller-only action plugins (`fetch`,
   `reboot`, …) are **not supported yet** and fail with a clear message.
-- Set **`ansiroll_delegate_on_target: true`** to run delegated tasks on the target
-  when the play uses the Ansiroll agent. Use it only when the task can run from
-  the target. When a play falls back to core linear execution, Ansiroll warns
-  and Ansible uses its normal delegation rules.
+- Set **`ansiroll_delegate_on_target: true`** under the play's `vars` or pass
+  `-e ansiroll_delegate_on_target=true` to run delegated tasks on the target when
+  the batch uses the Ansiroll agent. Use it only when the task can run from the
+  target. When a batch falls back to core linear execution, Ansiroll identifies
+  the batch in a warning and Ansible uses its normal delegation rules.
 
 ## Known limitations (v1)
 

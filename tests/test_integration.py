@@ -5692,7 +5692,9 @@ def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
 @pytest.mark.parametrize("on_target", [False, True])
 def test_strategy_reports_unavailable_on_target_delegation_in_linear_fallback(tmp_path, on_target):
     proc = _run_strategy_play(
-        tmp_path, """- hosts: all
+        tmp_path, """- name: Delegation by batch
+  hosts: all
+  serial: 2
   gather_facts: false
   connection: local
   tasks:
@@ -5709,11 +5711,15 @@ def test_strategy_reports_unavailable_on_target_delegation_in_linear_fallback(tm
           - hostvars.recipient.marker is undefined
           - hostvars.recipient.expected_marker == 'reached'
 """, "-e", json.dumps({"ansiroll_delegate_on_target": on_target}),
-        inventory="origin,recipient,",
+        inventory="origin,recipient,last,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     warning = "ansiroll_delegate_on_target has no effect during core linear fallback"
-    assert (warning in " ".join(proc.stderr.split())) is on_target
+    warnings = " ".join(proc.stderr.split())
+    assert warnings.count(warning) == int(on_target)
+    if on_target:
+        assert "for play 'Delegation by batch' on batch hosts origin, recipient" in warnings
+        assert "batch hosts last" not in warnings
 
 
 def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):

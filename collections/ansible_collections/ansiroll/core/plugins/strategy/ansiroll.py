@@ -335,8 +335,9 @@ class StrategyModule(StrategyBase):
         if linear_reason:
             if self._delegate_on_target:
                 display.warning(
-                    "ansiroll_delegate_on_target has no effect during core linear fallback (%s). "
-                    "Ansible handles delegation for this play." % linear_reason
+                    "ansiroll_delegate_on_target has no effect during core linear fallback for play %r "
+                    "on batch hosts %s (%s). Ansible handles delegation for this batch."
+                    % (play.name or play.get_name(), ", ".join(host.name for host in hosts), linear_reason)
                 )
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
