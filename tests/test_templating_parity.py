@@ -1099,6 +1099,11 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     ("{{ value -}}\r\n\r\n", "ready\n", "\n", b"ready\n"),
     ("{{ value -}}\n", "ready", "\r\n", b"ready\r\n"),
     ("{{ value -}}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
+    ("first\n{% if true %}second{% endif -%}\n", None, "\r\n", b"first\r\nsecond\r\n"),
+    ("hello{# note -#} \n", None, "\n", b"hello\n"),
+    ("hello\r\n{% set x = 1 -%}\r\n\r\n", None, "\n", b"hello\n"),
+    ("{{ value }}{# note -#}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
+    ("{# note -#}\n", None, "\n", b"" if MODERN_TEMPLATING else b"\n"),
     ("alpha\r\nbeta\r\n", None, "\n", b"alpha\r\nbeta\r\n" if MODERN_TEMPLATING else b"alpha\nbeta\n"),
     pytest.param("{% set value = 42 %}{{ value -}}\n", None, "\n", b"42",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native full-template scalar")),
@@ -1144,17 +1149,29 @@ DELEGATION    - template:
         src: block.j2
         dest: "{{ playbook_dir }}/untrimmed.txt"
         trim_blocks: false
+DELEGATION    - template:
+        src: custom.j2
+        dest: "{{ playbook_dir }}/custom.txt"
+        comment_start_string: "[["
+        comment_end_string: "]]"
+DELEGATION    - template:
+        src: header.j2
+        dest: "{{ playbook_dir }}/header.txt"
 DELEGATION""".replace("DELEGATION", "      delegate_to: localhost\n" if delegated else ""), {
         "comment.j2": "{# internal note #}",
         "block.j2": "{% if true %}\nhello{% endif %}\n",
+        "custom.j2": "A {# literal\n[[ internal note ]]",
+        "header.j2": "#jinja2: trim_blocks: False\n{% if true %}\nhello{% endif %}\n",
     })
-    outputs = {name: tmp_path / (name + ".txt") for name in ("comment", "trimmed", "untrimmed")}
+    outputs = {name: tmp_path / (name + ".txt") for name in ("comment", "trimmed", "untrimmed", "custom", "header")}
 
     summary = _ansible(path, tmp_path)
     expected = {name: output.read_bytes() for name, output in outputs.items()}
     assert expected["comment"] == b""
     assert expected["trimmed"].startswith(b"hello")
     assert expected["untrimmed"].startswith(b"\nhello")
+    assert expected["header"].startswith(b"\nhello")
+    assert expected["custom"].startswith(b"A {# literal")
     for output in outputs.values():
         output.unlink()
     result = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
