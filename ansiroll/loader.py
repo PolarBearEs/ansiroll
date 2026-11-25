@@ -15,6 +15,7 @@ import re
 import stat
 import time
 from copy import copy
+from contextlib import contextmanager
 from functools import lru_cache
 
 from .compat import init_loader
@@ -458,7 +459,7 @@ def _make_rewriting_loader(DataLoader):
 
     playbook_reader = Playbook._load_playbook_data.__code__
     role_reader = Role._load_role_yaml.__code__
-    task_readers = {load_list_of_tasks.__code__, _convert_include_tasks.__code__}
+    task_readers = {load_list_of_tasks.__code__, _expand_include_tasks.__code__}
 
     class RewritingDataLoader(DataLoader):
         def __init__(self):
@@ -1779,6 +1780,30 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     return _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
 
 
+@contextmanager
+def _include_source_loader(loader, plaintext_only, roots):
+    if not plaintext_only:
+        yield
+        return
+    original = vars(loader).get("load_from_file")
+
+    def read(path, *args, **kwargs):
+        resolved = loader.path_dwim(path)
+        physical = os.path.realpath(resolved)
+        if not any(os.path.commonpath((root, physical)) == root for root in roots):
+            raise ValueError("runtime-only task source is outside the playbook and role directories")
+        return _rewrite_includes(_load_plain_ansible_source(resolved))
+
+    loader.load_from_file = read
+    try:
+        yield
+    finally:
+        if original is None:
+            del loader.load_from_file
+        else:
+            loader.load_from_file = original
+
+
 def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes):
     if path is None or not os.path.exists(path):
         return None
@@ -1801,20 +1826,24 @@ def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_t
     if ref is None:
         try:
             from ansible.playbook.helpers import load_list_of_blocks
-            try:
-                data = task._loader.load_from_file(path, trusted_as_template=True)
-            except TypeError:  # older ansible-core without the trust kwarg
-                data = task._loader.load_from_file(path)
             handler = _is_handler(task)
             parent = task
             if handler and args.get("apply"):
                 include = task.copy()
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
-            blocks = load_list_of_blocks(
-                data, play=_play_of(task), task_include=parent, role=task._role,
-                use_handlers=handler, variable_manager=task.get_variable_manager(),
-                loader=task._loader)
+            roots = [os.path.realpath(basedir)]
+            if role is not None:
+                roots.append(os.path.realpath(role._role_path))
+            with _include_source_loader(task._loader, includes.compile_selected_vars is None, roots):
+                try:
+                    data = task._loader.load_from_file(path, trusted_as_template=True)
+                except TypeError:  # older ansible-core without the trust kwarg
+                    data = task._loader.load_from_file(path)
+                blocks = load_list_of_blocks(
+                    data, play=_play_of(task), task_include=parent, role=task._role,
+                    use_handlers=handler, variable_manager=task.get_variable_manager(),
+                    loader=task._loader)
             if parent is not task:
                 for block in blocks:
                     block.vars = dict(parent.vars, **(block.vars or {}))

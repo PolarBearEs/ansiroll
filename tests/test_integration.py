@@ -5591,3 +5591,30 @@ def test_standalone_selects_include_from_launch_selected_vars_file(tmp_path, mon
                                 env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps(extra)}, timeout=20)
         assert result.returncode == 0, result.stdout + result.stderr
         assert f"selected-profile-{expected}" in result.stdout
+
+
+def test_vars_file_alternate_include_does_not_embed_encrypted_task_bodies(tmp_path):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    secret = VaultSecret(b"password")
+    vault = VaultLib([("default", secret)])
+    password = tmp_path / "vault-password"
+    password.write_text("password\n")
+    (tmp_path / "profile-normal.yml").write_text("task_file: normal.yml\n")
+    (tmp_path / "profile-private.yml").write_text("task_file: sealed.yml\n")
+    (tmp_path / "normal.yml").write_text("- debug: {msg: ordinary-body}\n")
+    (tmp_path / "sealed.yml").write_bytes(vault.encrypt(b"- debug: {msg: synthetic-private-body}\n", secret=secret))
+    source, _ = compile_playbook(str(playbook), vault_password_file=str(password))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "synthetic-private-body" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(plan)
+    assert not runtime.failed
