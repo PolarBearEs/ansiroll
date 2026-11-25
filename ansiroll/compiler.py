@@ -125,6 +125,8 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
         plays, group_vars, extra_vars or {}, bool(freeze_playbook_vars),
         set(freeze_vars or []),
     )
+    for play in plays:
+        play.pop("ordered_vars_file_mutable_names", None)
     specialized_vars = dict(frozen_vars)
     specialized_vars.update(extra_vars or {})
     original_actions = set(actions)
@@ -275,6 +277,9 @@ def _shadowed_var_names(plays):
         ))
         names.update(_loop_shadowed_names(node))
     for play in plays:
+        if "ordered_vars_file_mutable_names" in play:
+            names.update(play["ordered_vars_file_mutable_names"])
+            continue
         for entry in play.get("deferred_vars_files") or ():
             for data in entry["files"].values():
                 if isinstance(data, list):
@@ -928,6 +933,11 @@ def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
 
     assets = {}
     compact_plays = _externalize_assets(copy.deepcopy(plays), assets)
+    for play in compact_plays:
+        entries = play.get("deferred_vars_files", ())
+        if entries and play.get("ordered_vars_files"):
+            index = {id(entry): position for position, entry in enumerate(entries)}
+            play["ordered_vars_files"] = [index.get(id(entry), entry) for entry in play["ordered_vars_files"]]
     data_entries = {
         "plays.json": json.dumps(compact_plays, default=_json_default).encode("utf-8"),
         "modules.json": json.dumps(module_meta, default=_json_default).encode("utf-8"),

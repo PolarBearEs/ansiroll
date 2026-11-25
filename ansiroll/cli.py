@@ -355,13 +355,18 @@ def _stat_if_present(path):
         return
 
 
-def _missing_destination(path):
-    # Follow the final symlink without collapsing an unresolved component.
+def _follow_destination_links(path):
+    # Resolve leaf links without collapsing ".." before a parent symlink.
     for _ in range(40):
         if not os.path.islink(path):
-            break
+            return path
         path = os.path.join(os.path.dirname(path), os.readlink(path))
-    else:
+    return None
+
+
+def _missing_destination(path):
+    path = _follow_destination_links(path)
+    if path is None:
         return
     parent, name = os.path.split(path)
     parent = parent or os.curdir
@@ -440,11 +445,26 @@ def _make_output_executable(path, reference, output_stat, mode):
     os.chmod(path, mode)
 
 
+def _private_output_path(path):
+    target = _follow_destination_links(path)
+    if target is None:
+        raise ValueError("too many symlinks in Vault-bearing output path: %s" % path)
+    parent, name = os.path.split(target)
+    parent = parent or os.curdir
+    # Require a real parent at the requested path before canonicalizing it.
+    if name in ("", ".", "..") or not os.path.isdir(parent):
+        raise ValueError("Vault-bearing output needs a regular file in an existing directory: %s" % path)
+    directory = os.path.realpath(parent)
+    if not os.path.samefile(parent, directory):
+        raise ValueError("Vault-bearing output directory changed: %s" % path)
+    return os.path.join(directory, name)
+
+
 @contextmanager
 def _open_private_compile_destination(path, validate, *, prepare):
     # A reader that already opened the previous output retains access to
     # that inode even after chmod. Publish the new source on a private inode.
-    destination = os.path.abspath(path)
+    destination = _private_output_path(path)
     directory = os.path.dirname(destination)
     fd, temp_path = tempfile.mkstemp(prefix=".ansiroll-vault-", dir=directory)
     try:
@@ -459,6 +479,8 @@ def _open_private_compile_destination(path, validate, *, prepare):
                     raise ValueError("Vault-bearing output needs a regular destination file: %s" % path)
             info = os.fstat(fd)
             validate(info, fd)
+            if _private_output_path(path) != destination:
+                raise ValueError("Vault-bearing output path changed: %s" % path)
             os.replace(temp_path, destination)
             prepare(info, fd)
     finally:

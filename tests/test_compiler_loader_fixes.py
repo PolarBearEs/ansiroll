@@ -1613,7 +1613,8 @@ def test_vault_strategy_keeps_literal_source_controller_side(tmp_path):
     assert payload.decode() not in run.stdout + run.stderr
 
 
-def test_cli_replaces_public_vault_artifact_with_private_inode(tmp_path):
+@pytest.mark.parametrize("path_form", ["direct", "symlink-parent", "symlink-leaf"])
+def test_cli_replaces_public_vault_artifact_with_private_inode(tmp_path, path_form):
     from stat import S_IMODE
 
     from ansible.parsing.vault import VaultLib, VaultSecret
@@ -1631,17 +1632,36 @@ def test_cli_replaces_public_vault_artifact_with_private_inode(tmp_path):
   tasks:
     - copy: {src: selected.vault, dest: /unused}
 """)
-    artifact = tmp_path / "artifact.py"
+    artifact = output_path = tmp_path / "artifact.py"
+    unrelated = None
+    if path_form == "symlink-parent":
+        inner = tmp_path / "vault-dir" / "inner"
+        inner.mkdir(parents=True)
+        link = tmp_path / "link"
+        link.symlink_to(inner, target_is_directory=True)
+        output_path = link / ".." / "artifact.py"
+        artifact = inner.parent / "artifact.py"
+        unrelated = tmp_path / "artifact.py"
+        unrelated.write_text("unrelated file")
+    elif path_form == "symlink-leaf":
+        output_path = tmp_path / "link.py"
+        output_path.symlink_to(artifact.name)
     artifact.write_text("previous public artifact")
     artifact.chmod(0o644)
     with artifact.open() as previous:
         result = subprocess.run(
-            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(output_path)],
             cwd=ROOT, env={**_env(), "ANSIBLE_CONFIG": str(config)},
             capture_output=True, text=True, timeout=45)
         assert result.returncode == 0, result.stdout + result.stderr
         assert previous.read() == "previous public artifact"
     assert S_IMODE(artifact.stat().st_mode) == 0o700
+
+    assert output_path.samefile(artifact)
+    if path_form == "symlink-leaf":
+        assert output_path.is_symlink()
+    if unrelated is not None:
+        assert unrelated.read_text() == "unrelated file"
 
 
 def test_vault_candidates_stay_encrypted_until_the_controller_selects_one(tmp_path):
