@@ -4797,19 +4797,17 @@ class Runtime:
                 self._store_register(node, result)
             if tally_ok:
                 self._tally("ok")
+            self._add_handlers(handlers, scope, b)
             scopes.append(scope)
         if looped and status == "ok" and node.get("register"):
             self.emit(node, status, aggregate, ignored=ignored, name=name)
         if failure is not None:
             if scopes:
-                failure.pending_includes = (tasks, handlers, scopes, b)
+                failure.pending_includes = (tasks, scopes, b)
             raise failure
-        yield from self._included_body_steps(tasks, handlers, scopes, b)
+        yield from self._included_body_steps(tasks, scopes, b)
 
-    def _included_body_steps(self, tasks, handlers, scopes, become):
-        # Load all selected role handlers before executing any included body.
-        for scope in scopes:
-            self._add_handlers(handlers, scope, become)
+    def _included_body_steps(self, tasks, scopes, become):
         for scope in scopes:
             yield self._node_steps(tasks, scope, become)
 
@@ -4862,7 +4860,8 @@ class Runtime:
             try:
                 yield from self._failed_include_steps(failed_exc)
                 yield self._node_steps(block["always"], scope, b_become)
-            except TaskFailed:
+            except TaskFailed as ex:
+                ex.pending_includes = None
                 # If always replaces a pending block/rescue failure, preserve
                 # the original count before propagating the new failure.
                 if (
@@ -4871,6 +4870,9 @@ class Runtime:
                     self._tally("failures")
                     failed_exc.counted = True
                 raise
+        elif failed_exc is not None:
+            # An outer block cannot insert tasks into a completed inner block.
+            failed_exc.pending_includes = None
         # `meta: clear_host_errors` (e.g. in the always section) forgives the
         # pending failure; the host still counts as failed once in the recap
         # (it was marked failed before being cleared, like Ansible).

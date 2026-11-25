@@ -1954,6 +1954,27 @@ def test_include_loop_runs_selected_body_before_block_recovery(tmp_path, section
     assert messages == ["first", "recovered"]
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores discard partial include results")
+def test_outer_rescue_drops_partial_include_bodies_but_keeps_handlers(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - block:
+            - include_role: {name: role_probe}
+              loop: [first, second]
+              when: item == 'first' or missing_condition
+      rescue:
+        - command: /bin/true
+          notify: included handler
+""", {
+        "roles/role_probe/tasks/main.yml": "- debug: {msg: unexpected body}\n",
+        "roles/role_probe/handlers/main.yml": "- name: included handler\n  debug: {msg: handler ran}\n",
+    })
+    assert messages == ["handler ran"]
+
+
 @pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="older cores merge loop metadata into item status")
 def test_include_loop_keeps_failed_loop_var_separate_from_item_status(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
