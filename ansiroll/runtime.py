@@ -3728,7 +3728,7 @@ class _Templater:
             # Its Jinja expressions still need lazy hostvars entries.
             with self._plugin_arg_scope(None):
                 result = self._render_string(
-                    text, ctx, strict, file_newline=file_newline, file_options=file_options)
+                    text, ctx, strict, file_newline=file_newline, file_options=file_options, file_header=file_header)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -3944,7 +3944,7 @@ class _Templater:
                     pending.extend(value)
         return False
 
-    def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=()):
+    def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=(), file_header=False):
         stripped = text.strip()
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
@@ -4029,8 +4029,13 @@ class _Templater:
                               else str(_as_text(result)))
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
+                if file_header and source_newlines == len(text):
+                    # Removing the header also consumed a trailing LF.
+                    source_newlines += 1
                 result_newlines = len(result) - len(result.rstrip("\n"))
-                result += file_newline * (source_newlines - result_newlines)
+                # Core 2.14–2.18 restore using the overlay's newline sequence.
+                restored_newline = env.newline_sequence if not native_file and _core_at_least(2, 14) else file_newline
+                result += restored_newline * (source_newlines - result_newlines)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
                 # when a later assertion member reads a cached alias.

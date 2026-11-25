@@ -1101,7 +1101,9 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     ("{{ value -}}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
     ("first\n{% if true %}second{% endif -%}\n", None, "\r\n", b"first\r\nsecond\r\n"),
     ("#jinja2: newline_sequence: '\\r\\n'\nfirst\n{% if true %}second{% endif -%}\n",
-     None, "\n", b"first\r\nsecond\n"),
+     None, "\n", b"first\r\nsecond\r\n" if Version("2.14") <= Version(__version__) < Version("2.19")
+     else b"first\r\nsecond\n"),
+    ("#jinja2: trim_blocks: False\n", None, "\n", b"" if MODERN_TEMPLATING else b"\n"),
     ("hello{# note -#} \n", None, "\n", b"hello\n"),
     ("hello\r\n{% set x = 1 -%}\r\n\r\n", None, "\n", b"hello\n"),
     ("{{ value }}{# note -#}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
