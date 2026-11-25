@@ -1561,6 +1561,16 @@ def test_delegated_set_fact_routes_each_loop_item():
     assert rt.vars["marker"] == "local"
 
 
+def test_local_cacheable_facts_feed_later_delegated_loop_items():
+    rt, _ = run([
+        _task("1", "increment", "set_fact",
+              args={"marker": "{{ (ansible_facts.marker | default(0) | int) + 1 }}", "cacheable": True},
+              delegate_to="recipient", delegate_facts=False, loop=[1, 2]),
+    ], host_vars={"inventory_hostname": "origin", "ansible_facts": {}, "hostvars": {"recipient": {}}})
+    assert rt.vars["ansible_facts"]["marker"] == 2
+    assert rt.vars["hostvars"]["recipient"] == {}
+
+
 def test_delegated_cacheable_fact_preserves_explicit_ansible_facts():
     rt, _ = run([
         _task("1", "explicit", "set_fact", args={"ansible_facts": "explicit"},

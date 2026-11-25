@@ -1746,6 +1746,19 @@ def _truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+class _LegacyFactResultQueue(collections.deque):
+    """Inspect 2.10 results at dequeue time, before linear publishes facts."""
+
+    def __init__(self, results, record):
+        super().__init__(results)
+        self._record = record
+
+    def popleft(self):
+        result = super().popleft()
+        self._record(result)
+        return result
+
+
 class _SetFactLinearStrategy(_LinearStrategy):
     """Use the worker's resolved delegation flags when linear publishes facts."""
 
@@ -1768,10 +1781,24 @@ class _SetFactLinearStrategy(_LinearStrategy):
                     self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
             return send_callback(method, *args, **kwargs)
 
+        # Core 2.10 consumes raw queues inline without a conversion hook.
+        raw_queues = ("_results", "_handler_results") if not (
+            hasattr(_LinearStrategy, "normalize_task_result")
+            or hasattr(_LinearStrategy, "_convert_wire_task_result_to_raw")
+            or _UnifiedTaskResult is not None
+        ) else ()
+        if raw_queues:
+            with self._results_lock:
+                for name in raw_queues:
+                    setattr(self, name, _LegacyFactResultQueue(getattr(self, name), self._record_legacy_routes))
         self._tqm.send_callback = capture_item
         try:
             return super().run(iterator, play_context)
         finally:
+            if raw_queues:
+                with self._results_lock:
+                    for name in raw_queues:
+                        setattr(self, name, collections.deque(getattr(self, name)))
             if original is None:
                 del self._tqm.send_callback
             else:
@@ -1803,7 +1830,14 @@ class _SetFactLinearStrategy(_LinearStrategy):
         if data.get("_ansible_item_result"):
             return
         host, task = ((result._host, result._task) if hasattr(result, "_task") else (result.host, result.task))
-        routes = self._fact_routes.pop((host.name, task._uuid), ())
+        if isinstance(task, str):
+            task_uuid = task
+            host = self._inventory.get_host(host)
+        else:
+            task_uuid = task._uuid
+        if host is None:
+            return
+        routes = self._fact_routes.pop((host.name, task_uuid), ())
         items = data.get("results", ())
         if routes and len(routes) == len(items) and not result.is_failed() and not result.is_unreachable():
             self._legacy_fact_items.update((id(item), (host, target)) for item, target in zip(items, routes)

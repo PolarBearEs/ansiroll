@@ -5432,6 +5432,11 @@ class Runtime:
                     elif isinstance(facts, dict):
                         action = (task.get("action") or "").rsplit(".", 1)[-1]
                         base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
+                        if commits_delegated_facts and action == "set_fact":
+                            cached = base_ctx.get("ansible_facts")
+                            base_ctx["ansible_facts"] = {
+                                **(cached if isinstance(cached, dict) else {}), **_normalized_facts(facts),
+                            }
                 res["item"] = it
                 if task.get("loop_label") is not None:
                     label_ctx = dict(ctx)
