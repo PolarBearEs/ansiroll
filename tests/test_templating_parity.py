@@ -1204,6 +1204,26 @@ DELEGATION""".replace("DELEGATION", "      delegate_to: localhost\n" if delegate
     assert {name: output.read_bytes() for name, output in outputs.items()} == expected
 
 
+def test_standalone_template_file_concatenates_buffered_native_values(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": """{% macro hello() %}Hello {{ 42 }}{% endmacro -%}
+{% set capture %}Capture {{ 43 }}{% endset -%}
+{{ hello() }}|{{ capture }}|{% filter upper %}Filter {{ 44 }}{% endfilter %}
+"""})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert output.read_bytes() == b"Hello 42|Capture 43|FILTER 44\n"
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"Hello 42|Capture 43|FILTER 44\n"
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 

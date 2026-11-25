@@ -3277,6 +3277,12 @@ class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
 
 
 class _FileCodeGenerator(_AnsirollCodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        # Jinja 2.11 uses its string-only global concat unless we bind the
+        # file environment's concatenator in the root and block functions.
+        self.writeline("concat = environment.concat")
+
     def _output_child_to_const(self, node, frame, finalize):
         if not isinstance(node, jinja2.nodes.TemplateData):
             raise jinja2.nodes.Impossible()
