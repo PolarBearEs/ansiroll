@@ -208,9 +208,9 @@ jobs:
           }
           if current_revision; then
             for attempt in 1 2 3; do
-              # Only the status on the merge commit can satisfy protection.
+              # GitHub also expects the protected check on the PR head.
               if check=$(gh api --method POST "$api/check-runs" --jq '.id' \
-                -f name="Manual Full CI / PR $PR" -f head_sha="$HEAD" -f details_url="$details_url" \
+                -f name="Manual Full CI" -f head_sha="$HEAD" -f details_url="$details_url" \
                 -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" \
                 -f "output[summary]=$(printf 'Merge commit: %s\nBase commit: %s' "$MERGE" "$BASE")"); then
                 revision_status=0
@@ -277,7 +277,7 @@ jobs:
           failed=0
           while IFS=$'\t' read -r pr head base branch; do
             [[ -n "$pr" ]] || continue
-            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Manual Full CI / PR $pr") ||
+            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Manual Full CI") ||
                ! stale=$(jq -r --arg base "$base" --arg branch "$branch" '
               .check_runs[] | select(.app.slug == "github-actions" and .conclusion != "cancelled" and
                 ($branch != "master" or (.output.summary // "" | endswith("Base commit: " + $base) | not))) | .id
