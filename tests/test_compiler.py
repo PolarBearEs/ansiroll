@@ -511,6 +511,76 @@ def test_hostname_vars_file_provenance_follows_later_selectors(tmp_path, monkeyp
     assert [frame["result"]["msg"] for frame in frames] == ["worker"]
 
 
+@pytest.mark.parametrize("hash_behaviour", ["replace", "merge"])
+def test_static_vars_file_shadows_earlier_hostname_projections(tmp_path, monkeypatch, hash_behaviour):
+    from ansible import constants as C
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", hash_behaviour)
+    monkeypatch.setenv("ANSIROLL_SHADOWED_PROFILE_SECRET", "controller-only-value")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - 'hosts/{{ inventory_hostname_short }}/settings.yml'
+    - static.yml
+    - "{{ profile.path if group_names else 'profiles/default.yml' }}"
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""")
+    worker = tmp_path / "hosts" / "worker"
+    worker.mkdir(parents=True)
+    (worker / "settings.yml").write_text("profile: {path: profiles/shadowed.yml, keep: true}\n")
+    (tmp_path / "static.yml").write_text("profile: {path: profiles/active.yml}\n")
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    active = profiles / "active.yml"
+    active.write_text("selected: active\n")
+    (profiles / "shadowed.yml").write_text(
+        "unused: \"{{ lookup('env', 'ANSIROLL_SHADOWED_PROFILE_SECRET') }}\"\n")
+    plays, _ = parse_playbook(str(playbook))
+    plan = plays[0]
+    assert "ANSIROLL_SHADOWED_PROFILE_SECRET" not in plan.get("controller_env", {})
+    files = plan["deferred_vars_files"][-1]["files"]
+    assert {path for path in files if os.path.dirname(path) == str(profiles)} == {str(active)}
+    frames = []
+    Runtime({}, "", {"inventory_hostname_short": "worker", "group_names": ["ungrouped"]},
+            on_result=frames.append).run_play(plan)
+    assert [frame["result"]["msg"] for frame in frames] == ["active"]
+
+
+@pytest.mark.parametrize("aliased", [False, True])
+def test_hostname_condition_can_select_an_explicit_external_vars_file(tmp_path, monkeypatch, aliased):
+    from ansiroll.loader import parse_playbook
+    from ansiroll.runtime import Runtime
+
+    monkeypatch.setenv("ANSIROLL_EXPLICIT_PROFILE_SECRET", "controller-only-value")
+    project = tmp_path / "project"
+    project.mkdir()
+    shared = tmp_path / "default.yml"
+    shared.write_text("selected: shared\nunused: \"{{ lookup('env', 'ANSIROLL_EXPLICIT_PROFILE_SECRET') }}\"\n")
+    selector = "{{ '%s' if (inventory_hostname_short | default('default')) == 'default' else 'dev.yml' }}" % shared
+    variables = "  vars: {profile: %s}\n" % json.dumps(selector) if aliased else ""
+    filename = "{{ profile }}" if aliased else selector
+    (project / "play.yml").write_text("""- hosts: all
+  gather_facts: false
+%s  vars_files:
+    - %s
+  tasks:
+    - debug: {msg: '{{ selected }}'}
+""" % (variables, json.dumps(filename)))
+    (project / "dev.yml").write_text("selected: dev\n")
+    plays, _ = parse_playbook(str(project / "play.yml"))
+    plan = plays[0]
+    assert str(shared) in plan["deferred_vars_files"][0]["files"]
+    assert "ANSIROLL_EXPLICIT_PROFILE_SECRET" not in plan.get("controller_env", {})
+    for hostname, expected in (("default", "shared"), ("dev", "dev")):
+        frames = []
+        Runtime({}, "", {"inventory_hostname_short": hostname}, on_result=frames.append).run_play(plan)
+        assert [frame["result"]["msg"] for frame in frames] == [expected]
+
+
 def test_standalone_vars_files_keep_glob_for_overridden_ternary(tmp_path):
     from ansiroll.loader import parse_playbook
     from ansiroll.runtime import Runtime
