@@ -604,9 +604,12 @@ class StrategyModule(StrategyBase):
                 if task is not None:
                     self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"), frame.get("name"))
             elif t == "rescue_overrides":
-                facts = self._restore_rescue_value(frame["facts"])
                 private = _private_rescue_facts(self._variable_manager, host.name)
-                self._save_rescue_facts(host.name, facts, private.keys() & facts.keys())
+                if private:
+                    facts = self._restore_rescue_value(frame["facts"])
+                    accepted = {name: value for name, value in facts.items() if name in private}
+                    if accepted:
+                        self._save_rescue_facts(host.name, accepted, accepted.keys())
             elif t == "gather_setup":
                 data = (self._gather_setup_options(host, gather_task) if gather_task is not None
                         else {"error": "implicit setup was not scheduled"})
@@ -2075,20 +2078,26 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
         try:
             host = inventory.get_host(name) if inventory is not None else None
             private_names = _private_rescue_facts(manager, host.name if host else name)
-            raw = raw_get(name) if raw_get is not None and (private_names or preserve_keys) else {}
             if private_names:
                 from ansible.vars.hostvars import HostVarsVars
 
-                # Templating an alias in the original view could disclose
-                # data even after stripping the private keys from its output.
-                if not isinstance(raw, dict):
+                if host is None:
                     continue
+                # Remove only the private fact layer before precedence is
+                # applied. This also keeps aliases from resolving it.
+                public_manager = object.__new__(type(manager))
+                vars(public_manager).update(vars(manager))
+                cache = manager._nonpersistent_fact_cache.copy()
+                cache[host.name] = {key: value for key, value in cache[host.name].items() if key not in private_names}
+                public_manager._nonpersistent_fact_cache = cache
+                raw = public_manager.get_vars(host=host, include_hostvars=False)
                 raw = {key: value for key, value in raw.items()
-                       if key not in private_names and key not in ("vars", "hostvars")}
+                       if key not in ("vars", "hostvars")}
                 raw["vars"] = dict(raw)
                 host_kw = {"host": name} if _core_version() >= (2, 19) else {}
                 source = HostVarsVars(raw, loader=hostvars._loader, **host_kw)
             else:
+                raw = raw_get(name) if raw_get is not None and preserve_keys else {}
                 source = hostvars[name]
             keys = list(source)
         except Exception:

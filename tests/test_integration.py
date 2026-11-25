@@ -5660,6 +5660,51 @@ LOOP
     assert "rejected-override" not in result.stdout + result.stderr
 
 
+def test_strategy_does_not_publish_censored_fact_under_an_untracked_rescue_name(tmp_path):
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  tasks:
+    - set_fact:
+        ansible_failed_result: {msg: untracked-private-value}
+      no_log: true
+- hosts: recipient
+  gather_facts: false
+  tasks:
+    - assert:
+        that: hostvars.origin.ansible_failed_result is undefined
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "untracked-private-value" not in proc.stdout + proc.stderr
+
+
+def test_strategy_hostvars_preserve_extra_vars_shadowing_rescue_facts(tmp_path):
+    inventory = tmp_path / "inventory.yml"
+    inventory.write_text("""all:
+  hosts:
+    origin:
+      failure_alias: "{{ ansible_failed_result.msg }}"
+    recipient:
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: private-rescue-value}
+          no_log: true
+      rescue:
+        - debug: {msg: rescued}
+- hosts: recipient
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - hostvars.origin.ansible_failed_result.msg == 'explicit-value'
+          - hostvars.origin.failure_alias == 'explicit-value'
+""", "-e", json.dumps({"ansible_failed_result": {"msg": "explicit-value"}}), inventory=str(inventory))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "private-rescue-value" not in proc.stdout + proc.stderr
+
+
 @pytest.mark.parametrize("write", ["inventory", "set_fact", "register", "replace-rescue"])
 def test_strategy_keeps_ordinary_rescue_names_in_hostvars(tmp_path, write):
     inventory = tmp_path / "inventory.yml"
