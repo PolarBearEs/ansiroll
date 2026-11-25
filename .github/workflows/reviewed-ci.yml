@@ -131,6 +131,26 @@ jobs:
           state=error
           conclusion=action_required
           description="Incomplete job results for merge $MERGE"
+          required_jobs_passed() {
+            local delay jobs
+            for delay in 0 2 4 6; do
+              ((delay == 0)) || sleep "$delay"
+              if jobs=$(gh api --paginate "$api/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100") &&
+                 jq -se --argjson attempt "$MERGE_ATTEMPT" '
+                  [.[].jobs[] | select(.run_attempt >= $attempt)] |
+                  group_by(.name) | map(max_by([.run_attempt, .id])) |
+                  map(select((.name | startswith("tests / "))
+                    and (.name | endswith("ansible ansible-base==2.10.17 (py3.9)") | not)
+                    and (.name | endswith("Ansible parity 2.10") | not))) |
+                  # ci.yml has four standalone jobs and seven required legs per matrix.
+                  length == 18 and all(.[]; .conclusion == "success")
+                 ' <<< "$jobs" >/dev/null; then
+                return 0
+              fi
+            done
+            echo '::warning::GitHub did not return all required test results.' >&2
+            return 1
+          }
           if [[ -n "$CACHED_RUN" ]]; then
             state=success
             details_url=$CACHED_RUN
@@ -146,17 +166,7 @@ jobs:
             # reuse results from attempts that tested the same merge.
             if [[ "$TESTS_RESULT" == failure ]]; then
               state=failure
-            elif [[ "$TESTS_RESULT" == success ]] &&
-                 jobs=$(gh api --paginate --slurp "$api/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100") &&
-                 jq -e --argjson attempt "$MERGE_ATTEMPT" '
-              [.[].jobs[] | select(.run_attempt >= $attempt)] |
-              group_by(.name) | map(max_by([.run_attempt, .id])) |
-              map(select((.name | startswith("tests / "))
-                and (.name | endswith("ansible ansible-base==2.10.17 (py3.9)") | not)
-                and (.name | endswith("Ansible parity 2.10") | not))) |
-              # ci.yml defines four standalone jobs and seven required legs in each matrix.
-              length == 18 and all(.[]; .conclusion == "success")
-                 ' <<< "$jobs" >/dev/null; then
+            elif [[ "$TESTS_RESULT" == success ]] && required_jobs_passed; then
               state=success
             elif [[ "$TESTS_RESULT" == cancelled ]]; then
               conclusion=cancelled
@@ -186,11 +196,19 @@ jobs:
           # Only create terminal checks. A force cancellation can skip the
           # reporter entirely, so it must not strand an in-progress check.
           current_revision() {
-            pr=$(gh api "$api/pulls/$PR") || return 2
-            jq -e --arg head "$HEAD" --arg base "$BASE" --arg merge "$MERGE" '
-              .state == "open" and .head.sha == $head and .base.ref == "master" and
-              .base.sha == $base and .merge_commit_sha == $merge
-            ' <<< "$pr" >/dev/null
+            local delay pr actual_merge
+            for delay in 0 2 4; do
+              ((delay == 0)) || sleep "$delay"
+              pr=$(gh api "$api/pulls/$PR") || continue
+              jq -e --arg head "$HEAD" --arg base "$BASE" '
+                .state == "open" and .head.sha == $head and .base.ref == "master" and .base.sha == $base
+              ' <<< "$pr" >/dev/null || return 1
+              actual_merge=$(jq -r '.merge_commit_sha // empty' <<< "$pr")
+              [[ -n "$actual_merge" ]] || continue
+              [[ "$actual_merge" == "$MERGE" ]]
+              return
+            done
+            return 2
           }
           if current_revision; then
             for attempt in 1 2 3; do
