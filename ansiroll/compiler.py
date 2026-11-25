@@ -910,6 +910,8 @@ def _module_archive_entries(raw):
 
 def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
                    frozen_vars=None):
+    from .runtime import _fact_key_template_paths
+
     module_meta = {}
     module_archives = {}
     for action in sorted(modules):
@@ -938,6 +940,10 @@ def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
             play["ordered_vars_files"] = [index.get(id(entry), entry) for entry in play["ordered_vars_files"]]
     data_entries = {
         "plays.json": json.dumps(compact_plays, default=_json_default).encode("utf-8"),
+        "fact-key-templates.json": json.dumps({
+            "plays": _fact_key_template_paths(compact_plays),
+            "group_vars": _fact_key_template_paths(group_vars),
+        }).encode("utf-8"),
         "modules.json": json.dumps(module_meta, default=_json_default).encode("utf-8"),
         "group_vars.json": json.dumps(group_vars or {}, default=_json_default).encode("utf-8"),
         "specialized_vars.json": json.dumps(
@@ -1112,8 +1118,11 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         "def _ansiroll_bundle_json(name):\n"
         "    return json.loads(_ansiroll_resource_read(name).decode('utf-8'))\n",
         "MODULES = _ansiroll_bundle_json('modules.json')\n",
-        "PLAYS = _ansiroll_bundle_json('plays.json')\n",
-        "_BAKED_GROUP_VARS = _ansiroll_bundle_json('group_vars.json')\n",
+        "_ansiroll_fact_key_paths = _ansiroll_bundle_json('fact-key-templates.json')\n",
+        "PLAYS = _restore_fact_key_templates(_ansiroll_bundle_json('plays.json'), "
+        "_ansiroll_fact_key_paths['plays'])\n",
+        "_BAKED_GROUP_VARS = _restore_fact_key_templates(_ansiroll_bundle_json('group_vars.json'), "
+        "_ansiroll_fact_key_paths['group_vars'])\n",
         "_SPECIALIZED_VARS = _ansiroll_bundle_json('specialized_vars.json')\n",
         "_FROZEN_VARS = {k: _decode_frozen_value(v) for k, v in "
         "_ansiroll_bundle_json('frozen_vars.json').items()}\n",

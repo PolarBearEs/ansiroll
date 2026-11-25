@@ -2987,6 +2987,86 @@ def test_set_fact_templates_authored_fact_names(tmp_path, use_strategy):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
+    unsafe_task = """
+    - set_fact: {}
+      args: '{{ unsafe_args }}'
+      ignore_errors: true
+""" if MODERN_TEMPLATING else ""
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_name: greeting
+    fact_args:
+      '{{ fact_name }}': hello
+    unsafe_args:
+      !unsafe '{{ fact_name }}': overwritten
+  tasks:
+    - set_fact: {}
+      args: '{{ fact_args }}'
+""" + unsafe_task + """
+    - assert:
+        quiet: true
+        that: greeting == 'hello'
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern args and omit semantics")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_finalizes_selected_args_and_omits_nested_values(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_args:
+      status: '{{ never_defined }}'
+      details:
+        kept: ready
+        missing: '{{ never_defined | default(omit) }}'
+        items: [ready, '{{ never_defined | default(omit) }}']
+  tasks:
+    - set_fact:
+        status: ready
+      args: '{{ fact_args }}'
+    - set_fact:
+        optional: ready
+      args: '{{ optional_facts | default(omit) }}'
+    - set_fact:
+        literal: unset
+      vars:
+        omit: unset
+    - assert:
+        quiet: true
+        that:
+          - status == 'ready'
+          - "details == {'kept': 'ready', 'items': ['ready']}"
+          - optional == 'ready'
+          - literal == 'unset'
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older parsers consume raw_params as an internal argument")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_preserves_an_explicit_raw_params_fact(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    payload: {inner: keep}
+  tasks:
+    - set_fact:
+        _raw_params: "{{ payload }}"
+      delegate_to: localhost
+    - assert:
+        quiet: true
+        that:
+          - _raw_params.inner == 'keep'
+          - inner is undefined
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
 def test_loop_preserves_distinct_registered_results(tmp_path, use_strategy):
     _, recap = _assert_parity(tmp_path, """
 - hosts: localhost

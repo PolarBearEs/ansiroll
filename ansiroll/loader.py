@@ -1430,6 +1430,8 @@ def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
 
 def _tag_untrusted(value, template_syntax_only=False):
     """Mark strings that are explicitly not trusted (for example `!unsafe`)."""
+    from .runtime import _FactKeyTemplate
+
     try:
         from ansible._internal._datatag._tags import TrustedAsTemplate
     except ImportError:
@@ -1444,7 +1446,8 @@ def _tag_untrusted(value, template_syntax_only=False):
             if not template_syntax_only or "{{" in v or "{%" in v:
                 return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
+            return {_FactKeyTemplate(k) if isinstance(k, str) and ("{{" in k or "{%" in k)
+                    and not untrusted(k) else k: walk(x) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
         if isinstance(v, tuple):
@@ -2425,6 +2428,15 @@ def _convert_task(task, actions, basedir):
         trusted_keys = [k for k in _tag_untrusted(keys) if isinstance(k, str)]
         if trusted_keys:
             node["set_fact_key_templates"] = trusted_keys
+        if "_raw_params" in args:
+            from ansible.parsing.splitter import split_args
+
+            source = task.get_ds() or {}
+            forms = (source.get("args"), source.get(action), source.get("action"), source.get("local_action"))
+            node["set_fact_raw_params_is_fact"] = any(
+                (isinstance(form, dict) and "_raw_params" in form)
+                or (isinstance(form, str) and any(token.startswith("_raw_params=") for token in split_args(form)))
+                for form in forms)
     if action.split(".")[-1] == "assert":
         node["args"] = {k: v if k == "that" else _tag_untrusted(v)
                         for k, v in node["args"].items()}
