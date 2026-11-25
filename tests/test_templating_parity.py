@@ -978,7 +978,8 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     output = tmp_path / "rendered.txt"
     expected = _ansible(path, tmp_path)
     expected_text = output.read_text()
-    suffix = "None" if (2, 13) <= _core_version() < (2, 19) else ""
+    version = _core_version()
+    suffix = "None" if version < (2, 12) or (2, 13) <= version < (2, 19) else ""
     assert expected_text == "prefix=controller/" + suffix + "\n"
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
@@ -2230,6 +2231,8 @@ def test_dynamic_include_when_uses_loop_item(tmp_path, action):
     assert messages == ["allowed", "second"]
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
+                    reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_include_loop_registers_results_and_tallies_ignored_failures(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
@@ -2433,6 +2436,8 @@ def test_include_loop_censors_no_log_item_values(tmp_path):
     assert "synthetic-private-item" not in result.stdout + result.stderr
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
+                    reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost

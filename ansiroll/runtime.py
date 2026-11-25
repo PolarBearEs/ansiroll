@@ -2941,9 +2941,10 @@ def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
         native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
-        # Ansible 2.13–2.18 reuse the native finalizer when switching the
-        # template action to a text environment. Earlier cores replace it.
-        if not native or (context.get(_TEMPLATE_FILE_TEXT) and not _core_at_least(2, 13)):
+        # Ansible 2.12 replaces the native finalizer for template files.
+        # Other legacy versions preserve native None stringification here.
+        text_finalizer = context.get(_TEMPLATE_FILE_TEXT) and _core_at_least(2, 12) and not _core_at_least(2, 13)
+        if not native or text_finalizer:
             return ""
     return _concretize(value)
 
