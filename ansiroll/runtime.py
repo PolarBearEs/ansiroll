@@ -4871,8 +4871,10 @@ class Runtime:
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
+        # Resolve aliases when a child consumes them so its task vars and
+        # facts written during the block participate in normal precedence.
         scope.update(self.template_vars(
-            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay)))
+            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay), defer=True))
         # Frames run strictly nested, so the block's conditions stay in force while its children are on the stack.
         inherited = self._inherited_when
         self._inherited_when = self._when_of(block)

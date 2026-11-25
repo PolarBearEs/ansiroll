@@ -93,6 +93,33 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
     return expected
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_follow_child_task_precedence(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact: {value: first}
+    - block:
+        - debug:
+            msg: "{{ value }} / {{ alias }} / {{ nested.leaf }}"
+        - set_fact: {value: second}
+        - debug:
+            msg: "{{ value }} / {{ alias }} / {{ nested.leaf }}"
+        - debug:
+            msg: "{{ other }} / {{ other_alias }}"
+          vars:
+            other: task
+      vars:
+        value: block
+        alias: "{{ value }}"
+        nested: {leaf: "{{ value }}"}
+        other: block
+        other_alias: "{{ other }}"
+""", use_strategy=use_strategy)
+    assert messages == ["first / first / first", "second / second / second", "task / task"]
+
+
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
     (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local import')\n")
     result = subprocess.run(
