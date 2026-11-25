@@ -5835,14 +5835,31 @@ class Runtime:
         if args_cache is None:
             args_cache = {}
         if "args" not in args_cache:
-            args = self.template(raw_args, ctx)
+            argument_layer = (source_task or {}).get("_file_source_argument_layer")
+            if argument_layer:
+                raw_args = dict(raw_args)
+                source = self.templater.render_string(raw_args.pop(argument_layer), ctx)
+                if not isinstance(source, dict):
+                    _fail_on_undef(source)
+                    if source == _OMIT or argument_layer == "_variable_params" and _legacy_templating():
+                        source = {}
+                    else:
+                        raise ValueError("file source arguments must resolve to a dictionary")
+                inherited = {key: raw_args.pop(key) for key in source_task["_file_source_inherited_args"]}
+                expanded = {key: source[key] for key in source if key not in raw_args}
+                inherited = {key: value for key, value in inherited.items() if key not in expanded}
+                args = {**self.template(inherited, ctx), **expanded, **self.template(raw_args, ctx)}
+            else:
+                args = self.template(raw_args, ctx)
             if source_task and source_task.get("_file_source_defaults"):
-                args = {**self._render_file_source_defaults(source_task, ctx), **args}
+                args = {**self._render_file_source_defaults(source_task, ctx, args.keys()), **args}
             args_cache["args"] = args
         return args_cache["args"]
 
-    def _render_file_source_defaults(self, task, ctx):
-        keys = set(task["_file_source_default_keys"])
+    def _render_file_source_defaults(self, task, ctx, provided):
+        keys = set(task["_file_source_default_keys"]) - provided
+        if not keys:
+            return {}
         selected = {}
         for entry in task["_file_source_defaults"]:
             templated = isinstance(entry, str)
@@ -6295,15 +6312,6 @@ class Runtime:
             }
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
-        if (name == "copy" and isinstance(args, dict)
-                and args.get("src") is not None and args.get("content") is None
-                and args.get("dest")
-                and _ansible_boolean(args.get("remote_src", False))):
-            # The copy action plugin (after its argument checks and the
-            # content branch) hands remote_src copies straight to the copy
-            # module, which reads src on the target.
-            return self.run_module(
-                task["action"], _fail_on_undef(_strip_omit(args)), become=become)
         if name in ("template", "copy"):
             return self._run_file_action(name, task, args, ctx, become)
         if name == "assert":
@@ -6596,9 +6604,9 @@ class Runtime:
                 failure = "can not use content with a dir as dest"
             if failure:
                 return {"failed": True, "changed": False, "msg": failure}
-            if content is None and _ansible_bool(args.get("remote_src", False)):
+            if content is None and _ansible_boolean(args.get("remote_src", False)):
                 args.pop("decrypt", None)
-                return self.run_module(_COPY_MODULE, args, become=become)
+                return self.run_module(_COPY_MODULE, _fail_on_undef(args), become=become)
         else:
             content = None
 

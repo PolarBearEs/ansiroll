@@ -2417,13 +2417,24 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
     if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
         source_action = action.rsplit(".", 1)[-1]
         unknown_defaults = False
+        argument_layer = None
         if source_action in ("copy", "unarchive"):
+            explicit = set(node["args"])
+            if "_variable_params" in explicit:
+                argument_layer = "_variable_params"
+            elif _contains_dynamic_value(node["args"].get("_raw_params")):
+                argument_layer = "_raw_params"
             unknown_defaults = _apply_file_source_defaults(task, source_action, node)
+            if argument_layer:
+                node["_file_source_argument_layer"] = argument_layer
+                node["_file_source_inherited_args"] = sorted(node["args"].keys() - explicit)
+                node["fallback"] = True
+                node["fallback_reason"] = "templated file source arguments require controller selection"
         _bake_sources(node, task, basedir, controller_execution=controller_execution,
-                      unknown_defaults=unknown_defaults)
+                      unknown_defaults=unknown_defaults or argument_layer is not None)
         decrypt = node["args"].get("decrypt", True)
         if (source_action in ("copy", "unarchive") and not node.get("_vault_plaintext")
-                and (unknown_defaults or _contains_dynamic_value(decrypt)
+                and (unknown_defaults or argument_layer or _contains_dynamic_value(decrypt)
                      or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
                 and any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
                         for value in (node.get("_baked") or {}).values())):
@@ -2434,6 +2445,8 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
             ]
             if unknown_defaults:
                 node["_vault_source_inputs"].append("module_defaults")
+            if argument_layer:
+                node["_vault_source_inputs"].append(argument_layer)
             node["fallback"] = True
             node["fallback_reason"] = "Vault source needs controller selection and decryption"
         if node["special"] is None:
@@ -2707,7 +2720,7 @@ def _apply_file_source_defaults(task, action, node):
     if action == "unarchive":
         source_keys.add("copy")
     else:
-        source_keys.add("content")
+        source_keys.update(("content", "mode"))
     missing = source_keys - args.keys()
     if missing and any(not isinstance(entry, dict) for entry in entries):
         node["_file_source_defaults"] = _tag_untrusted(entries)
@@ -2741,7 +2754,10 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
-    with_meta = name == "template" or (name == "copy" and (mode == "preserve" or _contains_dynamic_value(mode)))
+    with_meta = name == "template" or (name == "copy" and (
+        mode == "preserve" or _contains_dynamic_value(mode)
+        or "mode" in node.get("_file_source_default_keys", ())
+    ))
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
     src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)

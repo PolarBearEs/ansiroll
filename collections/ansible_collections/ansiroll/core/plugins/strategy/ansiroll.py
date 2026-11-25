@@ -317,6 +317,8 @@ class StrategyModule(StrategyBase):
             linear_reason = "dynamic role or templated action requires core linear"
         elif any(item["kind"] == "vault-source" for item in controller_reasons):
             linear_reason = "Vault source selection requires core linear"
+        elif any(item["kind"] == "file-source-arguments" for item in controller_reasons):
+            linear_reason = "templated file source arguments require core linear"
         elif not self._delegate_on_target and any(flag is not False for flag in fact_routes):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
@@ -1685,8 +1687,13 @@ def _controller_fallbacks(play_node):
                 walk(node.get("tasks"))
                 walk(node.get("handlers"))
             if node.get("fallback"):
+                kind = "controller-fallback"
+                if node.get("_deferred_vault_source"):
+                    kind = "vault-source"
+                elif node.get("_file_source_argument_layer"):
+                    kind = "file-source-arguments"
                 found.append({
-                    "kind": "vault-source" if node.get("_deferred_vault_source") else "controller-fallback",
+                    "kind": kind,
                     "task": node.get("name") or node.get("action"),
                     "reason": node.get("fallback_reason")
                               or "controller fallback",
