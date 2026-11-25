@@ -524,13 +524,35 @@ class StrategyModule(StrategyBase):
             chan.send_blob(agent_source)  # frame 1: the agent source
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
-                host, chan, task_map, hv, templar, become_pass, play_context)
+                host, chan, task_map, hv, templar, become_pass, play_context,
+                gather_task=task_map.get("__gather_facts__") if gather_facts else None)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
         finally:
             chan.close()
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
+    def _gather_setup_options(self, host, gather_task):
+        from ansiroll.loader import _core_version
+
+        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
+                   if key in gather_task.args}
+        if options.get("gather_subset") == ["all"] and "gather_subset" not in (self._cur_play.get_ds() or {}):
+            del options["gather_subset"]
+        error = None
+        if options:
+            try:
+                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+                values["ansible_search_path"] = gather_task.get_search_path()
+                options = self._mk_templar(values).template(options)
+                if _core_version() < (2, 19) and (omit := values.get("omit")):
+                    from ansible.executor.task_executor import remove_omit
+
+                    options = remove_omit(options, omit)
+            except AnsibleError as ex:
+                error = str(ex)
+        return {"options": options if error is None else {}, "error": error}
+
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -578,7 +600,15 @@ class StrategyModule(StrategyBase):
             elif t == "rescue":
                 task = task_map.get(frame.get("task"))
                 if task is not None:
-                    self._mirror_rescued_failure(host, task, frame["result"])
+                    self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"))
+            elif t == "rescue_overrides":
+                self._variable_manager.set_nonpersistent_facts(
+                    host.name, self._restore_rescue_value(frame["facts"]))
+            elif t == "gather_setup":
+                data = (self._gather_setup_options(host, gather_task) if gather_task is not None
+                        else {"error": "implicit setup was not scheduled"})
+                gather_task = None
+                chan.send({"t": "gather_setup_result", "setup": data})
             elif t == "delegate":
                 delegate_started = time.monotonic()
                 chan.send({"t": "delegate_result",
@@ -616,23 +646,30 @@ class StrategyModule(StrategyBase):
             last_frame = now
         return host_failed
 
-    def _mirror_rescued_failure(self, host, task, result):
-        # This is variable state for later plays. Display has already received
-        # the ordinary result frame with any no_log censoring applied.
+    def _restore_rescue_value(self, packed):
+        from ansiroll.runtime import _restore_rescue_scalars
+
+        value = _restore_rescue_scalars(packed)
         if _UnifiedTaskResult is None:
             from ansible.utils.unsafe_proxy import wrap_var
 
-            failed_task = wrap_var(task.serialize())
-            value = wrap_var(result["value"])
-        else:
-            failed_task = task.dump_attrs()
-            value = result["value"]
-        failure = self._restore_play_fallback(
-            value, result["undefined"], result.get("errors", ()), result.get("mapping_keys", ()),
-        )
+            value = wrap_var(value)
+        return self._restore_play_fallback(
+            value, packed["undefined"], packed.get("errors", ()), packed.get("mapping_keys", ()))
+
+    def _mirror_rescued_failure(self, host, task, result, args=None):
+        # This is variable state for later plays. Display has already received
+        # the ordinary result frame with any no_log censoring applied.
+        failed_task = task.dump_attrs() if hasattr(task, "dump_attrs") else task.serialize()
+        if args is not None:
+            failed_task["args"] = self._restore_rescue_value(args)
+        if _UnifiedTaskResult is None:
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            failed_task = wrap_var(failed_task)
         self._variable_manager.set_nonpersistent_facts(host.name, {
             "ansible_failed_task": failed_task,
-            "ansible_failed_result": failure,
+            "ansible_failed_result": self._restore_rescue_value(result),
         })
 
     @staticmethod
@@ -1270,21 +1307,27 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
+        from ansiroll.runtime import _RESCUE_FACT_NAMES, _pack_include_value
+
         mapping_keys = {"host": [], "overrides": []}
         blob = _json_blob(hv, mapping_keys["host"])
         extra_blob = _json_blob(_extra_vars(self._variable_manager))
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
-        override_blob = _json_blob(nonpersistent, mapping_keys["overrides"])
+        rescue = {key: nonpersistent[key] for key in _RESCUE_FACT_NAMES & nonpersistent.keys()}
+        override_blob = _json_blob(
+            {key: value for key, value in nonpersistent.items() if key not in rescue}, mapping_keys["overrides"])
+        rescue_blob = json.dumps(_pack_include_value(rescue, preserve_scalars=True)) if rescue else "null"
         return (
             "_INJECTED_HOST = %r\n"
             "_INJECTED_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_EXTRA_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_HOST_VAR_OVERRIDES = __import__('json').loads(%r)\n"
+            "_INJECTED_RESCUE_FACTS = __import__('json').loads(%r)\n"
             "_INJECTED_VAR_MAPPING_KEYS = __import__('json').loads(%r)\n"
             "_INJECTED_BECOME_PASS = %r\n"
-            % (host.name, blob, extra_blob, override_blob, json.dumps(mapping_keys), become_pass)
+            % (host.name, blob, extra_blob, override_blob, rescue_blob, json.dumps(mapping_keys), become_pass)
         )
 
     def _connect(self, host, play_context, hv, templar=None):
@@ -1985,7 +2028,7 @@ def _json_blob(values, mapping_keys=None):
 
 
 def _hostvars_snapshot(hostvars, *, preserve_keys=False):
-    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
+    from ansiroll.runtime import _RESCUE_FACT_NAMES, _contains_typed_mapping_keys, _pack_delegated_value
 
     if hostvars is None:
         return {}
@@ -2007,7 +2050,7 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
             continue
         safe = {}
         for key in keys:
-            if key in ("hostvars", "vars"):
+            if key in ("hostvars", "vars") or key in _RESCUE_FACT_NAMES:
                 continue
             try:
                 value = source[key]
