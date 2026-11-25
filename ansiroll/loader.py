@@ -745,6 +745,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if deferred:
         result["deferred_vars_files"] = deferred
     if gather:
+        setup_defaults = _setup_module_defaults(play)
         setup_options = {
             name: value
             for name in ("gather_subset", "fact_path")
@@ -752,8 +753,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         }
         # Older cores expose their default subset on the loaded Play. Leave
         # the equivalent setup default implicit when the play did not set it.
-        if setup_options.get("gather_subset") == ["all"] and "gather_subset" not in (play.get_ds() or {}):
+        play_data = play.get_ds() or {}
+        if (not setup_defaults and setup_options.get("gather_subset") == ["all"]
+                and "gather_subset" not in play_data):
             del setup_options["gather_subset"]
+        if setup_defaults:
+            result["gather_setup_defaults"] = _tag_untrusted(setup_defaults)
+            if "gather_timeout" not in play_data and play.gather_timeout is not None:
+                result["gather_timeout"] = play.gather_timeout
         if setup_options:
             result["gather_setup_options"] = _tag_untrusted(setup_options)
     # Retain authored selectors and compile-selected definitions, including
@@ -825,6 +832,17 @@ def _apply_force_handlers_default(play):
         play.force_handlers = bool(C.DEFAULT_FORCE_HANDLERS)
     except Exception:
         pass
+
+
+def _setup_module_defaults(play):
+    action = "ansible.builtin.setup"
+    defaults = {}
+    for layer in play.module_defaults or ():
+        defaults.update(layer)
+    groups = (play._action_groups or {}).get(action, ())
+    inherited = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
+    inherited.append(defaults.get(action))
+    return [entry for entry in inherited if entry]
 
 
 def _controller_env_names(value):

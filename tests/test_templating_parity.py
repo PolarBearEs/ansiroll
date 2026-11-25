@@ -112,6 +112,49 @@ def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypat
     assert messages == ["subset/custom" if custom_path else "subset/missing"]
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_applies_templated_module_defaults(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  vars:
+    setup_defaults:
+      filter: [ansible_distribution]
+  module_defaults:
+    ansible.builtin.setup: "{{ setup_defaults }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores set an implicit gather_subset override")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_arguments_override_module_defaults(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.setup:
+      gather_subset: ['!all', '!min']
+  tasks:
+    - debug:
+        msg: "{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"
+
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  module_defaults:
+    ansible.builtin.setup:
+      gather_subset: "{{ intentionally_undefined_and_overridden }}"
+  tasks:
+    - debug:
+        msg: "{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["subset", "full"]
+
+
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
     (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local import')\n")
     result = subprocess.run(

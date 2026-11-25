@@ -4574,6 +4574,7 @@ class Runtime:
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
                 setup_options=play.get("gather_setup_options"),
+                setup_defaults=play.get("gather_setup_defaults"),
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
             )
@@ -6798,7 +6799,7 @@ class Runtime:
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None):
+                     setup_options=None, setup_defaults=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -6832,6 +6833,15 @@ class Runtime:
                 gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                 setup_args["gather_timeout"] = gather_timeout
+            defaults = {}
+            for entry in setup_defaults or ():
+                if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
+                    entry = _fail_on_undef(self.template(entry, ctx, strict=True))
+                if not isinstance(entry, dict):
+                    raise ValueError("setup module defaults must resolve to a dictionary")
+                defaults.update(entry)
+            inherited = {key: value for key, value in defaults.items() if key not in setup_args}
+            setup_args.update(_fail_on_undef(_strip_omit(self.template(inherited, ctx, strict=True))))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
