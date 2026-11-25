@@ -174,7 +174,7 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                 setup_scope["controller_lookups"] = {
                     "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
                     "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
-                    "file": _capture_setup_files(play, lookups.get("file", ())),
+                    "file": _capture_setup_files(play, lookups.get("file", {})),
                 }
             node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
@@ -347,7 +347,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     timeout_names = set(runtime["names"]) if runtime is not None else set()
     setup_names = set()
     computed = set()
-    setup_lookups = {"env": set(), "config": set(), "file": set()}
+    setup_lookups = {"env": set(), "config": set(), "file": {}}
     lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
     for layer in (*exports, play.get_variable_manager().extra_vars, magic):
         lookup_scope = combine_vars(lookup_scope, layer)
@@ -432,24 +432,34 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     return result
 
 
-def _capture_setup_files(play, names):
+def _capture_setup_files(play, terms_by_alias):
     """Resolve literal early setup file lookups using the controller search path."""
     from ansible.errors import AnsibleError
-    from ansible.plugins.loader import lookup_loader
+    from ansible.plugins import loader as plugin_loader
+    from ansible.plugins.lookup import file as builtin_file
 
-    if not names:
+    if not terms_by_alias:
         return {}
     loader = play._loader
-    plugin = lookup_loader.get("file", loader=loader)
+    plugin = plugin_loader.lookup_loader.get("ansible.builtin.file", loader=loader)
     search_path = play.get_search_path() if hasattr(play, "get_search_path") else [loader.get_basedir()]
     variables = {"ansible_search_path": search_path}
+    plugin_dirs = [loader.get_basedir(), *(role._role_path for role in (play.roles or ()) if role._role_path)]
+    overrides_file = any(os.path.isfile(os.path.join(root, "lookup_plugins", "file.py")) for root in plugin_dirs)
+    builtin_path = os.path.realpath(builtin_file.__file__)
     captured = {}
-    for name in sorted(names):
-        try:
-            captured[name], = plugin.run([name], variables=variables, lstrip=False, rstrip=False)
-        except (AnsibleError, OSError):
-            # Missing terms fail only if the runner actually selects them.
-            continue
+    for alias, names in sorted(terms_by_alias.items()):
+        if alias != "ansible.builtin.file":
+            resolved = plugin_loader.lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
+            if overrides_file or not resolved or os.path.realpath(resolved) != builtin_path:
+                continue
+        files = captured[alias] = {}
+        for name in sorted(names):
+            try:
+                files[name], = plugin.run([name], variables=variables, lstrip=False, rstrip=False)
+            except (AnsibleError, OSError):
+                # Missing terms fail only if the runner actually selects them.
+                continue
     return captured
 
 
@@ -460,7 +470,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
-                          _selector_template_sources)
+                          _selector_template_sources, _setup_builtin_lookup)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
@@ -495,10 +505,12 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 return None
             if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
-                plugin = call.args[0].value.rsplit(".", 1)[-1]
+                alias = call.args[0].value
+                plugin = _setup_builtin_lookup(alias)
                 if plugin in lookups:
-                    lookups[plugin].update(arg.value for arg in call.args[1:]
-                                           if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
+                    terms = lookups[plugin].setdefault(alias, set()) if plugin == "file" else lookups[plugin]
+                    terms.update(arg.value for arg in call.args[1:]
+                                 if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
                                                 resolve_aliases=resolve_aliases, analysis=analysis,
                                                 retain_mutable=retain_mutable):

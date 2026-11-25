@@ -315,7 +315,8 @@ def test_strategy_setup_defaults_use_the_host_selected_vars_file(tmp_path):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
-def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strategy):
+@pytest.mark.parametrize("plugin", ["file", "ansible.builtin.file"])
+def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strategy, plugin):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: true
@@ -326,10 +327,31 @@ def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strate
     - debug:
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
 """.replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
-        "FILTER_EXPRESSION", '{{ lookup("file", "fact-filter.txt") }}' if LEGACY_SETUP
-        else '{{ [lookup("file", "fact-filter.txt")] }}'),
+        "FILTER_EXPRESSION", ('{{ lookup("PLUGIN", "fact-filter.txt") }}' if LEGACY_SETUP
+                              else '{{ [lookup("PLUGIN", "fact-filter.txt")] }}').replace("PLUGIN", plugin)),
         {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=use_strategy)
     assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("plugin", ["example.custom.file", "file"])
+def test_implicit_setup_does_not_capture_files_requested_by_custom_lookups(tmp_path, plugin):
+    files = {"files/private.txt": "synthetic private contents\n"}
+    if plugin == "file":
+        files["lookup_plugins/file.py"] = """from ansible.plugins.lookup import LookupBase
+
+class LookupModule(LookupBase):
+    def run(self, terms, variables=None, **kwargs):
+        return ['ansible_distribution']
+"""
+    path = _write(tmp_path, """
+- hosts: localhost
+  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ lookup("PLUGIN", "private.txt") }}'
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace("PLUGIN", plugin), files)
+    plays, _ = parse_playbook(str(path))
+    assert "synthetic private contents" not in json.dumps(plays, default=str)
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])

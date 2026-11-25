@@ -1616,11 +1616,21 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _setup_builtin_lookup(name):
+    namespace, _, short = name.rpartition(".")
+    if namespace in ("", "ansible.builtin", "ansible.legacy") and short in ("env", "config", "file"):
+        return short
+    return None
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
-    name = str(name).rsplit(".", 1)[-1]
+    qualified_name = str(name)
+    name = qualified_name.rsplit(".", 1)[-1]
     if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
         raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
     setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    if setup_lookups is not None and name in ("env", "config", "file") and not _setup_builtin_lookup(qualified_name):
+        raise _UnsupportedLookup(qualified_name)
     if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
         known = setup_lookups.get(name, ())
         if any(str(term) not in known for term in args):
@@ -1659,7 +1669,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
         lstrip = kwargs.get("lstrip", False)
         rstrip = kwargs.get("rstrip", True)
         if setup_lookups is not None:
-            files = setup_lookups.get("file", {})
+            files = setup_lookups.get("file", {}).get(qualified_name, {})
             for term in map(str, args):
                 if term not in files:
                     raise ValueError("setup requires an uncaptured controller file %r" % term)
@@ -5278,7 +5288,7 @@ class Runtime:
                 if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
                                               for arg in call.args)
-                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config", "file")
+                        and _setup_builtin_lookup(call.args[0].value)
                         and not (call.dyn_args or call.dyn_kwargs)):
                     continue
                 return None
