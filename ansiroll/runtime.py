@@ -5179,6 +5179,18 @@ class Runtime:
                 first_found = entry.get("first_found", {}).get(raw)
                 if first_found:
                     ctx["__ansiroll_first_found"] = first_found
+                    if "search_path_known" in first_found and (
+                            not first_found["search_path_known"]
+                            or not _same_vars_input(ctx.get("ansible_search_path", []), first_found["search_path"])):
+                        if before_setup:
+                            for mappings in entry["files"].values():
+                                if isinstance(mappings, list):
+                                    for mapping in mappings:
+                                        blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
+                            break
+                        raise VarsFilesError(
+                            "first_found ansible_search_path differs from the bundled search paths; "
+                            "recompile with the current search paths")
                 else:
                     ctx.pop("__ansiroll_first_found", None)
                 checked = entry.get("controller_candidates", {}).get(raw)
@@ -5208,6 +5220,8 @@ class Runtime:
                                     blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
                         break
                     inputs.update(dependencies)
+                    if first_found and "search_path_known" in first_found:
+                        inputs["ansible_search_path"] = ctx.get("ansible_search_path", _MISSING_VARS_FILE_INPUT)
                 try:
                     name = checked["name"] if reuse_checked else _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:

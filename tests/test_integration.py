@@ -183,6 +183,41 @@ def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path):
         assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_first_found_vars_files_uses_authored_search_path_order(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    roots = [tmp_path / name for name in ("preferred", "later")]
+    for directory, value in zip([*roots, tmp_path], ["preferred", "later", "fallback"]):
+        directory.mkdir(exist_ok=True)
+        (directory / "prod.yml").write_text(f"selected: {value}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_search_path: ROOTS
+  vars_files:
+    - "{{ lookup('first_found', [profile ~ '.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'preferred'}
+""".replace("ROOTS", json.dumps([str(root) for root in roots])))
+    args = ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)]
+    native = subprocess.run(ansible_playbook_command() + args, cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30)
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for directory in [*roots, tmp_path]:
+        (directory / "prod.yml").unlink()
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={
+        "profile": "prod", "ansible_search_path": [str(tmp_path / "unbundled")],
+    })
+    with pytest.raises(VarsFilesError, match="differs from the bundled search paths"):
+        runtime.run_play(plan)
+
+
 def test_first_found_vars_files_normalizes_string_options(tmp_path):
     from ansiroll.loader import _core_version
     from tests import ansible_playbook_command

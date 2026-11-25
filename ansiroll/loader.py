@@ -361,6 +361,8 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     file_aliases = {}
     file_names = set()
     for entry in entries:
+        if entry.get("first_found"):
+            selector_names.add("ansible_search_path")
         for candidate in entry.get("controller_candidates", {}).values():
             selector_names.update(name for name, _ in candidate["paths"])
         for source in entry.get("names", ()):
@@ -1359,9 +1361,7 @@ def _deferred_vars_files(play, basedir, entries):
     else:
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
-    first_found_roots = [basedir]
-    if not (2, 19) <= _core_version() < (2, 21):
-        first_found_roots.insert(0, os.path.join(basedir, "files"))
+    first_found_search = None
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
@@ -1381,6 +1381,9 @@ def _deferred_vars_files(play, basedir, entries):
                     name, basedir, bool(resolved and not has_local_override
                                and os.path.realpath(resolved) == os.path.realpath(builtin_first_found.__file__)))
                 if modeled is not None:
+                    if first_found_search is None:
+                        first_found_search = _vars_first_found_search(play, basedir)
+                    first_found_roots, search_path, known_search_path = first_found_search
                     plugin, patterns, named_homes = modeled
                     candidates = set()
                     for pattern in patterns:
@@ -1394,7 +1397,8 @@ def _deferred_vars_files(play, basedir, entries):
                                     files[path] = _bundled_vars_file(play, path)
                     first_found[name] = {"plugin": plugin, "patterns": patterns,
                                          "roots": first_found_roots, "files": sorted(candidates),
-                                         "home": os.path.expanduser("~"), "named_homes": named_homes}
+                                         "home": os.path.expanduser("~"), "named_homes": named_homes,
+                                         "search_path": search_path, "search_path_known": known_search_path}
                     continue
             if _vars_file_has_dynamic_directory(name):
                 unmodeled.append(name)
@@ -1446,6 +1450,39 @@ def _deferred_vars_files(play, basedir, entries):
             entry["unmodeled"] = unmodeled
         deferred.append(entry)
     return deferred
+
+
+def _vars_first_found_search(play, basedir):
+    """Capture literal lookup search paths that can be inspected at compile time."""
+    from ansible.utils.path import unfrackpath
+
+    manager = play.get_variable_manager()
+    supplied = {**_gather_role_defaults(_gather_public_roles(play)), **(play.vars or {}),
+                **(manager.extra_vars if manager else {})}
+    search_path = supplied.get("ansible_search_path", [])
+    paths = []
+    known = isinstance(search_path, (list, tuple)) and all(isinstance(path, str) for path in search_path)
+    if known:
+        paths = [_PLAYBOOK_DIR_RE.sub(lambda _: basedir, path) for path in search_path]
+        known = not any(_is_templated(path) for path in paths)
+    with_files = not (2, 19) <= _core_version() < (2, 21)
+    roots = []
+    for path in paths if known else ():
+        resolved = unfrackpath(path, follow=False)
+        parent = os.path.dirname(resolved)
+        if parent.endswith("/tasks") and play._loader._is_role(path):
+            if with_files:
+                roots.append(os.path.join(os.path.dirname(parent), "files"))
+            roots.append(parent)
+            if _core_version() < (2, 21):
+                continue
+        if with_files:
+            roots.append(os.path.join(resolved, "files"))
+        roots.append(resolved)
+    if with_files:
+        roots.append(os.path.join(basedir, "files"))
+    roots.append(basedir)
+    return list(dict.fromkeys(roots)), _tag_untrusted(search_path) if known else None, known
 
 
 def _bundled_vars_file(play, path):
