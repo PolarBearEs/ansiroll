@@ -1073,6 +1073,7 @@ def test_delegated_template_does_not_run_unused_block_lookups(tmp_path):
 
 def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    year = "vars.details.year" if MODERN_TEMPLATING else "details.year"
     playbook = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -1086,7 +1087,7 @@ def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeyp
         details:
           path: "{{ template_destpath }}"
           year: "{{ template_run_date.year }}"
-""", {"sample.j2": "{{ details.path }}|{{ vars.details.year }}\n"})
+""", {"sample.j2": "{{ details.path }}|{{ " + year + " }}\n"})
     output = tmp_path / "output.txt"
     expected = _ansible(playbook, tmp_path)
     expected_text = output.read_text()
