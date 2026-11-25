@@ -5903,7 +5903,13 @@ class Runtime:
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
         name = str(task.get("action") or "").split(".")[-1]
-        if name != "unarchive" or _ansible_boolean(args.get("remote_src", False)):
+        if name != "unarchive":
+            return None
+        if "copy" in args:
+            if "remote_src" in args:
+                raise ValueError("parameters are mutually exclusive: ('copy', 'remote_src')")
+            args["remote_src"] = not _ansible_boolean(args.pop("copy"))
+        if _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         key = self._baked_source_key(task, src)

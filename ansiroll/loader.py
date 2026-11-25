@@ -2324,7 +2324,7 @@ def _bake_sources(node, task, basedir):
     if not src:
         return  # copy with `content:` -- nothing to bake, templated at runtime
     name = node.get("action", "").split(".")[-1]
-    remote = _remote_src(args) if name in ("copy", "unarchive") else False
+    remote = _remote_src(args, unarchive=name == "unarchive") if name in ("copy", "unarchive") else False
     if remote is True:
         return  # src lives on the target; the module reads it there
 
@@ -2391,10 +2391,22 @@ def _bake_sources(node, task, basedir):
         node["_baked_meta"] = meta
 
 
-def _remote_src(args):
-    """remote_src with Ansible's boolean(strict=False) conversion (as the copy
-    and unarchive action plugins do); None when only known at runtime."""
-    value = args.get("remote_src", False)
+def _remote_src(args, *, unarchive=False):
+    """Whether compilation can skip reading the source, or None until templated."""
+    remote_src = _source_flag(args.get("remote_src", False))
+    if not unarchive or "copy" not in args:
+        return remote_src
+
+    copy = _source_flag(args["copy"])
+    if "remote_src" not in args:
+        return None if copy is None else not copy
+
+    # Both fixed options fail validation. If a templated option is omitted,
+    # the other option may still guarantee the archive lives on the target.
+    return True if copy is False or remote_src is True or (copy is not None and remote_src is not None) else None
+
+
+def _source_flag(value):
     if _contains_dynamic_value(value):
         return None
     try:

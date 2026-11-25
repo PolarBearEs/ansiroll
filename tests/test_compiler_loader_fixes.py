@@ -1453,17 +1453,22 @@ def test_tree_shake_keeps_conditions_on_jinja_globals(tmp_path):
     assert manifest["tree_shake"]["removed_nodes"] == 0
 
 
-def test_unarchive_remote_src_y_reads_target_at_runtime(tmp_path):
+@pytest.mark.parametrize("source_option", [
+    "remote_src=y", "copy=false", "copy='{{ archive_on_controller }}'",
+    "copy=false remote_src='{{ omit }}'", "remote_src=y copy='{{ omit }}'",
+])
+def test_unarchive_remote_source_reads_target_at_runtime(tmp_path, source_option):
     archive = tmp_path / "a.tgz"
     out = tmp_path / "out"
     out.mkdir()
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
+  vars: {archive_on_controller: false}
   tasks:
-    - unarchive: src=%s dest=%s remote_src=y
+    - unarchive: src=%s dest=%s %s
     - debug: msg="{{ lookup('file', '%s/f.txt') }}"
-""" % (archive, out, out)})
+""" % (archive, out, source_option, out)})
     compiled = tmp_path / "compiled.py"
     proc = subprocess.run(
         [sys.executable, "-m", "ansiroll.cli", "compile", str(tmp_path / "pb.yml"),
@@ -1475,10 +1480,46 @@ def test_unarchive_remote_src_y_reads_target_at_runtime(tmp_path):
     subprocess.check_call(["tar", "czf", str(archive), "-C", str(payload), "f.txt"])
     run = subprocess.run([sys.executable, str(compiled)], env=_env(),
                          capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout + run.stderr
     got = _summary(run.stdout + run.stderr)
     (out / "f.txt").unlink()
     assert got == _ansible(tmp_path / "pb.yml")
     assert got[0] == ["ON_TARGET"]
+
+
+@pytest.mark.parametrize("source_options", [
+    "copy=false", "copy=false remote_src='{{ omit }}'", "remote_src=y copy='{{ omit }}'",
+])
+def test_unarchive_remote_source_does_not_bake_a_controller_file(tmp_path, source_options):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - unarchive: src=archive.tgz dest=/tmp %s
+""" % source_options, "archive.tgz": "controller-only contents"})
+    _, manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    assert manifest["bundles"]["asset_count"] == 0
+
+
+@pytest.mark.parametrize("source_options", [
+    "copy=false remote_src=false",
+    "copy=false remote_src=true",
+    "copy=true remote_src=false",
+])
+def test_unarchive_source_options_are_mutually_exclusive_before_lookup(tmp_path, source_options):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - unarchive: src=/nonexistent/option-conflict.tgz dest=/tmp %s
+""" % source_options})
+    source, manifest = compile_playbook(str(tmp_path / "pb.yml"))
+    assert manifest["fallback_tasks"] == []
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "parameters are mutually exclusive" in result.stdout + result.stderr
 
 
 def test_copy_content_wins_over_remote_src(tmp_path):
