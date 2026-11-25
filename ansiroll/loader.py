@@ -17,7 +17,7 @@ import time
 from copy import copy
 from functools import lru_cache
 
-from .compat import init_loader
+from .compat import find_module, init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
 from .accelerated_modules import can_accelerate
 
@@ -68,7 +68,7 @@ def _vault_secrets(vault_password_file=None):
     if not paths[0]:
         try:
             from ansible import constants as C
-            paths = list(C.DEFAULT_VAULT_PASSWORD_FILES or [])
+            paths = [C.DEFAULT_VAULT_PASSWORD_FILE]
         except Exception:
             paths = []
     from ansible.parsing.vault import VaultSecret
@@ -156,9 +156,25 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         if compiled_play_vars is not None:
             node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope,
                                                 replay_files=bool(node.get("ordered_vars_files"))))
-        if node.get("ordered_vars_files"):
-            node.update(_gather_timeout_file_scope(
-                play, node["ordered_vars_files"], node.get("gather_timeout_template")))
+        scoped_options = node.pop("_gather_setup_scoped", None)
+        setup_compile_vars = node.pop("_gather_setup_compile_vars", None)
+        if node.get("ordered_vars_files") or scoped_options:
+            setup_layers = _gather_timeout_file_scope(
+                play, node.get("ordered_vars_files") or (), node.get("gather_timeout_template"),
+                scoped_options=scoped_options, setup_compile_vars=setup_compile_vars)
+            lookups = setup_layers.pop("_setup_controller_lookups", {})
+            env_names = lookups.get("env", ())
+            if env_names:
+                node.setdefault("controller_env", {}).update({
+                    name: os.environ[name] for name in sorted(env_names) if name in os.environ
+                })
+            node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
+            if scoped_options:
+                setup_layers["gather_setup_scope"]["controller_lookups"] = {
+                    "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
+                    "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
+                }
+            node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -305,8 +321,8 @@ def _gather_selector_magic(play):
     return manager._get_magic_variables(play=play, host=None, task=None, include_hostvars=True, **magic_args)
 
 
-def _gather_timeout_file_scope(play, entries, runtime):
-    """Keep original file order and the play layers needed by a runtime timeout."""
+def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, setup_compile_vars=None):
+    """Keep the play layers used by early vars-file and setup option expressions."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
@@ -326,6 +342,21 @@ def _gather_timeout_file_scope(play, entries, runtime):
                                    if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict))
     selector_names = set()
     timeout_names = set(runtime["names"]) if runtime is not None else set()
+    setup_names = set()
+    computed = set()
+    setup_lookups = {"env": set(), "config": set()}
+    lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
+    for layer in (*exports, play.get_variable_manager().extra_vars, magic):
+        lookup_scope = combine_vars(lookup_scope, layer)
+    for source, _, _ in _selector_template_sources(scoped_options or {}):
+        dependencies = _gather_timeout_dependencies(
+            source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            computed=computed, retain_mutable=True)
+        if dependencies is not None:
+            setup_names.update(dependencies[1])
+        _gather_timeout_dependencies(
+            source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            computed=computed, lookups=setup_lookups)
     file_aliases = {}
     file_names = set()
     for entry in entries:
@@ -349,6 +380,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
     for names, scope, shadowed in (
         (selector_names, selector_scope, {}),
         (timeout_names, timeout_scope, export_replacements),
+        (setup_names, timeout_scope, export_replacements),
     ):
         pending = list(names)
         while pending:
@@ -376,14 +408,26 @@ def _gather_timeout_file_scope(play, entries, runtime):
             {key: value for key, value in export.items() if runtime.get("computed_vars") or key in timeout_names}
             for export in exports
         ])
-    return {
+    result = {
         "vars_file_defaults": _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())}),
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
+    if scoped_options:
+        result["_setup_controller_lookups"] = setup_lookups
+        result["gather_setup_scope"] = _tag_untrusted({
+            "defaults": {key: value for key, value in defaults.items() if computed or key in setup_names},
+            "role_exports": [
+                {key: value for key, value in export.items() if computed or key in setup_names}
+                for export in exports
+            ],
+            "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
+            "task_search_path": play.get_search_path(),
+        })
+    return result
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -417,6 +461,12 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             method = call.node
             if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
                 return None
+            if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
+                    and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
+                plugin = call.args[0].value.rsplit(".", 1)[-1]
+                if plugin in lookups:
+                    lookups[plugin].update(arg.value for arg in call.args[1:]
+                                           if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
                                                 resolve_aliases=resolve_aliases, analysis=analysis,
                                                 retain_mutable=retain_mutable):
@@ -635,6 +685,7 @@ def _rewrite_includes(data, *, playbook=False, defer_import_fields=None):
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                   all_vars=None, runtime_writes=None, gather_facts=None):
     from ansible import constants as C
+    from .runtime import _selector_template_sources
 
     if basedir is None:
         try:
@@ -642,10 +693,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
+    scoped_options = {
+        key: value for key in ("fact_path", "gather_subset")
+        if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
+    }
     ordered_vars_files = [] if (
         gather_facts is None and play.gather_facts is not False
         and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
-        and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
+        and (scoped_options or _is_templated(play.gather_timeout))
     ) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
@@ -673,6 +728,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.controller_execution = gather_facts is not None
     for index, entry in enumerate(deferred):
         if index not in order_deferred or entry.get("unmodeled"):
             includes.incomplete = True
@@ -744,6 +800,21 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
+    if gather:
+        setup_options = {
+            name: value
+            for name in ("gather_subset", "fact_path")
+            if (value := getattr(play, name, None)) is not None
+        }
+        # Older cores expose their default subset on the loaded Play. Leave
+        # the equivalent setup default implicit when the play did not set it.
+        if setup_options.get("gather_subset") == ["all"] and "gather_subset" not in (play.get_ds() or {}):
+            del setup_options["gather_subset"]
+        if setup_options:
+            result["gather_setup_options"] = _tag_untrusted(setup_options)
+        if gather_facts is None and scoped_options:
+            result["_gather_setup_scoped"] = scoped_options
+            result["_gather_setup_compile_vars"] = play_vars
     # Retain authored selectors and compile-selected definitions, including
     # definitions needed during ordered replay before later files shadow them.
     lookup_sources = {
@@ -754,7 +825,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             entry for entry in (ordered_vars_files or ()) if deferred and not isinstance(entry, int)
         ],
     }
+    lookup_sources.pop("gather_setup_options", None)
+    lookup_sources.pop("_gather_setup_scoped", None)
+    lookup_sources.pop("_gather_setup_compile_vars", None)
     names = _controller_env_names(lookup_sources)
+    if "_gather_setup_scoped" in result:
+        result["_gather_compile_env_names"] = sorted(names)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -1021,6 +1097,39 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _finite_vars_file_names(source):
+    """Return closed literal alternatives of inline conditional file names."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    def choices(node):
+        if isinstance(node, nodes.TemplateData):
+            return [node.data]
+        if isinstance(node, nodes.Const) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, nodes.CondExpr):
+            if isinstance(node.test, nodes.Const):
+                return choices(node.expr1 if node.test.value else node.expr2)
+            result = choices(node.expr1) + choices(node.expr2)
+            if len(result) <= 128:
+                return result
+        if isinstance(node, (nodes.Template, nodes.Output, nodes.Concat)):
+            parts = node.body if isinstance(node, nodes.Template) else node.nodes
+            paths = [""]
+            for part in parts:
+                suffixes = choices(part)
+                if len(paths) * len(suffixes) > 128:
+                    break
+                paths = [head + tail for head in paths for tail in suffixes]
+            else:
+                return paths
+        raise ValueError("nonliteral vars file selector")
+
+    try:
+        return dict.fromkeys(choices(Environment(keep_trailing_newline=True).parse(source)))
+    except (TemplateSyntaxError, ValueError):
+        return None
+
+
 def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -1030,6 +1139,7 @@ def _deferred_vars_files(play, basedir, entries):
     as an error marker that aborts the run if it is selected.
     """
     import glob
+    from .runtime import _vars_file_glob_covers
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
@@ -1045,14 +1155,20 @@ def _deferred_vars_files(play, basedir, entries):
             if name in unmodeled:
                 continue
             pattern = _vars_file_glob_pattern(name)
-            if name.startswith(os.path.sep):
-                patterns = [pattern]
-            else:
-                patterns = []
+            finite_names = _finite_vars_file_names(name) if _is_templated(name) else None
+            variants = ([(candidate, glob.escape(candidate)) for candidate in finite_names
+                         if os.pardir not in candidate.split(os.path.sep)
+                         and _vars_file_glob_covers(pattern, candidate)]
+                        if finite_names else [(name, pattern)])
+            patterns = []
+            for candidate, variant in variants:
+                if candidate.startswith(os.path.sep):
+                    patterns.append(variant)
+                    continue
                 for d in dirs:
-                    if subdir and name.split("/")[0] != subdir:
-                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
-                    patterns.append(os.path.join(glob.escape(d), pattern))
+                    if subdir and candidate.split("/")[0] != subdir:
+                        patterns.append(os.path.join(glob.escape(d), subdir, variant))
+                    patterns.append(os.path.join(glob.escape(d), variant))
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
@@ -1070,21 +1186,86 @@ def _bundled_vars_file(play, path):
     from ansible.errors import AnsibleParserError
 
     try:
-        with open(path, "rb") as fh:
-            # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-            # select.
-            if b"$ANSIBLE_VAULT" in fh.read():
-                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                        % path}
-        loaded = _load_vars_file(play, path)
+        loaded = _load_plain_ansible_source(play._loader.path_dwim(path))
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
         return _tag_untrusted(preprocess_vars(loaded))
+    except _UnbundledVaultFile:
+        return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                % path}
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+
+
+class _UnbundledVaultFile(ValueError):
+    pass
+
+
+def _load_plain_ansible_source(path):
+    """Parse one validated snapshot of a source that must be unencrypted."""
+    from ansible.module_utils.common.text.converters import to_text
+    from ansible.parsing.dataloader import DataLoader
+
+    with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise ValueError("expected a regular file")
+        data = to_text(fh.read(), errors="surrogate_or_strict")
+    if _ansible_source_contains_vault(data):
+        raise _UnbundledVaultFile(path)
+    try:
+        from ansible._internal._datatag._tags import TrustedAsTemplate
+    except ImportError:
+        pass
+    else:
+        data = TrustedAsTemplate().tag(data)
+    return DataLoader().load(data, file_name=path, show_content=False)
+
+
+def _ansible_source_contains_vault(data):
+    if "$ANSIBLE_VAULT" in data:
+        return True
+    if data.lstrip().startswith(("{", "[")):
+        import json
+        try:
+            from ansible._internal._json._profiles._legacy import Decoder
+            from ansible.parsing.vault import EncryptedString
+        except ImportError:
+            from ansible.parsing.ajson import AnsibleJSONDecoder as Decoder
+            from ansible.parsing.yaml.objects import AnsibleVaultEncryptedUnicode as EncryptedString
+        try:
+            decoded = json.loads(data, cls=Decoder)
+        except Exception:
+            # Ansible retries the whole document as YAML if JSON decoding fails.
+            pass
+        else:
+            pending = [decoded]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, EncryptedString):
+                    return True
+                if isinstance(value, dict):
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+            return False
+    if "!" not in data:
+        return False
+    import yaml
+
+    try:
+        # Inspect tags before constructing values. A Vault value used as a
+        # mapping key may be decrypted by the YAML constructor itself.
+        return any(
+            event.tag in ("!vault", "!vault-encrypted")
+            for event in yaml.parse(data, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+            if isinstance(event, yaml.ScalarEvent)
+        )
+    except (yaml.YAMLError, UnicodeError, RecursionError):
+        # The Ansible loader supplies the diagnostic for malformed input.
+        return False
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
@@ -1314,7 +1495,7 @@ def _convert_node(node, actions, basedir,
                                         skip_tags, includes)
             if inc is not None:
                 return inc
-        return _convert_task(node, actions, basedir)
+        return _convert_task(node, actions, basedir, controller_execution=includes.controller_execution)
     return None
 
 
@@ -1980,7 +2161,7 @@ def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
         return True
 
 
-def _convert_task(task, actions, basedir):
+def _convert_task(task, actions, basedir, *, controller_execution=False):
     action = task.action
 
     if action in ("meta", "ansible.builtin.meta"):
@@ -2000,6 +2181,12 @@ def _convert_task(task, actions, basedir):
     role_defaults, role_vars = _role_vars(task)
 
     args = _clean_args(task.args)
+    unarchive = action.rsplit(".", 1)[-1] == "unarchive"
+    builtin_unarchive = unarchive and find_module(action)[1] == "ansible.builtin.unarchive"
+    if builtin_unarchive and "copy" in args:
+        literal_copy = _source_flag(args["copy"])
+        if literal_copy is not None:
+            args["copy"] = literal_copy
     if action.split(".")[-1] == "assert" and "that" in args:
         args["that"] = _conditions(args["that"])
 
@@ -2036,6 +2223,7 @@ def _convert_task(task, actions, basedir):
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
         "check_mode": getattr(task, "check_mode", None),
+        "diff": getattr(task, "diff", None),
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
@@ -2048,6 +2236,8 @@ def _convert_task(task, actions, basedir):
     }
     if _is_handler(task):
         node.update(_handler_match(task))
+    if unarchive:
+        node["_builtin_unarchive"] = builtin_unarchive
     if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
                                        "ansible.legacy.async_status"):
         from ansible.plugins.loader import shell_loader
@@ -2075,17 +2265,30 @@ def _convert_task(task, actions, basedir):
     delegate = getattr(task, "delegate_to", None)
     node["delegate_to"] = str(delegate) if delegate else None
     node["delegate_facts"] = getattr(task, "delegate_facts", False)
+    if delegate and action.rsplit(".", 1)[-1] == "set_fact":
+        node["delegate_to"] = _tag_untrusted(delegate, template_syntax_only=True)
+        node["delegate_facts"] = _boolean_or_template(node["delegate_facts"])
 
-    if action in BAKED_ACTIONS:
-        _bake_sources(node, task, basedir)
+    if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
         source_action = action.rsplit(".", 1)[-1]
+        unknown_defaults = False
+        if source_action in ("copy", "unarchive"):
+            unknown_defaults = _apply_file_source_defaults(task, source_action, args)
+        _bake_sources(node, task, basedir, controller_execution=controller_execution,
+                      unknown_defaults=unknown_defaults)
         decrypt = node["args"].get("decrypt", True)
-        if (source_action in ("copy", "unarchive") and not node.pop("_source_decrypted_at_compile", False)
-                and (_contains_dynamic_value(decrypt)
+        if (source_action in ("copy", "unarchive") and not node.get("_vault_plaintext")
+                and (unknown_defaults or _contains_dynamic_value(decrypt)
                      or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
                 and any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
                         for value in (node.get("_baked") or {}).values())):
             node["_deferred_vault_source"] = True
+            node["_vault_source_inputs"] = [
+                key for key in ("src", "remote_src", "copy", "decrypt")
+                if _contains_dynamic_value(args.get(key))
+            ]
+            if unknown_defaults:
+                node["_vault_source_inputs"].append("module_defaults")
             node["fallback"] = True
             node["fallback_reason"] = "Vault source needs controller selection and decryption"
         if node["special"] is None:
@@ -2321,7 +2524,31 @@ def _special_of(action):
     return None
 
 
-def _bake_sources(node, task, basedir):
+def _apply_file_source_defaults(task, action, args):
+    """Lower source-affecting module defaults without running their templates."""
+    layers = task.module_defaults or ()
+    defaults = {}
+    for layer in (layers,) if isinstance(layers, dict) else layers:
+        defaults.update(layer)
+    fqcn = "ansible.builtin." + action
+    groups = (getattr(_play_of(task), "_action_groups", None) or {}).get(fqcn, ())
+    entries = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
+    entries.extend(defaults[key] for key in (action, "ansible.legacy." + action, fqcn) if key in defaults)
+    source_keys = {"decrypt", "remote_src"}
+    if action == "unarchive":
+        source_keys.add("copy")
+    inherited = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            if source_keys - args.keys():
+                return True
+        else:
+            inherited.update({key: entry[key] for key in source_keys & entry.keys()})
+    args.update({key: value for key, value in inherited.items() if key not in args})
+    return False
+
+
+def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_defaults=False):
     """Bake controller-side src file(s) for template/copy/unarchive.
 
     Stores node['_baked'] = {rendered_src: text}. Resolves src using Ansible's
@@ -2353,7 +2580,7 @@ def _bake_sources(node, task, basedir):
 
     decrypt = args.get("decrypt", True)
     decrypt_selected = (
-        name in ("copy", "unarchive") and remote is False and not _contains_dynamic_value(src)
+        not unknown_defaults and name in ("copy", "unarchive") and remote is False and not _contains_dynamic_value(src)
         and not _contains_dynamic_value(decrypt) and args.get("content") is None
         and (_source_flag(decrypt) if name == "copy" else bool(decrypt))
     )
@@ -2387,24 +2614,30 @@ def _bake_sources(node, task, basedir):
         path = _find_needle(task, subdir, rel)
         if path is None:
             if remote is None:
-                return  # may be a target path if remote_src renders true
+                continue  # may be a target path if remote_src renders true
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
         source_is_plaintext = True
-        if decrypt_selected:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if decrypt_selected and raw.startswith(b"$ANSIBLE_VAULT;"):
+            if controller_execution:
+                node["_deferred_vault_source"] = True
+                node["fallback"] = True
+                node["fallback_reason"] = "Vault source needs per-host controller decryption"
+                return
             from ansible.errors import AnsibleError
-
             try:
-                data, source_is_plaintext = task._loader._get_file_contents(path)
-                baked[rel] = data.decode("utf-8", "surrogateescape")
+                raw, source_is_plaintext = task._loader._decrypt_if_vault_data(raw)
+                if not source_is_plaintext:
+                    node["_vault_plaintext"] = True
             except AnsibleError as ex:
                 # Match normal task gating for a source whose key is missing
                 # or incorrect. The failing payload needs no embedded bytes.
                 baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
-        else:
-            with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
-                baked[rel] = fh.read()
+                continue
+        baked[rel] = raw.decode("utf-8", "surrogateescape")
         if not with_meta:
             continue
         try:
@@ -2416,8 +2649,6 @@ def _bake_sources(node, task, basedir):
         except OSError:
             pass
     node["_baked"] = baked
-    if decrypt_selected:
-        node["_source_decrypted_at_compile"] = True
     if meta:
         node["_baked_meta"] = meta
 
@@ -2438,11 +2669,23 @@ def _remote_src(args, *, unarchive=False):
 
 
 def _source_flag(value):
-    if _contains_dynamic_value(value):
-        return None
+    from ansible.parsing import vault
+    from .runtime import _ansible_boolean
+
     try:
-        from ansible.module_utils.parsing.convert_bool import boolean
-        return boolean(value, strict=False)
+        if isinstance(value, getattr(vault, "EncryptedString", ())) or getattr(value, "__ENCRYPTED__", False):
+            value = str(value)
+        if _contains_dynamic_value(value) and isinstance(_tag_untrusted(value, template_syntax_only=True), str):
+            from jinja2 import Environment, nodes
+
+            parsed = Environment().parse(value).body
+            if (len(parsed) == 1 and isinstance(parsed[0], nodes.Output) and len(parsed[0].nodes) == 1
+                    and isinstance(parsed[0].nodes[0], nodes.Const) and isinstance(parsed[0].nodes[0].value, bool)):
+                return parsed[0].nodes[0].value
+            return None
+        if isinstance(value, (dict, list, tuple)):
+            return None
+        return _ansible_boolean(value)
     except Exception:
         return None
 

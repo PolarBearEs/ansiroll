@@ -194,6 +194,8 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
             "removed_modules": sorted(original_actions - surviving_actions),
         },
     }
+    if any(node.get("_vault_plaintext") for node in _walk_play_nodes(plays)):
+        manifest["contains_vault_plaintext"] = True
     return source, manifest
 
 

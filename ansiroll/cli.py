@@ -440,6 +440,34 @@ def _make_output_executable(path, reference, output_stat, mode):
     os.chmod(path, mode)
 
 
+@contextmanager
+def _open_private_compile_destination(path, validate, *, prepare):
+    # A reader that already opened the previous output retains access to
+    # that inode even after chmod. Publish the new source on a private inode.
+    destination = os.path.abspath(path)
+    directory = os.path.dirname(destination)
+    fd, temp_path = tempfile.mkstemp(prefix=".ansiroll-vault-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as writer:
+            yield writer
+            writer.flush()
+            os.fchmod(fd, 0o700)
+            existing = _try_stat(destination)
+            if existing is not None:
+                validate(existing, None)
+                if not stat.S_ISREG(existing.st_mode):
+                    raise ValueError("Vault-bearing output needs a regular destination file: %s" % path)
+            info = os.fstat(fd)
+            validate(info, fd)
+            os.replace(temp_path, destination)
+            prepare(info, fd)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
 def _write_compile_files(output_path, manifest_path, source, manifest, validate_input):
     # Paths can change during compilation or between the check and open.
     if manifest_path:
@@ -467,11 +495,14 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
                     output_reference.callback(os.close, reference)
             return reference
 
-        with _open_compile_destination(output_path, validate_output, prepare=prepare_output) as output:
+        sensitive = manifest.get("contains_vault_plaintext", False)
+        open_output = _open_private_compile_destination if sensitive else _open_compile_destination
+        with open_output(output_path, validate_output, prepare=prepare_output) as output:
             output.write(source)
             output.flush()
             mode = os.fstat(output.fileno()).st_mode | stat.S_IEXEC | stat.S_IXGRP
-        _make_output_executable(output_path, reference, output_stat, mode)
+        if not sensitive:
+            _make_output_executable(output_path, reference, output_stat, mode)
         if not manifest_path:
             return
 
