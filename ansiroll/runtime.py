@@ -867,9 +867,19 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
 
 
 def _registered_result(task, result, current=True):
-    include_vars = (task.get("action") or "").rsplit(".", 1)[-1] == "include_vars"
+    action = (task.get("action") or "").rsplit(".", 1)[-1]
+    if action == "synchronize":
+        result = _without_delegated_metadata(result)
     return _RegisteredResult(
-        _mark_unsafe(result, preserve_included_vars=include_vars, condition_text=True), current)
+        _mark_unsafe(result, preserve_included_vars=action == "include_vars", condition_text=True), current)
+
+
+def _without_delegated_metadata(result):
+    cleaned = {key: value for key, value in result.items() if key != "_ansible_delegated_vars"}
+    if isinstance(cleaned.get("results"), list):
+        cleaned["results"] = [_without_delegated_metadata(item) if isinstance(item, dict) else item
+                              for item in cleaned["results"]]
+    return cleaned
 
 
 def _decode_frozen_value(value):
@@ -1053,6 +1063,11 @@ class TaskFailed(Exception):
 
 class MissingHandler(Exception):
     """A changed task requested a handler that has not been loaded."""
+
+
+class HostUnreachable(TaskFailed):
+    counted = True
+    ends_play = True
 
 
 class VarsFilesError(Exception):
@@ -4122,6 +4137,7 @@ class Runtime:
                       "unreachable": 0, "rescued": 0, "ignored": 0}
         self.host = self._initial_host_vars.get("inventory_hostname") or _hostname()
         self.failed = False
+        self.unreachable = False
         if self.become_password is None:
             # Fall back to ansible_become_pass from the vars (e.g. baked group_vars),
             # so direct runs don't need ANSIROLL_BECOME_PASS in the environment.
@@ -4599,7 +4615,8 @@ class Runtime:
             self.failed = True
         # Through 2.13, StrategyBase.run() makes one final pass, with failed
         # hosts eligible only under force_handlers.
-        if not _core_at_least(2, 14) and (not self.failed or play.get("force_handlers")):
+        if (not _core_at_least(2, 14) and not self.unreachable
+                and (not self.failed or play.get("force_handlers"))):
             try:
                 self.flush_handlers()
             except TaskFailed as ex:
@@ -5142,18 +5159,32 @@ class Runtime:
             if res is None:
                 res = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
                 self._absorb_facts(task, res)
+        ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
             res.setdefault("changed", False)
             self._store_register(task, res)
 
         tally_changed = res.pop("_ansiroll_tally_changed", res.get("changed", False))
-        if res.get("changed") and not _result_failed(res):
+        if res.get("changed") and not (_result_failed(res) or res.get("unreachable")):
             self._queue_notify(notifications)
         status = _status_of(res)
+        if status == "unreachable" and task.get("loop") is None:
+            ignore_unreachable = self._ignores_unreachable(task, base_ctx)
         self.emit(task, status, res, ignored=ignore)
 
-        if _result_failed(res):
+        if status == "unreachable":
+            if not ignore_unreachable:
+                self._tally("unreachable")
+                self.unreachable = True
+                raise HostUnreachable(task.get("name"), task, res)
+            if _core_at_least(2, 14):
+                self._tally("ok")
+                self._tally("ignored")
+            else:
+                self._tally("skipped")
+                self._tally("unreachable")
+        elif _result_failed(res):
             if ignore:
                 self._tally("changed" if tally_changed else "ok")
                 self._tally("ignored")
@@ -5167,6 +5198,10 @@ class Runtime:
     def _conditional_skip(self):
         return {"changed": False, "skipped": True,
                 "skip_reason": "Conditional result was False"}
+
+    def _ignores_unreachable(self, task, ctx):
+        value = task.get("ignore_unreachable", False)
+        return _to_bool(self.template(value, ctx) if isinstance(value, (str, dict)) else value)
 
     def _ignore_before_validation(self, task):
         ignore = task.get("ignore_errors")
@@ -5294,6 +5329,13 @@ class Runtime:
             if _result_failed(res):
                 agg["failed"] = True
                 failed_items_ignored = failed_items_ignored and ignore
+            if res.get("unreachable"):
+                agg["unreachable"] = True
+                ignored = self._ignores_unreachable(task, ctx)
+                if _core_at_least(2, 21):
+                    agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", False) or ignored
+                else:
+                    agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
             ignore_loop = ignore_loop or ignore
             self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
             if stop:
@@ -5306,6 +5348,8 @@ class Runtime:
             agg["msg"] = "All items skipped"
         elif agg["failed"]:
             agg["msg"] = "One or more items failed"
+        elif agg.get("unreachable"):
+            agg["msg"] = "One or more items were unreachable"
         return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
     def _resolve_task_loop(self, task, ctx):
@@ -5436,7 +5480,7 @@ class Runtime:
         attempt_ctx = dict(ctx)
         for attempt in range(1, attempts + 1):
             res = self._exec_one(task, attempt_ctx, become, attempt=attempt, args_cache=args_cache)
-            if res.pop("_ansiroll_unknown_outcome", False) or attempts <= 1:
+            if res.pop("_ansiroll_unknown_outcome", False) or res.get("unreachable") or attempts <= 1:
                 return res
             if task.get("register"):
                 attempt_ctx[task["register"]] = _registered_result(task, res)
@@ -5602,7 +5646,7 @@ class Runtime:
         if "rc" in res:
             res.setdefault("failed", res["rc"] not in (0, "0"))
         ectx = ctx
-        if (not res.get("_ansiroll_unknown_outcome") and
+        if (not (res.get("_ansiroll_unknown_outcome") or res.get("unreachable")) and
                 (attempt is not None or task.get("changed_when") is not None or task.get("failed_when") is not None)):
             res.setdefault("failed", False)
             res.setdefault("changed", False)
@@ -5612,7 +5656,7 @@ class Runtime:
                 return {"failed": True, "changed": False, "msg": str(ex)}
             if attempt is not None:
                 ctx.update(ectx)
-        if not res.get("skipped") and not res.get("_ansiroll_unknown_outcome"):
+        if not (res.get("skipped") or res.get("unreachable") or res.get("_ansiroll_unknown_outcome")):
             self._apply_overrides(task, res, ectx)
         if refreshed_vars is not None:
             res["_ansiroll_vars"] = refreshed_vars
@@ -7246,10 +7290,10 @@ def _result_failed(res):
 
 
 def _status_of(res):
-    if res.get("unreachable"):
-        return "unreachable"
     if _result_failed(res):
         return "failed"
+    if res.get("unreachable"):
+        return "unreachable"
     if res.get("skipped"):
         return "skipped"
     if res.get("changed"):
@@ -7838,6 +7882,11 @@ def agent_main():
         for play in plays:
             if not g.get("_INJECTED_GATHER_FACTS", True):
                 play = dict(play, gather_facts=False)
+            if controller_lookups := g.get("_INJECTED_CONTROLLER_LOOKUPS"):
+                play = {**play, **{
+                    key: {**(play.get(key) or {}), **values}
+                    for key, values in controller_lookups.items()
+                }}
             rt.run_play(play)
             failed = failed or rt.failed
             for k in total:
@@ -7852,4 +7901,4 @@ def agent_main():
     finally:
         rt.cleanup()
     _chan_send(resp_fd, {"t": "stats", "host": rt.host, "stats": total})
-    _chan_send(resp_fd, {"t": "done", "failed": failed})
+    _chan_send(resp_fd, {"t": "done", "failed": failed, "unreachable": rt.unreachable})

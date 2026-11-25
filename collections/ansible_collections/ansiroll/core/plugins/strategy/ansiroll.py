@@ -382,7 +382,7 @@ class StrategyModule(StrategyBase):
 
     # ---- compilation -----------------------------------------------------
     def _compile(self, play, play_vars, gather_task):
-        from ansiroll.loader import _conditions, _convert_play
+        from ansiroll.loader import _conditions, _controller_config_names, _controller_env_names, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
 
@@ -417,6 +417,12 @@ class StrategyModule(StrategyBase):
             from ansiroll.compiler import _mark_unsupported
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
+        self._deferred_lookup_paths = {
+            os.path.abspath(path)
+            for entry in play_node.get("deferred_vars_files", ())
+            for path, data in entry["files"].items()
+            if _controller_env_names(data) or _controller_config_names(data)
+        }
 
         self._ansiballz = embedder.ansiballz_code or ""
         source = _render_source([play_node], modules, self._ansiballz)
@@ -487,14 +493,13 @@ class StrategyModule(StrategyBase):
         """Ship the agent once, then pump: results stream live, delegated tasks are
         serviced inline on the controller, all over one persistent channel."""
         started = time.monotonic()
-        hv = dict(self._variable_manager.get_vars(
-            host=host, play=self._cur_play
-        ))
+        hv, selected_vars_files = self._host_vars_and_lookup_sources(host)
         hv.setdefault("ansible_host", host.name)
         templar = self._mk_templar(hv)
         become_pass = self._resolve_become_password(hv, templar)
         agent_source = (
             self._agent_header(host, hv, become_pass)
+            + self._controller_lookup_header(selected_vars_files)
             + "_INJECTED_GATHER_FACTS = %r\n" % gather_facts
             + source
         )
@@ -592,7 +597,11 @@ class StrategyModule(StrategyBase):
             elif t == "stats":
                 self._apply_stats(host, frame.get("stats", {}))
             elif t == "done":
-                host_failed = host_failed or frame.get("failed", False)
+                if frame.get("unreachable"):
+                    self._tqm._unreachable_hosts[host.name] = True
+                    self._cur_play._removed_hosts.append(host.name)
+                else:
+                    host_failed = host_failed or frame.get("failed", False)
                 break
             last_frame = now
         return host_failed
@@ -753,8 +762,16 @@ class StrategyModule(StrategyBase):
                        % frame.get("action"),
             }
         try:
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            from ansiroll.loader import _core_version
+
             concrete = task.copy()
-            concrete.args = _drop_omit_values(dict(frame.get("args") or {}))
+            omit_tokens = {"__omit_place_holder__ansiroll", (hv or {}).get("omit")}
+            concrete.args = _drop_omit_values(dict(frame.get("args") or {}), omit_tokens)
+            if _core_version() < (2, 19):
+                # The agent rendered these arguments before JSON removed their tags.
+                concrete.args = wrap_var(concrete.args)
             concrete.when = []
             concrete.loop = None
             concrete.loop_with = None
@@ -768,8 +785,6 @@ class StrategyModule(StrategyBase):
             job_vars = dict(hv or {})
             job_vars.update(frame.get("vars") or {})
             if deferred := frame.get("deferred_vars"):
-                from ansible.utils.unsafe_proxy import wrap_var
-
                 from ansiroll.loader import _tag_untrusted
 
                 # Restore the controller's tagged source for each deferred
@@ -834,10 +849,33 @@ class StrategyModule(StrategyBase):
 
             from ansible.executor.task_executor import TaskExecutor
             from ansible.plugins import loader as plugin_loader
-            executor = TaskExecutor(
-                host, concrete, job_vars, play_context, None, self._loader,
-                plugin_loader, _QuietQueue(), self._variable_manager)
-            return executor.run()
+            queue = _QuietQueue()
+            parameters = inspect.signature(TaskExecutor).parameters
+            if "task" in parameters:
+                delegate_vars = getattr(self._variable_manager, "_get_delegated_vars", None)
+                if getattr(concrete, "delegate_to", None) and delegate_vars is not None:
+                    job_vars["ansible_delegated_vars"], _ = delegate_vars(self._cur_play, concrete, job_vars)
+                args = [host, concrete, job_vars, play_context]
+                if "new_stdin" in parameters:
+                    args.append(None)
+                args.extend((self._loader, plugin_loader, queue))
+                if "variable_manager" in parameters:
+                    args.append(self._variable_manager)
+                result = TaskExecutor(*args).run()
+            else:
+                from ansible._internal._task import TaskContext
+
+                # Match the worker's ambient task context on newer ansible-core.
+                with TaskContext.create(task=concrete, task_vars=job_vars, host_name=host.name):
+                    concrete.squash()
+                    executor = TaskExecutor(host, play_context, self._loader, plugin_loader,
+                                            queue, self._variable_manager)
+                    result = executor.run().as_result_dict(for_round_trip=True)
+            if isinstance(delegated := result.get("_ansible_delegated_vars"), dict):
+                safe_keys = ("ansible_delegated_host", "ansible_host", "ansible_port",
+                             "ansible_user", "ansible_connection")
+                result["_ansible_delegated_vars"] = {key: delegated[key] for key in safe_keys if key in delegated}
+            return result
         except Exception as ex:
             return {
                 "failed": True,
@@ -1145,6 +1183,46 @@ class StrategyModule(StrategyBase):
                 + "_INJECTED_FAST_FACTS = %r\n"
                 % _truthy(os.environ.get("ANSIROLL_FAST_FACTS", "")))
 
+    def _host_vars_and_lookup_sources(self, host):
+        selected = []
+        if not self._deferred_lookup_paths:
+            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+
+        # Record the candidate mappings as Ansible selects them. The merged
+        # host vars alone lose inputs used by earlier selectors.
+        loader = self._loader
+        load_from_file = loader.load_from_file
+        original_override = vars(loader).get("load_from_file")
+
+        def capture(path, *args, **kwargs):
+            data = load_from_file(path, *args, **kwargs)
+            if path and os.path.abspath(os.fsdecode(path)) in self._deferred_lookup_paths:
+                selected.append(data)
+            return data
+
+        loader.load_from_file = capture
+        try:
+            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+        finally:
+            if original_override is None:
+                del loader.load_from_file
+            else:
+                loader.load_from_file = original_override
+
+    def _controller_lookup_header(self, selected_vars_files):
+        if not selected_vars_files:
+            return ""
+        from ansiroll.loader import _controller_config_names, _controller_config_values, _controller_env_names
+
+        env_names = _controller_env_names(selected_vars_files)
+        config_names = _controller_config_names(selected_vars_files)
+        lookups = {
+            "controller_env": {name: os.environ[name] for name in sorted(env_names) if name in os.environ},
+            "controller_config": _controller_config_values(config_names),
+        }
+        return "_INJECTED_CONTROLLER_LOOKUPS = __import__('json').loads(%r)\n" % json.dumps(
+            lookups, default=str)
+
     # ---- channel transport ----------------------------------------------
     def _open_channel(self, host, play_context, hv, templar):
         from ansiroll.runtime import AGENT_BOOTSTRAP
@@ -1367,6 +1445,9 @@ class StrategyModule(StrategyBase):
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action == "synchronize":
+                    from ansiroll.runtime import _without_delegated_metadata
+                    registered_result = _without_delegated_metadata(result_data)
                 if action == "include_vars" and included_vars:
                     registered_result = _restore_included_vars(
                         result_data, included_vars, frame.get("included_vars_references"),
@@ -1422,6 +1503,9 @@ class StrategyModule(StrategyBase):
         tr = self._make_result(host, task, result_data)
         is_item = frame.get("is_item")
         ignored = frame.get("ignored")
+        if status == "unreachable" and is_item:
+            # Ansible emits the task-level unreachable callback for the loop.
+            return False
 
         method = _callback_for(status, is_item)
         if status == "failed" and not is_item:
@@ -1752,16 +1836,15 @@ def _conn_option(conn, name):
         return None
 
 
-def _drop_omit_values(value):
+def _drop_omit_values(value, omit_tokens):
     if isinstance(value, dict):
         return {
-            key: _drop_omit_values(item)
+            key: _drop_omit_values(item, omit_tokens)
             for key, item in value.items()
-            if not (isinstance(item, str)
-                    and item.startswith("__omit_place_holder__"))
+            if not (isinstance(item, str) and item in omit_tokens)
         }
     if isinstance(value, list):
-        return [_drop_omit_values(item) for item in value]
+        return [_drop_omit_values(item, omit_tokens) for item in value]
     return value
 
 
