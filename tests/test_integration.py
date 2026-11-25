@@ -5857,9 +5857,8 @@ def test_strategy_reports_controller_fallback_provenance(tmp_path):
   gather_facts: false
   connection: local
   tasks:
-    - name: delegated fact
-      set_fact:
-        delegated_value: present
+    - name: delegated command
+      command: 'true'
       delegate_to: localhost
 """,
         environment={"ANSIROLL_PROVENANCE": "1"},
