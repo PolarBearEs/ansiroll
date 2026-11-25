@@ -1530,6 +1530,7 @@ def test_selected_vault_source_honors_decrypt_option(tmp_path, action, decrypt, 
     from stat import S_IMODE
 
     from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import _core_version
 
     secret = VaultSecret(b"synthetic-test-password")
     vault = VaultLib([("default", secret)])
@@ -1551,7 +1552,8 @@ def test_selected_vault_source_honors_decrypt_option(tmp_path, action, decrypt, 
     controller_source.write_bytes(ciphertext)
     controller_source.chmod(0o644)
     task_option = "" if inherited else "\n        decrypt: " + str(decrypt).lower()
-    defaults = "\n  module_defaults: {ansible.builtin.copy: {decrypt: false}}" if inherited else ""
+    default_action = "copy" if _core_version() < (2, 12) else "ansible.builtin.copy"
+    defaults = "\n  module_defaults: {%s: {decrypt: false}}" % default_action if inherited else ""
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false%s
@@ -1600,6 +1602,7 @@ def test_vault_strategy_keeps_literal_source_controller_side(tmp_path):
     env = {**_env(), "ANSIBLE_STRATEGY": "ansiroll.core.ansiroll",
            "ANSIBLE_COLLECTIONS_PATH": os.path.join(ROOT, "collections")}
     cmd = ansible_playbook_command() + ["-i", "selected,other,", "-c", "local", "--diff",
+                                        "-e", "ansible_python_interpreter=" + sys.executable,
                                         "--vault-password-file", str(password), str(playbook)]
     blocked = subprocess.run(cmd, cwd=tmp_path, env={**env, "ANSIROLL_NATIVE_ONLY": "1"},
                              capture_output=True, text=True, timeout=45)
@@ -1611,6 +1614,93 @@ def test_vault_strategy_keeps_literal_source_controller_side(tmp_path):
     assert run.returncode == 0, run.stdout + run.stderr
     assert (tmp_path / "installed").read_bytes() == payload
     assert payload.decode() not in run.stdout + run.stderr
+
+
+@pytest.mark.parametrize("opts", ["templated-defaults", "legacy-alias", "templated-content"])
+def test_vault_source_baking_respects_default_scope_and_content(tmp_path, opts):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import _core_version
+
+    legacy = _core_version() < (2, 12)
+    if opts == "legacy-alias" and not legacy:
+        pytest.skip("legacy Core uses the authored action and redirect chain")
+    secret = VaultSecret(b"synthetic-test-password")
+    ciphertext = VaultLib([("default", secret)]).encrypt(b"synthetic content", secret=secret)
+    password = tmp_path / "vault-password"
+    password.write_bytes(secret.bytes)
+    (tmp_path / "selected.vault").write_bytes(ciphertext)
+    action = "copy" if legacy else "ansible.builtin.copy"
+    defaults = {
+        "templated-defaults": f'  module_defaults:\n    {action}: "{{{{ source_options }}}}"\n',
+        "legacy-alias": "  module_defaults: {copy: {decrypt: false}, ansible.builtin.copy: {decrypt: true}}\n",
+        "templated-content": "",
+    }[opts]
+    content = '\n        content: "{{ omit }}"' if opts == "templated-content" else ""
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: false
+  vars:
+    source_options: {decrypt: false}
+""" + defaults + """  tasks:
+    - copy:
+        src: selected.vault
+        dest: "{{ playbook_dir }}/installed"
+""" + content})
+    compiled, manifest = compile_playbook(str(tmp_path / "pb.yml"), vault_password_file=str(password))
+    assert not manifest.get("contains_vault_plaintext")
+    (tmp_path / "selected.vault").unlink()
+    artifact = tmp_path / "artifact.py"
+    artifact.write_text(compiled)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    if opts == "templated-content":
+        assert result.returncode != 0
+        assert "content" in (result.stdout + result.stderr).split("Vault source requires controller decryption.", 1)[1]
+        assert not (tmp_path / "installed").exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (tmp_path / "installed").read_bytes() == ciphertext
+
+
+def test_cli_protects_vault_artifacts_with_disabled_handlers(tmp_path):
+    from stat import S_IMODE
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    secret = VaultSecret(b"synthetic-test-password")
+    password = tmp_path / "vault-password"
+    password.write_bytes(secret.bytes)
+    (tmp_path / "selected.vault").write_bytes(VaultLib([("default", secret)]).encrypt(b"private source", secret=secret))
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: present}
+  handlers:
+    - name: Disabled handler
+      when: false
+      copy: {src: selected.vault, dest: /unused}
+"""})
+    output, manifest = tmp_path / "compiled.py", tmp_path / "manifest.json"
+    run = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(tmp_path / "pb.yml"),
+                          "--tree-shake", "--vault-password-file", str(password),
+                          "-o", str(output), "-m", str(manifest)], cwd=ROOT, env=_env(),
+                         capture_output=True, text=True, timeout=45)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert json.loads(manifest.read_text())["contains_vault_plaintext"]
+    assert S_IMODE(output.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can open read-only files for writing")
+def test_cli_keeps_existing_read_only_vault_output(tmp_path):
+    from ansiroll.cli import _write_compile_files
+
+    output = tmp_path / "compiled.py"
+    output.write_text("existing artifact")
+    output.chmod(0o444)
+    previous = output.stat()
+    with pytest.raises(PermissionError):
+        _write_compile_files(str(output), None, "new private source", {"contains_vault_plaintext": True},
+                             lambda *args: None)
+    assert output.read_text() == "existing artifact"
+    assert os.path.samestat(output.stat(), previous)
 
 
 @pytest.mark.parametrize("path_form", ["direct", "symlink-parent", "symlink-leaf"])
@@ -1724,6 +1814,7 @@ def test_vault_candidates_stay_encrypted_until_the_controller_selects_one(tmp_pa
 
     strategy = subprocess.run(
         ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
+                                     "-e", "ansible_python_interpreter=" + sys.executable,
                                      "--vault-password-file", str(password_file), "-e", "profile=private", str(playbook)],
         cwd=tmp_path, env={**_env(), "ANSIBLE_STRATEGY": "ansiroll.core.ansiroll",
                            "ANSIBLE_COLLECTIONS_PATH": os.path.join(ROOT, "collections")},
@@ -1760,8 +1851,8 @@ def test_builtin_unarchive_normalizes_options_before_dispatch():
 
     rt.delegate_fn = invoke
     common = {"delegate_to": "localhost", "action": "ansible.builtin.unarchive"}
-    rt._exec_one(dict(common, args={"copy": False, "src": "https://example.invalid/archive"}), {})
-    assert calls == [{"src": "https://example.invalid/archive", "remote_src": True}]
+    rt._exec_one(dict(common, args={"copy": False, "src": "https://example.invalid/archive", "decrypt": False}), {})
+    assert calls == [{"src": "https://example.invalid/archive", "remote_src": True, "decrypt": False}]
     result = rt._exec_one(dict(common, args={"copy": True, "remote_src": False, "src": "archive"}), {})
     assert result["failed"]
     assert "mutually exclusive" in result["msg"]

@@ -466,21 +466,36 @@ def _open_private_compile_destination(path, validate, *, prepare):
     # that inode even after chmod. Publish the new source on a private inode.
     destination = _private_output_path(path)
     directory = os.path.dirname(destination)
+
+    def destination_stat():
+        try:
+            return os.lstat(destination)
+        except FileNotFoundError:
+            return None
+
     fd, temp_path = tempfile.mkstemp(prefix=".ansiroll-vault-", dir=directory)
     try:
-        with os.fdopen(fd, "w") as writer:
+        with os.fdopen(fd, "w") as writer, ExitStack() as existing_ref:
             yield writer
             writer.flush()
             os.fchmod(fd, 0o700)
-            existing = _try_stat(destination)
+            existing = destination_stat()
             if existing is not None:
                 validate(existing, None)
                 if not stat.S_ISREG(existing.st_mode):
                     raise ValueError("Vault-bearing output needs a regular destination file: %s" % path)
+                existing_fd = os.open(destination, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                existing_ref.callback(os.close, existing_fd)
+                if not os.path.samestat(existing, os.fstat(existing_fd)):
+                    raise OSError(errno.ESTALE, "Vault-bearing output changed before access check", path)
             info = os.fstat(fd)
             validate(info, fd)
             if _private_output_path(path) != destination:
                 raise ValueError("Vault-bearing output path changed: %s" % path)
+            current = destination_stat()
+            if ((existing is None) != (current is None)
+                    or (existing is not None and not os.path.samestat(existing, current))):
+                raise OSError(errno.ESTALE, "Vault-bearing output changed before replacement", path)
             os.replace(temp_path, destination)
             prepare(info, fd)
     finally:

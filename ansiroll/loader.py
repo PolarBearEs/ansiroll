@@ -2418,7 +2418,7 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
         source_action = action.rsplit(".", 1)[-1]
         unknown_defaults = False
         if source_action in ("copy", "unarchive"):
-            unknown_defaults = _apply_file_source_defaults(task, source_action, args)
+            unknown_defaults = _apply_file_source_defaults(task, source_action, node)
         _bake_sources(node, task, basedir, controller_execution=controller_execution,
                       unknown_defaults=unknown_defaults)
         decrypt = node["args"].get("decrypt", True)
@@ -2429,7 +2429,7 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
                         for value in (node.get("_baked") or {}).values())):
             node["_deferred_vault_source"] = True
             node["_vault_source_inputs"] = [
-                key for key in ("src", "remote_src", "copy", "decrypt")
+                key for key in ("src", "remote_src", "copy", "decrypt", "content")
                 if _contains_dynamic_value(args.get(key))
             ]
             if unknown_defaults:
@@ -2669,27 +2669,53 @@ def _special_of(action):
     return None
 
 
-def _apply_file_source_defaults(task, action, args):
+def _apply_file_source_defaults(task, action, node):
     """Lower source-affecting module defaults without running their templates."""
+    from ansible.plugins.loader import action_loader, module_loader
+
+    args = node["args"]
     layers = task.module_defaults or ()
     defaults = {}
     for layer in (layers,) if isinstance(layers, dict) else layers:
         defaults.update(layer)
-    fqcn = "ansible.builtin." + action
-    groups = (getattr(_play_of(task), "_action_groups", None) or {}).get(fqcn, ())
-    entries = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
-    entries.extend(defaults[key] for key in (action, "ansible.legacy." + action, fqcn) if key in defaults)
-    source_keys = {"decrypt", "remote_src"}
+    if not defaults:
+        return False
+    if _core_version() < (2, 12):
+        # Legacy Core merges authored and redirected names in this order.
+        names = []
+        for name in getattr(task, "_ansible_internal_redirect_list", None) or (task.action,):
+            if name == task.action and name.startswith("ansible.legacy."):
+                names.append(name.rsplit(".", 1)[-1])
+            names.append(name)
+        entries = [defaults[name] for name in names if name in defaults]
+    else:
+        loaders = (action_loader, module_loader) if _core_version() >= (2, 19) else (module_loader, action_loader)
+        resolved = None
+        for loader in loaders:
+            result = loader.find_plugin_with_context(task.action, collection_list=task.collections)
+            if result.resolved:
+                resolved = result.resolved_fqcn
+                break
+        if not resolved:
+            # Without a known match, never bake plaintext based on a guessed alias.
+            return True
+        groups = (getattr(_play_of(task), "_action_groups", None) or {}).get(resolved, ())
+        entries = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
+        if resolved in defaults:
+            entries.append(defaults[resolved])
+    source_keys = {"decrypt", "remote_src", "src"}
     if action == "unarchive":
         source_keys.add("copy")
-    inherited = {}
+    else:
+        source_keys.add("content")
+    missing = source_keys - args.keys()
+    if missing and any(not isinstance(entry, dict) for entry in entries):
+        node["_file_source_defaults"] = _tag_untrusted(entries)
+        node["_file_source_default_keys"] = sorted(missing)
+        return True
     for entry in entries:
-        if not isinstance(entry, dict):
-            if source_keys - args.keys():
-                return True
-        else:
-            inherited.update({key: entry[key] for key in source_keys & entry.keys()})
-    args.update({key: value for key, value in inherited.items() if key not in args})
+        if isinstance(entry, dict):
+            args.update({key: entry[key] for key in missing & entry.keys()})
     return False
 
 

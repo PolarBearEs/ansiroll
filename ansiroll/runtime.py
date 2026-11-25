@@ -5831,12 +5831,29 @@ class Runtime:
                 res["exception"] = "(traceback unavailable)"
         return res
 
-    def _render_action_args(self, raw_args, ctx, args_cache):
+    def _render_action_args(self, raw_args, ctx, args_cache, *, source_task=None):
         if args_cache is None:
-            return self.template(raw_args, ctx)
+            args_cache = {}
         if "args" not in args_cache:
-            args_cache["args"] = self.template(raw_args, ctx)
+            args = self.template(raw_args, ctx)
+            if source_task and source_task.get("_file_source_defaults"):
+                args = {**self._render_file_source_defaults(source_task, ctx), **args}
+            args_cache["args"] = args
         return args_cache["args"]
+
+    def _render_file_source_defaults(self, task, ctx):
+        keys = set(task["_file_source_default_keys"])
+        selected = {}
+        for entry in task["_file_source_defaults"]:
+            templated = isinstance(entry, str)
+            layer = self.templater.render_string(entry, ctx) if templated else entry
+            if not isinstance(layer, dict) or set(layer) == {"__ansiroll_unsafe__"}:
+                _fail_on_undef(layer)
+                raise ValueError("file source module_defaults must resolve to a dictionary")
+            for key in keys & layer.keys():
+                selected[key] = layer, templated
+        return _strip_omit({key: layer[key] if templated else self.template(layer[key], ctx)
+                            for key, (layer, templated) in selected.items()})
 
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
@@ -5897,7 +5914,6 @@ class Runtime:
                     ))
                     if self._is_builtin_unarchive(task):
                         self._normalize_unarchive_options(args)
-                        args.pop("decrypt", None)
                     res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
@@ -5911,7 +5927,7 @@ class Runtime:
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
-                    self._render_action_args(task.get("args") or {}, ctx, args_cache)))
+                    self._render_action_args(task.get("args") or {}, ctx, args_cache, source_task=task)))
                 if self._is_builtin_unarchive(task):
                     self._normalize_unarchive_options(args)
                 self._module_source_bytes = self._baked_module_source(task, args)
@@ -6215,7 +6231,7 @@ class Runtime:
         if name == "assert":
             # Its condition expressions are interpreted only by when().
             raw_args = {k: v for k, v in raw_args.items() if k != "that"}
-        args = self._render_action_args(raw_args, ctx, args_cache)
+        args = self._render_action_args(raw_args, ctx, args_cache, source_task=task)
         # Ansible accepts the complete module argument dictionary through a
         # single template, representing it internally as `_raw_params`.
         if (
