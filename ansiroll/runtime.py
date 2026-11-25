@@ -1059,6 +1059,7 @@ class TaskFailed(Exception):
         super(TaskFailed, self).__init__(name)
         self.task = task or {"name": name}
         self.result = result or {"failed": True, "msg": str(name)}
+        self.pending_includes = None
 
 
 class MissingHandler(Exception):
@@ -4668,7 +4669,14 @@ class Runtime:
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
-        if items is not None and not items:
+        metadata_flags = None
+        if items:
+            try:
+                metadata_flags = self._loop_metadata_flags(node, base_ctx)
+            except (jinja2.UndefinedError, TypeError) as ex:
+                result = {"failed": True, "changed": False, "msg": str(ex)}
+                ignore = self._ignore_before_validation(node)
+        elif items is not None:
             result = {"changed": False, "skipped": True, "results": [],
                       "msg": "No items in the list"}
         if result is None and items is None:
@@ -4698,7 +4706,12 @@ class Runtime:
             if not looped:
                 selected.append((base_ctx, loop_vars, result, item))
                 break
-            loop_vars = self._loop_item_vars(node, items, i, base_ctx)
+            try:
+                loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
+            except (jinja2.UndefinedError, TypeError) as ex:
+                legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)},
+                                  self._ignore_before_validation(node))
+                break
             ctx = {**base_ctx, **loop_vars}
             blocked, ignored = self._task_gate(node, ctx)
             if blocked is not None:
@@ -4706,13 +4719,16 @@ class Runtime:
                     legacy_failure = (blocked, ignored)
                     break
                 result = blocked
-            result.update(loop_vars)
+            # Older executors added loop metadata directly to the result before
+            # aggregating item status. Newer executors keep status separately.
+            if not _core_at_least(2, 21):
+                result.update(loop_vars)
             result.setdefault("failed", False)
             stop = False
             if node.get("loop_break_when"):
                 break_ctx = dict(ctx)
                 if node.get("register"):
-                    break_ctx[node["register"]] = _registered_result(node, result)
+                    break_ctx[node["register"]] = _registered_result(node, {**result, **loop_vars})
                 try:
                     stop = self.when(node["loop_break_when"], break_ctx, keyword="break_when")
                 except ConditionalError as ex:
@@ -4724,21 +4740,23 @@ class Runtime:
             ignore_loop = ignore_loop or ignored
             if _result_failed(result):
                 failed_items_ignored = failed_items_ignored and ignored
-            elif not result.get("skipped"):
-                selected.append((ctx, loop_vars, result, item))
-            results.append((item, result))
+            reported = {**result, **loop_vars}
+            if not _result_failed(result) and not result.get("skipped"):
+                selected.append((ctx, loop_vars, reported, item))
+            results.append((item, result, reported))
             if stop:
                 break
 
+        failure = None
         if looped:
             if legacy_failure is not None:
                 aggregate, ignored = legacy_failure
                 selected.clear()
             else:
-                failed = any(_result_failed(outcome) for _, outcome in results)
-                skipped = all(outcome.get("skipped") for _, outcome in results)
+                failed = any(_result_failed(outcome) for _, outcome, _ in results)
+                skipped = all(outcome.get("skipped") for _, outcome, _ in results)
                 aggregate = {"changed": False, "failed": failed,
-                             "results": [outcome for _, outcome in results]}
+                             "results": [reported for _, _, reported in results]}
                 if failed:
                     aggregate["msg"] = "One or more items failed"
                 elif skipped:
@@ -4746,27 +4764,23 @@ class Runtime:
                 else:
                     aggregate["msg"] = "All items completed"
                 ignored = ignore_loop if _core_at_least(2, 21) else failed_items_ignored
-                for item, outcome in results:
+                for item, outcome, reported in results:
                     status = _status_of(outcome)
                     if status != "ok":
-                        self.emit(node, status, outcome, item=item, ignored=ignored, is_item=True, name=name)
+                        self.emit(node, status, reported, item=item, ignored=ignored, is_item=True, name=name)
             self._store_register(node, aggregate)
             status = _status_of(aggregate)
             if status != "ok":
                 self.emit(node, status, aggregate, ignored=ignored, name=name)
             if status == "failed":
-                if not ignored:
-                    if tally_ok:
-                        for _, _, result, item in selected:
-                            self.emit(node, "ok", result, item=item, is_item=True, name=name)
-                            self._tally("ok")
-                    raise TaskFailed(node.get("name"), node, aggregate)
-                self._tally("ok")
-                self._tally("ignored")
+                if ignored:
+                    self._tally("ok")
+                    self._tally("ignored")
+                else:
+                    failure = TaskFailed(node.get("name"), node, aggregate)
             elif status == "skipped":
                 self._tally("skipped")
 
-        # Register all selected role handlers before running any included body.
         scopes = []
         for ctx, loop_vars, result, item in selected:
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
@@ -4783,12 +4797,27 @@ class Runtime:
                 self._store_register(node, result)
             if tally_ok:
                 self._tally("ok")
-            self._add_handlers(handlers, scope, b)
             scopes.append(scope)
         if looped and status == "ok" and node.get("register"):
             self.emit(node, status, aggregate, ignored=ignored, name=name)
+        if failure is not None:
+            if scopes:
+                failure.pending_includes = (tasks, handlers, scopes, b)
+            raise failure
+        yield from self._included_body_steps(tasks, handlers, scopes, b)
+
+    def _included_body_steps(self, tasks, handlers, scopes, become):
+        # Load all selected role handlers before executing any included body.
         for scope in scopes:
-            yield self._node_steps(tasks, scope, b)
+            self._add_handlers(handlers, scope, become)
+        for scope in scopes:
+            yield self._node_steps(tasks, scope, become)
+
+    def _failed_include_steps(self, failure):
+        if failure is not None and failure.pending_includes is not None:
+            pending = failure.pending_includes
+            failure.pending_includes = None
+            yield from self._included_body_steps(*pending)
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
@@ -4823,6 +4852,7 @@ class Runtime:
                 }
                 self.vars.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
+                yield from self._failed_include_steps(ex)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
             if getattr(ex, "ends_play", False):
@@ -4830,6 +4860,7 @@ class Runtime:
             failed_exc = ex
         if block.get("always"):
             try:
+                yield from self._failed_include_steps(failed_exc)
                 yield self._node_steps(block["always"], scope, b_become)
             except TaskFailed:
                 # If always replaces a pending block/rescue failure, preserve
@@ -5277,7 +5308,7 @@ class Runtime:
         result = {"failed": True, "changed": False, "msg": message}
         return result, self._ignore_before_validation(task)
 
-    def _loop_item_vars(self, task, items, i, ctx=None):
+    def _loop_item_vars(self, task, items, i, ctx=None, *, metadata_flags=None):
         """Per-item loop variables: loop_var, index_var and ansible_loop."""
         loop_var = task.get("loop_var") or "item"
         if "{{" in loop_var and ctx is not None:
@@ -5286,7 +5317,8 @@ class Runtime:
         if task.get("index_var"):
             out[task["index_var"]] = i
             out["ansible_index_var"] = task["index_var"]
-        if _to_bool(self.template(task.get("loop_extended", False), ctx or {})):
+        extended, allitems = metadata_flags or self._loop_metadata_flags(task, ctx)
+        if extended:
             n = len(items)
             loop_info = {
                 "index": i + 1, "index0": i,
@@ -5298,18 +5330,27 @@ class Runtime:
                 loop_info["previtem"] = items[i - 1]
             if i < n - 1:
                 loop_info["nextitem"] = items[i + 1]
-            if _to_bool(self.template(task.get("loop_extended_allitems", True), ctx or {})):
+            if allitems:
                 loop_info["allitems"] = items
             out["ansible_loop"] = loop_info
         return out
+
+    def _loop_control_bool(self, task, key, default, ctx):
+        value = _fail_on_undef(self.template(task.get(key, default), ctx or {}))
+        return default if value is None or isinstance(value, _Omit) else _boolean(value, strict=True)
+
+    def _loop_metadata_flags(self, task, ctx):
+        return (self._loop_control_bool(task, "loop_extended", False, ctx),
+                self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
     def _run_loop(self, task, items, base_ctx, become=False, notifications=None):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
+        metadata_flags = self._loop_metadata_flags(task, base_ctx)
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
-            ctx.update(self._loop_item_vars(task, items, i, base_ctx))
+            ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
             res, ignore = self._task_gate(task, ctx)

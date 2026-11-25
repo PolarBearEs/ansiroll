@@ -1937,6 +1937,64 @@ def test_include_loop_does_not_run_bodies_after_a_later_unignored_error(tmp_path
     assert recap[3] == "1"
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores discard the partial include results")
+@pytest.mark.parametrize("section", ["rescue", "always"])
+def test_include_loop_runs_selected_body_before_block_recovery(tmp_path, section):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - include_tasks: child.yml
+          loop: [first, second]
+          when: item == 'first' or missing_condition
+      SECTION:
+        - debug: {msg: recovered}
+""".replace("SECTION", section), {"child.yml": '- debug: {msg: "{{ item }}"}\n'})
+    assert messages == ["first", "recovered"]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="older cores merge loop metadata into item status")
+def test_include_loop_keeps_failed_loop_var_separate_from_item_status(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [allowed, skipped]
+      loop_control: {loop_var: failed}
+      when: failed == 'allowed'
+      register: selected
+    - assert:
+        quiet: true
+        that:
+          - selected is succeeded
+          - selected.results | map(attribute='failed') | list == ['allowed', 'skipped']
+""", {"child.yml": '- debug: {msg: "{{ failed }}"}\n'})
+    assert messages == ["allowed"]
+
+
+def test_include_loop_validates_extended_metadata_options(tmp_path):
+    allitems = Version(__version__) >= Version("2.14")
+    option = ', extended_allitems: "f"' if allitems else ""
+    condition = " and ansible_loop.allitems is undefined" if allitems else ""
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [unused]
+      loop_control: {extended: "{{ missing_extended }}"}
+      ignore_errors: true
+    - include_tasks: child.yml
+      loop: [selected]
+      loop_control: {extended: "y"OPTION}
+      when: ansible_loop.index0 == 0CONDITION
+""".replace("OPTION", option).replace("CONDITION", condition),
+                                 {"child.yml": '- debug: {msg: "{{ item }}"}\n'})
+    assert messages == ["selected"]
+
+
 @pytest.mark.skipif(Version(__version__) < Version("2.18"), reason="break_when requires ansible-core 2.18")
 def test_include_loop_break_when_reads_registered_item_metadata(tmp_path):
     messages, _ = _assert_parity(tmp_path, """

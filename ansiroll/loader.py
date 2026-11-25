@@ -3450,9 +3450,10 @@ def _loop_control(task):
     if lc is None:
         return {}
     out = {}
-    if getattr(lc, "extended", None):
+    if getattr(lc, "extended", None) is not None:
         out["loop_extended"] = _boolean_or_template(lc.extended)
-        out["loop_extended_allitems"] = _boolean_or_template(getattr(lc, "extended_allitems", True))
+    if getattr(lc, "extended_allitems", None) is not None:
+        out["loop_extended_allitems"] = _boolean_or_template(lc.extended_allitems)
     bw = getattr(lc, "break_when", None)
     if bw:
         out["loop_break_when"] = _conditions(bw)
