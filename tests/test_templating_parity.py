@@ -1004,6 +1004,40 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     assert output.read_bytes() == expected
 
 
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_honors_comments_and_trim_blocks(tmp_path, delegated):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: comment.j2
+        dest: "{{ playbook_dir }}/comment.txt"
+DELEGATION    - template:
+        src: block.j2
+        dest: "{{ playbook_dir }}/trimmed.txt"
+DELEGATION    - template:
+        src: block.j2
+        dest: "{{ playbook_dir }}/untrimmed.txt"
+        trim_blocks: false
+DELEGATION""".replace("DELEGATION", "      delegate_to: localhost\n" if delegated else ""), {
+        "comment.j2": "{# internal note #}",
+        "block.j2": "{% if true %}\nhello{% endif %}\n",
+    })
+    outputs = {name: tmp_path / (name + ".txt") for name in ("comment", "trimmed", "untrimmed")}
+
+    summary = _ansible(path, tmp_path)
+    expected = {name: output.read_bytes() for name, output in outputs.items()}
+    assert expected["comment"] == b""
+    assert expected["trimmed"].startswith(b"hello")
+    assert expected["untrimmed"].startswith(b"\nhello")
+    for output in outputs.values():
+        output.unlink()
+    result = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert result == summary
+    assert {name: output.read_bytes() for name, output in outputs.items()} == expected
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 
