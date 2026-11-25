@@ -4448,7 +4448,7 @@ class Runtime:
             frame["item"] = item
         if self.on_result:
             if node.get("type") == "include" and node.get("no_log") and node.get("register") and not is_item:
-                frame["include_register"] = result
+                frame["include_register"] = _pack_delegated_value(result)
             if (not is_item and not node.get("no_log") and node.get("register")
                     and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
                 entries = result["results"] if "results" in result else [result]
@@ -4739,6 +4739,9 @@ class Runtime:
                         break
                     result.update(failed=True, break_when_result=str(ex))
                     stop = True
+                else:
+                    if _core_at_least(2, 21):
+                        result["break_when_result"] = stop
             ignore_loop = ignore_loop or ignored
             if _result_failed(result):
                 failed_items_ignored = failed_items_ignored and ignored
@@ -7732,6 +7735,17 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
+def _pack_delegated_value(value):
+    undefined, errors, mapping_keys = [], [], []
+    value = _delegate_fallback_value(value, undefined, errors, mapping_keys)
+    result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+    if errors:
+        result["errors"] = errors
+    if mapping_keys:
+        result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
+    return result
+
+
 def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=None):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
@@ -7754,19 +7768,11 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
                      else [reserve(index) for index in range(len(rendered))])
         else:
             slots = None
-        undefined = []
-        errors = []
-        mapping_keys = []
-        value = _delegate_fallback_value(rendered if slots is None else slots, undefined, errors, mapping_keys)
-        result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+        result = _pack_delegated_value(rendered if slots is None else slots)
         if slots is not None:
             result["lazy_members"] = True
             if isinstance(rendered, _HostVarView):
                 result["hostvar_view"] = True
-        if errors:
-            result["errors"] = errors
-        if mapping_keys:
-            result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
         return result
     except _CapturedTemplateError as error:
         return {"error": str(error)}

@@ -2135,6 +2135,24 @@ def test_include_loop_break_when_reads_registered_item_metadata(tmp_path):
     assert messages == ["first", "second"]
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="modern break_when result field")
+def test_include_loop_register_records_evaluated_break_when(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [first, second]
+      loop_control:
+        break_when: item == 'first'
+      register: selected
+    - assert:
+        quiet: true
+        that: selected.results[0].break_when_result is true
+""", {"child.yml": '- debug: {msg: "{{ item }}"}\n'})
+    assert messages == ["first"]
+
+
 @pytest.mark.skipif(not Version("2.18") <= Version(__version__) < Version("2.21"),
                     reason="legacy break_when errors replace the loop result")
 def test_include_loop_discards_selected_bodies_after_legacy_break_when_error(tmp_path):
@@ -2194,6 +2212,23 @@ def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_pat
         that: selected is skipped
 """, {"child.yml": "- debug: {msg: unexpected body}\n"}, use_strategy=True)
     assert messages == []
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern native tuple keys")
+def test_strategy_censored_include_can_transport_tuple_mapping_keys(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: "{{ [{(1, 2): 'private'}] }}"
+      when: false
+      register: selected
+      no_log: true
+""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+    messages, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert messages == []
+    assert recap[4] == "1"
 
 
 def test_empty_ordinary_loop_skips_validation_of_extended_metadata(tmp_path):

@@ -1452,7 +1452,11 @@ class StrategyModule(StrategyBase):
             registered_result = result_data
             if registers and not frame.get("is_item"):
                 if action in ("include_tasks", "include_role") and "include_register" in frame:
-                    registered_result = frame["include_register"]
+                    private = frame["include_register"]
+                    registered_result = self._restore_play_fallback(
+                        private["value"], private["undefined"], private.get("errors", ()),
+                        private.get("mapping_keys", ()),
+                    )
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
                     registered_result = _without_delegated_metadata(result_data)
