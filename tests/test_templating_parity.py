@@ -1100,6 +1100,8 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     ("{{ value -}}\n", "ready", "\r\n", b"ready\r\n"),
     ("{{ value -}}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
     ("first\n{% if true %}second{% endif -%}\n", None, "\r\n", b"first\r\nsecond\r\n"),
+    ("#jinja2: newline_sequence: '\\r\\n'\nfirst\n{% if true %}second{% endif -%}\n",
+     None, "\n", b"first\r\nsecond\n"),
     ("hello{# note -#} \n", None, "\n", b"hello\n"),
     ("hello\r\n{% set x = 1 -%}\r\n\r\n", None, "\n", b"hello\n"),
     ("{{ value }}{# note -#}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
@@ -1107,6 +1109,11 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     ("alpha\r\nbeta\r\n", None, "\n", b"alpha\r\nbeta\r\n" if MODERN_TEMPLATING else b"alpha\nbeta\n"),
     pytest.param("{% set value = 42 %}{{ value -}}\n", None, "\n", b"42",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native full-template scalar")),
+    pytest.param("answer={{ none }}\n", None, "\n", b"answer=\n",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern None output segments")),
+    ("{% if true %}{{ true }}{% endif %}", None, "\n", b"True"),
+    ("{% if true %}{{ [true, 'ready'] }}{% endif %}", None, "\n", b"[True, 'ready']"),
+    ("{% if true %}{{ {'value': true} }}{% endif %}", None, "\n", b"{'value': True}"),
     (" {{ value }}\n", True, "\n", b" True\n"),
     pytest.param(" {{ missing | default(omit) }}\n", None, "\n", b" \n",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native scalar omit semantics")),
@@ -1157,13 +1164,26 @@ DELEGATION    - template:
 DELEGATION    - template:
         src: header.j2
         dest: "{{ playbook_dir }}/header.txt"
+DELEGATION    - template:
+        src: line-directives.j2
+        dest: "{{ playbook_dir }}/line-directives.txt"
+DELEGATION    - template:
+        src: overlapping-comment.j2
+        dest: "{{ playbook_dir }}/overlapping-comment.txt"
+        comment_start_string: !unsafe '{{#'
+        comment_end_string: '#}}'
 DELEGATION""".replace("DELEGATION", "      delegate_to: localhost\n" if delegated else ""), {
         "comment.j2": "{# internal note #}",
         "block.j2": "{% if true %}\nhello{% endif %}\n",
         "custom.j2": "A {# literal\n[[ internal note ]]",
         "header.j2": "#jinja2: trim_blocks: False\n{% if true %}\nhello{% endif %}\n",
+        "line-directives.j2": "#jinja2: line_statement_prefix: '%', line_comment_prefix: '##'\n"
+                              "% if true\nhello\n% endif\n## private\n",
+        "overlapping-comment.j2": "{{# private #}}",
     })
-    outputs = {name: tmp_path / (name + ".txt") for name in ("comment", "trimmed", "untrimmed", "custom", "header")}
+    outputs = {name: tmp_path / (name + ".txt") for name in (
+        "comment", "trimmed", "untrimmed", "custom", "header", "line-directives", "overlapping-comment",
+    )}
 
     summary = _ansible(path, tmp_path)
     expected = {name: output.read_bytes() for name, output in outputs.items()}
@@ -1172,6 +1192,8 @@ DELEGATION""".replace("DELEGATION", "      delegate_to: localhost\n" if delegate
     assert expected["untrimmed"].startswith(b"\nhello")
     assert expected["header"].startswith(b"\nhello")
     assert expected["custom"].startswith(b"A {# literal")
+    assert expected["line-directives"].strip() == b"hello"
+    assert expected["overlapping-comment"] == b""
     for output in outputs.values():
         output.unlink()
     result = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)

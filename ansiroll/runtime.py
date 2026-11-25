@@ -3296,10 +3296,16 @@ class _ConditionalFileCodeGenerator(_ConditionalCodeGenerator, _FileCodeGenerato
 
 
 def _concat_file_output(nodes):
-    values = list(nodes)
+    values = [value for value in nodes if value is not None]
     if len(values) < 2:
         return values[0] if values else None
-    return "".join("" if isinstance(value, _Omit) else str(value) for value in values)
+    return "".join(_native_file_text(value) for value in values if not isinstance(value, _Omit))
+
+
+def _native_file_text(value):
+    if value is None:
+        return ""
+    return str(_fail_on_undef(_mark_unsafe(value)))
 
 
 class _AnsirollContext(jinja2.runtime.Context):
@@ -3382,12 +3388,12 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message, missing=missing)
 
 
-def _bare_template_expression(text, *, lex=None):
+def _bare_template_expression(text, *, lex=None, verify=False):
     stripped = text.strip()
     if not (stripped.startswith("{{") and stripped.endswith("}}")):
         return None
     inner = stripped[2:-2]
-    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
+    if not (verify or "{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
             or inner.endswith(("-", "}"))):
         return inner.strip()
     try:
@@ -3695,15 +3701,16 @@ class _Templater:
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
-    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None, file_options=()):
+    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None, file_options=(), file_header=False):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if file_newline is None:
             templated = _looks_templated(text)
         else:
             settings = dict(file_options)
-            templated = any(settings.get(kind + "_start_string", getattr(self.env, kind + "_start_string")) in text
-                            for kind in ("variable", "block", "comment"))
+            templated = file_header or any(
+                settings.get(kind + "_start_string", getattr(self.env, kind + "_start_string")) in text
+                for kind in ("variable", "block", "comment"))
         if not templated:
             if file_newline is not None and _legacy_templating():
                 return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
@@ -3959,7 +3966,7 @@ class _Templater:
                     file_env.finalize = _concretize
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
-        expr = (_bare_template_expression(stripped, lex=env.lex)
+        expr = (_bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
                 if env.variable_start_string == "{{" and env.variable_end_string == "}}" else None)
         template_key = (text, strict, lazy_names, file_newline, file_options, native_file)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
@@ -4009,8 +4016,8 @@ class _Templater:
                 tokens = list(env.lex(text))
                 prefix = tokens[0][2] if tokens[0][1] == "data" else ""
                 suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
-                prefix = prefix.replace("\n", file_newline)
-                suffix = suffix.replace("\n", file_newline)
+                prefix = prefix.replace("\n", env.newline_sequence)
+                suffix = suffix.replace("\n", env.newline_sequence)
                 legacy = _legacy_templating()
                 if prefix or suffix:
                     value = "" if not legacy and isinstance(result, _Omit) else result
@@ -6682,13 +6689,13 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    raw, newline_sequence, options = _template_file_options(raw, args, newline_sequence)
+                    raw, options, header = _template_file_options(raw, args)
                     rendered = self.templater.render_string(
-                        raw, tctx, file_newline=newline_sequence, file_options=options)
+                        raw, tctx, file_newline=newline_sequence, file_options=options, file_header=header)
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
-                    rendered = _as_text(rendered)
+                    rendered = _native_file_text(rendered) if _core_at_least(2, 19) else _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
@@ -7635,7 +7642,7 @@ _DEFAULT_REAL_FILE_ARGS = frozenset((
 ))
 
 
-def _template_file_options(source, args, newline_sequence):
+def _template_file_options(source, args):
     import ast
 
     options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
@@ -7643,7 +7650,8 @@ def _template_file_options(source, args, newline_sequence):
     for key in _TEMPLATE_ONLY_ARGS:
         if key.endswith(("_start_string", "_end_string")) and args.get(key) is not None:
             options[key] = args[key]
-    if source.startswith("#jinja2:"):
+    has_header = source.startswith("#jinja2:")
+    if has_header:
         header, delimiter, source = source.partition("\n")
         if not delimiter:
             raise ValueError("missing newline after #jinja2 override")
@@ -7655,7 +7663,7 @@ def _template_file_options(source, args, newline_sequence):
             ):
                 raise ValueError("invalid #jinja2 override %r" % key)
             options[key] = ast.literal_eval(value.strip())
-    return source, options.pop("newline_sequence", newline_sequence), tuple(sorted(options.items()))
+    return source, tuple(sorted(options.items())), has_header
 
 
 class _CopyActionError(Exception):
