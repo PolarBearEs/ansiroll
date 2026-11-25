@@ -1,8 +1,18 @@
-name: Reviewed PR CI
+name: Manual Full PR CI
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('Full CI for PR #{0}', inputs.pr_number) || 'Invalidate stale PR CI checks' }}
 
 on:
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open pull request number targeting master
+        type: string
+        required: true
+      head_sha:
+        description: Full SHA of the pull request commit to test
+        type: string
+        required: true
   push:
     branches: [master]
   pull_request_target:
@@ -12,21 +22,13 @@ permissions: {}
 
 concurrency:
   group: >-
-    ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-    format('{0}', github.event.comment.user.id) == vars.AMP_CI_ACTOR_ID &&
-    startsWith(github.event.comment.body, 'Amp cleared ci.yml for ') &&
-    format('amp-ci-pr-{0}-{1}', github.event.issue.number, github.event.comment.body) || github.run_id }}
+    ${{ github.event_name == 'workflow_dispatch' && format('manual-full-ci-pr-{0}', inputs.pr_number) || github.run_id }}
   queue: max
 
 jobs:
   reviewed-head:
-    # issue_comment uses the default branch's workflow. Keep write permissions
-    # in jobs that only call GitHub's API and never check out PR code.
-    if: >-
-      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-      vars.AMP_CI_ACTOR_ID != '' &&
-      format('{0}', github.event.comment.user.id) == vars.AMP_CI_ACTOR_ID &&
-      startsWith(github.event.comment.body, 'Amp cleared ci.yml for ')
+    # Keep write permissions in API-only jobs without a checkout.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,22 +39,28 @@ jobs:
       base: ${{ steps.resolve.outputs.base }}
       merge: ${{ steps.resolve.outputs.merge }}
       attempt: ${{ steps.resolve.outputs.attempt }}
-      cached_run: ${{ steps.resolve.outputs.cached_run }}
     steps:
       - id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.issue.number }}
-          COMMENT: ${{ github.event.comment.body }}
+          PR: ${{ inputs.pr_number }}
+          EXPECTED_HEAD: ${{ inputs.head_sha }}
         run: |
-          pattern='^Amp cleared ci\.yml for ([a-f0-9]{40})\.$'
-          [[ "$COMMENT" =~ $pattern ]] || exit 0
-          head=${BASH_REMATCH[1]}
+          if ! [[ "$PR" =~ ^[1-9][0-9]*$ && "$EXPECTED_HEAD" =~ ^[a-f0-9]{40}$ ]]; then
+            echo '::error::Supply a PR number and its full head SHA.'
+            exit 1
+          fi
+          head="$EXPECTED_HEAD"
           api="repos/$GITHUB_REPOSITORY"
           verified=false
           for attempt in 1 2 3 4 5; do
             pr=$(gh api "$api/pulls/$PR")
-            jq -e --arg head "$head" '.state == "open" and .head.sha == $head' <<< "$pr" >/dev/null || exit 0
+            if ! jq -e --arg head "$head" '
+              .state == "open" and .base.ref == "master" and .head.sha == $head
+            ' <<< "$pr" >/dev/null; then
+              echo '::error::The expected commit is no longer the head of an open PR targeting master.'
+              exit 1
+            fi
             mergeable=$(jq -r '.mergeable' <<< "$pr")
             if [[ "$mergeable" == false ]]; then
               break
@@ -77,32 +85,20 @@ jobs:
           fi
           runs="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
           printf 'head=%s\nbase=%s\nattempt=%s\n' "$head" "$base" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          if [[ "$GITHUB_RUN_ATTEMPT" == 1 ]]; then
-            combined=$(gh api "$api/commits/$merge/status")
-            if previous_run=$(jq -er --arg merge "$merge" --arg runs "$runs" '.statuses[] | select(
-              .context == "Amp CI" and
-              .state == "success" and
-              (.target_url // "" | startswith($runs)) and
-              (.description // "" | endswith(" merge " + $merge))
-            ) | .target_url' <<< "$combined"); then
-              echo 'CI already passed for this merge commit.'
-              printf 'merge=%s\ncached_run=%s\n' "$merge" "$previous_run" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
           gh api --method POST "$api/statuses/$merge" \
-            -f context='Amp CI' -f state=pending -f description="Testing merge $merge" \
+            -f context='Manual Full CI' -f state=pending -f description="Testing merge $merge" \
             -f target_url="$runs$GITHUB_RUN_ID"
           printf 'merge=%s\n' "$merge" >> "$GITHUB_OUTPUT"
 
   tests:
     needs: reviewed-head
-    if: needs.reviewed-head.outputs.merge != '' && needs.reviewed-head.outputs.cached_run == ''
+    if: needs.reviewed-head.outputs.merge != ''
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.reviewed-head.outputs.merge }}
+      require_all: true
 
   report-pr-ci:
     needs: [reviewed-head, tests]
@@ -116,12 +112,11 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.issue.number }}
+          PR: ${{ inputs.pr_number }}
           HEAD: ${{ needs.reviewed-head.outputs.head }}
           BASE: ${{ needs.reviewed-head.outputs.base }}
           MERGE: ${{ needs.reviewed-head.outputs.merge }}
           MERGE_ATTEMPT: ${{ needs.reviewed-head.outputs.attempt }}
-          CACHED_RUN: ${{ needs.reviewed-head.outputs.cached_run }}
           TESTS_RESULT: ${{ needs.tests.result }}
         run: |
           api="repos/$GITHUB_REPOSITORY"
@@ -139,11 +134,9 @@ jobs:
                  jq -se --argjson attempt "$MERGE_ATTEMPT" '
                   [.[].jobs[] | select(.run_attempt >= $attempt)] |
                   group_by(.name) | map(max_by([.run_attempt, .id])) |
-                  map(select((.name | startswith("tests / "))
-                    and (.name | endswith("ansible ansible-base==2.10.17 (py3.9)") | not)
-                    and (.name | endswith("Ansible parity 2.10") | not))) |
-                  # ci.yml has four standalone jobs and seven required legs per matrix.
-                  length == 18 and all(.[]; .conclusion == "success")
+                  map(select(.name | startswith("tests / "))) |
+                  # ci.yml has four standalone jobs and eight legs per matrix.
+                  length == 20 and all(.[]; .conclusion == "success")
                  ' <<< "$jobs" >/dev/null; then
                 return 0
               fi
@@ -151,12 +144,9 @@ jobs:
             echo '::warning::Could not verify that all required jobs passed.' >&2
             return 1
           }
-          if [[ -n "$CACHED_RUN" ]]; then
-            state=success
-            details_url=$CACHED_RUN
-          elif combined=$(gh api "$api/commits/$MERGE/status"); then
+          if combined=$(gh api "$api/commits/$MERGE/status"); then
             if ! jq -e --arg run "$run_url" --arg merge "$MERGE" '.statuses | any(
-              .context == "Amp CI" and .target_url == $run and
+              .context == "Manual Full CI" and .target_url == $run and
               (.description // "" | endswith(" merge " + $merge))
             )' <<< "$combined" >/dev/null; then
               echo 'Another run owns the status for this merge commit.'
@@ -176,7 +166,7 @@ jobs:
               failure) description="CI failed on merge $MERGE" ;;
             esac
             gh api --method POST "$api/statuses/$MERGE" \
-              -f context='Amp CI' -f state="$state" -f description="$description" \
+              -f context='Manual Full CI' -f state="$state" -f description="$description" \
               -f target_url="$run_url" || report_error=$?
           else
             report_error=$?
@@ -188,9 +178,9 @@ jobs:
             title='Could not publish merge status'
           elif [[ "$state" != error ]]; then
             conclusion="$state"
-            [[ "$state" != success ]] || title='Reviewed PR CI passed'
+            [[ "$state" != success ]] || title='Manual full PR CI passed'
           elif [[ "$conclusion" == cancelled ]]; then
-            title='Reviewed PR CI was cancelled'
+            title='Manual full PR CI was cancelled'
           fi
 
           # Only create terminal checks. A force cancellation can skip the
@@ -219,7 +209,7 @@ jobs:
           if current_revision; then
             for attempt in 1 2 3; do
               if check=$(gh api --method POST "$api/check-runs" --jq '.id' \
-                -f name="Amp CI / PR #$PR" -f head_sha="$HEAD" -f details_url="$details_url" \
+                -f name="Manual Full CI" -f head_sha="$HEAD" -f details_url="$details_url" \
                 -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" \
                 -f "output[summary]=$(printf 'Merge commit: %s\nBase commit: %s' "$MERGE" "$BASE")"); then
                 revision_status=0
@@ -234,12 +224,12 @@ jobs:
                   gh api --silent --method PATCH "$api/check-runs/$check" \
                     -f status=completed -f conclusion=cancelled \
                     -f "output[title]=$cancelled_title" \
-                    -f 'output[summary]=Run Reviewed PR CI for the current merge commit.' ||
+                    -f 'output[summary]=Run Manual Full PR CI for the current merge commit.' ||
                     { update_error=$?; ((report_error)) || report_error=$update_error; }
                 fi
                 break
               elif [[ "$attempt" == 3 ]]; then
-                echo '::error::Could not publish Reviewed PR CI to the PR head.'
+                echo '::error::Could not publish Manual Full CI to the PR head.'
                 ((report_error)) || report_error=1
               else
                 sleep "$attempt"
@@ -286,7 +276,7 @@ jobs:
           failed=0
           while IFS=$'\t' read -r pr head base branch; do
             [[ -n "$pr" ]] || continue
-            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Amp CI / PR #$pr") ||
+            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Manual Full CI") ||
                ! stale=$(jq -r --arg base "$base" --arg branch "$branch" '
               .check_runs[] | select(.app.slug == "github-actions" and .conclusion != "cancelled" and
                 ($branch != "master" or (.output.summary // "" | endswith("Base commit: " + $base) | not))) | .id
@@ -305,7 +295,7 @@ jobs:
             while read -r id; do
               if ! retry_api --silent --method PATCH "$api/check-runs/$id" \
                 -f status=completed -f conclusion=cancelled \
-                -f 'output[title]=PR base changed' -f 'output[summary]=Run Reviewed PR CI for the new merge commit.'; then
+                -f 'output[title]=PR base changed' -f 'output[summary]=Run Manual Full PR CI for the new merge commit.'; then
                 echo "::warning::Could not cancel stale CI check $id for PR #$pr."
                 failed=1
               fi
