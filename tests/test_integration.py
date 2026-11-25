@@ -2536,6 +2536,24 @@ def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_p
     assert called == [("ansible.builtin.setup", {"fact_path": "/west", "gather_subset": ["!all", "network"]})]
 
 
+def test_finite_setup_vars_selector_does_not_bundle_parent_traversal(tmp_path):
+    play_dir = tmp_path / "playbook"
+    play_dir.mkdir()
+    playbook = play_dir / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["./.{{ '.' if profile == 'parent' else 'local' }}/setup.yml"]
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "setup.yml").write_text("directory: /outside-playbook\n")
+    (play_dir / ".local").mkdir()
+    local = play_dir / ".local" / "setup.yml"
+    local.write_text("directory: /portable\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], play_dir)[0]
+    assert plan["deferred_vars_files"][0]["files"] == {str(local): [{"directory": "/portable"}]}
+
+
 def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
@@ -2679,6 +2697,26 @@ def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, 
     runtime.run_play(_compiled_plays(source, tmp_path)[0])
     assert called == [("ansible.builtin.setup", {"fact_path": "/independent"})]
     assert runtime.vars["unrelated"] == "value"
+
+
+def test_implicit_fact_path_sees_empty_local_facts_when_injection_is_disabled(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_INJECT_FACT_VARS", "False")
+    monkeypatch.setattr(C, "INJECT_FACTS_AS_VARS", False)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ '/empty' if ansible_local == {} else '/inventory' }}"
+  tasks: []
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost", "ansible_local": {"stale": True}})
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert calls == [{"fact_path": "/empty"}]
 
 
 def test_implicit_fact_path_merges_cached_facts_with_set_fact(tmp_path, monkeypatch):
