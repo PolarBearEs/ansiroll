@@ -48,6 +48,7 @@ DOCUMENTATION = """
 from ansible import constants as C, context
 from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
+from ansible.plugins.strategy.linear import StrategyModule as _LinearStrategy
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
 from jinja2 import StrictUndefined
@@ -345,17 +346,14 @@ class StrategyModule(StrategyBase):
                 "mode": "linear-fallback",
                 "reason": linear_reason,
             })
-            from ansible.plugins.strategy.linear import (
-                StrategyModule as LinearStrategy,
-            )
             # Keep this instance's result thread and queue caches; constructing
             # a second strategy would make both consumers race on the TQM queue.
             # ansible-core 2.14's linear strategy adds this state in its own
             # constructor, which this deliberately reused instance never runs.
             if not hasattr(self, "_in_handlers"):
                 self._in_handlers = False
-            self.__class__ = LinearStrategy
-            return LinearStrategy.run(self, iterator, play_context)
+            self.__class__ = _SetFactLinearStrategy if any(flag is not False for flag in fact_routes) else _LinearStrategy
+            return self.run(iterator, play_context)
         self._emit_provenance({
             "scope": "play",
             "play": play.name or play.get_name(),
@@ -1757,6 +1755,126 @@ def _truthy(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+class _SetFactLinearStrategy(_LinearStrategy):
+    """Use the worker's resolved delegation flags when linear publishes facts."""
+
+    def run(self, iterator, play_context):
+        self._fact_iterator = iterator
+        self._fact_routes = {}
+        self._legacy_fact_items = {}
+        self._run_once_fact_results = {}
+        send_callback = self._tqm.send_callback
+        original = vars(self._tqm).get("send_callback")
+
+        def capture_item(method, *args, **kwargs):
+            if method in ("v2_runner_item_on_ok", "v2_runner_item_on_skipped", "v2_runner_item_on_failed"):
+                result = args[0]
+                host, task = ((result.host, result.task) if _UnifiedTaskResult is not None else
+                              (result._host, result._task))
+                key = (host.name, task._uuid)
+                if self._routed_fact_task(key):
+                    target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
+                    self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
+            return send_callback(method, *args, **kwargs)
+
+        self._tqm.send_callback = capture_item
+        try:
+            return super().run(iterator, play_context)
+        finally:
+            if original is None:
+                del self._tqm.send_callback
+            else:
+                self._tqm.send_callback = original
+
+    def _routed_fact_task(self, key):
+        original = self._queued_task_cache.get(key, {}).get("task")
+        return (original is not None and original.action in C._ACTION_SET_FACT and original.delegate_to
+                and _delegated_fact_flag(original.delegate_facts) is not False)
+
+    def _fact_recipient(self, name):
+        if not isinstance(name, str):
+            return name
+        host = self._inventory.get_host(name)
+        return host.name if host is not None else name
+
+    def normalize_task_result(self, task_result):
+        result = super().normalize_task_result(task_result)
+        self._record_legacy_routes(result)
+        return result
+
+    def _convert_wire_task_result_to_raw(self, wire_task_result):
+        result = super()._convert_wire_task_result_to_raw(wire_task_result)
+        self._record_legacy_routes(result)
+        return result
+
+    def _record_legacy_routes(self, result):
+        data = result._result if hasattr(result, "_result") else result._return_data
+        if data.get("_ansible_item_result"):
+            return
+        host, task = ((result._host, result._task) if hasattr(result, "_task") else (result.host, result.task))
+        routes = self._fact_routes.pop((host.name, task._uuid), ())
+        items = data.get("results", ())
+        if routes and len(routes) == len(items) and not result.is_failed() and not result.is_unreachable():
+            self._legacy_fact_items.update((id(item), (host, target)) for item, target in zip(items, routes)
+                                           if "ansible_facts" in item)
+
+    def get_delegated_hosts(self, result, task):
+        route = self._legacy_fact_items.pop(id(result), None)
+        if route is not None:
+            host, target = route
+            if target is None:
+                return self.get_task_hosts(self._fact_iterator, host, task)
+            return [self._fact_recipient(target)]
+        hosts = super().get_delegated_hosts(result, task)
+        return [self._fact_recipient(name) for name in hosts] if task.action in C._ACTION_SET_FACT else hosts
+
+    def _convert_wire_task_result_to_host_task_result(self, wire_task_result):
+        result = super()._convert_wire_task_result_to_host_task_result(wire_task_result)
+        host, task, data = result.host, result.task, result.utr
+        if data.loop_var is not None:
+            return result
+        key = (host.name, task._uuid)
+        routes = self._fact_routes.pop(key, ())
+        if not self._routed_fact_task(key):
+            return result
+        if data.loop_results is None:
+            if data.delegated_host:
+                data.delegated_host = self._fact_recipient(data.delegated_host)
+            return result
+        if len(routes) == len(data.loop_results):
+            for item, target in zip(data.loop_results, routes):
+                item.delegated_host = self._fact_recipient(target) if target else host.name
+            if task.run_once and None in routes:
+                self._run_once_fact_results[id(result)] = routes
+        return result
+
+    def _process_pending_results(self, iterator, *args, **kwargs):
+        results = super()._process_pending_results(iterator, *args, **kwargs)
+        for result in results:
+            routes = self._run_once_fact_results.pop(id(result), ())
+            if not routes or result.utr.failed or result.utr.unreachable or result.utr.skipped:
+                continue
+            from ansible._internal._task import VariableLayer
+
+            # Core 2.21 accepts one delegated host per item, while a local
+            # run_once fact belongs to the entire batch. Replay in item order
+            # so a later delegated assignment wins for its own recipient.
+            cache = self._variable_manager
+            original_hosts = self.get_task_hosts(iterator, result.host, result.task)
+            for item, target in zip(result.utr.loop_results, routes):
+                recipients = [item.delegated_host] if target else original_hosts
+                changes = item.pending_changes.register_host_variables
+                for host in recipients:
+                    if VariableLayer.CACHEABLE_FACT in changes:
+                        cache.set_host_facts(host, changes[VariableLayer.CACHEABLE_FACT])
+                    if VariableLayer.EPHEMERAL_FACT in changes:
+                        cache.set_nonpersistent_facts(host, changes[VariableLayer.EPHEMERAL_FACT])
+            if result.utr.registered_values:
+                for host in original_hosts:
+                    cache.set_nonpersistent_facts(host, result.utr.registered_values)
+        return results
 
 
 def _delegated_fact_flag(value):

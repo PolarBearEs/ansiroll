@@ -4942,6 +4942,67 @@ def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("mixed", [False, True], ids=["all-local", "mixed"])
+def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_path, mixed):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        "{{ entry.key }}": "{{ entry.value }}"
+        cacheable: true
+      loop:
+        - {key: marker, value: first, target: recipient, route: ROUTE}
+        - {key: local_flag, value: second, target: recipient, route: false}
+        - {key: local_omit, value: third, route: true}
+      loop_control: {loop_var: entry}
+      delegate_to: "{{ entry.target | default(omit) }}"
+      delegate_facts: "{{ entry.route }}"
+      register: loop_result
+      no_log: true
+    - assert:
+        that:
+          - local_flag == 'second'
+          - local_omit == 'third'
+          - ansible_facts.local_flag == 'second'
+          - loop_result.results | length == 3
+          - hostvars.recipient.local_flag is undefined
+          - hostvars.recipient.local_omit is undefined
+          - EXPECTED
+- hosts: recipient
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert: {that: RECIPIENT}
+""".replace("ROUTE", "true" if mixed else "false").replace(
+            "EXPECTED", "marker is undefined" if mixed else "marker == 'first'"
+        ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
+        inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {marker: "{{ item.value }}"}
+      loop:
+        - {value: batch_value, route: false}
+        - {value: recipient_value, route: true}
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+    - assert:
+        that: marker == ('recipient_value' if inventory_hostname == 'recipient' else 'batch_value')
+""", inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
