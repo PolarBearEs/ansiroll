@@ -311,12 +311,6 @@ class StrategyModule(StrategyBase):
             if str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
             and getattr(task, "delegate_to", None)
         ]
-        if self._delegate_on_target and True in fact_routes:
-            display.error(
-                "ansiroll: delegated set_fact with delegate_facts is incompatible "
-                "with ansiroll_delegate_on_target"
-            )
-            return self._tqm.RUN_ERROR
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
