@@ -352,7 +352,9 @@ class StrategyModule(StrategyBase):
             # constructor, which this deliberately reused instance never runs.
             if not hasattr(self, "_in_handlers"):
                 self._in_handlers = False
-            self.__class__ = _SetFactLinearStrategy if any(flag is not False for flag in fact_routes) else _LinearStrategy
+            # Dynamic roles can introduce delegated set_fact after compilation.
+            routed_facts = self._requires_linear_fallback or any(flag is not False for flag in fact_routes)
+            self.__class__ = _SetFactLinearStrategy if routed_facts else _LinearStrategy
             return self.run(iterator, play_context)
         self._emit_provenance({
             "scope": "play",
@@ -600,10 +602,11 @@ class StrategyModule(StrategyBase):
             elif t == "rescue":
                 task = task_map.get(frame.get("task"))
                 if task is not None:
-                    self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"))
+                    self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"), frame.get("name"))
             elif t == "rescue_overrides":
-                self._variable_manager.set_nonpersistent_facts(
-                    host.name, self._restore_rescue_value(frame["facts"]))
+                facts = self._restore_rescue_value(frame["facts"])
+                private = _private_rescue_facts(self._variable_manager, host.name)
+                self._save_rescue_facts(host.name, facts, private.keys() & facts.keys())
             elif t == "gather_setup":
                 data = (self._gather_setup_options(host, gather_task) if gather_task is not None
                         else {"error": "implicit setup was not scheduled"})
@@ -657,20 +660,31 @@ class StrategyModule(StrategyBase):
         return self._restore_play_fallback(
             value, packed["undefined"], packed.get("errors", ()), packed.get("mapping_keys", ()))
 
-    def _mirror_rescued_failure(self, host, task, result, args=None):
+    def _mirror_rescued_failure(self, host, task, result, args=None, name=None):
         # This is variable state for later plays. Display has already received
         # the ordinary result frame with any no_log censoring applied.
         failed_task = task.dump_attrs() if hasattr(task, "dump_attrs") else task.serialize()
+        if name is not None:
+            failed_task["name"] = name
         if args is not None:
             failed_task["args"] = self._restore_rescue_value(args)
         if _UnifiedTaskResult is None:
             from ansible.utils.unsafe_proxy import wrap_var
 
             failed_task = wrap_var(failed_task)
-        self._variable_manager.set_nonpersistent_facts(host.name, {
+        facts = {
             "ansible_failed_task": failed_task,
             "ansible_failed_result": self._restore_rescue_value(result),
-        })
+        }
+        self._save_rescue_facts(host.name, facts, facts.keys())
+
+    def _save_rescue_facts(self, host_name, facts, private_names):
+        manager = self._variable_manager
+        manager.set_nonpersistent_facts(host_name, facts)
+        if private_names:
+            private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
+            stored = manager._nonpersistent_fact_cache[host_name]
+            private.setdefault(host_name, {}).update({key: stored[key] for key in private_names})
 
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
@@ -1305,7 +1319,7 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
-        from ansiroll.runtime import _RESCUE_FACT_NAMES, _pack_include_value
+        from ansiroll.runtime import _pack_include_value
 
         mapping_keys = {"host": [], "overrides": []}
         blob = _json_blob(hv, mapping_keys["host"])
@@ -1313,7 +1327,7 @@ class StrategyModule(StrategyBase):
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
-        rescue = {key: nonpersistent[key] for key in _RESCUE_FACT_NAMES & nonpersistent.keys()}
+        rescue = _private_rescue_facts(self._variable_manager, host.name)
         override_blob = _json_blob(
             {key: value for key, value in nonpersistent.items() if key not in rescue}, mapping_keys["overrides"])
         rescue_blob = json.dumps(_pack_include_value(rescue, preserve_scalars=True)) if rescue else "null"
@@ -1840,7 +1854,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
                 host, task = ((result.host, result.task) if _UnifiedTaskResult is not None else
                               (result._host, result._task))
                 key = (host.name, task._uuid)
-                if self._routed_fact_task(key):
+                if self._routed_fact_task(key, task):
                     target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
                     self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
             return send_callback(method, *args, **kwargs)
@@ -1868,10 +1882,11 @@ class _SetFactLinearStrategy(_LinearStrategy):
             else:
                 self._tqm.send_callback = original
 
-    def _routed_fact_task(self, key):
+    def _routed_fact_task(self, key, resolved):
         original = self._queued_task_cache.get(key, {}).get("task")
-        return (original is not None and original.action in C._ACTION_SET_FACT and original.delegate_to
-                and _delegated_fact_flag(original.delegate_facts) is not False)
+        return (original is not None and original.delegate_to
+                and (resolved.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT)
+                and original.delegate_facts is not None and original.delegate_facts is not False)
 
     def _fact_recipient(self, name):
         if not isinstance(name, str):
@@ -1924,7 +1939,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
             return result
         key = (host.name, task._uuid)
         routes = self._fact_routes.pop(key, ())
-        if not self._routed_fact_task(key):
+        if not routes and not self._routed_fact_task(key, task):
             return result
         if data.loop_results is None:
             if data.delegated_host:
@@ -2025,8 +2040,23 @@ def _json_blob(values, mapping_keys=None):
     return json.dumps(safe, default=str)
 
 
+def _private_rescue_facts(manager, host_name):
+    private = getattr(manager, "_ansiroll_private_rescue_facts", {})
+    tracked = private.get(host_name, {})
+    if not tracked:
+        return {}
+    current = manager._nonpersistent_fact_cache.get(host_name, {})
+    active = {key: value for key, value in tracked.items() if key in current and current[key] is value}
+    if active:
+        private[host_name] = active
+    else:
+        private.pop(host_name, None)
+    return active
+
+
 def _hostvars_snapshot(hostvars, *, preserve_keys=False):
-    from ansiroll.runtime import _RESCUE_FACT_NAMES, _contains_typed_mapping_keys, _pack_delegated_value
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     if hostvars is None:
         return {}
@@ -2038,22 +2068,34 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
             names.extend(alias for alias in C.LOCALHOST if alias not in names)
     except Exception:
         return out
-    raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
+    raw_get = getattr(hostvars, "raw_get", None)
     manager = getattr(hostvars, "_variable_manager", None)
     inventory = getattr(hostvars, "_inventory", None)
-    nonpersistent = getattr(manager, "_nonpersistent_fact_cache", {})
     for name in names:
         try:
             host = inventory.get_host(name) if inventory is not None else None
-            private_names = _RESCUE_FACT_NAMES & nonpersistent.get(host.name if host else name, {}).keys()
-            source = hostvars[name]
+            private_names = _private_rescue_facts(manager, host.name if host else name)
+            raw = raw_get(name) if raw_get is not None and (private_names or preserve_keys) else {}
+            if private_names:
+                from ansible.vars.hostvars import HostVarsVars
+
+                # Templating an alias in the original view could disclose
+                # data even after stripping the private keys from its output.
+                if not isinstance(raw, dict):
+                    continue
+                raw = {key: value for key, value in raw.items()
+                       if key not in private_names and key not in ("vars", "hostvars")}
+                raw["vars"] = dict(raw)
+                host_kw = {"host": name} if _core_version() >= (2, 19) else {}
+                source = HostVarsVars(raw, loader=hostvars._loader, **host_kw)
+            else:
+                source = hostvars[name]
             keys = list(source)
-            raw = raw_get(name) if raw_get is not None else {}
         except Exception:
             continue
         safe = {}
         for key in keys:
-            if key in ("hostvars", "vars") or key in private_names:
+            if key in ("hostvars", "vars"):
                 continue
             try:
                 value = source[key]

@@ -5082,7 +5082,8 @@ def test_compiled_copy_reads_content_addressed_binary_asset(tmp_path):
     assert manifest["bundles"]["asset_count"] == 1
 
 
-def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
+@pytest.mark.parametrize("legacy_copy", [False, True])
+def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path, legacy_copy):
     archive = tmp_path / "payload.zip"
     with zipfile.ZipFile(str(archive), "w") as zipped:
         zipped.writestr("inside.txt", b"embedded archive payload\x00")
@@ -5095,10 +5096,11 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
   tasks:
     - ansible.builtin.unarchive:
         src: payload.zip
-        dest: %s
-""" % destination)
+        dest: %s%s
+""" % (destination, "\n        copy: true" if legacy_copy else ""))
 
     src, manifest = compile_playbook(str(play))
+    archive.unlink()
     # copy/template stage their data in a temp dir like the action plugin;
     # unarchive must keep using the in-memory source.
     assert "ansiroll-unarchive-" not in src
@@ -5503,9 +5505,11 @@ def test_strategy_preserves_rescued_failure_facts_in_later_plays(tmp_path, no_lo
     result = _run_strategy_play(tmp_path, """- hosts: localhost
   connection: local
   gather_facts: false
+  vars:
+    reason: first-play
   tasks:
     - block:
-        - name: Original failure
+        - name: Original failure in {{ reason }}
           fail:
             msg: FAILURE_MARKER
           no_log: NO_LOG
@@ -5514,11 +5518,13 @@ def test_strategy_preserves_rescued_failure_facts_in_later_plays(tmp_path, no_lo
 - hosts: localhost
   connection: local
   gather_facts: false
+  vars:
+    reason: later-play
   tasks:
     - assert:
         that:
           - ansible_failed_result.msg == 'FAILURE_MARKER'
-          - ansible_failed_task.name == 'Original failure'
+          - ansible_failed_task.name == 'Original failure in first-play'
 """.replace("NO_LOG", str(no_log).lower()).replace("FAILURE_MARKER", failure))
     assert result.returncode == 0, result.stdout + result.stderr
     if no_log:
@@ -5546,6 +5552,28 @@ def test_rescued_loop_failure_retains_task_arguments(tmp_path):
     assert not runtime.failed
     assert runtime.vars["ansible_failed_task"]["args"]["msg"] == "{{ item }}"
     assert dispatches == [None]
+
+
+def test_strategy_retains_rescued_assert_conditions_from_dynamic_args(tmp_path):
+    proc = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    checks:
+      that: ['1 == 2']
+  tasks:
+    - block:
+        - assert: "{{ checks }}"
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_task.args.that == ['1 == 2']
+""")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_strategy_preserves_undefined_rescued_arguments_in_later_agents(tmp_path):
@@ -5632,7 +5660,8 @@ LOOP
     assert "rejected-override" not in result.stdout + result.stderr
 
 
-def test_strategy_keeps_inventory_rescue_names_in_hostvars(tmp_path):
+@pytest.mark.parametrize("write", ["inventory", "set_fact", "register", "replace-rescue"])
+def test_strategy_keeps_ordinary_rescue_names_in_hostvars(tmp_path, write):
     inventory = tmp_path / "inventory.yml"
     inventory.write_text("""all:
   hosts:
@@ -5640,17 +5669,43 @@ def test_strategy_keeps_inventory_rescue_names_in_hostvars(tmp_path):
       ansible_failed_result: {msg: inventory-value}
     recipient:
 """)
-    result = _run_strategy_play(tmp_path, """- hosts: recipient
+    task = {
+        "inventory": "",
+        "set_fact": "    - set_fact: {ansible_failed_result: {msg: ordinary-value}}\n",
+        "register": "    - debug: {msg: ordinary-value}\n      register: ansible_failed_result\n",
+        "replace-rescue": """    - block:
+        - fail: {msg: private}
+          no_log: true
+      rescue:
+        - debug: {msg: recovered}
+    - set_fact: {ansible_failed_result: {msg: ordinary-value}}
+""",
+    }[write]
+    first_play = """- hosts: origin
+  connection: local
+  gather_facts: false
+  tasks:
+""" + task if task else ""
+    expected = "inventory-value" if write == "inventory" else "ordinary-value"
+    result = _run_strategy_play(tmp_path, first_play + f"""- hosts: recipient
   connection: local
   gather_facts: false
   tasks:
     - assert:
-        that: hostvars.origin.ansible_failed_result.msg == 'inventory-value'
+        that: hostvars.origin.ansible_failed_result.msg == '{expected}'
 """, inventory=str(inventory))
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_strategy_transfers_rescue_state_only_to_originating_host(tmp_path):
+    inventory = tmp_path / "inventory.yml"
+    inventory.write_text("""all:
+  hosts:
+    origin:
+      rescue_summary: "{{ ansible_failed_result.msg | default('redacted') }}"
+      rescue_summary_via_vars: "{{ vars.ansible_failed_result.msg | default('redacted') }}"
+    recipient:
+""")
     result = _run_strategy_play(tmp_path, """- hosts: origin
   connection: local
   gather_facts: false
@@ -5673,6 +5728,8 @@ def test_strategy_transfers_rescue_state_only_to_originating_host(tmp_path):
         that:
           - hostvars.origin.ansible_failed_task is undefined
           - hostvars.origin.ansible_failed_result is undefined
+          - hostvars.origin.rescue_summary | default('redacted') == 'redacted'
+          - hostvars.origin.rescue_summary_via_vars | default('redacted') == 'redacted'
 - hosts: all
   connection: local
   gather_facts: false
@@ -5685,7 +5742,7 @@ def test_strategy_transfers_rescue_state_only_to_originating_host(tmp_path):
           - ansible_failed_task.args.msg == 'private-original-marker'
       when: inventory_hostname == 'origin'
       no_log: true
-""", inventory="origin,recipient,")
+""", inventory=str(inventory))
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
     assert "private-original-marker" not in output
@@ -5872,6 +5929,72 @@ RETRY_OPTIONS    - assert:
         ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
         inventory="origin,recipient,",
     )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("templated_action", [False, True])
+def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path, templated_action):
+    from ansiroll.loader import _core_version
+
+    if templated_action and _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""ACTION:
+    "{{ item.key }}": "{{ item.value }}"
+  delegate_to: recipient
+  delegate_facts: "{{ item.route }}"
+  loop:
+    - {key: local_marker, value: local, route: false}
+    - {key: remote_marker, value: remote, route: true}
+  register: fact_results
+  retries: 2
+  delay: 0
+  until: item.route is false or fact_results.attempts >= 2
+""".replace("ACTION", '- action: "{{ fact_action }}"\n  args' if templated_action else "- set_fact"))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+    fact_action: set_fact
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - fact_results.results[1].attempts == 2
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_routes_literal_false_delegation_in_dynamic_roles(tmp_path, flag):
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- set_fact:
+    local_marker: "{{ item }}"
+  delegate_to: recipient
+  delegate_facts: FLAG
+  loop: [first, second]
+""".replace("FLAG", flag))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
+""", inventory="origin,recipient,")
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 

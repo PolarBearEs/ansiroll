@@ -4839,7 +4839,7 @@ class Runtime:
                 self._tally("ok")
                 self._tally("ignored")
             else:
-                raise TaskFailed(node.get("name"), node, result)
+                raise TaskFailed(name, node, result)
             return
         tally_ok = node.get("tally_include_ok", True)
         looped = items is not None
@@ -4929,7 +4929,7 @@ class Runtime:
                     self._tally("ok")
                     self._tally("ignored")
                 else:
-                    failure = TaskFailed(node.get("name"), node, aggregate)
+                    failure = TaskFailed(name, node, aggregate)
             elif status == "skipped":
                 self._tally("skipped")
 
@@ -4996,7 +4996,9 @@ class Runtime:
                 self._tally("rescued")
                 # Saved as nonpersistent facts (set_fact level) that outlive
                 # the rescue (StrategyBase._process_pending_results).
-                failed_task = ex.task if ex.executed_args is None else {**ex.task, "args": ex.executed_args}
+                failed_task = {**ex.task, "name": ex.args[0]}
+                if ex.executed_args is not None:
+                    failed_task["args"] = ex.executed_args
                 failed_facts = {
                     "ansible_failed_task": failed_task,
                     "ansible_failed_result": ex.result,
@@ -5004,7 +5006,7 @@ class Runtime:
                 self.vars.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
                 if self.on_rescue is not None:
-                    self.on_rescue(ex.task, ex.result, ex.executed_args)
+                    self.on_rescue(failed_task, ex.result, ex.executed_args)
                 yield from self._failed_include_steps(ex)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
@@ -5367,9 +5369,9 @@ class Runtime:
                         return
                 except ConditionalError as ex:
                     result = {"failed": True, "changed": False, "msg": str(ex)}
-                    self.emit_start(task)
+                    name = self.emit_start(task)
                     self.emit(task, "failed", result)
-                    raise TaskFailed(task.get("name"), task, result)
+                    raise TaskFailed(name, task, result)
             if special == "meta_flush_handlers":
                 self.emit_start(task)
                 inherited = self._inherited_when
@@ -5395,7 +5397,7 @@ class Runtime:
             except Exception:
                 # Normal task execution will report invalid templating.
                 pass
-        self.emit_start(task)
+        name = self.emit_start(task)
 
         notifications = []
         rescue_overrides = {} if self.on_rescue_overrides is not None and task.get("no_log") else None
@@ -5456,7 +5458,7 @@ class Runtime:
                     except jinja2.UndefinedError:
                         # Legacy Core retains the authored args when validation fails.
                         executed_args = None
-                raise TaskFailed(task.get("name"), task, dict(res), executed_args=executed_args)
+                raise TaskFailed(name, task, dict(res), executed_args=executed_args)
         elif res.get("skipped"):
             self._tally("skipped")
         else:
@@ -5907,6 +5909,8 @@ class Runtime:
                     args = _fail_on_undef(_strip_omit(
                         self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
+                    if self._is_builtin_unarchive(task):
+                        self._normalize_unarchive_options(args)
                     self._executed_task_args = args
                     res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
@@ -5922,6 +5926,8 @@ class Runtime:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
                     self._render_action_args(task.get("args") or {}, ctx, args_cache)))
+                if self._is_builtin_unarchive(task):
+                    self._normalize_unarchive_options(args)
                 self._executed_task_args = args
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
@@ -6095,10 +6101,20 @@ class Runtime:
             return "./" + normalized
         return normalized
 
+    @staticmethod
+    def _is_builtin_unarchive(task):
+        return task.get("_builtin_unarchive", task.get("action") in ("unarchive", "ansible.builtin.unarchive"))
+
+    @staticmethod
+    def _normalize_unarchive_options(args):
+        if "copy" in args:
+            if "remote_src" in args:
+                raise ValueError("parameters are mutually exclusive: ('copy', 'remote_src')")
+            args["remote_src"] = not _ansible_boolean(args.pop("copy"))
+
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
-        name = str(task.get("action") or "").split(".")[-1]
-        if name != "unarchive" or _ansible_boolean(args.get("remote_src", False)):
+        if not self._is_builtin_unarchive(task) or _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         key = self._baked_source_key(task, src)
@@ -6215,7 +6231,17 @@ class Runtime:
                 and set(args) == {"_raw_params"}
                 and isinstance(args["_raw_params"], dict)):
             args = dict(args["_raw_params"])
-        self._executed_task_args = args if name != "assert" else {**args, "that": (task.get("args") or {}).get("that")}
+        if name == "assert" and "_variable_params" in args:
+            # Legacy Core parses a templated argument mapping into this field.
+            params = args["_variable_params"]
+            if params == _OMIT or params == ctx.get("omit", _OMIT):
+                params = {}
+            if not isinstance(params, dict):
+                _fail_on_undef(params)
+                raise ValueError("assert args must resolve to a dictionary")
+            args = {**params, **{key: value for key, value in args.items() if key != "_variable_params"}}
+        authored = task.get("args") or {}
+        self._executed_task_args = {**args, "that": authored["that"]} if name == "assert" and "that" in authored else args
         if name == "debug":
             for key, value in args.items():
                 try:
@@ -8299,6 +8325,7 @@ def agent_main():
     rt.on_rescue = lambda task, result, args: _chan_send(resp_fd, {
         "t": "rescue",
         "task": task.get("runtime_id") or task.get("uuid"),
+        "name": task.get("name"),
         "result": _pack_include_value(result, preserve_scalars=True),
         "args": _pack_include_value(args, preserve_scalars=True) if args is not None else None,
     })
