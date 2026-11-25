@@ -4833,6 +4833,54 @@ def test_strategy_honors_play_level_local_connection(tmp_path):
     assert "ok=1" in proc.stdout
 
 
+@pytest.mark.parametrize("runner", ["standalone", "strategy", "linear"])
+def test_expanded_include_applies_task_keywords(tmp_path, runner):
+    (tmp_path / "child.yml").write_text("""- name: Write dry-run file
+  register: dry_result
+  copy:
+    content: secret-dry-run
+    dest: "{{ playbook_dir }}/dry.txt"
+- name: Write with explicit overrides
+  register: real_result
+  check_mode: false
+  diff: true
+  no_log: false
+  copy:
+    content: visible-diff
+    dest: "{{ playbook_dir }}/real.txt"
+""")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          check_mode: true
+          diff: false
+          no_log: true
+    - assert:
+        that:
+          - not (dry_result.diff | default([]))
+          - real_result.diff | length > 0
+"""
+    if runner == "standalone":
+        play = tmp_path / "play.yml"
+        play.write_text(playbook)
+        script = tmp_path / "compiled.py"
+        script.write_text(compile_playbook(str(play))[0])
+        proc = subprocess.run([sys.executable, str(script)], cwd=tmp_path,
+                              text=True, capture_output=True)
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(tmp_path, playbook, "--diff", environment={"ANSIBLE_STRATEGY": strategy})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not (tmp_path / "dry.txt").exists()
+    assert (tmp_path / "real.txt").read_text() == "visible-diff"
+    assert "secret-dry-run" not in proc.stdout
+
+
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     proc = _run_strategy_play(
         tmp_path,

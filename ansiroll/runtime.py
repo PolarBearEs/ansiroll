@@ -5713,6 +5713,7 @@ class Runtime:
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
+        inherited_diff_mode = self.diff_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
@@ -5724,6 +5725,11 @@ class Runtime:
                 if isinstance(check_override, str):
                     check_override = self.template(check_override, ctx)
                 self.check_mode = _boolean(check_override)
+            diff_override = task.get("diff")
+            if diff_override is not None:
+                if isinstance(diff_override, str):
+                    diff_override = self.template(diff_override, ctx)
+                self.diff_mode = _boolean(diff_override)
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -5808,6 +5814,7 @@ class Runtime:
             self._module_source_bytes = None
             self._module_env = None
             self.check_mode = inherited_check_mode
+            self.diff_mode = inherited_diff_mode
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)

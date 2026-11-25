@@ -1485,7 +1485,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 data = task._loader.load_from_file(path)
             handler = _is_handler(task)
             parent = task
-            if handler and args.get("apply"):
+            if args.get("apply"):
                 include = task.copy()
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
@@ -2036,6 +2036,7 @@ def _convert_task(task, actions, basedir):
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
         "check_mode": getattr(task, "check_mode", None),
+        "diff": getattr(task, "diff", None),
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
