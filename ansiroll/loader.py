@@ -1057,7 +1057,7 @@ def _deferred_vars_files(play, basedir, entries):
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
                     if found not in files and os.path.isfile(found):
-                        files[found] = _bundled_vars_file(found)
+                        files[found] = _bundled_vars_file(play, found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
         if unmodeled:
             entry["unmodeled"] = unmodeled
@@ -1065,59 +1065,76 @@ def _deferred_vars_files(play, basedir, entries):
     return deferred
 
 
-def _bundled_vars_file(path):
+def _bundled_vars_file(play, path):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
-    from ansible.module_utils.common.text.converters import to_text
-    from ansible.parsing.dataloader import DataLoader
-
-    def open_nonblocking(filename, flags):
-        return os.open(filename, flags | os.O_NONBLOCK)
 
     try:
-        with open(path, "rb", opener=open_nonblocking) as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-                raise ValueError("expected a regular file")
-            data = to_text(fh.read(), errors="surrogate_or_strict")
-        if _deferred_vars_file_contains_vault(data):
-            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                    % path}
-        try:
-            from ansible._internal._datatag._tags import TrustedAsTemplate
-        except ImportError:
-            pass
-        else:
-            data = TrustedAsTemplate().tag(data)
-        loaded = DataLoader().load(data, file_name=path, show_content=False)
+        loaded = _load_plain_ansible_source(play._loader.path_dwim(path))
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
         return _tag_untrusted(preprocess_vars(loaded))
+    except _UnbundledVaultFile:
+        return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                % path}
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
 
 
-def _deferred_vars_file_contains_vault(data):
+class _UnbundledVaultFile(ValueError):
+    pass
+
+
+def _load_plain_ansible_source(path):
+    """Parse one validated snapshot of a source that must be unencrypted."""
+    from ansible.module_utils.common.text.converters import to_text
+    from ansible.parsing.dataloader import DataLoader
+
+    with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise ValueError("expected a regular file")
+        data = to_text(fh.read(), errors="surrogate_or_strict")
+    if _ansible_source_contains_vault(data):
+        raise _UnbundledVaultFile(path)
+    try:
+        from ansible._internal._datatag._tags import TrustedAsTemplate
+    except ImportError:
+        pass
+    else:
+        data = TrustedAsTemplate().tag(data)
+    return DataLoader().load(data, file_name=path, show_content=False)
+
+
+def _ansible_source_contains_vault(data):
     if "$ANSIBLE_VAULT" in data:
         return True
     if data.lstrip().startswith(("{", "[")):
         import json
-
-        contains_vault = False
-
-        def check_mapping(mapping):
-            nonlocal contains_vault
-            contains_vault |= "__ansible_vault" in mapping
-            return mapping
-
         try:
-            json.loads(data, object_hook=check_mapping)
-        except ValueError:
+            from ansible._internal._json._profiles._legacy import Decoder
+            from ansible.parsing.vault import EncryptedString
+        except ImportError:
+            from ansible.parsing.ajson import AnsibleJSONDecoder as Decoder
+            from ansible.parsing.yaml.objects import AnsibleVaultEncryptedUnicode as EncryptedString
+        try:
+            decoded = json.loads(data, cls=Decoder)
+        except Exception:
+            # Ansible retries the whole document as YAML if JSON decoding fails.
             pass
         else:
-            return contains_vault
+            pending = [decoded]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, EncryptedString):
+                    return True
+                if isinstance(value, dict):
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+            return False
     if "!" not in data:
         return False
     import yaml
@@ -1130,7 +1147,7 @@ def _deferred_vars_file_contains_vault(data):
             for event in yaml.parse(data, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
             if isinstance(event, yaml.ScalarEvent)
         )
-    except yaml.YAMLError:
+    except (yaml.YAMLError, UnicodeError, RecursionError):
         # The Ansible loader supplies the diagnostic for malformed input.
         return False
 
