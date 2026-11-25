@@ -835,6 +835,8 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
 
 
 def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+
     monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "true")
     monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
     path = _write(tmp_path, """
@@ -852,7 +854,8 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     output = tmp_path / "rendered.txt"
     expected = _ansible(path, tmp_path)
     expected_text = output.read_text()
-    assert expected_text == "prefix=controller/\n"
+    suffix = "None" if (2, 13) <= _core_version() < (2, 19) else ""
+    assert expected_text == "prefix=controller/" + suffix + "\n"
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
     assert output.read_text() == expected_text

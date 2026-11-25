@@ -2894,8 +2894,10 @@ def _concretize(value):
 def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
-        if context.get(_TEMPLATE_FILE_TEXT) or not (
-                _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True):
+        native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
+        # Ansible 2.13–2.18 reuse the native finalizer when switching the
+        # template action to a text environment. Earlier cores replace it.
+        if not native or (context.get(_TEMPLATE_FILE_TEXT) and not _core_at_least(2, 13)):
             return ""
     return _concretize(value)
 
@@ -3209,7 +3211,8 @@ class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
     def func(self, name):
         # A Python plugin can call back into any generated template body,
         # including recursive loops and blocks, without a new render_string.
-        self.writeline("@environment._ansiroll_templater._wrap_jinja_callback")
+        if hasattr(self.environment, "_ansiroll_templater"):
+            self.writeline("@environment._ansiroll_templater._wrap_jinja_callback")
         return super().func(name)
 
 
