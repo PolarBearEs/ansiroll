@@ -384,6 +384,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
                                  unknown_lookup=None, retain_mutable=False):
+    from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_scope, _selector_template_sources
@@ -392,6 +393,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     resolve_aliases = computed is not None or unknown_lookup is not None
     key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
                  for key, value in variables.items()}
+    key_scope["__ansiroll_controller_config"] = {"DEFAULT_JINJA2_NATIVE": getattr(C, "DEFAULT_JINJA2_NATIVE", None)}
     pending = [(source, (), None, ())]
     scope = {}
     names = set()

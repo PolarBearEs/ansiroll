@@ -67,6 +67,15 @@ def _legacy_non_native(ctx):
     return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
 
 
+def _rendered_number(value, source, ctx):
+    if isinstance(value, Number) and not isinstance(value, bool) and _legacy_non_native(ctx):
+        # A bare name preserves the type only when its original value is numeric.
+        bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source)
+        if bare is None or not isinstance(dict.get(ctx, bare[1]), Number):
+            return str(value)
+    return value
+
+
 def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
@@ -236,6 +245,7 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
     unreachable = set()
     calls = []
     closure_reads = set()
+    closure_nodes = set()
     external = frozenset({None})
     unknown_local = frozenset({_UNRESOLVED_SELECTOR_KEY})
     in_closure = False
@@ -252,14 +262,15 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
                 return None
         external_scalars = None if retain_mutable or in_closure else variables
         scope = {**variables, **_selector_local_values(names, bindings, external_scalars)} if names else variables
-        value = _selector_vars_key(test, scope, ())
+        value = _selector_vars_key(test, scope, (), template_variables=variables)
         return _selector_truth(value)
 
     def visit(node, names, top=None):
         nonlocal in_closure
-        if in_closure and isinstance(node, nodes.Name) and node.ctx == "load" and (
-                None in names.get(node.name, external)):
-            closure_reads.add(node.name)
+        if in_closure:
+            closure_nodes.add(id(node))
+            if isinstance(node, nodes.Name) and node.ctx == "load" and None in names.get(node.name, external):
+                closure_reads.add(node.name)
         if names:
             bindings[id(node)] = names.copy()
         if isinstance(node, nodes.Call):
@@ -374,23 +385,24 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
                                        unknown_local))
 
     visit(expression, {})
-    return bindings, unreachable, calls, closure_reads
+    return bindings, unreachable, calls, closure_reads, closure_nodes
 
 
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
                           *, resolve_aliases=False, analysis=None, retain_mutable=False):
     """Yield variable names and literal member paths read by a selector."""
     nodes = jinja2.nodes
-    bindings, unreachable, _, closure_reads = (
+    bindings, unreachable, _, closure_reads, closure_nodes = (
         analysis if analysis is not None else _selector_scope(expression, variables or {}))
 
     def resolve_key(node, aliases=None):
         local = bindings.get(id(node))
-        scope = variables or {}
+        template_variables = variables or {}
+        scope = template_variables
         if local:
-            external_scalars = None if retain_mutable or closure_reads else scope
+            external_scalars = None if retain_mutable or id(node) in closure_nodes else scope
             scope = {**scope, **_selector_local_values(local, bindings, external_scalars)}
-        return _selector_vars_key(node, scope, aliases)
+        return _selector_vars_key(node, scope, aliases, template_variables=template_variables)
 
     pending = [(expression, ())]
     if remaining and len(expression.body) == 1 and isinstance(expression.body[0], nodes.Output):
@@ -544,26 +556,32 @@ def _selector_default_uses_fallback(value, boolean):
     return not truth if boolean is True and truth is not None else None
 
 
-def _selector_vars_key(node, variables, aliases=None):
+def _selector_vars_key(node, variables, aliases=None, *, template_variables=None):
     """Resolve known values without running template plugins."""
+    if template_variables is None:
+        template_variables = variables
+
+    def resolve(child):
+        return _selector_vars_key(child, variables, aliases, template_variables=template_variables)
+
     unknown = _UNRESOLVED_SELECTOR_KEY
     missing = _MISSING_VARS_FILE_INPUT
     if isinstance(node, jinja2.nodes.Const):
         return node.value
     if isinstance(node, jinja2.nodes.CondExpr):
-        truth = _selector_truth(_selector_vars_key(node.test, variables, aliases))
+        truth = _selector_truth(resolve(node.test))
         if truth is not None:
-            return _selector_vars_key(node.expr1 if truth else node.expr2, variables, aliases)
+            return resolve(node.expr1 if truth else node.expr2)
     if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
-        left = _selector_vars_key(node.left, variables, aliases)
+        left = resolve(node.left)
         truth = _selector_truth(left)
         if truth is not None:
             short_circuit_on = isinstance(node, jinja2.nodes.Or)
             if truth is short_circuit_on:
                 return left
-            return _selector_vars_key(node.right, variables, aliases)
+            return resolve(node.right)
     if isinstance(node, jinja2.nodes.Not):
-        truth = _selector_truth(_selector_vars_key(node.node, variables, aliases))
+        truth = _selector_truth(resolve(node.node))
         if truth is not None:
             return not truth
     if isinstance(node, jinja2.nodes.Name):
@@ -584,13 +602,14 @@ def _selector_vars_key(node, variables, aliases=None):
                 except jinja2.TemplateSyntaxError:
                     return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
-                    return _selector_vars_key(body[0].nodes[0], variables, (*aliases, node.name))
+                    rendered = _selector_vars_key(body[0].nodes[0], template_variables, (*aliases, node.name))
+                    return _rendered_number(rendered, value, template_variables)
     if isinstance(node, jinja2.nodes.Compare):
         # Delegate each comparison of known scalars to Jinja's own operator
         # semantics. Evaluate chained operands only when needed.
-        left = _selector_vars_key(node.expr, variables, aliases)
+        left = resolve(node.expr)
         for operand in node.ops:
-            right = _selector_vars_key(operand.expr, variables, aliases)
+            right = resolve(operand.expr)
             if not all(isinstance(value, (str, bool, int, float, type(None))) for value in (left, right)):
                 return unknown
             compare = jinja2.nodes.Compare(
@@ -606,9 +625,9 @@ def _selector_vars_key(node, variables, aliases=None):
     if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
         method = node.node.attr
         if method in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None:
-            value = _selector_vars_key(node.node.node, variables, aliases)
-            args = [_selector_vars_key(arg, variables, aliases) for arg in node.args]
-            kwargs = {kw.key: _selector_vars_key(kw.value, variables, aliases) for kw in node.kwargs}
+            value = resolve(node.node.node)
+            args = [resolve(arg) for arg in node.args]
+            kwargs = {kw.key: resolve(kw.value) for kw in node.kwargs}
             if isinstance(value, str) and all(arg is not unknown and arg is not missing
                                               for arg in (*args, *kwargs.values())):
                 try:
@@ -616,38 +635,38 @@ def _selector_vars_key(node, variables, aliases=None):
                 except (TypeError, ValueError, OverflowError):
                     return unknown
     if isinstance(node, jinja2.nodes.Getitem):
-        value = _selector_vars_key(node.node, variables, aliases)
-        index = _selector_vars_key(node.arg, variables, aliases)
+        value = resolve(node.node)
+        index = resolve(node.arg)
         if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
             return value[index]
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d"):
         arguments = _selector_default_arguments(node)
         if arguments is None:
             return unknown
-        value = _selector_vars_key(node.node, variables, aliases)
-        boolean = _selector_vars_key(arguments["boolean"], variables, aliases) if "boolean" in arguments else False
+        value = resolve(node.node)
+        boolean = resolve(arguments["boolean"]) if "boolean" in arguments else False
         fallback = _selector_default_uses_fallback(value, boolean)
         if fallback is True:
-            return _selector_vars_key(arguments["default_value"], variables, aliases) if "default_value" in arguments else ""
+            return resolve(arguments["default_value"]) if "default_value" in arguments else ""
         return value if fallback is False else unknown
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
         if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
-            value = _selector_vars_key(node.node, variables, aliases)
+            value = resolve(node.node)
             if isinstance(value, str):
                 method = "strip" if node.name == "trim" else node.name
                 return getattr(value, method)()
     if (isinstance(node, jinja2.nodes.Filter) and node.name == "replace"
             and not (node.kwargs or node.dyn_args or node.dyn_kwargs) and len(node.args) in (2, 3)):
-        value = _selector_vars_key(node.node, variables, aliases)
-        old, new = (_selector_vars_key(arg, variables, aliases) for arg in node.args[:2])
-        count = _selector_vars_key(node.args[2], variables, aliases) if len(node.args) == 3 else -1
+        value = resolve(node.node)
+        old, new = map(resolve, node.args[:2])
+        count = resolve(node.args[2]) if len(node.args) == 3 else -1
         if all(isinstance(part, str) for part in (value, old, new)) and isinstance(count, int):
             try:
                 return str.replace(value, old, new, count)
             except OverflowError:
                 return unknown
     if isinstance(node, jinja2.nodes.Concat):
-        parts = [_selector_vars_key(part, variables, aliases) for part in node.nodes]
+        parts = list(map(resolve, node.nodes))
         if all(isinstance(part, str) for part in parts):
             return "".join(parts)
     return unknown
@@ -2575,14 +2594,6 @@ class _Templater:
             # A nested render (a lazily templated variable, a lookup term)
             # must not leave its context behind for the outer template.
             self._current_ctx = previous
-        if (isinstance(result, Number) and not isinstance(result, bool)
-                and _legacy_non_native(ctx)):
-            # Legacy non-native concatenation stringifies numbers unless the
-            # whole template names a variable whose raw value is a number.
-            single = re.match(r"^\{\{\s*(\w+)\s*\}\}$", text)
-            # The raw value: a play var scope would resolve a "{{ other }}" source to its number.
-            if single is None or not isinstance(dict.get(ctx, single.group(1)), Number):
-                return str(result)
         if isinstance(result, _UntrustedConditionValue):
             return result
         if isinstance(result, str):
@@ -2591,7 +2602,7 @@ class _Templater:
             return (_UnsafeText(result) if _looks_templated(result)
                     else str(result) if isinstance(result, _UnsafeTemplate)
                     else result)
-        return result
+        return _rendered_number(result, text, ctx)
 
     def _conditional_member(self, env, node):
         expression = None

@@ -3585,6 +3585,8 @@ def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, 
     ("{% if false %}{% macro unused() %}{{ local_cfg }}{% endmacro %}{% endif %}"
      "{% set local_cfg = cfg %}{{ local_cfg.seconds }}", {}, 45),
     ("{% macro unused() %}{{ base }}{% endmacro %}{% set local_cfg = cfg %}{{ local_cfg.seconds }}", {}, 45),
+    ("{% macro unused() %}{{ base }}{% endmacro %}{% set key = member %}{{ cfg[key] }}", {"member": "seconds"}, 45),
+    ("{% set member = 'unused' %}{{ cfg[member_alias] }}", {}, 45),
     ("{% set use_base = flag %}{{ base if use_base else seconds }}", {"flag": True}, 45),
     ("{% set use_base = flag %}{{ base if use_base else seconds }}", {"flag": False}, None),
     ("{% set local_cfg = cfg.group %}{{ local_cfg.seconds }}", {}, 45),
@@ -3598,7 +3600,7 @@ def test_ordered_timeout_ignores_vars_file_inputs_shadowed_by_a_local(tmp_path, 
                                                                     template, overrides, expected):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
-  vars: {profile: default, base: 23, flag: true}
+  vars: {profile: default, base: 23, flag: true, member: seconds, member_alias: '{{ member }}'}
   vars_files: ['settings-{{ profile }}.yml']
   gather_timeout: >-
     %s
@@ -3620,6 +3622,41 @@ cfg:
     called = []
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
                       extra_vars={"profile": "runtime", "base": 45, **overrides})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    if expected is None:
+        assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+        assert not called
+    else:
+        assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
+
+
+@pytest.mark.parametrize("native, expected", [(False, 45), (True, None)])
+def test_runtime_timeout_folds_aliases_using_legacy_rendering_mode(tmp_path, monkeypatch, native, expected):
+    from ansiroll import runtime as runtime_mod
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: default, base: 23}
+  vars_files: ['settings-{{ profile }}.yml']
+  gather_timeout: >-
+    {% set use_base = flag %}{{ base if use_base else seconds }}
+  tasks: []
+""")
+    (tmp_path / "settings-default.yml").write_text("flag: true\nseconds: 23\n")
+    (tmp_path / "settings-runtime.yml").write_text(
+        """flag: "{{ 0 }}"\nseconds: "{{ lookup('env', 'UNUSED_TIMEOUT') | int }}"\n"""
+    )
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    plan["controller_config"]["DEFAULT_JINJA2_NATIVE"] = native
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames = []
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "runtime", "base": 45})
     monkeypatch.setattr(runtime, "run_module",
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
