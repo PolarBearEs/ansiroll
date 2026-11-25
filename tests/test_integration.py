@@ -3944,7 +3944,7 @@ def test_controller_timeout_rechecks_projected_branch(tmp_path, monkeypatch, exp
 @pytest.mark.parametrize("alternate_vars, fallback", [
     ("seconds: 45\n", False),
     ("seconds: 45\ntask_file: other.yml\n", True),
-    ("seconds: [\n", True),
+    ("seconds: [\n", False),
 ])
 def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, alternate_vars, fallback):
     playbook = tmp_path / "play.yml"
