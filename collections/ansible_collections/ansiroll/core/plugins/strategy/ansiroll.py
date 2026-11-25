@@ -306,16 +306,17 @@ class StrategyModule(StrategyBase):
                 item for item in controller_reasons
                 if item.get("kind") != "delegate"
             ]
-        fact_routes = [
-            _delegated_fact_flag(getattr(task, "delegate_facts", None))
+        delegated_fact_tasks = [
+            task
             for task in task_map.values()
             if str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
-            and getattr(task, "delegate_to", None)
+            and _has_delegated_fact_flag(task)
         ]
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
-        elif not self._delegate_on_target and any(flag is not False for flag in fact_routes):
+        elif not self._delegate_on_target and any(
+                _delegated_fact_flag(task.delegate_facts) is not False for task in delegated_fact_tasks):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
@@ -352,8 +353,9 @@ class StrategyModule(StrategyBase):
             # constructor, which this deliberately reused instance never runs.
             if not hasattr(self, "_in_handlers"):
                 self._in_handlers = False
+            # Linear still needs the raw flag to identify quoted false values.
             # Dynamic roles can introduce delegated set_fact after compilation.
-            routed_facts = self._requires_linear_fallback or any(flag is not False for flag in fact_routes)
+            routed_facts = self._requires_linear_fallback or bool(delegated_fact_tasks)
             self.__class__ = _SetFactLinearStrategy if routed_facts else _LinearStrategy
             return self.run(iterator, play_context)
         self._emit_provenance({
@@ -1788,10 +1790,15 @@ class _LegacyFactResultQueue(collections.deque):
         return result
 
 
+_UNROUTED_FACT_RESULT = object()
+
+
 class _SetFactLinearStrategy(_LinearStrategy):
     """Use the worker's resolved delegation flags when linear publishes facts."""
 
     def run(self, iterator, play_context):
+        from ansiroll.runtime import _looks_templated
+
         self._fact_iterator = iterator
         self._fact_routes = {}
         self._legacy_fact_items = {}
@@ -1805,9 +1812,15 @@ class _SetFactLinearStrategy(_LinearStrategy):
                 host, task = ((result.host, result.task) if _UnifiedTaskResult is not None else
                               (result._host, result._task))
                 key = (host.name, task._uuid)
-                if self._routed_fact_task(key, task):
-                    target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
-                    self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
+                original = self._queued_task_cache.get(key, {}).get("task")
+                if _has_delegated_fact_flag(original):
+                    if task.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT:
+                        target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
+                        self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
+                    elif _looks_templated(original.action):
+                        # Keep the place of items that don't resolve to set_fact,
+                        # including skipped items that never resolve the action.
+                        self._fact_routes.setdefault(key, []).append(_UNROUTED_FACT_RESULT)
             return send_callback(method, *args, **kwargs)
 
         # Core 2.10 consumes raw queues inline without a conversion hook.
@@ -1835,9 +1848,8 @@ class _SetFactLinearStrategy(_LinearStrategy):
 
     def _routed_fact_task(self, key, resolved):
         original = self._queued_task_cache.get(key, {}).get("task")
-        return (original is not None and original.delegate_to
-                and (resolved.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT)
-                and original.delegate_facts is not None and original.delegate_facts is not False)
+        return (_has_delegated_fact_flag(original)
+                and (resolved.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT))
 
     def _fact_recipient(self, name):
         if not isinstance(name, str):
@@ -1871,7 +1883,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
         items = data.get("results", ())
         if routes and len(routes) == len(items) and not result.is_failed() and not result.is_unreachable():
             self._legacy_fact_items.update((id(item), (host, target)) for item, target in zip(items, routes)
-                                           if "ansible_facts" in item)
+                                           if target is not _UNROUTED_FACT_RESULT and "ansible_facts" in item)
 
     def get_delegated_hosts(self, result, task):
         route = self._legacy_fact_items.pop(id(result), None)
@@ -1898,7 +1910,8 @@ class _SetFactLinearStrategy(_LinearStrategy):
             return result
         if len(routes) == len(data.loop_results):
             for item, target in zip(data.loop_results, routes):
-                item.delegated_host = self._fact_recipient(target) if target else host.name
+                if target is not _UNROUTED_FACT_RESULT:
+                    item.delegated_host = self._fact_recipient(target) if target else host.name
             if task.run_once and None in routes:
                 self._run_once_fact_results[id(result)] = routes
         return result
@@ -1917,6 +1930,8 @@ class _SetFactLinearStrategy(_LinearStrategy):
             cache = self._variable_manager
             original_hosts = self.get_task_hosts(iterator, result.host, result.task)
             for item, target in zip(result.utr.loop_results, routes):
+                if target is _UNROUTED_FACT_RESULT:
+                    continue
                 recipients = [item.delegated_host] if target else original_hosts
                 changes = item.pending_changes.register_host_variables
                 for host in recipients:
@@ -1928,6 +1943,11 @@ class _SetFactLinearStrategy(_LinearStrategy):
                 for host in original_hosts:
                     cache.set_nonpersistent_facts(host, result.utr.registered_values)
         return results
+
+
+def _has_delegated_fact_flag(task):
+    return (task is not None and task.delegate_to
+            and task.delegate_facts is not None and task.delegate_facts is not False)
 
 
 def _delegated_fact_flag(value):

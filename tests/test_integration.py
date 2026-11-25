@@ -5720,6 +5720,61 @@ def test_strategy_routes_literal_false_delegation_in_dynamic_roles(tmp_path, fla
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_keeps_false_string_fact_on_origin_in_multihost_fallback(tmp_path, flag):
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        local_marker: "{{ item }}"
+      delegate_to: recipient
+      delegate_facts: FLAG
+      loop: [first, second]
+      when: inventory_hostname == 'origin'
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
+      when: inventory_hostname == 'origin'
+""".replace("FLAG", flag), inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_routes_templated_set_fact_after_a_skipped_item(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    fact_action: set_fact
+  tasks:
+    - action: "{{ fact_action }}"
+      args:
+        "{{ item.key }}": "{{ item.value }}"
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+      loop:
+        - {key: skipped_marker, value: skipped, route: true, run: false}
+        - {key: local_marker, value: local, route: false, run: true}
+        - {key: remote_marker, value: remote, route: true, run: true}
+      when: item.run
+      register: fact_results
+    - assert:
+        that:
+          - fact_results.results[0].skipped
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - hostvars.recipient.skipped_marker is undefined
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: all
