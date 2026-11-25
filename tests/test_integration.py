@@ -100,6 +100,45 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_path, monkeypatch):
+    import builtins
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files: ['vars-{{ profile }}.yml']
+  tasks:
+    - debug: {msg: "{{ selected }}"}
+""")
+    blocked = tmp_path / "vars-blocked.yml"
+    blocked.write_text("selected: unavailable\n")
+    (tmp_path / "vars-safe.yml").write_text("selected: selected-safe-candidate\n")
+    original_open = builtins.open
+
+    def deny_candidate(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(blocked):
+            raise PermissionError("synthetic read denial for candidate")
+        return original_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "open", deny_candidate)
+        source, _ = compile_playbook(str(playbook))
+    script = tmp_path / "compiled.py"
+    script.write_text(source)
+
+    def run(profile):
+        return subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
+                              env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
+                              timeout=20)
+
+    safe = run("safe")
+    assert safe.returncode == 0, safe.stdout + safe.stderr
+    assert "selected-safe-candidate" in safe.stdout
+    error = run("blocked")
+    assert error.returncode == 1, error.stdout + error.stderr
+    assert "synthetic read denial for candidate" in error.stderr
+
+
 def test_ordered_vars_files_capture_env_before_later_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_ORDERED_PREFIX", "compile")
     monkeypatch.setenv("ANSIROLL_TEST_ORDERED_SELECTOR", "chosen")

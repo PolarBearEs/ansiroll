@@ -1069,14 +1069,14 @@ def _bundled_vars_file(play, path):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
-    with open(path, "rb") as fh:
-        # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-        # select.
-        if b"$ANSIBLE_VAULT" in fh.read():
-            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                    % path}
     try:
+        with open(path, "rb") as fh:
+            # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
+            # select.
+            if b"$ANSIBLE_VAULT" in fh.read():
+                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                        % path}
         loaded = _load_vars_file(play, path)
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
@@ -2331,7 +2331,7 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
-    newline = None if name == "template" else ""
+    newline = ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
@@ -2675,7 +2675,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked."""
     if getattr(task, "_role", None) is None:
         return False
-    newline = "" if subdir == "files" else None
+    newline = ""
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
@@ -3244,7 +3244,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         return False
 
     assets, metadata, contents = {}, {}, {}
-    newline = "" if subdir == "files" else None
+    newline = ""
     remaining_linked_visits = 4096
     # Finish paths with the current number of symlinks before expanding paths
     # with one more, even when a path has many ordinary directories.
