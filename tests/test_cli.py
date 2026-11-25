@@ -773,6 +773,37 @@ def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path
     assert playbook.read_bytes() == original
 
 
+@pytest.mark.parametrize(("destination", "alias"), [
+    ("output", "direct"), ("output", "hardlink"), ("output", "symlink"),
+    ("manifest", "hardlink"), ("stdout", "direct"),
+])
+def test_compile_rejects_destinations_aliasing_a_transitive_import(tmp_path, destination, alias):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    (tmp_path / "nested").mkdir()
+    imported = tmp_path / "nested" / "child.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    imported.write_bytes(original)
+    (tmp_path / "parent.yml").write_text("- import_playbook: nested/child.yml\n")
+    playbook.write_text("- import_playbook: parent.yml\n")
+    target = imported if alias == "direct" else tmp_path / "alias"
+    if alias == "hardlink":
+        os.link(imported, target)
+    elif alias == "symlink":
+        target.symlink_to(imported)
+    command = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook)]
+    if destination == "stdout":
+        with target.open("ab") as stdout:
+            result = subprocess.run(command + ["-o", "-"], stdout=stdout, stderr=subprocess.PIPE, timeout=10)
+    else:
+        args = (["-o", str(target)] if destination == "output"
+                else ["-o", str(tmp_path / "compiled.py"), "-m", str(target)])
+        result = subprocess.run(command + args, capture_output=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert b"points to input playbook" in result.stderr
+    assert imported.read_bytes() == original
+
+
 def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
     playbook = tmp_path / "play.yml"
     destination = tmp_path / "stdout"

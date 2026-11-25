@@ -464,13 +464,13 @@ def _make_rewriting_loader(DataLoader):
         def __init__(self):
             super().__init__()
             self.on_playbook_open = None
+            self._opening_playbook = False
             self._deferred_import_fields = {}
 
         def _get_file_contents(self, file_name):
             observe = self.on_playbook_open
-            if observe is None:
+            if not self._opening_playbook or observe is None:
                 return super()._get_file_contents(file_name)
-            self.on_playbook_open = None
 
             from ansible.errors import AnsibleFileNotFound, AnsibleParserError
 
@@ -498,7 +498,12 @@ def _make_rewriting_loader(DataLoader):
             reader = sys._getframe(1).f_code
             playbook = reader is playbook_reader
             role_tasks = reader is role_reader and sys._getframe(1).f_locals.get("subdir") in ("tasks", "handlers")
-            data = super(RewritingDataLoader, self).load_from_file(*args, **kwargs)
+            opening_playbook = self._opening_playbook
+            self._opening_playbook = playbook
+            try:
+                data = super().load_from_file(*args, **kwargs)
+            finally:
+                self._opening_playbook = opening_playbook
             if not (playbook or role_tasks or reader in task_readers):
                 return data
             return _rewrite_includes(data, playbook=playbook, defer_import_fields=self._defer_import_fields)
