@@ -229,6 +229,20 @@ def test_strategy_setup_defaults_use_the_host_selected_vars_file(tmp_path):
     assert messages == ["filtered"]
 
 
+def test_strategy_setup_default_uses_controller_file_lookup(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.setup:
+      filter: '{{ [lookup("file", "fact-filter.txt")] }}'
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=True)
+    assert messages == ["filtered"]
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup evaluates path defaults differently")
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_setup_uses_default_fact_path_when_explicit_value_is_null(tmp_path, use_strategy):

@@ -827,6 +827,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     lookup_sources.pop("gather_setup_options", None)
     lookup_sources.pop("_gather_setup_scoped", None)
+    lookup_sources.pop("gather_setup_defaults", None)
+    lookup_sources.pop("gather_action_defaults", None)
     names = _controller_env_names(lookup_sources)
     if names:
         result["controller_env"] = {
@@ -837,6 +839,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     config_names = _controller_config_names(lookup_sources)
     config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE",
                          "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
+    if setup_defaults or gather_defaults:
+        config_names.add("DEFAULT_GATHER_SUBSET")
     if core_version >= (2, 19):
         config_names.add("DISPLAY_TRACEBACK")
     controller_config = _controller_config_values(config_names)

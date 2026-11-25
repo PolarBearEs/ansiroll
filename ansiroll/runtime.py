@@ -6911,7 +6911,8 @@ class Runtime:
                                 raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
                     resolved_options[key] = self.template(value, scope, strict=True)
                 if not _core_at_least(2, 18) and resolved_options.get("gather_subset") == _OMIT:
-                    resolved_options["gather_subset"] = ["all"]
+                    config = ctx.get("__ansiroll_controller_config", {})
+                    resolved_options["gather_subset"] = config.get("DEFAULT_GATHER_SUBSET", ["all"])
                 setup_args = {key: value for key, value in _setup_omit(resolved_options).items() if value is not None}
                 if "gather_subset" in setup_args:
                     subset = setup_args["gather_subset"]
