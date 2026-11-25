@@ -3623,7 +3623,7 @@ class _Templater:
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
-    def render_string(self, text, ctx, _depth=0, strict=False):
+    def render_string(self, text, ctx, _depth=0, strict=False, *, file_text=False):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if "{{" not in text and "{%" not in text:
@@ -3640,7 +3640,7 @@ class _Templater:
             # A Python plugin can read an alias that starts a nested template.
             # Its Jinja expressions still need lazy hostvars entries.
             with self._plugin_arg_scope(None):
-                result = self._render_string(text, ctx, strict)
+                result = self._render_string(text, ctx, strict, file_text=file_text)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -3856,7 +3856,7 @@ class _Templater:
                     pending.extend(value)
         return False
 
-    def _render_string(self, text, ctx, strict=False):
+    def _render_string(self, text, ctx, strict=False, *, file_text=False):
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
@@ -3900,6 +3900,17 @@ class _Templater:
                 return _captured_jinja_error(e)
         try:
             result = _concretize(result)
+            if file_text and expr is not None and text != stripped and not isinstance(result, _Omit):
+                # Apply Jinja's whitespace controls before restoring the
+                # source's trailing newline count, as Ansible's template action does.
+                tokens = list(env.lex(text))
+                prefix = tokens[0][2] if tokens[0][1] == "data" else ""
+                suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
+                result = prefix + _as_text(result) + suffix
+                source = text.replace("\r\n", "\n").replace("\r", "\n")
+                source_newlines = len(source) - len(source.rstrip("\n"))
+                result_newlines = len(result) - len(result.rstrip("\n"))
+                result += "\n" * (source_newlines - result_newlines)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
                 # when a later assertion member reads a cached alias.
@@ -6281,7 +6292,7 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    rendered = self.templater.render_string(raw, tctx)
+                    rendered = self.templater.render_string(raw, tctx, file_text=True)
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
