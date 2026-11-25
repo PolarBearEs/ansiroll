@@ -87,7 +87,8 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
+                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_setup_controller_lookups",
+                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -1586,6 +1587,12 @@ _ANSIBLE_TESTS = {
 
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name).rsplit(".", 1)[-1]
+    setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
+        known = setup_lookups.get(name, ())
+        if any(str(term) not in known for term in args):
+            raise ValueError("setup requires an uncaptured controller %s value; pass the option's input through "
+                             "extra vars or select the vars file at compile time" % name)
     if name == "vars":
         vals = []
         for a in args:
@@ -4099,6 +4106,7 @@ class Runtime:
         self.vars = dict(host_vars or {})
         self._play_var_names = set()
         self._initial_host_vars = self._task_host_vars()
+        self._vars_file_host_vars = self._initial_host_vars
         self.python = python or sys.executable
         self.check_mode = check_mode
         self.diff_mode = diff_mode
@@ -4143,6 +4151,7 @@ class Runtime:
         self._module_source_bytes = None  # baked unarchive input for the next worker call
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
+        self.gather_setup_fn = None  # resolve implicit setup options using controller task scope
         self.delegate_on_target = False
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
@@ -4605,18 +4614,73 @@ class Runtime:
         vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
         merge_vars_files = (ordered_files is not None and
                             self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
+        merge_setup_scope = self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         vars_file_defaults = play.get("vars_file_defaults", timeout_template.get("vars_file_defaults")) or {}
         vars_file_magic = play.get("vars_file_magic") or {}
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = None
             blocked_timeout_inputs = {}
-            if timeout_template and vars_files:
+            option_scope = play.get("gather_setup_scope")
+            if (timeout_template or option_scope) and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files,
-                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {})},
+                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {}),
+                     **((option_scope or {}).get("defaults") or {})},
                     blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
+            option_contexts = {}
+            if option_scope:
+                layers = (*option_scope["role_exports"], self.extra_vars, option_scope["magic"])
+                option_vars = _f_combine(
+                    option_scope["defaults"], play_vars if timeout_vars is None else timeout_vars,
+                    *layers, recursive=merge_setup_scope)
+                option_ctx = self.ctx(option_vars, base={
+                    name: self.vars[name]
+                    for name in ("__ansiroll_controller_env", "__ansiroll_controller_config")
+                })
+                option_blocks = dict(blocked_timeout_inputs)
+                for layer in layers:
+                    _clear_vars_file_blocks(option_blocks, layer, merge_setup_scope)
+                option_ctx["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
+                option_contexts["gather_subset"] = (option_ctx, option_blocks)
+                config = self.vars["__ansiroll_controller_config"]
+                facts = self._module_fact_layer
+                inject_facts = config.get("INJECT_FACTS_AS_VARS", True)
+                visible_facts = facts if inject_facts else {"ansible_local": facts.get("ansible_local", {})}
+                host_vars = _f_combine(self._vars_file_host_vars, visible_facts, recursive=merge_setup_scope)
+                host_vars["ansible_facts"] = _normalized_facts(facts, preserve_local=True)
+                for name in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
+                    host_vars[name] = self.vars[name]
+                task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
+                task_blocks = {}
+                if vars_files:
+                    task_vars = self._resolve_deferred_vars_files(
+                        vars_file_play_vars, vars_files, early_files,
+                        {**vars_file_defaults, **option_scope["defaults"]},
+                        blocked_inputs=task_blocks, merge_hashes=merge_setup_scope, magic=vars_file_magic,
+                        pre_setup_host_vars=host_vars,
+                    )
+                task_layers = (*option_scope["role_exports"], self._include_vars_layer,
+                               self._set_fact_overrides, self.extra_vars, option_scope["magic"])
+                for layer in task_layers:
+                    _clear_vars_file_blocks(task_blocks, layer, merge_setup_scope)
+                task_scope = self.ctx(_f_combine(task_vars, *task_layers, recursive=merge_setup_scope), base={})
+                task_scope["ansible_search_path"] = option_scope.get("task_search_path") or []
+                host_view = _f_combine(
+                    {key: value for key, value in host_vars.items()
+                     if key != "hostvars" and not key.startswith("__ansiroll_")},
+                    self._include_vars_layer, self._set_fact_overrides, self.extra_vars,
+                    recursive=merge_setup_scope,
+                )
+                self._pin_magic_vars(host_view)
+                hostviews = dict(host_vars.get("hostvars") or {})
+                hostviews[self.host] = host_view
+                task_scope["hostvars"] = hostviews
+                task_scope["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
+                task_scope.pop("vars", None)
+                task_scope["vars"] = _vars_snapshot(task_scope)
+                option_contexts["fact_path"] = (task_scope, task_blocks)
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -4625,6 +4689,8 @@ class Runtime:
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
+                setup_options=play.get("gather_setup_options"),
+                option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
             )
@@ -4959,7 +5025,8 @@ class Runtime:
         return ctx
 
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
-                                     blocked_inputs=None, merge_hashes=False, magic=None):
+                                     blocked_inputs=None, merge_hashes=False, magic=None,
+                                     pre_setup_host_vars=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # During early replay each blocked variable records the member paths
         # that later assignments have definitely replaced.
@@ -4970,7 +5037,8 @@ class Runtime:
         else:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         selected = dict(play_vars)
-        selector_vars = _f_combine(defaults, None if before_setup else base, selected, recursive=merge_hashes)
+        selector_base = pre_setup_host_vars if before_setup else base
+        selector_vars = _f_combine(defaults, selector_base, selected, recursive=merge_hashes)
 
         def apply_files(mappings):
             nonlocal selected, selector_vars
@@ -5094,7 +5162,7 @@ class Runtime:
                                  % (item,))
         return selector_vars if before_setup else selected
 
-    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False):
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -5110,6 +5178,12 @@ class Runtime:
             analysis = _selector_scope(expression, ctx)
             for call in analysis[2]:
                 method = call.node
+                if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
+                        and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
+                                              for arg in call.args)
+                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
+                        and not (call.dyn_args or call.dyn_kwargs)):
+                    continue
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
             for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
@@ -7021,7 +7095,8 @@ class Runtime:
 
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=()):
+                     gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
+                     setup_options=None, option_contexts=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -7047,7 +7122,38 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            setup_args = {}
+            if self.gather_setup_fn is not None and setup_options:
+                controller_setup = self.gather_setup_fn()
+                if controller_setup["error"] is not None:
+                    raise ValueError(controller_setup["error"])
+                resolved_options = controller_setup["options"]
+            else:
+                authored_options = dict(setup_options or {})
+                if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
+                    authored_options.pop("fact_path", None)
+                resolved_options = {}
+                for key, value in authored_options.items():
+                    scope, blocks = (option_contexts or {}).get(key, (ctx, ()))
+                    if blocks:
+                        for source, _, _ in _selector_template_sources(value):
+                            paths = set()
+                            inputs = self._pre_setup_template_inputs(
+                                source, scope, selector=True, paths=paths, setup_lookups=True)
+                            if inputs is None or _vars_file_reads_blocked(blocks, paths):
+                                raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
+                    resolved_options[key] = self.template(value, scope, strict=True)
+                resolved_options = _fail_on_undef(_strip_omit(resolved_options))
+                if _core_at_least(2, 19) and isinstance(resolved_options.get("gather_subset"), list):
+                    resolved_options["gather_subset"] = [item for item in resolved_options["gather_subset"]
+                                                         if item != _OMIT]
+                if "gather_subset" in resolved_options and resolved_options["gather_subset"] is not None:
+                    subset = resolved_options["gather_subset"]
+                    if not isinstance(subset, list):
+                        subset = [subset]
+                    if not all(isinstance(item, str) for item in subset):
+                        raise ValueError("gather_subset items must be strings")
+                    resolved_options["gather_subset"] = subset
+            setup_args = {key: value for key, value in resolved_options.items() if value is not None}
             gather_timeout = self._gather_timeout_for_run(
                 gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
@@ -7570,6 +7676,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         "worker_startup": 0.0,
     }
     rt = None
+    vars_file_host_vars = {**inventory_defaults, **host_vars}
     host_var_overrides = {}
     delegated_ansible_facts_overrides = set()
     include_vars_layer = {}
@@ -7591,6 +7698,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      native_only=native_only, inventory_defaults=inventory_defaults)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
+        rt._vars_file_host_vars = vars_file_host_vars
         rt._delegated_ansible_facts_overrides = delegated_ansible_facts_overrides
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
@@ -8078,6 +8186,15 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
+
+    def _gather_setup():
+        _chan_send(resp_fd, {"t": "gather_setup"})
+        reply = _chan_recv()
+        if not reply or reply.get("t") != "gather_setup_result":
+            raise RuntimeError("controller did not return setup options")
+        return reply["setup"]
+
+    rt.gather_setup_fn = _gather_setup
     rt.delegate_on_target = delegate_on_target
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
