@@ -4655,8 +4655,7 @@ class Runtime:
         if items is not None and not items:
             result = {"changed": False, "skipped": True, "results": [],
                       "msg": "No items in the list"}
-        deferred_scopes = [] if items and handlers else None
-        if result is None and deferred_scopes is None:
+        if result is None and items is None:
             result, ignore = self._task_gate(node, base_ctx)
         if result is not None:
             self._store_register(node, result)
@@ -4673,6 +4672,8 @@ class Runtime:
         looped = items is not None
         invocation_params = node.get("include_params", node.get("vars")) or {}
         # Ansible loads all successful role-loop handlers before running any body.
+        deferred_scopes = [] if looped and handlers else None
+        included = False
         for i, item in enumerate(items if looped else [None]):
             result = {"changed": False, "include": node.get("file")}
             loop_vars = {}
@@ -4682,7 +4683,7 @@ class Runtime:
             ctx = dict(base_ctx)
             ctx.update(loop_vars)
             stop = False
-            if deferred_scopes is not None:
+            if looped:
                 blocked, ignored = self._task_gate(node, ctx)
                 if node.get("loop_break_when"):
                     break_ctx = dict(ctx)
@@ -4714,6 +4715,7 @@ class Runtime:
             include_params.update(loop_vars)
             scope[_INCLUDE_PARAMS_KEY] = include_params
             self.emit(node, "ok", result, item=item, is_item=looped, name=name)
+            included = True
             if tally_ok:
                 self._tally("ok")
             self._add_handlers(handlers, scope, b)
@@ -4721,9 +4723,9 @@ class Runtime:
                 yield self._node_steps(tasks, scope, b)
             else:
                 deferred_scopes.append(scope)
-                if stop:
-                    break
-        if deferred_scopes == []:
+            if stop:
+                break
+        if looped and not included:
             self._tally("skipped")
         for scope in deferred_scopes or ():
             yield self._node_steps(tasks, scope, b)

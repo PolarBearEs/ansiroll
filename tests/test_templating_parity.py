@@ -1859,6 +1859,35 @@ def test_dynamic_include_loop_resolution_reports_task_results(tmp_path, action, 
     assert recap == ("6", "0", "0", "0", "2", "1", "2")
 
 
+@pytest.mark.parametrize("action", [
+    "include_tasks: included.yml", "include_role: {name: r}",
+], ids=["tasks", "role"])
+def test_dynamic_include_when_uses_loop_item(tmp_path, action):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ACTION
+      loop: [allowed, skipped]
+      when: item == 'allowed'
+    - ACTION
+      loop: [first, second]
+      loop_control:
+        loop_var: candidate
+        index_var: position
+      when: position == 1
+      vars:
+        item: "{{ candidate }}"
+    - ACTION
+      loop: [skipped, also_skipped]
+      when: item == 'allowed'
+""".replace("ACTION", action), {
+        "included.yml": '- debug: {msg: "{{ item }}"}\n',
+        "roles/r/tasks/main.yml": '- debug: {msg: "{{ item }}"}\n',
+    })
+    assert messages == ["allowed", "second"]
+
+
 def test_undefined_and_false_loop_conditions(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost
