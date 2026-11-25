@@ -62,6 +62,41 @@ def _compiled_plays(src, tmp_path):
     return json.loads(result.stdout)
 
 
+def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TEST_DEFERRED_PREFIX", "region")
+    monkeypatch.setenv("ANSIROLL_TEST_SELECTED_ENV", "selected-at-compile")
+    monkeypatch.setenv("ANSIROLL_TEST_DEFERRED_ENV", "synthetic-unselected-value")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - selected.yml
+    - 'profile-{{ lookup("env", "ANSIROLL_TEST_DEFERRED_PREFIX") }}-{{ profile }}.yml'
+  tasks:
+    - debug:
+        msg:
+          selected: '{{ compile_value }}'
+          runtime: '{{ runtime_value }}'
+""")
+    (tmp_path / "selected.yml").write_text('compile_value: "{{ lookup(\'env\', \'ANSIROLL_TEST_SELECTED_ENV\') }}"\n')
+    (tmp_path / "profile-region-run.yml").write_text(
+        'runtime_value: "{{ lookup(\'env\', \'ANSIROLL_TEST_DEFERRED_ENV\') }}"\n')
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert plan["controller_env"] == {
+        "ANSIROLL_TEST_DEFERRED_PREFIX": "region",
+        "ANSIROLL_TEST_SELECTED_ENV": "selected-at-compile",
+    }
+    for overrides, expected in (({}, ""), ({"runtime_value": "supplied-at-launch"}, "supplied-at-launch")):
+        frames = []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                          extra_vars={"profile": "run", **overrides})
+        runtime.run_play(plan)
+        assert [frame["result"]["msg"] for frame in frames] == [{
+            "selected": "selected-at-compile", "runtime": expected,
+        }]
+
+
 # ---- module embedding (cross-version core mechanism) --------------------
 
 

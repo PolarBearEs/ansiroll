@@ -744,10 +744,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
-    # Replaying a selector after an earlier deferred file may bundle new
-    # candidates. Their lookup names do not authorize copying controller data.
+    # Only scan vars-file contents selected during compilation. Ordinary
+    # deferred entries still need environment inputs from their selectors.
     environment_sources = {**result, "deferred_vars_files": [
-        order_deferred[index][0] if index in order_deferred else entry
+        order_deferred[index][0] if index in order_deferred else entry["names"]
         for index, entry in enumerate(result.get("deferred_vars_files", ()))
     ]}
     names = _controller_env_names(environment_sources)

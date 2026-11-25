@@ -92,6 +92,10 @@ runtime overrides are rejected. Values passed with `-e` are embedded in the
 artifact, including values used only to resolve a controller-side lookup.
 When a standalone play's `gather_timeout` uses a controller lookup, supply the
 lookup inputs and any vars-file selectors it depends on at compile time.
+Environment values referenced only by the contents of runtime-selected
+`vars_files` are omitted from the artifact. For runtime-selected data, use a
+play variable and supply its value at launch through `ANSIROLL_EXTRA_VARS` or
+the JSON file named by `ANSIROLL_VARS_FILE`.
 
 ### Run a playbook locally (compile + execute)
 
