@@ -554,7 +554,7 @@ class StrategyModule(StrategyBase):
 
                 validate_args = getattr(task, "_post_validate_args", None)
                 if validate_args is not None:
-                    task.args = validate_args(task._valid_attrs["args"], task.args, templar)
+                    task.args = validate_args(task.fattributes["args"], task.args, templar)
                 else:
                     task.args = templar.template(task.args)
                 legacy = _core_version() < (2, 12)
