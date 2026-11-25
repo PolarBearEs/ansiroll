@@ -1690,7 +1690,7 @@ def _controller_fallbacks(play_node):
                 kind = "controller-fallback"
                 if node.get("_deferred_vault_source"):
                     kind = "vault-source"
-                elif node.get("_file_source_argument_layer"):
+                elif node.get("_file_source_argument_layers"):
                     kind = "file-source-arguments"
                 found.append({
                     "kind": kind,

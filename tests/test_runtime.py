@@ -3676,6 +3676,15 @@ def test_copy_without_embedded_modules_fails_clearly(tmp_path):
     assert not dest.exists()
 
 
+@pytest.mark.parametrize("module", ["copy", "ansible.builtin.copy"])
+def test_remote_copy_prefers_the_embedded_task_module(monkeypatch, module):
+    rt = Runtime({module: {}}, "", {"inventory_hostname": "h"})
+    monkeypatch.setattr(rt, "run_module", lambda action, args, become: {"action": action})
+    result = rt._run_file_action("copy", {"action": "copy"},
+                                 {"src": "/source", "dest": "/output", "remote_src": True}, {})
+    assert result == {"action": module}
+
+
 def test_copy_fetches_runtime_created_controller_source(tmp_path):
     src = tmp_path / "checkout" / "docker-compose.yml"
     src.parent.mkdir()

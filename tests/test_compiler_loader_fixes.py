@@ -1706,6 +1706,78 @@ def test_copy_keeps_default_vault_encrypted_with_uncertain_source_options(tmp_pa
     assert (tmp_path / "installed").read_bytes() == expected
 
 
+@pytest.mark.parametrize("options, defaults", [
+    ("{remote_src: false, decrypt: false}", "{remote_src: true}"),
+    ("{mode: preserve, decrypt: false}", "{}"),
+])
+def test_templated_copy_args_keep_encrypted_source_candidates(tmp_path, options, defaults):
+    from stat import S_IMODE
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import _core_version
+
+    secret = VaultSecret(b"synthetic-test-password")
+    password = tmp_path / "vault-password"
+    password.write_bytes(secret.bytes)
+    ciphertext = VaultLib([("default", secret)]).encrypt(b"synthetic vault payload", secret=secret)
+    source = tmp_path / "selected.vault"
+    source.write_bytes(ciphertext)
+    source.chmod(0o640)
+    action = "copy" if _core_version() < (2, 12) else "ansible.builtin.copy"
+    playbook = tmp_path / "pb.yml"
+    playbook.write_text(f"""- hosts: localhost
+  gather_facts: false
+  vars:
+    options: {options}
+  module_defaults:
+    {action}: {defaults}
+  tasks:
+    - copy:
+        src: selected.vault
+        dest: "{{{{ playbook_dir }}}}/installed"
+      args: "{{{{ options }}}}"
+""")
+    compiled, manifest = compile_playbook(str(playbook), vault_password_file=str(password))
+    assert not manifest.get("contains_vault_plaintext")
+    source.unlink()
+    artifact = tmp_path / "artifact.py"
+    artifact.write_text(compiled)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    installed = tmp_path / "installed"
+    assert installed.read_bytes() == ciphertext
+    if "preserve" in options:
+        assert S_IMODE(installed.stat().st_mode) == 0o640
+
+
+def test_copy_combines_templated_action_and_args_layers(tmp_path):
+    from stat import S_IMODE
+
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("action argument mapping finalization uses modern Core semantics")
+    playbook = tmp_path / "pb.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    options: {dest: "{{ playbook_dir }}/selected", content: chosen}
+    defaults: {dest: "{{ playbook_dir }}/incorrect", content: shadowed, mode: '0640'}
+  tasks:
+    - copy: "{{ options }}"
+      args: "{{ defaults }}"
+""")
+    _ansible(playbook, returncode=0)
+    selected = tmp_path / "selected"
+    assert selected.read_text() == "chosen"
+    assert S_IMODE(selected.stat().st_mode) == 0o640
+    selected.unlink()
+    _ansiroll(playbook, tmp_path, returncode=0)
+    assert selected.read_text() == "chosen"
+    assert S_IMODE(selected.stat().st_mode) == 0o640
+    assert not (tmp_path / "incorrect").exists()
+
+
 def test_cli_protects_vault_artifacts_with_disabled_handlers(tmp_path):
     from stat import S_IMODE
 

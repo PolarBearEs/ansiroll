@@ -5835,18 +5835,22 @@ class Runtime:
         if args_cache is None:
             args_cache = {}
         if "args" not in args_cache:
-            argument_layer = (source_task or {}).get("_file_source_argument_layer")
-            if argument_layer:
+            argument_layers = (source_task or {}).get("_file_source_argument_layers")
+            if argument_layers:
                 raw_args = dict(raw_args)
-                source = self.templater.render_string(raw_args.pop(argument_layer), ctx)
-                if not isinstance(source, dict):
-                    _fail_on_undef(source)
-                    if source == _OMIT or argument_layer == "_variable_params" and _legacy_templating():
-                        source = {}
-                    else:
+                sources = []
+                for layer in argument_layers:
+                    source = self.templater.render_string(raw_args.pop(layer), ctx)
+                    if not isinstance(source, dict):
+                        _fail_on_undef(source)
+                        if source == _OMIT or layer == "_variable_params" and _legacy_templating():
+                            continue
                         raise ValueError("file source arguments must resolve to a dictionary")
+                    sources.append(source)
                 inherited = {key: raw_args.pop(key) for key in source_task["_file_source_inherited_args"]}
-                expanded = {key: source[key] for key in source if key not in raw_args}
+                expanded = {}
+                for source in reversed(sources):
+                    expanded.update({key: source[key] for key in source if key not in raw_args and key not in expanded})
                 inherited = {key: value for key, value in inherited.items() if key not in expanded}
                 args = {**self.template(inherited, ctx), **expanded, **self.template(raw_args, ctx)}
             else:
@@ -6606,7 +6610,9 @@ class Runtime:
                 return {"failed": True, "changed": False, "msg": failure}
             if content is None and _ansible_boolean(args.get("remote_src", False)):
                 args.pop("decrypt", None)
-                return self.run_module(_COPY_MODULE, _fail_on_undef(args), become=become)
+                action = task.get("action")
+                return self.run_module(action if action in self.modules else _COPY_MODULE,
+                                       _fail_on_undef(args), become=become)
         else:
             content = None
 

@@ -2417,24 +2417,24 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
     if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
         source_action = action.rsplit(".", 1)[-1]
         unknown_defaults = False
-        argument_layer = None
+        argument_layers = []
         if source_action in ("copy", "unarchive"):
             explicit = set(node["args"])
             if "_variable_params" in explicit:
-                argument_layer = "_variable_params"
-            elif _contains_dynamic_value(node["args"].get("_raw_params")):
-                argument_layer = "_raw_params"
+                argument_layers.append("_variable_params")
+            if _contains_dynamic_value(node["args"].get("_raw_params")):
+                argument_layers.append("_raw_params")
             unknown_defaults = _apply_file_source_defaults(task, source_action, node)
-            if argument_layer:
-                node["_file_source_argument_layer"] = argument_layer
+            if argument_layers:
+                node["_file_source_argument_layers"] = argument_layers
                 node["_file_source_inherited_args"] = sorted(node["args"].keys() - explicit)
                 node["fallback"] = True
                 node["fallback_reason"] = "templated file source arguments require controller selection"
         _bake_sources(node, task, basedir, controller_execution=controller_execution,
-                      unknown_defaults=unknown_defaults or argument_layer is not None)
+                      unknown_defaults=unknown_defaults or bool(argument_layers))
         decrypt = node["args"].get("decrypt", True)
         if (source_action in ("copy", "unarchive") and not node.get("_vault_plaintext")
-                and (unknown_defaults or argument_layer or _contains_dynamic_value(decrypt)
+                and (unknown_defaults or argument_layers or _contains_dynamic_value(decrypt)
                      or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
                 and any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
                         for value in (node.get("_baked") or {}).values())):
@@ -2445,8 +2445,7 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
             ]
             if unknown_defaults:
                 node["_vault_source_inputs"].append("module_defaults")
-            if argument_layer:
-                node["_vault_source_inputs"].append(argument_layer)
+            node["_vault_source_inputs"].extend(argument_layers)
             node["fallback"] = True
             node["fallback_reason"] = "Vault source needs controller selection and decryption"
         if node["special"] is None:
@@ -2456,7 +2455,7 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
             # official copy and file modules.
             actions.update(COPY_ACTION_MODULES)
             node.update(_copy_action_settings())
-            if node["special"] == "copy" and _remote_src(node["args"]) is not False:
+            if node["special"] == "copy" and (argument_layers or _remote_src(node["args"]) is not False):
                 # remote_src copies run the copy module on the target, like the
                 # copy action plugin's remote_src path.
                 actions.add(action)
@@ -2747,7 +2746,12 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     name = node.get("action", "").split(".")[-1]
     remote = _remote_src(args, unarchive=name == "unarchive") if name in ("copy", "unarchive") else False
     if remote is True:
-        return  # src lives on the target; the module reads it there
+        inherited = node.get("_file_source_inherited_args", ())
+        if not inherited or _remote_src(
+                {key: value for key, value in args.items() if key not in inherited},
+                unarchive=name == "unarchive") is True:
+            return  # src lives on the target; the module reads it there
+        remote = None  # templated arguments can override inherited source flags
 
     subdir = "templates" if name == "template" else "files"
     newline = ""
@@ -2757,6 +2761,8 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     with_meta = name == "template" or (name == "copy" and (
         mode == "preserve" or _contains_dynamic_value(mode)
         or "mode" in node.get("_file_source_default_keys", ())
+        or (node.get("_file_source_argument_layers") and (
+            "mode" not in args or "mode" in node["_file_source_inherited_args"]))
     ))
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
