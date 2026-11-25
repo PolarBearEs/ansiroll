@@ -3643,6 +3643,8 @@ class _Templater:
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if "{{" not in text and "{%" not in text:
+            if file_newline is not None and _legacy_templating():
+                return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
             return text
         ctx = self._play_var_scope(ctx, strict)
         previous = self._current_ctx
@@ -3873,6 +3875,11 @@ class _Templater:
         return False
 
     def _render_string(self, text, ctx, strict=False, *, file_newline=None):
+        stripped = text.strip()
+        expr = _bare_template_expression(stripped, lex=self.env.lex)
+        if expr is None:
+            # Full templates keep their existing rendering and newline behavior.
+            file_newline = None
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
@@ -3888,10 +3895,8 @@ class _Templater:
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
         template_key = (text, strict, lazy_names, file_newline)
-        stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
-        expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is not None:
             expr_key = (expr, strict, lazy_names, file_newline)
             try:
@@ -3933,11 +3938,13 @@ class _Templater:
                 prefix = prefix.replace("\n", file_newline)
                 suffix = suffix.replace("\n", file_newline)
                 legacy = _legacy_templating()
-                if prefix or suffix or legacy:
+                if prefix or suffix:
                     value = "" if not legacy and isinstance(result, _Omit) else result
                     if _core_at_least(2, 13):
                         _fail_on_undef(value)
                     result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
+                elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
+                    result = str(_as_text(result))
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
                 result_newlines = len(result) - len(result.rstrip("\n"))
