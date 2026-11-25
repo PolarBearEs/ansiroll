@@ -49,12 +49,12 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None):
+def _ansible(playbook, cwd, strategy=None, *, diff=False):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
-        ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
+        ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
          "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
@@ -970,6 +970,109 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
     assert output.read_text() == expected_text
+
+
+@pytest.mark.parametrize("src", ["sites/app.j2", "sites/{{ site }}.j2"])
+def test_delegated_template_uses_original_role_search_path(tmp_path, src):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    site: app
+  roles: [web]
+""", {
+        "roles/web/tasks/main.yml": (
+            '- template:\n'
+            f'    src: "{src}"\n'
+            '    dest: "{{ playbook_dir }}/rendered.txt"\n'
+            '  delegate_to: localhost\n'
+        ),
+        "roles/web/templates/sites/app.j2": "role template from {{ template_fullpath }}\n",
+        "sites/app.j2": "working directory file\n",
+    })
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    expected_text = "role template from " + str(tmp_path / "roles/web/templates/sites/app.j2") + "\n"
+    assert output.read_text() == expected_text
+    output.unlink()
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+@pytest.mark.parametrize("parent_traversal", [False, True], ids=["external-link", "parent-traversal"])
+def test_delegated_template_uses_local_loader_for_symlink_sources(tmp_path, parent_traversal):
+    project = tmp_path / "project"
+    src = "current/../app.j2" if parent_traversal else "shared.j2"
+    path = _write(project, """
+- hosts: localhost
+  gather_facts: false
+  roles: [web]
+""", {
+        "roles/web/tasks/main.yml": (
+            '- template:\n'
+            f'    src: "{src}"\n'
+            '    dest: "{{ playbook_dir }}/rendered.txt"\n'
+            '  delegate_to: localhost\n'
+        ),
+        "roles/web/templates/app.j2": "normalized path\n",
+        "roles/web/templates/releases/app.j2": "non-normalized path\n",
+    })
+    templates = project / "roles/web/templates"
+    if parent_traversal:
+        (templates / "releases/live").mkdir()
+        (templates / "current").symlink_to("releases/live", target_is_directory=True)
+        expected_text = "normalized path\n"
+    else:
+        shared = tmp_path / "shared.j2"
+        shared.write_text("external role template\n")
+        (templates / src).symlink_to(shared)
+        expected_text = "external role template\n"
+    output = project / "rendered.txt"
+    expected = _ansible(path, project)
+    assert output.read_text() == expected_text
+    output.unlink()
+    assert _ansible(path, project, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monkeypatch):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    password = tmp_path / "vault-password"
+    password.write_text("synthetic-vault-password\n")
+    monkeypatch.setenv("ANSIBLE_VAULT_PASSWORD_FILE", str(password))
+    secret = VaultSecret(b"synthetic-vault-password")
+    vault = VaultLib([("default", secret)])
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    value: ready
+  tasks:
+    - template:
+        src: encrypted.j2
+        dest: "{{ playbook_dir }}/check-only.txt"
+      delegate_to: localhost
+      check_mode: true
+      diff: false
+      register: suppressed
+    - assert:
+        quiet: true
+        that: suppressed.diff | default([]) | length == 0
+    - template:
+        src: encrypted.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+""")
+    (tmp_path / "encrypted.j2").write_bytes(vault.encrypt(b"decrypted={{ value }}\n", secret=secret))
+    expected = _ansible(path, tmp_path, diff=True)
+    result = tmp_path / "rendered.txt"
+    assert result.read_bytes() == b"decrypted=ready\n"
+    assert not (tmp_path / "check-only.txt").exists()
+    result.unlink()
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", diff=True) == expected
+    assert result.read_bytes() == b"decrypted=ready\n"
+    assert not (tmp_path / "check-only.txt").exists()
 
 
 def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
