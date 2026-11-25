@@ -352,7 +352,9 @@ class StrategyModule(StrategyBase):
             # constructor, which this deliberately reused instance never runs.
             if not hasattr(self, "_in_handlers"):
                 self._in_handlers = False
-            self.__class__ = _SetFactLinearStrategy if any(flag is not False for flag in fact_routes) else _LinearStrategy
+            # Dynamic roles can introduce delegated set_fact after compilation.
+            routed_facts = self._requires_linear_fallback or any(flag is not False for flag in fact_routes)
+            self.__class__ = _SetFactLinearStrategy if routed_facts else _LinearStrategy
             return self.run(iterator, play_context)
         self._emit_provenance({
             "scope": "play",

@@ -4988,6 +4988,40 @@ RETRY_OPTIONS    - assert:
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path):
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- set_fact:
+    "{{ item.key }}": "{{ item.value }}"
+  delegate_to: recipient
+  delegate_facts: "{{ item.route }}"
+  loop:
+    - {key: local_marker, value: local, route: false}
+    - {key: remote_marker, value: remote, route: true}
+  register: fact_results
+  retries: 2
+  delay: 0
+  until: item.route is false or fact_results.attempts >= 2
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - fact_results.results[1].attempts == 2
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: all
