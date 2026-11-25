@@ -5083,7 +5083,8 @@ def test_compiled_copy_reads_content_addressed_binary_asset(tmp_path):
     assert manifest["bundles"]["asset_count"] == 1
 
 
-def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
+@pytest.mark.parametrize("legacy_copy", [False, True])
+def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path, legacy_copy):
     archive = tmp_path / "payload.zip"
     with zipfile.ZipFile(str(archive), "w") as zipped:
         zipped.writestr("inside.txt", b"embedded archive payload\x00")
@@ -5096,10 +5097,11 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
   tasks:
     - ansible.builtin.unarchive:
         src: payload.zip
-        dest: %s
-""" % destination)
+        dest: %s%s
+""" % (destination, "\n        copy: true" if legacy_copy else ""))
 
     src, manifest = compile_playbook(str(play))
+    archive.unlink()
     # copy/template stage their data in a temp dir like the action plugin;
     # unarchive must keep using the in-memory source.
     assert "ansiroll-unarchive-" not in src
@@ -5911,6 +5913,72 @@ RETRY_OPTIONS    - assert:
         ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
         inventory="origin,recipient,",
     )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("templated_action", [False, True])
+def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path, templated_action):
+    from ansiroll.loader import _core_version
+
+    if templated_action and _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""ACTION:
+    "{{ item.key }}": "{{ item.value }}"
+  delegate_to: recipient
+  delegate_facts: "{{ item.route }}"
+  loop:
+    - {key: local_marker, value: local, route: false}
+    - {key: remote_marker, value: remote, route: true}
+  register: fact_results
+  retries: 2
+  delay: 0
+  until: item.route is false or fact_results.attempts >= 2
+""".replace("ACTION", '- action: "{{ fact_action }}"\n  args' if templated_action else "- set_fact"))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+    fact_action: set_fact
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - fact_results.results[1].attempts == 2
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_routes_literal_false_delegation_in_dynamic_roles(tmp_path, flag):
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- set_fact:
+    local_marker: "{{ item }}"
+  delegate_to: recipient
+  delegate_facts: FLAG
+  loop: [first, second]
+""".replace("FLAG", flag))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
+""", inventory="origin,recipient,")
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
