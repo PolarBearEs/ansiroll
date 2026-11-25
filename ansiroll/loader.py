@@ -748,6 +748,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
+    includes.unresolved_vars_file = include_replay and any(
+        not selected and not checked for selected, checked, _ in order_deferred.values())
     includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
         key for entry in deferred for data in entry["files"].values() if isinstance(data, list)
         for mapping in data for key in mapping
@@ -1785,6 +1787,7 @@ class _IncludeVariables:
         self.vars_file_scopes = None
         # When candidate contents are unknown, any play var can change.
         self.incomplete = False
+        self.unresolved_vars_file = False
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -1998,6 +2001,8 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
 
 
 def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes):
+    if not variants and includes.unresolved_vars_file:
+        return None
     raw_fname = sources[0]
     default_key = None
     default_inputs = None
@@ -2510,7 +2515,8 @@ def _template_include_filename(task, value, includes, *, runtime_portable=False)
     extra_vars = higher_layers[-1]
     # Higher mappings can inherit keys from vars_files when hashes are merged.
     higher_names = set().union(*higher_layers)
-    replayed_names = higher_names if includes.incomplete else higher_names & includes.vars_file_writes
+    incomplete_scope = includes.incomplete or includes.unresolved_vars_file
+    replayed_names = higher_names if incomplete_scope else higher_names & includes.vars_file_writes
     vars_file_inputs = dict.fromkeys(replayed_names, frozenset())
     for layer in higher_layers:
         _clear_vars_file_blocks(vars_file_inputs, layer, DEFAULT_HASH_BEHAVIOUR == "merge")
@@ -2560,7 +2566,7 @@ def _template_include_filename(task, value, includes, *, runtime_portable=False)
     def is_runtime(name):
         if name in loop_names:
             return True
-        if ((includes.incomplete or name in includes.vars_file_writes)
+        if ((incomplete_scope or name in includes.vars_file_writes)
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
                 and vars_file_can_change(name)):
             return True
