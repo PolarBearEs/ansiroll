@@ -4034,8 +4034,8 @@ def test_controller_timeout_detects_type_and_vars_lookup_dependencies(
         tmp_path, monkeypatch, expression, play_vars, override, expected):
     from ansiroll.loader import _core_version
 
-    if _core_version() < (2, 12) and expression.startswith("lookup('ansible.builtin.vars'"):
-        pytest.skip("Ansible 2.10 does not load the fully qualified vars lookup's options")
+    if _core_version(include_patch=True) < (2, 11, 12) and expression.startswith("lookup('ansible.builtin.vars'"):
+        pytest.skip("Ansible 2.10 and early 2.11 do not load the fully qualified vars lookup's options")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_1", "abc")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_a", "abc")
     playbook = tmp_path / "play.yml"

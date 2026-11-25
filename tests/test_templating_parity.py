@@ -2231,7 +2231,7 @@ def test_dynamic_include_when_uses_loop_item(tmp_path, action):
     assert messages == ["allowed", "second"]
 
 
-@pytest.mark.skipif(Version(__version__) < Version("2.12"),
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
                     reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_include_loop_registers_results_and_tallies_ignored_failures(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
@@ -2436,7 +2436,7 @@ def test_include_loop_censors_no_log_item_values(tmp_path):
     assert "synthetic-private-item" not in result.stdout + result.stderr
 
 
-@pytest.mark.skipif(Version(__version__) < Version("2.12"),
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
                     reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_path):
     messages, _ = _assert_parity(tmp_path, """

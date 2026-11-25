@@ -26,6 +26,14 @@ concurrency:
   queue: max
 
 jobs:
+  invalid-dispatch-ref:
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo '::error::Dispatch Manual Full PR CI from master.'
+          exit 1
+
   reviewed-head:
     # Keep write permissions in API-only jobs without a checkout.
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
@@ -67,6 +75,10 @@ jobs:
             fi
             merge=$(jq -r '.merge_commit_sha // empty' <<< "$pr")
             base=$(jq -r '.base.sha // empty' <<< "$pr")
+            if [[ "$base" != "$GITHUB_SHA" ]]; then
+              echo '::error::The base changed. Start a fresh Manual Full PR CI run from master.'
+              exit 1
+            fi
             if [[ "$mergeable" == true && "$merge" =~ ^[a-f0-9]{40}$ && "$base" =~ ^[a-f0-9]{40}$ ]] &&
                commit=$(gh api "$api/git/commits/$merge") &&
                jq -e --arg base "$base" --arg head "$head" '
@@ -95,6 +107,7 @@ jobs:
     if: needs.reviewed-head.outputs.merge != ''
     permissions:
       contents: read
+    cache-mode: none
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.reviewed-head.outputs.merge }}
