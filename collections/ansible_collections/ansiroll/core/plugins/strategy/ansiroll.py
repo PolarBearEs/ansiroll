@@ -976,6 +976,7 @@ class StrategyModule(StrategyBase):
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
                 "no_log": bool(frame.get("no_log")),
+                "_max_diff_size": frame.get("max_diff_size"),
                 "_baked": {src: raw},
                 "_baked_meta": {src: {
                     "fullpath": fullpath,

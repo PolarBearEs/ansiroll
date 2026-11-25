@@ -5536,11 +5536,11 @@ class Runtime:
                 if isinstance(check_override, str):
                     check_override = self.template(check_override, ctx)
                 self.check_mode = _boolean(check_override)
-            diff_override = task.get("diff")
+            diff_override = task.get("diff") if task.get("special") == "template" else None
             if diff_override is not None:
                 value = _fail_on_undef(self.template(diff_override, ctx))
                 if isinstance(value, _Omit):
-                    value = _fail_on_undef(self.template(task.get("diff_on_omit"), ctx))
+                    value = task.get("diff_on_omit")
                 if value is not None and value != _OMIT:
                     self.diff_mode = _boolean(value, strict=True)
             become_user = task.get("become_user")
@@ -7826,6 +7826,7 @@ def agent_main():
                 "check_mode": bool(rt.check_mode),
                 "diff_mode": bool(rt.diff_mode),
                 "no_log": bool(task.get("no_log")),
+                "max_diff_size": task.get("_max_diff_size"),
                 "fallback": bool(task.get("fallback")),
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),

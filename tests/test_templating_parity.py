@@ -1018,6 +1018,29 @@ def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch)
     assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\ntype=list\n"
 
 
+def test_delegated_template_honors_configured_diff_size(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_MAX_DIFF_SIZE", "10")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/check-only.txt"
+      check_mode: true
+      delegate_to: localhost
+      register: rendered
+    - assert:
+        quiet: true
+        that:
+          - rendered.diff[0].src_larger == 10
+          - rendered.diff[0].after is undefined
+""", {"sample.j2": "sensitive rendered value\n"})
+    expected = _ansible(path, tmp_path, diff=True)
+    assert expected[1][3] == "0"
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", diff=True) == expected
+
+
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost
