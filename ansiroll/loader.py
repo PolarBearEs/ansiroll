@@ -2359,6 +2359,7 @@ def _convert_task(task, actions, basedir):
         "check_mode": _tag_untrusted(getattr(task, "check_mode", None)),
         "diff": _tag_untrusted(getattr(task, "diff", None)),
         "become": bool(task.become),
+        "become_override": _tag_untrusted(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)

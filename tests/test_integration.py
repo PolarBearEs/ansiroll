@@ -5499,6 +5499,7 @@ def test_strategy_honors_play_level_local_connection(tmp_path):
 
 @pytest.mark.parametrize("runner", ["standalone", "strategy", "linear"])
 def test_expanded_include_applies_task_keywords(tmp_path, runner):
+    (tmp_path / "sample.j2").write_text("template diff\n")
     (tmp_path / "child.yml").write_text("""
 - debug: {msg: private_debug_message}
 - name: Write dry-run file
@@ -5514,6 +5515,15 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
   copy:
     content: visible-diff
     dest: "{{ playbook_dir }}/real.txt"
+- name: Delegate template with diff
+  register: template_result
+  delegate_to: localhost
+  check_mode: false
+  diff: true
+  no_log: false
+  template:
+    src: sample.j2
+    dest: "{{ playbook_dir }}/template.txt"
 """)
     playbook = """- hosts: localhost
   gather_facts: false
@@ -5529,6 +5539,7 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
         that:
           - not (dry_result.diff | default([]))
           - real_result.diff | length > 0
+          - template_result.diff | length > 0
 """
     if runner == "standalone":
         play = tmp_path / "play.yml"
@@ -5545,6 +5556,33 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
     assert not (tmp_path / "dry.txt").exists()
     assert (tmp_path / "real.txt").read_text() == "visible-diff"
     assert "private_debug_message" not in proc.stdout
+
+
+def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {escalate: false}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply: {become: true}
+""")
+    (tmp_path / "child.yml").write_text("""- command: first
+  become: false
+- command: second
+  become: "{{ escalate }}"
+""")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    recorded = []
+    monkeypatch.setattr(runtime, "_run_accelerated_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, become=False: recorded.append((args["_raw_params"], become))
+                        or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert recorded == [("first", False), ("second", False)]
 
 
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):

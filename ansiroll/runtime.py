@@ -5846,18 +5846,19 @@ class Runtime:
             modes = args_cache.get("execution_modes") if args_cache is not None else None
             if modes is None:
                 resolved = []
-                for key, inherited in (("check_mode", inherited_check_mode), ("diff", inherited_diff_mode)):
+                for key, inherited in (("check_mode", inherited_check_mode), ("diff", inherited_diff_mode),
+                                       ("become_override", become)):
                     value = task.get(key)
                     if value is not None:
                         value = _fail_on_undef(self.template(value, ctx))
                     if value is None or isinstance(value, _Omit):
                         resolved.append(inherited)
                     else:
-                        resolved.append(_boolean(value, strict=key == "diff"))
+                        resolved.append(_boolean(value, strict=key != "check_mode"))
                 modes = tuple(resolved)
                 if args_cache is not None:
                     args_cache["execution_modes"] = modes
-            self.check_mode, self.diff_mode = modes
+            self.check_mode, self.diff_mode, become = modes
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
