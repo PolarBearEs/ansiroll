@@ -87,7 +87,8 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_setup_controller_lookups",
+                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_vars_file_selector",
+                "__ansiroll_setup_controller_lookups",
                 _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
@@ -395,6 +396,20 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
 
     visit(expression, {})
     return bindings, unreachable, calls, closure_reads, closure_nodes
+
+
+def _is_literal_vars_lookup(call):
+    """Whether selector analysis can enumerate every variable read by a lookup."""
+    nodes = jinja2.nodes
+    return (
+        isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
+        and call.dyn_args is None and call.dyn_kwargs is None and call.args
+        and isinstance(call.args[0], nodes.Const)
+        and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
+        and all(isinstance(arg, nodes.Const) and isinstance(arg.value, str)
+                and not _looks_templated(arg.value) and "{#" not in arg.value
+                for arg in call.args[1:])
+    )
 
 
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
@@ -734,14 +749,14 @@ def _clear_vars_file_blocks(blocked, mapping, merge_hashes):
     """Record which members a guaranteed assignment replaces."""
     for key in blocked.keys() & mapping.keys():
         value = mapping[key]
-        if not merge_hashes or not isinstance(value, dict):
+        if not merge_hashes or not _vars_hash_mapping(value):
             del blocked[key]
             continue
         pending = [(value, ())]
         replacements = set(blocked[key])
         while pending:
             member, path = pending.pop()
-            if isinstance(member, dict):
+            if _vars_hash_mapping(member):
                 pending.extend((entry, (*path, name)) for name, entry in member.items())
             else:
                 replacements.add(path)
@@ -1166,6 +1181,11 @@ def _boolean(value, strict=False):
     raise TypeError("Invalid boolean value")
 
 
+def _vars_hash_mapping(value):
+    return isinstance(value, (dict, _RawSnapshotMapping)) and value.keys() not in (
+        {"__ansiroll_unsafe__"}, {"__ansiroll_vault__"})
+
+
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
 
@@ -1173,8 +1193,7 @@ def _f_combine(d, *others, **kwargs):
     def merge(a, b):
         out = dict(a.items())
         for k, v in b.items():
-            if recursive and isinstance(out.get(k), (dict, _RawSnapshotMapping)) and isinstance(
-                    v, (dict, _RawSnapshotMapping)):
+            if recursive and _vars_hash_mapping(out.get(k)) and _vars_hash_mapping(v):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
@@ -1587,6 +1606,8 @@ _ANSIBLE_TESTS = {
 
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name).rsplit(".", 1)[-1]
+    if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
+        raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
     setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
     if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
         known = setup_lookups.get(name, ())
@@ -4612,8 +4633,9 @@ class Runtime:
                          and saved_facts.get("_ansible_facts_gathered"))
         timeout_template = play.get("gather_timeout_template") or {}
         play_vars = dict(play.get("vars") or {})
+        deferred_files = play.get("deferred_vars_files") or ()
         ordered_files = play.get("ordered_vars_files", timeout_template.get("vars_files"))
-        vars_files = ordered_files if ordered_files is not None else play.get("deferred_vars_files") or ()
+        vars_files = ordered_files if ordered_files is not None else deferred_files
         vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
         merge_vars_files = (ordered_files is not None and
                             self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
@@ -4625,13 +4647,15 @@ class Runtime:
             timeout_vars = None
             blocked_timeout_inputs = {}
             option_scope = play.get("gather_setup_scope")
-            if (timeout_template or option_scope) and vars_files:
+            if (timeout_template or option_scope or ordered_files is not None) and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files,
                     {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {}),
                      **((option_scope or {}).get("defaults") or {})},
-                    blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic)
-            setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
+                    blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic,
+                    ordered=ordered_files is not None, deferred_entries=deferred_files)
+            setup_ctx = self._layered_ctx(self.ctx(play_vars if timeout_template or timeout_vars is None else {},
+                                                   timeout_vars))
             option_contexts = {}
             if option_scope:
                 layers = (*option_scope["role_exports"], self.extra_vars, option_scope["magic"])
@@ -4662,7 +4686,8 @@ class Runtime:
                         vars_file_play_vars, vars_files, early_files,
                         {**vars_file_defaults, **option_scope["defaults"]},
                         blocked_inputs=task_blocks, merge_hashes=merge_setup_scope, magic=vars_file_magic,
-                        pre_setup_host_vars=host_vars,
+                        pre_setup_host_vars=host_vars, ordered=ordered_files is not None,
+                        deferred_entries=deferred_files,
                     )
                 task_layers = (*option_scope["role_exports"], self._include_vars_layer,
                                self._set_fact_overrides, self.extra_vars, option_scope["magic"])
@@ -4704,7 +4729,8 @@ class Runtime:
         # Play templates resolve when consumed, after task precedence is applied.
         play_vars = self._resolve_deferred_vars_files(
             vars_file_play_vars, vars_files, early_files, vars_file_defaults,
-            merge_hashes=merge_vars_files, magic=vars_file_magic)
+            merge_hashes=merge_vars_files, magic=vars_file_magic, ordered=ordered_files is not None,
+            deferred_entries=deferred_files)
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -5028,8 +5054,8 @@ class Runtime:
         return ctx
 
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
-                                     blocked_inputs=None, merge_hashes=False, magic=None,
-                                     pre_setup_host_vars=None):
+                                     blocked_inputs=None, merge_hashes=False, magic=None, ordered=False,
+                                     deferred_entries=(), pre_setup_host_vars=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # During early replay each blocked variable records the member paths
         # that later assignments have definitely replaced.
@@ -5037,6 +5063,12 @@ class Runtime:
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         if before_setup:
             base = {key: self.vars[key] for key in ("__ansiroll_controller_env", "__ansiroll_controller_config")}
+        elif ordered:
+            base = {**self._vars_file_host_vars, **self._module_fact_layer,
+                    **{key: self.vars[key] for key in ("__ansiroll_controller_env", "__ansiroll_controller_config")}}
+            if self._module_fact_layer:
+                base["ansible_facts"] = {**(base.get("ansible_facts") or {}),
+                                         **_normalized_facts(self._module_fact_layer)}
         else:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         selected = dict(play_vars)
@@ -5053,6 +5085,8 @@ class Runtime:
                 selector_vars = _f_combine(selector_vars, mapping, recursive=merge_hashes)
 
         for index, entry in enumerate(entries):
+            if isinstance(entry, int):
+                entry = deferred_entries[entry]
             if "static_vars" in entry:
                 apply_files(entry["static_vars"])
                 continue
@@ -5060,6 +5094,7 @@ class Runtime:
                 "__ansiroll_controller_env": base.get("__ansiroll_controller_env", {}),
                 "__ansiroll_controller_config": base.get("__ansiroll_controller_config", {}),
                 "__ansiroll_lazy_selector_members": True,
+                "__ansiroll_vars_file_selector": ordered,
             })
             if not before_setup and index in early_files:
                 inputs, mappings = early_files[index]
@@ -5082,6 +5117,14 @@ class Runtime:
                     _same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
                     for key, path in paths
                 )
+                if checked and checked.get("controller_only") and not reuse_checked:
+                    plugins = checked.get("jinja_plugins")
+                    if not plugins or any(name not in getattr(self.templater.env, kind)
+                                          for kind, names in plugins.items() for name in names):
+                        if before_setup:
+                            break
+                        raise VarsFilesError("vars_files item %r uses a controller-only selector with changed inputs; "
+                                             "recompile with the current selector values" % (item,))
                 if before_setup:
                     if reuse_checked:
                         dependencies = {key: ctx.get(key, _MISSING_VARS_FILE_INPUT) for key, _ in paths}
@@ -5114,10 +5157,13 @@ class Runtime:
                     continue
                 if name.startswith(os.path.sep):
                     candidates = [name]
+                elif name.startswith("~/") and entry.get("controller_home"):
+                    candidates = [os.path.join(entry["controller_home"], name[2:])]
                 else:
                     candidates = []
                     for d in entry["dirs"]:
-                        if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
+                        if entry.get("subdir") and (not _core_at_least(2, 21)
+                                                    or name.split("/")[0] != entry["subdir"]):
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
                 checked_paths = entry.get("checked_paths", {})
@@ -5181,14 +5227,17 @@ class Runtime:
             analysis = _selector_scope(expression, ctx)
             for call in analysis[2]:
                 method = call.node
+                if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
+                    continue
+                if selector and _is_literal_vars_lookup(call):
+                    continue
                 if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
                                               for arg in call.args)
                         and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
                         and not (call.dyn_args or call.dyn_kwargs)):
                     continue
-                if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
-                    return None
+                return None
             for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
                                                     analysis=analysis):
                 if paths is not None:
