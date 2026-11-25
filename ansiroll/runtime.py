@@ -1588,7 +1588,51 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _first_found_vars_file(args, kwargs, selector):
+    def split_terms(values, separators=None):
+        for value in values:
+            if isinstance(value, (list, tuple)):
+                yield from split_terms(value, separators)
+            elif isinstance(value, str):
+                yield from re.split(separators, value) if separators else (value,)
+            else:
+                raise ValueError("first_found filenames and paths must be strings")
+
+    _fail_on_undef((args, dict(kwargs)))
+    skip = _boolean(kwargs.get("skip", False), strict=True)
+    modern = _core_at_least(2, 16)
+    paths = tuple(split_terms((kwargs["paths"],), "[,:;]")) if "paths" in kwargs else ()
+    if not modern and args and "files" in kwargs:
+        filenames = [tuple(split_terms((kwargs["files"],), "[,;]"))]
+    else:
+        terms = args
+        if modern and not terms:
+            terms = (kwargs.get("files", ()),)
+        filenames = [tuple(re.split("[,;]", term)) if modern else (term,) for term in split_terms(terms)]
+    bundled = selector["files"]
+    for group in filenames:
+        for folder in paths or ("",):
+            for filename in group:
+                candidate = os.path.join(folder, filename) if folder else filename
+                if candidate.startswith("~/"):
+                    candidate = os.path.join(selector["home"], candidate[2:])
+                if ".." in candidate.split(os.path.sep):
+                    raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
+                for root in selector["roots"]:
+                    path = os.path.normpath(os.path.join(root, candidate))
+                    if path in bundled:
+                        return [path]
+                if not any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"]):
+                    raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
+    if skip and (modern or args):
+        return []
+    raise ValueError("No file was found when using first_found.")
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
+    selector = (ctx or {}).get("__ansiroll_first_found")
+    if selector and name == selector["plugin"]:
+        return _first_found_vars_file(args, kwargs, selector)
     name = str(name).rsplit(".", 1)[-1]
     if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
         raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
@@ -1620,25 +1664,6 @@ def _lookup_values(name, args, kwargs, ctx=None):
         if isinstance(controller_config, dict):
             return [controller_config.get(str(a)) for a in args]
         return [None for _a in args]
-    if name == "first_found" and ctx is not None and "__ansiroll_first_found" in ctx:
-        directories, bundled = ctx["__ansiroll_first_found"]
-        terms = _flatten_deep(args or [kwargs.get("files")])
-        explicit_paths = _flatten_deep([kwargs.get("paths")])
-        if not all(isinstance(term, str) for term in terms + explicit_paths):
-            raise ValueError("first_found filenames and paths must be strings")
-        filenames = [part.strip() for term in terms for part in re.split("[,;]", term) if part.strip()]
-        roots = [part.strip() for directory in explicit_paths
-                 for part in re.split("[,:;]", directory) if part.strip()] or [""]
-        for root in roots:
-            for filename in filenames:
-                for directory in directories:
-                    for search in (os.path.join(directory, "files"), directory):
-                        path = os.path.normpath(os.path.join(search, root, filename))
-                        if path in bundled:
-                            return [path]
-        if _boolean(kwargs.get("skip")):
-            return []
-        raise ValueError("No file was found when using first_found.")
     if name == "file":
         vals = []
         lstrip = kwargs.get("lstrip", False)
@@ -1728,7 +1753,8 @@ def _lookup(name, *args, **kwargs):
     ctx = kwargs.pop("_ansiroll_ctx", None)
     wantlist = kwargs.pop("wantlist", False)
     vals = _lookup_values(name, args, kwargs, ctx)
-    if wantlist:
+    selector = (ctx or {}).get("__ansiroll_first_found")
+    if wantlist or (not vals and selector and name == selector["plugin"] and _core_at_least(2, 19)):
         return vals
     if len(vals) == 1:
         return vals[0]
@@ -5043,8 +5069,9 @@ class Runtime:
             else:
                 selector_blocks = {}
             for raw in entry["names"]:
-                if raw in entry.get("first_found", {}):
-                    ctx["__ansiroll_first_found"] = (entry["dirs"], set(entry["first_found"][raw]))
+                first_found = entry.get("first_found", {}).get(raw)
+                if first_found:
+                    ctx["__ansiroll_first_found"] = first_found
                 else:
                     ctx.pop("__ansiroll_first_found", None)
                 checked = entry.get("controller_candidates", {}).get(raw)
@@ -5079,6 +5106,8 @@ class Runtime:
                 except jinja2.UndefinedError as ex:
                     if before_setup:
                         break
+                    if first_found and isinstance(ex, _CapturedTemplateError):
+                        raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
                                              "vars_files item %r: %s" % (item, ex))
@@ -5090,6 +5119,8 @@ class Runtime:
                         break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
+                    if first_found and not before_setup:
+                        raise VarsFilesError("vars_files item %r must resolve to a string" % (item,))
                     continue
                 if name.startswith(os.path.sep):
                     candidates = [name]
@@ -5166,6 +5197,16 @@ class Runtime:
                 if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
                     continue
                 nodes = jinja2.nodes
+                modeled = ctx.get("__ansiroll_first_found")
+                if (selector and modeled and isinstance(method, nodes.Name) and method.name == "lookup"
+                        and call.args and isinstance(call.args[0], nodes.Const)
+                        and call.args[0].value == modeled["plugin"]):
+                    for arg in [*call.args[1:], *(kw.value for kw in call.kwargs)]:
+                        literals = (arg,) if isinstance(arg, nodes.Const) else arg.find_all(nodes.Const)
+                        pending.extend((literal.value, (), None, ()) for literal in literals
+                                       if isinstance(literal.value, str)
+                                       and ("{{" in literal.value or "{%" in literal.value))
+                    continue
                 if (selector and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.dyn_args is None and call.dyn_kwargs is None and call.args
                         and isinstance(call.args[0], nodes.Const)

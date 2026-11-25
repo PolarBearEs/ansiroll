@@ -989,6 +989,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                             paths=paths, unknown_lookup=unknown_lookup)
                         if dependencies is not None and not unknown_lookup:
+                            if "first_found" in filename and _vars_first_found_patterns(filename, True) is not None:
+                                defer_for_order |= bool(dependencies[1] - extra_replacements - selector_magic.keys())
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
                             if requires_controller:
                                 controller_inputs["controller_only"] = True
@@ -1124,14 +1126,14 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
-def _vars_first_found_patterns(source):
+def _vars_first_found_patterns(source, allow_short_name):
     """Model positional first_found filenames using bounded glob patterns."""
-    import glob
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     def term_patterns(term, separators="[;,]"):
         if isinstance(term, nodes.Const) and isinstance(term.value, str):
-            return [glob.escape(name.strip()) for name in re.split(separators, term.value) if name.strip()]
+            values = re.split(separators, term.value) if separators else [term.value]
+            return [_vars_file_glob_pattern(os.path.expanduser(name)) for name in values]
         if isinstance(term, nodes.Name):
             return ["*"]
         if isinstance(term, (nodes.List, nodes.Tuple)):
@@ -1154,15 +1156,26 @@ def _vars_first_found_patterns(source):
         call = expressions[0]
         if not (isinstance(call.node, nodes.Name) and call.node.name == "lookup" and call.args
                 and isinstance(call.args[0], nodes.Const)
-                and call.args[0].value in ("first_found", "ansible.builtin.first_found")
+                and (call.args[0].value == "ansible.builtin.first_found"
+                     or allow_short_name and call.args[0].value == "first_found")
                 and not (call.dyn_args or call.dyn_kwargs)
                 and all(keyword.key in ("files", "paths", "skip") for keyword in call.kwargs)):
             return None
         options = {keyword.key: keyword.value for keyword in call.kwargs}
-        terms = call.args[1:] or ([options["files"]] if "files" in options else [])
-        filenames = [pattern for term in terms for pattern in term_patterns(term)]
-        directories = term_patterns(options["paths"], "[,:;]") if "paths" in options else []
-        return [os.path.join(directory, filename) for directory in (directories or [""]) for filename in filenames]
+        terms = call.args[1:]
+        modern = _core_version() >= (2, 16)
+        use_file_option = "files" in options and ((modern and not terms) or (not modern and terms))
+        if use_file_option:
+            terms = [options["files"]]
+        separator = "[;,]" if modern or use_file_option else None
+        filenames = [pattern for term in terms for pattern in term_patterns(term, separator)]
+        paths = options.get("paths")
+        directories = term_patterns(paths, "[,:;]") if paths is not None else []
+        path_terms = paths.items if isinstance(paths, (nodes.List, nodes.Tuple)) else [paths]
+        if not directories or any(not isinstance(term, nodes.Const) for term in path_terms):
+            directories.insert(0, "")
+        return call.args[0].value, [os.path.join(directory, filename)
+                                   for directory in directories for filename in filenames]
     except (TemplateSyntaxError, ValueError):
         return None
 
@@ -1188,6 +1201,9 @@ def _deferred_vars_files(play, basedir, entries):
     else:
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
+    first_found_roots = [basedir]
+    if not (2, 19) <= _core_version() < (2, 21):
+        first_found_roots.insert(0, os.path.join(basedir, "files"))
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
@@ -1196,19 +1212,30 @@ def _deferred_vars_files(play, basedir, entries):
         checked_paths = {}
         unmodeled = []
         for position, name in enumerate(names):
-            if _is_templated(name) and (patterns := _vars_first_found_patterns(name)) is not None:
-                candidates = set()
-                for pattern in patterns:
-                    for directory in dirs:
-                        for root in (os.path.join(directory, "files"), directory):
+            if _is_templated(name) and "first_found" in name:
+                from ansible.plugins.loader import lookup_loader
+                from ansible.plugins.lookup import first_found as builtin_first_found
+
+                resolved = lookup_loader.find_plugin_with_context("first_found").plugin_resolved_path
+                has_local_override = any(os.path.isfile(os.path.join(root, "lookup_plugins", "first_found.py"))
+                                         for root in dirs)
+                modeled = _vars_first_found_patterns(
+                    name, bool(resolved and not has_local_override
+                               and os.path.realpath(resolved) == os.path.realpath(builtin_first_found.__file__)))
+                if modeled is not None:
+                    plugin, patterns = modeled
+                    candidates = set()
+                    for pattern in patterns:
+                        for root in first_found_roots:
                             for path in glob.glob(os.path.join(glob.escape(root), pattern)):
-                                if os.path.isfile(path):
-                                    path = os.path.normpath(path)
-                                    candidates.add(path)
-                                    if path not in files:
-                                        files[path] = _bundled_vars_file(play, path)
-                first_found[name] = sorted(candidates)
-                continue
+                                path = os.path.normpath(path)
+                                candidates.add(path)
+                                if path not in files:
+                                    files[path] = _bundled_vars_file(play, path)
+                    first_found[name] = {"plugin": plugin, "patterns": patterns,
+                                         "roots": first_found_roots, "files": sorted(candidates),
+                                         "home": os.path.expanduser("~")}
+                    continue
             if _vars_file_has_dynamic_directory(name):
                 unmodeled.append(name)
                 continue
