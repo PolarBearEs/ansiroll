@@ -745,6 +745,15 @@ def _same_vars_input(left, right):
     return left == right
 
 
+def _include_input_at(scope, name, path):
+    value = _vars_input_at(scope, name, path)
+    if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
+        return str(value)
+    if isinstance(value, (_LazyTplDict, _LazyTplList)):
+        return value._raw
+    return value
+
+
 def _clear_vars_file_blocks(blocked, mapping, merge_hashes):
     """Record which members a guaranteed assignment replaces."""
     for key in blocked.keys() & mapping.keys():
@@ -4818,8 +4827,19 @@ class Runtime:
         def select_body(ctx):
             if "include_selector" not in node:
                 return node.get("file"), tasks, handlers
-            filename = _fail_on_undef(self.template(node["include_selector"], ctx, strict=True))
-            variant = next((entry for entry in tasks if entry["include_variant"] == filename), None)
+            compile_inputs = node.get("include_compile_inputs")
+            if compile_inputs is not None and all(
+                    _same_vars_input(_include_input_at(ctx, name, path),
+                                     value if present else _MISSING_VARS_FILE_INPUT)
+                    for name, path, present, value in compile_inputs):
+                key = node["compile_selection"]
+            else:
+                key = _fail_on_undef(self.template(node["include_selector"], ctx, strict=True))
+                if "include_parent_selectors" in node:
+                    key = [key, *(_fail_on_undef(self.template(source, ctx, strict=True))
+                                  for source in node["include_parent_selectors"])]
+            filename = key[0] if isinstance(key, list) else key
+            variant = next((entry for entry in tasks if entry["include_variant"] == key), None)
             if variant is None:
                 raise ValueError("no bundled task file matches %r" % filename)
             body = variant["block"]
