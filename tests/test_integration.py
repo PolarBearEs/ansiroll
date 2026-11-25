@@ -5094,7 +5094,8 @@ def test_compiled_copy_reads_content_addressed_binary_asset(tmp_path):
     assert manifest["bundles"]["asset_count"] == 1
 
 
-def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
+@pytest.mark.parametrize("legacy_copy", [False, True])
+def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path, legacy_copy):
     archive = tmp_path / "payload.zip"
     with zipfile.ZipFile(str(archive), "w") as zipped:
         zipped.writestr("inside.txt", b"embedded archive payload\x00")
@@ -5107,10 +5108,11 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
   tasks:
     - ansible.builtin.unarchive:
         src: payload.zip
-        dest: %s
-""" % destination)
+        dest: %s%s
+""" % (destination, "\n        copy: true" if legacy_copy else ""))
 
     src, manifest = compile_playbook(str(play))
+    archive.unlink()
     # copy/template stage their data in a temp dir like the action plugin;
     # unarchive must keep using the in-memory source.
     assert "ansiroll-unarchive-" not in src
