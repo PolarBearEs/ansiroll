@@ -2112,6 +2112,95 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
+def test_controller_synchronize_uses_the_installed_task_executor(tmp_path):
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        delegated = task_vars.get("ansible_delegated_vars", {}).get(self._task.delegate_to, {})
+        return {
+            "changed": True,
+            "msg": self._task.args["label"],
+            "source": self._task.args.get("src"),
+            "delegate_endpoint": delegated.get("ansible_host"),
+            "delegate_port": delegated.get("ansible_port"),
+        }
+""")
+    inventory = tmp_path / "inventory.ini"
+    inventory.write_text(
+        "delegate_fixture ansible_host=192.0.2.42 ansible_port=2222 ansible_connection=local "
+        "ansible_password=synthetic-fixture-password\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    expected_label: !unsafe '{{ 1 + 1 }}'
+  tasks:
+    - synchronize:
+        label: !unsafe '{{ 1 + 1 }}'
+        src: __omit_place_holder__backup
+      delegate_to: "{{ item }}"
+      loop: [delegate_fixture]
+      register: synced
+    - assert:
+        that:
+          - synced.results[0].msg == expected_label
+          - synced.results[0].source == '__omit_place_holder__backup'
+          - synced.results[0].delegate_endpoint == '192.0.2.42'
+          - synced.results[0].delegate_port | int == 2222
+          - synced.results[0]._ansible_delegated_vars is undefined
+    - debug:
+        var: synced
+""", "-i", str(inventory))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "synthetic-fixture-password" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("looped", [False, True], ids=["single", "loop"])
+@pytest.mark.parametrize("ignore", [False, True], ids=["fatal", "ignored"])
+def test_controller_synchronize_tallies_unreachable(tmp_path, looped, ignore):
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.errors import AnsibleConnectionFailure
+from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        raise AnsibleConnectionFailure("fixture delegate was unreachable")
+""")
+    loop = "          loop: [first, second]" if looped else ""
+    result = _run_strategy_play(tmp_path, f"""- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - synchronize:
+            src: unused
+          ignore_unreachable: {str(ignore).lower()}
+{loop}
+      rescue:
+        - debug: msg=unexpected_rescue
+      always:
+        - debug: msg=always_task_ran
+
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - debug: msg=next_play_ran
+""")
+    assert result.returncode == (0 if ignore else 4), result.stdout + result.stderr
+    assert "UNREACHABLE!" in result.stdout
+    assert "failed=0" in result.stdout
+    assert "unexpected_rescue" not in result.stdout
+    assert ("always_task_ran" in result.stdout) == ignore
+    assert ("next_play_ran" in result.stdout) == ignore
+    if not ignore:
+        assert "unreachable=1" in result.stdout
+
+
 @pytest.mark.parametrize(("alias_value", "alias_member", "alias_error"), [
     ("{{ missing }}", "", None),
     ("{{ missing | regex_replace('x', 'y') }}", "", None),
