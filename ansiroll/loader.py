@@ -744,31 +744,29 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
-    # Replaying a selector after an earlier deferred file may bundle new
-    # candidates. Their lookup names do not authorize copying controller data.
-    environment_sources = {**result, "deferred_vars_files": [
-        order_deferred[index][0] if index in order_deferred else entry
-        for index, entry in enumerate(result.get("deferred_vars_files", ()))
-    ]}
-    names = _controller_env_names(environment_sources)
+    # Retain authored selectors and compile-selected definitions, including
+    # definitions needed during ordered replay before later files shadow them.
+    lookup_sources = {
+        **result,
+        "deferred_vars_files": [entry["names"] for entry in deferred],
+        "selected_vars_files": [entry[0] for entry in order_deferred.values()],
+        "ordered_static_vars": [
+            entry for entry in (ordered_vars_files or ()) if deferred and not isinstance(entry, int)
+        ],
+    }
+    names = _controller_env_names(lookup_sources)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
         }
     from ansible import constants as C
 
-    config_names = _controller_config_names(result)
+    config_names = _controller_config_names(lookup_sources)
     config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE",
                          "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
     if core_version >= (2, 19):
         config_names.add("DISPLAY_TRACEBACK")
-    controller_config = {}
-    for name in sorted(config_names):
-        try:
-            controller_config[name] = C.config.get_config_value(name)
-        except Exception:
-            # Config keys differ across core releases.
-            pass
+    controller_config = _controller_config_values(config_names)
     from ansible.plugins.loader import connection_loader
 
     restricted = set(C.RESTRICTED_RESULT_KEYS).union(C.COMMON_CONNECTION_VARS)
@@ -819,32 +817,43 @@ def _apply_force_handlers_default(play):
 
 def _controller_env_names(value):
     """Find literal controller-side env lookups that the target must reproduce."""
-    names = set()
-    if isinstance(value, str):
-        names.update(_ENV_LOOKUP_RE.findall(value))
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            names.update(_controller_env_names(key))
-            names.update(_controller_env_names(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            names.update(_controller_env_names(item))
-    return names
+    return _controller_lookup_names(value, _ENV_LOOKUP_RE)
 
 
 def _controller_config_names(value):
     """Find literal config lookups whose controller values must be preserved."""
+    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE)
+
+
+def _controller_lookup_names(value, pattern):
     names = set()
-    if isinstance(value, str):
-        names.update(_CONFIG_LOOKUP_RE.findall(value))
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            names.update(_controller_config_names(key))
-            names.update(_controller_config_names(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            names.update(_controller_config_names(item))
+    seen = set()
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            names.update(pattern.findall(item))
+        elif isinstance(item, (dict, list, tuple)) and id(item) not in seen:
+            seen.add(id(item))
+            if isinstance(item, dict):
+                pending.extend(item)
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
     return names
+
+
+def _controller_config_values(names):
+    from ansible import constants as C
+
+    values = {}
+    for name in sorted(names):
+        try:
+            values[name] = C.config.get_config_value(name)
+        except Exception:
+            # Config keys differ across core releases.
+            pass
+    return values
 
 
 def _fact_schema():
