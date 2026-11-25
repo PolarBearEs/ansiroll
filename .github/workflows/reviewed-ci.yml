@@ -6,7 +6,7 @@ on:
   push:
     branches: [master]
   pull_request_target:
-    types: [edited]
+    types: [edited, reopened]
 
 permissions: {}
 
@@ -221,7 +221,8 @@ jobs:
 
   invalidate-head-checks:
     if: github.event_name == 'push' ||
-      (github.event_name == 'pull_request_target' && github.event.changes.base.ref.from != '')
+      (github.event_name == 'pull_request_target' &&
+        (github.event.action == 'reopened' || github.event.changes.base.ref.from != ''))
     runs-on: ubuntu-latest
     permissions:
       checks: write
@@ -229,28 +230,52 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-          RETARGETED_PR: ${{ github.event.pull_request.number }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
         run: |
           api="repos/$GITHUB_REPOSITORY"
+          retry_api() {
+            local attempt output
+            for attempt in 1 2 3; do
+              if output=$(gh api "$@"); then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              [[ "$attempt" == 3 ]] || sleep "$attempt"
+            done
+            return 1
+          }
           filter='. | [.number, .head.sha, .base.sha, .base.ref] | @tsv'
-          if [[ -n "$RETARGETED_PR" ]]; then
-            prs=$(gh api "$api/pulls/$RETARGETED_PR" --jq "$filter")
+          if [[ -n "$EVENT_PR" ]]; then
+            prs=$(retry_api "$api/pulls/$EVENT_PR" --jq "$filter")
           else
-            prs=$(gh api --paginate "$api/pulls?state=open&base=master&per_page=100" --jq ".[] | $filter")
+            prs=$(retry_api --paginate "$api/pulls?state=open&base=master&per_page=100" --jq ".[] | $filter")
           fi
+          failed=0
           while IFS=$'\t' read -r pr head base branch; do
             [[ -n "$pr" ]] || continue
-            checks=$(gh api --method GET "$api/commits/$head/check-runs" -f check_name="Amp CI / PR #$pr")
-            stale=$(jq -r --arg base "$base" --arg branch "$branch" '
+            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Amp CI / PR #$pr") ||
+               ! stale=$(jq -r --arg base "$base" --arg branch "$branch" '
               .check_runs[] | select(.app.slug == "github-actions" and .conclusion != "cancelled" and
                 ($branch != "master" or (.output.summary // "" | endswith("Base commit: " + $base) | not))) | .id
-            ' <<< "$checks")
+            ' <<< "$checks"); then
+              echo "::warning::Could not inspect CI checks for PR #$pr."
+              failed=1
+              continue
+            fi
             [[ -n "$stale" ]] || continue
-            current=$(gh api "$api/pulls/$pr" --jq "$filter")
+            if ! current=$(retry_api "$api/pulls/$pr" --jq "$filter"); then
+              echo "::warning::Could not recheck the revision of PR #$pr."
+              failed=1
+              continue
+            fi
             [[ "$current" == "$pr"$'\t'"$head"$'\t'"$base"$'\t'"$branch" ]] || continue
             while read -r id; do
-              gh api --silent --method PATCH "$api/check-runs/$id" \
+              if ! retry_api --silent --method PATCH "$api/check-runs/$id" \
                 -f status=completed -f conclusion=cancelled \
-                -f 'output[title]=PR base changed' -f 'output[summary]=Run Reviewed PR CI for the new merge commit.'
+                -f 'output[title]=PR base changed' -f 'output[summary]=Run Reviewed PR CI for the new merge commit.'; then
+                echo "::warning::Could not cancel stale CI check $id for PR #$pr."
+                failed=1
+              fi
             done <<< "$stale"
           done <<< "$prs"
+          exit "$failed"
