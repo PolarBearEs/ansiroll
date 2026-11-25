@@ -2938,17 +2938,20 @@ def test_ordinary_vars_replay_does_not_use_previous_play_values(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_ordinary_vars_replay_applies_launch_values_before_setup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("selector", ["tier", "lookup('vars', 'tier')"])
+def test_ordinary_vars_replay_applies_launch_values_before_setup(tmp_path, monkeypatch, selector):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: true
   vars: {profile: prod}
-  vars_files: ['vars-{{ profile }}.yml', last.yml]
+  vars_files: ['vars-{{ profile }}.yml', "settings-{{ SELECTOR }}.yml", last.yml]
   environment: {ANSIROLL_SETUP_PROFILE: '{{ selected }}'}
   tasks: []
-""")
-    (tmp_path / "vars-prod.yml").write_text("selected: prod\n")
-    (tmp_path / "vars-test.yml").write_text("selected: test\n")
+""".replace("SELECTOR", selector))
+    (tmp_path / "vars-prod.yml").write_text("tier: prod\n")
+    (tmp_path / "vars-test.yml").write_text("tier: test\n")
+    (tmp_path / "settings-prod.yml").write_text("selected: prod\n")
+    (tmp_path / "settings-test.yml").write_text("selected: test\n")
     (tmp_path / "last.yml").write_text("{}\n")
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "test"})
@@ -2957,6 +2960,77 @@ def test_ordinary_vars_replay_applies_launch_values_before_setup(tmp_path, monke
                         called.append(runtime._module_env.copy()) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called == [{"ANSIROLL_SETUP_PROFILE": "test"}]
+
+
+def test_ordinary_vars_replay_resolves_bundled_selector_filters(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: default}
+  vars_files: ["vars-{{ profile | ansiroll_profile_name }}.yml", last.yml]
+  tasks:
+    - assert: {that: "selected == 'alternative'"}
+""")
+    plugins = tmp_path / "filter_plugins"
+    plugins.mkdir()
+    (plugins / "profiles.py").write_text("""class FilterModule:
+    def filters(self):
+        return {"ansiroll_profile_name": str.upper}
+""")
+    (tmp_path / "vars-DEFAULT.yml").write_text("selected: default\n")
+    (tmp_path / "vars-ALT.yml").write_text("selected: alternative\n")
+    (tmp_path / "last.yml").write_text("{}\n")
+    artifact = tmp_path / "artifact.py"
+    compile_result = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
+        cwd=tmp_path, env={**os.environ, "ANSIBLE_FILTER_PLUGINS": str(plugins), "PYTHONPATH": ROOT},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert compile_result.returncode == 0, compile_result.stdout + compile_result.stderr
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path,
+        env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": "alt"})},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ordinary_vars_replay_retains_selected_inputs_used_by_alternative_aliases(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: default}
+  vars_files: [base.yml, 'mode-{{ profile }}.yml', "settings-{{ alias }}.yml", last.yml]
+  tasks:
+    - assert: {that: "selected == 'alternative' and token == 'final'"}
+""")
+    (tmp_path / "base.yml").write_text(
+        """token: '{{ lookup("env", "ANSIROLL_SELECTED_ALIAS_TOKEN") }}'\n""")
+    (tmp_path / "mode-default.yml").write_text("alias: default\n")
+    (tmp_path / "mode-alt.yml").write_text(
+        """alias: "{{ token }}"
+unused: '{{ lookup("env", "ANSIROLL_UNSELECTED_ALIAS_SECRET") }}'
+""")
+    (tmp_path / "settings-default.yml").write_text("selected: default\n")
+    (tmp_path / "settings-launch.yml").write_text("selected: alternative\n")
+    (tmp_path / "last.yml").write_text("token: final\n")
+    monkeypatch.setenv("ANSIROLL_SELECTED_ALIAS_TOKEN", "launch")
+    monkeypatch.setenv("ANSIROLL_UNSELECTED_ALIAS_SECRET", "unused-controller-secret")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "ANSIROLL_UNSELECTED_ALIAS_SECRET" not in plan["controller_env"]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "alt"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFOs")
+def test_ordinary_vars_bundling_marks_literal_fifo_without_reading_it(tmp_path):
+    from ansiroll.loader import _bundled_vars_file
+
+    fallback = tmp_path / "fallback.yml"
+    os.mkfifo(fallback)
+    result = _bundled_vars_file(None, fallback)
+    assert "expected a regular file" in result["__ansiroll_vars_file_error__"]
 
 
 def test_ordinary_vars_replay_treats_unsafe_scalar_as_a_hash_replacement(tmp_path, monkeypatch):

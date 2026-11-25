@@ -5031,10 +5031,13 @@ class Runtime:
                     for key, path in paths
                 )
                 if checked and checked.get("controller_only") and not reuse_checked:
-                    if before_setup:
-                        break
-                    raise VarsFilesError("vars_files item %r uses a controller-only selector with changed inputs; "
-                                         "recompile with the current selector values" % (item,))
+                    plugins = checked.get("jinja_plugins")
+                    if not plugins or any(name not in getattr(self.templater.env, kind)
+                                          for kind, names in plugins.items() for name in names):
+                        if before_setup:
+                            break
+                        raise VarsFilesError("vars_files item %r uses a controller-only selector with changed inputs; "
+                                             "recompile with the current selector values" % (item,))
                 if before_setup:
                     if reuse_checked:
                         dependencies = {key: ctx.get(key, _MISSING_VARS_FILE_INPUT) for key, _ in paths}
@@ -5137,8 +5140,17 @@ class Runtime:
             analysis = _selector_scope(expression, ctx)
             for call in analysis[2]:
                 method = call.node
-                if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
-                    return None
+                if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
+                    continue
+                nodes = jinja2.nodes
+                if (selector and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
+                        and call.dyn_args is None and call.dyn_kwargs is None and call.args
+                        and isinstance(call.args[0], nodes.Const)
+                        and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
+                        and all(isinstance(arg, nodes.Const) and isinstance(arg.value, str)
+                                for arg in call.args[1:])):
+                    continue
+                return None
             for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
                                                     analysis=analysis):
                 if paths is not None:

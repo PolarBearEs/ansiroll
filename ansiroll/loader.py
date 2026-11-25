@@ -807,12 +807,35 @@ def _ordered_vars_file_inputs(ordered, deferred, compile_selections):
     merge = DEFAULT_HASH_BEHAVIOUR == "merge"
     rewritten, selector_reads, mutable = set(), set(), set()
     sources = []
+
+    def alias_reads(value):
+        for source, _, _ in _selector_template_sources(value):
+            dependencies = _gather_timeout_dependencies(
+                source, {}, _GATHER_STRING_METHODS, allow_controller=True, retain_mutable=True)
+            if dependencies is not None:
+                yield from dependencies[1]
+
     for slot in reversed(ordered):
         if isinstance(slot, int):
             entry = deferred[slot]
+            definitions = {}
             for contents in entry["files"].values():
                 if isinstance(contents, list):
-                    mutable.update(key for mapping in contents for key in mapping if key not in rewritten)
+                    for mapping in contents:
+                        for key, value in mapping.items():
+                            definitions.setdefault(key, []).append(value)
+                            if key not in rewritten:
+                                mutable.add(key)
+            # A launch-selected file can supply aliases used by later selectors.
+            # Follow those references, but collect lookups only from eligible
+            # mappings that were actually selected during compilation.
+            pending = list(selector_reads & definitions.keys())
+            while pending:
+                key = pending.pop()
+                for value in definitions[key]:
+                    new_reads = set(alias_reads(value)) - selector_reads
+                    selector_reads.update(new_reads)
+                    pending.extend(new_reads & definitions.keys())
             mappings = next(iter(compile_selections.get(slot, ({},))[0].values()), [])
         else:
             mappings = slot
@@ -827,11 +850,7 @@ def _ordered_vars_file_inputs(ordered, deferred, compile_selections):
                 selector_reads.difference_update(replaced)
                 rewritten.update(replaced)
             for value in visible.values():
-                for source, _, _ in _selector_template_sources(value):
-                    dependencies = _gather_timeout_dependencies(
-                        source, {}, _GATHER_STRING_METHODS, allow_controller=True, retain_mutable=True)
-                    if dependencies is not None:
-                        selector_reads.update(dependencies[1])
+                selector_reads.update(alias_reads(value))
         if isinstance(slot, int):
             for source in entry["names"]:
                 dependencies = _gather_timeout_dependencies(
@@ -958,7 +977,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     selector_vars = hash_scope if hash_scope is not None else {**role_defaults, **out}
                     inputs = combine_vars(combine_vars(selector_vars, compile_extra_vars), selector_magic)
                     portable = _gather_timeout_dependencies(filename, inputs, _GATHER_STRING_METHODS, selector=True)
-                    requires_controller = _vars_filename_requires_controller(filename, portable)
+                    requires_controller, required_plugins = _vars_filename_controller_requirements(filename, portable)
                     # A templated leading directory cannot be bundled by the
                     # filename glob. Keep its known choice unless order requires replay.
                     if portable is not None and not _vars_file_has_dynamic_directory(filename):
@@ -973,6 +992,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
                             if requires_controller:
                                 controller_inputs["controller_only"] = True
+                            if required_plugins:
+                                controller_inputs["jinja_plugins"] = required_plugins
                     if unresolved and dependencies is not None:
                         earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
                         for index, previous in enumerate(earlier, start=scanned):
@@ -994,6 +1015,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             paths.update((key, ()) for key in affected)
                             controller_inputs = {"inputs": scope, "paths": sorted(paths, key=repr),
                                                  "controller_only": requires_controller}
+                            if required_plugins:
+                                controller_inputs["jinja_plugins"] = required_plugins
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 selector_vars = dict(hash_scope if hash_scope is not None else {**role_defaults, **out},
                                      playbook_dir=basedir)
@@ -1063,27 +1086,29 @@ def _vars_filename_template_environment():
     return _Templater().env
 
 
-def _vars_filename_requires_controller(source, portable):
+def _vars_filename_controller_requirements(source, portable):
     from jinja2 import nodes, TemplateSyntaxError
     from .runtime import _selector_template_sources
 
     env = _vars_filename_template_environment()
     values = portable[0].values() if portable is not None else ()
     sources = [source, *(alias for value in values for alias, _, _ in _selector_template_sources(value))]
+    missing_filters = set()
+    missing_tests = set()
     for candidate in sources:
         try:
             parsed = env.parse(candidate)
         except TemplateSyntaxError:
-            return True
-        if any(node.name not in env.filters for node in parsed.find_all(nodes.Filter)) or any(
-                node.name not in env.tests for node in parsed.find_all(nodes.Test)):
-            return True
+            return True, {}
+        missing_filters.update(node.name for node in parsed.find_all(nodes.Filter) if node.name not in env.filters)
+        missing_tests.update(node.name for node in parsed.find_all(nodes.Test) if node.name not in env.tests)
         for call in parsed.find_all(nodes.Call):
             if (isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const)
                     and str(call.args[0].value).rsplit(".", 1)[-1] in ("file", "pipe")):
-                return True
-    return False
+                return True, {}
+    required = {kind: sorted(names) for kind, names in (("filters", missing_filters), ("tests", missing_tests)) if names}
+    return bool(required), required
 
 
 def _load_vars_file(play, path):
@@ -1175,6 +1200,8 @@ def _bundled_vars_file(play, path):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
+    if not os.path.isfile(path):
+        return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: expected a regular file" % path, "rc": 1}
     try:
         with open(path, "rb") as fh:
             # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
