@@ -5556,10 +5556,12 @@ class Runtime:
                         action = (task.get("action") or "").rsplit(".", 1)[-1]
                         base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
                         if commits_delegated_facts and action == "set_fact":
-                            cached = base_ctx.get("ansible_facts")
-                            base_ctx["ansible_facts"] = {
-                                **(cached if isinstance(cached, dict) else {}), **_normalized_facts(facts),
-                            }
+                            cached = base_ctx.setdefault("ansible_facts", {})
+                            if res.get("_ansible_facts_cacheable"):
+                                base_ctx["ansible_facts"] = {
+                                    **(cached if isinstance(cached, dict) else {}),
+                                    **_normalized_facts(facts, preserve_local=True),
+                                }
                 res["item"] = it
                 if task.get("loop_label") is not None:
                     label_ctx = dict(ctx)
@@ -6190,7 +6192,8 @@ class Runtime:
         if (
                 isinstance(args, dict)
                 and set(args) == {"_raw_params"}
-                and isinstance(args["_raw_params"], dict)):
+                and isinstance(args["_raw_params"], dict)
+                and (name != "set_fact" or isinstance(raw_args["_raw_params"], str))):
             args = dict(args["_raw_params"])
         if name == "debug":
             for key, value in args.items():
@@ -6224,10 +6227,19 @@ class Runtime:
         args = _fail_on_undef(args)
         if name == "set_fact":
             import keyword
+            if "_variable_params" in args:
+                params = args["_variable_params"]
+                if not isinstance(params, dict):
+                    raise ValueError("set_fact args must resolve to a dictionary")
+                args = {**params, **{key: value for key, value in args.items() if key != "_variable_params"}}
+            omit = ctx.get("omit", _OMIT)
+            args = {key: value for key, value in args.items()
+                    if not isinstance(value, str) or value not in (_OMIT, omit)}
             facts = {}
             key_templates = set(task.get("set_fact_key_templates", ()))
-            cacheable = _boolean(args.get("cacheable", False))
-            reserved = ("true", "false", "yes", "no", "on", "off", "none", "null")
+            cacheable = _boolean(args.get("cacheable", False), strict=True)
+            modern = _core_at_least(2, 19)
+            reserved = {"true", "false", "none", "True", "False", "None", "not"}
             for k, value in args.items():
                 if k == "cacheable":
                     continue
@@ -6237,7 +6249,8 @@ class Runtime:
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s' of type '%s'"
                                    % (k, type(k).__name__)}
-                if not k.isidentifier() or keyword.iskeyword(k) or k.lower() in reserved:
+                is_reserved = k in reserved if modern else keyword.iskeyword(k)
+                if is_reserved or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", k):
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s'" % k}
                 facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
@@ -6906,6 +6919,7 @@ class Runtime:
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
                 if not res.get("_ansible_facts_cacheable"):
+                    self.vars.setdefault("ansible_facts", {})
                     return
             elif short_action == "include_vars":
                 self.vars.update(facts)
@@ -6919,7 +6933,7 @@ class Runtime:
             # The `ansible_facts` magic var holds facts without the ansible_
             # prefix ('fqdn' in ansible_facts), unlike the injected top-level
             # ansible_* vars.
-            existing.update(_normalized_facts(facts))
+            existing.update(_normalized_facts(facts, preserve_local=short_action == "set_fact"))
 
     def _notification_names(self, task, ctx):
         with self._strict_vars():

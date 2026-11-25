@@ -5529,15 +5529,28 @@ def test_delegated_set_fact_normalizes_arguments_on_invoking_host(tmp_path, stra
   connection: local
   vars:
     fact_name: rendered_fact
+    templated_facts: {incoming: arrived, rendered_fact: replaced}
   tasks:
     - set_fact:
         "{{ fact_name }}": here
+        'on': quoted
+        ignored_fact: "{{ missing | default(omit) }}"
         cacheable: "false"
+      args: "{{ templated_facts }}"
       delegate_to: recipient
       delegate_facts: false
+    - set_fact:
+        loop_value: "{{ ansible_facts.loop_value | default(0) | int + 1 }}"
+      delegate_to: recipient
+      loop: [first, second]
     - assert:
         that:
+          - loop_value | int == 1
+          - ansible_facts.loop_value is undefined
           - rendered_fact == 'here'
+          - incoming == 'arrived'
+          - vars['on'] == 'quoted'
+          - ignored_fact is undefined
           - ansible_facts.rendered_fact is undefined
           - hostvars.recipient.rendered_fact is undefined
 """, inventory="origin,recipient,", environment={"ANSIBLE_STRATEGY": strategy},
