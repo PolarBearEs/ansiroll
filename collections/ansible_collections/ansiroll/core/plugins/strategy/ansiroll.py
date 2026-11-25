@@ -834,10 +834,25 @@ class StrategyModule(StrategyBase):
 
             from ansible.executor.task_executor import TaskExecutor
             from ansible.plugins import loader as plugin_loader
-            executor = TaskExecutor(
-                host, concrete, job_vars, play_context, None, self._loader,
-                plugin_loader, _QuietQueue(), self._variable_manager)
-            return executor.run()
+            queue = _QuietQueue()
+            parameters = inspect.signature(TaskExecutor).parameters
+            if "task" in parameters:
+                args = [host, concrete, job_vars, play_context]
+                if "new_stdin" in parameters:
+                    args.append(None)
+                args.extend((self._loader, plugin_loader, queue))
+                if "variable_manager" in parameters:
+                    args.append(self._variable_manager)
+                return TaskExecutor(*args).run()
+
+            from ansible._internal._task import TaskContext
+
+            # Match the worker's ambient task context on newer ansible-core.
+            with TaskContext.create(task=concrete, task_vars=job_vars, host_name=host.name):
+                concrete.squash()
+                executor = TaskExecutor(host, play_context, self._loader, plugin_loader,
+                                        queue, self._variable_manager)
+                return executor.run().as_result_dict(for_round_trip=True)
         except Exception as ex:
             return {
                 "failed": True,

@@ -2027,6 +2027,29 @@ def test_controller_synchronize_leaves_retries_to_agent(monkeypatch):
     assert original.retries == 2 and original.until == ["ready"]
 
 
+def test_controller_synchronize_uses_the_installed_task_executor(tmp_path):
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        return {"changed": True, "msg": self._task.args["label"]}
+""")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - synchronize:
+        label: controller-executor
+      register: synced
+    - debug:
+        msg: '{{ synced.msg }}'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"msg": "controller-executor"' in result.stdout
+
+
 @pytest.mark.parametrize(("alias_value", "alias_member", "alias_error"), [
     ("{{ missing }}", "", None),
     ("{{ missing | regex_replace('x', 'y') }}", "", None),
