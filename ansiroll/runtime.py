@@ -19,6 +19,7 @@ import datetime as _dt
 import base64
 from decimal import Decimal
 import json
+import operator
 import os
 import struct
 import selectors
@@ -28,8 +29,9 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import KeysView
+from collections.abc import Generator, ItemsView, KeysView, MutableMapping, MutableSequence, ValuesView
 from contextlib import contextmanager
+from functools import wraps
 from itertools import groupby
 from numbers import Number
 
@@ -67,6 +69,10 @@ def _legacy_non_native(ctx):
     return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
 
 
+_DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
+_TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
+
+
 def _rendered_number(value, source, ctx):
     if isinstance(value, Number) and not isinstance(value, bool) and _legacy_non_native(ctx):
         # A bare name preserves the type only when its original value is numeric.
@@ -80,7 +86,7 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members"}
+                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -808,42 +814,54 @@ def _vars_file_glob_covers(pattern, name):
 
 
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
-                 preserve_views=False):
+                 preserve_views=False, preserve_lookup_hostvars=False, reject_vault=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
+    if preserve_lookup_hostvars and isinstance(value, _LookupHostVars):
+        return value
     if preserve_included_vars and isinstance(value, _IncludedVars):
         return value
     if preserve_views and isinstance(value, (_LazyTplDict, _LazyTplList, _LazyTplTuple, _PlayVarView)):
         return value
+    if reject_vault and isinstance(value, dict) and dict.keys(value) == {"__ansiroll_vault__"}:
+        raise ValueError("The variable contains an undecryptable variable")
     if isinstance(value, str):
         if condition_text and not isinstance(value, _TrustedAsTemplateValue):
             return _UntrustedConditionValue(value)
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             return _UnsafeText(value)
         return value
-    if isinstance(value, (dict, list, tuple)):
+    if isinstance(value, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
         if _seen is None:
             _seen = {}
         # Keep source containers alive because lazy views create temporary
         # wrappers whose object IDs could be reused during this traversal.
         if id(value) in _seen:
             return _seen[id(value)][1]
-        if isinstance(value, dict):
+        if isinstance(value, (dict, _RawSnapshotMapping)):
             out = {}
             _seen[id(value)] = (value, out)
             # Lazy views render on access; plain containers are read raw.
-            items = value.items() if isinstance(value, (_LazyTplDict, _PlayVarView)) else dict.items(value)
+            if reject_vault and isinstance(value, _LazyTplDict):
+                items = ((key, value[key]) for key in value)
+            elif isinstance(value, (_LazyTplDict, _PlayVarView, _RawSnapshotMapping)):
+                items = value.items()
+            else:
+                items = dict.items(value)
             for key, item in items:
-                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views)
-                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views)
+                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views,
+                                          reject_vault=reject_vault)
+                out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
+                                               preserve_lookup_hostvars, reject_vault)
             return out
-        if isinstance(value, list):
+        if isinstance(value, (list, _HostVarEntries, _RawSnapshotList)):
             out = []
             _seen[id(value)] = (value, out)
-            items = (iter(value) if isinstance(value, _LazyTplList)
-                     else list.__iter__(value))
-            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views) for v in items)
+            items = iter(value) if isinstance(value, (_LazyTplList, _HostVarEntries, _RawSnapshotList)) else list.__iter__(value)
+            out.extend(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
+                                    preserve_lookup_hostvars, reject_vault) for v in items)
             return out
-        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views) for v in value)
+        return tuple(_mark_unsafe(v, _seen, preserve_included_vars, condition_text, preserve_views,
+                                  preserve_lookup_hostvars, reject_vault) for v in value)
     return value
 
 
@@ -972,7 +990,7 @@ def _fail_on_undef(value):
         for k, v in value.items():
             _fail_on_undef(k)
             _fail_on_undef(v)
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, (list, tuple, _HostVarEntries)):
         for v in value:
             _fail_on_undef(v)
     elif _is_undef(value):
@@ -983,7 +1001,7 @@ def _fail_on_undef(value):
 def _debug_var_value(value):
     if not _core_at_least(2, 19):
         try:
-            return _fail_on_undef(value)
+            return _fail_on_undef(_mark_unsafe(value))
         except jinja2.UndefinedError:
             return "VARIABLE IS NOT DEFINED!"
 
@@ -999,7 +1017,7 @@ def _debug_var_value(value):
                 return "<< error %d - %s >>" % (error_count, ex)
         if isinstance(v, dict):
             return {k: replace(x) for k, x in v.items()}
-        if isinstance(v, (list, tuple)):
+        if isinstance(v, (list, tuple, _HostVarEntries)):
             return [replace(x) for x in v]
         return v
 
@@ -1136,7 +1154,8 @@ def _f_combine(d, *others, **kwargs):
     def merge(a, b):
         out = dict(a.items())
         for k, v in b.items():
-            if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
+            if recursive and isinstance(out.get(k), (dict, _RawSnapshotMapping)) and isinstance(
+                    v, (dict, _RawSnapshotMapping)):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
@@ -1241,7 +1260,7 @@ def _f_unique(seq):
 def _f_flatten(seq, levels=None):
     out = []
     for x in seq or []:
-        if isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple, _HostVarEntries, _RawSnapshotList)):
             if levels is None or levels > 0:
                 out.extend(_f_flatten(x, None if levels is None else levels - 1))
             else:
@@ -1281,7 +1300,7 @@ def _yaml_plain_key(k, memo):
 
 def _yaml_plain(v, memo=None, key_memo=None):
     """Materialize runtime wrappers (lazy vars, trusted strings) into the
-    built-in types PyYAML's SafeDumper can represent.
+    built-in types supported by the serializers.
 
     Shared and self-referencing containers keep their identity: each output
     container is registered before its children are converted, so PyYAML can
@@ -1292,7 +1311,7 @@ def _yaml_plain(v, memo=None, key_memo=None):
         memo, key_memo = {}, {}
     if isinstance(v, str):
         return "".join([v]) if type(v) is not str else v
-    if not isinstance(v, (dict, list, tuple)):
+    if not isinstance(v, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
         return v
     # Lazy wrappers are rebuilt on every access; key them by the raw
     # container they wrap so recursion through them is still detected, plus
@@ -1303,7 +1322,7 @@ def _yaml_plain(v, memo=None, key_memo=None):
     key = (id(getattr(v, "_raw", v)), id(origin) if origin is not None else None)
     if key in memo:
         return memo[key][1]
-    if isinstance(v, dict):
+    if isinstance(v, (dict, _RawSnapshotMapping)):
         out = {}
         memo[key] = (v, out)
         for k, x in v.items():
@@ -1357,20 +1376,41 @@ def _f_quote(v):
         return _to_text_str(v)
 
 
-def _contains_vault(v):
-    if isinstance(v, dict):
-        if set(v.keys()) == {"__ansiroll_vault__"}:
-            return True
-        return any(_contains_vault(x) for x in v.values())
-    if isinstance(v, (list, tuple)):
-        return any(_contains_vault(x) for x in v)
-    return False
-
-
 def _f_to_json(v, **kwargs):
-    if _contains_vault(v):
-        raise ValueError("The variable contains an undecryptable variable")
-    return json.dumps(v, **kwargs)
+    return json.dumps(_mark_unsafe(v, reject_vault=True), **kwargs)
+
+
+def _view_json_options(options):
+    """Expand the runtime's mapping and sequence views when encoding JSON."""
+    options = dict(options)
+
+    def expand(value, fallback):
+        if isinstance(value, (_HostVarEntries, _RawSnapshotList)):
+            return list(value)
+        if isinstance(value, _RawSnapshotMapping):
+            return dict(value)
+        return fallback(value)
+
+    fallback = options.get("default")
+    if fallback is not None:
+        options["default"] = lambda value: expand(value, fallback)
+    else:
+        encoder = options.get("cls") or json.JSONEncoder
+
+        class ViewEncoder(encoder):
+            def default(self, value):
+                return expand(value, super().default)
+
+        options["cls"] = ViewEncoder
+    return options
+
+
+def _jinja_tojson(eval_ctx, value, indent=None):
+    policies = eval_ctx.environment.policies
+    options = _view_json_options(policies["json.dumps_kwargs"])
+    if indent is not None:
+        options["indent"] = indent
+    return jinja2.utils.htmlsafe_json_dumps(value, policies["json.dumps_function"], **options)
 
 
 def _f_unvault(v, secret):
@@ -1532,12 +1572,16 @@ def _lookup_values(name, args, kwargs, ctx=None):
         vals = []
         for a in args:
             key = str(a)
-            if ctx is not None and key in ctx and not _is_undef(ctx[key]):
-                vals.append(ctx[key])
-            elif "default" in kwargs:
+            if ctx is not None and key in ctx:
+                value = ctx[key]
+                _raise_captured_template_error(value)
+                if not _is_undef(value):
+                    vals.append(value)
+                    continue
+            if "default" in kwargs:
                 vals.append(kwargs["default"])
             else:
-                raise RuntimeError("lookup vars: no variable named %r" % key)
+                raise jinja2.UndefinedError("lookup vars: no variable named %r" % key)
         return vals
     if name == "env":
         default = kwargs.get("default", "")
@@ -1589,7 +1633,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
 def _flatten_deep(terms):
     out = []
     for t in terms:
-        if isinstance(t, (list, tuple)):
+        if isinstance(t, (list, tuple, _RawSnapshotList)):
             out.extend(_flatten_deep(list(t)))
         elif t is not None:
             out.append(t)
@@ -1603,7 +1647,7 @@ def _loop_lookup(name, terms):
     if name == "items":
         out = []
         for t in terms:
-            if isinstance(t, list):
+            if isinstance(t, (list, _RawSnapshotList)):
                 out.extend(t)
             else:
                 out.append(t)
@@ -1614,17 +1658,17 @@ def _loop_lookup(name, terms):
         import itertools
         return [list(x) for x in itertools.zip_longest(*terms, fillvalue=None)]
     if name == "dict":
-        if len(terms) == 1 and isinstance(terms[0], dict):
+        if len(terms) == 1 and isinstance(terms[0], (dict, _RawSnapshotMapping)):
             return [{"key": k, "value": v} for k, v in terms[0].items()]
         raise RuntimeError("with_dict/dict lookup plugin expects a dictionary")
     if name == "nested":
         import itertools
-        lists = [t if isinstance(t, list) else [t] for t in terms]
+        lists = [t if isinstance(t, (list, _RawSnapshotList)) else [t] for t in terms]
         return [list(x) for x in itertools.product(*lists)]
     if name == "indexed_items":
         out = []
         for t in terms:
-            items = t if isinstance(t, list) else [t]
+            items = t if isinstance(t, (list, _RawSnapshotList)) else [t]
             out.extend(items)
         return [[i, item] for i, item in enumerate(out)]
     raise _UnsupportedLookup(name)
@@ -1654,18 +1698,22 @@ def _query(name, *args, **kwargs):
     return _lookup_values(name, args, kwargs, ctx)
 
 
-def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
+def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
     if isinstance(value, dict):
         return _LazyTplDict(value, rt, ctx, dynamic, origin, task_vars)
     if isinstance(value, list):
-        return _LazyTplList(value, rt, ctx, dynamic, origin, task_vars)
+        return _LazyTplList(value, rt, ctx, dynamic, origin, task_vars, delegated=delegated)
     return value
 
 
 def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
+    if isinstance(value, _DelegatedTemplateValue):
+        return value.resolve()
+    if isinstance(value, _TaskHostVars) and isinstance(ctx, _PlayVarScope):
+        return _TaskHostVarView(value, ctx)
     if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
         # Dynamic containers resolve their members in the task's context.
-        return _lazy_container(value._raw, rt, ctx, task_vars=value._task_vars)
+        return _lazy_wrap(value._raw, rt, ctx, task_vars=value._task_vars)
     if isinstance(value, _UntrustedConditionValue):
         return rt.templater._observe_untrusted(value)
     if task_vars and type(value) is str and _looks_templated(value):
@@ -1682,14 +1730,37 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
         return rt.templater._observe_untrusted(_UntrustedConditionValue(value["__ansiroll_unsafe__"]))
     if isinstance(value, dict) and set(value.keys()) == {"__ansiroll_vault__"}:
         return value
+    if task_vars and isinstance(ctx, _PlayVarScope) and isinstance(value, (dict, list)):
+        key = id(value)
+        if key not in ctx.task_containers:
+            ctx.task_containers[key] = _lazy_container(value, rt, ctx, dynamic, origin, task_vars)
+        return ctx.task_containers[key]
     return _lazy_container(value, rt, ctx, dynamic, origin, task_vars)
 
 
 def _observe_container_value(value, rt, render_ctx):
+    if isinstance(value, _DelegatedTemplateValue):
+        return value.resolve()
     templater = rt.templater
     if templater._untrusted_task_interpolation is not None and type(value) in (dict, list, tuple):
         return _lazy_wrap(value, rt, render_ctx())
     return templater._observe_untrusted(value)
+
+
+def _read_lazy_member(container, value):
+    ctx = container._render_ctx()
+    binding = getattr(container, "_task_binding", None)
+    if binding is not None:
+        ctx.active_task_bindings.append(binding)
+    try:
+        resolved = _lazy_wrap(value, container._rt, ctx, container._dynamic,
+                              container._origin, container._task_vars)
+    finally:
+        if binding is not None:
+            ctx.active_task_bindings.pop()
+    if binding is not None and isinstance(resolved, (_LazyTplDict, _LazyTplList)):
+        resolved._task_binding = binding
+    return resolved
 
 
 class _LazyTplDict(dict):
@@ -1714,9 +1785,10 @@ class _LazyTplDict(dict):
         return ctx
 
     def __getitem__(self, k):
-        return _lazy_wrap(
-            dict.__getitem__(self, k), self._rt, self._render_ctx(), self._dynamic,
-            self._origin, self._task_vars)
+        return self._read_member(dict.__getitem__(self, k))
+
+    def _read_member(self, value):
+        return _read_lazy_member(self, value)
 
     def get(self, k, default=None):
         try:
@@ -1726,18 +1798,22 @@ class _LazyTplDict(dict):
 
     def pop(self, key, *default):
         if key in self:
-            return _observe_container_value(dict.pop(self, key, *default), self._rt, self._render_ctx)
+            return self._mutation_value(key, dict.pop(self, key, *default))
         return dict.pop(self, key, *default)
 
     def popitem(self):
         key, value = dict.popitem(self)
-        return (self._rt.templater._observe_untrusted(key),
-                _observe_container_value(value, self._rt, self._render_ctx))
+        return self._rt.templater._observe_untrusted(key), self._mutation_value(key, value)
 
     def setdefault(self, key, default=None):
         if key in self:
-            return _observe_container_value(dict.__getitem__(self, key), self._rt, self._render_ctx)
+            return self._mutation_value(key, dict.__getitem__(self, key))
         return dict.setdefault(self, key, default)
+
+    def _mutation_value(self, key, value):
+        if self._task_vars:
+            return self._read_member(value)
+        return _observe_container_value(value, self._rt, self._render_ctx)
 
     def keys(self):
         if self._rt.templater._untrusted_task_interpolation is None:
@@ -1751,6 +1827,9 @@ class _LazyTplDict(dict):
         return [self[k] for k in dict.keys(self)]
 
     def copy(self):
+        raw_items = dict.items(self)
+        if self._task_vars or any(isinstance(value, _DelegatedTemplateValue) for _, value in raw_items):
+            return _LazyMappingSnapshot(self, {key: _SnapshotBinding(value) for key, value in raw_items})
         return {k: self[k] for k in self}
 
     def __iter__(self):
@@ -1764,18 +1843,225 @@ class _LazyTplDict(dict):
 
     def __repr__(self):
         # str()/repr() inside a template shows the rendered values.
-        return repr(self.copy())
+        return repr({k: self[k] for k in self})
 
     __str__ = __repr__
 
     def __eq__(self, other):
         mine = {k: self[k] for k in dict.keys(self)}
-        return mine == (other.copy() if isinstance(other, _LazyTplDict) else other)
+        if isinstance(other, _LazyTplDict):
+            other = {k: other[k] for k in dict.keys(other)}
+        return mine == other
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
     __hash__ = None
+
+
+class _SnapshotBinding:
+    """Distinguish inherited bindings from values written into a copy."""
+
+    _resolved = False
+
+    def __init__(self, value):
+        self.source = value
+
+    def resolve(self, read):
+        if not self._resolved:
+            self._value = read(self.source)
+            self._resolved = True
+        return self._value
+
+    def raw_value(self):
+        if (self._resolved and isinstance(self._value, (_LazyMappingSnapshot, _LazyListSnapshot))
+                and self._value._inventory_snapshot):
+            return self._value
+        return self.source
+
+
+def _inventory_snapshot(value):
+    if type(value) is _LazyTplDict:
+        bindings = {key: _SnapshotBinding(source) for key, source in dict.items(value)}
+        return _LazyMappingSnapshot(value, bindings, inventory=True)
+    if type(value) is _LazyTplList:
+        return _LazyListSnapshot(value, [_SnapshotBinding(source) for source in list.__iter__(value)], inventory=True)
+    return value
+
+
+def _read_snapshot_member(container, value):
+    if isinstance(value, _SnapshotBinding):
+        def read(source):
+            member = _read_lazy_member(container, source)
+            if container._inventory_snapshot and type(source) in (dict, list):
+                member = _inventory_snapshot(member)
+            return member
+
+        value = value.resolve(read)
+    return container._rt.templater._observe_untrusted(value)
+
+
+def _raw_inventory_member(container, value):
+    """Read source data or a live view of an inherited nested container."""
+    if isinstance(value, _SnapshotBinding):
+        if type(value.source) in (dict, list):
+            container._read_member(value)
+        value = value.raw_value()
+    if isinstance(value, (_LazyMappingSnapshot, _LazyListSnapshot)) and value._inventory_snapshot:
+        return value._raw_view
+    return value
+
+
+class _RawSnapshotMapping(MutableMapping):
+    """Access a snapshot's mapping as literal data while sharing its storage."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __getitem__(self, key):
+        return _raw_inventory_member(self._owner, dict.__getitem__(self._owner, key))
+
+    def __setitem__(self, key, value):
+        self._owner[key] = value
+
+    def __delitem__(self, key):
+        del self._owner[key]
+
+    def __iter__(self):
+        return dict.__iter__(self._owner)
+
+    def __len__(self):
+        return len(self._owner)
+
+    def popitem(self):
+        key, value = dict.popitem(self._owner)
+        return key, _raw_inventory_member(self._owner, value)
+
+    def copy(self):
+        return dict(self)
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def __deepcopy__(self, memo):
+        return _deepcopy_snapshot_data(self._owner, memo)
+
+
+class _RawSnapshotList(MutableSequence):
+    """Access a snapshot's list as literal data while sharing its storage."""
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __getitem__(self, index):
+        value = list.__getitem__(self._owner, index)
+        if isinstance(index, slice):
+            return [_raw_inventory_member(self._owner, member) for member in value]
+        return _raw_inventory_member(self._owner, value)
+
+    def __setitem__(self, index, value):
+        self._owner[index] = value
+
+    def __delitem__(self, index):
+        del self._owner[index]
+
+    def __len__(self):
+        return len(self._owner)
+
+    def insert(self, index, value):
+        self._owner.insert(index, value)
+
+    def copy(self):
+        return list(self)
+
+    def reverse(self):
+        list.reverse(self._owner)
+
+    def sort(self, *, key=None, reverse=False):
+        def raw_key(value):
+            member = _raw_inventory_member(self._owner, value)
+            return key(member) if key is not None else member
+
+        list.sort(self._owner, key=raw_key, reverse=reverse)
+
+    def __eq__(self, other):
+        if not isinstance(other, (list, _RawSnapshotList)):
+            return NotImplemented
+        return len(self) == len(other) and _compare_list_members(self, other, operator.eq)
+
+    def _compare_order(self, other, compare):
+        if not isinstance(other, (list, _RawSnapshotList)):
+            return NotImplemented
+        return _compare_list_members(self, other, compare)
+
+    def __lt__(self, other):
+        return self._compare_order(other, operator.lt)
+
+    def __le__(self, other):
+        return self._compare_order(other, operator.le)
+
+    def __gt__(self, other):
+        return self._compare_order(other, operator.gt)
+
+    def __ge__(self, other):
+        return self._compare_order(other, operator.ge)
+
+    def __add__(self, other):
+        return list(self) + (list(other) if isinstance(other, _RawSnapshotList) else other)
+
+    def __radd__(self, other):
+        return other + list(self)
+
+    def __mul__(self, count):
+        return list(self) * count
+
+    __rmul__ = __mul__
+
+    def __repr__(self):
+        return repr(self.copy())
+
+    def __deepcopy__(self, memo):
+        return _deepcopy_snapshot_data(self._owner, memo)
+
+
+def _deepcopy_snapshot_data(value, memo):
+    """Copy source data and snapshot writes without copying a Jinja scope."""
+    from copy import deepcopy
+
+    if isinstance(value, _SnapshotBinding):
+        value = value.raw_value()
+    if id(value) in memo:
+        return memo[id(value)]
+    if isinstance(value, dict):
+        result = memo[id(value)] = {}
+        result.update((deepcopy(key, memo), _deepcopy_snapshot_data(member, memo))
+                      for key, member in dict.items(value))
+    elif isinstance(value, list):
+        result = memo[id(value)] = []
+        result.extend(_deepcopy_snapshot_data(member, memo) for member in list.__iter__(value))
+    else:
+        return deepcopy(value, memo)
+    return result
+
+
+class _LazyMappingSnapshot(_LazyTplDict):
+    """A shallow copy with deferred source bindings and ordinary dict writes."""
+
+    def __init__(self, source, bindings, *, inventory=False):
+        super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=source._task_vars)
+        self._task_binding = getattr(source, "_task_binding", None)
+        self._inventory_snapshot = inventory
+        if inventory:
+            self._raw_view = _RawSnapshotMapping(self)
+
+    def _read_member(self, value):
+        return _read_snapshot_member(self, value)
+
+    def _mutation_value(self, key, value):
+        return self._read_member(value)
+
+    def copy(self):
+        return _LazyMappingSnapshot(self, dict(dict.items(self)), inventory=self._inventory_snapshot)
 
 
 class _HandlerNameVars(_LazyTplDict):
@@ -1803,8 +2089,30 @@ class _TaskVarTemplate(str):
     """Source of a task variable that may need a loop binding."""
 
 
+class _DelegatedTemplateValue:
+    """Read an agent variable or container member once, on demand."""
+
+    def __init__(self, load):
+        self._load = load
+
+    def resolve(self):
+        if self._load is not None:
+            self._value = self._load()
+            self._load = None
+        return self._value
+
+
 class _LoopVarsSnapshot(dict):
     """The task's magic vars mapping before its loop bindings were applied."""
+
+
+class _TaskHostVars(dict):
+    """Current-host values whose deferred task bindings share the render scope."""
+
+    def __init__(self, values, task_bindings, key_order):
+        super().__init__(values)
+        self.task_bindings = task_bindings
+        self.key_order = key_order
 
 
 class _PlayVarScope(dict):
@@ -1817,8 +2125,13 @@ class _PlayVarScope(dict):
         self.resolving = set()
         self.resolved = {}
         self.resolved_task = {}
+        self.task_containers = {}
+        self.active_task_bindings = []
         self.resolved_snapshot = {}
-        view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
+        if ctx.get(_DEFER_LOOKUP_NAMES):
+            view = _DeferredPlayVarView
+        else:
+            view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
         snapshot = ctx.get("vars")
         self["vars"] = view(snapshot if isinstance(snapshot, _LoopVarsSnapshot) else _vars_snapshot(ctx), self)
 
@@ -1855,8 +2168,9 @@ class _LookupVars(dict):
         return self._resolve(key, dict.__getitem__(self, key))
 
     def _resolve(self, key, value):
-        if isinstance(value, _TaskVarTemplate) or (
-                isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
+        if isinstance(value, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
+                isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic) or (
+                key == "hostvars" and isinstance(self.ctx, _PlayVarScope) and self.ctx.get(_DEFER_LOOKUP_NAMES)):
             return self.templater.resolve_variable(key, value, self.ctx)
         return self.templater._observe_untrusted(value)
 
@@ -1893,34 +2207,39 @@ class _LookupVars(dict):
 class _PlayVarView(dict):
     """The finite public vars mapping for a lazy play-variable scope."""
 
+    _preserve_legacy_sources = True
+
     def __init__(self, snapshot, scope, loop_snapshot=False):
         super().__init__(snapshot)
         self.scope = scope
         self._loop_snapshot = loop_snapshot or isinstance(snapshot, _LoopVarsSnapshot)
         self._templates = {}
-        if not _core_at_least(2, 19):
+        if self._preserve_legacy_sources and not _core_at_least(2, 19):
             for key, value in snapshot.items():
                 if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
                     if self._loop_snapshot:
                         self._templates[key] = value
                     self[key] = str(value)
-        if "vars" in snapshot:
+        if "vars" in snapshot and not isinstance(snapshot["vars"], _PlayVarView):
             self["vars"] = type(self)(snapshot["vars"], scope, self._loop_snapshot)
 
     def __getitem__(self, key):
-        value = dict.__getitem__(self, key)
+        return self._read_variable(key, dict.__getitem__(self, key))
+
+    def _read_variable(self, key, value):
         if key == "vars":
             return value
         if not self._loop_snapshot:
             return self.scope.templater.resolve_variable(key, self.scope[key], self.scope, strict=self.scope.strict)
-        if key not in self.scope.resolved_snapshot:
-            value = self._templates.get(key, value)
+        value = self._templates.get(key, value)
+        cache_key = (key, id(value))
+        if cache_key not in self.scope.resolved_snapshot:
             if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
                 resolved = self.scope[key]
             else:
                 resolved = self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
-            self.scope.resolved_snapshot[key] = resolved
-        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[key])
+            self.scope.resolved_snapshot[cache_key] = value, resolved
+        return self.scope.templater._observe_untrusted(self.scope.resolved_snapshot[cache_key][1])
 
     def get(self, key, default=None):
         return self[key] if key in self else default
@@ -1951,22 +2270,360 @@ class _ModernPlayVarView(_PlayVarView):
 
     def __eq__(self, other):
         if isinstance(other, _PlayVarView):
-            other = other.copy()
-        return self.copy() == other
+            other = dict(other.items())
+        return dict(self.items()) == other
 
     def __ne__(self, other):
         return not self == other
 
     def __repr__(self):
-        return repr(self.copy())
+        return repr(dict(self.items()))
 
     __str__ = __repr__
+
+
+class _LookupHostVars(_LazyTplDict):
+    """Mark the result of the vars lookup as data on first access to each host."""
+
+    def __init__(self, hostvars):
+        def read(host):
+            value = hostvars[host]
+            if isinstance(value, _HostVarView):
+                view = value.copy()
+                view._resolved_values = {}
+                view._mark_lookup_data = True
+                return view
+            return _mark_unsafe(value)
+
+        sources = {host: _DelegatedTemplateValue(lambda host=host: read(host)) for host in hostvars}
+        super().__init__(sources, hostvars._rt, hostvars._render_ctx())
+
+
+class _HostVarView(_LazyTplDict):
+    """Keep hostvars entries lazy until the template reads them."""
+
+    def copy(self):
+        # Copy the current bindings without resolving them or rebuilding the
+        # view from its original host data. Preserve its existing resolver.
+        raw = (dict(dict.items(self)) if self._resolved_values is not None else
+               {key: _SnapshotBinding(value) for key, value in dict.items(self)})
+        view = dict.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        view._raw = raw
+        if view._resolved_values is None:
+            view._resolved_values = {}
+        dict.__init__(view, raw)
+        return view
+
+    _resolved_values = None
+    _mark_lookup_data = False
+
+    def __getitem__(self, key):
+        return self._resolve(key, dict.__getitem__(self, key))
+
+    def _resolve(self, key, value):
+        templater = self._rt.templater
+        if self._resolved_values is None:
+            result = self._read_host_value(key, value)
+        elif not isinstance(value, _SnapshotBinding):
+            result = templater._observe_untrusted(value)
+        else:
+            source = value.source
+            binding = key, id(source)
+            if binding not in self._resolved_values:
+                result = self._read_host_value(key, source)
+                if self._mark_lookup_data:
+                    result = _mark_unsafe(result)
+                self._resolved_values[binding] = source, result
+            result = templater._observe_untrusted(self._resolved_values[binding][1])
+        converted = templater._custom_plugin_args
+        return _custom_plugin_arg(result, converted) if converted is not None else result
+
+    def _mutation_value(self, key, value):
+        if self._resolved_values is not None:
+            return self._resolve(key, value)
+        return super()._mutation_value(key, value)
+
+    def _read_host_value(self, key, value):
+        return _read_lazy_member(self, value)
+
+    def items(self):
+        entries = _HostVarEntries(self, include_keys=True)
+        converted = self._rt.templater._custom_plugin_args
+        return _custom_plugin_arg(entries, converted) if converted is not None else entries
+
+    def values(self):
+        entries = _HostVarEntries(self, include_keys=False)
+        converted = self._rt.templater._custom_plugin_args
+        return _custom_plugin_arg(entries, converted) if converted is not None else entries
+
+
+class _TaskHostVarView(_HostVarView):
+    """Resolve current-host bindings with hostvars' rendered iteration rules."""
+
+    def __init__(self, host, scope):
+        bindings = {key: value for key, value in host.task_bindings.items()
+                    if not self._uses_inventory(scope, key, value)}
+        ordered = {key: bindings[key] if key in bindings else host[key]
+                   for key in host.key_order if key in bindings or key in host}
+        super().__init__(ordered, scope.templater._runtime, scope)
+        self._host = host
+
+    @staticmethod
+    def _uses_inventory(scope, key, value):
+        return key in scope.active_task_bindings or (
+            isinstance(value, _TaskVarTemplate) and (key, value) in scope.templater._resolving)
+
+    def _read_host_value(self, key, value):
+        templater = self._ctx.templater
+        # A task alias can read the inventory value it shadows.
+        if self._uses_inventory(self._ctx, key, value):
+            if key not in self._host:
+                raise KeyError(key)
+            value = self._host[key]
+        return templater.resolve_variable(key, value, self._ctx, strict=self._ctx.strict)
+
+    def _mutation_value(self, key, value):
+        return self._resolve(key, value)
+
+
+class _HostVarEntries(MutableSequence):
+    """Keep hostvars entries indexable while rendering only the values read."""
+
+    def __init__(self, mapping, *, include_keys):
+        self._mapping = mapping
+        self._include_keys = include_keys
+        self._sources = dict(dict.items(mapping))
+        self._keys = tuple(self._sources)
+        self._entries = {}
+        self._values = None
+
+    def _entry(self, key):
+        if key not in self._entries:
+            value = self._mapping._resolve(key, self._sources[key])
+            self._entries[key] = (key, value) if self._include_keys else value
+        return self._entries[key]
+
+    def _materialize(self):
+        if self._values is None:
+            self._values = list(self)
+        return self._values
+
+    def __len__(self):
+        return len(self._keys if self._values is None else self._values)
+
+    def __iter__(self):
+        if self._values is not None:
+            return iter(self._values)
+        return (self._entry(key) for key in self._keys)
+
+    def __contains__(self, item):
+        if self._values is not None:
+            return item in self._values
+        if not self._include_keys:
+            return super().__contains__(item)
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        key, expected = item
+        try:
+            present = key in self._sources
+        except TypeError:
+            return False
+        if not present:
+            return False
+        _, value = self._entry(key)
+        return value is expected or value == expected
+
+    def __getitem__(self, index):
+        if self._values is not None:
+            return self._values[index]
+        if isinstance(index, slice):
+            return [self._entry(key) for key in self._keys[index]]
+        return self._entry(self._keys[index])
+
+    def __setitem__(self, index, value):
+        self._materialize()[index] = value
+
+    def __delitem__(self, index):
+        del self._materialize()[index]
+
+    def insert(self, index, value):
+        self._materialize().insert(index, value)
+
+    def copy(self):
+        return list(self)
+
+    def sort(self, *, key=None, reverse=False):
+        self._materialize().sort(key=key, reverse=reverse)
+
+    def __add__(self, other):
+        return list(self) + (list(other) if isinstance(other, _HostVarEntries) else other)
+
+    def __radd__(self, other):
+        return other + list(self)
+
+    def __mul__(self, count):
+        return list(self) * count
+
+    __rmul__ = __mul__
+
+    def __imul__(self, count):
+        values = self._materialize()
+        values *= count
+        return self
+
+    def __eq__(self, other):
+        if not isinstance(other, (list, _HostVarEntries)):
+            return NotImplemented
+        return len(self) == len(other) and _compare_list_members(self, other, operator.eq)
+
+    def _compare_order(self, other, compare):
+        if not isinstance(other, (list, _HostVarEntries)):
+            return NotImplemented
+        return _compare_list_members(self, other, compare)
+
+    def __lt__(self, other):
+        return self._compare_order(other, operator.lt)
+
+    def __le__(self, other):
+        return self._compare_order(other, operator.le)
+
+    def __gt__(self, other):
+        return self._compare_order(other, operator.gt)
+
+    def __ge__(self, other):
+        return self._compare_order(other, operator.ge)
+
+    def __repr__(self):
+        return repr(list(self))
+
+
+class _DeferredVarItems(ItemsView):
+    def __iter__(self):
+        for key in self._mapping:
+            yield key, self._mapping.iteration_value(key)
+
+    def __contains__(self, item):
+        if not isinstance(item, tuple) or len(item) != 2:
+            return False
+        key, value = item
+        if key not in self._mapping:
+            return False
+        current = self._mapping.iteration_value(key)
+        return current is value or current == value
+
+
+class _DeferredVarValues(ValuesView):
+    def __iter__(self):
+        for _, value in self._mapping.items():
+            yield value
+
+    def __contains__(self, value):
+        return any(current is value or current == value for current in self)
+
+
+class _DeferredPlayVarView(_ModernPlayVarView):
+    """Read deferred agent and controller aliases through the magic vars mapping."""
+
+    _preserve_legacy_sources = False
+    _is_snapshot = False
+
+    def __init__(self, snapshot, scope, loop_snapshot=False):
+        super().__init__(snapshot, scope, loop_snapshot)
+        self._legacy_iteration = not _core_at_least(2, 19)
+
+    def __getitem__(self, key):
+        return self._resolve(key, dict.__getitem__(self, key))
+
+    def _resolve(self, key, value):
+        if self._is_snapshot:
+            if isinstance(value, _SnapshotBinding):
+                def read(source):
+                    member = self._resolve_inherited(key, source)
+                    return _inventory_snapshot(member) if type(source) in (dict, list) else member
+
+                value = value.resolve(read)
+            return self.scope.templater._observe_untrusted(value)
+        return self._resolve_inherited(key, value)
+
+    def _resolve_inherited(self, key, value):
+        if self._loop_snapshot:
+            return self._read_variable(key, value)
+        if key == "vars":
+            return value
+        if isinstance(value, _PlayVarTemplate) and value is dict.get(self.scope, key):
+            return self.scope[key]
+        return self.scope.templater.resolve_variable(key, value, self.scope, strict=self.scope.strict)
+
+    def iteration_value(self, key):
+        if not self._legacy_iteration:
+            return self[key]
+        source = dict.__getitem__(self, key)
+        if self._is_snapshot:
+            if not isinstance(source, _SnapshotBinding):
+                return self.scope.templater._observe_untrusted(source)
+            if type(source.source) in (dict, list):
+                resolved = self._resolve(key, source)
+                if isinstance(resolved, (_LazyMappingSnapshot, _LazyListSnapshot)) and resolved._inventory_snapshot:
+                    return resolved._raw_view
+            source = source.source
+        # Legacy iteration still exposes play template source, while accessed
+        # containers retain their mutations in the snapshot.
+        if isinstance(source, _PlayVarTemplate):
+            return str(source)
+        if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
+                isinstance(source, (_LazyTplDict, _LazyTplList)) and source._task_vars):
+            return self[key]
+        return source
+
+    def items(self):
+        return _DeferredVarItems(self)
+
+    def values(self):
+        return _DeferredVarValues(self) if self._legacy_iteration else ValuesView(self)
+
+    def copy(self):
+        raw = (dict(dict.items(self)) if self._is_snapshot else
+               {key: _SnapshotBinding(value) for key, value in dict.items(self)})
+        view = dict.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        view._is_snapshot = True
+        dict.__init__(view, raw)
+        return view
+
+    def __deepcopy__(self, memo):
+        return _deepcopy_snapshot_data(self, memo)
+
+    def pop(self, key, *default):
+        if key in self:
+            return self._resolve(key, dict.pop(self, key, *default))
+        return dict.pop(self, key, *default)
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        return key, self._resolve(key, value)
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        return dict.setdefault(self, key, default)
+
+
+def _compare_list_members(left, right, compare):
+    # Index only shared positions so a surplus deferred member stays unread.
+    left_len, right_len = len(left), len(right)
+    for index in range(min(left_len, right_len)):
+        first, second = left[index], right[index]
+        if first is second or first == second:
+            continue
+        return False if compare is operator.eq else compare(first, second)
+    return compare(left_len, right_len)
 
 
 class _LazyTplList(list):
     """A vars list whose items render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
         list.__init__(self, raw)
         self._raw = raw
         self._rt = rt
@@ -1974,6 +2631,7 @@ class _LazyTplList(list):
         self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
         self._task_vars = task_vars
+        self._delegated = delegated
 
     def _render_ctx(self):
         if not self._dynamic:
@@ -1986,27 +2644,71 @@ class _LazyTplList(list):
     def __getitem__(self, i):
         v = list.__getitem__(self, i)
         if isinstance(i, slice):
-            return [
-                _lazy_wrap(x, self._rt, self._render_ctx(), self._dynamic,
-                           self._origin, self._task_vars)
-                for x in v
-            ]
-        return _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
-                          self._origin, self._task_vars)
+            return [self._read_member(x) for x in v]
+        return self._read_member(v)
+
+    def _read_member(self, value):
+        return _read_lazy_member(self, value)
 
     def __iter__(self):
         for v in list.__iter__(self):
-            yield _lazy_wrap(v, self._rt, self._render_ctx(), self._dynamic,
-                             self._origin, self._task_vars)
+            yield self._read_member(v)
 
     def pop(self, index=-1):
-        return _observe_container_value(list.pop(self, index), self._rt, self._render_ctx)
+        value = list.pop(self, index)
+        if self._task_vars:
+            return self._read_member(value)
+        return _observe_container_value(value, self._rt, self._render_ctx)
 
     def copy(self):
         values = list.copy(self)
+        if self._delegated or self._task_vars:
+            return _LazyListSnapshot(self, [_SnapshotBinding(value) for value in values])
         return _observe_container_value(values, self._rt, self._render_ctx)
 
+    def remove(self, item):
+        if not self._uses_lazy_members():
+            return list.remove(self, item)
+        for index, value in enumerate(self):
+            if value is item or value == item:
+                del self[index]
+                return
+        raise ValueError("list.remove(x): x not in list")
+
+    def sort(self, *, key=None, reverse=False):
+        if self._delegated or self._task_vars:
+            self[:] = list(self)
+        list.sort(self, key=key, reverse=reverse)
+
+    def _uses_lazy_members(self):
+        return self._delegated or self._task_vars
+
+    def _compares_resolved_items(self, other):
+        return isinstance(other, list) and (self._uses_lazy_members() or (
+            isinstance(other, _LazyTplList) and other._uses_lazy_members()))
+
+    def _compare_order(self, other, compare, raw_compare):
+        if self._compares_resolved_items(other):
+            return _compare_list_members(self, other, compare)
+        return raw_compare(self, other)
+
+    def __lt__(self, other):
+        return self._compare_order(other, operator.lt, list.__lt__)
+
+    def __le__(self, other):
+        return self._compare_order(other, operator.le, list.__le__)
+
+    def __gt__(self, other):
+        return self._compare_order(other, operator.gt, list.__gt__)
+
+    def __ge__(self, other):
+        return self._compare_order(other, operator.ge, list.__ge__)
+
     def __eq__(self, other):
+        if isinstance(other, _HostVarEntries):
+            return NotImplemented
+        if self._compares_resolved_items(other):
+            return len(self) == len(other) and _compare_list_members(self, other, operator.eq)
         return list(iter(self)) == (list(iter(other)) if isinstance(other, _LazyTplList) else other)
 
     # list's C-level operations read the raw storage; render first, like
@@ -2020,7 +2722,7 @@ class _LazyTplList(list):
     def __add__(self, other):
         if isinstance(other, _LazyTplList):
             other = list(iter(other))
-        return list.__add__(list(iter(self)), other)
+        return list(iter(self)) + other
 
     def __radd__(self, other):
         if not isinstance(other, list):
@@ -2044,9 +2746,41 @@ class _LazyTplList(list):
     __str__ = __repr__
 
     def __ne__(self, other):
-        return not self.__eq__(other)
+        equal = self.__eq__(other)
+        return NotImplemented if equal is NotImplemented else not equal
 
     __hash__ = None
+
+
+class _LazyListSnapshot(_LazyTplList):
+    """A shallow copy that resolves inherited list members on demand."""
+
+    def __init__(self, source, bindings, *, inventory=False):
+        super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin,
+                         task_vars=source._task_vars, delegated=source._delegated)
+        self._task_binding = getattr(source, "_task_binding", None)
+        self._inventory_snapshot = inventory
+        if inventory:
+            self._raw_view = _RawSnapshotList(self)
+
+    def _read_member(self, value):
+        return _read_snapshot_member(self, value)
+
+    def pop(self, index=-1):
+        return self._read_member(list.pop(self, index))
+
+    def _uses_lazy_members(self):
+        return True
+
+    def sort(self, *, key=None, reverse=False):
+        def resolved_key(value):
+            member = self._read_member(value)
+            return key(member) if key is not None else member
+
+        list.sort(self, key=resolved_key, reverse=reverse)
+
+    def copy(self):
+        return _LazyListSnapshot(self, list.copy(self), inventory=self._inventory_snapshot)
 
 
 class _LazyTplTuple(tuple):
@@ -2128,8 +2862,10 @@ def _jinja_dict(*args, **kwargs):
 
 def _type_name(value):
     """type_debug: internal wrappers report the builtin type they stand for."""
-    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"),
-                           (_LazyTplList, "list"), (_LazyTplTuple, "tuple")):
+    for internal, name in ((_LazyTplDict, "dict"), (_PlayVarView, "dict"), (_RawSnapshotMapping, "dict"),
+                           (_LazyTplList, "list"), (_HostVarEntries, "list"), (_RawSnapshotList, "list"),
+                           (_LazyTplTuple, "tuple"),
+                           (_DeferredVarItems, "ItemsView"), (_DeferredVarValues, "ValuesView")):
         if isinstance(value, internal):
             return name
     if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
@@ -2149,9 +2885,21 @@ def _concretize(value):
     """Consume lazy iterators (selectattr/map/... results) so errors surface at
     template time, like Ansible's templar does."""
     import types
-    if isinstance(value, (types.GeneratorType, map, filter)):
+    if isinstance(value, (types.GeneratorType, map, filter)) or type(value) in (
+            ItemsView, ValuesView, _DeferredVarItems, _DeferredVarValues, _HostVarEntries):
         return list(value)
     return value
+
+
+def _finalize_text_segment(context, value):
+    if value is None:
+        config = context.get("__ansiroll_controller_config") or {}
+        native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
+        # Ansible 2.13–2.18 reuse the native finalizer when switching the
+        # template action to a text environment. Earlier cores replace it.
+        if not native or (context.get(_TEMPLATE_FILE_TEXT) and not _core_at_least(2, 13)):
+            return ""
+    return _concretize(value)
 
 
 class _CapturedTemplateError(jinja2.UndefinedError):
@@ -2166,6 +2914,19 @@ def _captured(msg, *, missing=False):
     return jinja2.StrictUndefined(hint=msg, exc=error_type)
 
 
+def _raise_captured_template_error(value):
+    if _is_undef(value) and value._undefined_exception is _CapturedTemplateError:
+        value._fail_with_undefined_error()
+
+
+def _preserve_captured_errors(function):
+    def checked(value, *args, **kwargs):
+        _raise_captured_template_error(value)
+        return function(value, *args, **kwargs)
+
+    return checked
+
+
 def _dump_object(v):
     if _is_undef(v):
         msg = getattr(v, "_undefined_hint", None) or "undefined value"
@@ -2178,6 +2939,213 @@ def _jinja_undef(hint=None):
         return _captured("The undef() hint argument must be of type 'str', got %r"
                          % type(hint).__name__)
     return _captured(hint or "Mandatory variable has not been overridden", missing=True)
+
+
+class _PluginInventoryArgument:
+    """Give Python plugins a built-in container and retain its snapshot bindings."""
+
+    def __init__(self, view):
+        self.view = view
+        self.value = {} if isinstance(view, _RawSnapshotMapping) else []
+        self.previous = None
+        self.previous_bindings = None
+
+    def populate(self, converted, inventory):
+        if isinstance(self.view, _RawSnapshotMapping):
+            self.value.clear()
+            self.value.update(
+                (key, _custom_plugin_arg(item, converted, inventory)) for key, item in self.view.items()
+            )
+        else:
+            self.value[:] = [_custom_plugin_arg(item, converted, inventory) for item in self.view]
+            self.previous_bindings = list.copy(self.view._owner)
+        self.previous = self.value.copy()
+
+    def write_back(self, sources, restored):
+        if self.previous is None:
+            return
+        owner = self.view._owner
+        if isinstance(self.view, _RawSnapshotMapping):
+            if (tuple(self.previous) != tuple(self.value)
+                    or any(self.previous[key] is not value for key, value in self.value.items())):
+                members = {
+                    key: (dict.__getitem__(owner, key) if key in self.previous and self.previous[key] is value
+                          else _restore_plugin_argument(value, sources, restored))
+                    for key, value in self.value.items()
+                }
+                dict.clear(owner)
+                dict.update(owner, members)
+        elif len(self.previous) != len(self.value) or any(a is not b for a, b in zip(self.previous, self.value)):
+            bindings = {}
+            for value, stored in zip(reversed(self.previous), reversed(self.previous_bindings)):
+                bindings.setdefault(id(value), []).append(stored)
+            members = []
+            for value in self.value:
+                retained = bindings.get(id(value))
+                members.append(retained.pop() if retained else _restore_plugin_argument(value, sources, restored))
+            list.__setitem__(owner, slice(None), members)
+
+
+def _restore_plugin_argument(value, sources, restored, *, copies=None):
+    if id(value) in sources:
+        return sources[id(value)]
+    if copies is not None and id(value) not in copies:
+        return value
+    if id(value) in restored:
+        return restored[id(value)][1]
+    if type(value) is dict:
+        result = {} if copies is not None else value
+        restored[id(value)] = value, result
+        for key, item in dict.items(value):
+            result[key] = _restore_plugin_argument(item, sources, restored, copies=copies)
+        return result
+    elif type(value) is list:
+        result = [] if copies is not None else value
+        restored[id(value)] = value, result
+        result[:] = [_restore_plugin_argument(item, sources, restored, copies=copies)
+                     for item in value]
+        return result
+    elif type(value) is tuple:
+        items = tuple(_restore_plugin_argument(item, sources, restored, copies=copies)
+                      for item in value)
+        if all(item is original for item, original in zip(items, value)):
+            items = value
+        return restored.setdefault(id(value), (value, items))[1]
+    return value
+
+
+def _restore_plugin_arguments(converted):
+    if converted:
+        entries = [entry[2] for entry in converted.values() if len(entry) == 3]
+        sources = {id(entry.value): entry.view for entry in entries}
+        if sources:
+            restored = {}
+            for entry in entries:
+                entry.write_back(sources, restored)
+            for entry in converted.values():
+                if len(entry) == 2:
+                    _restore_plugin_argument(entry[1], sources, restored)
+
+
+def _plugin_result_copies(result, sources):
+    # Find the containers that reach a converted argument, including cycles.
+    parents = {}
+    visited = set()
+    pending = [result]
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in sources or identity in visited or type(value) not in (dict, list, tuple):
+            continue
+        visited.add(identity)
+        for item in value.values() if type(value) is dict else value:
+            if id(item) in sources or type(item) in (dict, list, tuple):
+                parents.setdefault(id(item), set()).add(identity)
+                pending.append(item)
+    copies = set()
+    affected = list(sources.keys() & parents.keys())
+    while affected:
+        for parent in parents.get(affected.pop(), ()):
+            if parent not in copies:
+                copies.add(parent)
+                affected.append(parent)
+    return copies
+
+
+def _restore_plugin_result(result, converted):
+    if converted:
+        sources = {id(builtin): original for original, builtin, *_ in converted.values()
+                   if isinstance(original, (_RawSnapshotMapping, _RawSnapshotList))}
+        if sources:
+            return _restore_plugin_argument(result, sources, {}, copies=_plugin_result_copies(result, sources))
+    return result
+
+
+def _refresh_plugin_arguments(converted):
+    # Reuse the containers held by suspended Python code, but read their new
+    # contents and bindings from the snapshots after Jinja has run.
+    if converted:
+        inventory = {key: entry[2] for key, entry in converted.items() if len(entry) == 3}
+        if inventory:
+            originals = [entry[0] for entry in converted.values()]
+            converted.clear()
+            for value in originals:
+                _custom_plugin_arg(value, converted, inventory)
+
+
+def _custom_plugin_arg(value, converted, inventory=None):
+    if id(value) in converted:
+        return converted[id(value)][1]
+    if isinstance(value, _HostVarEntries):
+        entries = value._materialize()
+        converted[id(value)] = value, entries
+        return _custom_plugin_arg(entries, converted, inventory)
+    if isinstance(value, (_RawSnapshotMapping, _RawSnapshotList)):
+        entry = inventory.get(id(value)) if inventory else None
+        if entry is None:
+            entry = _PluginInventoryArgument(value)
+        converted[id(value)] = value, entry.value, entry
+        entry.populate(converted, inventory)
+        return entry.value
+    # Hostvars wrappers normalize members when the plugin reads them.
+    if type(value) is dict:
+        converted[id(value)] = value, value
+        for key, item in dict.items(value):
+            normalized = _custom_plugin_arg(item, converted, inventory)
+            if normalized is not item:
+                dict.__setitem__(value, key, normalized)
+    elif type(value) is list:
+        converted[id(value)] = value, value
+        for index, item in enumerate(value):
+            value[index] = _custom_plugin_arg(item, converted, inventory)
+    elif type(value) is tuple:
+        items = tuple(_custom_plugin_arg(item, converted, inventory) for item in value)
+        if all(item is original for item, original in zip(items, value)):
+            items = value
+        # A mutable member can lead back to this tuple during conversion.
+        return converted.setdefault(id(value), (value, items))[1]
+    return value
+
+
+def _wrap_custom_plugin(fn, templater):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        converted = {}
+        with templater._plugin_arg_scope(converted):
+            args = tuple(_custom_plugin_arg(value, converted) for value in args)
+            kwargs = {key: _custom_plugin_arg(value, converted) for key, value in kwargs.items()}
+            result = fn(*args, **kwargs)
+        if isinstance(result, Generator):
+            return _resume_scoped_generator(result, templater, converted)
+        return _restore_plugin_result(result, converted)
+    return wrapped
+
+
+class _ScopedGenerator(Generator):
+    """Restore the caller's normalization scope while a generator is suspended."""
+
+    def __init__(self, generator, templater, converted):
+        self._generator = generator
+        self._templater = templater
+        self._converted = converted
+
+    def send(self, value):
+        with self._templater._plugin_arg_scope(self._converted):
+            result = self._generator.send(value)
+        return _restore_plugin_result(result, self._converted)
+
+    def throw(self, *args):
+        with self._templater._plugin_arg_scope(self._converted):
+            result = self._generator.throw(*args)
+        return _restore_plugin_result(result, self._converted)
+
+    def close(self):
+        with self._templater._plugin_arg_scope(self._converted):
+            return self._generator.close()
+
+
+def _resume_scoped_generator(generator, templater, converted):
+    return (yield from _ScopedGenerator(generator, templater, converted))
 
 
 def _wrap_filter(fn):
@@ -2239,7 +3207,16 @@ class _ConditionalName:
         self.key = key
 
 
-class _ConditionalCodeGenerator(jinja2.compiler.CodeGenerator):
+class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
+    def func(self, name):
+        # A Python plugin can call back into any generated template body,
+        # including recursive loops and blocks, without a new render_string.
+        if hasattr(self.environment, "_ansiroll_templater"):
+            self.writeline("@environment._ansiroll_templater._wrap_jinja_callback")
+        return super().func(name)
+
+
+class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
     """Observe external names at their use sites in conditional templates."""
 
     def get_resolve_func(self):
@@ -2333,25 +3310,45 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message, missing=missing)
 
 
-def _bare_template_expression(text):
+def _bare_template_expression(text, *, lex=None):
     stripped = text.strip()
-    lookup_expr = re.match(r"^\{\{\s*(?:lookup|query|q)\s*\(", stripped)
-    if (stripped.startswith("{{") and stripped.endswith("}}")
-            and (stripped.count("{{") == 1 or lookup_expr)
-            and "{%" not in stripped):
-        return stripped[2:-2].strip()
+    if not (stripped.startswith("{{") and stripped.endswith("}}")):
+        return None
+    inner = stripped[2:-2]
+    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
+            or inner.endswith(("-", "}"))):
+        return inner.strip()
+    try:
+        tokens = iter((lex or jinja2.Environment().lex)(stripped))
+        _, kind, opening = next(tokens, (None, None, None))
+        if kind != "variable_begin":
+            return None
+        for _, kind, closing in tokens:
+            if kind == "variable_end":
+                if next(tokens, None) is None:
+                    return stripped[len(opening):-len(closing)].strip()
+                break
+    except jinja2.TemplateSyntaxError:
+        # Rendering reports the error when the variable is consumed.
+        pass
     return None
 
 
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
+    _LOOKUP_CALL = re.compile(r"\b(?:lookup|query|q)\b\s*(?:\)\s*)*\(")
+    _SCOPE_REFERENCE = re.compile(r"\b(?:hostvars|vars)\b")
+
     def __init__(self):
         self._expr_cache = {}
         self._condition_list_cache = {}
         self._template_cache = {}
+        self._lookup_templates = {}
+        self._inherited_lookup_scans = {}
         self._current_ctx = {}
         self._untrusted_task_interpolation = None
+        self._custom_plugin_args = None
         self._plugin_errors = {"filter": {}, "test": {}}
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
@@ -2359,18 +3356,25 @@ class _Templater:
         self.env = jinja2.Environment(
             undefined=_AnsirollUndefined,
             keep_trailing_newline=True,
-            finalize=_concretize,
+            finalize=(getattr(jinja2, "pass_context", None) or jinja2.contextfunction)(_finalize_text_segment),
         )
         self.env.context_class = _AnsirollContext
+        self.env.code_generator_class = _AnsirollCodeGenerator
         self.env._ansiroll_templater = self
         self._resolving = []        # variable templates being rendered (cycles)
         self._runtime = None        # bound by Runtime for lazy containers
         filters = _PluginDict("filter", self._plugin_errors["filter"])
         filters.update(self.env.filters)
         self.env.filters = filters
+        eval_context_filter = getattr(jinja2, "pass_eval_context", None) or jinja2.evalcontextfilter
+        self.env.filters["tojson"] = eval_context_filter(_jinja_tojson)
         tests = _PluginDict("test", self._plugin_errors["test"])
         tests.update(self.env.tests)
         self.env.tests = tests
+        for name in ("d", "default"):
+            self.env.filters[name] = _preserve_captured_errors(self.env.filters[name])
+        for name in ("defined", "undefined"):
+            self.env.tests[name] = _preserve_captured_errors(self.env.tests[name])
         # A few commonly-used Ansible filters/tests, best-effort.
         for fname, func in _ANSIBLE_FILTERS.items():
             self.env.filters.setdefault(fname, _wrap_filter(func))
@@ -2389,6 +3393,39 @@ class _Templater:
         self._conditional_env.code_generator_class = _ConditionalCodeGenerator
         self._strict_conditional_env = self._conditional_env.overlay(undefined=_StrictAnsirollUndefined)
 
+    @contextmanager
+    def _plugin_arg_scope(self, converted):
+        previous = self._custom_plugin_args
+        if converted is previous:
+            yield
+            return
+        _restore_plugin_arguments(previous)
+        self._custom_plugin_args = converted
+        try:
+            _refresh_plugin_arguments(converted)
+            yield
+        finally:
+            try:
+                _restore_plugin_arguments(converted)
+            finally:
+                self._custom_plugin_args = previous
+                _refresh_plugin_arguments(previous)
+
+    def _wrap_jinja_callback(self, body):
+        @wraps(body)
+        def wrapped(*args, **kwargs):
+            if self._custom_plugin_args is None:
+                result = body(*args, **kwargs)
+            else:
+                with self._plugin_arg_scope(None):
+                    result = body(*args, **kwargs)
+            # Jinja can create the generator before a plugin enters its scope,
+            # then advance it from that plugin (for example loop.nextitem).
+            if isinstance(result, Generator):
+                return _resume_scoped_generator(result, self, None)
+            return result
+        return wrapped
+
     def _lookup_ctx(self, name, terms):
         """The vars lookup templates trusted values like a variable reference."""
         ctx = self._current_ctx
@@ -2398,16 +3435,17 @@ class _Templater:
         for term in terms:
             key = str(term)
             if key in ctx and not key.startswith("__ansiroll"):
-                view[key] = self.resolve_variable(key, ctx[key], ctx)
+                value = self.resolve_variable(key, ctx[key], ctx)
+                view[key] = _LookupHostVars(value) if key == "hostvars" and isinstance(value, _LazyTplDict) else value
         return view
 
     def _g_lookup(self, name, *a, **k):
         try:
-            a = tuple(self._template_lookup_arg(v) for v in a)
+            a = tuple(self._template_lookup_term(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
-                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
+                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k), preserve_lookup_hostvars=True)
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
@@ -2416,35 +3454,45 @@ class _Templater:
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
+        except jinja2.UndefinedError as e:
+            return _captured_jinja_error(e)
         except Exception as e:
             return _captured(str(e))
 
     def _g_query(self, name, *a, **k):
         try:
-            a = tuple(self._template_lookup_arg(v) for v in a)
+            a = tuple(self._template_lookup_term(v) for v in a)
             k = {key: self._template_lookup_arg(value) for key, value in k.items()}
             return _mark_unsafe(
-                _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k))
+                _query(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k), preserve_lookup_hostvars=True)
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)
+        except jinja2.UndefinedError as e:
+            return _captured_jinja_error(e)
         except Exception as e:
             return _captured(str(e))
 
+    def _template_lookup_term(self, value):
+        rendered = self._template_lookup_arg(value)
+        if _is_undef(rendered):
+            rendered._fail_with_undefined_error()
+        return rendered
+
     def _template_lookup_arg(self, value):
-        """Render template constants nested inside lookup terms/options."""
-        if isinstance(value, dict):
+        """Render lookup arguments, preserving missing values and raising evaluation failures."""
+        if isinstance(value, (dict, _RawSnapshotMapping)):
             return {self._template_lookup_arg(k): self._template_lookup_arg(v)
                     for k, v in value.items()}
-        if isinstance(value, list):
+        if isinstance(value, (list, _HostVarEntries, _RawSnapshotList)):
             return [self._template_lookup_arg(v) for v in value]
         if isinstance(value, tuple):
             return tuple(self._template_lookup_arg(v) for v in value)
         if isinstance(value, str):
-            rendered = self.render_string(value, self._current_ctx)
-            if rendered is not value and isinstance(rendered, (dict, list, tuple)):
-                return self._template_lookup_arg(rendered)
-            return rendered
+            value = self.render_string(value, self._current_ctx)
+            if isinstance(value, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
+                return self._template_lookup_arg(value)
+        _raise_captured_template_error(value)
         return value
 
     def register_plugins(self, plugins):
@@ -2473,14 +3521,20 @@ class _Templater:
                 except Exception as e:
                     self._plugin_errors[kind][pname] = str(e)
                     continue
-                target[pname] = _wrap_filter(fn) if kind == "filter" else fn
+                wrapped = _wrap_custom_plugin(fn, self)
+                target[pname] = _wrap_filter(wrapped) if kind == "filter" else wrapped
 
     def _plugin_lookup(self, name, args, kwargs):
         """Run a baked lookup plugin; errors come back captured."""
         if name in self._lookup_loaded:
             try:
                 variables = _LookupVars(self._current_ctx or {}, self)
-                return list(self._lookup_loaded[name](list(args), variables, **kwargs))
+                converted = {}
+                with self._plugin_arg_scope(converted):
+                    terms = _custom_plugin_arg(list(args), converted)
+                    options = _custom_plugin_arg(kwargs, converted)
+                    result = list(self._lookup_loaded[name](terms, variables, **options))
+                return _restore_plugin_result(result, converted)
             except Exception as e:
                 return _captured("lookup plugin '%s' failed: %s" % (name, e))
         if name in self._lookup_errors:
@@ -2505,6 +3559,8 @@ class _Templater:
 
     def resolve_variable(self, key, value, ctx, strict=False):
         """Template a variable's trusted value when a template references it."""
+        if isinstance(value, _DelegatedTemplateValue):
+            return value.resolve()
         self._observe_untrusted(value)
         if type(value) in (str, _TaskVarTemplate, _PlayVarTemplate) and _looks_templated(value):
             cache = None
@@ -2525,7 +3581,10 @@ class _Templater:
             finally:
                 self._resolving.pop()
         if isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
-            return _lazy_wrap(value, value._rt, ctx)
+            resolved = _lazy_wrap(value, value._rt, ctx)
+            if value._task_vars and isinstance(ctx, _PlayVarScope):
+                resolved._task_binding = key
+            return resolved
         if self._runtime is not None:
             if type(value) in (dict, list, _LoopVarsSnapshot, _RegisteredResult):
                 return _lazy_wrap(value, self._runtime, ctx)
@@ -2558,7 +3617,7 @@ class _Templater:
     def _play_var_scope(self, ctx, strict):
         if isinstance(ctx, _PlayVarScope):
             return ctx
-        if (isinstance(ctx.get("vars"), _LoopVarsSnapshot)
+        if (ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
                 or any(isinstance(value, _PlayVarTemplate) for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
         return ctx
@@ -2577,7 +3636,10 @@ class _Templater:
         if alias:
             self._untrusted_task_interpolation = False
         try:
-            result = self._render_string(text, ctx, strict)
+            # A Python plugin can read an alias that starts a nested template.
+            # Its Jinja expressions still need lazy hostvars entries.
+            with self._plugin_arg_scope(None):
+                result = self._render_string(text, ctx, strict)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -2706,17 +3768,107 @@ class _Templater:
             return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
+    def _has_lookup_call(self, text):
+        if not _looks_templated(text) or not self._LOOKUP_CALL.search(text):
+            return False
+        if text not in self._lookup_templates:
+            nodes = jinja2.nodes
+            has_lookup = defer_lookup = False
+            try:
+                pending = [(self.env.parse(text), False, False)]
+                while pending:
+                    node, in_lookup, composed = pending.pop()
+                    if (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name)
+                            and node.node.name in ("lookup", "query", "q")):
+                        has_lookup = True
+                        in_lookup = True
+                        if not node.args or not isinstance(node.args[0], nodes.Const):
+                            defer_lookup = True
+                            break
+                    if in_lookup and isinstance(node, nodes.Const) and isinstance(node.value, str):
+                        # Lookup terms are templated after Jinja constructs them.
+                        # Their rendered shape may differ from any single literal.
+                        if _looks_templated(node.value) or (composed and "{" in node.value):
+                            defer_lookup = True
+                            break
+                    composed = composed or (in_lookup and isinstance(node, (nodes.Concat, nodes.Add)))
+                    pending.extend((child, in_lookup, composed) for child in node.iter_child_nodes())
+            except RecursionError:
+                # The parser may succeed later with a shallower call stack.
+                return False
+            except jinja2.TemplateSyntaxError:
+                # Report a parser error only if the value is used.
+                pass
+            self._lookup_templates[text] = has_lookup, defer_lookup
+        return self._lookup_templates[text][0]
+
+    def _contains_mixed_lookup(self, inherited, overrides, role_layers):
+        # Scope maps may contain an entire inventory. A template that can
+        # access one needs lazy binding without inspecting the map itself.
+        cache = self._inherited_lookup_scans
+        for key in cache.keys() - inherited.keys():
+            del cache[key]
+        scope = {**inherited, **overrides} if overrides else inherited
+        for key, value in scope.items():
+            if key in ("vars", "hostvars"):
+                continue
+            # Facts can change in place. Scan task overrides independently.
+            if key != "ansible_facts" and key not in overrides and isinstance(
+                    value, (dict, list, tuple)):
+                previous, was_role_data, needs_deferral = cache.get(key, (None, False, False))
+                if previous is not value:
+                    plain_role_data = (type(value) in (dict, list, tuple)
+                                       and any(layer.get(key) is value for layer in role_layers))
+                    # Compiled tasks can deserialize equal copies of raw role
+                    # data. Live variables can contain views with lazy equality.
+                    if not (plain_role_data and was_role_data and type(value) is type(previous)
+                            and value == previous):
+                        needs_deferral = self._value_needs_lookup_deferral(value)
+                    cache[key] = value, plain_role_data, needs_deferral
+            else:
+                needs_deferral = self._value_needs_lookup_deferral(value)
+            if needs_deferral:
+                return True
+        return False
+
+    def _value_needs_lookup_deferral(self, value):
+        pending = [value]
+        seen = set()
+        while pending:
+            value = pending.pop()
+            if isinstance(value, (_LazyTplDict, _LazyTplList)):
+                value = value._raw
+            if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate):
+                stripped = value.strip()
+                if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
+                    return True
+                if self._has_lookup_call(stripped):
+                    if self._lookup_templates[stripped][1] or _bare_template_expression(stripped, lex=self.env.lex) is None:
+                        return True
+            elif type(value) in (dict, list, tuple) and id(value) not in seen:
+                seen.add(id(value))
+                if type(value) is dict:
+                    if len(value) == 1 and ("__ansiroll_unsafe__" in value or "__ansiroll_vault__" in value):
+                        continue
+                    pending.extend(value.values())
+                else:
+                    pending.extend(value)
+        return False
+
     def _render_string(self, text, ctx, strict=False):
         tracking = self._untrusted_task_interpolation is not None
-        if tracking:
+        lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
+        if lazy_names:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
-        template_key = (text, strict, tracking)
+        template_key = (text, strict, lazy_names)
+        stripped = text.strip()
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
-        expr = _bare_template_expression(text)
+        has_lookup = self._has_lookup_call(stripped)
+        expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is not None:
-            expr_key = (expr, strict, tracking)
+            expr_key = (expr, strict, lazy_names)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(text.strip(), env, ctx, strict)
@@ -2727,37 +3879,24 @@ class _Templater:
                     compiled = env.compile_expression(expr, undefined_to_none=False)
                     self._expr_cache[expr_key] = compiled
                 result = compiled(**ctx)
-            except jinja2.TemplateSyntaxError as e:
-                # Captured, not raised: surfaces when the value is used (or is
-                # inspected via dump_object), like Ansible 2.19.
-                return _captured_jinja_error(e, syntax=True)
             except Exception as e:
-                if strict and isinstance(e, jinja2.UndefinedError):
-                    return _captured_jinja_error(e)
-                try:
-                    tmpl = self._template_cache.get(template_key)
-                    if tmpl is None:
-                        tmpl = env.from_string(text)
-                        self._template_cache[template_key] = tmpl
-                    result = tmpl.render(**ctx)
-                except jinja2.TemplateError as e:
-                    return _captured_jinja_error(
-                        e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
-                    )
+                # Capture evaluation errors without replaying lookups.
+                return _captured_jinja_error(e, syntax=isinstance(e, jinja2.TemplateSyntaxError))
         else:
             try:
                 tmpl = self._template_cache.get(template_key)
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-            except jinja2.TemplateSyntaxError as e:
-                return _captured_jinja_error(e, syntax=True)
-            try:
                 result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
                 return _captured_jinja_error(
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
                 )
+            except Exception as e:
+                if not has_lookup:
+                    raise
+                return _captured_jinja_error(e)
         try:
             result = _concretize(result)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
@@ -2776,13 +3915,17 @@ class _Templater:
             return expr
         expr = str(expr)
         ctx = self._play_var_scope(ctx, strict)
-        expr_key = (expr, strict, False)
+        lazy_names = bool(ctx.get(_DEFER_LOOKUP_NAMES))
+        expr_key = (expr, strict, lazy_names)
         previous = self._current_ctx
         self._current_ctx = ctx
         try:
             compiled = self._expr_cache.get(expr_key)
             if compiled is None:
-                env = self._strict_env if strict else self.env
+                if lazy_names:
+                    env = self._strict_conditional_env if strict else self._conditional_env
+                else:
+                    env = self._strict_env if strict else self.env
                 compiled = env.compile_expression(expr, undefined_to_none=False)
                 self._expr_cache[expr_key] = compiled
             return compiled(**ctx)
@@ -2803,8 +3946,8 @@ def _as_text(v):
         v._fail_with_undefined_error()
     if v is None:
         return ""
-    if isinstance(v, (dict, list)):
-        return json.dumps(v)
+    if isinstance(v, (dict, list, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
+        return json.dumps(v, **_view_json_options({}))
     if isinstance(v, bool):
         return "true" if v else "false"
     return str(v)
@@ -3029,7 +4172,7 @@ class Runtime:
             return tuple(self.template(v, ctx, _seen, strict) for v in value)
         if isinstance(value, str):
             out = self.templater.render_string(value, ctx, strict=strict)
-            if isinstance(out, (dict, list, tuple)) and out is not value:
+            if isinstance(out, (dict, list, tuple, _RawSnapshotMapping, _RawSnapshotList)) and out is not value:
                 # A bare expression returned a container that may hold lazy
                 # variable views -- resolve them now that it is used.  The
                 # result is data and is never templated again.
@@ -3836,9 +4979,11 @@ class Runtime:
         # < role vars < block vars < task vars < include_vars < set_fact/
         # register < role params < include params < extra vars < loop item.
         ctx = {}
-        ctx.update(task.get("role_defaults") or {})
+        role_defaults = task.get("role_defaults") or {}
+        role_vars = task.get("role_vars") or {}
+        ctx.update(role_defaults)
         ctx.update(self.vars)
-        ctx.update(task.get("role_vars") or {})
+        ctx.update(role_vars)
         ctx.update(overlay)
         higher_vars = self._layered_ctx({}, overlay, task.get("role_params"))
         if task.get("type") == "include":
@@ -3853,7 +4998,10 @@ class Runtime:
         # A loop expression can use task vars, and later uses can see the
         # loop bindings. Keep templates live until they are actually read.
         looped = task.get("type") != "include" and task.get("loop") is not None
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped))
+        # Inherited lookups can be reached through aliases in task vars.
+        mixed_lookup = self.templater._contains_mixed_lookup(
+            {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -3866,20 +5014,28 @@ class Runtime:
         # for every task while preserving other hosts from the snapshot.
         hostvars = dict(hostvars) if isinstance(hostvars, dict) else {}
         current = dict(hostvars.get(self.host) or {})
+        inventory_order = tuple(current)
+        host_task_bindings = {}
         for key, value in ctx.items():
             if key in ("hostvars", "vars"):
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
-                # A play alias can refer back to the host value it shadows.
+                if mixed_lookup and key in task_vars:
+                    host_task_bindings[key] = value
+                # An alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
                     current.setdefault(key, self._initial_host_vars[key])
                 if key in self._module_fact_layer:
                     current[key] = self._module_fact_layer[key]
                 continue
             current[key] = value
+        if host_task_bindings:
+            current = _TaskHostVars(current, host_task_bindings, tuple(dict.fromkeys((*inventory_order, *ctx))))
         hostvars[self.host] = current
         ctx["hostvars"] = hostvars
+        if mixed_lookup:
+            ctx[_DEFER_LOOKUP_NAMES] = True
         loop_snapshot = looped and bool(task_vars)
         play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
         if "vars" not in ctx or play_magic:
@@ -4136,6 +5292,8 @@ class Runtime:
             return None, None, False
         try:
             return self._resolve_loop(loop, ctx), None, False
+        except _CapturedTemplateError as ex:
+            result = {"failed": True, "changed": False, "msg": str(ex)}
         except jinja2.UndefinedError as ex:
             # Only undefined loop values are deferred until the task's
             # condition has had a chance to skip it.
@@ -5090,6 +6248,7 @@ class Runtime:
                 lmode = "0%03o" % meta["mode"]
             if name == "template":
                 tctx = dict(ctx)
+                tctx[_TEMPLATE_FILE_TEXT] = True
                 try:
                     import platform
                     import pwd
@@ -6346,9 +7505,9 @@ def _chan_send(out_fd, obj):
 def _delegate_template_value(value):
     if isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
         return {"__ansiroll_unsafe__": str(value)}
-    if isinstance(value, dict):
+    if isinstance(value, (dict, _RawSnapshotMapping)):
         return {key: _delegate_template_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_template_value(item) for item in value]
     return value
 
@@ -6384,7 +7543,7 @@ def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path)
 
 def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
     """Keep each member's position and classify failures at its own path."""
-    if isinstance(value, dict):
+    if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
         if all(isinstance(key, str) for key in keys):
             wire_keys = keys
@@ -6394,7 +7553,7 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
             mapping_keys.append((path, keys))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys, (*path, wire_key))
                 for wire_key, key in zip(wire_keys, keys)}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys, (*path, index))
                 for index in range(len(value))]
     return _fail_on_undef(value)
@@ -6412,17 +7571,37 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
-def _resolve_delegated_play_var(name, scope, templater):
+def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=None):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
-        rendered = scope[name]
-        if not isinstance(scope, _PlayVarScope):
-            rendered = templater.resolve_variable(name, rendered, scope)
+        if member is not None:
+            container, key = members[member]
+            rendered = container[key]
+        else:
+            rendered = scope[name]
+            if name == "hostvars" or not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
+                rendered = templater.resolve_variable(name, rendered, scope)
+        mapping = isinstance(rendered, (dict, _RawSnapshotMapping))
+        if members is not None and (mapping or isinstance(rendered, (list, tuple, _HostVarEntries, _RawSnapshotList))):
+            # Send the container's shape without reading any of its members.
+            def reserve(key):
+                index = len(members)
+                members.append((rendered, key))
+                return index
+
+            slots = ({key: reserve(key) for key in rendered} if mapping
+                     else [reserve(index) for index in range(len(rendered))])
+        else:
+            slots = None
         undefined = []
         errors = []
         mapping_keys = []
-        value = _delegate_fallback_value(rendered, undefined, errors, mapping_keys)
+        value = _delegate_fallback_value(rendered if slots is None else slots, undefined, errors, mapping_keys)
         result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
+        if slots is not None:
+            result["lazy_members"] = True
+            if isinstance(rendered, _HostVarView):
+                result["hostvar_view"] = True
         if errors:
             result["errors"] = errors
         if mapping_keys:
@@ -6442,7 +7621,9 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
     for key, value in (ctx or {}).items():
-        if key == "vars" or (deferred is not None and key == "omit"):
+        if key in ("vars", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT):
+            continue
+        if key == "omit" and deferred is not None and key not in resolve_keys:
             continue
         try:
             if deferred is not None and key not in resolve_keys:
@@ -6544,10 +7725,15 @@ def agent_main():
             # Only the agent has the play's bundled filters and lookup plugins.
             # Synchronize also reads connection and executable vars directly.
             action = (task.get("action") or "").rsplit(".", 1)[-1]
+            if action == "template":
+                ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
+            defer_template = action == "template" and ctx.get(_DEFER_LOOKUP_NAMES)
+            if defer_template:
+                resolve_keys = {"omit"}
             deferred = {} if resolve_keys is not None else None
-            lazy_play = set() if deferred is not None else None
+            lazy_play = set() if action == "synchronize" else None
             scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
@@ -6563,17 +7749,27 @@ def agent_main():
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),
             }
-            if deferred:
+            if lazy_play is not None and deferred:
                 frame["deferred_vars"] = deferred
             if lazy_play:
                 frame["lazy_play_vars"] = sorted(lazy_play)
+            requested_names = lazy_play or set()
+            members = [] if defer_template else None
+            if defer_template:
+                requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+                if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
+                    requested_names.add("hostvars")
+                frame["lazy_template_vars"] = sorted(requested_names)
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
                 name = reply.get("name")
+                member = reply.get("member")
                 fallback = None
-                if isinstance(name, str) and lazy_play and name in lazy_play:
-                    fallback = _resolve_delegated_play_var(name, scope, templater)
+                if member is None and isinstance(name, str) and name in requested_names:
+                    fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
+                elif members is not None and type(member) is int and 0 <= member < len(members):
+                    fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)
                 _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
                 reply = _chan_recv()
             if not reply or reply.get("t") != "delegate_result":

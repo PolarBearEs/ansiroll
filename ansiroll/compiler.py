@@ -392,6 +392,10 @@ def _condition_value(condition, variables, templater):
         from jinja2 import meta as jinja_meta
         source = str(condition) if trusted else "{{ (%s) }}" % condition
         parsed = templater.env.parse(source)
+        # Jinja's undeclared-variable scan compiles and can fold constant
+        # filter operands in this AST. Check for runtime filters first.
+        if _uses_nondeterministic_filter(parsed):
+            return None
         referenced = jinja_meta.find_undeclared_variables(parsed)
     except Exception:
         return None
@@ -403,8 +407,6 @@ def _condition_value(condition, variables, templater):
     if any(node.name not in variables and node.name in templater.env.globals
            and node.name not in _DETERMINISTIC_GLOBALS
            for node in parsed.find_all(jinja_nodes.Name)):
-        return None
-    if _uses_nondeterministic_filter(parsed):
         return None
     if not referenced.issubset(variables):
         # A tracking StrictUndefined distinguishes an unknown value that Jinja

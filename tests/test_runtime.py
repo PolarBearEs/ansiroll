@@ -5,6 +5,7 @@ template/copy-with-content, so no Ansible or embedded modules are required.
 """
 
 import io
+import json
 import os
 import shlex
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from ansiroll.runtime import (
-    ConditionalError, Runtime, UntrustedConditional, _parse_output,
+    _OMIT, ConditionalError, Runtime, UntrustedConditional, _parse_output,
 )
 
 
@@ -34,6 +35,1445 @@ def run(tasks, host_vars=None, handlers=None, gather=False):
 
 def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
+
+
+def test_lookup_followed_by_another_template_segment_renders_as_text():
+    templater = Runtime({}, "", {}).templater
+    calls = []
+
+    def lookup(name):
+        calls.append(name)
+        return "first"
+
+    templater.env.globals["lookup"] = lookup
+    text = "{{ lookup('source') }}/{{ 'second' }}"
+    assert templater.render_string(text, {}) == "first/second"
+    assert templater.render_string(" " + text + " ", {}) == " first/second "
+    assert templater.render_string(text, {}) == "first/second"
+    assert calls == ["source"] * 3
+
+
+def test_bare_expression_honors_the_plus_opening_delimiter():
+    templater = Runtime({}, "", {}).templater
+    text = "{{+ 'hello' }}"
+    if next(templater.env.lex(text))[2] != "{{+":
+        pytest.skip("Jinja does not support the plus opening delimiter")
+    assert templater.render_string(text, {}) == "hello"
+
+
+@pytest.mark.parametrize(("opening", "closing"), [("{{", "}}"), ("{{-", "}}"), ("{{", "-}}"), ("{{-", "-}}")])
+def test_single_lookup_with_a_quoted_template_keeps_its_native_value(opening, closing):
+    templater = Runtime({}, "", {}).templater
+    templater.env.globals["query"] = lambda _name, term: [term]
+    assert templater.render_string("{{ query('source', '{{ key }}') }}", {}) == ["{{ key }}"]
+    block = "{% if true %}x{% endif %}"
+    assert templater.render_string(f"{opening} query('source', '{block}') {closing}", {}) == [block]
+
+
+def test_lookup_with_literal_closing_braces_and_null_suffix():
+    templater = Runtime({}, "", {}).templater
+    templater.env.globals["lookup"] = lambda _name: "first"
+    assert templater.render_string("{{ lookup('source') }}/literal}}", {}) == "first/literal}}"
+    assert templater.render_string("{{ lookup('source') }}}", {}) == "first}"
+    assert templater.render_string('{{ {"x": 1}}}', {}) == {"x": 1}
+    assert templater.render_string("{{ lookup('source') }}/{{ suffix }}", {"suffix": None}) == "first/"
+    assert templater.render_string("{{ suffix }}", {"suffix": None}) is None
+
+
+def test_null_interpolation_respects_legacy_native_mode(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    templater = Runtime({}, "", {}).templater
+    for text in ("prefix/{{ suffix }}", "prefix/{{ none }}"):
+        ctx = {"suffix": None, "__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": True}}
+        assert templater.render_string(text, ctx) == "prefix/None"
+        ctx["__ansiroll_controller_config"]["DEFAULT_JINJA2_NATIVE"] = False
+        assert templater.render_string(text, ctx) == "prefix/"
+
+
+def test_template_file_interpolates_null_as_empty_in_legacy_native_mode(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {})
+    source = "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/{{ empty }}"
+    context = {"empty": None, "__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": True},
+               "__ansiroll_controller_env": {"ANSIROLL_TEST_PREFIX": "controller"}}
+    monkeypatch.setattr(runtime, "_copy_single_file", lambda _task, _args, data, *_rest: data)
+    assert runtime._run_file_action("template", {"_baked": {"out.j2": source}},
+                                    {"src": "out.j2", "dest": "/out"}, context) == b"controller/"
+    assert runtime.templater.render_string(source, context) == "controller/None"
+
+
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("vars.row.copy()[0]", 17),
+    ("vars.row.copy().pop(0)", 17),
+    ("[rows.remove(17), rows | length] | last", 1),
+    ("vars.row.copy() < [99, 99]", True),
+    ("[99, 99] > vars.row.copy()", True),
+    ("vars.row.copy() != [99, 99]", True),
+])
+def test_copy_of_deferred_task_list_renders_only_selected_member(expression, expected):
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    task = _task("1", "Copy row", "debug", args={"msg": "{{ " + expression + " }}"}, vars={
+        "number": 17, "row": ["{{ number }}", "{{ lookup('source') }}/tail"], "rows": "{{ vars.row.copy() }}",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == expected
+    assert calls == []
+
+
+@pytest.mark.parametrize("expression", [
+    "settings.copy().used",
+    "settings.copy().setdefault('used')",
+    "settings.copy().pop('used')",
+    "settings.copy().popitem()[1]",
+])
+def test_copy_of_deferred_task_mapping_renders_only_selected_member(expression):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Read a copied setting", "debug", loop=["sample"], vars={
+        "suffix": "{{ item }}",
+        "settings": {"unused": "{{ lookup('unused') }}/{{ suffix }}",
+                     "used": "{{ lookup('chosen') }}/{{ suffix }}"},
+    })
+    assert runtime.template("{{ " + expression + " }}", runtime._task_ctx(task, {"item": "sample"})) == "chosen/sample"
+    assert calls == ["chosen"]
+
+
+@pytest.mark.parametrize(("mutation", "read"), [
+    ("copied.append(source)", "copied[-1]"),
+    ("copied.extend([source])", "copied.copy().pop()"),
+    ("copied.insert(0, source)", "(copied[:1] | first)"),
+])
+def test_task_list_copy_keeps_written_values_literal(mutation, read):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Write a copied list", "debug", loop=["sample"], vars={
+        "rows": ["{{ lookup('unread') }}/tail", "{{ item }}"],
+    })
+    template = ("{% set copied = rows.copy() %}{{ copied[1] }}|"
+                "{% set source = \"{{ lookup('written') }}\" %}"
+                "{% set ignored = " + mutation + " %}{{ " + read + " }}")
+    assert runtime.template(template, runtime._task_ctx(task, {"item": "sample"})) == (
+        "sample|{{ lookup('written') }}")
+    assert not calls
+
+
+@pytest.mark.parametrize("mapping", ["vars", "hostvars[inventory_hostname]", "hostvars.other"])
+@pytest.mark.parametrize(("mutation", "read"), [
+    ("copied.setdefault('new', source)", "copied.new"),
+    ("copied.update({'original': source})", "copied.copy().pop('original')"),
+])
+def test_magic_mapping_copy_keeps_written_values_literal(mapping, mutation, read):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "original": 17,
+                               "hostvars": {"h": {"original": 17}, "other": {"original": 17}}})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Write copied magic variables", "debug", vars={
+        "unused": "{{ lookup('unread') }}/tail",
+    })
+    template = ("{% set copied = " + mapping + ".copy() %}{{ copied.original }}|"
+                "{% set source = \"{{ lookup('written') }}\" %}"
+                "{% set ignored = " + mutation + " %}{{ " + read + " }}")
+    assert runtime.template(template, runtime._task_ctx(task, {})) == "17|{{ lookup('written') }}"
+    assert not calls
+
+
+@pytest.mark.parametrize(("nested", "mutation", "expected"), [
+    (["original"], "copied.nested.append('added')", ["original", "added"]),
+    ({"original": 1}, "copied.nested.update(added=2)", {"original": 1, "added": 2}),
+])
+@pytest.mark.parametrize("read", [
+    "copied.nested",
+    "copied.copy().get('nested')",
+    "(copied.items() | selectattr('0', 'equalto', 'nested') | first)[1]",
+])
+def test_vars_copy_preserves_nested_mutations(nested, mutation, expected, read):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "nested": nested})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("looked up " + name)
+    task = _task("1", "Mutate a copied variable", "debug", vars={
+        "unused": "{{ lookup('unread') }}/tail",
+    })
+    template = ("{% set copied = vars.copy() %}{% set ignored = " + mutation + " %}"
+                "{{ " + read + " | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == expected
+
+
+def test_legacy_vars_copy_iteration_keeps_unmodified_inventory_members_literal(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('inventory') }}"
+    runtime = Runtime({}, "", {"payload": {"child": literal, "nested": {"items": ["original"]}}})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Iterate a copied variable", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set loaded = copied.payload.child %}"
+                "{% set ignored = copied.payload.nested['items'].append('added') %}"
+                "{% set iterated = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ [loaded, copied.payload.nested['items'], iterated] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        "inventory", ["original", "added"], {"child": literal, "nested": {"items": ["original", "added"]}},
+    ]
+    assert calls == ["inventory"]
+
+
+def test_legacy_vars_copy_list_operations_preserve_inventory_sources(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('number') }}"
+    runtime = Runtime({}, "", {"nums": [3, 1, literal]})
+    runtime.templater.env.globals["lookup"] = lambda name: 2 if name == "number" else pytest.fail(name)
+    task = _task("1", "Sort inventory list", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set ignored = copied.nums.sort() %}"
+                "{% set removed = copied.nums.remove(1) %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'nums') | first)[1] %}"
+                "{{ [copied.nums < [4], copied.nums, entry] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        True, [2, 3], [literal, 3],
+    ]
+
+
+@pytest.mark.parametrize("filter_name", ["to_json", "tojson"])
+def test_legacy_vars_copy_iteration_and_direct_reads_share_mutations(monkeypatch, filter_name):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('inventory') }}"
+    runtime = Runtime({}, "", {"payload": {"child": literal, "nested": [1]}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Mutate an iteration entry", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set payload = copied.payload %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set changed = entry.update(added=2) %}{% set appended = entry.nested.append(3) %}"
+                "{{ [copied.payload.added, payload.nested, entry] | " + filter_name + " }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        2, [1, 3], {"added": 2, "child": literal, "nested": [1, 3]},
+    ]
+
+
+def test_deep_copy_of_legacy_vars_detaches_data_without_resolving_unused_inputs(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"nested": [1]}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "deep_copy", "source": """
+from copy import deepcopy
+
+class FilterModule:
+    def filters(self):
+        return {'deep_copy': deepcopy}
+"""}])
+    task = _task("1", "Deep copy vars", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}{% set seen = copied.payload.nested.append(2) %}"
+                "{% set detached = copied | deep_copy %}{% set changed = detached.payload.nested.append(3) %}"
+                "{{ [copied.payload.nested, detached.payload.nested] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [[1, 2], [1, 2, 3]]
+
+
+def test_legacy_inventory_views_work_in_collection_filters_and_dict_lookup(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"child": {"keep": 1}, "nested": [[1], [2, [3]]]}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Read raw inventory collections", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ [(entry | combine({'child': {'add': 2}}, recursive=true)).child,"
+                " entry.nested | flatten, query('dict', entry.child)] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        {"keep": 1, "add": 2}, [1, 2, 3], [{"key": "keep", "value": 1}],
+    ]
+
+
+@pytest.mark.parametrize("filter_name", ["to_yaml", "to_nice_yaml"])
+def test_legacy_inventory_views_serialize_yaml_and_keep_bindings_when_reversed(monkeypatch, filter_name):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('raw') }}"
+    runtime = Runtime({}, "", {"payload": {"nested": [literal, "plain"]}})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    task = _task("1", "Reverse raw inventory", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set ignored = entry.nested.reverse() %}"
+                "{{ [entry | " + filter_name + " | from_yaml, copied.payload.nested] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        {"nested": ["plain", literal]}, ["plain", "rendered"],
+    ]
+    assert calls == ["raw"]
+
+
+def test_custom_plugin_receives_builtin_inventory_collections_and_keeps_writes(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    literal = "{{ lookup('raw') }}"
+    runtime = Runtime({}, "", {"payload": {"nested": [literal, "plain"]}})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    runtime.templater.register_plugins([{"kind": "filter", "name": "inspect_inventory", "source": """
+import json
+
+def inspect_inventory(entry):
+    assert type(entry) is dict
+    assert type(entry['nested']) is list
+    before = json.dumps(entry)
+    entry.update(added=2)
+    entry['nested'].reverse()
+    return before
+
+class FilterModule:
+    def filters(self):
+        return {'inspect_inventory': inspect_inventory}
+"""}])
+    task = _task("1", "Inspect raw inventory in Python", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set before = entry | inspect_inventory | from_json %}"
+                "{{ [before, copied.payload.added, copied.payload.nested] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        {"nested": [literal, "plain"]}, 2, ["plain", "rendered"],
+    ]
+    assert calls == ["raw"]
+
+
+@pytest.mark.parametrize("batch, member", [("[entry]", "0"), ("{'entry': entry}", "'entry'")])
+def test_custom_filter_keeps_inventory_views_in_caller_containers(monkeypatch, batch, member):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"count": 1}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "increment", "source": """
+def increment(batch, key):
+    assert type(batch[key]) is dict
+    batch[key]['count'] += 1
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'increment': increment}
+"""}])
+    task = _task("1", "Mutate a nested plugin argument twice", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set batch = " + batch + " %}"
+                "{{ batch | increment(" + member + ") }}{{ batch | increment(" + member + ") }}"
+                "{{ [copied.payload.count, entry.count, batch[" + member + "].count] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [3, 3, 3]
+
+
+def test_custom_filter_keeps_inventory_writes_from_jinja_callbacks(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "update_inventory", "source": """
+def update_inventory(values, callback):
+    values.append(2)
+    callback()
+    values.append(4)
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'update_inventory': update_inventory}
+"""}])
+    task = _task("1", "Update inventory around a Jinja callback", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% macro update() %}{% set ignored = entry.append(3) %}{% endmacro %}"
+                "{{ entry | update_inventory(update) }}"
+                "{{ [entry, copied.payload] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[1, 2, 3, 4]] * 2
+
+
+def test_custom_filter_writes_inventory_keys_in_the_final_order(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": {"a": 1, "b": 2}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "reorder_inventory", "source": """
+def reorder_inventory(entry):
+    entry['a'] = entry.pop('a')
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'reorder_inventory': reorder_inventory}
+"""}])
+    task = _task("1", "Reinsert a mapping key", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ entry | reorder_inventory }}"
+                "{{ [entry.keys() | list, copied.payload.keys() | list] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [["b", "a"]] * 2
+
+
+@pytest.mark.parametrize("lookup", ["lookup", "query"])
+def test_custom_lookups_receive_builtin_inventory_collections(monkeypatch, lookup):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"count": 3, "payload": {"values": ["{{ count }}"]}})
+    runtime.templater.register_plugins([{"kind": "lookup", "name": "encode_inventory", "source": """
+import json
+
+class LookupModule:
+    def run(self, terms, variables, **kwargs):
+        return [json.dumps([terms[0].pop('values'), kwargs['values']])]
+"""}])
+    task = _task("1", "Serialize an inventory lookup term", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    expression = lookup + "('encode_inventory', entry, values=entry['values'])"
+    if lookup == "query":
+        expression += " | first"
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set result = " + expression + " %}"
+                "{{ [result | from_json, entry['values']] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[[3], [3]], ["{{ count }}"]]
+
+
+def test_generator_filter_keeps_its_yielded_collections_builtin(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "generate_inventory", "source": """
+import json
+
+def generate_inventory(values):
+    item = [values]
+    yield item
+    yield json.dumps(item)
+
+class FilterModule:
+    def filters(self):
+        return {'generate_inventory': generate_inventory}
+"""}])
+    task = _task("1", "Reuse a yielded collection", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ entry | generate_inventory | list | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[[1]], "[[1]]"]
+
+
+def test_custom_filter_result_keeps_plugin_owned_collections(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "cache_inventory", "source": """
+import json
+
+cache = []
+
+def cache_inventory(values):
+    cache[:] = [values]
+    return cache
+
+def generate_independent(values):
+    item = [0]
+    yield item
+    item[0] = 1
+    yield item
+
+class FilterModule:
+    def filters(self):
+        return {'cache_inventory': cache_inventory, 'read_cache': lambda _: json.dumps(cache),
+                'generate_independent': generate_independent}
+"""}])
+    task = _task("1", "Keep plugin result identity where possible", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set cached = entry | cache_inventory %}"
+                "{{ [cached, entry | read_cache | from_json, entry | generate_independent | list] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[[1]], [[1]], [[1], [1]]]
+
+
+@pytest.mark.parametrize(("payload", "key"), [({"enabled": True}, "enabled"), ([True], 0)])
+def test_raw_inventory_collection_can_cross_delegation_and_render_as_json(monkeypatch, payload, key):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": payload})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Read a raw inventory entry", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    source = "{{ (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] }}"
+    entry = runtime.templater.render_string(source, runtime._task_ctx(task, {}))
+    assert json.loads(runtime_module._as_text(entry)) == payload
+    scope = {"alias": entry}
+    resolve = runtime_module._resolve_delegated_play_var
+    assert resolve("alias", scope, runtime.templater) == {"value": payload, "undefined": []}
+    members = []
+    slots = {key: 0} if isinstance(payload, dict) else [0]
+    assert resolve("alias", scope, runtime.templater, members=members) == {
+        "value": slots, "undefined": [], "lazy_members": True,
+    }
+    assert resolve(None, scope, runtime.templater, members=members, member=0) == {
+        "value": True, "undefined": [],
+    }
+
+
+@pytest.mark.parametrize("body", [
+    "{{ copied.used }}/{{ copied.used }}",
+    "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",
+    "{% set other = copied.copy() %}{{ copied.used }}/{{ other.used }}",
+])
+def test_task_mapping_copy_reuses_the_first_resolved_member(body):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+
+    def lookup(name):
+        calls.append(name)
+        return len(calls)
+
+    runtime.templater.env.globals["lookup"] = lookup
+    task = _task("1", "Read a copied setting twice", "debug", loop=["sample"], vars={
+        "settings": {"used": "{{ lookup('chosen') }}:{{ item }}", "unused": "{{ lookup('unused') }}/tail"},
+    })
+    template = "{% set copied = settings.copy() %}" + body
+    result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
+    assert result.split("/") == ["1:sample"] * body.count("{{")
+    assert calls == ["chosen"]
+
+
+@pytest.mark.parametrize(("mutation", "expression"), [
+    ("copied.setdefault('new', source)", "copied.new"),
+    ("copied.update({'used': source})", "copied.used"),
+    ("copied.update(used=source)", "copied.copy().pop('used')"),
+    ("copied.update({'used': source})", "copied.setdefault('used')"),
+    ("copied.update({'used': source})", "copied.popitem()[1]"),
+])
+def test_task_mapping_copy_keeps_written_values_literal(mutation, expression):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    task = _task("1", "Write a copied setting", "debug", loop=["sample"], vars={
+        "settings": {"kept": "{{ lookup('kept') }}/tail", "used": "{{ lookup('original') }}/tail"},
+    })
+    template = ("{% set copied = settings.copy() %}{{ copied.kept }}|"
+                "{% set source = \"{{ lookup('written') }}\" %}"
+                "{% set ignored = " + mutation + " %}{{ " + expression + " }}")
+    assert runtime.template(template, runtime._task_ctx(task, {"item": "sample"})) == (
+        "kept/tail|{{ lookup('written') }}")
+    assert calls == ["kept"]
+
+
+def test_task_mapping_copy_reuses_a_captured_lookup_error():
+    from ansiroll.runtime import _captured, _is_undef
+
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+
+    def lookup(name):
+        calls.append(name)
+        return _captured("failed lookup")
+
+    runtime.templater.env.globals["lookup"] = lookup
+    task = _task("1", "Read a failed setting twice", "debug", loop=["sample"], vars={
+        "settings": {"used": "{{ lookup('chosen') }}/tail", "unused": "{{ lookup('unused') }}/tail"},
+    })
+    ctx = runtime._task_ctx(task, {"item": "sample"})
+    copied = runtime.templater.render_string("{{ settings.copy() }}", ctx)
+    first = copied["used"]
+    assert _is_undef(first)
+    assert copied["used"] is first
+    assert calls == ["chosen"]
+
+
+def test_sort_of_deferred_task_list_compares_rendered_members():
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    task = _task("1", "Sort row", "debug", args={"msg": "{{ [rows.sort(), rows] | last }}"}, vars={
+        "number": 17, "row": ["{{ number }}", 2], "rows": "{{ vars.row.copy() }}",
+        "spare": "{{ lookup('source') }}/tail",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == [2, 17]
+    assert calls == []
+
+
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("[row.sort(), row] | last", [2, 17]),
+    ("[row.pop(), vars.row] | last", [17]),
+    ("[vars.row.pop(), hostvars[inventory_hostname].row] | last", [17]),
+    ("[nested.rows.pop(), nested.rows] | last", [17]),
+])
+def test_deferred_task_container_mutations_share_a_render_view(expression, expected):
+    runtime, frames = run([_task("1", "Mutate row", "debug", args={"msg": "{{ " + expression + " }}"}, vars={
+        "row": [17, 2], "nested": {"rows": [17, 2]}, "spare": "{{ lookup('unused') }}/tail",
+    })])
+    assert not runtime.failed
+    assert frames[0]["result"]["msg"] == expected
+
+
+@pytest.mark.parametrize("scope", ["hostvars", "vars.hostvars"])
+def test_current_hostvars_resolve_deferred_task_aliases(scope):
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"alias": 1}}},
+                      on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or 17
+    task = _task("1", "Read alias", "debug", args={
+        "msg": "{{ [" + scope + "[inventory_hostname].alias, alias] }}",
+    }, vars={"alias": "{{ lookup('number') }}", "spare": "{{ lookup('unused') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == [17, 17]
+    assert calls == ["number"]
+
+
+def test_deferred_task_alias_can_read_its_inventory_hostvar():
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "alias": 17}, on_result=frames.append)
+    task = _task("1", "Read inventory fallback", "debug", args={"msg": "{{ alias }}"}, vars={
+        "alias": "{{ hostvars[inventory_hostname].alias }}",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == 17
+
+
+@pytest.mark.parametrize(("member", "template_value", "inventory_value"), [
+    ("key", {"key": "{{ hostvars[inventory_hostname].alias.key }}"}, {"key": 17}),
+    ("0", ["{{ hostvars[inventory_hostname].alias[0] }}"], [17]),
+])
+def test_deferred_task_container_can_read_its_inventory_hostvar(member, template_value, inventory_value):
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "alias": inventory_value}, on_result=frames.append)
+    task = _task("1", "Read inventory fallback", "debug", args={"msg": "{{ alias." + member + " }}"}, vars={
+        "alias": template_value,
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == 17
+
+
+def test_deferred_task_container_can_default_a_missing_inventory_hostvar():
+    runtime, frames = run([_task("1", "Default missing inventory", "debug", args={
+        "msg": "{{ [alias.value, alias.available] }}",
+    }, vars={"alias": {
+        "value": "{{ hostvars[inventory_hostname].alias.b | default(17) }}",
+        "available": "{{ hostvars[inventory_hostname].alias.b is defined }}",
+    }})])
+    assert not runtime.failed
+    assert frames[0]["result"]["msg"] == [17, False]
+
+
+@pytest.mark.parametrize("method", ["pop('alias')", "setdefault('alias')"])
+def test_current_hostvars_methods_resolve_deferred_task_aliases(method):
+    _, frames = run([_task("1", "Read hostvars", "debug", args={
+        "msg": "{{ hostvars[inventory_hostname]." + method + " }}",
+    }, vars={"number": 17, "alias": "{{ number }}"})])
+    assert frames[0]["result"]["msg"] == 17
+
+
+def test_custom_lookup_reads_deferred_task_alias_from_hostvars():
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater._lookup_loaded["host_alias"] = lambda terms, variables: [variables["hostvars"]["h"]["alias"]]
+    task = _task("1", "Read hostvar in lookup", "debug", args={"msg": "{{ payload }}"}, vars={
+        "alias": "{{ number }}", "number": 17, "payload": "{{ lookup('host_alias') }}/tail",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == "17/tail"
+
+
+@pytest.mark.parametrize("copy", [False, True], ids=["direct", "copy"])
+@pytest.mark.parametrize("expression", [
+    "({view}.items() | selectattr('0', 'equalto', 'original') | first)[1]",
+    "{view}.items()[0][1]",
+    "{view}.values()[0]",
+    "{view}.original",
+])
+def test_legacy_hostvars_entries_render_only_accessed_sources(monkeypatch, expression, copy):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames = []
+    host_vars = {"inventory_hostname": "h", "hostvars": {"h": {"original": "{{ seed }}"}}, "seed": "ready"}
+    runtime = Runtime({}, "", host_vars, on_result=frames.append)
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    view = "hostvars[inventory_hostname].copy()" if copy else "hostvars[inventory_hostname]"
+    task = _task("1", "Iterate hostvars", "debug", args={
+        "msg": "{{ " + expression.format(view=view) + " }}",
+    }, vars={"unused": "{{ lookup('unused') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["result"]["msg"] == "ready"
+    assert not calls
+
+
+def test_hostvars_entries_keep_deferred_bindings_in_task_order():
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or 17
+    task = _task("1", "Read task entry", "debug", args={
+        "msg": "{{ hostvars[inventory_hostname].items()[1] }}",
+    }, vars={"alias": "{{ lookup('number') }}", "ordinary": 2, "unused": "{{ lookup('spare') }}/tail"})
+    ctx = runtime._task_ctx(task, {})
+    assert runtime.template(task["args"]["msg"], ctx) == ("alias", 17)
+    assert calls == ["number"]
+
+
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("entries == []", False), ("entries != []", True), ("[] == entries", False),
+    ("prefix == entries", False), ("entries != prefix", True),
+    ("prefix != entries", True),
+    ("entries < [18]", True), ("entries >= [18]", False), ("[18] > entries", True),
+    ("entries[:1] == [17]", True), ("entries > [17]", True),
+])
+def test_hostvars_comparisons_leave_unneeded_values_unread(expression, expected):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Compare hostvars entries", "debug", vars={
+        "unused": "{{ lookup('unused') }}/tail", "prefix": ["{{ lookup('unused') }}/tail"],
+    })
+    template = ("{% set entries = hostvars[inventory_hostname].copy().values() %}"
+                "{{ (" + expression + ") | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) is expected
+
+
+@pytest.mark.parametrize("hostvars", ["lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]"])
+def test_vars_lookup_preserves_lazy_hostvars_members(hostvars):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": "{{ seed }}"}},
+                                "seed": "ready"})
+    runtime.templater._lookup_loaded["unused"] = lambda *args, **kwargs: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Read a hostvars lookup member", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    expression = "{{ " + hostvars + "[inventory_hostname].copy().original }}"
+    assert runtime.template(expression, runtime._task_ctx(task, {})) == "ready"
+
+
+@pytest.mark.parametrize("expression", [
+    "lookup('vars', 'hostvars')", "query('vars', 'hostvars')[0]", "{inventory_hostname: hostvars.h.copy()}",
+])
+@pytest.mark.parametrize("whole_result", [True, False])
+def test_vars_lookup_hostvars_resolves_each_value_once(expression, whole_result):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
+        "original": "{{ lookup('counting') }}",
+    }}})
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(None)
+        return [len(calls)]
+
+    runtime.templater._lookup_loaded["counting"] = counting
+    task = _task("1", "Read the whole hostvars lookup", "debug", vars={
+        "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
+    })
+    ctx = runtime._task_ctx(task, {})
+    if whole_result:
+        result = runtime.template("{{ " + expression + " }}", ctx)
+        assert type(result) is dict
+        assert json.loads(json.dumps(result))["h"]["original"] == 1
+    else:
+        template = "{% set hosts = " + expression + " %}{{ hosts.h.original }}/{{ hosts.h.original }}"
+        assert runtime.template(template, ctx) == "1/1"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("filter_name", [None, "to_json", "to_nice_json"])
+def test_hostvars_lookup_is_read_once_by_legacy_debug_and_json(monkeypatch, filter_name):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.12.10")
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
+        "original": "{{ lookup('counting') }}",
+    }}}, on_result=frames.append)
+
+    def counting(*args, **kwargs):
+        calls.append(None)
+        return [len(calls)]
+
+    runtime.templater._lookup_loaded["counting"] = counting
+    expression = "lookup('vars', 'hostvars')"
+    args = {"msg": "{{ " + expression + " | " + filter_name + " }}"} if filter_name else {"var": expression}
+    task = _task("1", "Read the whole hostvars lookup", "debug", args=args, vars={
+        "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
+    })
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert frames[0]["status"] == "ok"
+    result = frames[0]["result"]
+    rendered = json.loads(result["msg"]) if filter_name else result[expression]
+    assert rendered["h"]["original"] == 1
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json"])
+def test_json_vault_error_does_not_resolve_later_hostvars(filter_name):
+    import jinja2
+
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {
+        "original": "{{ lookup('unused') }}",
+    }}, "vault_value": {"__ansiroll_vault__": "ciphertext"}})
+    runtime.templater._lookup_loaded["unused"] = lambda *args, **kwargs: pytest.fail("unneeded lookup ran")
+    task = _task("1", "Serialize hostvars after vault", "debug", vars={
+        "mixed": "{{ lookup('env', 'ANSIROLL_HOSTVARS_UNUSED') }}/tail",
+    })
+    expression = "{{ {'vault': vault_value, 'later': lookup('vars', 'hostvars').h} | " + filter_name + " }}"
+    with pytest.raises(jinja2.UndefinedError, match="undecryptable variable"):
+        str(runtime.template(expression, runtime._task_ctx(task, {})))
+
+
+@pytest.mark.parametrize("container", ["list", "dict", "hostvars_copy"])
+def test_custom_filter_receives_hostvars_values_as_a_list(container):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
+import json
+class FilterModule:
+    def filters(self):
+        return {'dump_hostvars': json.dumps}
+"""}])
+    runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["value"]
+    task = _task("1", "Serialize hostvars through a custom filter", "debug", vars={
+        "alias": "{{ lookup('sample') }}/tail",
+    })
+    ctx = runtime._task_ctx(task, {})
+    templates = {
+        "list": "{{ hostvars.h.values() | dump_hostvars }}",
+        "dict": "{{ {'values': hostvars.h.values()} | dump_hostvars }}",
+        "hostvars_copy": ("{% set snapshot = hostvars.h.copy() %}"
+                          "{% set unused = snapshot.update({'values': hostvars.h.values()}) %}"
+                          "{{ snapshot | dump_hostvars }}"),
+    }
+    result = json.loads(runtime.template(templates[container], ctx))
+    values = result if container == "list" else result["values"]
+    assert values[0] == 17
+    assert "value/tail" in values
+
+
+def test_custom_jinja_tests_receive_hostvars_lists_without_loading_other_bindings():
+    hostvars = {"h": {"original": 17}, "other": {"value": 23}}
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars})
+    runtime.templater.register_plugins([{"kind": "test", "name": "python_list", "source": """
+def python_list(value):
+    return isinstance(value, list)
+
+def nested_list(snapshot):
+    return isinstance(snapshot['nested'], list)
+
+class TestModule:
+    def tests(self):
+        return {'python_list': python_list, 'nested_list': nested_list}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Inspect hostvars inputs", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    ctx = runtime._task_ctx(task, {})
+    assert runtime.template("{{ hostvars.other.values() is python_list }}", ctx) is True
+    expression = ("{% set snapshot = hostvars.h.copy() %}"
+                  "{% set unused = snapshot.update({'nested': hostvars.other.values()}) %}"
+                  "{{ snapshot is nested_list }}")
+    assert runtime.template(expression, ctx) == "True"
+
+
+def test_custom_filter_leaves_unread_hostvars_entries_lazy():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "original", "source": """
+class FilterModule:
+    def filters(self):
+        return {'original_hostvar': lambda snapshot: snapshot['original']}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Read one hostvar", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    template = ("{% set snapshot = hostvars.h.copy() %}"
+                "{% set unused = snapshot.update({'nested': hostvars.h.values()}) %}"
+                "{{ snapshot | original_hostvar }}")
+    assert runtime.template(template, runtime._task_ctx(task, {})) == "17"
+
+
+@pytest.mark.parametrize("method", ["values", "items"])
+@pytest.mark.parametrize("filter_expression", ["encode_entries", "encode_entries_lazily"])
+def test_custom_filter_can_serialize_hostvars_methods(method, filter_expression):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "dump", "source": """
+import json
+
+def encode(host, method):
+    return json.dumps(getattr(host, method)())
+
+def encode_lazily(host, method):
+    yield encode(host, method)
+
+class FilterModule:
+    def filters(self):
+        return {'encode_entries': encode, 'encode_entries_lazily': encode_lazily}
+"""}])
+    runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["sample"]
+    task = _task("1", "Serialize hostvars entries", "debug", vars={"mixed": "{{ lookup('sample') }}/tail"})
+    expression = "hostvars.h | %s('%s')" % (filter_expression, method)
+    if filter_expression == "encode_entries_lazily":
+        expression += " | first"
+    entries = json.loads(runtime.template("{{ " + expression + " }}", runtime._task_ctx(task, {})))
+    if method == "items":
+        assert dict(entries)["mixed"] == "sample/tail"
+    else:
+        assert "sample/tail" in entries
+
+
+def test_custom_filter_can_read_a_lazy_hostvars_alias_without_eager_nested_render():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "selected", "source": """
+class FilterModule:
+    def filters(self):
+        return {'selected_hostvar': lambda snapshot: snapshot['selected']}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Read one entry through an alias", "debug", vars={
+        "unused": "{{ lookup('unused') }}/tail",
+        "selected": ("{% set inner = hostvars.h.copy() %}"
+                     "{% set ignored = inner.update({'nested': hostvars.h.values()}) %}"
+                     "{{ inner.nested[0] }}"),
+    })
+    result = runtime.template("{{ hostvars.h.copy() | selected_hostvar }}", runtime._task_ctx(task, {}))
+    assert str(result) == "17"
+
+
+@pytest.mark.parametrize("template", [
+    "{% macro selected() %}{{ hostvars.h.values()[0] }}{% endmacro %}{{ selected | invoke_callback }}",
+    ("{% for row in [[17]] recursive %}{% if row is number %}{{ hostvars.h.values()[0] }}"
+     "{% else %}{{ loop | invoke_callback(row) }}{% endif %}{% endfor %}"),
+    ("{% if false %}{% block selected %}{{ hostvars.h.values()[0] }}{% endblock %}{% endif %}"
+     "{{ self.selected | invoke_callback }}"),
+], ids=["macro", "recursive_loop", "block"])
+def test_custom_filter_jinja_callback_keeps_hostvars_entries_lazy(template):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "invoke", "source": """
+class FilterModule:
+    def filters(self):
+        return {'invoke_callback': lambda callback, *args: callback(*args)}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Invoke a Jinja callback from a filter", "debug", loop=["sample"],
+                 vars={"unused": "{{ lookup('unused') }}/tail"})
+    result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
+    assert result == "17"
+
+
+def test_custom_filter_lookahead_keeps_filtered_loop_predicates_lazy():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "next_item", "source": """
+class FilterModule:
+    def filters(self):
+        return {'next_item': lambda loop: '' if loop.index0 else loop.nextitem}
+"""}])
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("unrelated lookup ran")
+    task = _task("1", "Look ahead in a filtered loop", "debug", loop=["sample"],
+                 vars={"unused": "{{ lookup('unused') }}/tail"})
+    template = ("{% for value in [1, 2] if hostvars.h.values()[0] == 17 recursive %}"
+                "{{ loop | next_item }}{% endfor %}")
+    result = runtime.template(template, runtime._task_ctx(task, {"item": "sample"}))
+    assert result == "2"
+
+
+def test_custom_filter_mutates_saved_hostvars_values():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "append", "source": """
+def append(values):
+    values.append('added')
+    return ''
+
+def append_nested(snapshot):
+    return append(snapshot['nested'])
+
+class FilterModule:
+    def filters(self):
+        return {'append_hostvar': append, 'append_nested': append_nested}
+"""}])
+    task = _task("1", "Mutate hostvars entries through a custom filter", "debug", vars={
+        "alias": "{{ lookup('sample') }}/tail",
+    })
+    runtime.templater._lookup_loaded["sample"] = lambda *args, **kwargs: ["value"]
+    result = runtime.template(
+        "{% set entries = hostvars.h.values() %}{{ entries | append_hostvar }}{{ entries[-1] }}",
+        runtime._task_ctx(task, {}),
+    )
+    assert result == "added"
+    result = runtime.template(
+        "{% set entries = hostvars.h.values() %}{% set snapshot = hostvars.h.copy() %}"
+        "{% set unused = snapshot.update({'nested': entries}) %}"
+        "{{ snapshot | append_nested }}{{ entries[-1] }}",
+        runtime._task_ctx(task, {}),
+    )
+    assert result == "added"
+
+
+@pytest.mark.parametrize("filter_name", ["to_json", "to_nice_json", "to_yaml", "to_nice_yaml"])
+def test_serializers_materialize_nested_lazy_hostvars_entries(filter_name):
+    from ansiroll.runtime import _yaml_module
+
+    frames, calls = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    task = _task("1", "Serialize entries", "debug", args={
+        "msg": "{{ {'values': hostvars[inventory_hostname].values()} | " + filter_name + " }}",
+    }, vars={"alias": "{{ lookup('source') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert not runtime.failed
+    serialized = frames[0]["result"]["msg"]
+    decoded = json.loads(serialized) if "json" in filter_name else _yaml_module().safe_load(serialized)
+    assert "rendered/tail" in decoded["values"]
+    assert calls == ["source"]
+
+
+def test_hostvars_item_membership_resolves_only_matching_keys():
+    frames, calls = [], []
+    hostvars = {"h": {"unused": "{{ lookup('unused') }}/tail"}}
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "rendered"
+    task = _task("1", "Check entries", "debug", args={
+        "msg": "{% set entries = hostvars[inventory_hostname].items() %}{{ ["
+               "('absent', 0) in entries, ('absent', 0) in entries, ('alias', 'rendered/tail') in entries] | to_json }}",
+    }, vars={"alias": "{{ lookup('source') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert json.loads(frames[0]["result"]["msg"]) == [False, False, True]
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize(("expression", "expected"), [
+    ("(hostvars[inventory_hostname].items() + [('extra', 1)])[-1]", ("extra", 1)),
+    ("(['extra'] + hostvars[inventory_hostname].values())[0]", "extra"),
+    ("(prefix_list + hostvars[inventory_hostname].values())[0:3]", ["extra", "h", 17]),
+    ("hostvars[inventory_hostname].values().copy()[1]", 17),
+    ("(hostvars[inventory_hostname].values() * 2)[1]", 17),
+    ("hostvars[inventory_hostname].values() > []", True),
+])
+def test_lazy_hostvars_entries_support_list_operations(expression, expected):
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: 17
+    task = _task("1", "Use hostvar entries as lists", "debug", vars={
+        "alias": "{{ lookup('source') }}", "unused": "{{ lookup('source') }}/tail", "prefix_list": ["extra"],
+    })
+    ctx = runtime._task_ctx(task, {})
+    assert runtime.template("{{ " + expression + " }}", ctx) == expected
+
+
+@pytest.mark.parametrize(("plugin", "expected"), [
+    ("items", ["h", 17, "17/tail", _OMIT]),
+    ("flattened", ["h", 17, "17/tail", _OMIT]),
+    ("indexed_items", [[0, "h"], [1, 17], [2, "17/tail"], [3, _OMIT]]),
+    ("nested", [["h"], [17], ["17/tail"], [_OMIT]]),
+])
+def test_loop_lookups_consume_lazy_hostvars_values(plugin, expected):
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater._lookup_loaded["source"] = lambda terms, variables: [17]
+    task = _task("1", "Pass hostvar values to a lookup", "debug", vars={
+        "alias": "{{ lookup('source') }}", "mixed": "{{ lookup('source') }}/tail",
+    })
+    expression = "{{ query('" + plugin + "', hostvars[inventory_hostname].values()) }}"
+    assert runtime.template(expression, runtime._task_ctx(task, {})) == expected
+
+
+def test_lazy_hostvars_entries_keep_mutations_on_the_list():
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: 17
+    task = _task("1", "Mutate materialized entries", "debug", vars={"alias": "{{ lookup('source') }}/tail"})
+    ctx = runtime._task_ctx(task, {})
+    expression = ("{% set current = hostvars[inventory_hostname] %}"
+                  "{% set values = current.values() %}"
+                  "{% set unused = values.append('extra') %}"
+                  "{{ values[-1] }}/{{ current.values()[-1] == 'extra' }}")
+    assert runtime.template(expression, ctx) == "extra/False"
+
+
+def test_hostvars_item_membership_surfaces_matching_entry_render_failure():
+    frames = []
+    hostvars = {"h": {"broken": "prefix{{ 1 + 'str' }}"}}
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
+    task = _task("1", "Check broken entry", "debug", args={
+        "msg": "{{ ('broken', '') in hostvars[inventory_hostname].items() }}",
+    }, vars={"unused": "{{ lookup('source') }}/tail"})
+    runtime.run_play({"tasks": [task], "gather_facts": False, "vars": {}})
+    assert runtime.failed
+    assert "unsupported operand type" in frames[0]["result"]["msg"]
+
+
+def test_lazy_hostvars_entries_preserve_the_mapping_snapshot():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    task = _task("1", "Save hostvar entries", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    expression = ("{% set current = hostvars[inventory_hostname] %}"
+                  "{% set entries = current.items() %}"
+                  "{% set removed = current.pop('original') %}"
+                  "{% set inserted = current.setdefault('added', 18) %}"
+                  "{{ [entries[0], ('original', 17) in entries, ('added', 18) in entries] | to_json }}")
+    assert json.loads(runtime.template(expression, runtime._task_ctx(task, {}))) == [["original", 17], True, False]
+
+
+def test_lazy_hostvars_copy_uses_current_bindings_and_mutates_independently():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}})
+    task = _task("1", "Copy hostvar bindings", "debug", vars={"unused": "{{ lookup('unused') }}/tail"})
+    expression = ("{% set current = hostvars[inventory_hostname] %}"
+                  "{% set removed = current.pop('original') %}"
+                  "{% set added = current.setdefault('new', 18) %}"
+                  "{% set snapshot = current.copy() %}"
+                  "{% set copied = snapshot.pop('new') %}"
+                  "{{ [copied, 'original' in snapshot, 'new' in snapshot, current.new] | to_json }}")
+    assert json.loads(runtime.template(expression, runtime._task_ctx(task, {}))) == [18, False, False, 18]
+
+
+def test_jinja_tojson_escapes_values_in_nested_lazy_hostvars_entries():
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    task = _task("1", "Serialize hostvars", "debug", vars={"alias": "{{ '<script>' }}",
+                                                         "unused": "{{ lookup('source') }}/tail"})
+    runtime.templater.env.globals["lookup"] = lambda name: "unused"
+    result = runtime.template("{{ {'values': hostvars[inventory_hostname].values()} | tojson }}",
+                              runtime._task_ctx(task, {}))
+    assert "<script>" in json.loads(result)["values"]
+    assert r"\u003cscript\u003e" in result
+
+
+@pytest.mark.parametrize("filter_name", ["tojson", "to_json", "to_nice_json"])
+def test_json_preserves_independently_mutated_list_views(filter_name):
+    runtime = Runtime({}, "", {})
+    expression = ("{% set a = data['values'] %}{% set b = data['values'] %}"
+                  "{% set unused = a.append(2) %}{{ [a, b] | " + filter_name + " }}")
+    result = runtime.template(expression, {"data": {"values": [1]}})
+    assert json.loads(result) == [[1, 2], [1]]
+
+
+def test_template_writes_json_with_nested_hostvars_entries(monkeypatch):
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: "ready"
+    task = _task("1", "Write hostvars", "template", vars={"alias": "{{ lookup('source') }}/tail"})
+    source = "{{ {'values': hostvars[inventory_hostname].values()} }}"
+    monkeypatch.setattr(runtime, "_copy_single_file", lambda _task, _args, data, *_rest: data)
+    result = runtime._run_file_action(
+        "template", {**task, "_baked": {"out.j2": source}}, {"src": "out.j2", "dest": "/out"},
+        runtime._task_ctx(task, {}),
+    )
+    assert "ready/tail" in json.loads(result)["values"]
+
+
+def test_flatten_treats_lazy_hostvars_entries_as_lists():
+    runtime = Runtime({}, "", {"inventory_hostname": "h"})
+    runtime.templater.env.globals["lookup"] = lambda name: "ready"
+    task = _task("1", "Flatten hostvars", "debug", vars={"alias": "{{ lookup('source') }}/tail"})
+    result = runtime.template("{{ [hostvars[inventory_hostname].values()] | flatten }}",
+                              runtime._task_ctx(task, {}))
+    assert "ready/tail" in result
+
+
+def test_delegated_hostvars_sequence_exposes_only_requested_members():
+    from ansiroll.runtime import _resolve_delegated_play_var
+
+    inventory = {"inventory_hostname": "h", "hostvars": {"h": {"original": 17}}}
+    runtime = Runtime({}, "", inventory)
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or "unused"
+    task = _task("1", "Send hostvars alias", "template", vars={
+        "payload": "{{ {'values': hostvars[inventory_hostname].values()} }}",
+        "unused": "{{ lookup('source') }}/tail",
+    })
+    scope = runtime.templater._play_var_scope(runtime._task_ctx(task, {}), strict=False)
+    members = []
+    payload = _resolve_delegated_play_var("payload", scope, runtime.templater, members=members)
+    sequence = _resolve_delegated_play_var(None, scope, runtime.templater,
+                                          members=members, member=payload["value"]["values"])
+    assert sequence["lazy_members"]
+    assert isinstance(sequence["value"], list)
+    value = _resolve_delegated_play_var(None, scope, runtime.templater,
+                                       members=members, member=sequence["value"][0])
+    assert value["value"] == 17
+    assert not calls
+
+
+def test_lazy_hostvars_entries_compare_unordered_values_like_lists():
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "hostvars": {"h": {"original": float("nan")}}})
+    task = _task("1", "Compare unordered values", "debug", vars={"unused": "{{ lookup('source') }}/tail"})
+    runtime.templater.env.globals["lookup"] = lambda name: "unused"
+    expression = "{{ hostvars[inventory_hostname].values() > [0] }}"
+    assert runtime.template(expression, runtime._task_ctx(task, {})) is False
+
+
+@pytest.mark.parametrize("text", [
+    "{{ lookup('source') }}/{{ missing.attribute }}",
+    "{{ lookup('source') }}/{{ 1 // divisor }}",
+    "{{ lookup('source') ~ missing }}",
+    "{{ 'prefix' ~ lookup('source') ~ missing }}",
+])
+def test_template_does_not_repeat_lookup_after_a_render_error(text):
+    from jinja2 import Undefined
+
+    templater = Runtime({}, "", {}).templater
+    calls = []
+
+    def lookup(source):
+        calls.append(source)
+        return "first"
+
+    templater.env.globals["lookup"] = lookup
+    result = templater.render_string(text, {"divisor": 0})
+    assert isinstance(result, Undefined)
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize("plugin,expression", [
+    ("filter", "'x' | broken"),
+    ("test", "'x' is broken"),
+])
+def test_mixed_template_defers_unavailable_plugin_errors(plugin, expression):
+    from jinja2 import Undefined
+
+    templater = Runtime({}, "", {}).templater
+    templater._plugin_errors[plugin]["broken"] = "load failed"
+    result = templater.render_string("{{ lookup('source') }}/{{ %s }}" % expression, {})
+    assert isinstance(result, Undefined)
+    assert "load failed" in result._undefined_hint
+
+
+@pytest.mark.parametrize(("payload", "aliased"), [
+    ("{{ lookup('source') }}/{{ suffix }}", "payload"),
+    ({"nested": ["{{- lookup('source') -}} /{{ suffix }}"]}, "payload.nested[0]"),
+    ("{{ (lookup('source')) }}/{{ suffix }}", "payload"),
+    ("{{ (lookup)('source') }}/{{ suffix }}", "payload"),
+])
+@pytest.mark.parametrize("from_play", [False, True])
+def test_task_defers_mixed_lookup_and_its_alias_until_the_task_runs(payload, aliased, from_play):
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    calls = []
+
+    def lookup(name):
+        calls.append(name)
+        return "first"
+
+    rt.templater.env.globals["lookup"] = lookup
+    variables = {"alias": "{{ %s }}" % aliased, "suffix": "second"}
+    play_vars = {"payload": payload} if from_play else {}
+    if not from_play:
+        variables["payload"] = payload
+    tasks = [
+        _task("1", "skipped", "debug", vars=variables, when=["false and alias"], args={"msg": "{{ alias }}"}),
+        _task("2", "unused", "debug", vars=variables, args={"msg": "{{ 'untouched' if true else alias }}"}),
+        _task("3", "runs", "debug", vars=variables, args={"msg": "{{ alias ~ '|' ~ alias }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok", "ok"]
+    assert frames[1]["result"]["msg"] == "untouched"
+    assert frames[2]["result"]["msg"] == "first/second|first/second"
+    assert calls == ["source"]
+
+
+def test_literal_tasks_do_not_scan_other_hosts_for_lookup_templates(monkeypatch):
+    hostvars = {"another": {"example": "inventory-only value"}}
+    rt = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=lambda frame: None)
+    examined = []
+    has_lookup = rt.templater._has_lookup_call
+
+    def record(text):
+        examined.append(text)
+        return has_lookup(text)
+
+    monkeypatch.setattr(rt.templater, "_has_lookup_call", record)
+    task = _task("1", "literal", "debug", args={"msg": "untouched"})
+    rt.run_play({"tasks": [task], "gather_facts": False,
+                 "vars": {"unused": "{{ hostvars.another.example }}"}})
+    assert "inventory-only value" not in examined
+
+
+@pytest.mark.parametrize("layer", ["host", "role_defaults", "role_vars"])
+def test_literal_tasks_scan_inherited_lookup_containers_once(monkeypatch, layer):
+    host_vars = {"inventory_hostname": "h"}
+    if layer == "host":
+        host_vars["unused"] = ["inherited marker"]
+    rt = Runtime({}, "", host_vars, on_result=lambda frame: None)
+    examined = []
+    has_lookup = rt.templater._has_lookup_call
+
+    def record(text):
+        if text == "inherited marker":
+            examined.append(text)
+        return has_lookup(text)
+
+    monkeypatch.setattr(rt.templater, "_has_lookup_call", record)
+    tasks = [_task(str(index), "literal", "debug", args={"msg": "untouched"}) for index in range(10)]
+    if layer != "host":
+        for task in tasks:
+            task[layer] = {"unused": ["inherited marker"]}
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert examined == ["inherited marker"]
+
+
+@pytest.mark.parametrize("host_vars", ["hostvars", "lookup('vars', scope_name)",
+                                       "lookup(plugin_name, scope_name)"])
+def test_task_defers_alias_to_mixed_lookup_in_hostvars(host_vars):
+    frames, calls = [], []
+    hostvars = {"another": {"payload": "{{ lookup('source') }}/{{ suffix }}"}}
+    rt = Runtime({}, "", {"inventory_hostname": "h", "hostvars": hostvars}, on_result=frames.append)
+    lookup = rt.templater.env.globals["lookup"]
+
+    def record(name, *args):
+        if name == "source":
+            calls.append(name)
+            return "first"
+        return lookup(name, *args)
+
+    rt.templater.env.globals["lookup"] = record
+    variables = {"alias": "{{ %s.another.payload }}" % host_vars, "suffix": "second",
+                 "scope_name": "hostvars", "plugin_name": "vars"}
+    tasks = [
+        _task("1", "skipped", "debug", vars=variables, when=["false"], args={"msg": "{{ alias }}"}),
+        _task("2", "runs", "debug", vars=variables, args={"msg": "{{ alias }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok"]
+    assert frames[1]["result"]["msg"] == "first/second"
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize("loop", [None, ["loop item"]])
+def test_legacy_vars_methods_resolve_deferred_task_aliases(monkeypatch, loop):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames, calls = [], []
+    rt = Runtime({}, "", {"inventory_hostname": "h", "item": "original item"}, on_result=frames.append)
+    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "used"
+    task = _task("task", "Show alias", "debug", loop=loop, vars={
+        "alias": "{{ 'value' }}", "unused": "{{ lookup('source') }}/tail",
+    }, args={"msg": "{{ vars.copy().alias }} / "
+             "{{ (vars.items() | selectattr('0', 'equalto', 'alias') | first)[1] }} / {{ vars.copy().item }}"})
+    rt.run_play({"tasks": [task], "gather_facts": False})
+    assert frames[0]["result"]["msg"] == "value / value / original item"
+    assert calls == []
+
+
+@pytest.mark.parametrize("location", ["play", "inventory", "inventory_mapping", "inventory_list"])
+def test_legacy_vars_iteration_preserves_unresolved_sources(monkeypatch, location):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    frames, calls = [], []
+    source = "{{ lookup('source') }}/tail"
+    host_vars = {"inventory_hostname": "h"}
+    payload, suffix = {
+        "play": (source, ""), "inventory": (source, ""),
+        "inventory_mapping": ({"nested": source}, ".nested"),
+        "inventory_list": ([source], "[0]"),
+    }[location]
+    if location != "play":
+        host_vars["payload"] = payload
+    play_vars = {"payload": payload} if location == "play" else {"another": "{{ 'value' }}"}
+    rt = Runtime({}, "", host_vars, on_result=frames.append)
+    rt.templater.env.globals["lookup"] = lambda name: calls.append(name) or "used"
+    tasks = [
+        _task("keys", "Inspect keys", "debug", args={"msg": "{{ vars.items() | map(attribute=0) | list }}"}),
+        _task("source", "Inspect source", "debug", args={
+            "msg": "{{ (vars.items() | selectattr('0', 'equalto', 'payload') | first)[1]%s }}" % suffix,
+        }),
+        _task("membership", "Inspect membership", "debug", args={"msg": "{{ 'payload' in vars.items() }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
+    assert "payload" in frames[0]["result"]["msg"]
+    assert frames[1]["result"]["msg"] == source
+    assert frames[2]["result"]["msg"] is False
+    assert calls == []
+
+    tasks = [_task("read", "Read value", "debug", args={"msg": "{{ vars.payload%s }}" % suffix})]
+    rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
+    assert frames[3]["result"]["msg"] == "used/tail"
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize("version", ["2.12.10", "2.21.0"])
+def test_deferred_vars_keep_standard_mapping_view_type_names(monkeypatch, version):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    ctx = {"alias": "{{ 'value' }}", runtime_mod._DEFER_LOOKUP_NAMES: True}
+    assert rt.template("{{ vars.items() | type_debug }}", ctx) == "ItemsView"
+    assert rt.template("{{ vars.values() | type_debug }}", ctx) == "ValuesView"
+    assert rt.template("{{ 'alias' in vars.items() }}", ctx) is False
+
+
+@pytest.mark.parametrize("argument", [
+    '''"{{ lookup('source') }}/{{ suffix }}"''',
+    '''"{{ lookup('source') }}" ~ "/{{ suffix }}"''',
+    '''"{" ~ "{ lookup('source') }}" ~ tail''',
+])
+def test_task_defers_mixed_lookup_in_a_lookup_argument(argument):
+    frames, calls = [], []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    rt.templater._lookup_loaded["source"] = lambda terms, variables: calls.append("source") or ["first"]
+    rt.templater._lookup_loaded["consume"] = lambda terms, variables: terms
+    variables = {
+        "alias": "{{ lookup('consume', %s) }}" % argument,
+        "suffix": "second",
+        "tail": "/second",
+    }
+    tasks = [
+        _task("skip", "Skip", "debug", vars=variables, when=[False], args={"msg": "{{ alias }}"}),
+        _task("unused", "Unused", "debug", vars=variables, args={"msg": "untouched"}),
+        _task("use", "Use", "debug", vars=variables, args={"msg": "{{ alias }}"}),
+    ]
+    rt.run_play({"tasks": tasks, "gather_facts": False})
+    assert [frame["status"] for frame in frames] == ["skipped", "ok", "ok"]
+    assert frames[-1]["result"]["msg"] == "first/second"
+    assert calls == ["source"]
+
+
+@pytest.mark.parametrize("method", ["items", "values"])
+@pytest.mark.parametrize(("version", "value"), [("2.12.10", "{{ 'value' }}"), ("2.21.0", "value")])
+def test_deferred_vars_methods_produce_loop_lists(monkeypatch, method, version, value):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    ctx = {"alias": "{{ 'value' }}", runtime_mod._DEFER_LOOKUP_NAMES: True}
+    expected = ("alias", value) if method == "items" else value
+    items = rt._resolve_loop("{{ vars.%s() }}" % method, ctx)
+    assert isinstance(items, list)
+    assert items[0] == expected
+
+
+@pytest.mark.parametrize(
+    "expression", [" + ".join(["term"] * 1100), "(" * 1100 + "term" + ")" * 1100],
+    ids=["long_addition", "nested_parentheses"],
+)
+def test_unused_deep_lookup_template_does_not_abort_task_setup(expression):
+    frames = []
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, on_result=frames.append)
+    task = _task("1", "literal", "debug", args={"msg": "untouched"})
+    lookup = "{{ " + expression + " }}/{{ lookup('source') }}"
+    rt.run_play({"tasks": [task], "gather_facts": False, "vars": {"unused": lookup}})
+    assert frames[0]["result"]["msg"] == "untouched"
+
+
+@pytest.mark.parametrize("expression", ["value | default('fallback')", "value | d('fallback')",
+                                         "value is defined", "value is undefined"])
+@pytest.mark.parametrize(("source", "message"), [
+    ("{{ 1 // divisor }}", "by zero"),
+    ("{{ 'x' | unknown_filter }}", "No filter named"),
+])
+def test_captured_errors_do_not_count_as_missing_variables(expression, source, message):
+    from ansiroll.runtime import _dump_object
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ %s }}" % expression
+    result = templater.render_string(text, {"value": source, "divisor": 0})
+    assert message in _dump_object(result)["exception"]["message"]
+
+    missing = templater.render_string(text, {})
+    assert missing == {"value is defined": False, "value is undefined": True}.get(expression, "fallback")
 
 
 @pytest.mark.parametrize("version,resolve", [("2.18.20", False), ("2.19.15", True)])
@@ -477,6 +1917,66 @@ def test_conditional_rendering_tracks_marked_list_reads(expression):
     ctx["item"] = "sample"
     with pytest.raises(UntrustedConditional):
         rt.when([{"__ansiroll_trusted_condition__": "'{{ alias }}' == 'sample value'"}], ctx)
+
+
+@pytest.mark.parametrize("mapping", [False, True])
+def test_delegated_container_copies_keep_written_values_literal(mapping):
+    from ansiroll.runtime import _DelegatedTemplateValue, _lazy_container
+
+    runtime = Runtime({}, "", {})
+    reads = []
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail("looked up " + name)
+    member = _DelegatedTemplateValue(lambda: reads.append("source") or 17)
+    literal = "{{ lookup('written') }}"
+    raw = {"source": member} if mapping else [member]
+    copied = _lazy_container(raw, runtime, {}, delegated=True).copy()
+    if mapping:
+        copied.update(written=literal)
+        assert copied.copy()["written"] == literal
+    else:
+        copied.append(literal)
+        assert copied.copy()[-1] == literal
+    assert not reads
+    assert copied["source" if mapping else 0] == 17
+    assert reads == ["source"]
+
+
+def test_delegated_list_mutations_compare_resolved_values():
+    from ansiroll.runtime import _DelegatedTemplateValue, _lazy_container
+
+    rt = Runtime({}, "", {})
+    reads = []
+    rows = _lazy_container([
+        _DelegatedTemplateValue(lambda text=text: reads.append(text) or text)
+        for text in ("remove", "b", "a")
+    ], rt, {}, delegated=True)
+    rows.remove("remove")
+    assert reads == ["remove"]
+    rows.sort()
+    assert reads == ["remove", "b", "a"]
+    assert rows == ["a", "b"]
+
+
+@pytest.mark.parametrize(("expression", "expected", "reads"), [
+    ("rows < ['z']", True, ["a"]),
+    ("rows.copy() <= ['z']", True, ["a"]),
+    ("['0'] < rows", True, ["a"]),
+    ("rows > ['a']", True, ["a"]),
+    ("rows >= []", True, []),
+    ("rows == ['a']", False, []),
+    ("rows != ['z', 'z']", True, ["a"]),
+])
+def test_delegated_list_comparisons_read_only_needed_items(expression, expected, reads):
+    from ansiroll.runtime import _DelegatedTemplateValue, _lazy_container
+
+    rt = Runtime({}, "", {})
+    requested = []
+    rows = _lazy_container([
+        _DelegatedTemplateValue(lambda text=text: requested.append(text) or text)
+        for text in ("a", "b")
+    ], rt, {}, delegated=True)
+    assert rt.templater.render_string("{{ %s }}" % expression, {"rows": rows}) is expected
+    assert requested == reads
 
 
 @pytest.mark.parametrize("expression", [
@@ -1366,6 +2866,87 @@ def test_literal_false_when_short_circuits_undefined_loop_once():
     assert rt.vars["result"]["skipped"] is True
 
 
+def test_literal_false_when_does_not_hide_loop_evaluation_error():
+    task = _task("1", "broken loop", "debug", loop="{{ [1 / divisor] }}",
+                 vars={"divisor": 0}, when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "failed"
+    assert "division by zero" in frames[0]["result"]["msg"]
+
+
+@pytest.mark.parametrize("expression", [
+    "query('file', missing_path)", "query('vars', 'missing_items')",
+    "query('dict', missing_mapping)", "lookup('dict', missing_mapping, wantlist=true)",
+])
+def test_literal_false_when_can_skip_loop_with_undefined_lookup_inputs(expression):
+    task = _task("1", "undefined lookup", "debug", loop="{{ %s }}" % expression, when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "skipped"
+
+
+def test_literal_false_when_does_not_hide_lookup_type_errors():
+    task = _task("1", "broken dict lookup", "debug", loop="{{ query('dict', 42) }}", when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "failed"
+    assert "expects a dictionary" in frames[0]["result"]["msg"]
+
+
+@pytest.mark.parametrize("call", ["query('list', ['ok', missing])",
+                                  "lookup('list', ['ok', missing], wantlist=true)"])
+def test_lookup_can_leave_unused_nested_terms_undefined(call):
+    templater = Runtime({}, "", {}).templater
+    assert templater.render_string("{{ (%s | first)[0] }}" % call, {}) == "ok"
+
+
+def test_literal_false_when_does_not_hide_lookup_file_errors(tmp_path):
+    task = _task("1", "broken lookup", "debug", loop="{{ query('file', path) }}",
+                 vars={"path": str(tmp_path / "missing")}, when=[False])
+    _rt, frames = run([task])
+    assert frames[0]["status"] == "failed"
+    assert "No such file" in frames[0]["result"]["msg"]
+
+
+def test_vars_lookup_default_preserves_evaluation_errors():
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ lookup('vars', 'value', default='fallback') }}"
+    assert templater.render_string(text, {}) == "fallback"
+    result = templater.render_string(text, {"value": "{{ 1 / divisor }}", "divisor": 0})
+    with pytest.raises(_CapturedTemplateError, match="division by zero"):
+        _fail_on_undef(result)
+
+
+@pytest.mark.parametrize(("call", "expected"), [("lookup", "present"), ("query", ["present"])])
+def test_vars_lookup_preserves_captured_default_errors(call, expected, tmp_path):
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ " + call + "('vars', 'value', default=fallback) }}"
+    assert templater.render_string(text, {"value": "present"}) == expected
+    assert templater.render_string(text, {"value": "present", "fallback": ["{{ missing }}"]}) == expected
+    context = {"value": "present", "divisor": 0}
+    broken = "{{ 1 // divisor }}"
+    for fallback in (broken, [broken], {"outer": (broken,)}):
+        context["fallback"] = fallback
+        with pytest.raises(_CapturedTemplateError, match="by zero"):
+            _fail_on_undef(templater.render_string(text, context))
+    context.update(fallback="{{ lookup('file', path) }}", path=str(tmp_path / "missing"))
+    with pytest.raises(_CapturedTemplateError, match="No such file"):
+        _fail_on_undef(templater.render_string(text, context))
+
+
+@pytest.mark.parametrize("call", ["query('list', term)", "lookup('list', term, wantlist=true)"])
+def test_lookup_preserves_captured_nested_term_errors(call):
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    templater = Runtime({}, "", {}).templater
+    text = "{{ (%s | first)[0] }}" % call
+    context = {"term": ["ok", "{{ 1 // divisor }}"], "divisor": 0}
+    with pytest.raises(_CapturedTemplateError, match="by zero"):
+        _fail_on_undef(templater.render_string(text, context))
+
+
 def test_loop_set_fact_is_visible_to_next_iteration():
     tasks = [
         _task(
@@ -1531,6 +3112,20 @@ def test_delegated_debug_remains_a_runtime_special_action():
     rt.on_result = frames.append
     rt.run_play({"tasks": [task], "handlers": [], "gather_facts": False, "vars": {}})
     assert frames[0]["result"]["msg"] == "hello"
+
+
+def test_modern_debug_var_formats_undefined_lazy_hostvars_entries(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    monkeypatch.setenv("ANSIROLL_DEBUG_HOSTVARS", "ready")
+    expression = "{'entries': hostvars[inventory_hostname].values()}"
+    task = _task("1", "Inspect hostvars entries", "debug", args={"var": expression}, vars={
+        "alias": "{{ lookup('env', 'ANSIROLL_DEBUG_HOSTVARS') }}/tail",
+    })
+    _, frames = run([task], host_vars={
+        "inventory_hostname": "h", "hostvars": {"h": {"broken": "{{ missing }}"}},
+    })
+    assert frames[0]["status"] == "ok"
+    assert "<< error 1 - 'missing' is undefined >>" in frames[0]["result"][expression]["entries"]
 
 
 def test_inventory_refresh_vars_are_absorbed_without_leaking_result_key():

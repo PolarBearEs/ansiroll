@@ -525,8 +525,8 @@ class StrategyModule(StrategyBase):
         included_vars_by_task = {}
         last_frame = time.monotonic()
 
-        def resolve_play_var(name):
-            chan.send({"t": "delegate_play_var", "name": name})
+        def resolve_play_var(name=None, *, member=None):
+            chan.send({"t": "delegate_play_var", "name": name, "member": member})
             reply = chan.recv()
             if not reply or reply.get("t") != "delegate_play_var_result":
                 raise RuntimeError("ansiroll: agent did not return a delegated play variable")
@@ -721,7 +721,7 @@ class StrategyModule(StrategyBase):
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
         if action == "template" and local:
-            return self._run_local_template(frame, become_pass)
+            return self._run_local_template(frame, become_pass, resolve_play_var)
         if frame.get("fallback") or not local:
             reason = ("delegate_to: %s (non-local delegation)" % to if to
                       else "controller-coupled action %s" % frame.get("action"))
@@ -847,28 +847,33 @@ class StrategyModule(StrategyBase):
             }
 
     @staticmethod
-    def _restore_play_fallback(value, undefined, errors=(), mapping_keys=()):
+    def _restore_play_fallback(value, undefined, errors=(), mapping_keys=(), *, runtime_marker=None):
         if not undefined and not errors and not mapping_keys:
             return value
-        try:
-            from ansible._internal._templating._jinja_common import CapturedExceptionMarker, UndefinedMarker
-        except ImportError:
-            from ansible.template import AnsibleUndefined
-
-            class DelegatedUndefined(AnsibleUndefined):
-                # Prevent the legacy templar from evaluating this placeholder
-                # when it recursively loads the surrounding container.
-                __UNSAFE__ = True
-
-            missing = DelegatedUndefined(hint="Undefined element in a delegated play variable")
-
-            def error_marker(message):
-                return _DelegatedMemberError(hint=message, exc=AnsibleError)
+        if runtime_marker is not None:
+            missing = runtime_marker("Undefined element in a delegated template variable", missing=True)
+            error_marker = runtime_marker
         else:
-            missing = UndefinedMarker(hint="Undefined element in a delegated play variable", _no_template_source=True)
+            message = "Undefined element in a delegated play variable"
+            try:
+                from ansible._internal._templating._jinja_common import CapturedExceptionMarker, UndefinedMarker
+            except ImportError:
+                from ansible.template import AnsibleUndefined
 
-            def error_marker(message):
-                return CapturedExceptionMarker(AnsibleError(message))
+                class DelegatedUndefined(AnsibleUndefined):
+                    # Stop the legacy templar from evaluating the marker
+                    # while loading its surrounding container.
+                    __UNSAFE__ = True
+
+                missing = DelegatedUndefined(hint=message)
+
+                def error_marker(message):
+                    return _DelegatedMemberError(hint=message, exc=AnsibleError)
+            else:
+                missing = UndefinedMarker(hint=message, _no_template_source=True)
+
+                def error_marker(message):
+                    return CapturedExceptionMarker(AnsibleError(message))
 
         markers = [(path, missing) for path in undefined]
         markers.extend((path, error_marker(message)) for path, message in errors)
@@ -902,7 +907,7 @@ class StrategyModule(StrategyBase):
             container.update(entries)
         return value
 
-    def _run_local_template(self, frame, become_pass):
+    def _run_local_template(self, frame, become_pass, resolve_play_var=None):
         """Render a runtime-created controller file through the in-memory runtime."""
         args = dict(frame.get("args") or {})
         src = args.get("src")
@@ -933,9 +938,47 @@ class StrategyModule(StrategyBase):
                     },
                 },
             }
-            return rt._run_file_action(
-                "template", task, args, frame.get("vars") or {},
-                become=bool(frame.get("become")))
+            job_vars = dict(frame.get("vars") or {})
+            if names := frame.get("lazy_template_vars"):
+                from ansiroll.runtime import (
+                    _DEFER_LOOKUP_NAMES,
+                    _AnsirollUndefined,
+                    _captured,
+                    _DelegatedTemplateValue,
+                    _HostVarView,
+                    _lazy_container,
+                    _mark_unsafe,
+                )
+
+                def runtime_marker(message, missing=False):
+                    return _AnsirollUndefined(hint=message) if missing else _captured(message)
+
+                def load_template_var(name=None, *, member=None):
+                    resolved = resolve_play_var(name, member=member) if resolve_play_var else None
+                    if resolved is None:
+                        return _captured("unable to resolve delegated template value")
+                    if "error" in resolved:
+                        return _captured(resolved["error"])
+                    value = self._restore_play_fallback(
+                        _mark_unsafe(resolved["value"]), resolved["undefined"], resolved.get("errors", ()),
+                        resolved.get("mapping_keys", ()), runtime_marker=runtime_marker,
+                    )
+                    if not resolved.get("lazy_members"):
+                        return value
+
+                    def defer_member(index):
+                        return _DelegatedTemplateValue(lambda: load_template_var(member=index))
+
+                    items = ({key: defer_member(index) for key, index in value.items()}
+                             if isinstance(value, dict) else [defer_member(index) for index in value])
+                    if resolved.get("hostvar_view"):
+                        return _HostVarView(items, rt, job_vars)
+                    return _lazy_container(items, rt, job_vars, delegated=True)
+
+                job_vars[_DEFER_LOOKUP_NAMES] = True
+                for name in names:
+                    job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
+            return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
         finally:
             rt.become_user = previous_become_user
 
