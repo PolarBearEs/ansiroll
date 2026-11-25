@@ -182,11 +182,15 @@ def _fact_key_template_paths(value):
     while pending:
         path, current = pending.pop()
         if isinstance(current, dict):
-            keys = [str(key) for key in current if isinstance(key, _FactKeyTemplate)]
+            # JSON object keys are strings. Keep only the last entry for a
+            # spelling, just as json.loads does, before recording trust.
+            surviving = {str(key) if isinstance(key, str) else json.dumps(key): (key, item)
+                         for key, item in current.items()}
+            keys = [name for name, (key, _) in surviving.items() if isinstance(key, _FactKeyTemplate)]
             if keys:
                 paths.append((path, keys))
-            pending.extend(((*path, key if isinstance(key, str) else json.dumps(key)), item)
-                           for key, item in current.items() if isinstance(item, (dict, list, tuple)))
+            pending.extend(((*path, name), item) for name, (_, item) in surviving.items()
+                           if isinstance(item, (dict, list, tuple)))
         elif isinstance(current, (list, tuple)):
             pending.extend(((*path, index), item) for index, item in enumerate(current)
                            if isinstance(item, (dict, list, tuple)))
@@ -6346,25 +6350,33 @@ class Runtime:
                 fields = ((key, finalize(member)) for key, member in value.items())
                 return {_mark_unsafe(key): member for key, member in fields if member is not _OMIT}
             if isinstance(value, (list, tuple)):
-                members = [finalize(member) for member in value]
                 if modern:
-                    members = [member for member in members if member is not _OMIT]
+                    members = [member for member in map(finalize, value) if member is not _OMIT]
+                else:
+                    # Legacy remove_omit visits mappings directly in lists.
+                    members = [finalize(member) if isinstance(member, dict) else _fail_on_undef(member)
+                               for member in value]
                 return tuple(members) if isinstance(value, tuple) else members
             return _fail_on_undef(value)
 
         source = raw.pop("_variable_params", None)
-        if source is None and set(raw) == {"_raw_params"}:
-            if not task.get("set_fact_raw_params_is_fact") and isinstance(raw["_raw_params"], str):
-                source = raw.pop("_raw_params")
+        free_form = (source is None and set(raw) == {"_raw_params"}
+                     and not task.get("set_fact_raw_params_is_fact") and isinstance(raw["_raw_params"], str))
+        if free_form:
+            source = raw["_raw_params"]
         params = {}
         if source is not None:
             params = self.templater.render_string(source, ctx)
             if _is_undef(params):
                 _fail_on_undef(params)
-            if omitted(params):
-                params = {}
             if not isinstance(params, dict) or set(params) == {"__ansiroll_unsafe__"}:
-                raise ValueError("set_fact args must resolve to a dictionary")
+                if free_form:
+                    raw["_raw_params"] = params
+                elif modern and not omitted(params):
+                    raise ValueError("set_fact args must resolve to a dictionary")
+                params = {}
+            elif free_form:
+                raw.pop("_raw_params")
         explicit_templates = set(task.get("set_fact_key_templates", ()))
         # Modern Core checks only the surviving value for a key. Keeping a
         # lazy mapping here avoids evaluating shadowed aliases and lookups.
@@ -6375,7 +6387,7 @@ class Runtime:
                 if value is not _OMIT:
                     args[key] = value
         for key, value in raw.items():
-            normalized = finalize(self.template(value, ctx))
+            normalized = finalize(value if free_form else self.template(value, ctx))
             args.pop(key, None)
             if normalized is not _OMIT:
                 args[_FactKeyTemplate(key) if key in explicit_templates else key] = normalized

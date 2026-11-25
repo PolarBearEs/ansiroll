@@ -1673,7 +1673,9 @@ def _runtime_write_names(action, args, register):
     action = str(action or "").rsplit(".", 1)[-1]
     if action == "set_fact":
         names.update(None if _is_templated(key) else key
-                     for key in args if key != "cacheable")
+                     for key in args if key not in ("cacheable", "_variable_params"))
+        if "_variable_params" in args or (set(args) == {"_raw_params"} and _is_templated(args["_raw_params"])):
+            names.add(None)
     elif action == "include_vars":
         name = args.get("name")
         names.add(name if isinstance(name, str) and name and not _is_templated(name) else None)

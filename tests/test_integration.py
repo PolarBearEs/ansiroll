@@ -5560,6 +5560,68 @@ def test_delegated_set_fact_normalizes_arguments_on_invoking_host(tmp_path, stra
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_expanded_set_fact_args_prevent_conflicting_freeze(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    status: before
+    inputs: {status: after}
+  tasks:
+    - set_fact: {}
+      args: '{{ inputs }}'
+      delegate_to: localhost
+""")
+    with pytest.raises(ValueError, match="cannot freeze 'status'"):
+        compile_playbook(str(playbook), freeze_vars=["status"])
+
+
+def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 19):
+        pytest.skip("checks legacy argument and omit semantics")
+    playbook = """- hosts: origin
+  gather_facts: false
+  tasks:
+    - set_fact:
+        explicit_marker: applied
+        deep: [[{field: '{{ omit }}'}]]
+        direct: [{field: '{{ omit }}'}]
+      args: '{{ optional_facts | default(none) }}'
+      delegate_to: recipient
+    - assert:
+        that:
+          - explicit_marker == 'applied'
+          - deep[0][0].field is defined
+          - direct[0].field is undefined
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_delegated_set_fact_keeps_free_form_scalar(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("checks free-form argument processing on Core 2.21")
+    playbook = """- hosts: origin
+  gather_facts: false
+  vars: {payload: scalar}
+  tasks:
+    - set_fact: '{{ payload }}'
+      delegate_to: recipient
+    - assert:
+        that: vars['_raw_params'] == 'scalar'
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
