@@ -5735,7 +5735,7 @@ class Runtime:
             else:
                 self._module_env = self._task_environment(task, ctx)
             special = task.get("special")
-            if special and (special == "debug"
+            if special and (special in ("debug", "set_fact")
                             or not (self.delegate_fn and task.get("delegate_to"))):
                 res = self._run_special(special, task, ctx, become, args_cache)
             elif delegated:
@@ -6782,6 +6782,8 @@ class Runtime:
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
+                if not res.get("_ansible_facts_cacheable"):
+                    return
             elif short_action == "include_vars":
                 self.vars.update(facts)
                 self._include_vars_layer.update(facts)

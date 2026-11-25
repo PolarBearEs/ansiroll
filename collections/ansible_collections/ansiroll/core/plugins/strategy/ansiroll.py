@@ -721,14 +721,6 @@ class StrategyModule(StrategyBase):
                     for key, value in facts.items():
                         self._variable_manager.set_host_variable(target.name, key, value)
             return result
-        if action == "set_fact":
-            args = dict(frame.get("args") or {})
-            cacheable = bool(args.pop("cacheable", False))
-            return {
-                "changed": False,
-                "ansible_facts": args,
-                "_ansible_facts_cacheable": cacheable,
-            }
         if action == "synchronize":
             return self._run_native_controller_task(
                 frame, host, hv, task_map or {}, play_context, resolve_play_var)

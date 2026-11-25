@@ -4857,6 +4857,30 @@ def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     assert "failed=0" in proc.stdout
 
 
+@pytest.mark.parametrize("strategy", ["linear", "ansiroll.core.ansiroll"])
+def test_delegated_set_fact_normalizes_arguments_on_invoking_host(tmp_path, strategy):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    fact_name: rendered_fact
+  tasks:
+    - set_fact:
+        "{{ fact_name }}": here
+        cacheable: "false"
+      delegate_to: recipient
+      delegate_facts: false
+    - assert:
+        that:
+          - rendered_fact == 'here'
+          - ansible_facts.rendered_fact is undefined
+          - hostvars.recipient.rendered_fact is undefined
+""", inventory="origin,recipient,", environment={"ANSIBLE_STRATEGY": strategy},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
