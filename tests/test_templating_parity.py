@@ -1888,6 +1888,112 @@ def test_dynamic_include_when_uses_loop_item(tmp_path, action):
     assert messages == ["allowed", "second"]
 
 
+def test_include_loop_registers_results_and_tallies_ignored_failures(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [1, 2]
+      when: false
+      register: filtered
+    - assert:
+        quiet: true
+        that:
+          - filtered is skipped
+          - filtered.results | length == 2
+    - include_tasks: child.yml
+      loop: [1, 2]
+      when: missing_condition
+      ignore_errors: true
+      register: ignored
+    - assert:
+        quiet: true
+        that:
+          - ignored is failed
+          - EXPECTED_RESULTS
+    - include_tasks: child.yml
+      loop: [first, second]
+      loop_control:
+        extended: "{{ enable_metadata }}"
+      when: ansible_loop is undefined
+      vars:
+        enable_metadata: false
+""".replace("EXPECTED_RESULTS", "ignored.results | length == 2" if MODERN_TEMPLATING
+            else "ignored.results is undefined"), {"child.yml": '- debug: {msg: "{{ item }}"}\n'})
+    assert messages == ["first", "second"]
+
+
+def test_include_loop_does_not_run_bodies_after_a_later_unignored_error(tmp_path):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [1, 2]
+      when: item != 2 or missing_condition
+""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+    assert messages == []
+    assert recap[3] == "1"
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.18"), reason="break_when requires ansible-core 2.18")
+def test_include_loop_break_when_reads_registered_item_metadata(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [first, second]
+      loop_control:
+        loop_var: entry
+        break_when: selected.ansible_loop_var != 'entry'
+      register: selected
+""", {"child.yml": '- debug: {msg: "{{ entry }}"}\n'})
+    assert messages == ["first", "second"]
+
+
+@pytest.mark.skipif(not Version("2.18") <= Version(__version__) < Version("2.21"),
+                    reason="legacy break_when errors replace the loop result")
+def test_include_loop_discards_selected_bodies_after_legacy_break_when_error(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [first, second]
+      loop_control:
+        break_when: item == 'second' and missing_condition
+      register: selected
+      ignore_errors: true
+    - assert:
+        quiet: true
+        that:
+          - selected is failed
+          - selected.results is undefined
+    - debug: {msg: continued}
+""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+    assert messages == ["continued"]
+
+
+def test_include_loop_censors_no_log_item_values(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [synthetic-private-item]
+      when: false
+      no_log: true
+""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(path))[0])
+    result = subprocess.run([sys.executable, str(script)], cwd=tmp_path,
+                            env=_env(), capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "synthetic-private-item" not in result.stdout + result.stderr
+
+
 def test_undefined_and_false_loop_conditions(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost
