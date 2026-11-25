@@ -256,6 +256,9 @@ def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(("template", "selected", "unrelated"), [
+    ("sites/{{ selection }}.j2", "sites/app.j2", "sites/.env"),
+    ("sites/prod-{{ selection }}.j2", "sites/prod-web.j2", "sites/staging-private.j2"),
+    ("sites/prod-   {{- selection }}.j2", "sites/prod-web.j2", "sites/staging-private.j2"),
     ("sites/{{ selection }}.j2", "sites/app.j2", "sites/notes.txt"),
     ("sites/{{ selection -}}   .j2", "sites/app.j2", "sites/notes.txt"),
     ("sites/{{ selection | default('}}') }}.j2", "sites/app.j2", "sites/notes.txt"),
@@ -297,6 +300,20 @@ def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_pa
 
     _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
     assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+
+
+def test_compile_dynamic_role_source_keeps_a_reachable_parent_path(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {selection: 'dir/../fallback'}
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: {src: "sites/prod-{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/prod-dir/placeholder": "not a template",
+        "roles/r/templates/sites/fallback.j2": "selected through parent traversal\n"})
+    _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
+    assert (tmp_path / "rendered.txt").read_text() == "selected through parent traversal\n"
 
 
 @pytest.mark.parametrize("prefix", ["templates/", "./templates/"])

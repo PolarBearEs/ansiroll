@@ -2491,22 +2491,27 @@ def _literal_head(src):
     return src[:m.start()] if m else src
 
 
-def _literal_role_source_tail(src):
+def _literal_role_source_edges(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import _bare_template_expression
 
     if _bare_template_expression(src) is not None:
-        return ""
+        return "", ""
     try:
         body = Environment(keep_trailing_newline=True).parse(src).body
     except TemplateSyntaxError:
-        return ""
+        return "", ""
+    head = tail = ""
+    if body and isinstance(body[0], nodes.Output):
+        output = body[0].nodes
+        if output and isinstance(output[0], nodes.TemplateData):
+            head = output[0].data
     if body and isinstance(body[-1], nodes.Output):
         output = body[-1].nodes
         if output and isinstance(output[-1], nodes.TemplateData):
-            return output[-1].data
-    return ""
+            tail = output[-1].data
+    return head, tail
 
 
 def _role_source_layout(base, walk):
@@ -2665,7 +2670,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             return False
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
-    tail = _literal_role_source_tail(src)
+    head, tail = _literal_role_source_edges(src)
+    head_dir, _, basename_head = head.rpartition(os.sep)
+    prefix_dir = os.path.normpath(prefix)
+    if basename_head in (".", "..") or os.path.normpath(head_dir) != prefix_dir:
+        basename_head = ""
     fixed_path = ""
     literal_tail = ()
     if os.sep in tail:
@@ -2686,21 +2695,30 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     explicit_subdir = _literal_head(src).startswith(subdir + "/") and _core_version() >= (2, 21)
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True, explicit_subdir=explicit_subdir):
         walk = []
+        requires_basename_head = False
         if prefix or is_subdir:
-            for root, dirs, files in os.walk(os.path.join(base, prefix)):
+            start = os.path.join(base, prefix)
+            for root, dirs, files in os.walk(start):
                 dirs.sort()
+                if basename_head and root == start:
+                    # Only a matching directory can let a rendered slash or
+                    # parent traversal reach a file outside this basename prefix.
+                    requires_basename_head = not any(name.startswith(basename_head) for name in dirs)
                 if fixed_path:
                     files = [basename] if basename in files else []
                 walk.append((root, dirs, files))
         root_dirs, root_aliases = _role_source_layout(base, walk)
-        trees.append((base, is_subdir, walk, root_dirs, root_aliases))
+        trees.append((base, is_subdir, walk, root_dirs, root_aliases, requires_basename_head))
         directories.update(root_dirs)
         for relative, target in root_aliases.items():
             aliases.setdefault(relative, target)
     aliases = {path: target for path, target in aliases.items() if target in directories}
     suffix = fixed_path[1:].split(os.sep) if os.sep in fixed_path[1:] else ()
 
-    def matches_suffix(relative, filename, alias_candidates):
+    def matches_source(relative, filename, alias_candidates, requires_basename_head):
+        if requires_basename_head and (os.path.normpath(os.path.dirname(relative)) != prefix_dir
+                                       or not filename.startswith(basename_head)):
+            return False
         if fixed_path and not ((os.sep + relative).endswith(fixed_path) or relative in alias_candidates):
             return False
         return os.sep in tail or filename.endswith(tail)
@@ -2772,7 +2790,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
                      "mode": stat.S_IMODE(st.st_mode)}
 
-    for base, is_subdir, walk, root_dirs, root_aliases in trees:
+    for base, is_subdir, walk, root_dirs, root_aliases, requires_basename_head in trees:
         root_index = len(source_roots)
         # The blocker's flag records whether copy would recurse into it.
         root_blocks, root_files = {}, {}
@@ -2803,7 +2821,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 for filename in claimed_names.intersection(files):
                     path = os.path.join(directory, filename)
                     relative = os.path.relpath(path, base)
-                    if matches_suffix(relative, filename, alias_candidates):
+                    if matches_source(relative, filename, alias_candidates, requires_basename_head):
                         mode = _role_source_mode(path)
                         if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                             special_paths.add(relative)
@@ -2823,7 +2841,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if not matches_suffix(rel, fn, alias_candidates):
+                if not matches_source(rel, fn, alias_candidates, requires_basename_head):
                     continue
                 mode = _role_source_mode(full)
                 if mode is None:
