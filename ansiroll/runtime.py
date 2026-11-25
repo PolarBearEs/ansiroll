@@ -17,6 +17,7 @@ installed Jinja2.
 
 import datetime as _dt
 import base64
+from decimal import Decimal
 import json
 import operator
 import os
@@ -43,6 +44,7 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # compiler bakes it into the generated source; target hosts usually have no
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
+_GATHER_STRING_METHODS = {"split", "rsplit", "strip", "lstrip", "rstrip"}
 
 
 def _core_at_least(major, minor):
@@ -71,11 +73,20 @@ _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 
 
+def _rendered_number(value, source, ctx):
+    if isinstance(value, Number) and not isinstance(value, bool) and _legacy_non_native(ctx):
+        # A bare name preserves the type only when its original value is numeric.
+        bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source)
+        if bare is None or not isinstance(dict.get(ctx, bare[1]), Number):
+            return str(value)
+    return value
+
+
 def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
+                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -157,6 +168,8 @@ class _Omit(str):
 
 _OMIT = _Omit("__omit_place_holder__ansiroll")
 _NO_CONDITIONAL_LIST = object()
+_MISSING_VARS_FILE_INPUT = object()
+_UNRESOLVED_SELECTOR_KEY = object()
 
 
 class _UnsafeTemplate(str):
@@ -208,6 +221,596 @@ def _decode_included_var(value):
 
 def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _selector_local_values(names, bindings, variables=None):
+    """Follow assignment-time names to constants, leaving other locals opaque."""
+    values = dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)
+    for name, sources in names.items():
+        visited = set()
+        while len(sources) == 1:
+            source, = sources
+            if isinstance(source, jinja2.nodes.Const):
+                literal = source.value
+                values[name] = _UnsafeText(literal) if isinstance(literal, str) else literal
+                break
+            if not isinstance(source, jinja2.nodes.Name) or id(source) in visited:
+                break
+            visited.add(id(source))
+            sources = bindings.get(id(source), {}).get(source.name, ())
+            if not sources and variables is not None:
+                value = _selector_vars_key(source, variables, ())
+                if isinstance(value, (str, int, float, bool, type(None))):
+                    values[name] = value
+    return values
+
+
+def _selector_scope(expression, variables, *, retain_mutable=False):
+    nodes = jinja2.nodes
+    bindings = {}
+    unreachable = set()
+    calls = []
+    closure_reads = set()
+    closure_nodes = set()
+    external = frozenset({None})
+    unknown_local = frozenset({_UNRESOLVED_SELECTOR_KEY})
+    in_closure = False
+
+    def target_names(target):
+        if isinstance(target, nodes.Name):
+            return {target.name}
+        return {name.name for name in target.find_all(nodes.Name) if name.ctx != "load"}
+
+    def branch_value(test, names):
+        if retain_mutable or in_closure:
+            variables_in_test = (test,) if isinstance(test, nodes.Name) else test.find_all(nodes.Name)
+            if any(node.name not in names for node in variables_in_test):
+                return None
+        external_scalars = None if retain_mutable or in_closure else variables
+        scope = {**variables, **_selector_local_values(names, bindings, external_scalars)} if names else variables
+        value = _selector_vars_key(test, scope, (), template_variables=variables)
+        return _selector_truth(value)
+
+    def visit(node, names, top=None):
+        nonlocal in_closure
+        if in_closure:
+            closure_nodes.add(id(node))
+            if isinstance(node, nodes.Name) and node.ctx == "load" and None in names.get(node.name, external):
+                closure_reads.add(node.name)
+        if names:
+            bindings[id(node)] = names.copy()
+        if isinstance(node, nodes.Call):
+            calls.append(node)
+        context = names if top is None else top
+        if isinstance(node, nodes.If):
+            outcomes = []
+            fallthrough = True
+            for branch in (node, *node.elif_):
+                if not fallthrough:
+                    unreachable.add(id(branch))
+                    continue
+                visit(branch.test, names, top)
+                test = branch_value(branch.test, names)
+                if test is not False:
+                    local = names.copy()
+                    for child in branch.body:
+                        visit(child, local, top)
+                    outcomes.append(local)
+                else:
+                    unreachable.update(map(id, branch.body))
+                if test is True:
+                    fallthrough = False
+            if fallthrough:
+                local = names.copy()
+                for child in node.else_:
+                    visit(child, local, top)
+                outcomes.append(local)
+            else:
+                unreachable.update(map(id, node.else_))
+            # Keep the possible definitions, including the outer variable on
+            # paths that leave a name unassigned.
+            names.update({name: frozenset().union(*(outcome.get(name, external) for outcome in outcomes))
+                          for name in set().union(*outcomes)})
+            return
+        if isinstance(node, nodes.CondExpr):
+            visit(node.test, names, top)
+            test = branch_value(node.test, names)
+            for arm, selected in ((node.expr1, True), (node.expr2, False)):
+                if arm is not None:
+                    if test is None or test is selected:
+                        visit(arm, names, top)
+                    else:
+                        unreachable.add(id(arm))
+            return
+        if isinstance(node, (nodes.And, nodes.Or)):
+            visit(node.left, names, top)
+            left = branch_value(node.left, names)
+            short_circuit_on = isinstance(node, nodes.Or)
+            if left is short_circuit_on:
+                unreachable.add(id(node.right))
+            else:
+                visit(node.right, names, top)
+            return
+        if isinstance(node, nodes.For):
+            visit(node.iter, names, top)
+            local = {**names, **dict.fromkeys(target_names(node.target), unknown_local)}
+            if node.test is not None:
+                visit(node.test, local.copy(), context)
+            local["loop"] = unknown_local
+            for child in node.body:
+                visit(child, local, context)
+            local = names.copy()
+            for child in node.else_:
+                visit(child, local, context)
+            return
+        if isinstance(node, nodes.With):
+            for value in node.values:
+                visit(value, names, top)
+            targets = set().union(*(target_names(target) for target in node.targets))
+            local = {**names, **dict.fromkeys(targets, unknown_local)}
+            for child in node.body:
+                visit(child, local, context)
+            return
+        local = names
+        if isinstance(node, (nodes.Macro, nodes.CallBlock)):
+            if isinstance(node, nodes.CallBlock):
+                visit(node.call, names, top)
+            # The closure can run after captured names are reassigned.
+            # Keep their possible outer reads and avoid folding their values.
+            captured = {name: sources | external for name, sources in names.items()}
+            captured_context = {name: sources | external for name, sources in context.items()}
+            was_in_closure, in_closure = in_closure, True
+            for default in node.defaults:
+                visit(default, captured, captured_context)
+            parameters = {arg.name for arg in node.args} | {"caller", "kwargs", "varargs"}
+            if isinstance(node, nodes.Macro):
+                parameters.add(node.name)
+            local = {**captured, **dict.fromkeys(parameters, unknown_local)}
+            for child in node.body:
+                visit(child, local, captured_context)
+            in_closure = was_in_closure
+            if isinstance(node, nodes.Macro):
+                names[node.name] = unknown_local
+            return
+        elif isinstance(node, nodes.Block) and not node.scoped:
+            local = context.copy()
+        elif isinstance(node, (nodes.Block, nodes.Scope, nodes.FilterBlock, nodes.AssignBlock,
+                               nodes.OverlayScope)):
+            local = names.copy()
+        for child in node.iter_child_nodes():
+            visit(child, local, top if local is names else context)
+        if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(
+                node.node, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Const)):
+            names[node.target.name] = frozenset({node.node})
+        elif isinstance(node, (nodes.Assign, nodes.AssignBlock)):
+            names.update(dict.fromkeys(target_names(node.target), unknown_local))
+        elif isinstance(node, nodes.Import):
+            names[node.target] = unknown_local
+        elif isinstance(node, nodes.FromImport):
+            names.update(dict.fromkeys((name[1] if isinstance(name, tuple) else name for name in node.names),
+                                       unknown_local))
+
+    visit(expression, {})
+    return bindings, unreachable, calls, closure_reads, closure_nodes
+
+
+def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
+                          *, resolve_aliases=False, analysis=None, retain_mutable=False):
+    """Yield variable names and literal member paths read by a selector."""
+    nodes = jinja2.nodes
+    bindings, unreachable, _, closure_reads, closure_nodes = (
+        analysis if analysis is not None else _selector_scope(expression, variables or {}))
+
+    def resolve_key(node, aliases=None):
+        local = bindings.get(id(node))
+        template_variables = variables or {}
+        scope = template_variables
+        if local:
+            external_scalars = None if retain_mutable or id(node) in closure_nodes else scope
+            scope = {**scope, **_selector_local_values(local, bindings, external_scalars)}
+        return _selector_vars_key(node, scope, aliases, template_variables=template_variables)
+
+    pending = [(expression, ())]
+    if remaining and len(expression.body) == 1 and isinstance(expression.body[0], nodes.Output):
+        outputs = [node for node in expression.body[0].nodes
+                   if not isinstance(node, nodes.TemplateData) or node.data.strip()]
+        if len(outputs) == 1:
+            pending = [(outputs[0], remaining)]
+    visited = set()
+    while pending:
+        node, suffix = pending.pop()
+        if id(node) in unreachable or (id(node), suffix) in visited:
+            continue
+        visited.add((id(node), suffix))
+        if (isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name)
+                and node.target.name not in closure_reads
+                and isinstance(node.node, (nodes.Name, nodes.Getattr, nodes.Getitem))):
+            # Resolving the assignment reads the binding. Members of a lazy
+            # mapping are read only where the alias is used.
+            pending.append((node.node, (None, "defined")))
+            continue
+        if isinstance(node, nodes.CondExpr):
+            pending.append((node.test, ()))
+            pending.extend((arm, suffix) for arm in (node.expr1, node.expr2) if arm is not None)
+            continue
+        if isinstance(node, (nodes.And, nodes.Or)):
+            pending.extend(((node.left, suffix), (node.right, suffix)))
+            if suffix and suffix != (None,):
+                # A branch can change even when the projected member stays absent.
+                pending.append((node.left, (None,)))
+            continue
+        if suffix and isinstance(node, nodes.Filter) and node.name in ("default", "d"):
+            args = _selector_default_arguments(node)
+            if args is not None:
+                boolean_node = args.get("boolean")
+                boolean = resolve_key(boolean_node, ()) if boolean_node is not None else False
+                control = (None, "defined") if _selector_truth(boolean) is False else (None,)
+                pending.append((node.node, control))
+                if boolean_node is not None:
+                    pending.append((boolean_node, ()))
+                fallback = args.get("default_value")
+                use_fallback = None if retain_mutable else _selector_default_uses_fallback(
+                    resolve_key(node.node, ()), boolean)
+                if use_fallback is not True:
+                    pending.append((node.node, suffix))
+                if fallback is not None and (use_fallback is not False or
+                                             resolve_key(fallback, ()) is _UNRESOLVED_SELECTOR_KEY):
+                    # Jinja still evaluates the argument. A known mapping only
+                    # reads one of its members if it is the selected operand.
+                    pending.append((fallback, suffix))
+                continue
+            pending.append((node.node, suffix))
+            pending.extend((value, suffix if index == 0 else ()) for index, value in enumerate(node.args))
+            pending.extend((kw.value, suffix if kw.key == "default_value" else ()) for kw in node.kwargs)
+            pending.extend((value, ()) for value in (node.dyn_args, node.dyn_kwargs) if value is not None)
+            continue
+        if isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name) and node.node.name in (
+            "lookup", "query", "q",
+        ):
+            pending.extend((child, ()) for child in node.iter_child_nodes() if child is not node.node)
+            plugin = resolve_key(node.args[0]) if node.args else None
+            vars_lookup = plugin in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
+            if unknown_lookup is not None and (not isinstance(plugin, str) or vars_lookup and node.dyn_args is not None):
+                unknown_lookup.add("vars")
+            if vars_lookup:
+                for term in node.args[1:]:
+                    key = resolve_key(term)
+                    if isinstance(key, str):
+                        yield key, ()
+                    elif unknown_lookup is not None:
+                        unknown_lookup.add("vars")
+            continue
+        if isinstance(node, nodes.Call) and isinstance(node.node, nodes.Getattr):
+            # Calling an attribute can read the receiver itself, as dict.keys() does.
+            pending.append((node.node.node, ()))
+            pending.extend((child, ()) for child in node.iter_child_nodes() if child is not node.node)
+            continue
+        root = node
+        path = []
+        while isinstance(root, (nodes.Getattr, nodes.Getitem)):
+            if isinstance(root, nodes.Getattr):
+                path.append(root.attr)
+            elif isinstance(root.arg, nodes.Const) and isinstance(root.arg.value, (str, int)):
+                path.append(root.arg.value)
+            else:
+                vars_access = isinstance(root.node, nodes.Name) and root.node.name == "vars"
+                if vars_access and computed is not None:
+                    computed.add("vars")
+                pending.append((root.arg, ()))
+                if retain_mutable and not vars_access:
+                    # An override can select a different member. Scan every
+                    # member of this receiver for the aliases it may need.
+                    pending.append((root.node, ()))
+                    root = None
+                    break
+                key = resolve_key(root.arg, () if resolve_aliases else None)
+                if not isinstance(key, str if vars_access else (str, int)):
+                    if vars_access and unknown_lookup is not None:
+                        unknown_lookup.add("vars")
+                    if vars_access and (computed is not None or unknown_lookup is not None):
+                        root = None
+                    break
+                path.append(key)
+            root = root.node
+        if root is None:
+            continue
+        if isinstance(root, nodes.Name) and root.ctx == "load":
+            path = tuple(reversed(path)) + suffix
+            local = bindings.get(id(root), {}).get(root.name, ())
+            pending.extend((source, path) for source in local
+                           if isinstance(source, (nodes.Name, nodes.Getattr, nodes.Getitem)))
+            if local and None not in local:
+                continue
+            if root.name == "vars" and path and isinstance(path[0], str):
+                yield path[0], path[1:]
+            else:
+                yield root.name, path
+        elif path and (isinstance(root, (nodes.CondExpr, nodes.And, nodes.Or))
+                       or isinstance(root, nodes.Filter) and root.name in ("default", "d")):
+            pending.append((root, tuple(reversed(path)) + suffix))
+        else:
+            pending.extend((child, ()) for child in node.iter_child_nodes())
+
+
+def _selector_truth(value):
+    if isinstance(value, (str, bool, int, float, type(None), dict, list, tuple)):
+        return bool(value)
+    return None
+
+
+def _selector_default_arguments(node):
+    if node.dyn_args is not None or node.dyn_kwargs is not None or len(node.args) > 2:
+        return None
+    parameters = ("default_value", "boolean")
+    arguments = dict(zip(parameters, node.args))
+    for keyword in node.kwargs:
+        if keyword.key not in parameters or keyword.key in arguments:
+            return None
+        arguments[keyword.key] = keyword.value
+    return arguments
+
+
+def _selector_default_uses_fallback(value, boolean):
+    if value is _MISSING_VARS_FILE_INPUT:
+        return True
+    if value is _UNRESOLVED_SELECTOR_KEY:
+        return None
+    boolean = _selector_truth(boolean)
+    if boolean is False:
+        return False
+    truth = _selector_truth(value)
+    return not truth if boolean is True and truth is not None else None
+
+
+def _selector_vars_key(node, variables, aliases=None, *, template_variables=None):
+    """Resolve known values without running template plugins."""
+    if template_variables is None:
+        template_variables = variables
+
+    def resolve(child):
+        return _selector_vars_key(child, variables, aliases, template_variables=template_variables)
+
+    unknown = _UNRESOLVED_SELECTOR_KEY
+    missing = _MISSING_VARS_FILE_INPUT
+    if isinstance(node, jinja2.nodes.Const):
+        return node.value
+    if isinstance(node, jinja2.nodes.CondExpr):
+        truth = _selector_truth(resolve(node.test))
+        if truth is not None:
+            return resolve(node.expr1 if truth else node.expr2)
+    if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
+        left = resolve(node.left)
+        truth = _selector_truth(left)
+        if truth is not None:
+            short_circuit_on = isinstance(node, jinja2.nodes.Or)
+            if truth is short_circuit_on:
+                return left
+            return resolve(node.right)
+    if isinstance(node, jinja2.nodes.Not):
+        truth = _selector_truth(resolve(node.node))
+        if truth is not None:
+            return not truth
+    if isinstance(node, jinja2.nodes.Name):
+        value = variables.get(node.name, missing)
+        if value is None or value is missing:
+            return value
+        if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+            return value["__ansiroll_unsafe__"]
+        if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
+            return value
+        if isinstance(value, (int, float, dict, list, tuple)):
+            return value
+        if aliases is not None and len(aliases) < 64 and node.name not in aliases and isinstance(value, str):
+            source = _bare_template_expression(value)
+            if source is not None:
+                try:
+                    body = jinja2.Environment().parse("{{ " + source + " }}").body
+                except jinja2.TemplateSyntaxError:
+                    return unknown
+                if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
+                    rendered = _selector_vars_key(body[0].nodes[0], template_variables, (*aliases, node.name))
+                    return _rendered_number(rendered, value, template_variables)
+    if isinstance(node, jinja2.nodes.Compare):
+        # Delegate each comparison of known scalars to Jinja's own operator
+        # semantics. Evaluate chained operands only when needed.
+        left = resolve(node.expr)
+        for operand in node.ops:
+            right = resolve(operand.expr)
+            if not all(isinstance(value, (str, bool, int, float, type(None))) for value in (left, right)):
+                return unknown
+            compare = jinja2.nodes.Compare(
+                jinja2.nodes.Const(left), [jinja2.nodes.Operand(operand.op, jinja2.nodes.Const(right))])
+            compare.set_environment(node.environment)
+            try:
+                if not compare.as_const():
+                    return False
+            except jinja2.nodes.Impossible:
+                return unknown
+            left = right
+        return True
+    if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
+        method = node.node.attr
+        if method in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None:
+            value = resolve(node.node.node)
+            args = [resolve(arg) for arg in node.args]
+            kwargs = {kw.key: resolve(kw.value) for kw in node.kwargs}
+            if isinstance(value, str) and all(arg is not unknown and arg is not missing
+                                              for arg in (*args, *kwargs.values())):
+                try:
+                    return getattr(str, method)(value, *args, **kwargs)
+                except (TypeError, ValueError, OverflowError):
+                    return unknown
+    if isinstance(node, jinja2.nodes.Getitem):
+        value = resolve(node.node)
+        index = resolve(node.arg)
+        if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
+            return value[index]
+    if isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d"):
+        arguments = _selector_default_arguments(node)
+        if arguments is None:
+            return unknown
+        value = resolve(node.node)
+        boolean = resolve(arguments["boolean"]) if "boolean" in arguments else False
+        fallback = _selector_default_uses_fallback(value, boolean)
+        if fallback is True:
+            return resolve(arguments["default_value"]) if "default_value" in arguments else ""
+        return value if fallback is False else unknown
+    if isinstance(node, jinja2.nodes.Filter) and node.name in ("lower", "upper", "trim"):
+        if not (node.args or node.kwargs or node.dyn_args or node.dyn_kwargs):
+            value = resolve(node.node)
+            if isinstance(value, str):
+                method = "strip" if node.name == "trim" else node.name
+                return getattr(value, method)()
+    if (isinstance(node, jinja2.nodes.Filter) and node.name == "replace"
+            and not (node.kwargs or node.dyn_args or node.dyn_kwargs) and len(node.args) in (2, 3)):
+        value = resolve(node.node)
+        old, new = map(resolve, node.args[:2])
+        count = resolve(node.args[2]) if len(node.args) == 3 else -1
+        if all(isinstance(part, str) for part in (value, old, new)) and isinstance(count, int):
+            try:
+                return str.replace(value, old, new, count)
+            except OverflowError:
+                return unknown
+    if isinstance(node, jinja2.nodes.Concat):
+        parts = list(map(resolve, node.nodes))
+        if all(isinstance(part, str) for part in parts):
+            return "".join(parts)
+    return unknown
+
+
+def _literal_vars_input(value):
+    if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+        text = value["__ansiroll_unsafe__"]
+        if isinstance(text, str) and not _looks_templated(text):
+            return text
+    return value
+
+
+def _vars_input_at(scope, name, path):
+    value = scope.get(name, _MISSING_VARS_FILE_INPUT)
+    for member in path:
+        value = _literal_vars_input(value)
+        if member is None:
+            # None marks a branch choice rather than a member lookup.
+            if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+                return value
+            if path[-1] == "defined":
+                return value is not _MISSING_VARS_FILE_INPUT
+            truth = _selector_truth(value)
+            return value if truth is None else truth
+        if isinstance(value, dict):
+            if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                break
+            value = value.get(member, _MISSING_VARS_FILE_INPUT)
+        elif (_looks_templated(value) and not isinstance(value, _NO_TEMPLATE)):
+            # The dependency scan also records the projection through this source.
+            return value
+        elif isinstance(value, (list, tuple, str)) and isinstance(member, int):
+            value = value[member] if -len(value) <= member < len(value) else _MISSING_VARS_FILE_INPUT
+        else:
+            # An unsupported projection must not hide a changed input.
+            return value
+    return value
+
+
+def _same_vars_input(left, right):
+    left, right = _literal_vars_input(left), _literal_vars_input(right)
+    if left is right:
+        return True
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return len(left) == len(right) and all(
+            _same_vars_input(a, b) for a, b in zip(left.items(), right.items()))
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(_same_vars_input(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _clear_vars_file_blocks(blocked, mapping, merge_hashes):
+    """Record which members a guaranteed assignment replaces."""
+    for key in blocked.keys() & mapping.keys():
+        value = mapping[key]
+        if not merge_hashes or not isinstance(value, dict):
+            del blocked[key]
+            continue
+        pending = [(value, ())]
+        replacements = set(blocked[key])
+        while pending:
+            member, path = pending.pop()
+            if isinstance(member, dict):
+                pending.extend((entry, (*path, name)) for name, entry in member.items())
+            else:
+                replacements.add(path)
+        blocked[key] = frozenset(replacements)
+
+
+def _vars_file_reads_blocked(blocked, inputs):
+    return any(name in blocked and not any(path[:len(prefix)] == prefix for prefix in blocked[name])
+               for name, path in inputs)
+
+
+def _selector_projection_cycle(origin, path, ancestors):
+    for previous_origin, previous in ancestors:
+        if previous_origin != origin:
+            continue
+        if previous == path:
+            return True
+        if len(path) <= len(previous):
+            continue
+        # Growth in the same branch can keep inserting components without
+        # ever consuming the tail. A different branch may still terminate.
+        tail = previous[1:]
+        if not previous or (path[0] == previous[0] and (not tail or path[-len(tail):] == tail)):
+            return True
+    return False
+
+
+def _selector_template_sources(value, path=()):
+    """Yield each required template with its remaining path and its location in the input."""
+    for index, key in enumerate(path):
+        if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+            yield value, path[index:], path[:index]
+            return
+        if key is None:
+            return
+        if isinstance(value, dict):
+            if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                return
+            value = value.get(key)
+        elif isinstance(value, (list, tuple)) and isinstance(key, int) and -len(value) <= key < len(value):
+            value = value[key]
+        else:
+            return
+    pending = [(value, path)]
+    seen = set()
+    while pending:
+        value, location = pending.pop()
+        if isinstance(value, (dict, list, tuple)):
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if isinstance(value, dict):
+                if value.keys() in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
+                    continue
+                pending.extend((item, (*location, key)) for key, item in value.items())
+            else:
+                pending.extend((item, (*location, index)) for index, item in enumerate(value))
+        elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+            yield value, (), location
+
+
+def _vars_file_glob_covers(pattern, name):
+    """Match the same path components as glob.glob, without filesystem reads."""
+    from fnmatch import fnmatchcase
+
+    parts = name.split(os.path.sep)
+    patterns = pattern.split(os.path.sep)
+    return len(parts) == len(patterns) and all(
+        (part or not segment) and (not part.startswith(".") or segment.startswith("."))
+        and fnmatchcase(part, segment)
+        for part, segment in zip(parts, patterns)
+    )
 
 
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
@@ -1117,6 +1720,8 @@ def _lazy_wrap(value, rt, ctx, dynamic=False, origin=None, task_vars=False):
         value = _TaskVarTemplate(value)
     if type(value) is tuple and rt.templater._untrusted_task_interpolation is not None:
         return _LazyTplTuple(value, rt, ctx)
+    if isinstance(value, str) and ctx.get("__ansiroll_lazy_selector_members"):
+        return rt.templater.render_string(value, ctx, strict=rt._strict_var_resolution)
     if isinstance(value, (str, tuple)):
         if getattr(rt, "_strict_var_resolution", False):
             return rt.template(value, ctx, strict=True)
@@ -2379,25 +2984,27 @@ class _PluginInventoryArgument:
             list.__setitem__(owner, slice(None), members)
 
 
-def _restore_plugin_argument(value, sources, restored, *, copy_containers=False):
+def _restore_plugin_argument(value, sources, restored, *, copies=None):
     if id(value) in sources:
         return sources[id(value)]
+    if copies is not None and id(value) not in copies:
+        return value
     if id(value) in restored:
         return restored[id(value)][1]
     if type(value) is dict:
-        result = {} if copy_containers else value
+        result = {} if copies is not None else value
         restored[id(value)] = value, result
         for key, item in dict.items(value):
-            result[key] = _restore_plugin_argument(item, sources, restored, copy_containers=copy_containers)
+            result[key] = _restore_plugin_argument(item, sources, restored, copies=copies)
         return result
     elif type(value) is list:
-        result = [] if copy_containers else value
+        result = [] if copies is not None else value
         restored[id(value)] = value, result
-        result[:] = [_restore_plugin_argument(item, sources, restored, copy_containers=copy_containers)
+        result[:] = [_restore_plugin_argument(item, sources, restored, copies=copies)
                      for item in value]
         return result
     elif type(value) is tuple:
-        items = tuple(_restore_plugin_argument(item, sources, restored, copy_containers=copy_containers)
+        items = tuple(_restore_plugin_argument(item, sources, restored, copies=copies)
                       for item in value)
         if all(item is original for item, original in zip(items, value)):
             items = value
@@ -2418,12 +3025,37 @@ def _restore_plugin_arguments(converted):
                     _restore_plugin_argument(entry[1], sources, restored)
 
 
-def _restore_plugin_result(result, converted, *, copy_containers=False):
+def _plugin_result_copies(result, sources):
+    # Find the containers that reach a converted argument, including cycles.
+    parents = {}
+    visited = set()
+    pending = [result]
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in sources or identity in visited or type(value) not in (dict, list, tuple):
+            continue
+        visited.add(identity)
+        for item in value.values() if type(value) is dict else value:
+            if id(item) in sources or type(item) in (dict, list, tuple):
+                parents.setdefault(id(item), set()).add(identity)
+                pending.append(item)
+    copies = set()
+    affected = list(sources.keys() & parents.keys())
+    while affected:
+        for parent in parents.get(affected.pop(), ()):
+            if parent not in copies:
+                copies.add(parent)
+                affected.append(parent)
+    return copies
+
+
+def _restore_plugin_result(result, converted):
     if converted:
         sources = {id(builtin): original for original, builtin, *_ in converted.values()
                    if isinstance(original, (_RawSnapshotMapping, _RawSnapshotList))}
         if sources:
-            return _restore_plugin_argument(result, sources, {}, copy_containers=copy_containers)
+            return _restore_plugin_argument(result, sources, {}, copies=_plugin_result_copies(result, sources))
     return result
 
 
@@ -2498,12 +3130,12 @@ class _ScopedGenerator(Generator):
     def send(self, value):
         with self._templater._plugin_arg_scope(self._converted):
             result = self._generator.send(value)
-        return _restore_plugin_result(result, self._converted, copy_containers=True)
+        return _restore_plugin_result(result, self._converted)
 
     def throw(self, *args):
         with self._templater._plugin_arg_scope(self._converted):
             result = self._generator.throw(*args)
-        return _restore_plugin_result(result, self._converted, copy_containers=True)
+        return _restore_plugin_result(result, self._converted)
 
     def close(self):
         with self._templater._plugin_arg_scope(self._converted):
@@ -3021,14 +3653,6 @@ class _Templater:
             # A nested render (a lazily templated variable, a lookup term)
             # must not leave its context behind for the outer template.
             self._current_ctx = previous
-        if (isinstance(result, Number) and not isinstance(result, bool)
-                and _legacy_non_native(ctx)):
-            # Legacy non-native concatenation stringifies numbers unless the
-            # whole template names a variable whose raw value is a number.
-            single = re.match(r"^\{\{\s*(\w+)\s*\}\}$", text)
-            # The raw value: a play var scope would resolve a "{{ other }}" source to its number.
-            if single is None or not isinstance(dict.get(ctx, single.group(1)), Number):
-                return str(result)
         if isinstance(result, _UntrustedConditionValue):
             return result
         if isinstance(result, str):
@@ -3037,7 +3661,7 @@ class _Templater:
             return (_UnsafeText(result) if _looks_templated(result)
                     else str(result) if isinstance(result, _UnsafeTemplate)
                     else result)
-        return result
+        return _rendered_number(result, text, ctx)
 
     def _conditional_member(self, env, node):
         expression = None
@@ -3319,7 +3943,7 @@ def _as_text(v):
         v._fail_with_undefined_error()
     if v is None:
         return ""
-    if isinstance(v, (dict, list, _HostVarEntries)):
+    if isinstance(v, (dict, list, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
         return json.dumps(v, **_view_json_options({}))
     if isinstance(v, bool):
         return "true" if v else "false"
@@ -3892,8 +4516,25 @@ class Runtime:
         saved_facts = self.vars.get("ansible_facts")
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
+        timeout_template = play.get("gather_timeout_template") or {}
+        play_vars = dict(play.get("vars") or {})
+        ordered_files = play.get("ordered_vars_files", timeout_template.get("vars_files"))
+        vars_files = ordered_files if ordered_files is not None else play.get("deferred_vars_files") or ()
+        vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
+        merge_vars_files = (ordered_files is not None and
+                            self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
+        vars_file_defaults = play.get("vars_file_defaults", timeout_template.get("vars_file_defaults")) or {}
+        vars_file_magic = play.get("vars_file_magic") or {}
+        early_files = {}
         if play.get("gather_facts") and not gather_cached:
-            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
+            timeout_vars = None
+            blocked_timeout_inputs = {}
+            if timeout_template and vars_files:
+                timeout_vars = self._resolve_deferred_vars_files(
+                    vars_file_play_vars, vars_files, early_files,
+                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {})},
+                    blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic)
+            setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -3901,13 +4542,18 @@ class Runtime:
                 fact_schema=play.get("fact_schema"),
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
+                gather_timeout=play.get("gather_timeout"),
+                timeout_template=timeout_template, timeout_vars=timeout_vars,
+                blocked_timeout_inputs=blocked_timeout_inputs,
             )
             if not gathered:
                 self.failed = True
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        play_vars = self._with_deferred_vars_files(play)
+        play_vars = self._resolve_deferred_vars_files(
+            vars_file_play_vars, vars_files, early_files, vars_file_defaults,
+            merge_hashes=merge_vars_files, magic=vars_file_magic)
         self._play_var_names = set(play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -4148,19 +4794,77 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _with_deferred_vars_files(self, play):
-        """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
-        files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
-        play_vars = dict(play.get("vars") or {})
+    def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
+                                     blocked_inputs=None, merge_hashes=False, magic=None):
+        """Resolve each vars file in order, reusing early matches with unchanged inputs."""
+        # During early replay each blocked variable records the member paths
+        # that later assignments have definitely replaced.
+        before_setup = blocked_inputs is not None
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
-        base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
-        for entry in play.get("deferred_vars_files") or ():
-            ctx = self.ctx(play_vars, self.extra_vars, base=base)
+        if before_setup:
+            base = {key: self.vars[key] for key in ("__ansiroll_controller_env", "__ansiroll_controller_config")}
+        else:
+            base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
+        selected = dict(play_vars)
+        selector_vars = _f_combine(defaults, None if before_setup else base, selected, recursive=merge_hashes)
+
+        def apply_files(mappings):
+            nonlocal selected, selector_vars
+            for mapping in mappings:
+                if before_setup:
+                    _clear_vars_file_blocks(blocked_inputs, mapping, merge_hashes)
+                else:
+                    selected = _f_combine(selected, mapping, recursive=merge_hashes)
+                selector_vars = _f_combine(selector_vars, mapping, recursive=merge_hashes)
+
+        for index, entry in enumerate(entries):
+            if "static_vars" in entry:
+                apply_files(entry["static_vars"])
+                continue
+            ctx = self.ctx(_f_combine(selector_vars, self.extra_vars, magic, recursive=merge_hashes), base={
+                "__ansiroll_controller_env": base.get("__ansiroll_controller_env", {}),
+                "__ansiroll_controller_config": base.get("__ansiroll_controller_config", {}),
+                "__ansiroll_lazy_selector_members": True,
+            })
+            if not before_setup and index in early_files:
+                inputs, mappings = early_files[index]
+                if all(_same_vars_input(ctx.get(key, _MISSING_VARS_FILE_INPUT), value)
+                       for key, value in inputs.items()):
+                    apply_files(mappings)
+                    continue
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
+            inputs = {}
+            if blocked_inputs:
+                selector_blocks = dict(blocked_inputs)
+                for layer in (self.extra_vars, magic or {}):
+                    _clear_vars_file_blocks(selector_blocks, layer, merge_hashes)
+            else:
+                selector_blocks = {}
             for raw in entry["names"]:
+                checked = entry.get("controller_candidates", {}).get(raw)
+                paths = {(key, tuple(path)) for key, path in checked["paths"]} if checked else set()
+                reuse_checked = checked and not _vars_file_reads_blocked(selector_blocks, paths) and all(
+                    _same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
+                    for key, path in paths
+                )
+                if before_setup:
+                    if reuse_checked:
+                        dependencies = {key: ctx.get(key, _MISSING_VARS_FILE_INPUT) for key, _ in paths}
+                    else:
+                        dependencies = self._pre_setup_template_inputs(raw, ctx, selector=True, paths=paths)
+                    if dependencies is None or _vars_file_reads_blocked(selector_blocks, paths):
+                        # A selector we cannot evaluate here may still change inputs to setup.
+                        for mappings in entry["files"].values():
+                            if isinstance(mappings, list):
+                                for mapping in mappings:
+                                    blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
+                        break
+                    inputs.update(dependencies)
                 try:
-                    name = _fail_on_undef(self.template(raw, ctx))
+                    name = checked["name"] if reuse_checked else _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
+                    if before_setup:
+                        break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
                                              "vars_files item %r: %s" % (item, ex))
@@ -4168,6 +4872,8 @@ class Runtime:
                                      % (item,))
                     break
                 except Exception as ex:
+                    if before_setup:
+                        break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
                     continue
@@ -4179,22 +4885,91 @@ class Runtime:
                         if entry.get("subdir") and name.split("/")[0] != entry["subdir"]:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
-                found = [path for path in map(os.path.normpath, candidates) if path in entry["files"]]
-                if found:
-                    data = entry["files"][found[0]]
+                checked_paths = entry.get("checked_paths", {})
+                if name in checked_paths:
+                    path = checked_paths[name]
+                    if path is None:
+                        continue
+                    data = entry["files"][path]
+                else:
+                    pattern = entry.get("glob_patterns", {}).get(raw)
+                    covered = raw not in entry.get("unmodeled", ()) and (
+                        pattern is None or _vars_file_glob_covers(pattern, name))
+                    data = None
+                    if ".." not in name.split(os.path.sep) or not entry.get("glob_patterns"):
+                        for candidate in map(os.path.normpath, candidates):
+                            if candidate in entry["files"]:
+                                data = entry["files"][candidate]
+                                break
+                            if not covered:
+                                break
+                    else:
+                        covered = False
+                    if data is None and not covered:
+                        if before_setup:
+                            break
+                        raise VarsFilesError("vars_files item %r selected a path that was not bundled; "
+                                             "make its selector resolvable at compile time" % (item,))
+                if data is not None:
                     if isinstance(data, dict):
+                        if before_setup:
+                            break
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    for value in data:
-                        play_vars.update(value)
+                    apply_files(data)
+                    if before_setup:
+                        early_files[index] = (inputs, data)
                     break
             else:
+                if before_setup:
+                    continue
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
                 if not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
                 sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                  % (item,))
-        return play_vars
+        return selector_vars if before_setup else selected
+
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None):
+        inputs = {}
+        pending = [(source, (), None, ())]
+        seen = set()
+        while pending:
+            source, remaining, origin, ancestors = pending.pop()
+            if _selector_projection_cycle(origin, remaining, ancestors):
+                return None
+            ancestors = (*ancestors, (origin, remaining))
+            try:
+                expression = self.templater.env.parse(source)
+            except jinja2.TemplateSyntaxError:
+                return None
+            analysis = _selector_scope(expression, ctx)
+            for call in analysis[2]:
+                method = call.node
+                if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
+                    return None
+            for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
+                                                    analysis=analysis):
+                if paths is not None:
+                    paths.add((name, path))
+                if (name, path) in seen:
+                    continue
+                seen.add((name, path))
+                if name not in ctx:
+                    inputs[name] = _MISSING_VARS_FILE_INPUT
+                    continue
+                value = ctx[name]
+                unsafe_scalar = (
+                    isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}
+                    and isinstance(value["__ansiroll_unsafe__"], str)
+                )
+                container = (selector or path) and isinstance(value, (dict, list, tuple))
+                if not (unsafe_scalar or container or isinstance(value, (str, int, float, bool, type(None)))):
+                    return None
+                inputs[name] = value
+                pending.extend((alias, suffix, (name, location), ancestors)
+                               for alias, suffix, location in _selector_template_sources(value, path))
+        return inputs
 
     def _task_ctx(self, task, overlay):
         # Precedence (low -> high): role defaults < host vars/facts/play vars
@@ -5898,8 +6673,72 @@ class Runtime:
             self._flushing = False
 
     # ---- facts -----------------------------------------------------------
+    def _gather_timeout_for_run(self, timeout, template, setup_ctx, vars_files=None, blocked_inputs=()):
+        if not template:
+            return timeout
+        role_exports = template.get("role_exports") or ()
+        if isinstance(role_exports, dict):
+            role_exports = (role_exports,)
+        config = setup_ctx.get("__ansiroll_controller_config", {})
+        merge_hashes = config.get("DEFAULT_HASH_BEHAVIOUR") == "merge"
+        blocked = dict(blocked_inputs)
+        for layer in (*role_exports, self.extra_vars):
+            _clear_vars_file_blocks(blocked, layer, merge_hashes)
+        overrides = self.extra_vars.keys() | (vars_files or {}).keys() | blocked.keys()
+        wildcard = template.get("controller_wildcard")
+        relevant = overrides if wildcard or template.get("computed_vars") else overrides.intersection(template["names"])
+        if not (template.get("required") or template.get("file_names") or relevant):
+            return timeout
+        play_vars = template.get("play_vars") if vars_files is None else vars_files
+        defaults = template.get("timeout_defaults") if vars_files is None else None
+        merged_vars = _f_combine(defaults, template["vars"], play_vars, *role_exports,
+                                 self.extra_vars, recursive=merge_hashes)
+        scope = self.ctx(merged_vars, base={
+            "__ansiroll_controller_config": config,
+            "__ansiroll_lazy_selector_members": True,
+        })
+        error = ("gather_timeout requires a controller template that cannot be rendered before setup; "
+                 "make its vars files and lookup inputs resolvable at compile time")
+        if "controller_inputs" in template:
+            compiled = template["controller_inputs"]
+            paths = {(key, tuple(path)) for key, path in template.get(
+                "controller_paths", [(key, ()) for key in template["names"]])}
+            if wildcard:
+                paths.update((key, ()) for key in overrides)
+            if not _vars_file_reads_blocked(blocked, paths) and all(
+                _same_vars_input(_vars_input_at(scope, key, path), _vars_input_at(compiled, key, path))
+                for key, path in paths
+            ):
+                return timeout
+            if "source" not in template:
+                raise ValueError(error)
+        paths = set()
+        inputs = self._pre_setup_template_inputs(template["source"], scope, paths=paths)
+        if inputs is None or _vars_file_reads_blocked(blocked, paths):
+            raise ValueError(error)
+        value = _fail_on_undef(self.template(template["source"], scope, strict=True))
+        if value == _OMIT:
+            return template["omit_default"]
+        if value is None:
+            if not _legacy_non_native(scope):
+                return None
+            # Legacy Ansible returns a bare null variable directly. Other
+            # expressions that yield null render as an empty, invalid timeout.
+            bare = re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", template["source"])
+            if not (bare and bare[1] in scope and scope[bare[1]] is None):
+                raise ValueError("gather_timeout must be an integer")
+            value = template.get("null_representation")
+            if value is None:
+                return None
+        if _core_at_least(2, 18) and not isinstance(value, int):
+            value = Decimal(value)
+            if not value.is_finite() or value != value.to_integral_value():
+                raise ValueError("gather_timeout must be an integer")
+        return int(value)
+
     def gather_facts(self, environment=None, become=False, become_user=None,
-                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False):
+                     fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
+                     gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=()):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -5925,8 +6764,13 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
+            setup_args = {}
+            gather_timeout = self._gather_timeout_for_run(
+                gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
+            if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
+                setup_args["gather_timeout"] = gather_timeout
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
-            if fast_facts in ("1", "true", "yes", "on"):
+            if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
                 from ansiroll.accelerated_modules.environment import module_environment
                 started = time.monotonic()
@@ -5952,7 +6796,7 @@ class Runtime:
                     res = self.run_module("ansible.builtin.setup", {}, become=become)
             else:
                 provenance = {"mode": "real-ansiballz"}
-                res = self.run_module("ansible.builtin.setup", {}, become=become)
+                res = self.run_module("ansible.builtin.setup", setup_args, become=become)
         except Exception as ex:
             provenance = {"mode": "native-agent"}
             res = {"failed": True, "changed": False,
@@ -6658,9 +7502,9 @@ def _chan_send(out_fd, obj):
 def _delegate_template_value(value):
     if isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
         return {"__ansiroll_unsafe__": str(value)}
-    if isinstance(value, dict):
+    if isinstance(value, (dict, _RawSnapshotMapping)):
         return {key: _delegate_template_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, _HostVarEntries)):
+    if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_template_value(item) for item in value]
     return value
 
@@ -6696,7 +7540,7 @@ def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path)
 
 def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
     """Keep each member's position and classify failures at its own path."""
-    if isinstance(value, dict):
+    if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
         if all(isinstance(key, str) for key in keys):
             wire_keys = keys
@@ -6706,7 +7550,7 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
             mapping_keys.append((path, keys))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys, (*path, wire_key))
                 for wire_key, key in zip(wire_keys, keys)}
-    if isinstance(value, (list, tuple, _HostVarEntries)):
+    if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys, (*path, index))
                 for index in range(len(value))]
     return _fail_on_undef(value)
@@ -6734,14 +7578,15 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
             rendered = scope[name]
             if name == "hostvars" or not isinstance(scope, _PlayVarScope) or isinstance(rendered, _TaskVarTemplate):
                 rendered = templater.resolve_variable(name, rendered, scope)
-        if members is not None and isinstance(rendered, (dict, list, tuple, _HostVarEntries)):
+        mapping = isinstance(rendered, (dict, _RawSnapshotMapping))
+        if members is not None and (mapping or isinstance(rendered, (list, tuple, _HostVarEntries, _RawSnapshotList))):
             # Send the container's shape without reading any of its members.
             def reserve(key):
                 index = len(members)
                 members.append((rendered, key))
                 return index
 
-            slots = ({key: reserve(key) for key in rendered} if isinstance(rendered, dict)
+            slots = ({key: reserve(key) for key in rendered} if mapping
                      else [reserve(index) for index in range(len(rendered))])
         else:
             slots = None

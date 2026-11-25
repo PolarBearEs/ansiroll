@@ -112,7 +112,7 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
                                    extra_vars=extra_vars, on_playbook_open=on_playbook_open)
     for play in plays:
         for entry in play.get("deferred_vars_files") or ():
-            if entry.get("unmodeled"):
+            if entry.get("unmodeled") and not entry.get("has_compile_selection"):
                 raise ValueError(
                     "ansiroll: vars_files name %r starts with a template that is only known at run time, so its "
                     "files cannot be bundled; make it resolvable at compile time (e.g. with -e)"

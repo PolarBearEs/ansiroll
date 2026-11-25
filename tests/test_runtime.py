@@ -477,6 +477,65 @@ class FilterModule:
     assert json.loads(str(result)) == [[[1]], "[[1]]"]
 
 
+def test_custom_filter_result_keeps_plugin_owned_collections(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "cache_inventory", "source": """
+import json
+
+cache = []
+
+def cache_inventory(values):
+    cache[:] = [values]
+    return cache
+
+def generate_independent(values):
+    item = [0]
+    yield item
+    item[0] = 1
+    yield item
+
+class FilterModule:
+    def filters(self):
+        return {'cache_inventory': cache_inventory, 'read_cache': lambda _: json.dumps(cache),
+                'generate_independent': generate_independent}
+"""}])
+    task = _task("1", "Keep plugin result identity where possible", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set cached = entry | cache_inventory %}"
+                "{{ [cached, entry | read_cache | from_json, entry | generate_independent | list] | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[[1]], [[1]], [[1], [1]]]
+
+
+@pytest.mark.parametrize(("payload", "key"), [({"enabled": True}, "enabled"), ([True], 0)])
+def test_raw_inventory_collection_can_cross_delegation_and_render_as_json(monkeypatch, payload, key):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": payload})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Read a raw inventory entry", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    source = "{{ (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] }}"
+    entry = runtime.templater.render_string(source, runtime._task_ctx(task, {}))
+    assert json.loads(runtime_module._as_text(entry)) == payload
+    scope = {"alias": entry}
+    resolve = runtime_module._resolve_delegated_play_var
+    assert resolve("alias", scope, runtime.templater) == {"value": payload, "undefined": []}
+    members = []
+    slots = {key: 0} if isinstance(payload, dict) else [0]
+    assert resolve("alias", scope, runtime.templater, members=members) == {
+        "value": slots, "undefined": [], "lazy_members": True,
+    }
+    assert resolve(None, scope, runtime.templater, members=members, member=0) == {
+        "value": True, "undefined": [],
+    }
+
+
 @pytest.mark.parametrize("body", [
     "{{ copied.used }}/{{ copied.used }}",
     "{{ copied.used }}/{{ copied.setdefault('used') }}/{{ copied.pop('used') }}",

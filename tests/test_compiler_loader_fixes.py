@@ -1854,25 +1854,37 @@ def test_dynamic_role_template_bakes_symlinked_subdirectories(tmp_path, shared_d
 
 
 @pytest.mark.parametrize("action", ["copy", "unarchive"])
-def test_dynamic_linked_role_file_preserves_binary_content(tmp_path, action):
+@pytest.mark.parametrize("source_layout", ["linked", "role", "absolute", "literal"])
+def test_baked_role_file_preserves_binary_content(tmp_path, action, source_layout):
     import tarfile
 
     payload = b"one\r\ntwo\rthree\xff\n"
     destination = tmp_path / "output"
     extension = ".bin" if action == "copy" else ".tar"
+    files = tmp_path / "roles/r/files"
+    selection = "app"
+    src = "sites/{{ selection }}" + extension
+    source = files / "sites" / ("app" + extension)
+    if source_layout == "linked":
+        (files / "shared").mkdir(parents=True)
+        (files / "sites").mkdir()
+        (files / "sites/alias").symlink_to("../shared", target_is_directory=True)
+        selection = "alias/app"
+        source = files / "shared" / ("app" + extension)
+    elif source_layout == "absolute":
+        src = "{{ playbook_dir }}/assets/{{ selection }}" + extension
+        source = tmp_path / "assets" / ("app" + extension)
+    elif source_layout == "literal":
+        src = "sites/app" + extension
+    source.parent.mkdir(parents=True, exist_ok=True)
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
-- set_fact: {selection: alias/app}
-- %s: {src: "sites/{{ selection }}%s", dest: "%s"}
-""" % (action, extension, destination)})
-    files = tmp_path / "roles/r/files"
-    (files / "shared").mkdir(parents=True)
-    (files / "sites").mkdir()
-    (files / "sites/alias").symlink_to("../shared", target_is_directory=True)
-    source = files / "shared" / ("app" + extension)
+- set_fact: {selection: "%s"}
+- %s: {src: "%s", dest: "%s"}
+""" % (selection, action, src, destination)})
     if action == "copy":
         source.write_bytes(payload)
         extracted = destination
@@ -2792,7 +2804,7 @@ def test_freezing_skips_names_set_by_deferred_vars_files(tmp_path):
     assert _ansiroll(playbook, tmp_path, "--freeze-playbook-vars") == expected
 
 
-def test_deferred_vars_files_bundle_only_plain_mappings(tmp_path):
+def test_deferred_vars_files_bundle_valid_vars_but_keep_vault_data_out(tmp_path):
     from ansible.parsing.vault import VaultLib, VaultSecret
     from ansiroll.loader import parse_playbook
 
@@ -2803,14 +2815,16 @@ def test_deferred_vars_files_bundle_only_plain_mappings(tmp_path):
     - "{{ ansible_system | lower }}.yml"
   tasks:
     - debug: msg=reached
-""", "tasks.yml": "- debug: msg=task\n", "plain.yml": "x: 1\n", "pw.txt": "pw\n"})
+""", "list.yml": "- x: 0\n- x: 1\n", "invalid.yml": "- x: 1\n- scalar\n", "plain.yml": "x: 1\n", "pw.txt": "pw\n"})
     (tmp_path / "vault.yml").write_bytes(secret)
     inline = VaultLib([("default", VaultSecret(b"pw"))]).encrypt("hunter3").decode()
     (tmp_path / "inline.yml").write_text("token: !vault |\n" + "".join("  %s\n" % line for line in inline.splitlines()))
     plays, _actions = parse_playbook(str(tmp_path / "pb.yml"), vault_password_file=str(tmp_path / "pw.txt"))
     files = {os.path.basename(path): data for path, data in plays[0]["deferred_vars_files"][0]["files"].items()}
     assert files["plain.yml"] == [{"x": 1}]
-    for name in ("pb.yml", "tasks.yml", "vault.yml", "inline.yml"):
+    assert files["list.yml"] == [{"x": 0}, {"x": 1}]
+    assert "__ansiroll_vars_file_error__" in files["invalid.yml"]
+    for name in ("vault.yml", "inline.yml"):
         assert set(files[name]) == {"__ansiroll_vars_file_error__"}, name
     assert "hunter2" not in json.dumps(files) and "hunter3" not in json.dumps(files)
 
