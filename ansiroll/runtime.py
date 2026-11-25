@@ -4644,7 +4644,7 @@ class Runtime:
                 config = self.vars["__ansiroll_controller_config"]
                 facts = self._module_fact_layer
                 inject_facts = config.get("INJECT_FACTS_AS_VARS", True)
-                visible_facts = {key: value for key, value in facts.items() if inject_facts or key == "ansible_local"}
+                visible_facts = facts if inject_facts else {"ansible_local": facts.get("ansible_local", {})}
                 host_vars = _f_combine(self._vars_file_host_vars, visible_facts, recursive=merge_setup_scope)
                 host_vars["ansible_facts"] = _normalized_facts(facts, preserve_local=True)
                 for name in ("__ansiroll_controller_env", "__ansiroll_controller_config"):

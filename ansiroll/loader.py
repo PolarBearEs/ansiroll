@@ -1156,7 +1156,8 @@ def _deferred_vars_files(play, basedir, entries):
             pattern = _vars_file_glob_pattern(name)
             finite_names = _finite_vars_file_names(name) if _is_templated(name) else None
             variants = ([(candidate, glob.escape(candidate)) for candidate in finite_names
-                         if _vars_file_glob_covers(pattern, candidate)]
+                         if os.pardir not in candidate.split(os.path.sep)
+                         and _vars_file_glob_covers(pattern, candidate)]
                         if finite_names else [(name, pattern)])
             patterns = []
             for candidate, variant in variants:
