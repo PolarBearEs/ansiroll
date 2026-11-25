@@ -127,7 +127,7 @@ def test_implicit_setup_resolves_options_in_their_native_scope(tmp_path, use_str
     subsets: ['!all', '!min', local]
     directory: "{{ playbook_dir }}/unselected"
   gather_subset: "{{ subsets }}"
-  fact_path: "{{ PATH_EXPRESSION }}"
+  fact_path: "{{ PATH_EXPRESSION if ansible_facts is defined and ansible_facts == {} else omit }}"
   tasks:
     - debug:
         msg: "{{ ansible_local.probe.value }}/{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"

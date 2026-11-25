@@ -4651,6 +4651,8 @@ class Runtime:
                     host_vars["ansible_facts"] = _f_combine(
                         cached_facts if isinstance(cached_facts, dict) else {}, _normalized_facts(facts),
                         recursive=merge_setup_scope)
+                else:
+                    host_vars.setdefault("ansible_facts", {})
                 for name in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
                     host_vars[name] = self.vars[name]
                 task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
