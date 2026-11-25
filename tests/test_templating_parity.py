@@ -1044,6 +1044,33 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
     assert messages == ["first/second", "first/" + null_suffix]
 
 
+def test_delegated_template_does_not_run_unused_block_lookups(tmp_path):
+    marker = tmp_path / "lookup-marker"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/one.txt"
+          delegate_to: localhost
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/two.txt"
+          delegate_to: localhost
+      vars:
+        unused: "{{ lookup('pipe', 'printf x >> MARKER_PATH') }}"
+""".replace("MARKER_PATH", str(marker)), {"sample.j2": "plain template\n"})
+    expected = _ansible(playbook, tmp_path)
+    assert not marker.exists()
+    (tmp_path / "one.txt").unlink()
+    (tmp_path / "two.txt").unlink()
+    actual = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert actual == expected
+    assert not marker.exists()
+
+
 def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     from ansiroll.loader import _core_version
 

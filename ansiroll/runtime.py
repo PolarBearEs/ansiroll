@@ -5299,6 +5299,8 @@ class Runtime:
         # Inherited lookups can be reached through aliases in task vars.
         mixed_lookup = self.templater._contains_mixed_lookup(
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
+        if task.get("delegate_to") and task.get("special") == "template":
+            mixed_lookup = mixed_lookup or any(_is_deferred_block_var(value) for value in ctx.values())
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
