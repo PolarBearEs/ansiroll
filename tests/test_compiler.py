@@ -345,6 +345,7 @@ def test_deferred_vars_file_projects_duplicate_aliases_once(tmp_path, monkeypatc
     ("final.yml", False),
     ("config/{{ inventory_hostname_short | default('fallback') }}.yml", False),
     ("config/{{ inventory_hostname_short | default('fallback') | lower }}.yml", False),
+    ("config/{{ inventory_hostname_short | default('fallback') | regex_search('H') }}.yml", False),
     ("{{ 'config/' ~ (inventory_hostname_short | default('fallback') | lower) ~ '.yml' }}", False),
     ("{{ base_path }}/{{ inventory_hostname_short | default('fallback') }}.yml", False),
     ("config/{{ group_names | default([]) | length }}.yml", False),
@@ -422,6 +423,30 @@ def test_standalone_vars_file_bundles_directory_from_group_default(tmp_path, gro
     frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
               if line.startswith("__ANSIROLL_RESULT__ ")]
     assert frame["result"]["msg"] == "group defaults"
+
+
+def test_static_vars_file_group_shadows_the_synthetic_group(tmp_path, monkeypatch):
+    from ansiroll.loader import parse_playbook
+
+    monkeypatch.setenv("ANSIROLL_OTHER_GROUP_VALUE", "controller-only-value")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: true
+  vars_files:
+    - groups.yml
+    - "{{ 'profiles/' ~ group_names[0] ~ '.yml' if ansible_facts.profile else 'profiles/fallback.yml' }}"
+  tasks: []
+""")
+    (tmp_path / "groups.yml").write_text("group_names: [workers]\n")
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "workers.yml").write_text("selected: workers\n")
+    unused = profiles / "ungrouped.yml"
+    unused.write_text("unused: \"{{ lookup('env', 'ANSIROLL_OTHER_GROUP_VALUE') }}\"\n")
+    plays, _ = parse_playbook(str(playbook))
+    assert "ANSIROLL_OTHER_GROUP_VALUE" not in plays[0].get("controller_env", {})
+    files = plays[0]["deferred_vars_files"][0]["files"]
+    assert str(profiles / "workers.yml") in files
 
 
 def test_deferred_vars_file_projects_qualified_join_of_known_and_fallback_lists(tmp_path):
@@ -608,6 +633,7 @@ def test_standalone_vars_files_keep_glob_for_overridden_ternary(tmp_path):
 
 @pytest.mark.parametrize(("kind", "plugin", "selector"), [
     ("filter", "first", "{{ groups | first }}"),
+    ("filter", "regex_search", "{{ 'worker' | regex_search('work') }}"),
     ("filter", "ternary", "{{ true | ansible.legacy.ternary('a', 'b') }}"),
     ("test", "defined", "{{ groups is defined }}"),
 ])

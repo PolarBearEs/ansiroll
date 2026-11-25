@@ -591,12 +591,12 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_var
                         if all_vars is None:
                             from .runtime import _STANDALONE_DEFAULT_GROUP, _STANDALONE_DEFAULT_HOST
 
-                            scopes.extend((
-                                {"group_names": [_STANDALONE_DEFAULT_GROUP],
-                                 "inventory_hostname": _STANDALONE_DEFAULT_HOST,
-                                 "inventory_hostname_short": _STANDALONE_DEFAULT_HOST},
-                                dict.fromkeys(("inventory_hostname", "inventory_hostname_short"), _HOSTNAME_COMPONENT),
-                            ))
+                            fixed_names = selector_vars.keys() | explicit_scopes[1].keys()
+                            hostname_names = {"inventory_hostname", "inventory_hostname_short"} - fixed_names
+                            defaults = dict.fromkeys(hostname_names, _STANDALONE_DEFAULT_HOST)
+                            if "group_names" not in fixed_names:
+                                defaults["group_names"] = [_STANDALONE_DEFAULT_GROUP]
+                            scopes.extend((defaults, dict.fromkeys(hostname_names, _HOSTNAME_COMPONENT)))
                         scopes.extend(candidate_scopes)
                         bundled, = _deferred_vars_files(
                             play, basedir, [entry], scopes=scopes, ternary_builtin=ternary_builtin,
@@ -898,6 +898,7 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=T
     hostname_inputs = set(hostname_writes)
     if standalone:
         hostname_inputs.update(("inventory_hostname", "inventory_hostname_short"))
+    fixed_group = standalone and any("group_names" in scope for scope in explicit_scopes)
     scope_values = {}
     if hostname_inputs:
         hostname_inputs.update(("vars", "hostvars"))
@@ -914,6 +915,7 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=T
         patterns_by_name = []
         for name in names:
             bounded = bool(hostname_inputs) and _depends_on_vars(name, scope_values, hostname_inputs.__contains__)
+            group_fallback = fixed_group and _depends_on_vars(name, scope_values, {"group_names"}.__contains__)
             choices, exhaustive = (_known_vars_file_choices(name, scopes, basedir, ternary_builtin=ternary_builtin)
                                    if _is_templated(name) else ((), False))
             choices = [choice for choice in choices if choice not in ("", "\0", _HOSTNAME_COMPONENT)
@@ -928,9 +930,10 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=T
                 explicit.update(path for path in explicit_paths if "\0" not in path)
             for choice in choices:
                 host_pattern = _HOSTNAME_COMPONENT in choice
+                inventory_pattern = host_pattern or group_fallback and "\0" in choice
                 pattern = "*".join(glob.escape(part) for part in choice.replace(_HOSTNAME_COMPONENT, "\0").split("\0"))
-                patterns_by_name.append((choice, pattern, bounded or host_pattern,
-                                         host_pattern or bounded and choice not in explicit))
+                patterns_by_name.append((choice, pattern, bounded or inventory_pattern,
+                                         inventory_pattern or bounded and choice not in explicit))
             if exhaustive:
                 continue
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
@@ -938,7 +941,8 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=T
                 if not choices:
                     unmodeled.append(name)
             else:
-                patterns_by_name.append((name, pattern, bounded, bounded))
+                inventory_fallback = bounded or group_fallback
+                patterns_by_name.append((name, pattern, inventory_fallback, inventory_fallback))
         for name, pattern, hostname_dependent, require_containment in patterns_by_name:
             if name.startswith(os.path.sep):
                 patterns = [pattern]

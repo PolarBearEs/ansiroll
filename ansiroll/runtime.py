@@ -932,7 +932,7 @@ _ANSIBLE_TESTS = {
 
 _SETUP_VARS_FILE_FILTERS = (
     "default", "d", "ternary", "lower", "upper", "trim", "replace", "capitalize", "title",
-    "length", "count", "first", "last", "join", "int",
+    "length", "count", "first", "last", "join", "int", "regex_search",
 )
 _SETUP_VARS_FILE_TESTS = ("defined", "undefined", "none", "boolean")
 
