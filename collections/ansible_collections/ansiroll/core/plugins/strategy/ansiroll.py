@@ -1887,14 +1887,17 @@ class _SetFactLinearStrategy(_LinearStrategy):
             return
         routes = self._fact_routes.pop((host.name, task_uuid), ())
         items = data.get("results", ())
-        if routes and len(routes) == len(items) and not result.is_failed() and not result.is_unreachable():
-            self._legacy_fact_items.update((id(item), (host, target)) for item, target in zip(items, routes)
+        if (routes and len(routes) == len(items) and getattr(task, "action", None) not in C._ACTION_DEBUG
+                and not (result.is_failed() or result.is_unreachable() or result.is_skipped())):
+            # Hold the item itself so its identity cannot be reused before
+            # linear consumes the route or finishes the aggregate.
+            self._legacy_fact_items.update((id(item), (item, host, target)) for item, target in zip(items, routes)
                                            if target is not _UNROUTED_FACT_RESULT and "ansible_facts" in item)
 
     def get_delegated_hosts(self, result, task):
         route = self._legacy_fact_items.pop(id(result), None)
         if route is not None:
-            host, target = route
+            _, host, target = route
             if target is None:
                 return self.get_task_hosts(self._fact_iterator, host, task)
             return [self._fact_recipient(target)]
@@ -1932,6 +1935,12 @@ class _SetFactLinearStrategy(_LinearStrategy):
 
     def _process_pending_results(self, iterator, *args, **kwargs):
         results = super()._process_pending_results(iterator, *args, **kwargs)
+        if _UnifiedTaskResult is None:
+            for result in results:
+                data = result._result if hasattr(result, "_result") else result._return_data
+                for item in data.get("results", ()):
+                    self._legacy_fact_items.pop(id(item), None)
+            return results
         for result in results:
             replay = self._run_once_fact_results.pop(id(result), None)
             if replay is None or result.utr.failed or result.utr.unreachable or result.utr.skipped:

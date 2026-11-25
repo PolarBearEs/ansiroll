@@ -5897,6 +5897,29 @@ def test_strategy_ignores_deferred_group_callbacks_in_later_handler_fact_routing
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("action", ["debug", "set_fact"])
+def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action):
+    from types import SimpleNamespace
+
+    module = _load_strategy_module()
+    strategy = object.__new__(module._SetFactLinearStrategy)
+    host = SimpleNamespace(name="origin")
+    task = SimpleNamespace(_uuid="loop", action=action)
+    item = {"ansible_facts": {"marker": "value"}}
+    result = SimpleNamespace(_result={"results": [item]}, _host=host, _task=task,
+                             is_failed=lambda: False, is_unreachable=lambda: False, is_skipped=lambda: False)
+    strategy._fact_routes = {("origin", "loop"): ["recipient"]}
+    strategy._legacy_fact_items = {}
+    monkeypatch.setattr(module, "_UnifiedTaskResult", None)
+    monkeypatch.setattr(module._LinearStrategy, "_process_pending_results", lambda *_: [result])
+
+    strategy._record_legacy_routes(result)
+    assert (id(item) in strategy._legacy_fact_items) == (action == "set_fact")
+    assert not strategy._fact_routes
+    assert strategy._process_pending_results(None) == [result]
+    assert not strategy._legacy_fact_items
+
+
 def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
