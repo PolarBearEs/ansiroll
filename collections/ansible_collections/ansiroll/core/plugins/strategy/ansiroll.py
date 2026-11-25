@@ -1194,6 +1194,7 @@ class StrategyModule(StrategyBase):
                 + "_INJECTED_SKIP_RUN_ONCE = %r\n"
                 % (host.name != getattr(self, "_first_host_name", host.name))
                 + "_INJECTED_CHECK_MODE = %r\n" % bool(self._check_mode)
+                + "_INJECTED_INVOCATION_CHECK_MODE = %r\n" % bool(context.CLIARGS.get("check"))
                 + "_INJECTED_DIFF_MODE = %r\n" % bool(self._diff_mode)
                 + "_INJECTED_PROFILE = %r\n" % bool(getattr(self, "_profile_enabled", False))
                 + "_INJECTED_NATIVE_ONLY = %r\n"

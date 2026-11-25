@@ -2917,6 +2917,8 @@ def _concretize(value):
 
 
 def _finalize_text_segment(context, value):
+    if isinstance(value, _Omit) and context.get("__ansiroll_check_mode_template"):
+        return ""
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
         native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
@@ -4109,6 +4111,7 @@ class Runtime:
         self._vars_file_host_vars = self._initial_host_vars
         self.python = python or sys.executable
         self.check_mode = check_mode
+        self._invocation_check_mode = check_mode
         self.diff_mode = diff_mode
         self.on_result = on_result
         self.become_password = become_password
@@ -5795,14 +5798,22 @@ class Runtime:
         try:
             check_override = task.get("check_mode")
             if check_override is not None:
-                check_override = _fail_on_undef(self.template(check_override, ctx))
                 omit_token = ctx.get("omit")
+                check_ctx = ctx
+                if isinstance(check_override, str) and _core_at_least(2, 19):
+                    check_ctx = {**ctx, "__ansiroll_check_mode_template": True}
+                    if isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__"):
+                        check_ctx["omit"] = _OMIT
+                check_override = _fail_on_undef(self.template(check_override, check_ctx))
                 if (check_override == _OMIT or (
                         isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__")
                         and check_override == omit_token)):
-                    check_override = task.get("check_mode_on_omit")
-                if check_override is not None:
-                    self.check_mode = _boolean(check_override, strict=True)
+                    check_override = task.get("check_mode_on_omit", inherited_check_mode)
+                    if check_override == "invocation":
+                        check_override = self._invocation_check_mode
+                    elif check_override == "invalid":
+                        raise ValueError("invalid inherited check_mode value")
+                self.check_mode = _boolean(check_override, strict=check_override is not None)
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -8188,6 +8199,7 @@ def agent_main():
                  skip_run_once=skip_run_once,
                  module_bundle=g.get("_ansiroll_import_bytes"),
                  resource_reader=g.get("_ansiroll_resource_read"))
+    rt._invocation_check_mode = bool(g.get("_INJECTED_INVOCATION_CHECK_MODE", check_mode))
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})

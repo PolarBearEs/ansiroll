@@ -15,6 +15,7 @@ import socket
 import stat
 import subprocess
 import sys
+import textwrap
 import time
 import zipfile
 from types import SimpleNamespace
@@ -5058,28 +5059,117 @@ def test_standalone_task_omit_preserves_invocation_check_mode(tmp_path):
     assert not runtime.failed
 
 
-@pytest.mark.parametrize("parent_override", [False, True], ids=["invocation", "parent"])
-def test_strategy_preserves_check_mode_on_omit(tmp_path, parent_override):
-    directives = "      check_mode: false\n" if parent_override else ""
+@pytest.mark.parametrize("scope", ["invocation", "parent", "tasks-apply", "role-apply", "play", "raw-parent"])
+def test_strategy_preserves_check_mode_on_omit(tmp_path, scope):
+    task = """- file:
+    path: "{{ playbook_dir }}/result"
+    state: touch
+  check_mode: "{{ omit }}"
+"""
     playbook = """- hosts: localhost
   gather_facts: false
-  tasks:
-    - block:
-        - copy:
-            content: sample
-            dest: "{{ playbook_dir }}/result"
-          check_mode: "{{ omit }}"
-""" + directives
+"""
+    if scope == "tasks-apply":
+        (tmp_path / "child.yml").write_text(task)
+        tasks = "- include_tasks:\n    file: child.yml\n    apply: {check_mode: false}\n"
+    elif scope == "role-apply":
+        role_tasks = tmp_path / "roles" / "child" / "tasks"
+        role_tasks.mkdir(parents=True)
+        (role_tasks / "main.yml").write_text(task)
+        tasks = "- include_role:\n    name: child\n    apply: {check_mode: false}\n"
+    elif scope in ("parent", "raw-parent"):
+        parent_mode = 'false' if scope == "parent" else '"{{ simulate }}"'
+        tasks = "- block:\n" + textwrap.indent(task, "    ") + "  check_mode: " + parent_mode + "\n"
+    else:
+        tasks = task
+    if scope == "play":
+        playbook += "  check_mode: true\n"
+    playbook += "  tasks:\n" + textwrap.indent(tasks, "    ")
+    opts = ["-c", "local", "-e", "ansible_python_interpreter=" + sys.executable]
+    if scope not in ("play", "raw-parent"):
+        opts.append("--check")
     output = tmp_path / "result"
-    expected = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
+    expected = _run_strategy_play(tmp_path, playbook, *opts,
                                   environment={"ANSIBLE_STRATEGY": "linear"})
-    assert expected.returncode == 0, expected.stdout + expected.stderr
+    if scope != "raw-parent":
+        assert expected.returncode == 0, expected.stdout + expected.stderr
     native_wrote_file = output.exists()
     if native_wrote_file:
         output.unlink()
-    actual = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local")
-    assert actual.returncode == 0, actual.stdout + actual.stderr
+    actual = _run_strategy_play(tmp_path, playbook, *opts)
+    assert actual.returncode == expected.returncode, actual.stdout + actual.stderr
     assert output.exists() == native_wrote_file
+
+
+@pytest.mark.parametrize("expression", ["{{ none }}", "{{ omit }}{{ false }}"])
+def test_strategy_preserves_rendered_false_check_mode(tmp_path, expression):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    if Version(__version__) < Version("2.19"):
+        pytest.skip("uses modern omit and null templating")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: "{{ playbook_dir }}/result"
+        state: touch
+      check_mode: CHECK_MODE
+""".replace("CHECK_MODE", json.dumps(expression))
+    output = tmp_path / "result"
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        proc = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
+                                  environment={"ANSIBLE_STRATEGY": strategy})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert output.exists()
+        output.unlink()
+
+
+def test_compiled_check_mode_omit_fallback_does_not_capture_parent_lookup(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - command: /bin/true
+          check_mode: "{{ false }}"
+      check_mode: "{{ lookup('env', 'ANSIROLL_UNUSED_PARENT_MODE') }}"
+""")
+    monkeypatch.setenv("ANSIROLL_UNUSED_PARENT_MODE", "synthetic-unneeded-mode")
+    source, _ = compile_playbook(str(playbook))
+    assert "synthetic-unneeded-mode" not in json.dumps(_compiled_plays(source, tmp_path))
+
+
+def test_recursive_include_preserves_its_inherited_check_mode(tmp_path):
+    (tmp_path / "child.yml").write_text("""- file:
+    path: "{{ playbook_dir }}/result-{{ depth | default(0) }}"
+    state: touch
+  check_mode: "{{ omit }}"
+- set_fact:
+    depth: "{{ (depth | default(0) | int) + 1 }}"
+- block:
+    - include_tasks: child.yml
+      when: depth | int < 2
+  check_mode: false
+""")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+"""
+    opts = ["--check", "-c", "local", "-e", "ansible_python_interpreter=" + sys.executable]
+    expected = None
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        proc = _run_strategy_play(tmp_path, playbook, *opts, environment={"ANSIBLE_STRATEGY": strategy})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        files = sorted(tmp_path.glob("result-*"))
+        written = [file.name for file in files]
+        if expected is None:
+            expected = written
+        else:
+            assert written == expected
+        for file in files:
+            file.unlink()
 
 
 def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):

@@ -1600,7 +1600,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 data = task._loader.load_from_file(path)
             handler = _is_handler(task)
             parent = task
-            if handler and args.get("apply"):
+            if args.get("apply"):
                 include = task.copy()
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
@@ -1778,7 +1778,11 @@ def _include_scope(task):
 
 
 def _include_scope_key(task):
-    return tuple(repr(sorted(scope.items())) for scope in _include_scope(task))
+    return (
+        *(repr(sorted(scope.items())) for scope in _include_scope(task)),
+        repr(getattr(task, "check_mode", None)),
+        repr(((task.args or {}).get("apply") or {}).get("check_mode")),
+    )
 
 
 def _too_many_include_contexts(key):
@@ -1994,11 +1998,11 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 handler_dep_chain = None
             blocks = role.compile(play, dep_chain=dep_chain)
             handler_blocks = role.get_handler_blocks(play, dep_chain=handler_dep_chain) or []
-            if handler_blocks and args.get("apply"):
+            if args.get("apply"):
                 include = task.copy()
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
-                for block in handler_blocks:
+                for block in blocks + handler_blocks:
                     block._parent = parent
         except Exception:
             return None
@@ -2008,7 +2012,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
         task._role_path = role._role_path
         role_roots = [id(block) for block in blocks + handler_blocks
                       if getattr(block, "_parent", None) is None]
-        if handler_blocks and args.get("apply"):
+        if args.get("apply"):
             role_roots.append(id(parent))
         _INCLUDE_ROLE_PARENTS.update(dict.fromkeys(role_roots, task))
         include_id = _new_include_id()
@@ -3659,9 +3663,21 @@ def _task_check_mode(task):
 
             inherited = task._get_parent_attribute("check_mode", omit=True)
         except (ImportError, TypeError):  # Older cores restore the keyword default.
-            return result
-        if inherited is not Sentinel:
-            result["check_mode_on_omit"] = _tag_untrusted(inherited)
+            result["check_mode_on_omit"] = "invocation"
+        else:
+            if inherited is Sentinel:
+                result["check_mode_on_omit"] = "invocation"
+            elif inherited is None or _core_version() < (2, 19):
+                result["check_mode_on_omit"] = bool(inherited)
+            else:
+                from ansible.module_utils.parsing.convert_bool import boolean
+
+                # Core validates the restored value directly. It does not render
+                # a parent expression, so retain only the conversion outcome.
+                try:
+                    result["check_mode_on_omit"] = boolean(inherited)
+                except TypeError:
+                    result["check_mode_on_omit"] = "invalid"
     return result
 
 
