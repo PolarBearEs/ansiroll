@@ -2654,16 +2654,22 @@ def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(
 
 
 def test_standalone_setup_defaults_use_launch_selected_vars_and_final_vars_scope(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    legacy = Version(__version__) < Version("2.12")
+    action = "setup" if legacy else "ansible.builtin.setup"
+    fact_filter = "ansible_distribution" if legacy else ["ansible_distribution"]
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: true
   vars_files: ['vars-{{ profile }}.yml']
   module_defaults:
-    ansible.builtin.setup:
+    SETUP_ACTION:
       filter: "{{ vars.fact_filter }}"
   tasks: []
-""")
-    (tmp_path / "vars-active.yml").write_text("fact_filter: [ansible_distribution]\n")
+""".replace("SETUP_ACTION", action))
+    (tmp_path / "vars-active.yml").write_text("fact_filter: " + json.dumps(fact_filter) + "\n")
     source, _ = compile_playbook(str(playbook))
     plan = _compiled_plays(source, tmp_path)[0]
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "active"})
@@ -2672,7 +2678,36 @@ def test_standalone_setup_defaults_use_launch_selected_vars_and_final_vars_scope
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called[0][0] == "ansible.builtin.setup"
-    assert called[0][1]["filter"] == ["ansible_distribution"]
+    assert called[0][1]["filter"] == fact_filter
+
+
+def test_standalone_setup_reads_captured_controller_file_after_source_removal(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    legacy = Version(__version__) < Version("2.12")
+    action = "setup" if legacy else "ansible.builtin.setup"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"""- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    {action}:
+      filter: '{{{{ lookup("file", "fact-filter.txt", lstrip=true) }}}}'
+  tasks: []
+""")
+    directory = tmp_path / "files"
+    directory.mkdir()
+    filter_file = directory / "fact-filter.txt"
+    filter_file.write_text("  ansible_distribution  \n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    filter_file.unlink()
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert calls[0]["filter"] == "ansible_distribution"
 
 
 def test_standalone_setup_captures_only_the_active_query_from_selected_vars(tmp_path, monkeypatch):
@@ -2772,22 +2807,29 @@ def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, 
     assert runtime.vars["unrelated"] == "value"
 
 
-def test_setup_defaults_do_not_capture_an_overridden_controller_lookup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("option", ["gather_subset", "gather_timeout", "filter"])
+def test_setup_defaults_do_not_capture_an_overridden_controller_lookup(tmp_path, monkeypatch, option):
     from ansible.release import __version__
     from packaging.version import Version
 
     if Version(__version__) < Version("2.19"):
         pytest.skip("older cores eagerly render module defaults")
     playbook = tmp_path / "play.yml"
+    override = {
+        "gather_subset": "  gather_subset: [all]\n",
+        "gather_timeout": "  gather_timeout: 15\n",
+        "filter": "",
+    }[option]
+    gather_default = ("    ansible.builtin.gather_facts:\n      filter: [ansible_distribution]\n"
+                      if option == "filter" else "")
     playbook.write_text("""- hosts: localhost
   gather_facts: true
-  gather_subset: [all]
-  module_defaults:
-    ansible.builtin.setup:
-      gather_subset: "{{ lookup('env', 'ANSIROLL_SHADOWED_SETUP_SUBSET') }}"
+""" + override + """  module_defaults:
+""" + gather_default + f"""    ansible.builtin.setup:
+      {option}: "{{{{ lookup('env', 'ANSIROLL_SHADOWED_SETUP_DEFAULT') }}}}"
   tasks: []
 """)
-    monkeypatch.setenv("ANSIROLL_SHADOWED_SETUP_SUBSET", "synthetic-private-setup-subset")
+    monkeypatch.setenv("ANSIROLL_SHADOWED_SETUP_DEFAULT", "synthetic-private-setup-subset")
     source, _ = compile_playbook(str(playbook))
     assert "synthetic-private-setup-subset" not in json.dumps(_compiled_plays(source, tmp_path))
 

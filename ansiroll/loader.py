@@ -170,9 +170,11 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                 })
             node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
             if scoped_options:
-                setup_layers["gather_setup_scope"]["controller_lookups"] = {
+                setup_scope = setup_layers["gather_setup_scope"]
+                setup_scope["controller_lookups"] = {
                     "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
                     "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
+                    "file": _capture_setup_files(play, lookups.get("file", ())),
                 }
             node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
@@ -345,7 +347,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     timeout_names = set(runtime["names"]) if runtime is not None else set()
     setup_names = set()
     computed = set()
-    setup_lookups = {"env": set(), "config": set()}
+    setup_lookups = {"env": set(), "config": set(), "file": set()}
     lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
     for layer in (*exports, play.get_variable_manager().extra_vars, magic):
         lookup_scope = combine_vars(lookup_scope, layer)
@@ -428,6 +430,28 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                                  else [play._loader.get_basedir()]),
         })
     return result
+
+
+def _capture_setup_files(play, names):
+    """Resolve literal early setup file lookups using the controller search path."""
+    from ansible.errors import AnsibleError
+    from ansible.plugins.loader import lookup_loader
+
+    if not names:
+        return {}
+    loader = play._loader
+    plugin = lookup_loader.get("file", loader=loader)
+    search_path = play.get_search_path() if hasattr(play, "get_search_path") else [loader.get_basedir()]
+    variables = {"ansible_search_path": search_path}
+    captured = {}
+    for name in sorted(names):
+        try:
+            captured[name], = plugin.run([name], variables=variables, lstrip=False, rstrip=False)
+        except (AnsibleError, OSError):
+            # Missing terms fail only if the runner actually selects them.
+            continue
+    return captured
+
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
@@ -710,17 +734,22 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     gather_defaults = _setup_module_defaults(play, "ansible.builtin.gather_facts") if gather else []
     if (setup_defaults or gather_defaults) and _core_version() >= (2, 19):
         explicit = {
-            key for key in ("fact_path", "gather_subset")
-            if key in (play.get_ds() or {})
-            and (value := getattr(play, key, None)) is not None
-            and not any(_selector_template_sources(_tag_untrusted(value)))
+            key for key in ("fact_path", "gather_subset", "gather_timeout")
+            if key in (play.get_ds() or {}) and _known_setup_arg(getattr(play, key, None))
         }
-        if explicit:
-            setup_defaults, gather_defaults = (
-                [{key: value for key, value in layer.items() if key not in explicit}
-                 if isinstance(layer, dict) else layer for layer in defaults]
-                for defaults in (setup_defaults, gather_defaults)
-            )
+        gather_defaults = _prune_setup_defaults(gather_defaults, explicit)
+        # A gather_facts argument overrides the setup default when Core
+        # forwards it. Templated mappings can replace any earlier value.
+        known_gather_args = {}
+        for layer in gather_defaults:
+            if isinstance(layer, dict):
+                known_gather_args.update(layer)
+            else:
+                known_gather_args.clear()
+        setup_overrides = explicit | {
+            key for key, value in known_gather_args.items() if key != "parallel" and _known_setup_arg(value)
+        }
+        setup_defaults = _prune_setup_defaults(setup_defaults, setup_overrides)
     vars_file_entries = _as_list(getattr(play, "vars_files", None))
     replay_order = any(_is_templated(filename)
                        for entry in vars_file_entries[:-1]
@@ -988,6 +1017,17 @@ def _apply_force_handlers_default(play):
         play.force_handlers = bool(C.DEFAULT_FORCE_HANDLERS)
     except Exception:
         pass
+
+
+def _known_setup_arg(value):
+    from .runtime import _selector_template_sources
+
+    return value is not None and not any(_selector_template_sources(_tag_untrusted(value)))
+
+
+def _prune_setup_defaults(layers, overrides):
+    return [{key: value for key, value in layer.items() if key not in overrides}
+            if isinstance(layer, dict) else layer for layer in layers]
 
 
 def _setup_module_defaults(play, action):

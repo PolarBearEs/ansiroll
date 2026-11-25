@@ -1658,6 +1658,16 @@ def _lookup_values(name, args, kwargs, ctx=None):
         vals = []
         lstrip = kwargs.get("lstrip", False)
         rstrip = kwargs.get("rstrip", True)
+        if setup_lookups is not None:
+            files = setup_lookups.get("file", {})
+            for term in map(str, args):
+                if term not in files:
+                    raise ValueError("setup requires an uncaptured controller file %r" % term)
+                value = files[term]
+                if lstrip:
+                    value = value.lstrip()
+                vals.append(value.rstrip() if rstrip else value)
+            return vals
         dirs = (ctx or {}).get("__ansiroll_search_dirs") or []
         for a in args:
             path = os.path.expanduser(str(a))
@@ -5253,7 +5263,7 @@ class Runtime:
                 if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
                                               for arg in call.args)
-                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
+                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config", "file")
                         and not (call.dyn_args or call.dyn_kwargs)):
                     continue
                 return None

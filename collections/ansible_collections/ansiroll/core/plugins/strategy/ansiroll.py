@@ -545,14 +545,18 @@ class StrategyModule(StrategyBase):
             if _core_version() >= (2, 19):
                 from ansible.executor.module_common import _apply_action_arg_defaults
 
-                task.post_validate(templar=templar._engine)
-                options = {key: value for key, value in task.args.items() if key != "parallel" and value is not None}
+                args = task.post_validate_attribute("args", templar=templar._engine)
+                options = {key: value for key, value in args.items() if key != "parallel" and value is not None}
                 options = _apply_action_arg_defaults("ansible.builtin.setup", task, options, templar)
             else:
                 from ansible.executor.module_common import get_action_args_with_defaults
                 from ansible.executor.task_executor import remove_omit
 
-                task.post_validate(templar=templar)
+                validate_args = getattr(task, "_post_validate_args", None)
+                if validate_args is not None:
+                    task.args = validate_args(task._valid_attrs["args"], task.args, templar)
+                else:
+                    task.args = templar.template(task.args)
                 legacy = _core_version() < (2, 12)
                 groups = {} if legacy else {"action_groups": getattr(self._cur_play, "_action_groups", {})}
                 setup_action = "ansible.legacy.setup" if legacy else "ansible.builtin.setup"

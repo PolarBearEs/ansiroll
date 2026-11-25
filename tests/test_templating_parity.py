@@ -313,7 +313,8 @@ def test_strategy_setup_defaults_use_the_host_selected_vars_file(tmp_path):
     assert messages == ["filtered"]
 
 
-def test_strategy_setup_default_uses_controller_file_lookup(tmp_path):
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strategy):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: true
@@ -326,8 +327,25 @@ def test_strategy_setup_default_uses_controller_file_lookup(tmp_path):
 """.replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
         "FILTER_EXPRESSION", '{{ lookup("file", "fact-filter.txt") }}' if LEGACY_SETUP
         else '{{ [lookup("file", "fact-filter.txt")] }}'),
-        {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=True)
+        {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=use_strategy)
     assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_skips_an_undefined_environment_value(tmp_path, use_strategy):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ playbook_dir }}/facts"
+  gather_subset: ['!all', '!min', local]
+  environment:
+    ANSIROLL_GATHER_PROBE: "{{ unavailable_during_setup }}"
+  tasks: []
+""", {"facts/probe.fact": '{"value":"setup"}\n'})
+    _, recap = (_ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+                if use_strategy else _ansiroll(path, tmp_path))
+    assert recap[0] == "1"
+    assert recap[3] == "0"
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup evaluates path defaults differently")
