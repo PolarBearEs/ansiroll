@@ -1533,6 +1533,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "action": action,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
+        "no_log": bool(getattr(task, "no_log", False)),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -3473,9 +3474,10 @@ def _loop_control(task):
     if lc is None:
         return {}
     out = {}
-    if getattr(lc, "extended", None):
-        out["loop_extended"] = True
-        out["loop_extended_allitems"] = getattr(lc, "extended_allitems", True) is not False
+    if getattr(lc, "extended", None) is not None:
+        out["loop_extended"] = _boolean_or_template(lc.extended)
+    if getattr(lc, "extended_allitems", None) is not None:
+        out["loop_extended_allitems"] = _boolean_or_template(lc.extended_allitems)
     bw = getattr(lc, "break_when", None)
     if bw:
         out["loop_break_when"] = _conditions(bw)
