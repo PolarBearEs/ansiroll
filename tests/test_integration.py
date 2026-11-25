@@ -5681,6 +5681,33 @@ def test_strategy_keeps_explicit_omit_like_variable_as_a_string(tmp_path):
         assert not (tmp_path / "result").exists()
 
 
+@pytest.mark.parametrize("expression", ["{{ fallback }}{{ false }}", "{{ fallback is string }}"])
+def test_strategy_preserves_native_omit_from_block_alias(tmp_path, expression):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native omit values")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - vars:
+        fallback: "{{ omit }}"
+      block:
+        - file:
+            path: "{{ playbook_dir }}/result"
+            state: touch
+          check_mode: CHECK_MODE
+""".replace("CHECK_MODE", json.dumps(expression))
+    output = tmp_path / "result"
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        proc = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
+                                  "-e", "ansible_python_interpreter=" + sys.executable,
+                                  environment={"ANSIBLE_STRATEGY": strategy})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert output.exists()
+        output.unlink()
+
+
 def test_strategy_rejects_padded_legacy_check_mode_omit(tmp_path):
     from ansiroll.loader import _core_version
 

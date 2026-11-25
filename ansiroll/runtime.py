@@ -2948,10 +2948,9 @@ _KEYWORD_OMIT = _KeywordOmit()
 
 
 def _concat_keyword_segments(nodes):
-    if _core_at_least(2, 19, 1):
-        parts = [part for part in nodes if part is not None]
-    else:
-        parts = list(nodes)
+    preserve_none = not _core_at_least(2, 19, 1)
+    parts = [_KEYWORD_OMIT if isinstance(part, _Omit) else part
+             for part in nodes if preserve_none or part is not None]
     if len(parts) < 2:
         return parts[0] if parts else None
     return "".join(str(_fail_on_undef(part)) for part in parts if part is not _KEYWORD_OMIT)
@@ -3347,13 +3346,16 @@ class _AnsirollContext(jinja2.runtime.Context):
             return jinja2.runtime.missing
         value = self.parent[key]
         if isinstance(value, _PlayVarTemplate) and isinstance(scope, _PlayVarView):
-            return scope.scope[key]
-        templater = getattr(self.environment, "_ansiroll_templater", None)
-        if templater is None or str(key).startswith("__ansiroll"):
-            return value
-        context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
-        return templater.resolve_variable(
-            key, value, context, strict=self.environment.undefined is _StrictAnsirollUndefined)
+            value = scope.scope[key]
+        else:
+            templater = getattr(self.environment, "_ansiroll_templater", None)
+            if templater is not None and not str(key).startswith("__ansiroll"):
+                context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
+                value = templater.resolve_variable(
+                    key, value, context, strict=self.environment.undefined is _StrictAnsirollUndefined)
+        if isinstance(value, _Omit) and self.parent.get(_CHECK_MODE_TEMPLATE) is True:
+            return _KEYWORD_OMIT
+        return value
 
 
 class _PluginDict(dict):
