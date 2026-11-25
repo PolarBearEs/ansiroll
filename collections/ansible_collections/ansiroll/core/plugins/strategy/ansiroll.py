@@ -25,6 +25,7 @@ import base64
 import json
 import inspect
 import os
+import re
 import shlex
 import stat
 import struct
@@ -44,9 +45,10 @@ DOCUMENTATION = """
     author: PolarBearEs
 """
 
-from ansible import context
+from ansible import constants as C, context
 from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
+from ansible.plugins.strategy.linear import StrategyModule as _LinearStrategy
 from ansible.plugins.loader import connection_loader
 from ansible.utils.display import Display
 from jinja2 import StrictUndefined
@@ -304,9 +306,17 @@ class StrategyModule(StrategyBase):
                 item for item in controller_reasons
                 if item.get("kind") != "delegate"
             ]
+        fact_routes = [
+            _delegated_fact_flag(getattr(task, "delegate_facts", None))
+            for task in task_map.values()
+            if str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
+            and getattr(task, "delegate_to", None)
+        ]
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
+        elif not self._delegate_on_target and any(flag is not False for flag in fact_routes):
+            linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
                 "multi-host controller-only play requires task-lockstep scheduling"
@@ -322,8 +332,7 @@ class StrategyModule(StrategyBase):
                 % (play.name or play.get_name(), "; ".join(reasons))
             )
             return self._tqm.RUN_ERROR
-        if self._requires_linear_fallback or (
-                len(hosts) > 1 and self._controller_only_play):
+        if linear_reason:
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
             # scheduling. Reuse core linear for this compatibility-only case.
@@ -337,17 +346,14 @@ class StrategyModule(StrategyBase):
                 "mode": "linear-fallback",
                 "reason": linear_reason,
             })
-            from ansible.plugins.strategy.linear import (
-                StrategyModule as LinearStrategy,
-            )
             # Keep this instance's result thread and queue caches; constructing
             # a second strategy would make both consumers race on the TQM queue.
             # ansible-core 2.14's linear strategy adds this state in its own
             # constructor, which this deliberately reused instance never runs.
             if not hasattr(self, "_in_handlers"):
                 self._in_handlers = False
-            self.__class__ = LinearStrategy
-            return LinearStrategy.run(self, iterator, play_context)
+            self.__class__ = _SetFactLinearStrategy if any(flag is not False for flag in fact_routes) else _LinearStrategy
+            return self.run(iterator, play_context)
         self._emit_provenance({
             "scope": "play",
             "play": play.name or play.get_name(),
@@ -518,13 +524,35 @@ class StrategyModule(StrategyBase):
             chan.send_blob(agent_source)  # frame 1: the agent source
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
-                host, chan, task_map, hv, templar, become_pass, play_context)
+                host, chan, task_map, hv, templar, become_pass, play_context,
+                gather_task=task_map.get("__gather_facts__") if gather_facts else None)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
         finally:
             chan.close()
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context):
+    def _gather_setup_options(self, host, gather_task):
+        from ansiroll.loader import _core_version
+
+        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
+                   if key in gather_task.args}
+        if options.get("gather_subset") == ["all"] and "gather_subset" not in (self._cur_play.get_ds() or {}):
+            del options["gather_subset"]
+        error = None
+        if options:
+            try:
+                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+                values["ansible_search_path"] = gather_task.get_search_path()
+                options = self._mk_templar(values).template(options)
+                if _core_version() < (2, 19) and (omit := values.get("omit")):
+                    from ansible.executor.task_executor import remove_omit
+
+                    options = remove_omit(options, omit)
+            except AnsibleError as ex:
+                error = str(ex)
+        return {"options": options if error is None else {}, "error": error}
+
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -569,6 +597,11 @@ class StrategyModule(StrategyBase):
                 self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "gather_setup":
+                data = (self._gather_setup_options(host, gather_task) if gather_task is not None
+                        else {"error": "implicit setup was not scheduled"})
+                gather_task = None
+                chan.send({"t": "gather_setup_result", "setup": data})
             elif t == "delegate":
                 delegate_started = time.monotonic()
                 chan.send({"t": "delegate_result",
@@ -888,6 +921,8 @@ class StrategyModule(StrategyBase):
 
     @staticmethod
     def _restore_play_fallback(value, undefined, errors=(), mapping_keys=(), *, runtime_marker=None):
+        from ansiroll.runtime import _restore_delegated_mapping_keys
+
         if not undefined and not errors and not mapping_keys:
             return value
         if runtime_marker is not None:
@@ -924,28 +959,7 @@ class StrategyModule(StrategyBase):
             for key in path[:-1]:
                 container = container[key]
             container[path[-1]] = marker
-        def restore_key(key):
-            if isinstance(key, list):
-                return tuple(restore_key(part) for part in key)
-            if isinstance(key, dict):
-                from datetime import date, datetime
-
-                if "bytes" in key:
-                    return base64.b64decode(key["bytes"], validate=True)
-                if "date" in key:
-                    return date.fromisoformat(key["date"])
-                return datetime.fromisoformat(key["datetime"])
-            return key
-
-        # Decode inner mappings before changing the keys used to reach them.
-        for path, keys in reversed(mapping_keys):
-            container = value
-            for key in path:
-                container = container[key]
-            entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
-            container.clear()
-            container.update(entries)
-        return value
+        return _restore_delegated_mapping_keys(value, mapping_keys)
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
@@ -1260,19 +1274,21 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
-        blob = _json_blob(hv)
+        mapping_keys = {"host": [], "overrides": []}
+        blob = _json_blob(hv, mapping_keys["host"])
         extra_blob = _json_blob(_extra_vars(self._variable_manager))
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
-        override_blob = _json_blob(nonpersistent)
+        override_blob = _json_blob(nonpersistent, mapping_keys["overrides"])
         return (
             "_INJECTED_HOST = %r\n"
             "_INJECTED_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_EXTRA_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_HOST_VAR_OVERRIDES = __import__('json').loads(%r)\n"
+            "_INJECTED_VAR_MAPPING_KEYS = __import__('json').loads(%r)\n"
             "_INJECTED_BECOME_PASS = %r\n"
-            % (host.name, blob, extra_blob, override_blob, become_pass)
+            % (host.name, blob, extra_blob, override_blob, json.dumps(mapping_keys), become_pass)
         )
 
     def _connect(self, host, play_context, hv, templar=None):
@@ -1451,6 +1467,12 @@ class StrategyModule(StrategyBase):
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action in ("include_tasks", "include_role") and "include_register" in frame:
+                    private = frame["include_register"]
+                    registered_result = self._restore_play_fallback(
+                        private["value"], private["undefined"], private.get("errors", ()),
+                        private.get("mapping_keys", ()),
+                    )
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
                     registered_result = _without_delegated_metadata(result_data)
@@ -1751,6 +1773,174 @@ def _truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+class _LegacyFactResultQueue(collections.deque):
+    """Inspect 2.10 results at dequeue time, before linear publishes facts."""
+
+    def __init__(self, results, record):
+        super().__init__(results)
+        self._record = record
+
+    def popleft(self):
+        result = super().popleft()
+        self._record(result)
+        return result
+
+
+class _SetFactLinearStrategy(_LinearStrategy):
+    """Use the worker's resolved delegation flags when linear publishes facts."""
+
+    def run(self, iterator, play_context):
+        self._fact_iterator = iterator
+        self._fact_routes = {}
+        self._legacy_fact_items = {}
+        self._run_once_fact_results = {}
+        send_callback = self._tqm.send_callback
+        original = vars(self._tqm).get("send_callback")
+
+        def capture_item(method, *args, **kwargs):
+            if method in ("v2_runner_item_on_ok", "v2_runner_item_on_skipped", "v2_runner_item_on_failed"):
+                result = args[0]
+                host, task = ((result.host, result.task) if _UnifiedTaskResult is not None else
+                              (result._host, result._task))
+                key = (host.name, task._uuid)
+                if self._routed_fact_task(key):
+                    target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
+                    self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
+            return send_callback(method, *args, **kwargs)
+
+        # Core 2.10 consumes raw queues inline without a conversion hook.
+        raw_queues = ("_results", "_handler_results") if not (
+            hasattr(_LinearStrategy, "normalize_task_result")
+            or hasattr(_LinearStrategy, "_convert_wire_task_result_to_raw")
+            or _UnifiedTaskResult is not None
+        ) else ()
+        if raw_queues:
+            with self._results_lock:
+                for name in raw_queues:
+                    setattr(self, name, _LegacyFactResultQueue(getattr(self, name), self._record_legacy_routes))
+        self._tqm.send_callback = capture_item
+        try:
+            return super().run(iterator, play_context)
+        finally:
+            if raw_queues:
+                with self._results_lock:
+                    for name in raw_queues:
+                        setattr(self, name, collections.deque(getattr(self, name)))
+            if original is None:
+                del self._tqm.send_callback
+            else:
+                self._tqm.send_callback = original
+
+    def _routed_fact_task(self, key):
+        original = self._queued_task_cache.get(key, {}).get("task")
+        return (original is not None and original.action in C._ACTION_SET_FACT and original.delegate_to
+                and _delegated_fact_flag(original.delegate_facts) is not False)
+
+    def _fact_recipient(self, name):
+        if not isinstance(name, str):
+            return name
+        host = self._inventory.get_host(name)
+        return host.name if host is not None else name
+
+    def normalize_task_result(self, task_result):
+        result = super().normalize_task_result(task_result)
+        self._record_legacy_routes(result)
+        return result
+
+    def _convert_wire_task_result_to_raw(self, wire_task_result):
+        result = super()._convert_wire_task_result_to_raw(wire_task_result)
+        self._record_legacy_routes(result)
+        return result
+
+    def _record_legacy_routes(self, result):
+        data = result._result if hasattr(result, "_result") else result._return_data
+        if data.get("_ansible_item_result") or data.get("_ansible_retry"):
+            return
+        host, task = ((result._host, result._task) if hasattr(result, "_task") else (result.host, result.task))
+        if isinstance(task, str):
+            task_uuid = task
+            host = self._inventory.get_host(host)
+        else:
+            task_uuid = task._uuid
+        if host is None:
+            return
+        routes = self._fact_routes.pop((host.name, task_uuid), ())
+        items = data.get("results", ())
+        if routes and len(routes) == len(items) and not result.is_failed() and not result.is_unreachable():
+            self._legacy_fact_items.update((id(item), (host, target)) for item, target in zip(items, routes)
+                                           if "ansible_facts" in item)
+
+    def get_delegated_hosts(self, result, task):
+        route = self._legacy_fact_items.pop(id(result), None)
+        if route is not None:
+            host, target = route
+            if target is None:
+                return self.get_task_hosts(self._fact_iterator, host, task)
+            return [self._fact_recipient(target)]
+        hosts = super().get_delegated_hosts(result, task)
+        return [self._fact_recipient(name) for name in hosts] if task.action in C._ACTION_SET_FACT else hosts
+
+    def _convert_wire_task_result_to_host_task_result(self, wire_task_result):
+        result = super()._convert_wire_task_result_to_host_task_result(wire_task_result)
+        host, task, data = result.host, result.task, result.utr
+        if data.loop_var is not None:
+            return result
+        key = (host.name, task._uuid)
+        routes = self._fact_routes.pop(key, ())
+        if not self._routed_fact_task(key):
+            return result
+        if data.loop_results is None:
+            if data.delegated_host:
+                data.delegated_host = self._fact_recipient(data.delegated_host)
+            return result
+        if len(routes) == len(data.loop_results):
+            for item, target in zip(data.loop_results, routes):
+                item.delegated_host = self._fact_recipient(target) if target else host.name
+            if task.run_once and None in routes:
+                self._run_once_fact_results[id(result)] = routes
+        return result
+
+    def _process_pending_results(self, iterator, *args, **kwargs):
+        results = super()._process_pending_results(iterator, *args, **kwargs)
+        for result in results:
+            routes = self._run_once_fact_results.pop(id(result), ())
+            if not routes or result.utr.failed or result.utr.unreachable or result.utr.skipped:
+                continue
+            from ansible._internal._task import VariableLayer
+
+            # Core 2.21 accepts one delegated host per item, while a local
+            # run_once fact belongs to the entire batch. Replay in item order
+            # so a later delegated assignment wins for its own recipient.
+            cache = self._variable_manager
+            original_hosts = self.get_task_hosts(iterator, result.host, result.task)
+            for item, target in zip(result.utr.loop_results, routes):
+                recipients = [item.delegated_host] if target else original_hosts
+                changes = item.pending_changes.register_host_variables
+                for host in recipients:
+                    if VariableLayer.CACHEABLE_FACT in changes:
+                        cache.set_host_facts(host, changes[VariableLayer.CACHEABLE_FACT])
+                    if VariableLayer.EPHEMERAL_FACT in changes:
+                        cache.set_nonpersistent_facts(host, changes[VariableLayer.EPHEMERAL_FACT])
+            if result.utr.registered_values:
+                for host in original_hosts:
+                    cache.set_nonpersistent_facts(host, result.utr.registered_values)
+        return results
+
+
+def _delegated_fact_flag(value):
+    """Resolve literal flags without evaluating templates that depend on runtime vars."""
+    from ansiroll.runtime import _boolean
+
+    if value is None:
+        return False
+    if isinstance(value, str) and re.fullmatch(r"\s*\{\{-?\s*(?:false|False|0)\s*-?\}\}\s*", value):
+        return False
+    try:
+        return _boolean(value, strict=True)
+    except TypeError:
+        return None
+
+
 def _extra_vars(variable_manager):
     for attr in ("extra_vars", "_extra_vars"):
         value = getattr(variable_manager, attr, None)
@@ -1759,8 +1949,9 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values):
+def _json_blob(values, mapping_keys=None):
     from ansiroll.loader import _tag_untrusted
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     # hostvars/vars are live controller objects that stringify uselessly; the
     # agent synthesizes ``vars``. Materialize hostvars without their recursive
@@ -1769,46 +1960,75 @@ def _json_blob(values):
     if isinstance(values, dict):
         hostvars = values.get("hostvars")
         values = {k: v for k, v in values.items() if k not in ("hostvars", "vars")}
-        snapshot = _hostvars_snapshot(hostvars)
+        snapshot = _hostvars_snapshot(hostvars, preserve_keys=mapping_keys is not None)
         if snapshot:
             values["hostvars"] = snapshot
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
+        if mapping_keys is None or not _contains_typed_mapping_keys(values):
+            return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
     except Exception:
-        safe = {}
-        for k, v in (values or {}).items():
-            try:
-                v = _tag_untrusted(v, template_syntax_only=True)
+        pass
+    safe = {}
+    for k, v in (values or {}).items():
+        try:
+            v = _tag_untrusted(v, template_syntax_only=True)
+            if mapping_keys is not None and _contains_typed_mapping_keys(v):
+                packed = _pack_delegated_value(v)
+                if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
+                    continue
+                mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
+                v = packed["value"]
+            else:
                 json.dumps(v, default=str)
-                safe[k] = v
-            except Exception:
-                pass
-        return json.dumps(safe, default=str)
+        except Exception:
+            continue
+        safe[k] = v
+    return json.dumps(safe, default=str)
 
 
-def _hostvars_snapshot(hostvars):
+def _hostvars_snapshot(hostvars, *, preserve_keys=False):
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
+
     if hostvars is None:
         return {}
     out = {}
     try:
         names = list(hostvars)
+        implicit_local = getattr(getattr(hostvars, "_inventory", None), "localhost", None)
+        if implicit_local is not None:
+            names.extend(alias for alias in C.LOCALHOST if alias not in names)
     except Exception:
         return out
+    raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
     for name in names:
         try:
-            source = dict(hostvars[name])
+            source = hostvars[name]
+            keys = list(source)
+            raw = raw_get(name) if raw_get is not None else {}
         except Exception:
             continue
         safe = {}
-        for key, value in source.items():
+        for key in keys:
             if key in ("hostvars", "vars"):
                 continue
             try:
-                json.dumps(value, default=str)
-            except (TypeError, ValueError):
-                continue
+                value = source[key]
+                if not preserve_keys or not _contains_typed_mapping_keys(value):
+                    json.dumps(value, default=str)
+            except Exception:
+                # Core can reject typed keys when reading a register. Keep
+                # raw data only when its ordinary source-host view failed.
+                value = raw.get(key) if isinstance(raw, dict) else None
+                if not preserve_keys or not _contains_typed_mapping_keys(value):
+                    continue
+                try:
+                    packed = _pack_delegated_value(value)
+                    if packed["undefined"] or packed.get("errors"):
+                        continue
+                except Exception:
+                    continue
             safe[key] = value
         out[str(name)] = safe
     return out
