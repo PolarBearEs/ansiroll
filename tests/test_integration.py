@@ -5563,6 +5563,64 @@ def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, 
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("cached", [False, True])
+def test_strategy_rejects_undefined_vars_file_after_successful_setup(tmp_path, fast, cached):
+    gather = """- hosts: localhost
+  gather_facts: true
+  connection: local
+  tasks:
+    - debug: {msg: gathered}
+"""
+    verify = """- hosts: localhost
+  gather_facts: GATHER
+  connection: local
+  vars_files: ['settings-{{ missing_file_selector }}.yml']
+  tasks:
+    - debug: {msg: should-not-run}
+""".replace("GATHER", str(not cached).lower())
+    playbook = (gather if cached else "") + verify
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        proc = _run_strategy_play(
+            tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+            environment={"ANSIBLE_STRATEGY": strategy, "ANSIROLL_FAST_FACTS": str(int(fast))},
+        )
+        output = proc.stdout + proc.stderr
+        assert proc.returncode != 0, output
+        assert "an undefined variable was found" in output, output
+        assert "should-not-run" not in output
+
+
+def test_strategy_does_not_capture_lookup_source_from_untrusted_fact(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires Ansible template trust tags")
+    (tmp_path / "settings-localhost.yml").write_text("replacement: safe\n")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        replacement: !unsafe "{{ lookup('env', 'ANSIROLL_UNTRUSTED_FACT_LOOKUP') }}"
+
+- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files: ['settings-{{ inventory_hostname }}.yml']
+  tasks:
+    - assert:
+        that:
+          - "'ANSIROLL_UNTRUSTED_FACT_LOOKUP' in replacement"
+          - "'ANSIROLL_UNTRUSTED_FACT_LOOKUP' not in __ansiroll_controller_env"
+"""
+    proc = _run_strategy_play(
+        tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+        environment={"ANSIROLL_UNTRUSTED_FACT_LOOKUP": "controller-only test value"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     proc = _run_strategy_play(
         tmp_path,

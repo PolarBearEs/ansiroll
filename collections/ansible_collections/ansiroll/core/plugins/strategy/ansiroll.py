@@ -1240,6 +1240,12 @@ class StrategyModule(StrategyBase):
     def _resolved_vars_file_state(self, host, initial_files, *, task=None, snapshot=None):
         if self._deferred_vars_file_keys is None:
             return {"error": "unexpected request for vars_files"}
+        if task is None:
+            from ansible.playbook.task import Task
+
+            # Native vars_files validation uses a task context to distinguish
+            # an unresolved selector after cached setup from an early probe.
+            task = Task()
         try:
             current_vars, files = self._host_vars_and_lookup_sources(host, task=task)
         except AnsibleError as ex:
@@ -1272,8 +1278,8 @@ class StrategyModule(StrategyBase):
     def _controller_lookups(selected_vars_files):
         from ansiroll.loader import _controller_config_names, _controller_config_values, _controller_env_names
 
-        env_names = _controller_env_names(selected_vars_files)
-        config_names = _controller_config_names(selected_vars_files)
+        env_names = _controller_env_names(selected_vars_files, trusted_only=True)
+        config_names = _controller_config_names(selected_vars_files, trusted_only=True)
         return {
             "controller_env": {name: os.environ[name] for name in sorted(env_names) if name in os.environ},
             "controller_config": _controller_config_values(config_names),
@@ -1530,6 +1536,10 @@ class StrategyModule(StrategyBase):
             facts = result_data.get("ansible_facts")
             if task_key == "__gather_facts__" and status == "ok":
                 facts = frame.get("gathered_facts", facts)
+                if isinstance(facts, dict):
+                    # Accelerated setup does not emit the marker that
+                    # Ansible's variable manager checks in the fact cache.
+                    facts = dict(facts, module_setup=True)
             if action == "include_vars":
                 # The controller has already stored the original tagged values.
                 facts = None
