@@ -1142,6 +1142,7 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     assert output.read_bytes() == expected
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"), reason="custom comment arguments require Core 2.11+")
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 def test_template_file_honors_comments_and_trim_blocks(tmp_path, delegated):
     path = _write(tmp_path, """
