@@ -2838,6 +2838,190 @@ def test_standalone_replays_later_vars_file_after_launch_selected_earlier_file(t
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_ordinary_vars_replay_keeps_the_controller_only_compile_selection(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: 'dir\\prod'}
+  vars_files: ['vars-{{ profile | win_basename }}.yml', last.yml]
+  tasks: []
+""")
+    (tmp_path / "vars-prod.yml").write_text("selected: expected\n")
+    (tmp_path / "last.yml").write_text("{}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "expected"
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "different"})
+    with pytest.raises(VarsFilesError, match="controller-only selector with changed inputs"):
+        runtime.run_play(plan)
+
+
+def test_ordinary_vars_replay_does_not_open_controller_lookup_on_target(tmp_path, monkeypatch):
+    from ansiroll.runtime import VarsFilesError
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: prod, choice: selection.txt}
+  vars_files:
+    - 'vars-{{ profile }}.yml'
+    - "settings-{{ lookup('file', choice) }}.yml"
+  tasks: []
+""")
+    (tmp_path / "vars-prod.yml").write_text("{}\n")
+    (tmp_path / "vars-other.yml").write_text("choice: unavailable.txt\n")
+    controller_file = tmp_path / "selection.txt"
+    controller_file.write_text("original\n")
+    (tmp_path / "settings-original.yml").write_text("selected: original\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    controller_file.unlink()
+    monkeypatch.chdir(tmp_path)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "original"
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "other"})
+    with pytest.raises(VarsFilesError, match="requires recompilation|controller-only selector"):
+        runtime.run_play(plan)
+
+
+def test_ordinary_vars_replay_keeps_uniform_include_usable_and_omits_shadowed_secret(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: prod}
+  vars_files: [['vars-{{ profile }}.yml', default.yml, never.yml], last.yml]
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    (tmp_path / "vars-prod.yml").write_text(
+        '''task_file: unused.yml\ntoken: '{{ lookup("env", "ANSIROLL_TEST_SHADOWED_PROFILE_TOKEN") }}'\n''')
+    (tmp_path / "vars-bad.yml").write_text("- [malformed\n")
+    (tmp_path / "default.yml").write_text("task_file: unused.yml\n")
+    (tmp_path / "never.yml").write_text("unreachable: must-not-be-bundled\n")
+    (tmp_path / "last.yml").write_text("task_file: child.yml\ntoken: override\n")
+    (tmp_path / "child.yml").write_text("- debug: {msg: included-expected-child}\n")
+    monkeypatch.setenv("ANSIROLL_TEST_SHADOWED_PROFILE_TOKEN", "synthetic-unreachable-secret")
+    source, _ = compile_playbook(str(playbook), freeze_vars=["task_file"])
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["ordered_vars_files"][0] == 0
+    dumped = json.dumps(plan)
+    assert "synthetic-unreachable-secret" not in dumped
+    assert "must-not-be-bundled" not in dumped
+    script = tmp_path / "compiled.py"
+    script.write_text(source)
+    result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "included-expected-child" in result.stdout
+
+
+def test_ordinary_vars_replay_does_not_use_previous_play_values(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: admin}
+  tasks: []
+- hosts: localhost
+  gather_facts: false
+  vars_files: ["vars-{{ profile | default('prod') }}.yml", last.yml]
+  tasks:
+    - assert: {that: "picked == 'prod'"}
+""")
+    (tmp_path / "vars-admin.yml").write_text("picked: admin\n")
+    (tmp_path / "vars-prod.yml").write_text("picked: prod\n")
+    (tmp_path / "last.yml").write_text("{}\n")
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ordinary_vars_replay_applies_launch_values_before_setup(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {profile: prod}
+  vars_files: ['vars-{{ profile }}.yml', last.yml]
+  environment: {ANSIROLL_SETUP_PROFILE: '{{ selected }}'}
+  tasks: []
+""")
+    (tmp_path / "vars-prod.yml").write_text("selected: prod\n")
+    (tmp_path / "vars-test.yml").write_text("selected: test\n")
+    (tmp_path / "last.yml").write_text("{}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "test"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs:
+                        called.append(runtime._module_env.copy()) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [{"ANSIROLL_SETUP_PROFILE": "test"}]
+
+
+def test_ordinary_vars_replay_treats_unsafe_scalar_as_a_hash_replacement(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: default, settings: {key: old}}
+  vars_files: ['vars-{{ profile }}.yml', last.yml]
+  tasks:
+    - assert: {that: "settings == 'replacement'"}
+""")
+    (tmp_path / "vars-default.yml").write_text("{}\n")
+    (tmp_path / "vars-run.yml").write_text("settings: !unsafe replacement\n")
+    (tmp_path / "last.yml").write_text("{}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "run"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
+def test_ordinary_vars_replay_resolves_templates_with_literal_slashes(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: default}
+  vars_files: ['vars-{{ profile }}.yml', "{{ flavor | default('normal') | replace('/', '-') }}.yml"]
+  tasks: []
+""")
+    (tmp_path / "vars-default.yml").write_text("{}\n")
+    (tmp_path / "vars-run.yml").write_text("flavor: test/run\n")
+    (tmp_path / "normal.yml").write_text("selected: default\n")
+    (tmp_path / "test-run.yml").write_text("selected: runtime\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "run"})
+    runtime.run_play(plan)
+    assert runtime.vars["selected"] == "runtime"
+
+
+def test_ordinary_vars_replay_matches_native_vars_subdirectory_precedence(tmp_path):
+    from ansible.release import __version__ as ansible_version
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: default}
+  vars_files: ['vars/profile-{{ profile }}.yml', last.yml]
+  tasks: []
+""")
+    nested = tmp_path / "vars" / "vars"
+    nested.mkdir(parents=True)
+    (nested.parent / "profile-default.yml").write_text("selected: default\n")
+    (nested.parent / "profile-run.yml").write_text("selected: outer\n")
+    (nested / "profile-run.yml").write_text("selected: inner\n")
+    (tmp_path / "last.yml").write_text("{}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "run"})
+    runtime.run_play(plan)
+    core = tuple(map(int, ansible_version.split(".")[:2]))
+    assert runtime.vars["selected"] == ("inner" if (2, 12) <= core < (2, 21) else "outer")
+
+
 def test_ordered_task_vars_files_merge_with_compile_only_timeout(tmp_path, monkeypatch):
     from ansible import constants as C
 
