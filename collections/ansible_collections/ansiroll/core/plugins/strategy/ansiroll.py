@@ -382,7 +382,7 @@ class StrategyModule(StrategyBase):
 
     # ---- compilation -----------------------------------------------------
     def _compile(self, play, play_vars, gather_task):
-        from ansiroll.loader import _conditions, _convert_play
+        from ansiroll.loader import _conditions, _controller_config_names, _controller_env_names, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
 
@@ -417,6 +417,12 @@ class StrategyModule(StrategyBase):
             from ansiroll.compiler import _mark_unsupported
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
+        self._deferred_lookup_paths = {
+            os.path.abspath(path)
+            for entry in play_node.get("deferred_vars_files", ())
+            for path, data in entry["files"].items()
+            if _controller_env_names(data) or _controller_config_names(data)
+        }
 
         self._ansiballz = embedder.ansiballz_code or ""
         source = _render_source([play_node], modules, self._ansiballz)
@@ -487,14 +493,13 @@ class StrategyModule(StrategyBase):
         """Ship the agent once, then pump: results stream live, delegated tasks are
         serviced inline on the controller, all over one persistent channel."""
         started = time.monotonic()
-        hv = dict(self._variable_manager.get_vars(
-            host=host, play=self._cur_play
-        ))
+        hv, selected_vars_files = self._host_vars_and_lookup_sources(host)
         hv.setdefault("ansible_host", host.name)
         templar = self._mk_templar(hv)
         become_pass = self._resolve_become_password(hv, templar)
         agent_source = (
             self._agent_header(host, hv, become_pass)
+            + self._controller_lookup_header(selected_vars_files)
             + "_INJECTED_GATHER_FACTS = %r\n" % gather_facts
             + source
         )
@@ -1177,6 +1182,46 @@ class StrategyModule(StrategyBase):
                 % os.environ.get("ANSIROLL_ACCELERATED_MODULES", "")
                 + "_INJECTED_FAST_FACTS = %r\n"
                 % _truthy(os.environ.get("ANSIROLL_FAST_FACTS", "")))
+
+    def _host_vars_and_lookup_sources(self, host):
+        selected = []
+        if not self._deferred_lookup_paths:
+            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+
+        # Record the candidate mappings as Ansible selects them. The merged
+        # host vars alone lose inputs used by earlier selectors.
+        loader = self._loader
+        load_from_file = loader.load_from_file
+        original_override = vars(loader).get("load_from_file")
+
+        def capture(path, *args, **kwargs):
+            data = load_from_file(path, *args, **kwargs)
+            if path and os.path.abspath(os.fsdecode(path)) in self._deferred_lookup_paths:
+                selected.append(data)
+            return data
+
+        loader.load_from_file = capture
+        try:
+            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+        finally:
+            if original_override is None:
+                del loader.load_from_file
+            else:
+                loader.load_from_file = original_override
+
+    def _controller_lookup_header(self, selected_vars_files):
+        if not selected_vars_files:
+            return ""
+        from ansiroll.loader import _controller_config_names, _controller_config_values, _controller_env_names
+
+        env_names = _controller_env_names(selected_vars_files)
+        config_names = _controller_config_names(selected_vars_files)
+        lookups = {
+            "controller_env": {name: os.environ[name] for name in sorted(env_names) if name in os.environ},
+            "controller_config": _controller_config_values(config_names),
+        }
+        return "_INJECTED_CONTROLLER_LOOKUPS = __import__('json').loads(%r)\n" % json.dumps(
+            lookups, default=str)
 
     # ---- channel transport ----------------------------------------------
     def _open_channel(self, host, play_context, hv, templar):
