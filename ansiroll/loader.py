@@ -1200,21 +1200,86 @@ def _bundled_vars_file(play, path):
     from ansible.errors import AnsibleParserError
 
     try:
-        with open(path, "rb") as fh:
-            # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-            # select.
-            if b"$ANSIBLE_VAULT" in fh.read():
-                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                        % path}
-        loaded = _load_vars_file(play, path)
+        loaded = _load_plain_ansible_source(play._loader.path_dwim(path))
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
         return _tag_untrusted(preprocess_vars(loaded))
+    except _UnbundledVaultFile:
+        return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                % path}
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+
+
+class _UnbundledVaultFile(ValueError):
+    pass
+
+
+def _load_plain_ansible_source(path):
+    """Parse one validated snapshot of a source that must be unencrypted."""
+    from ansible.module_utils.common.text.converters import to_text
+    from ansible.parsing.dataloader import DataLoader
+
+    with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise ValueError("expected a regular file")
+        data = to_text(fh.read(), errors="surrogate_or_strict")
+    if _ansible_source_contains_vault(data):
+        raise _UnbundledVaultFile(path)
+    try:
+        from ansible._internal._datatag._tags import TrustedAsTemplate
+    except ImportError:
+        pass
+    else:
+        data = TrustedAsTemplate().tag(data)
+    return DataLoader().load(data, file_name=path, show_content=False)
+
+
+def _ansible_source_contains_vault(data):
+    if "$ANSIBLE_VAULT" in data:
+        return True
+    if data.lstrip().startswith(("{", "[")):
+        import json
+        try:
+            from ansible._internal._json._profiles._legacy import Decoder
+            from ansible.parsing.vault import EncryptedString
+        except ImportError:
+            from ansible.parsing.ajson import AnsibleJSONDecoder as Decoder
+            from ansible.parsing.yaml.objects import AnsibleVaultEncryptedUnicode as EncryptedString
+        try:
+            decoded = json.loads(data, cls=Decoder)
+        except Exception:
+            # Ansible retries the whole document as YAML if JSON decoding fails.
+            pass
+        else:
+            pending = [decoded]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, EncryptedString):
+                    return True
+                if isinstance(value, dict):
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+            return False
+    if "!" not in data:
+        return False
+    import yaml
+
+    try:
+        # Inspect tags before constructing values. A Vault value used as a
+        # mapping key may be decrypted by the YAML constructor itself.
+        return any(
+            event.tag in ("!vault", "!vault-encrypted")
+            for event in yaml.parse(data, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+            if isinstance(event, yaml.ScalarEvent)
+        )
+    except (yaml.YAMLError, UnicodeError, RecursionError):
+        # The Ansible loader supplies the diagnostic for malformed input.
+        return False
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
@@ -2586,7 +2651,7 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
-    newline = None if name == "template" else ""
+    newline = ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
@@ -2930,7 +2995,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked."""
     if getattr(task, "_role", None) is None:
         return False
-    newline = "" if subdir == "files" else None
+    newline = ""
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
@@ -3499,7 +3564,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         return False
 
     assets, metadata, contents = {}, {}, {}
-    newline = "" if subdir == "files" else None
+    newline = ""
     remaining_linked_visits = 4096
     # Finish paths with the current number of symlinks before expanding paths
     # with one more, even when a path has many ordinary directories.
