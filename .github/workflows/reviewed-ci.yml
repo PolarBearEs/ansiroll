@@ -148,10 +148,10 @@ jobs:
               state=failure
             elif [[ "$TESTS_RESULT" == success ]] &&
                  jobs=$(gh api --paginate --slurp "$api/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100") &&
-                 jq -e --arg reporter "$GITHUB_JOB" --argjson attempt "$MERGE_ATTEMPT" '
+                 jq -e --argjson attempt "$MERGE_ATTEMPT" '
               [.[].jobs[] | select(.run_attempt >= $attempt)] |
               group_by(.name) | map(max_by([.run_attempt, .id])) |
-              map(select(.name != $reporter and .name != "reviewed-head"
+              map(select((.name | startswith("tests / "))
                 and (.name | endswith("ansible ansible-base==2.10.17 (py3.9)") | not)
                 and (.name | endswith("Ansible parity 2.10") | not))) |
               # ci.yml defines four standalone jobs and seven required legs in each matrix.
