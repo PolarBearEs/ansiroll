@@ -228,6 +228,7 @@ jobs:
                   cancelled_title='PR revision changed'
                   if ((revision_status == 2)); then
                     cancelled_title='Could not verify the PR revision'
+                    echo '::error::GitHub did not confirm the PR revision after publishing the check.'
                     ((report_error)) || report_error=1
                   fi
                   gh api --silent --method PATCH "$api/check-runs/$check" \
@@ -245,6 +246,7 @@ jobs:
               fi
             done
           elif [[ "$?" == 2 ]]; then
+            echo '::error::GitHub did not confirm the PR revision. The PR-head check was not published.'
             ((report_error)) || report_error=1
           fi
           ((report_error == 0)) || exit "$report_error"
