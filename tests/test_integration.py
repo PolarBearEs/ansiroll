@@ -4943,7 +4943,10 @@ def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
 
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["all-local", "mixed"])
-def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_path, mixed):
+@pytest.mark.parametrize("retry", [False, True], ids=["plain", "retry"])
+def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_path, mixed, retry):
+    retry_options = ("      retries: 2\n      delay: 0\n"
+                     "      until: entry.key != 'local_flag' or loop_result.attempts >= 2\n") if retry else ""
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
   gather_facts: false
@@ -4961,11 +4964,11 @@ def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_
       delegate_facts: "{{ entry.route }}"
       register: loop_result
       no_log: true
-    - assert:
+RETRY_OPTIONS    - assert:
         that:
           - local_flag == 'second'
           - local_omit == 'third'
-          - ansible_facts.local_flag == 'second'
+          - CACHED_FACT_CHECK
           - loop_result.results | length == 3
           - hostvars.recipient.local_flag is undefined
           - hostvars.recipient.local_omit is undefined
@@ -4975,7 +4978,9 @@ def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_
   connection: local
   tasks:
     - assert: {that: RECIPIENT}
-""".replace("ROUTE", "true" if mixed else "false").replace(
+""".replace("RETRY_OPTIONS", retry_options).replace("CACHED_FACT_CHECK",
+            "loop_result.results[1].attempts == 2" if retry else "ansible_facts.local_flag == 'second'"
+        ).replace("ROUTE", "true" if mixed else "false").replace(
             "EXPECTED", "marker is undefined" if mixed else "marker == 'first'"
         ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
         inventory="origin,recipient,",

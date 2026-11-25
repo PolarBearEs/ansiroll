@@ -1827,7 +1827,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
 
     def _record_legacy_routes(self, result):
         data = result._result if hasattr(result, "_result") else result._return_data
-        if data.get("_ansible_item_result"):
+        if data.get("_ansible_item_result") or data.get("_ansible_retry"):
             return
         host, task = ((result._host, result._task) if hasattr(result, "_task") else (result.host, result.task))
         if isinstance(task, str):
