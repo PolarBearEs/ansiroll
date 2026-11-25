@@ -168,6 +168,7 @@ class _Omit(str):
 
 
 _OMIT = _Omit("__omit_place_holder__ansiroll")
+_LOCALHOST_NAMES = ("localhost", "127.0.0.1", "::1")
 _NO_CONDITIONAL_LIST = object()
 _MISSING_VARS_FILE_INPUT = object()
 _UNRESOLVED_SELECTOR_KEY = object()
@@ -4122,6 +4123,7 @@ class Runtime:
         # the flattened host snapshot. Those values (set_fact/register) outrank
         # play vars, a distinction that is otherwise lost after serialization.
         self._set_fact_overrides = dict(host_var_overrides or {})
+        self._delegated_ansible_facts_overrides = set()
         # include_vars results: above task vars, below set_fact/register.
         self._include_vars_layer = {}
         self._module_fact_layer = {}
@@ -4141,6 +4143,7 @@ class Runtime:
         self._module_source_bytes = None  # baked unarchive input for the next worker call
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
+        self.delegate_on_target = False
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
         self._started_task_name = (None, None)
@@ -5276,8 +5279,9 @@ class Runtime:
         else:
             res, ignore = self._task_gate(task, base_ctx)
             if res is None:
-                res = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
-                self._absorb_facts(task, res)
+                res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
+                if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
+                    self._absorb_facts(task, res, fact_host)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
@@ -5402,73 +5406,96 @@ class Runtime:
         ignore_loop = False
         failed_items_ignored = True
         metadata_flags = self._loop_metadata_flags(task, base_ctx) if items else None
-        for i, it in enumerate(items):
-            ctx = dict(base_ctx)
-            ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
-            if i > 0 and task.get("loop_pause"):
-                time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
-            res, ignore = self._task_gate(task, ctx)
-            if res is None:
-                res = self._exec_notifying_task(task, ctx, become, notifications)
-                self._absorb_facts(task, res)
-                facts = res.get("ansible_facts")
-                if isinstance(facts, _IncludedVars):
-                    base_ctx.update({key: self.vars[key] for key in facts})
-                elif isinstance(facts, dict):
-                    action = (task.get("action") or "").rsplit(".", 1)[-1]
-                    base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
-            res["item"] = it
-            if task.get("loop_label") is not None:
-                label_ctx = dict(ctx)
-                if task.get("register"):
-                    label_ctx[task["register"]] = res
-                try:
-                    label = self.template(task["loop_label"], label_ctx)
-                    if _is_undef(label):
-                        label._fail_with_undefined_error()
-                    res["_ansible_item_label"] = label
-                except Exception as ex:
-                    res = {"failed": True, "changed": False, "item": it,
-                           "msg": "Failed to template loop_control.label: %s" % ex}
-            stop = False
-            bw = task.get("loop_break_when")
-            if bw:
-                bctx = dict(ctx)
-                if task.get("register"):
-                    bctx[task["register"]] = _registered_result(task, res)
-                try:
-                    stop = self.when(bw, bctx, keyword="break_when")
-                except ConditionalError as ex:
-                    if not _core_at_least(2, 21):
-                        # Older executors emitted the item before evaluating
-                        # break_when, then returned the task-level error.
-                        self.emit(task, _status_of(res), res, item=it,
-                                  ignored=ignore, is_item=True)
-                        return {"failed": True, "changed": False, "msg": str(ex)}, ignore
-                    res["failed"] = True
-                    res["break_when_result"] = str(ex)
-                    stop = True
-            tally_changed = res.pop(
-                "_ansiroll_tally_changed", res.get("changed", False)
-            )
-            agg["results"].append(res)
-            agg["changed"] = agg["changed"] or res.get("changed", False)
-            if tally_changed:
-                agg["_ansiroll_tally_changed"] = True
-            if _result_failed(res):
-                agg["failed"] = True
-                failed_items_ignored = failed_items_ignored and ignore
-            if res.get("unreachable"):
-                agg["unreachable"] = True
-                ignored = self._ignores_unreachable(task, ctx)
-                if _core_at_least(2, 21):
-                    agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", False) or ignored
-                else:
-                    agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
-            ignore_loop = ignore_loop or ignore
-            self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
-            if stop:
-                break
+        commits_delegated_facts = task.get("delegate_to") and (
+            task.get("action", "").rsplit(".", 1)[-1] == "set_fact"
+        )
+        pending_facts = []
+        loop_succeeded = False
+        try:
+            for i, it in enumerate(items):
+                fact_host = None
+                ctx = dict(base_ctx)
+                ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
+                if i > 0 and task.get("loop_pause"):
+                    time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
+                res, ignore = self._task_gate(task, ctx)
+                if res is None:
+                    res, fact_host = self._exec_notifying_task(task, ctx, become, notifications)
+                    if fact_host is None:
+                        if commits_delegated_facts:
+                            pending_facts.append((None, dict(res)))
+                        else:
+                            self._absorb_facts(task, res)
+                    facts = res.get("ansible_facts") if fact_host is None else None
+                    if isinstance(facts, _IncludedVars):
+                        base_ctx.update({key: self.vars[key] for key in facts})
+                    elif isinstance(facts, dict):
+                        action = (task.get("action") or "").rsplit(".", 1)[-1]
+                        base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
+                        if commits_delegated_facts and action == "set_fact":
+                            cached = base_ctx.get("ansible_facts")
+                            base_ctx["ansible_facts"] = {
+                                **(cached if isinstance(cached, dict) else {}), **_normalized_facts(facts),
+                            }
+                res["item"] = it
+                if task.get("loop_label") is not None:
+                    label_ctx = dict(ctx)
+                    if task.get("register"):
+                        label_ctx[task["register"]] = res
+                    try:
+                        label = self.template(task["loop_label"], label_ctx)
+                        if _is_undef(label):
+                            label._fail_with_undefined_error()
+                        res["_ansible_item_label"] = label
+                    except Exception as ex:
+                        res = {"failed": True, "changed": False, "item": it,
+                               "msg": "Failed to template loop_control.label: %s" % ex}
+                stop = False
+                bw = task.get("loop_break_when")
+                if bw:
+                    bctx = dict(ctx)
+                    if task.get("register"):
+                        bctx[task["register"]] = _registered_result(task, res)
+                    try:
+                        stop = self.when(bw, bctx, keyword="break_when")
+                    except ConditionalError as ex:
+                        if not _core_at_least(2, 21):
+                            # Older executors emitted the item before evaluating
+                            # break_when, then returned the task-level error.
+                            self.emit(task, _status_of(res), res, item=it,
+                                      ignored=ignore, is_item=True)
+                            return {"failed": True, "changed": False, "msg": str(ex)}, ignore
+                        res["failed"] = True
+                        res["break_when_result"] = str(ex)
+                        stop = True
+                tally_changed = res.pop(
+                    "_ansiroll_tally_changed", res.get("changed", False)
+                )
+                agg["results"].append(res)
+                agg["changed"] = agg["changed"] or res.get("changed", False)
+                if tally_changed:
+                    agg["_ansiroll_tally_changed"] = True
+                if _result_failed(res):
+                    agg["failed"] = True
+                    failed_items_ignored = failed_items_ignored and ignore
+                if res.get("unreachable"):
+                    agg["unreachable"] = True
+                    ignored = self._ignores_unreachable(task, ctx)
+                    if _core_at_least(2, 21):
+                        agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", False) or ignored
+                    else:
+                        agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
+                ignore_loop = ignore_loop or ignore
+                if fact_host is not None:
+                    pending_facts.append((fact_host, res))
+                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
+                if stop:
+                    break
+            loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
+        finally:
+            for fact_host, result in pending_facts:
+                if fact_host is None or loop_succeeded:
+                    self._absorb_facts(task, result, fact_host)
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
@@ -5588,11 +5615,33 @@ class Runtime:
             names = self._notification_names(task, ctx)
         except Exception as ex:
             return {"failed": True, "changed": False,
-                    "msg": "Failed to template notify: %s" % ex}
-        res = self._exec_with_retries(task, ctx, become)
+                    "msg": "Failed to template notify: %s" % ex}, None
+        fact_host = None
+        concrete = task
+        if task.get("delegate_to") and task["action"].rsplit(".", 1)[-1] == "set_fact":
+            try:
+                flag = _fail_on_undef(self.template(task.get("delegate_facts", False), ctx))
+                delegate_facts = flag != _OMIT and _boolean(flag, strict=True)
+                target = None
+                if delegate_facts or not self.delegate_on_target:
+                    target = _fail_on_undef(self.template(task["delegate_to"], ctx))
+                    if target == _OMIT:
+                        target = None
+                    elif not isinstance(target, str) or not target:
+                        raise ValueError("delegate_to must resolve to a nonempty host name")
+                fact_host = self._delegated_fact_host(target) if delegate_facts else None
+                if self.delegate_on_target and fact_host is not None:
+                    raise ValueError("delegate_facts is incompatible with ansiroll_delegate_on_target")
+                concrete = dict(task, delegate_to=target, delegate_facts=bool(fact_host))
+            except Exception as ex:
+                return {"failed": True, "changed": False,
+                        "msg": "Failed to resolve delegated fact host: %s" % ex}, None
+        res = self._exec_with_retries(concrete, ctx, become)
+        if concrete is not task:
+            self._task_provenance[id(task)] = self._task_provenance.pop(id(concrete), {"mode": "native-agent"})
         if notifications is not None and not _result_failed(res):
             notifications.extend(names)
-        return res
+        return res, fact_host
 
     def _exec_with_retries(self, task, ctx, become=False):
         until = task.get("until")
@@ -6069,7 +6118,6 @@ class Runtime:
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s'" % k}
                 facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
-            self.vars.update(facts)
             return {
                 "changed": False,
                 "ansible_facts": facts,
@@ -6682,7 +6730,18 @@ class Runtime:
                 if key not in self._play_var_names and key not in self._include_vars_layer
                 and key not in self._set_fact_overrides and key not in self.extra_vars}
 
-    def _absorb_facts(self, task, res):
+    def _delegated_fact_host(self, target):
+        if target not in _LOCALHOST_NAMES:
+            return target
+        hostvars = self.vars.get("hostvars") or {}
+        if target in hostvars:
+            entry = hostvars[target]
+            return next(name for name in hostvars if name in _LOCALHOST_NAMES and hostvars[name] is entry)
+        if self.host in _LOCALHOST_NAMES:
+            return self.host
+        return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
+
+    def _absorb_facts(self, task, res, fact_host=None):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -6696,6 +6755,30 @@ class Runtime:
             # Facts are module output: never templated (Ansible marks them unsafe).
             facts = _mark_unsafe(facts)
             short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
+            if fact_host is not None and fact_host != self.host:
+                hostvars = dict(self.vars.get("hostvars") or {})
+                if fact_host not in hostvars and fact_host not in _LOCALHOST_NAMES:
+                    return
+                previous = hostvars.get(fact_host)
+                target = dict(previous or {})
+                exposed = {key: value for key, value in facts.items() if key not in self.extra_vars}
+                target.update(exposed)
+                if "ansible_facts" in exposed:
+                    self._delegated_ansible_facts_overrides.add(fact_host)
+                if (res.get("_ansible_facts_cacheable") and fact_host not in self._delegated_ansible_facts_overrides
+                        and "ansible_facts" not in self.extra_vars):
+                    cached = target.get("ansible_facts")
+                    target["ansible_facts"] = {
+                        **(cached if isinstance(cached, dict) else {}),
+                        **_normalized_facts(facts, preserve_local=True),
+                    }
+                hostvars[fact_host] = target
+                if fact_host in _LOCALHOST_NAMES:
+                    for alias in _LOCALHOST_NAMES:
+                        if alias != self.host and (alias not in hostvars or hostvars[alias] is previous):
+                            hostvars[alias] = target
+                self.vars["hostvars"] = hostvars
+                return
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
@@ -7488,6 +7571,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     }
     rt = None
     host_var_overrides = {}
+    delegated_ansible_facts_overrides = set()
     include_vars_layer = {}
     module_fact_layer = {}
     for play in plays:
@@ -7507,6 +7591,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      native_only=native_only, inventory_defaults=inventory_defaults)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
+        rt._delegated_ansible_facts_overrides = delegated_ansible_facts_overrides
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
@@ -7993,6 +8078,7 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
+    rt.delegate_on_target = delegate_on_target
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
             # Only the agent has the play's bundled filters and lookup plugins.
