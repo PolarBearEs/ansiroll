@@ -72,6 +72,7 @@ def _legacy_non_native(ctx):
 
 _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
+_CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
 
 
 def _rendered_number(value, source, ctx):
@@ -89,7 +90,7 @@ def _vars_snapshot(ctx):
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
                 "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_vars_file_selector",
                 "__ansiroll_setup_controller_lookups",
-                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
+                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT, _CHECK_MODE_TEMPLATE}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -2948,8 +2949,15 @@ _KEYWORD_OMIT_SEGMENT = _KeywordTemplateSegment()
 _KEYWORD_NULL_SEGMENT = _KeywordTemplateSegment()
 
 
+def _concat_keyword_segments(nodes):
+    parts = [part for part in nodes if part is not _KEYWORD_NULL_SEGMENT]
+    if len(parts) == 1:
+        return parts[0]
+    return "".join(parts) if parts else _KEYWORD_NULL_SEGMENT
+
+
 def _finalize_text_segment(context, value):
-    if context.get("__ansiroll_check_mode_template"):
+    if context.get(_CHECK_MODE_TEMPLATE) is True:
         if isinstance(value, _Omit):
             return _KEYWORD_OMIT_SEGMENT
         if value is None:
@@ -3270,6 +3278,12 @@ class _ConditionalName:
 
 
 class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        if getattr(self.environment, "concat", None) is _concat_keyword_segments:
+            # Bundled Jinja refers to its global concatenator in buffers.
+            self.writeline("concat = environment.concat")
+
     def func(self, name):
         # A Python plugin can call back into any generated template body,
         # including recursive loops and blocks, without a new render_string.
@@ -3407,6 +3421,7 @@ class _Templater:
         self._condition_list_cache = {}
         self._template_cache = {}
         self._file_environments = {}
+        self._keyword_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
         self._current_ctx = {}
@@ -3922,9 +3937,10 @@ class _Templater:
 
     def _render_string(self, text, ctx, strict=False, *, file_newline=None):
         stripped = text.strip()
-        check_mode_template = ctx.get("__ansiroll_check_mode_template")
+        check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE)
+        native_keyword = check_mode_template is True
         expr = None
-        if not check_mode_template or stripped == text:
+        if check_mode_template is None or stripped == text:
             expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is None:
             # Full templates keep their existing rendering and newline behavior.
@@ -3935,6 +3951,13 @@ class _Templater:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
+        if native_keyword and expr is None:
+            if env not in self._keyword_environments:
+                keyword_env = env.overlay()
+                keyword_env.keep_trailing_newline = False
+                keyword_env.concat = _concat_keyword_segments
+                self._keyword_environments[env] = keyword_env
+            env = self._keyword_environments[env]
         if file_newline is not None:
             key = (env, file_newline)
             if key not in self._file_environments:
@@ -3943,7 +3966,7 @@ class _Templater:
                 file_env.newline_sequence = file_newline
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
-        template_key = (text, strict, lazy_names, file_newline)
+        template_key = (text, strict, lazy_names, file_newline, native_keyword)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
         if expr is not None:
@@ -3967,12 +3990,12 @@ class _Templater:
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-                if check_mode_template:
-                    parts = [part for part in tmpl.generate(**ctx) if part is not _KEYWORD_NULL_SEGMENT]
-                    if len(parts) == 1 and parts[0] is _KEYWORD_OMIT_SEGMENT:
+                if native_keyword:
+                    result = _concat_keyword_segments(tmpl.generate(**ctx))
+                    if result is _KEYWORD_OMIT_SEGMENT:
                         result = _OMIT
-                    else:
-                        result = "".join(parts) if parts else None
+                    elif result is _KEYWORD_NULL_SEGMENT:
+                        result = None
                 else:
                     result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
@@ -5875,9 +5898,10 @@ class Runtime:
             if check_override is not None:
                 omit_token = ctx.get("omit")
                 check_ctx = ctx
-                if isinstance(check_override, str) and _core_at_least(2, 19):
-                    check_ctx = {**ctx, "__ansiroll_check_mode_template": True}
-                    if isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__"):
+                if isinstance(check_override, str):
+                    native_keyword = _core_at_least(2, 19)
+                    check_ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
+                    if native_keyword and isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__"):
                         check_ctx["omit"] = _OMIT
                 check_override = _fail_on_undef(self.template(check_override, check_ctx))
                 if (isinstance(check_override, _Omit) or (

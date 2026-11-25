@@ -5605,7 +5605,13 @@ def test_strategy_preserves_rendered_false_check_mode(tmp_path, expression):
         output.unlink()
 
 
-@pytest.mark.parametrize("expression", ["{% if true %}{{ omit }}{% endif %}", " {{ omit }} ", " {{- omit -}} "])
+@pytest.mark.parametrize("expression", [
+    "{% if true %}{{ omit }}{% endif %}",
+    " {{ omit }} ",
+    " {{- omit -}} ",
+    "{{ omit }}\n",
+    "{% macro fallback() %}{{ omit }}{% endmacro %}{{ fallback() }}",
+])
 def test_strategy_full_check_mode_omit_matches_native(tmp_path, expression):
     from ansiroll.loader import _core_version
 
@@ -5624,6 +5630,26 @@ def test_strategy_full_check_mode_omit_matches_native(tmp_path, expression):
     actual = _run_strategy_play(tmp_path, playbook, *opts)
     assert actual.returncode == native.returncode, actual.stdout + actual.stderr + native.stdout + native.stderr
     assert not (tmp_path / "result").exists()
+
+
+def test_strategy_rejects_padded_legacy_check_mode_omit(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 19):
+        pytest.skip("requires the legacy omit token")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: "{{ playbook_dir }}/result"
+        state: touch
+      check_mode: " {{ omit }} "
+"""
+    opts = ["-c", "local", "-e", "ansible_python_interpreter=" + sys.executable]
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        actual = _run_strategy_play(tmp_path, playbook, *opts, environment={"ANSIBLE_STRATEGY": strategy})
+        assert actual.returncode != 0, actual.stdout + actual.stderr
+        assert not (tmp_path / "result").exists()
 
 
 def test_compiled_check_mode_omit_fallback_does_not_capture_parent_lookup(tmp_path, monkeypatch):
