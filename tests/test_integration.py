@@ -4771,7 +4771,7 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,"):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -4781,7 +4781,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None):
     env["ANSIBLE_NOCOLOR"] = "1"
     env.update(environment or {})
     return subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", str(path), *args],
+        ["ansible-playbook", "-i", inventory, str(path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -4883,6 +4883,211 @@ def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "failed=0" in proc.stdout
+
+
+def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path,
+        """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        routed_fact: one
+        cacheable: true
+      delegate_to: localhost
+      delegate_facts: true
+      no_log: true
+      register: issued
+    - set_fact:
+        loop_fact: "{{ item.value }}"
+      loop:
+        - {host: localhost, value: local}
+        - {host: recipient, value: remote}
+      delegate_to: "{{ item.host }}"
+      delegate_facts: true
+    - set_fact:
+        local_fact: stays_local
+      delegate_to: localhost
+      delegate_facts: false
+    - assert:
+        that:
+          - routed_fact is undefined
+          - loop_fact is undefined
+          - issued.ansible_facts.routed_fact == 'one'
+          - local_fact == 'stays_local'
+
+- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that:
+          - routed_fact == 'one'
+          - ansible_facts.routed_fact == 'one'
+          - loop_fact == 'local'
+          - issued is undefined
+          - local_fact is undefined
+
+- hosts: recipient
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that:
+          - routed_fact is undefined
+          - loop_fact == 'remote'
+          - hostvars['localhost'].routed_fact == 'one'
+          - hostvars['127.0.0.1'].routed_fact == 'one'
+          - hostvars['::1'].routed_fact == 'one'
+""",
+        inventory="origin,recipient,",
+        environment={"ANSIROLL_PROVENANCE": "1"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '"reason": "delegated set_fact requires task-lockstep scheduling"' in proc.stdout
+
+
+def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - command: /bin/true
+    - assert:
+        that: seeded is undefined
+    - set_fact:
+        seeded: during_task
+      when: inventory_hostname == 'alpha'
+      delegate_to: beta
+      delegate_facts: true
+    - assert:
+        that: seeded == 'during_task'
+      when: inventory_hostname == 'beta'
+""", inventory="alpha,beta,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["all-local", "mixed"])
+@pytest.mark.parametrize("retry", [False, True], ids=["plain", "retry"])
+def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_path, mixed, retry):
+    retry_options = ("      retries: 2\n      delay: 0\n"
+                     "      until: entry.key != 'local_flag' or loop_result.attempts >= 2\n") if retry else ""
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        "{{ entry.key }}": "{{ entry.value }}"
+        cacheable: true
+      loop:
+        - {key: marker, value: first, target: recipient, route: ROUTE}
+        - {key: local_flag, value: second, target: recipient, route: false}
+        - {key: local_omit, value: third, route: true}
+      loop_control: {loop_var: entry}
+      delegate_to: "{{ entry.target | default(omit) }}"
+      delegate_facts: "{{ entry.route }}"
+      register: loop_result
+      no_log: true
+RETRY_OPTIONS    - assert:
+        that:
+          - local_flag == 'second'
+          - local_omit == 'third'
+          - CACHED_FACT_CHECK
+          - loop_result.results | length == 3
+          - hostvars.recipient.local_flag is undefined
+          - hostvars.recipient.local_omit is undefined
+          - EXPECTED
+- hosts: recipient
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert: {that: RECIPIENT}
+""".replace("RETRY_OPTIONS", retry_options).replace("CACHED_FACT_CHECK",
+            "loop_result.results[1].attempts == 2" if retry else "ansible_facts.local_flag == 'second'"
+        ).replace("ROUTE", "true" if mixed else "false").replace(
+            "EXPECTED", "marker is undefined" if mixed else "marker == 'first'"
+        ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
+        inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {marker: "{{ item.value }}"}
+      loop:
+        - {value: batch_value, route: false}
+        - {value: recipient_value, route: true}
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+    - assert:
+        that: marker == ('recipient_value' if inventory_hostname == 'recipient' else 'batch_value')
+""", inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - set_fact: {marker: value}
+      delegate_to: localhost
+      delegate_facts: true
+""", inventory="origin,",
+    )
+    assert proc.returncode != 0
+    assert "with ansiroll_delegate_on_target" in " ".join((proc.stdout + proc.stderr).split())
+
+
+def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - set_fact: {marker: value}
+      when: false
+      delegate_to: localhost
+      delegate_facts: true
+    - assert: {that: marker is undefined}
+""", inventory="origin,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ["false", "route_facts"])
+def test_strategy_allows_on_target_delegation_when_fact_flag_is_false(tmp_path, flag):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+    route_facts: false
+  tasks:
+    - set_fact: {marker: value}
+      delegate_to: "{{ missing_host }}"
+      delegate_facts: "{{ FLAG }}"
+    - assert: {that: "marker == 'value'"}
+""".replace("FLAG", flag), inventory="origin,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_strategy_native_only_rejects_linear_fallback(tmp_path):

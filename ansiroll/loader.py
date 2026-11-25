@@ -2075,6 +2075,9 @@ def _convert_task(task, actions, basedir):
     delegate = getattr(task, "delegate_to", None)
     node["delegate_to"] = str(delegate) if delegate else None
     node["delegate_facts"] = getattr(task, "delegate_facts", False)
+    if delegate and action.rsplit(".", 1)[-1] == "set_fact":
+        node["delegate_to"] = _tag_untrusted(delegate, template_syntax_only=True)
+        node["delegate_facts"] = _boolean_or_template(node["delegate_facts"])
 
     if action in BAKED_ACTIONS:
         _bake_sources(node, task, basedir)
