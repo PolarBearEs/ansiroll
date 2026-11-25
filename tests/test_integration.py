@@ -2471,6 +2471,32 @@ def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_p
     assert called == [("ansible.builtin.setup", {"fact_path": "/west", "gather_subset": ["!all", "network"]})]
 
 
+def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  roles: [settings]
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    defaults = tmp_path / "roles" / "settings" / "defaults"
+    defaults.mkdir(parents=True)
+    (defaults / "main.yml").write_text(
+        """directory: '{{ lookup("env", "ANSIROLL_SELECTED_SETUP_PATH") if true else lookup("env", "ANSIROLL_UNUSED_SETUP_PATH") }}'\n""")
+    monkeypatch.setenv("ANSIROLL_SELECTED_SETUP_PATH", "/controller-facts")
+    monkeypatch.setenv("ANSIROLL_UNUSED_SETUP_PATH", "synthetic-unused-secret")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["controller_env"].get("ANSIROLL_SELECTED_SETUP_PATH") == "/controller-facts"
+    assert "ANSIROLL_UNUSED_SETUP_PATH" not in plan["controller_env"]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"fact_path": "/controller-facts"})]
+
+
 def test_standalone_setup_defaults_use_launch_selected_vars_and_final_vars_scope(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

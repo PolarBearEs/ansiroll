@@ -4564,6 +4564,7 @@ class Runtime:
         vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
         merge_vars_files = (ordered_files is not None and
                             self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
+        merge_setup_scope = self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         vars_file_defaults = play.get("vars_file_defaults", timeout_template.get("vars_file_defaults")) or {}
         vars_file_magic = play.get("vars_file_magic") or {}
         early_files = {}
@@ -4583,21 +4584,34 @@ class Runtime:
                 layers = (*option_scope["role_exports"], self.extra_vars, option_scope["magic"])
                 option_vars = _f_combine(
                     option_scope["defaults"], play_vars if timeout_vars is None else timeout_vars,
-                    *layers, recursive=merge_vars_files)
+                    *layers, recursive=merge_setup_scope)
                 option_ctx = self.ctx(option_vars, base={
                     name: self.vars[name]
                     for name in ("__ansiroll_controller_env", "__ansiroll_controller_config")
                 })
                 option_blocks = dict(blocked_timeout_inputs)
                 for layer in layers:
-                    _clear_vars_file_blocks(option_blocks, layer, merge_vars_files)
+                    _clear_vars_file_blocks(option_blocks, layer, merge_setup_scope)
                 option_contexts["gather_subset"] = (option_ctx, option_blocks)
-                task_blocks = dict(option_blocks)
-                for layer in (self._include_vars_layer, self._set_fact_overrides):
-                    _clear_vars_file_blocks(task_blocks, layer, merge_vars_files)
-                setup_task_scope = self._layered_ctx(self.ctx(option_vars))
-                setup_task_scope["vars"] = _vars_snapshot(setup_task_scope)
-                option_contexts["fact_path"] = (setup_task_scope, task_blocks)
+                host_vars = {key: value for key, value in self._task_host_vars().items()
+                             if key not in self._include_vars_layer and key not in self._set_fact_overrides}
+                task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
+                task_blocks = {}
+                if vars_files:
+                    task_vars = self._resolve_deferred_vars_files(
+                        vars_file_play_vars, vars_files, early_files,
+                        {**vars_file_defaults, **option_scope["defaults"]},
+                        blocked_inputs=task_blocks, merge_hashes=merge_setup_scope, magic=vars_file_magic,
+                        pre_setup_host_vars=host_vars,
+                    )
+                task_layers = (*option_scope["role_exports"], self._include_vars_layer,
+                               self._set_fact_overrides, self.extra_vars, option_scope["magic"])
+                for layer in task_layers:
+                    _clear_vars_file_blocks(task_blocks, layer, merge_setup_scope)
+                task_scope = self.ctx(_f_combine(task_vars, *task_layers, recursive=merge_setup_scope), base={})
+                task_scope.pop("vars", None)
+                task_scope["vars"] = _vars_snapshot(task_scope)
+                option_contexts["fact_path"] = (task_scope, task_blocks)
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -4863,7 +4877,8 @@ class Runtime:
         return ctx
 
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
-                                     blocked_inputs=None, merge_hashes=False, magic=None):
+                                     blocked_inputs=None, merge_hashes=False, magic=None,
+                                     pre_setup_host_vars=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # During early replay each blocked variable records the member paths
         # that later assignments have definitely replaced.
@@ -4874,7 +4889,8 @@ class Runtime:
         else:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         selected = dict(play_vars)
-        selector_vars = _f_combine(defaults, None if before_setup else base, selected, recursive=merge_hashes)
+        selector_base = pre_setup_host_vars if before_setup else base
+        selector_vars = _f_combine(defaults, selector_base, selected, recursive=merge_hashes)
 
         def apply_files(mappings):
             nonlocal selected, selector_vars
@@ -6897,6 +6913,13 @@ class Runtime:
                 if not _core_at_least(2, 18) and resolved_options.get("gather_subset") == _OMIT:
                     resolved_options["gather_subset"] = ["all"]
                 setup_args = {key: value for key, value in _setup_omit(resolved_options).items() if value is not None}
+                if "gather_subset" in setup_args:
+                    subset = setup_args["gather_subset"]
+                    if not isinstance(subset, list):
+                        subset = [subset]
+                    if not all(isinstance(item, str) for item in subset):
+                        raise ValueError("gather_subset items must be strings")
+                    setup_args["gather_subset"] = subset
                 gather_timeout = self._gather_timeout_for_run(
                     gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
                 if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
