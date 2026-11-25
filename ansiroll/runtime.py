@@ -2379,21 +2379,26 @@ class _PluginInventoryArgument:
             list.__setitem__(owner, slice(None), members)
 
 
-def _restore_plugin_argument(value, sources, restored):
+def _restore_plugin_argument(value, sources, restored, *, copy_containers=False):
     if id(value) in sources:
         return sources[id(value)]
     if id(value) in restored:
         return restored[id(value)][1]
     if type(value) is dict:
-        restored[id(value)] = value, value
+        result = {} if copy_containers else value
+        restored[id(value)] = value, result
         for key, item in dict.items(value):
-            value[key] = _restore_plugin_argument(item, sources, restored)
+            result[key] = _restore_plugin_argument(item, sources, restored, copy_containers=copy_containers)
+        return result
     elif type(value) is list:
-        restored[id(value)] = value, value
-        for index, item in enumerate(value):
-            value[index] = _restore_plugin_argument(item, sources, restored)
+        result = [] if copy_containers else value
+        restored[id(value)] = value, result
+        result[:] = [_restore_plugin_argument(item, sources, restored, copy_containers=copy_containers)
+                     for item in value]
+        return result
     elif type(value) is tuple:
-        items = tuple(_restore_plugin_argument(item, sources, restored) for item in value)
+        items = tuple(_restore_plugin_argument(item, sources, restored, copy_containers=copy_containers)
+                      for item in value)
         if all(item is original for item, original in zip(items, value)):
             items = value
         return restored.setdefault(id(value), (value, items))[1]
@@ -2413,12 +2418,12 @@ def _restore_plugin_arguments(converted):
                     _restore_plugin_argument(entry[1], sources, restored)
 
 
-def _restore_plugin_result(result, converted):
+def _restore_plugin_result(result, converted, *, copy_containers=False):
     if converted:
         sources = {id(builtin): original for original, builtin, *_ in converted.values()
                    if isinstance(original, (_RawSnapshotMapping, _RawSnapshotList))}
         if sources:
-            return _restore_plugin_argument(result, sources, {})
+            return _restore_plugin_argument(result, sources, {}, copy_containers=copy_containers)
     return result
 
 
@@ -2493,12 +2498,12 @@ class _ScopedGenerator(Generator):
     def send(self, value):
         with self._templater._plugin_arg_scope(self._converted):
             result = self._generator.send(value)
-        return _restore_plugin_result(result, self._converted)
+        return _restore_plugin_result(result, self._converted, copy_containers=True)
 
     def throw(self, *args):
         with self._templater._plugin_arg_scope(self._converted):
             result = self._generator.throw(*args)
-        return _restore_plugin_result(result, self._converted)
+        return _restore_plugin_result(result, self._converted, copy_containers=True)
 
     def close(self):
         with self._templater._plugin_arg_scope(self._converted):
@@ -2841,16 +2846,16 @@ class _Templater:
 
     def _template_lookup_arg(self, value):
         """Render lookup arguments, preserving missing values and raising evaluation failures."""
-        if isinstance(value, dict):
+        if isinstance(value, (dict, _RawSnapshotMapping)):
             return {self._template_lookup_arg(k): self._template_lookup_arg(v)
                     for k, v in value.items()}
-        if isinstance(value, (list, _HostVarEntries)):
+        if isinstance(value, (list, _HostVarEntries, _RawSnapshotList)):
             return [self._template_lookup_arg(v) for v in value]
         if isinstance(value, tuple):
             return tuple(self._template_lookup_arg(v) for v in value)
         if isinstance(value, str):
             value = self.render_string(value, self._current_ctx)
-            if isinstance(value, (dict, list, tuple, _HostVarEntries)):
+            if isinstance(value, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
                 return self._template_lookup_arg(value)
         _raise_captured_template_error(value)
         return value

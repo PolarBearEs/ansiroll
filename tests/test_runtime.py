@@ -432,13 +432,13 @@ def test_custom_lookups_receive_builtin_inventory_collections(monkeypatch, looku
     from ansiroll import runtime as runtime_module
 
     monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
-    runtime = Runtime({}, "", {"payload": {"values": [1]}})
+    runtime = Runtime({}, "", {"count": 3, "payload": {"values": ["{{ count }}"]}})
     runtime.templater.register_plugins([{"kind": "lookup", "name": "encode_inventory", "source": """
 import json
 
 class LookupModule:
     def run(self, terms, variables, **kwargs):
-        return [json.dumps([terms[0], kwargs['values']])]
+        return [json.dumps([terms[0].pop('values'), kwargs['values']])]
 """}])
     task = _task("1", "Serialize an inventory lookup term", "debug",
                  vars={"unused": "{{ lookup('unread') }}/tail"})
@@ -446,9 +446,35 @@ class LookupModule:
     if lookup == "query":
         expression += " | first"
     template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
-                "{{ " + expression + " }}")
+                "{% set result = " + expression + " %}"
+                "{{ [result | from_json, entry['values']] | to_json }}")
     result = runtime.template(template, runtime._task_ctx(task, {}))
-    assert json.loads(str(result)) == [{"values": [1]}, [1]]
+    assert json.loads(str(result)) == [[[3], [3]], ["{{ count }}"]]
+
+
+def test_generator_filter_keeps_its_yielded_collections_builtin(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "generate_inventory", "source": """
+import json
+
+def generate_inventory(values):
+    item = [values]
+    yield item
+    yield json.dumps(item)
+
+class FilterModule:
+    def filters(self):
+        return {'generate_inventory': generate_inventory}
+"""}])
+    task = _task("1", "Reuse a yielded collection", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ entry | generate_inventory | list | to_json }}")
+    result = runtime.template(template, runtime._task_ctx(task, {}))
+    assert json.loads(str(result)) == [[[1]], "[[1]]"]
 
 
 @pytest.mark.parametrize("body", [
