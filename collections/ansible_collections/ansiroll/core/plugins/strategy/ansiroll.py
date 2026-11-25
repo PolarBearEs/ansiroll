@@ -32,7 +32,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import MappingView
+from collections.abc import Mapping, MappingView, Set
 
 DOCUMENTATION = """
     name: ansiroll
@@ -98,6 +98,24 @@ class _DelegatedMemberError(StrictUndefined):
 
     def __repr__(self):
         self._fail_with_undefined_error()
+
+
+def _wrap_legacy_rescue_value(value):
+    from ansible.utils.unsafe_proxy import wrap_var
+
+    def wrap(member):
+        # Legacy wrap_var rebuilds ranges from a generator, which range does not accept.
+        if isinstance(member, range):
+            return member
+        if isinstance(member, Mapping):
+            return {wrap(key): wrap(item) for key, item in member.items()}
+        if isinstance(member, (list, tuple)):
+            return type(member)(wrap(item) for item in member)
+        if isinstance(member, Set):
+            return {wrap(item) for item in member}
+        return wrap_var(member)
+
+    return wrap(value)
 
 
 def _legacy_environment_validator(validate, aliases):
@@ -657,9 +675,7 @@ class StrategyModule(StrategyBase):
 
         value = _restore_rescue_scalars(packed)
         if _UnifiedTaskResult is None:
-            from ansible.utils.unsafe_proxy import wrap_var
-
-            value = wrap_var(value)
+            value = _wrap_legacy_rescue_value(value)
         return self._restore_play_fallback(
             value, packed["undefined"], packed.get("errors", ()), packed.get("mapping_keys", ()))
 
@@ -672,9 +688,7 @@ class StrategyModule(StrategyBase):
         if args is not None:
             failed_task["args"] = self._restore_rescue_value(args)
         if _UnifiedTaskResult is None:
-            from ansible.utils.unsafe_proxy import wrap_var
-
-            failed_task = wrap_var(failed_task)
+            failed_task = _wrap_legacy_rescue_value(failed_task)
         facts = {
             "ansible_failed_task": failed_task,
             "ansible_failed_result": self._restore_rescue_value(result),

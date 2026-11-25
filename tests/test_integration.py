@@ -5822,6 +5822,31 @@ def test_strategy_preserves_native_rescued_result_values(tmp_path, later_hosts):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_strategy_preserves_legacy_native_ranges_in_rescue(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if not (2, 12) <= _core_version() < (2, 19):
+        pytest.skip("checks legacy native range values")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: '{{ range(3) }}'}
+          no_log: true
+      rescue:
+        - assert:
+            that: ansible_failed_result.msg | list == [0, 1, 2]
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - ansible_failed_result.msg | list == [0, 1, 2]
+          - ansible_failed_task.args.msg | list == [0, 1, 2]
+""", environment={"ANSIBLE_JINJA2_NATIVE": "true"})
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
