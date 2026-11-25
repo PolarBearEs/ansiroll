@@ -156,9 +156,11 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         if compiled_play_vars is not None:
             node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope,
                                                 replay_files=bool(node.get("ordered_vars_files"))))
-        if node.get("ordered_vars_files"):
+        scoped_options = node.pop("_gather_setup_scoped", None)
+        if node.get("ordered_vars_files") or scoped_options:
             node.update(_gather_timeout_file_scope(
-                play, node["ordered_vars_files"], node.get("gather_timeout_template")))
+                play, node.get("ordered_vars_files") or (), node.get("gather_timeout_template"),
+                scoped_options=scoped_options))
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -305,8 +307,8 @@ def _gather_selector_magic(play):
     return manager._get_magic_variables(play=play, host=None, task=None, include_hostvars=True, **magic_args)
 
 
-def _gather_timeout_file_scope(play, entries, runtime):
-    """Keep original file order and the play layers needed by a runtime timeout."""
+def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
+    """Keep the play layers used by early vars-file and setup option expressions."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
@@ -326,6 +328,14 @@ def _gather_timeout_file_scope(play, entries, runtime):
                                    if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict))
     selector_names = set()
     timeout_names = set(runtime["names"]) if runtime is not None else set()
+    setup_names = set()
+    computed = set()
+    for source, _, _ in _selector_template_sources(scoped_options or {}):
+        dependencies = _gather_timeout_dependencies(
+            source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            computed=computed, retain_mutable=True)
+        if dependencies is not None:
+            setup_names.update(dependencies[1])
     file_aliases = {}
     file_names = set()
     for entry in entries:
@@ -349,6 +359,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
     for names, scope, shadowed in (
         (selector_names, selector_scope, {}),
         (timeout_names, timeout_scope, export_replacements),
+        (setup_names, timeout_scope, export_replacements),
     ):
         pending = list(names)
         while pending:
@@ -376,10 +387,20 @@ def _gather_timeout_file_scope(play, entries, runtime):
             {key: value for key, value in export.items() if runtime.get("computed_vars") or key in timeout_names}
             for export in exports
         ])
-    return {
+    result = {
         "vars_file_defaults": _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())}),
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
+    if scoped_options:
+        result["gather_setup_scope"] = _tag_untrusted({
+            "defaults": {key: value for key, value in defaults.items() if computed or key in setup_names},
+            "role_exports": [
+                {key: value for key, value in export.items() if computed or key in setup_names}
+                for export in exports
+            ],
+            "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
+        })
+    return result
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
@@ -635,6 +656,7 @@ def _rewrite_includes(data, *, playbook=False, defer_import_fields=None):
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                   all_vars=None, runtime_writes=None, gather_facts=None):
     from ansible import constants as C
+    from .runtime import _selector_template_sources
 
     if basedir is None:
         try:
@@ -642,10 +664,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
+    scoped_options = {
+        key: value for key in ("fact_path", "gather_subset")
+        if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
+    }
     ordered_vars_files = [] if (
         gather_facts is None and play.gather_facts is not False
         and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
-        and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
+        and (scoped_options or _is_templated(play.gather_timeout))
     ) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
@@ -756,6 +782,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             del setup_options["gather_subset"]
         if setup_options:
             result["gather_setup_options"] = _tag_untrusted(setup_options)
+        if gather_facts is None and scoped_options:
+            result["_gather_setup_scoped"] = scoped_options
     # Retain authored selectors and compile-selected definitions, including
     # definitions needed during ordered replay before later files shadow them.
     lookup_sources = {
@@ -1033,6 +1061,39 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _finite_vars_file_names(source):
+    """Return closed literal alternatives of inline conditional file names."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    def choices(node):
+        if isinstance(node, nodes.TemplateData):
+            return [node.data]
+        if isinstance(node, nodes.Const) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, nodes.CondExpr):
+            if isinstance(node.test, nodes.Const):
+                return choices(node.expr1 if node.test.value else node.expr2)
+            result = choices(node.expr1) + choices(node.expr2)
+            if len(result) <= 128:
+                return result
+        if isinstance(node, (nodes.Template, nodes.Output, nodes.Concat)):
+            parts = node.body if isinstance(node, nodes.Template) else node.nodes
+            paths = [""]
+            for part in parts:
+                suffixes = choices(part)
+                if len(paths) * len(suffixes) > 128:
+                    break
+                paths = [head + tail for head in paths for tail in suffixes]
+            else:
+                return paths
+        raise ValueError("nonliteral vars file selector")
+
+    try:
+        return dict.fromkeys(choices(Environment(keep_trailing_newline=True).parse(source)))
+    except (TemplateSyntaxError, ValueError):
+        return None
+
+
 def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -1042,6 +1103,7 @@ def _deferred_vars_files(play, basedir, entries):
     as an error marker that aborts the run if it is selected.
     """
     import glob
+    from .runtime import _vars_file_glob_covers
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
@@ -1057,14 +1119,19 @@ def _deferred_vars_files(play, basedir, entries):
             if name in unmodeled:
                 continue
             pattern = _vars_file_glob_pattern(name)
-            if name.startswith(os.path.sep):
-                patterns = [pattern]
-            else:
-                patterns = []
+            finite_names = _finite_vars_file_names(name) if _is_templated(name) else None
+            variants = ([(candidate, glob.escape(candidate)) for candidate in finite_names
+                         if _vars_file_glob_covers(pattern, candidate)]
+                        if finite_names else [(name, pattern)])
+            patterns = []
+            for candidate, variant in variants:
+                if candidate.startswith(os.path.sep):
+                    patterns.append(variant)
+                    continue
                 for d in dirs:
-                    if subdir and name.split("/")[0] != subdir:
-                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
-                    patterns.append(os.path.join(glob.escape(d), pattern))
+                    if subdir and candidate.split("/")[0] != subdir:
+                        patterns.append(os.path.join(glob.escape(d), subdir, variant))
+                    patterns.append(os.path.join(glob.escape(d), variant))
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)

@@ -2444,6 +2444,33 @@ def test_implicit_setup_passes_play_gather_timeout(tmp_path, monkeypatch, timeou
         assert calls == [("ansible.builtin.setup", expected)]
 
 
+def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["vars-{{ 'east' if profile == 'east' else 'west' }}.yml"]
+  gather_subset: "{{ subset }}"
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "vars-east.yml").write_text("directory: /east\nsubset: ['!all', local]\n")
+    (tmp_path / "vars-west.yml").write_text("directory: /west\nsubset: ['!all', network]\n")
+    (tmp_path / "vars-other.yml").write_text(
+        "directory: '{{ lookup(\"env\", \"ANSIROLL_UNSELECTED_SETUP_SECRET\") }}'\n")
+    monkeypatch.setenv("ANSIROLL_UNSELECTED_SETUP_SECRET", "synthetic-setup-secret")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    bundled = plan["deferred_vars_files"][0]["files"]
+    assert {os.path.basename(path) for path in bundled} == {"vars-east.yml", "vars-west.yml"}
+    assert "ANSIROLL_UNSELECTED_SETUP_SECRET" not in plan.get("controller_env", {})
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "west"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"fact_path": "/west", "gather_subset": ["!all", "network"]})]
+
+
 def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
