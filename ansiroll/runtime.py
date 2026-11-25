@@ -3930,10 +3930,12 @@ class _Templater:
                 tokens = list(env.lex(text))
                 prefix = tokens[0][2] if tokens[0][1] == "data" else ""
                 suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
+                prefix = prefix.replace("\n", file_newline)
+                suffix = suffix.replace("\n", file_newline)
                 legacy = _legacy_templating()
                 if prefix or suffix or legacy:
                     value = "" if not legacy and isinstance(result, _Omit) else result
-                    if not legacy:
+                    if _core_at_least(2, 13):
                         _fail_on_undef(value)
                     result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):

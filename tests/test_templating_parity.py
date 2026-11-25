@@ -865,6 +865,7 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
 @pytest.mark.parametrize(("source", "value", "newline", "expected"), [
     ("{{ value }}\n", "ready", "\n", b"ready\n"),
     ("{{ value }}\n\n", "ready", "\n", b"ready\n\n"),
+    ("{{ value }}\n\n", "ready", "\r\n", b"ready\r\n\r\n"),
     ("\t{{ value }}  \n", "ready", "\n", b"\tready  \n"),
     ("{{ value -}}\n", "ready", "\n", b"ready\n"),
     ("{{ value }}\n", "ready\n", "\n", b"ready\n"),
@@ -907,7 +908,7 @@ def test_template_file_newline_mode_does_not_affect_later_expressions():
     assert templater.render_string(source, {}) == "a\nb"
 
 
-@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores stringify undefined collection members")
+@pytest.mark.skipif(Version(__version__) < Version("2.13"), reason="older cores stringify undefined collection members")
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 def test_template_file_does_not_overwrite_destination_for_undefined_collection_member(tmp_path, delegated):
     output = tmp_path / "rendered.txt"
