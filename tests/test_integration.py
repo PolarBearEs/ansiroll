@@ -5897,8 +5897,8 @@ def test_strategy_ignores_deferred_group_callbacks_in_later_handler_fact_routing
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-@pytest.mark.parametrize("action", ["debug", "set_fact"])
-def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action):
+@pytest.mark.parametrize(("action", "looped"), [("debug", True), ("set_fact", True), ("debug", False)])
+def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action, looped):
     from types import SimpleNamespace
 
     module = _load_strategy_module()
@@ -5906,9 +5906,9 @@ def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action):
     host = SimpleNamespace(name="origin")
     task = SimpleNamespace(_uuid="loop", action=action)
     item = {"ansible_facts": {"marker": "value"}}
-    result = SimpleNamespace(_result={"results": [item]}, _host=host, _task=task,
+    result = SimpleNamespace(_result={"results": [item] if looped else None}, _host=host, _task=task,
                              is_failed=lambda: False, is_unreachable=lambda: False, is_skipped=lambda: False)
-    strategy._fact_routes = {("origin", "loop"): ["recipient"]}
+    strategy._fact_routes = {("origin", "loop"): ["recipient"]} if looped else {}
     strategy._legacy_fact_items = {}
     monkeypatch.setattr(module, "_UnifiedTaskResult", None)
     monkeypatch.setattr(module._LinearStrategy, "_process_pending_results", lambda *_: [result])

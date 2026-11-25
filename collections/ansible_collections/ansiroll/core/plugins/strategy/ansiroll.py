@@ -1886,8 +1886,9 @@ class _SetFactLinearStrategy(_LinearStrategy):
         if host is None:
             return
         routes = self._fact_routes.pop((host.name, task_uuid), ())
-        items = data.get("results", ())
-        if (routes and len(routes) == len(items) and getattr(task, "action", None) not in C._ACTION_DEBUG
+        items = data.get("results")
+        if (routes and isinstance(items, list) and len(routes) == len(items)
+                and getattr(task, "action", None) not in C._ACTION_DEBUG
                 and not (result.is_failed() or result.is_unreachable() or result.is_skipped())):
             # Hold the item itself so its identity cannot be reused before
             # linear consumes the route or finishes the aggregate.
@@ -1938,8 +1939,10 @@ class _SetFactLinearStrategy(_LinearStrategy):
         if _UnifiedTaskResult is None:
             for result in results:
                 data = result._result if hasattr(result, "_result") else result._return_data
-                for item in data.get("results", ()):
-                    self._legacy_fact_items.pop(id(item), None)
+                items = data.get("results")
+                if isinstance(items, list):
+                    for item in items:
+                        self._legacy_fact_items.pop(id(item), None)
             return results
         for result in results:
             replay = self._run_once_fact_results.pop(id(result), None)
