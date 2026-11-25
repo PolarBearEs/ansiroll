@@ -185,9 +185,11 @@ def _fact_key_template_paths(value):
             keys = [str(key) for key in current if isinstance(key, _FactKeyTemplate)]
             if keys:
                 paths.append((path, keys))
-            pending.extend(((*path, str(key)), item) for key, item in current.items())
+            pending.extend(((*path, key if isinstance(key, str) else json.dumps(key)), item)
+                           for key, item in current.items() if isinstance(item, (dict, list, tuple)))
         elif isinstance(current, (list, tuple)):
-            pending.extend(((*path, index), item) for index, item in enumerate(current))
+            pending.extend(((*path, index), item) for index, item in enumerate(current)
+                           if isinstance(item, (dict, list, tuple)))
     return paths
 
 
