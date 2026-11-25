@@ -979,7 +979,7 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     expected = _ansible(path, tmp_path)
     expected_text = output.read_text()
     version = _core_version()
-    suffix = "None" if version < (2, 11) or (2, 13) <= version < (2, 19) else ""
+    suffix = "None" if version < (2, 12) or (2, 13) <= version < (2, 19) else ""
     assert expected_text == "prefix=controller/" + suffix + "\n"
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
