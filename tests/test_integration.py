@@ -130,6 +130,23 @@ def test_ordered_vars_files_capture_env_before_later_overrides(tmp_path, monkeyp
     assert runtime.vars["selected"] == "expected"
 
 
+def test_discarded_static_vars_file_lookup_is_omitted(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TEST_SHADOWED_ENV", "already-overridden")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {timeout_seconds: 23}
+  gather_timeout: '{{ timeout_seconds }}'
+  vars_files: [first.yml, last.yml]
+  tasks: []
+""")
+    (tmp_path / "first.yml").write_text('value: "{{ lookup(\'env\', \'ANSIROLL_TEST_SHADOWED_ENV\') }}"\n')
+    (tmp_path / "last.yml").write_text("value: last\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert plan["vars"]["value"] == "last"
+    assert "ordered_vars_files" not in plan
+    assert "ANSIROLL_TEST_SHADOWED_ENV" not in plan.get("controller_env", {})
+
+
 # ---- module embedding (cross-version core mechanism) --------------------
 
 
@@ -4646,20 +4663,30 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None):
 
 def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):
     (tmp_path / "settings-localhost.yml").write_text(
-        'value: "{{ lookup(\'env\', \'ANSIROLL_TEST_HOST_SELECTED_ENV\') }}"\n')
+        'value: "{{ lookup(\'env\', \'ANSIROLL_TEST_HOST_SELECTED_ENV\') }}"\n'
+        'prefix: "{{ lookup(\'env\', \'ANSIROLL_TEST_HOST_SELECTED_PREFIX\', default=\'wrong\') }}"\n')
     (tmp_path / "settings-other.yml").write_text(
         'value: "{{ lookup(\'env\', \'ANSIROLL_TEST_OTHER_HOST_ENV\') }}"\n')
+    (tmp_path / "chosen-right.yml").write_text("prefix: overridden\nchoice: right\n")
+    (tmp_path / "chosen-wrong.yml").write_text("prefix: overridden\nchoice: wrong\n")
     proc = _run_strategy_play(
         tmp_path,
         """- hosts: localhost
   gather_facts: false
   connection: local
-  vars_files: ['settings-{{ inventory_hostname }}.yml']
+  vars_files: ['settings-{{ inventory_hostname }}.yml', 'chosen-{{ prefix }}.yml']
   tasks:
     - assert:
-        that: value == 'host-selected'
+        that:
+          - value == 'host-selected'
+          - choice == 'right'
+          - prefix == 'overridden'
 """,
-        environment={"ANSIROLL_TEST_HOST_SELECTED_ENV": "host-selected", "ANSIROLL_TEST_OTHER_HOST_ENV": "other"},
+        environment={
+            "ANSIROLL_TEST_HOST_SELECTED_ENV": "host-selected",
+            "ANSIROLL_TEST_HOST_SELECTED_PREFIX": "right",
+            "ANSIROLL_TEST_OTHER_HOST_ENV": "other",
+        },
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 

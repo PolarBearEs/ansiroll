@@ -751,7 +751,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "deferred_vars_files": [entry["names"] for entry in deferred],
         "selected_vars_files": [entry[0] for entry in order_deferred.values()],
         "ordered_static_vars": [
-            entry for entry in ordered_vars_files or () if not isinstance(entry, int)
+            entry for entry in (ordered_vars_files or ()) if deferred and not isinstance(entry, int)
         ],
     }
     names = _controller_env_names(lookup_sources)
@@ -817,31 +817,29 @@ def _apply_force_handlers_default(play):
 
 def _controller_env_names(value):
     """Find literal controller-side env lookups that the target must reproduce."""
-    names = set()
-    if isinstance(value, str):
-        names.update(_ENV_LOOKUP_RE.findall(value))
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            names.update(_controller_env_names(key))
-            names.update(_controller_env_names(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            names.update(_controller_env_names(item))
-    return names
+    return _controller_lookup_names(value, _ENV_LOOKUP_RE)
 
 
 def _controller_config_names(value):
     """Find literal config lookups whose controller values must be preserved."""
+    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE)
+
+
+def _controller_lookup_names(value, pattern):
     names = set()
-    if isinstance(value, str):
-        names.update(_CONFIG_LOOKUP_RE.findall(value))
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            names.update(_controller_config_names(key))
-            names.update(_controller_config_names(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            names.update(_controller_config_names(item))
+    seen = set()
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            names.update(pattern.findall(item))
+        elif isinstance(item, (dict, list, tuple)) and id(item) not in seen:
+            seen.add(id(item))
+            if isinstance(item, dict):
+                pending.extend(item)
+                pending.extend(item.values())
+            else:
+                pending.extend(item)
     return names
 
 
