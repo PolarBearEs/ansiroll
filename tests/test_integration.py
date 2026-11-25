@@ -5827,6 +5827,39 @@ def test_strategy_keeps_mixed_run_once_fact_writes_in_loop_order(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_strategy_keeps_registered_variables_in_mixed_run_once_loop_order(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("requires the unified register variable layer")
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "write_registered_value.py").write_text("""
+from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        self.register_host_variables({"marker": "registered"})
+        return {"changed": False}
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - action: "{{ item.action }}"
+      args: "{{ item.args }}"
+      loop:
+        - {action: set_fact, args: {marker: earlier}}
+        - {action: write_registered_value, args: {}}
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ inventory_hostname == 'recipient' }}"
+    - assert:
+        that: marker == 'registered'
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_ignores_deferred_group_callbacks_in_later_handler_fact_routing(tmp_path):
     from ansiroll.loader import _core_version
 

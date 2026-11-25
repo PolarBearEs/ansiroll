@@ -1952,7 +1952,10 @@ class _SetFactLinearStrategy(_LinearStrategy):
                 else:
                     recipients = [delegated_host] if target else original_hosts
                 for layer, values in sorted(changes.items()):
-                    if layer == VariableLayer.CACHEABLE_FACT:
+                    if layer == VariableLayer.REGISTER_VARS:
+                        for host in original_hosts:
+                            cache.set_nonpersistent_facts(host, dict(values))
+                    elif layer == VariableLayer.CACHEABLE_FACT:
                         for host in recipients:
                             cache.set_host_facts(host, dict(values))
                     elif layer == VariableLayer.EPHEMERAL_FACT:
