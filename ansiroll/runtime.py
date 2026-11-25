@@ -6719,7 +6719,7 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    raw, options, header = _template_file_options(raw, args)
+                    raw, options, header = _template_file_options(raw, args, self.on_warning)
                     rendered = self.templater.render_string(
                         raw, tctx, file_newline=newline_sequence, file_options=options, file_header=header)
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
@@ -7672,7 +7672,7 @@ _DEFAULT_REAL_FILE_ARGS = frozenset((
 ))
 
 
-def _template_file_options(source, args):
+def _template_file_options(source, args, warn):
     import ast
 
     options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
@@ -7685,17 +7685,30 @@ def _template_file_options(source, args):
             options[key] = str(value)
     has_header = source.startswith("#jinja2:")
     if has_header:
+        modern = _core_at_least(2, 19)
         header, delimiter, source = source.partition("\n")
         if not delimiter:
             raise ValueError("missing newline after #jinja2 override")
+        overrides = {}
+        nullable = ("line_statement_prefix", "line_comment_prefix")
+        booleans = ("trim_blocks", "lstrip_blocks", "keep_trailing_newline")
         for entry in header[len("#jinja2:"):].split(","):
             key, value = entry.split(":", 1)
             key = key.strip()
-            if key not in options and key not in (
-                *(_TEMPLATE_ONLY_ARGS[:-3]), "keep_trailing_newline", "line_statement_prefix", "line_comment_prefix",
-            ):
-                raise ValueError("invalid #jinja2 override %r" % key)
-            options[key] = ast.literal_eval(value.strip())
+            if key not in _TEMPLATE_ONLY_ARGS[:-3] + booleans + nullable:
+                if modern:
+                    raise ValueError("invalid #jinja2 override %r" % key)
+                warn("Could not find Jinja2 environment setting to override: %r" % key)
+                continue
+            overrides[key] = ast.literal_eval(value.strip())
+        if modern:
+            for key, value in overrides.items():
+                expected = bool if key in booleans else str
+                if value is None and key in nullable:
+                    continue
+                if not isinstance(value, expected) or (key == "newline_sequence" and value not in ("\n", "\r", "\r\n")):
+                    raise ValueError("invalid value for #jinja2 override %r: %r" % (key, value))
+        options.update(overrides)
     return source, tuple(sorted(options.items())), has_header
 
 

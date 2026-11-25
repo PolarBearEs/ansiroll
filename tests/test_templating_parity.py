@@ -1142,6 +1142,45 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     assert output.read_bytes() == expected
 
 
+@pytest.mark.parametrize("override", ['trim_blocks: "False"', 'newline_sequence: "X"', 'unknown_option: 1'])
+def test_modern_template_rejects_invalid_header_without_writing(tmp_path, override):
+    if not MODERN_TEMPLATING:
+        pytest.skip("modern Core validates the template header")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": f"#jinja2: {override}\nstart{{# note #}}\nend\n", "rendered.txt": "original"})
+    for run in (_ansible, _ansiroll):
+        _, recap = run(path, tmp_path)
+        assert recap[3] == "1"
+        assert (tmp_path / "rendered.txt").read_text() == "original"
+
+
+def test_legacy_template_keeps_valid_header_options_alongside_an_unknown_key(tmp_path):
+    if MODERN_TEMPLATING:
+        pytest.skip("legacy Core ignores unknown template header options")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "#jinja2: unknown_option: 1, trim_blocks: False\nstart{# note #}\nend\n"})
+    output = tmp_path / "rendered.txt"
+    _, recap = _ansible(path, tmp_path)
+    assert recap[3] == "0"
+    assert output.read_bytes() == b"start\nend\n"
+    output.unlink()
+    _, recap = _ansiroll(path, tmp_path)
+    assert recap[3] == "0"
+    assert output.read_bytes() == b"start\nend\n"
+
+
 @pytest.mark.skipif(Version(__version__) < Version("2.11"), reason="custom comment arguments require Core 2.11+")
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 def test_template_file_honors_comments_and_trim_blocks(tmp_path, delegated):
