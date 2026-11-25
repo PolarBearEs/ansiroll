@@ -5398,11 +5398,13 @@ class Runtime:
         self.emit_start(task)
 
         notifications = []
+        rescue_overrides = {} if self.on_rescue_overrides is not None and task.get("no_log") else None
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
                 try:
-                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications)
+                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications,
+                                                 rescue_overrides=rescue_overrides)
                 except TaskFailed:
                     raise
                 except Exception as ex:
@@ -5413,7 +5415,7 @@ class Runtime:
             if res is None:
                 res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
                 if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
-                    self._absorb_facts(task, res, fact_host)
+                    self._absorb_facts(task, res, fact_host, rescue_overrides=rescue_overrides)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
@@ -5424,6 +5426,8 @@ class Runtime:
         if res.get("changed") and not (_result_failed(res) or res.get("unreachable")):
             self._queue_notify(notifications)
         status = _status_of(res)
+        if rescue_overrides and status in ("ok", "changed"):
+            self.on_rescue_overrides(rescue_overrides)
         if status == "unreachable" and task.get("loop") is None:
             ignore_unreachable = self._ignores_unreachable(task, base_ctx)
         self.emit(task, status, res, ignored=ignore)
@@ -5446,6 +5450,12 @@ class Runtime:
             else:
                 # Aggregate loop failures retain the task-level args.
                 executed_args = self._executed_task_args if task.get("loop") is None else None
+                if executed_args is not None and not _core_at_least(2, 19):
+                    try:
+                        _fail_on_undef(executed_args)
+                    except jinja2.UndefinedError:
+                        # Legacy Core retains the authored args when validation fails.
+                        executed_args = None
                 raise TaskFailed(task.get("name"), task, dict(res), executed_args=executed_args)
         elif res.get("skipped"):
             self._tally("skipped")
@@ -5535,7 +5545,7 @@ class Runtime:
         return (self._loop_control_bool(task, "loop_extended", False, ctx),
                 self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
-    def _run_loop(self, task, items, base_ctx, become=False, notifications=None):
+    def _run_loop(self, task, items, base_ctx, become=False, notifications=None, *, rescue_overrides=None):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
@@ -5559,7 +5569,7 @@ class Runtime:
                         if commits_delegated_facts:
                             pending_facts.append((None, dict(res)))
                         else:
-                            self._absorb_facts(task, res)
+                            self._absorb_facts(task, res, rescue_overrides=rescue_overrides)
                     facts = res.get("ansible_facts") if fact_host is None else None
                     if isinstance(facts, _IncludedVars):
                         base_ctx.update({key: self.vars[key] for key in facts})
@@ -5629,7 +5639,7 @@ class Runtime:
         finally:
             for fact_host, result in pending_facts:
                 if fact_host is None or loop_succeeded:
-                    self._absorb_facts(task, result, fact_host)
+                    self._absorb_facts(task, result, fact_host, rescue_overrides=rescue_overrides)
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
@@ -6878,7 +6888,7 @@ class Runtime:
             return self.host
         return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
 
-    def _absorb_facts(self, task, res, fact_host=None):
+    def _absorb_facts(self, task, res, fact_host=None, *, rescue_overrides=None):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -6919,10 +6929,8 @@ class Runtime:
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
-                if self.on_rescue_overrides is not None and task.get("no_log"):
-                    overrides = {name: facts[name] for name in _RESCUE_FACT_NAMES & facts.keys()}
-                    if overrides:
-                        self.on_rescue_overrides(overrides)
+                if rescue_overrides is not None:
+                    rescue_overrides.update((name, facts[name]) for name in _RESCUE_FACT_NAMES & facts.keys())
             elif short_action == "include_vars":
                 self.vars.update(facts)
                 self._include_vars_layer.update(facts)

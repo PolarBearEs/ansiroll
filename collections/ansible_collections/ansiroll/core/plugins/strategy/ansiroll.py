@@ -2039,8 +2039,13 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
     except Exception:
         return out
     raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
+    manager = getattr(hostvars, "_variable_manager", None)
+    inventory = getattr(hostvars, "_inventory", None)
+    nonpersistent = getattr(manager, "_nonpersistent_fact_cache", {})
     for name in names:
         try:
+            host = inventory.get_host(name) if inventory is not None else None
+            private_names = _RESCUE_FACT_NAMES & nonpersistent.get(host.name if host else name, {}).keys()
             source = hostvars[name]
             keys = list(source)
             raw = raw_get(name) if raw_get is not None else {}
@@ -2048,7 +2053,7 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
             continue
         safe = {}
         for key in keys:
-            if key in ("hostvars", "vars") or key in _RESCUE_FACT_NAMES:
+            if key in ("hostvars", "vars") or key in private_names:
                 continue
             try:
                 value = source[key]

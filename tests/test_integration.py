@@ -5602,6 +5602,54 @@ def test_strategy_preserves_captured_argument_errors_in_later_agents(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("looped", [False, True])
+def test_strategy_drops_failed_censored_rescue_overrides(tmp_path, looped):
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: saved-failure}
+          no_log: true
+      rescue:
+        - set_fact:
+            ansible_failed_result: {msg: rejected-override}
+          no_log: true
+          ignore_errors: true
+          failed_when: FAILURE_TEST
+LOOP
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_result.msg == 'saved-failure'
+"""
+    result = _run_strategy_play(tmp_path, playbook.replace(
+        "FAILURE_TEST", "item == 1" if looped else "true"
+    ).replace("LOOP", "          loop: [0, 1]" if looped else ""))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "rejected-override" not in result.stdout + result.stderr
+
+
+def test_strategy_keeps_inventory_rescue_names_in_hostvars(tmp_path):
+    inventory = tmp_path / "inventory.yml"
+    inventory.write_text("""all:
+  hosts:
+    origin:
+      ansible_failed_result: {msg: inventory-value}
+    recipient:
+""")
+    result = _run_strategy_play(tmp_path, """- hosts: recipient
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: hostvars.origin.ansible_failed_result.msg == 'inventory-value'
+""", inventory=str(inventory))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_transfers_rescue_state_only_to_originating_host(tmp_path):
     result = _run_strategy_play(tmp_path, """- hosts: origin
   connection: local
