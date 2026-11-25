@@ -126,9 +126,12 @@ def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_p
     script = tmp_path / "compiled.py"
     script.write_text(source)
 
+    environment = os.environ.copy()
+    environment.pop("ANSIROLL_VARS_FILE", None)
+
     def run(profile):
         return subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
-                              env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
+                              env={**environment, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
                               timeout=20)
 
     safe = run("safe")
@@ -137,6 +140,76 @@ def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_p
     error = run("blocked")
     assert error.returncode == 1, error.stdout + error.stderr
     assert "synthetic read denial for candidate" in error.stderr
+
+
+def test_deferred_vars_file_uses_validated_source_bytes(tmp_path, monkeypatch):
+    import builtins
+    from ansible.parsing.dataloader import DataLoader
+    from ansiroll.loader import _bundled_vars_file
+
+    source = tmp_path / "candidate.yml"
+    source.write_text('value: "{{ preserved_template }}"\n')
+    opens = []
+    flags = []
+    original_open = builtins.open
+    original_os_open = os.open
+
+    def spy_file(path, *args, **kwargs):
+        if not isinstance(path, int) and os.fsdecode(path) == str(source):
+            opens.append(path)
+        return original_open(path, *args, **kwargs)
+
+    def spy_descriptor(path, mode, *args, **kwargs):
+        if os.fsdecode(path) == str(source):
+            flags.append(mode)
+        return original_os_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", spy_file)
+    monkeypatch.setattr(os, "open", spy_descriptor)
+    monkeypatch.setattr(DataLoader, "load_from_file",
+                        lambda *args, **kwargs: pytest.fail("candidate must not be reopened"))
+    assert _bundled_vars_file(SimpleNamespace(_loader=DataLoader()), str(source)) == [
+        {"value": "{{ preserved_template }}"}]
+    assert len(opens) == len(flags) == 1
+    assert flags[0] & os.O_NONBLOCK
+
+
+def test_deferred_vars_file_rejects_nonregular_descriptor(tmp_path, monkeypatch):
+    import stat
+    from ansible.parsing.dataloader import DataLoader
+    from ansiroll.loader import _bundled_vars_file
+
+    source = tmp_path / "candidate.yml"
+    source.write_text("value: example\n")
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fstat", lambda fd: SimpleNamespace(st_mode=stat.S_IFIFO))
+        result = _bundled_vars_file(SimpleNamespace(_loader=DataLoader()), str(source))
+    assert "expected a regular file" in result["__ansiroll_vars_file_error__"]
+    assert result["rc"] == 1
+
+
+def test_deferred_vars_file_uses_controller_path_expansion(tmp_path, monkeypatch):
+    from ansible.parsing.dataloader import DataLoader
+    from ansiroll.loader import _bundled_vars_file
+
+    monkeypatch.setenv("ANSIROLL_TEST_VAR_PATH", "selected")
+    (tmp_path / "vars-selected.yml").write_text("value: correct\n")
+    literal = tmp_path / "vars-$ANSIROLL_TEST_VAR_PATH.yml"
+    literal.write_text("value: literal\n")
+    assert _bundled_vars_file(SimpleNamespace(_loader=DataLoader()), str(literal)) == [{"value": "correct"}]
+
+
+def test_deferred_vars_file_retains_native_json_fallback(tmp_path):
+    from ansible.parsing.dataloader import DataLoader
+    from ansiroll.loader import _bundled_vars_file
+
+    source = tmp_path / "candidate.json"
+    source.write_text('{"service": {"__ansible_vault": false}}')
+    loader = DataLoader()
+    expected = loader.load_from_file(str(source))
+    if not isinstance(expected.get("service"), dict):
+        pytest.skip("this Core release treats the JSON wrapper as Vault data")
+    assert _bundled_vars_file(SimpleNamespace(_loader=loader), str(source)) == [expected]
 
 
 def test_ordered_vars_files_capture_env_before_later_overrides(tmp_path, monkeypatch):
@@ -2483,6 +2556,260 @@ def test_implicit_setup_passes_play_gather_timeout(tmp_path, monkeypatch, timeou
         assert calls == [("ansible.builtin.setup", expected)]
 
 
+def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["vars-{{ 'east' if profile == 'east' else 'west' }}.yml"]
+  gather_subset: "{{ subset }}"
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "vars-east.yml").write_text("directory: /east\nsubset: ['!all', local]\n")
+    (tmp_path / "vars-west.yml").write_text("directory: /west\nsubset: ['!all', network]\n")
+    (tmp_path / "vars-other.yml").write_text(
+        "directory: '{{ lookup(\"env\", \"ANSIROLL_UNSELECTED_SETUP_SECRET\") }}'\n")
+    monkeypatch.setenv("ANSIROLL_UNSELECTED_SETUP_SECRET", "synthetic-setup-secret")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    bundled = plan["deferred_vars_files"][0]["files"]
+    assert {os.path.basename(path) for path in bundled} == {"vars-east.yml", "vars-west.yml"}
+    assert "ANSIROLL_UNSELECTED_SETUP_SECRET" not in plan.get("controller_env", {})
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "west"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"fact_path": "/west", "gather_subset": ["!all", "network"]})]
+
+
+def test_finite_setup_vars_selector_does_not_bundle_parent_traversal(tmp_path):
+    play_dir = tmp_path / "playbook"
+    play_dir.mkdir()
+    playbook = play_dir / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["./.{{ '.' if profile == 'parent' else 'local' }}/setup.yml"]
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "setup.yml").write_text("directory: /outside-playbook\n")
+    (play_dir / ".local").mkdir()
+    local = play_dir / ".local" / "setup.yml"
+    local.write_text("directory: /portable\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], play_dir)[0]
+    assert plan["deferred_vars_files"][0]["files"] == {str(local): [{"directory": "/portable"}]}
+
+
+def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  roles: [settings]
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    defaults = tmp_path / "roles" / "settings" / "defaults"
+    defaults.mkdir(parents=True)
+    (defaults / "main.yml").write_text(
+        """directory: '{{ lookup("env", "ANSIROLL_SELECTED_SETUP_PATH") if true else lookup("env", "ANSIROLL_UNUSED_SETUP_PATH") }}'\n""")
+    monkeypatch.setenv("ANSIROLL_SELECTED_SETUP_PATH", "/controller-facts")
+    monkeypatch.setenv("ANSIROLL_UNUSED_SETUP_PATH", "synthetic-unused-secret")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["controller_env"].get("ANSIROLL_SELECTED_SETUP_PATH") == "/controller-facts"
+    assert "ANSIROLL_UNUSED_SETUP_PATH" not in plan["controller_env"]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"fact_path": "/controller-facts"})]
+
+
+def test_standalone_setup_captures_only_the_active_query_from_selected_vars(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: [selected.yml]
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "selected.yml").write_text(
+        """directory: '{{ (query("env", "ANSIROLL_SELECTED_SETUP_QUERY") | first) if true else (query("env", "ANSIROLL_UNREACHABLE_SETUP_QUERY") | first) }}'\n""")
+    monkeypatch.setenv("ANSIROLL_SELECTED_SETUP_QUERY", "/query-facts")
+    monkeypatch.setenv("ANSIROLL_UNREACHABLE_SETUP_QUERY", "synthetic-unreachable-secret")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert plan["controller_env"] == {"ANSIROLL_SELECTED_SETUP_QUERY": "/query-facts"}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert calls == [{"fact_path": "/query-facts"}]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_standalone_setup_uses_the_host_view_and_cache_namespace(tmp_path, monkeypatch, cached):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars:
+    directory: /play
+  fact_path: "{{ hostvars[inventory_hostname].directory if ansible_facts == {} else ansible_facts.ansible_local.directory }}"
+  tasks: []
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {
+        "inventory_hostname": "localhost", "directory": "/inventory", "ansible_facts": {"inventory": True},
+    })
+    if cached:
+        runtime._module_fact_layer = {"ansible_local": {"directory": "/cached"}}
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert calls == [{"fact_path": "/cached" if cached else "/inventory"}]
+
+
+def test_implicit_setup_requires_explicit_input_for_an_uncaptured_controller_value(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {profile: public}
+  vars_files: ['vars-{{ profile }}.yml']
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "vars-public.yml").write_text("directory: /public\n")
+    (tmp_path / "vars-alternate.yml").write_text(
+        '''directory: '{{ lookup("env", "ANSIROLL_DORMANT_SETUP_DIRECTORY") }}'\n''')
+    monkeypatch.setenv("ANSIROLL_DORMANT_SETUP_DIRECTORY", "/synthetic-private-directory")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "/synthetic-private-directory" not in json.dumps(plan)
+    for extra, expected in (({}, "/public"), ({"profile": "alternate"}, None),
+                            ({"profile": "alternate", "directory": "/portable"}, "/portable")):
+        frames, called = [], []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra, on_result=frames.append)
+        monkeypatch.setattr(runtime, "run_module", lambda action, args, **kwargs:
+                            called.append(args) or {"ansible_facts": {}})
+        runtime.run_play(plan)
+        if expected is None:
+            assert runtime.failed
+            assert "uncaptured controller env value" in frames[0]["result"]["msg"]
+            assert not called
+        else:
+            assert not runtime.failed
+            assert called == [{"fact_path": expected}]
+
+
+def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["vars-{{ lookup('vars', 'profile') }}.yml"]
+  fact_path: "{{ lookup('env', 'ANSIROLL_INDEPENDENT_FACT_PATH') }}"
+  tasks: []
+""")
+    (tmp_path / "vars-late.yml").write_text("unrelated: value\n")
+    monkeypatch.setenv("ANSIROLL_INDEPENDENT_FACT_PATH", "/independent")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "late"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert called == [("ansible.builtin.setup", {"fact_path": "/independent"})]
+    assert runtime.vars["unrelated"] == "value"
+
+
+def test_implicit_fact_path_sees_empty_local_facts_when_injection_is_disabled(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_INJECT_FACT_VARS", "False")
+    monkeypatch.setattr(C, "INJECT_FACTS_AS_VARS", False)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ '/empty' if ansible_local == {} else '/inventory' }}"
+  tasks: []
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost", "ansible_local": {"stale": True}})
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert calls == [{"fact_path": "/empty"}]
+
+
+def test_implicit_fact_path_merges_cached_facts_with_set_fact(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  tasks:
+    - set_fact:
+        ansible_local: {settings: {other: true}}
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ ansible_local.settings.directory }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        return {"ansible_facts": {"ansible_local": {"settings": {"directory": "/cached"}}}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    for play in _compiled_plays(source, tmp_path):
+        runtime.run_play(play)
+    assert called == [("ansible.builtin.setup", {}), ("ansible.builtin.setup", {"fact_path": "/cached"})]
+
+
+@pytest.mark.parametrize("explicit_host_value", [False, True])
+def test_implicit_fact_path_reads_persistent_vars_and_respects_fact_injection(tmp_path, monkeypatch,
+                                                                        explicit_host_value):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_INJECT_FACT_VARS", "False")
+    monkeypatch.setattr(C, "INJECT_FACTS_AS_VARS", False)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {directory: /stale}
+  tasks:
+    - set_fact: {suffix: persistent}
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ directory | default('/current') }}/{{ ansible_distribution | default('fallback') }}/{{ ansible_facts.distribution }}/{{ suffix }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    host_vars = {"inventory_hostname": "localhost"}
+    if explicit_host_value:
+        host_vars["ansible_distribution"] = "inventory"
+    runtime = Runtime({}, "", host_vars)
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append(args)
+        return {"ansible_facts": {"ansible_distribution": "gathered"}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    for play in _compiled_plays(source, tmp_path):
+        runtime.run_play(play)
+    segment = "inventory" if explicit_host_value else "fallback"
+    assert called == [{}, {"fact_path": f"/current/{segment}/gathered/persistent"}]
+
+
 def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
@@ -4771,7 +5098,7 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,"):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -4781,7 +5108,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None):
     env["ANSIBLE_NOCOLOR"] = "1"
     env.update(environment or {})
     return subprocess.run(
-        ["ansible-playbook", "-i", "localhost,", str(path), *args],
+        ["ansible-playbook", "-i", inventory, str(path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -4855,6 +5182,211 @@ def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "failed=0" in proc.stdout
+
+
+def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path,
+        """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        routed_fact: one
+        cacheable: true
+      delegate_to: localhost
+      delegate_facts: true
+      no_log: true
+      register: issued
+    - set_fact:
+        loop_fact: "{{ item.value }}"
+      loop:
+        - {host: localhost, value: local}
+        - {host: recipient, value: remote}
+      delegate_to: "{{ item.host }}"
+      delegate_facts: true
+    - set_fact:
+        local_fact: stays_local
+      delegate_to: localhost
+      delegate_facts: false
+    - assert:
+        that:
+          - routed_fact is undefined
+          - loop_fact is undefined
+          - issued.ansible_facts.routed_fact == 'one'
+          - local_fact == 'stays_local'
+
+- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that:
+          - routed_fact == 'one'
+          - ansible_facts.routed_fact == 'one'
+          - loop_fact == 'local'
+          - issued is undefined
+          - local_fact is undefined
+
+- hosts: recipient
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that:
+          - routed_fact is undefined
+          - loop_fact == 'remote'
+          - hostvars['localhost'].routed_fact == 'one'
+          - hostvars['127.0.0.1'].routed_fact == 'one'
+          - hostvars['::1'].routed_fact == 'one'
+""",
+        inventory="origin,recipient,",
+        environment={"ANSIROLL_PROVENANCE": "1"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '"reason": "delegated set_fact requires task-lockstep scheduling"' in proc.stdout
+
+
+def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - command: /bin/true
+    - assert:
+        that: seeded is undefined
+    - set_fact:
+        seeded: during_task
+      when: inventory_hostname == 'alpha'
+      delegate_to: beta
+      delegate_facts: true
+    - assert:
+        that: seeded == 'during_task'
+      when: inventory_hostname == 'beta'
+""", inventory="alpha,beta,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["all-local", "mixed"])
+@pytest.mark.parametrize("retry", [False, True], ids=["plain", "retry"])
+def test_strategy_routes_each_set_fact_loop_result_using_its_resolved_flags(tmp_path, mixed, retry):
+    retry_options = ("      retries: 2\n      delay: 0\n"
+                     "      until: entry.key != 'local_flag' or loop_result.attempts >= 2\n") if retry else ""
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        "{{ entry.key }}": "{{ entry.value }}"
+        cacheable: true
+      loop:
+        - {key: marker, value: first, target: recipient, route: ROUTE}
+        - {key: local_flag, value: second, target: recipient, route: false}
+        - {key: local_omit, value: third, route: true}
+      loop_control: {loop_var: entry}
+      delegate_to: "{{ entry.target | default(omit) }}"
+      delegate_facts: "{{ entry.route }}"
+      register: loop_result
+      no_log: true
+RETRY_OPTIONS    - assert:
+        that:
+          - local_flag == 'second'
+          - local_omit == 'third'
+          - CACHED_FACT_CHECK
+          - loop_result.results | length == 3
+          - hostvars.recipient.local_flag is undefined
+          - hostvars.recipient.local_omit is undefined
+          - EXPECTED
+- hosts: recipient
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert: {that: RECIPIENT}
+""".replace("RETRY_OPTIONS", retry_options).replace("CACHED_FACT_CHECK",
+            "loop_result.results[1].attempts == 2" if retry else "ansible_facts.local_flag == 'second'"
+        ).replace("ROUTE", "true" if mixed else "false").replace(
+            "EXPECTED", "marker is undefined" if mixed else "marker == 'first'"
+        ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
+        inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {marker: "{{ item.value }}"}
+      loop:
+        - {value: batch_value, route: false}
+        - {value: recipient_value, route: true}
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+    - assert:
+        that: marker == ('recipient_value' if inventory_hostname == 'recipient' else 'batch_value')
+""", inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - set_fact: {marker: value}
+      delegate_to: localhost
+      delegate_facts: true
+""", inventory="origin,",
+    )
+    assert proc.returncode != 0
+    assert "with ansiroll_delegate_on_target" in " ".join((proc.stdout + proc.stderr).split())
+
+
+def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - set_fact: {marker: value}
+      when: false
+      delegate_to: localhost
+      delegate_facts: true
+    - assert: {that: marker is undefined}
+""", inventory="origin,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ["false", "route_facts"])
+def test_strategy_allows_on_target_delegation_when_fact_flag_is_false(tmp_path, flag):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+    route_facts: false
+  tasks:
+    - set_fact: {marker: value}
+      delegate_to: "{{ missing_host }}"
+      delegate_facts: "{{ FLAG }}"
+    - assert: {that: "marker == 'value'"}
+""".replace("FLAG", flag), inventory="origin,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_strategy_native_only_rejects_linear_fallback(tmp_path):
