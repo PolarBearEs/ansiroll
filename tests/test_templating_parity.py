@@ -49,12 +49,12 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None):
+def _ansible(playbook, cwd, strategy=None, *, diff=False):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
-        ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
+        ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
          "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
@@ -943,18 +943,23 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
         dest: "{{ playbook_dir }}/check-only.txt"
       delegate_to: localhost
       check_mode: true
+      diff: false
+      register: suppressed
+    - assert:
+        quiet: true
+        that: suppressed.diff | default([]) | length == 0
     - template:
         src: encrypted.j2
         dest: "{{ playbook_dir }}/rendered.txt"
       delegate_to: localhost
 """)
     (tmp_path / "encrypted.j2").write_bytes(vault.encrypt(b"decrypted={{ value }}\n", secret=secret))
-    expected = _ansible(path, tmp_path)
+    expected = _ansible(path, tmp_path, diff=True)
     result = tmp_path / "rendered.txt"
     assert result.read_bytes() == b"decrypted=ready\n"
     assert not (tmp_path / "check-only.txt").exists()
     result.unlink()
-    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", diff=True) == expected
     assert result.read_bytes() == b"decrypted=ready\n"
     assert not (tmp_path / "check-only.txt").exists()
 

@@ -2035,6 +2035,7 @@ def _convert_task(task, actions, basedir):
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
         "check_mode": getattr(task, "check_mode", None),
+        "diff": _tag_untrusted(getattr(task, "diff", None)),
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
