@@ -1921,6 +1921,10 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                         continue
                     variant_task = task.copy(exclude_parent=True)
                     variant_task._parent = task._parent
+                    if _core_version() >= (2, 19):
+                        # Modern Core keeps the selected directory in the
+                        # parent include. Older cores re-render its expression.
+                        variant_task._ansiroll_include_variant_filename = filename
                     expanded = _expand_include_tasks(variant_task, raw_fname, filename, path,
                                                      variant_actions, basedir, only_tags, skip_tags, branch)
                 except Exception:
@@ -2115,7 +2119,8 @@ def _parent_include_paths(obj):
         if isinstance(obj, IncludeRole):
             yield getattr(obj, "_role_path", None) or "", False
         elif isinstance(obj, TaskInclude):
-            raw = (obj.args or {}).get("_raw_params") or (obj.args or {}).get("file")
+            raw = (getattr(obj, "_ansiroll_include_variant_filename", None)
+                   or (obj.args or {}).get("_raw_params") or (obj.args or {}).get("file"))
             if isinstance(raw, str) and ("{{" in raw or "{%" in raw):
                 yield raw, True
             else:

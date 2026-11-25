@@ -6311,6 +6311,72 @@ def test_vars_file_include_combines_launch_mapping_and_checks_each_loop_item(tmp
             if frame.get("result", {}).get("msg", "").startswith("selected-")] == ["selected-alternate"]
 
 
+def test_vars_file_include_matches_native_nested_parent_path(tmp_path):
+    from ansiroll.loader import _core_version
+
+    playbook = """- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+"""
+    for profile in ("normal", "alternate"):
+        directory = tmp_path / profile
+        directory.mkdir()
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}/entry.yml\n")
+        (directory / "entry.yml").write_text("""- include_tasks: child.yml
+  vars: {task_file: rebound/entry.yml}
+""")
+        (directory / "child.yml").write_text("- debug: {msg: original-child}\n")
+    rebound = tmp_path / "rebound"
+    rebound.mkdir()
+    (rebound / "child.yml").write_text("- debug: {msg: rebound-child}\n")
+    native = _run_strategy_play(tmp_path, playbook, "-e", "profile=alternate",
+                                environment={"ANSIBLE_STRATEGY": "linear"})
+    assert native.returncode == 0, native.stdout + native.stderr
+    expected = "original-child" if _core_version() >= (2, 19) else "rebound-child"
+    assert expected in native.stdout
+    source, _ = compile_playbook(str(tmp_path / "play.yml"))
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "alternate"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed, json.dumps(frames)
+    messages = [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
+    assert messages == [expected]
+
+
+def test_vars_file_alternate_can_load_a_role_from_roles_path(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    role_tasks = tmp_path / "external" / "roles" / "path_role" / "tasks"
+    role_tasks.mkdir(parents=True)
+    (role_tasks / "main.yml").write_text("- debug: {msg: external-role-body}\n")
+    monkeypatch.setattr(C, "DEFAULT_ROLES_PATH", [str(role_tasks.parents[1])])
+    project = tmp_path / "project"
+    project.mkdir()
+    playbook = project / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    for profile in ("normal", "alternate"):
+        (project / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+    (project / "normal.yml").write_text("- debug: {msg: default-body}\n")
+    (project / "alternate.yml").write_text("- include_role: {name: path_role}\n")
+    source, _ = compile_playbook(str(playbook))
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "alternate"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed, json.dumps(frames)
+    assert "external-role-body" in json.dumps(frames)
+
+
 @pytest.mark.parametrize("prefix", ["", "{{ playbook_dir }}/"])
 def test_vars_file_include_resolves_unsafe_filename_as_literal(tmp_path, prefix):
     playbook = tmp_path / "play.yml"
