@@ -1522,6 +1522,120 @@ def test_unarchive_source_options_are_mutually_exclusive_before_lookup(tmp_path,
     assert "parameters are mutually exclusive" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("action,decrypt", [("copy", True), ("copy", False), ("unarchive", True)])
+def test_selected_vault_source_honors_decrypt_option(tmp_path, action, decrypt):
+    from stat import S_IMODE
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    secret = VaultSecret(b"synthetic-test-password")
+    vault = VaultLib([("default", secret)])
+    (tmp_path / "vault-password").write_bytes(secret.bytes)
+    payload = b"synthetic-selected-payload\x00\xff"
+    if action == "unarchive":
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("content.txt", payload)
+        source = buffer.getvalue()
+        destination = tmp_path / "extracted"
+        destination.mkdir()
+        installed = destination / "content.txt"
+    else:
+        source = payload
+        destination = installed = tmp_path / "copied"
+    ciphertext = vault.encrypt(source, secret=secret)
+    controller_source = tmp_path / "selected.vault"
+    controller_source.write_bytes(ciphertext)
+    controller_source.chmod(0o644)
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - %s:
+        src: selected.vault
+        dest: %s
+        decrypt: %s%s
+""" % (action, destination, str(decrypt).lower(), "\n        mode: preserve" if action == "copy" else "")})
+    compiled, _ = compile_playbook(str(tmp_path / "pb.yml"), vault_password_file=str(tmp_path / "vault-password"))
+    (tmp_path / "selected.vault").unlink()
+    artifact = tmp_path / "artifact.py"
+    artifact.write_text(compiled)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert installed.read_bytes() == (payload if decrypt else ciphertext)
+    if action == "copy":
+        assert S_IMODE(installed.stat().st_mode) == (0o600 if decrypt else 0o644)
+
+
+def test_vault_candidates_stay_encrypted_until_the_controller_selects_one(tmp_path):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from tests import ansible_playbook_command
+
+    secret = VaultSecret(b"synthetic-test-password")
+    vault = VaultLib([("default", secret)])
+    password_file = tmp_path / "vault-password"
+    password_file.write_bytes(secret.bytes)
+    payload = b"synthetic-unchosen-payload"
+    ciphertext = vault.encrypt(payload, secret=secret)
+    role = tmp_path / "roles" / "vault_sample"
+    source_dir = role / "files"
+    source_dir.mkdir(parents=True)
+    (role / "tasks").mkdir()
+    (source_dir / "profile-public.txt").write_bytes(b"public")
+    (source_dir / "profile-private.txt").write_bytes(ciphertext)
+    installed = tmp_path / "installed"
+    playbook = tmp_path / "pb.yml"
+    playbook.write_text("""
+- hosts: localhost
+  gather_facts: false
+  vars:
+    profile: public
+  roles: [vault_sample]
+""")
+    (role / "tasks" / "main.yml").write_text("""
+- copy:
+    src: "profile-{{ profile }}.txt"
+    dest: %s
+    decrypt: "{{ decrypt_source | default(true) }}"
+""" % installed)
+
+    source, _ = compile_playbook(str(playbook), vault_password_file=str(password_file))
+    data = re.search(r"_ANSIROLL_DATA_BUNDLE = b'([^']*)'", source).group(1)
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(data))) as bundle:
+        assets = [bundle.read(name) for name in bundle.namelist() if name.startswith("assets/")]
+    assert ciphertext in assets
+    assert all(payload not in asset for asset in assets)
+    artifact = tmp_path / "artifact.py"
+    artifact.write_text(source)
+
+    def run(extra):
+        return subprocess.run(
+            [sys.executable, str(artifact)], cwd=tmp_path,
+            env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps(extra)},
+            capture_output=True, text=True, timeout=30,
+        )
+
+    public = run({})
+    assert public.returncode == 0, public.stdout + public.stderr
+    assert installed.read_bytes() == b"public"
+    private = run({"profile": "private"})
+    assert private.returncode != 0
+    assert "Vault source requires controller decryption" in private.stdout + private.stderr
+    encrypted = run({"profile": "private", "decrypt_source": False})
+    assert encrypted.returncode == 0, encrypted.stdout + encrypted.stderr
+    assert installed.read_bytes() == ciphertext
+
+    strategy = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
+                                     "--vault-password-file", str(password_file), "-e", "profile=private", str(playbook)],
+        cwd=tmp_path, env={**_env(), "ANSIBLE_STRATEGY": "ansiroll.core.ansiroll",
+                           "ANSIBLE_COLLECTIONS_PATH": os.path.join(ROOT, "collections")},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert strategy.returncode == 0, strategy.stdout + strategy.stderr
+    assert installed.read_bytes() == payload
+
+
 def test_copy_content_wins_over_remote_src(tmp_path):
     dest = tmp_path / "dest.txt"
     _write(tmp_path, {"pb.yml": """

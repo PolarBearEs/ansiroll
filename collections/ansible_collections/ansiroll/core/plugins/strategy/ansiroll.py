@@ -307,6 +307,8 @@ class StrategyModule(StrategyBase):
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
+        elif any(item["kind"] == "vault-source" for item in controller_reasons):
+            linear_reason = "Vault source selection requires core linear"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
                 "multi-host controller-only play requires task-lockstep scheduling"
@@ -322,8 +324,7 @@ class StrategyModule(StrategyBase):
                 % (play.name or play.get_name(), "; ".join(reasons))
             )
             return self._tqm.RUN_ERROR
-        if self._requires_linear_fallback or (
-                len(hosts) > 1 and self._controller_only_play):
+        if linear_reason:
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
             # scheduling. Reuse core linear for this compatibility-only case.
@@ -1649,7 +1650,7 @@ def _controller_fallbacks(play_node):
                 walk(node.get("handlers"))
             if node.get("fallback"):
                 found.append({
-                    "kind": "controller-fallback",
+                    "kind": "vault-source" if node.get("_deferred_vault_source") else "controller-fallback",
                     "task": node.get("name") or node.get("action"),
                     "reason": node.get("fallback_reason")
                               or "controller fallback",

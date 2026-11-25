@@ -2078,6 +2078,16 @@ def _convert_task(task, actions, basedir):
 
     if action in BAKED_ACTIONS:
         _bake_sources(node, task, basedir)
+        source_action = action.rsplit(".", 1)[-1]
+        decrypt = node["args"].get("decrypt", True)
+        if (source_action in ("copy", "unarchive") and not node.pop("_source_decrypted_at_compile", False)
+                and (_contains_dynamic_value(decrypt)
+                     or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
+                and any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
+                        for value in (node.get("_baked") or {}).values())):
+            node["_deferred_vault_source"] = True
+            node["fallback"] = True
+            node["fallback_reason"] = "Vault source needs controller selection and decryption"
         if node["special"] is None:
             actions.add(action)
         else:
@@ -2341,6 +2351,12 @@ def _bake_sources(node, task, basedir):
     if role_path:
         src = _ROLE_PATH_RE.sub(lambda _m: role_path, src)
 
+    decrypt = args.get("decrypt", True)
+    decrypt_selected = (
+        name in ("copy", "unarchive") and remote is False and not _contains_dynamic_value(src)
+        and not _contains_dynamic_value(decrypt) and args.get("content") is None
+        and (_source_flag(decrypt) if name == "copy" else bool(decrypt))
+    )
     candidates = []
     if _JINJA_RE.search(src):
         loop = node.get("loop")
@@ -2375,18 +2391,33 @@ def _bake_sources(node, task, basedir):
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
-        with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
-            baked[rel] = fh.read()
+        source_is_plaintext = True
+        if decrypt_selected:
+            from ansible.errors import AnsibleError
+
+            try:
+                data, source_is_plaintext = task._loader._get_file_contents(path)
+                baked[rel] = data.decode("utf-8", "surrogateescape")
+            except AnsibleError as ex:
+                # Match normal task gating for a source whose key is missing
+                # or incorrect. The failing payload needs no embedded bytes.
+                baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
+        else:
+            with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
+                baked[rel] = fh.read()
         if not with_meta:
             continue
         try:
             st = os.stat(path)
             meta[rel] = {"fullpath": os.path.abspath(path),
                          "mtime": st.st_mtime, "uid": st.st_uid,
-                         "mode": stat.S_IMODE(st.st_mode)}
+                         # Vault's temporary plaintext source is owner-only.
+                         "mode": stat.S_IMODE(st.st_mode) if source_is_plaintext else 0o600}
         except OSError:
             pass
     node["_baked"] = baked
+    if decrypt_selected:
+        node["_source_decrypted_at_compile"] = True
     if meta:
         node["_baked_meta"] = meta
 

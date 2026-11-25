@@ -5916,7 +5916,10 @@ class Runtime:
         marker = (task.get("_baked") or {}).get(key)
         if marker is None:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
-        return self._asset_bytes(marker)
+        data = self._asset_bytes(marker)
+        if task.get("_deferred_vault_source") and args.get("decrypt", True) and data.startswith(b"$ANSIBLE_VAULT;"):
+            raise RuntimeError("Vault archive requires controller decryption. Use a literal controller src when compiling.")
+        return data
 
     def _task_environment(self, task, ctx):
         """Resolve the `environment:` keyword to a flat {name: value} dict."""
@@ -6431,6 +6434,9 @@ class Runtime:
                         "msg": "%s: src %r was not baked into the compiled file" % (name, src)}
             try:
                 raw = self._asset_text(raw)
+                if (task.get("_deferred_vault_source") and _ansible_boolean(args.get("decrypt", True))
+                        and raw.startswith("$ANSIBLE_VAULT;")):
+                    raise RuntimeError("Vault source requires controller decryption. Use a literal src when compiling.")
             except Exception as ex:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
