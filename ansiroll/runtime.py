@@ -41,8 +41,6 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # compiler bakes it into the generated source; target hosts usually have no
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
-_STANDALONE_DEFAULT_GROUP = "ungrouped"
-_STANDALONE_DEFAULT_HOST = "localhost"
 _ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 
 
@@ -531,17 +529,12 @@ def _boolean(value, strict=False):
 
 def _f_combine(d, *others, **kwargs):
     recursive = kwargs.get("recursive", False)
-    encoded_vars = kwargs.get("encoded_vars", False)
-
-    def mapping(value):
-        return isinstance(value, dict) and (not encoded_vars or value.keys() not in (
-            {"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}))
 
     # Copy through items(): dict(lazy_view) bypasses rendering on Python 3.5.
     def merge(a, b):
         out = dict(a.items())
         for k, v in b.items():
-            if recursive and mapping(out.get(k)) and mapping(v):
+            if recursive and isinstance(out.get(k), dict) and isinstance(v, dict):
                 out[k] = merge(out[k], v)
             else:
                 out[k] = v
@@ -929,12 +922,6 @@ _ANSIBLE_TESTS = {
         )
     ),
 }
-
-_SETUP_VARS_FILE_FILTERS = (
-    "default", "d", "ternary", "lower", "upper", "trim", "replace", "capitalize", "title",
-    "length", "count", "first", "last", "join", "int", "regex_search",
-)
-_SETUP_VARS_FILE_TESTS = ("defined", "undefined", "none", "boolean")
 
 
 def _lookup_values(name, args, kwargs, ctx=None):
@@ -1785,28 +1772,6 @@ class _Templater:
             self.env.filters.setdefault(fname, _wrap_filter(func))
         for tname, tfunc in _ANSIBLE_TESTS.items():
             self.env.tests.setdefault(tname, tfunc)
-        for name, function in tuple(filters.items()):
-            filters.setdefault("ansible.builtin." + name, function)
-        for name in _ANSIBLE_FILTERS.keys() | {"d"}:
-            filters.setdefault("ansible.legacy." + name, filters[name])
-        for name in _SETUP_VARS_FILE_TESTS:
-            if name in tests:
-                tests.setdefault("ansible.builtin." + name, tests[name])
-                tests.setdefault("ansible.legacy." + name, tests[name])
-        # Remember which implementations may be run twice. Adjacent plugins
-        # can replace an individual filter or test without affecting the rest.
-        self._setup_vars_file_filters = {
-            prefix + name: filters[prefix + name]
-            for prefix in ("", "ansible.builtin.", "ansible.legacy.")
-            for name in _SETUP_VARS_FILE_FILTERS
-            if prefix + name in filters
-        }
-        self._setup_vars_file_tests = {
-            prefix + name: tests[prefix + name]
-            for prefix in ("", "ansible.builtin.", "ansible.legacy.")
-            for name in _SETUP_VARS_FILE_TESTS
-            if prefix + name in tests
-        }
         self.env.filters["ansible._protomatter.dump_object"] = _dump_object
         # Bind the render context so context-dependent lookups ('vars') work.
         self.env.globals.setdefault("lookup", self._g_lookup)
@@ -1904,12 +1869,7 @@ class _Templater:
                 except Exception as e:
                     self._plugin_errors[kind][pname] = str(e)
                     continue
-                registered = _wrap_filter(fn) if kind == "filter" else fn
-                target[pname] = registered
-                if isinstance(pname, str):
-                    legacy_name = "ansible.legacy." + pname
-                    if dict.__contains__(target, legacy_name):
-                        target[legacy_name] = registered
+                target[pname] = _wrap_filter(fn) if kind == "filter" else fn
 
     def _plugin_lookup(self, name, args, kwargs):
         """Run a baked lookup plugin; errors come back captured."""
@@ -2821,7 +2781,7 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         if play.get("gather_facts") and not gather_cached:
-            setup_ctx = self._layered_ctx(self.ctx(self._with_deferred_vars_files(play, before_setup=True)))
+            setup_ctx = self._layered_ctx(self.ctx(play.get("vars")))
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -3076,69 +3036,19 @@ class Runtime:
         self._pin_magic_vars(ctx)
         return ctx
 
-    def _pre_setup_vars_file_selector(self, source, ctx):
-        """Only attempt selectors that can safely render again after setup."""
-        env = self.templater.env
-        safe_filters = self.templater._setup_vars_file_filters
-        safe_tests = self.templater._setup_vars_file_tests
-        pending = [source]
-        seen = set()
-        containers = set()
-        while pending:
-            value = pending.pop()
-            if isinstance(value, (dict, list, tuple)):
-                if id(value) in containers:
-                    continue
-                containers.add(id(value))
-                if isinstance(value, dict):
-                    if dict.keys(value) not in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
-                        pending.extend(dict.values(value))
-                else:
-                    pending.extend(list.__iter__(value) if isinstance(value, list) else tuple.__iter__(value))
-            elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
-                if value in seen:
-                    continue
-                seen.add(value)
-                try:
-                    expr = env.parse(value)
-                except jinja2.TemplateSyntaxError:
-                    return False
-                nodes = jinja2.nodes
-                if (next(expr.find_all(nodes.Call), None) is not None
-                        or any(node.name not in safe_filters or dict.get(env.filters, node.name) is not safe_filters[node.name]
-                               for node in expr.find_all(nodes.Filter))
-                        or any(node.name not in safe_tests or dict.get(env.tests, node.name) is not safe_tests[node.name]
-                               for node in expr.find_all(nodes.Test))):
-                    return False
-                for node in expr.find_all(nodes.Name):
-                    if node.ctx == "load" and node.name in ctx:
-                        pending.append(ctx[node.name])
-        return True
-
-    def _with_deferred_vars_files(self, play, *, before_setup=False):
+    def _with_deferred_vars_files(self, play):
         """Play vars plus the vars_files entries whose names needed facts: the first candidate found among the
         files the compiler bundled for it wins, like Ansible's first-found vars_files lists."""
         play_vars = dict(play.get("vars") or {})
-        merge_hashes = (play.get("controller_config") or {}).get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         # Ansible renders these names before merging set_fact and register results, so they cannot see them.
         base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         for entry in play.get("deferred_vars_files") or ():
-            if "static_vars" in entry:
-                play_vars = _f_combine(play_vars, *entry["static_vars"], recursive=merge_hashes, encoded_vars=True)
-                continue
-            selector_vars = _f_combine(base, play_vars, self.extra_vars, recursive=merge_hashes, encoded_vars=True)
-            selector_vars = {key: _PlayVarTemplate(value) if _looks_templated(value)
-                             and not isinstance(value, _NO_TEMPLATE) else value for key, value in selector_vars.items()}
-            ctx = self.ctx(base=selector_vars)
+            ctx = self.ctx(play_vars, self.extra_vars, base=base)
             item = entry["names"][0] if len(entry["names"]) == 1 else entry["names"]
             for raw in entry["names"]:
-                if before_setup and not self._pre_setup_vars_file_selector(raw, ctx):
-                    break
                 try:
                     name = _fail_on_undef(self.template(raw, ctx))
                 except jinja2.UndefinedError as ex:
-                    if before_setup:
-                        break
                     if self.vars.get("module_setup") or self._facts_gathered:
                         raise VarsFilesError("an undefined variable was found when attempting to template the "
                                              "vars_files item %r: %s" % (item, ex))
@@ -3146,8 +3056,6 @@ class Runtime:
                                      % (item,))
                     break
                 except Exception as ex:
-                    if before_setup:
-                        break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
                     continue
@@ -3163,19 +3071,17 @@ class Runtime:
                 if found:
                     data = entry["files"][found[0]]
                     if isinstance(data, dict):
-                        if before_setup:
-                            break
                         raise VarsFilesError(data["__ansiroll_vars_file_error__"], data.get("rc", 1))
-                    play_vars = _f_combine(play_vars, *data, recursive=merge_hashes, encoded_vars=True)
+                    for value in data:
+                        play_vars.update(value)
                     break
             else:
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
-                if not before_setup and not _core_at_least(2, 15):
+                if not _core_at_least(2, 15):
                     raise VarsFilesError("vars file %s was not found" % (item,))
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
-                if not before_setup:
-                    sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
-                                     % (item,))
+                sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
+                                 % (item,))
         return play_vars
 
     def _task_ctx(self, task, overlay):
@@ -5384,7 +5290,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     host = host_vars.get("inventory_hostname") or _hostname()
     host_vars["inventory_hostname"] = _mark_unsafe(host)
     host_vars.setdefault("inventory_hostname_short", _mark_unsafe(_inventory_hostname_short(host)))
-    host_vars.setdefault("group_names", [_STANDALONE_DEFAULT_GROUP])
+    host_vars.setdefault("group_names", ["ungrouped"])
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}

@@ -24,8 +24,6 @@ import zipfile
 from .embed import ModuleEmbedder
 from .loader import (
     COPY_ACTION_MODULES,
-    _STANDALONE_CONTEXT_NAMES,
-    _STANDALONE_INVENTORY_NAMES,
     _can_write_var,
     _depends_on_vars,
     _loop_binding_names,
@@ -48,6 +46,8 @@ _ACCELERATED_MODULES_PATH = os.path.join(
 )
 _JINJA_BUNDLE_MARKER = "# __ANSIROLL_JINJA_BUNDLE__"
 _WORKER_CODE_MARKER = "# __ANSIROLL_WORKER_CODE__"
+_STANDALONE_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names"))
+_RUNTIME_INVENTORY_NAMES = _STANDALONE_INVENTORY_NAMES | {"vars", "hostvars"}
 
 _FOOTER = '''
 
@@ -274,9 +274,7 @@ def _shadowed_var_names(plays):
         names.update(_loop_shadowed_names(node))
     for play in plays:
         for entry in play.get("deferred_vars_files") or ():
-            for item in entry.get("static_vars", ()):
-                names.update(item)
-            for data in entry.get("files", {}).values():
+            for data in entry["files"].values():
                 if isinstance(data, list):
                     for item in data:
                         names.update(item)
@@ -297,7 +295,7 @@ def _resolve_frozen_vars(plays, group_vars, extra_vars,
     skipped = {}
     frozen = {}
     shadowed = _shadowed_var_names(plays)
-    runtime_context = _STANDALONE_CONTEXT_NAMES - extra_vars.keys()
+    runtime_context = _RUNTIME_INVENTORY_NAMES - extra_vars.keys()
 
     def is_shadowed(name):
         return _can_write_var(shadowed, name)
@@ -1090,7 +1088,7 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         "_ANSIROLL_BOOT_STARTED = _ansiroll_boot_time.monotonic()\n",
         runtime_src,
         "\n\n# ===== embedded data =====\n",
-        "_ANSIROLL_HOST = _STANDALONE_DEFAULT_HOST\n",
+        '_ANSIROLL_HOST = "localhost"\n',
         "_ANSIROLL_CORE_VERSION = " + repr(_controller_core_version()) + "\n",
         "_ANSIROLL_INVENTORY_ADDRESS_PATTERNS = " + repr(_controller_inventory_address_patterns()) + "\n",
         "ANSIBALLZ_CODE = " + repr(ansiballz_code) + "\n",

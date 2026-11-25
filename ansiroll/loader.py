@@ -21,9 +21,6 @@ from .compat import init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
 from .accelerated_modules import can_accelerate
 
-_STANDALONE_INVENTORY_NAMES = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names"))
-_STANDALONE_CONTEXT_NAMES = _STANDALONE_INVENTORY_NAMES | {"vars", "hostvars"}
-
 # Actions that are coupled to the controller and cannot run inside the single file.
 CONTROLLER_COUPLED = {
     "fetch", "ansible.builtin.fetch",
@@ -363,12 +360,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    include_vars = {}
-    vars_file_writes = set()
-    jinja_plugins = _collect_jinja_plugins(play, basedir)
-    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files,
-                                   include_vars=include_vars, deferred_writes=vars_file_writes,
-                                   ternary_builtin=not any(plugin["kind"] == "filter" for plugin in jinja_plugins or ()))
+    play_vars = _resolved_play_vars(play, all_vars, basedir, unresolved_vars_files)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -382,12 +374,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     for cache_name in ("_vars_cache", "_nonpersistent_fact_cache"):
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
-    includes = _IncludeVariables(include_vars if all_vars is None else play_vars, all_vars, known_writes)
+    includes = _IncludeVariables(play_vars, all_vars, known_writes)
     includes.incomplete = bool(unresolved_vars_files)
-    if all_vars is None:
-        includes.vars_file_writes = vars_file_writes
-        includes.replayed_static_names = {key for entry in unresolved_vars_files
-                                          for mapping in entry.get("static_vars", ()) for key in mapping}
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -426,7 +414,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     result = {
         "name": play.name or "",
         "hosts": hosts,
-        "jinja_plugins": jinja_plugins,
+        "jinja_plugins": _collect_jinja_plugins(play, basedir),
         "gather_facts": bool(gather),
         "smart_gathering": gather_facts is None and C.DEFAULT_GATHERING == "smart",
         "gather_when": _conditions(getattr(play, "_included_conditional", None)),
@@ -449,18 +437,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "handlers": handlers,
     }
     if unresolved_vars_files:
-        result["deferred_vars_files"] = unresolved_vars_files
-    # Searching possible launcher host directories does not authorize copying
-    # controller environment values mentioned only in those candidates.
-    environment_sources = dict(result)
-    if unresolved_vars_files:
-        environment_sources["deferred_vars_files"] = []
-        for entry in unresolved_vars_files:
-            hostname_candidates = entry.pop("hostname_candidates", ())
-            environment_sources["deferred_vars_files"].append({**entry, "files": {
-                name: data for name, data in entry.get("files", {}).items() if name not in hostname_candidates
-            }})
-    names = _controller_env_names(environment_sources)
+        result["deferred_vars_files"] = _deferred_vars_files(play, basedir, unresolved_vars_files)
+    names = _controller_env_names(result)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -555,26 +533,18 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_vars=None, deferred_writes=None,
-                        ternary_builtin=True):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
-    appended to ``unresolved`` with their bundled candidates.
+    appended to ``unresolved``.
     """
-    from ansible import constants as C
     from ansible.errors import AnsibleFileNotFound
     from ansible.utils.vars import combine_vars
 
     out = dict(play.vars or {})
-    selector_vars = out
-    if deferred_writes is None:
-        deferred_writes = set()
-    hostname_writes = set()
-    candidate_scopes = []
     use_search_stack = _core_version() >= (2, 12)
     for entry in _as_list(getattr(play, "vars_files", None)):
-        replay = all_vars is None and bool(unresolved)
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
@@ -582,35 +552,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_var
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
             if _is_templated(filename):
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
-                filename = _template_vars_file_name(
-                    play, raw, dict(selector_vars, playbook_dir=basedir), all_vars, deferred_writes)
+                filename = _template_vars_file_name(play, raw, dict(out, playbook_dir=basedir), all_vars)
                 if filename is None:
                     if unresolved is not None:
-                        explicit_scopes = (selector_vars, play.get_variable_manager().extra_vars)
-                        scopes = list(explicit_scopes)
-                        if all_vars is None:
-                            from .runtime import _STANDALONE_DEFAULT_GROUP, _STANDALONE_DEFAULT_HOST
-
-                            fixed_names = selector_vars.keys() | explicit_scopes[1].keys()
-                            hostname_names = {"inventory_hostname", "inventory_hostname_short"} - fixed_names
-                            defaults = dict.fromkeys(hostname_names, _STANDALONE_DEFAULT_HOST)
-                            if "group_names" not in fixed_names:
-                                defaults["group_names"] = [_STANDALONE_DEFAULT_GROUP]
-                            scopes.extend((defaults, dict.fromkeys(hostname_names, _HOSTNAME_COMPONENT)))
-                        scopes.extend(candidate_scopes)
-                        bundled, = _deferred_vars_files(
-                            play, basedir, [entry], scopes=scopes, ternary_builtin=ternary_builtin,
-                            standalone=all_vars is None, hostname_writes=hostname_writes,
-                            explicit_scopes=explicit_scopes)
-                        unresolved.append(bundled)
-                        hostname_candidates = bundled.get("hostname_candidates", ())
-                        for path, candidate in bundled["files"].items():
-                            if isinstance(candidate, list):
-                                for mapping in candidate:
-                                    candidate_scopes.append(dict(mapping))
-                                    deferred_writes.update(mapping)
-                                    if path in hostname_candidates:
-                                        hostname_writes.update(mapping)
+                        unresolved.append(entry)
                     break
             try:
                 # 2.10 and 2.11 load relative to the playbook directory.
@@ -622,26 +567,9 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_var
             except AnsibleFileNotFound:
                 # Like Ansible: only a missing file moves on to the next candidate.
                 continue
-            mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
-            for item in mappings:
-                selector_vars = combine_vars(selector_vars, item)
-                replaced = {key for key, value in item.items()
-                            if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict)}
-                deferred_writes.difference_update(replaced)
-                hostname_writes.difference_update(replaced)
-                # Keep projection scopes in replay order without changing the
-                # original mappings bundled for earlier vars_files entries.
-                for scope in candidate_scopes:
-                    for key in item.keys() & scope.keys():
-                        if key in replaced:
-                            del scope[key]
-                        else:
-                            scope[key] = combine_vars({key: scope[key]}, {key: item[key]})[key]
-            if replay:
-                # Later files must take precedence over the deferred choice.
-                unresolved.append({"static_vars": _tag_untrusted(mappings)})
-            else:
-                out = selector_vars
+            for item in _as_list(loaded) or []:
+                if isinstance(item, dict):
+                    out = combine_vars(out, item)
             break
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
@@ -661,8 +589,6 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, *, include_var
         ):
             if key in all_vars:
                 out[key] = all_vars[key]
-    if include_vars is not None:
-        include_vars.update(selector_vars)
     return out
 
 
@@ -673,213 +599,7 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
-_HOSTNAME_COMPONENT = "\1"
-
-
-def _known_vars_file_choices(source, scopes, basedir, *, ternary_builtin=True):
-    """Return literal or bounded wildcard paths without rendering selectors."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
-
-    env = Environment()
-    try:
-        body = env.parse(source).body
-    except TemplateSyntaxError:
-        return (), False
-    if len(body) != 1 or not isinstance(body[0], nodes.Output):
-        return (), False
-    parts = body[0].nodes
-    dynamic = [part for part in parts if not isinstance(part, nodes.TemplateData)]
-    if len(dynamic) != 1:
-        return _known_vars_file_path_values(body[0], scopes, env, basedir), False
-    choice = dynamic[0]
-    branches = _vars_file_choice_branches(choice)
-    exhaustive = (bool(branches) and (ternary_builtin or isinstance(choice, nodes.CondExpr))
-                  and all(isinstance(branch, nodes.Const) and isinstance(branch.value, str) for branch in branches))
-    values = ([branch.value for branch in branches] if exhaustive
-              else _known_vars_file_path_values(choice, scopes, env, basedir))
-    paths = tuple(dict.fromkeys("".join(value if part is choice else part.data for part in parts) for value in values))
-    return paths, exhaustive
-
-
-def _vars_file_choice_branches(node):
-    """Pull out possible path expressions without evaluating the test."""
-    from jinja2 import nodes
-
-    if isinstance(node, nodes.CondExpr):
-        return node.expr1, node.expr2
-    if not (isinstance(node, nodes.Filter) and node.name in ("ternary", "ansible.builtin.ternary",
-                                                            "ansible.legacy.ternary")
-            and not (node.dyn_args or node.dyn_kwargs) and len(node.args) in (2, 3)):
-        return ()
-    branches = list(node.args)
-    if node.kwargs:
-        if len(branches) != 2 or len(node.kwargs) != 1 or node.kwargs[0].key != "none_val":
-            return ()
-        branches.append(node.kwargs[0].value)
-    if len(branches) == 3 and isinstance(branches[-1], nodes.Const) and branches[-1].value is None:
-        branches.pop()
-    return branches
-
-
-def _known_vars_file_path_values(expression, scopes, env, basedir):
-    """Follow aliases and keep literal filename components around variable values."""
-    from jinja2 import TemplateSyntaxError, nodes
-
-    class ProjectionLimit(Exception):
-        pass
-
-    # Share the budget across all scopes and aliases for this selector.
-    remaining = 4096
-    parsed = {}
-
-    def consume(amount=1):
-        nonlocal remaining
-        remaining -= amount
-        if remaining < 0:
-            raise ProjectionLimit
-
-    def parse_alias(value):
-        try:
-            body = env.parse(value).body
-        except TemplateSyntaxError:
-            return None
-        if len(body) == 1 and isinstance(body[0], nodes.Output):
-            return body[0].nodes[0] if len(body[0].nodes) == 1 else body[0]
-        return None
-
-    def project(node, members=(), seen=frozenset(), *, sequence=False):
-        consume()
-        while isinstance(node, (nodes.Getattr, nodes.Getitem)):
-            consume()
-            if isinstance(node, nodes.Getattr):
-                member = node.attr
-            elif isinstance(node.arg, nodes.Const) and isinstance(node.arg.value, (str, int)):
-                member = node.arg.value
-            elif (isinstance(node.arg, nodes.Neg) and isinstance(node.arg.node, nodes.Const)
-                  and isinstance(node.arg.node.value, int)):
-                member = -node.arg.node.value
-            else:
-                return
-            members = (member, *members)
-            node = node.node
-        if isinstance(node, nodes.Const) and isinstance(node.value, str) and not members and not sequence:
-            yield node.value
-            return
-        if isinstance(node, (nodes.List, nodes.Tuple)):
-            if members and isinstance(members[0], int) and -len(node.items) <= members[0] < len(node.items):
-                yield from project(node.items[members[0]], members[1:], seen, sequence=sequence)
-            elif sequence and not members:
-                consume(len(node.items))
-                if all(isinstance(item, nodes.Const) and isinstance(item.value, str) for item in node.items):
-                    yield tuple(item.value for item in node.items)
-            return
-        if isinstance(node, (nodes.CondExpr, nodes.Filter)):
-            branches = _vars_file_choice_branches(node)
-            if branches:
-                for branch in branches:
-                    if branch is not None:
-                        yield from project(branch, members, seen, sequence=sequence)
-                return
-        if isinstance(node, (nodes.Output, nodes.Concat, nodes.Add)) and not members and not sequence:
-            paths = {""}
-            parts = (node.left, node.right) if isinstance(node, nodes.Add) else node.nodes
-            for part in parts:
-                if isinstance(part, nodes.TemplateData):
-                    values = {part.data}
-                elif isinstance(part, nodes.Const) and isinstance(part.value, str):
-                    values = {part.value}
-                else:
-                    values = set(project(part, seen=seen)) | {"\0"}
-                combinations = len(paths) * len(values)
-                if combinations > 128:
-                    return
-                consume(combinations)
-                paths = {prefix + suffix for prefix in paths for suffix in values}
-            yield from sorted(paths)
-            return
-        if isinstance(node, nodes.Filter) and not (node.dyn_args or node.dyn_kwargs):
-            name = node.name
-            if name.startswith(("ansible.builtin.", "ansible.legacy.")):
-                name = name.split(".", 2)[2]
-            if not (members or sequence or node.args or node.kwargs) and name in ("lower", "upper", "trim"):
-                method = "strip" if name == "trim" else name
-                yield from (getattr(value, method)() for value in project(node.node, seen=seen))
-            elif name in ("default", "d"):
-                yield from project(node.node, members, seen, sequence=sequence)
-                fallback = node.args[0] if node.args else next(
-                    (kw.value for kw in node.kwargs if kw.key == "default_value"), None)
-                if fallback is not None:
-                    yield from project(fallback, members, seen, sequence=sequence)
-            elif name in ("first", "last") and not (node.args or node.kwargs):
-                yield from project(node.node, (0 if name == "first" else -1, *members), seen, sequence=sequence)
-            elif name == "join" and not (members or sequence):
-                arguments = [*node.args, *(kw.value for kw in node.kwargs if kw.key == "d")]
-                if len(arguments) != len(node.args) + len(node.kwargs) or len(arguments) > 1:
-                    return
-                delimiters = (tuple(dict.fromkeys(project(arguments[0], seen=seen))) if arguments else ("",))
-                for items in project(node.node, seen=seen, sequence=True):
-                    for delimiter in delimiters:
-                        if "\0" not in delimiter and _HOSTNAME_COMPONENT not in delimiter:
-                            consume()
-                            yield delimiter.join(items)
-            return
-        if not isinstance(node, nodes.Name) or len(seen) >= 64 or len(members) > 64:
-            return
-        if node.name == "playbook_dir":
-            if not members and not sequence:
-                yield basedir
-            return
-        binding = node.name, members, sequence
-        if binding in seen:
-            return
-        aliases = set()
-        for scope in scopes:
-            consume()
-            value = scope.get(node.name)
-            index = 0
-            while index < len(members):
-                member = members[index]
-                if isinstance(value, dict):
-                    value = value.get(member)
-                elif isinstance(value, (list, tuple)) and isinstance(member, int) and -len(value) <= member < len(value):
-                    value = value[member]
-                else:
-                    break
-                index += 1
-            if sequence and index == len(members) and isinstance(value, (list, tuple)):
-                consume(len(value))
-                if all(isinstance(item, str) and not _is_templated(item) for item in value):
-                    yield tuple(value)
-                continue
-            if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
-                literal = value["__ansiroll_unsafe__"]
-                if not sequence and index == len(members) and isinstance(literal, str) and not _is_templated(literal):
-                    yield literal
-                continue
-            if not isinstance(value, str):
-                continue
-            if not _is_templated(value):
-                if not sequence and index == len(members):
-                    yield value
-                continue
-            remaining_members = members[index:]
-            alias = value, remaining_members
-            if alias in aliases:
-                continue
-            aliases.add(alias)
-            if value not in parsed:
-                parsed[value] = parse_alias(value)
-            if parsed[value] is not None:
-                yield from project(parsed[value], remaining_members, seen | {binding}, sequence=sequence)
-
-    try:
-        return tuple(dict.fromkeys(project(expression)))
-    except ProjectionLimit:
-        return ()
-
-
-def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=True,
-                         standalone=False, hostname_writes=(), explicit_scopes=()):
+def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -894,56 +614,13 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=T
     else:
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
-    roots = tuple(dict.fromkeys(os.path.realpath(d) for d in dirs))
-    hostname_inputs = set(hostname_writes)
-    if standalone:
-        hostname_inputs.update(("inventory_hostname", "inventory_hostname_short"))
-    fixed_group = standalone and any("group_names" in scope for scope in explicit_scopes)
-    scope_values = {}
-    if hostname_inputs:
-        hostname_inputs.update(("vars", "hostvars"))
-        for scope in scopes:
-            for key, value in scope.items():
-                scope_values.setdefault(key, []).append(value)
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
-        hostname_candidates = set()
-        regular_candidates = set()
-        unmodeled = []
-        patterns_by_name = []
+        unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
-            bounded = bool(hostname_inputs) and _depends_on_vars(name, scope_values, hostname_inputs.__contains__)
-            group_fallback = fixed_group and _depends_on_vars(name, scope_values, {"group_names"}.__contains__)
-            choices, exhaustive = (_known_vars_file_choices(name, scopes, basedir, ternary_builtin=ternary_builtin)
-                                   if _is_templated(name) else ((), False))
-            choices = [choice for choice in choices if choice not in ("", "\0", _HOSTNAME_COMPONENT)
-                       and "\0" not in os.path.dirname(choice)]
-            explicit = set(choices) if exhaustive else set()
-            if bounded and choices and not exhaustive:
-                # A hostname-dependent test can select an explicitly named
-                # path. Only search results inferred from runtime values need
-                # containment, while both still have hostname provenance.
-                explicit_paths, _ = _known_vars_file_choices(name, explicit_scopes, basedir,
-                                                               ternary_builtin=ternary_builtin)
-                explicit.update(path for path in explicit_paths if "\0" not in path)
-            for choice in choices:
-                host_pattern = _HOSTNAME_COMPONENT in choice
-                inventory_pattern = host_pattern or group_fallback and "\0" in choice
-                pattern = "*".join(glob.escape(part) for part in choice.replace(_HOSTNAME_COMPONENT, "\0").split("\0"))
-                patterns_by_name.append((choice, pattern, bounded or inventory_pattern,
-                                         inventory_pattern or bounded and choice not in explicit))
-            if exhaustive:
-                continue
             pattern = "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
-            if name.startswith(("{{", "{%")) and "/" in pattern:
-                if not choices:
-                    unmodeled.append(name)
-            else:
-                inventory_fallback = bounded or group_fallback
-                patterns_by_name.append((name, pattern, inventory_fallback, inventory_fallback))
-        for name, pattern, hostname_dependent, require_containment in patterns_by_name:
             if name.startswith(os.path.sep):
                 patterns = [pattern]
             else:
@@ -955,18 +632,9 @@ def _deferred_vars_files(play, basedir, entries, *, scopes=(), ternary_builtin=T
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
-                    if require_containment:
-                        real_path = os.path.realpath(found)
-                        if not any(os.path.commonpath([root, real_path]) == root for root in roots):
-                            continue
-                    if found in files or os.path.isfile(found):
-                        (hostname_candidates if hostname_dependent else regular_candidates).add(found)
-                        if found not in files:
-                            files[found] = _bundled_vars_file(play, found)
+                    if found not in files and os.path.isfile(found):
+                        files[found] = _bundled_vars_file(play, found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
-        hostname_candidates.difference_update(regular_candidates)
-        if hostname_candidates:
-            entry["hostname_candidates"] = hostname_candidates
         if unmodeled:
             entry["unmodeled"] = unmodeled
         deferred.append(entry)
@@ -989,26 +657,19 @@ def _bundled_vars_file(play, path):
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
-        return _tag_untrusted(preprocess_vars(loaded))
+        preprocess_vars(loaded)
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+    return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r was not bundled because its top level is not "
+            "a mapping" % path}
 
 
-def _template_vars_file_name(play, filename, play_vars, all_vars, deferred_writes=frozenset()):
-    from ansible import constants as C
+def _template_vars_file_name(play, filename, play_vars, all_vars):
     from ansible.utils.vars import combine_vars
 
-    extras = play.get_variable_manager().extra_vars
     variables = combine_vars(play_vars, all_vars or {})
-    variables = combine_vars(variables, extras)
-    if all_vars is None:
-        runtime_names = _STANDALONE_CONTEXT_NAMES - variables.keys()
-        runtime_names.update(key for key in deferred_writes if key not in extras or (
-            C.DEFAULT_HASH_BEHAVIOUR == "merge" and isinstance(extras[key], dict)))
-        runtime_names.discard("playbook_dir")
-        if _depends_on_vars(filename, variables, runtime_names.__contains__):
-            return None
+    variables = combine_vars(variables, play.get_variable_manager().extra_vars)
     try:
         from ansible.template import Templar
         try:
@@ -1332,8 +993,6 @@ class _IncludeVariables:
         self.resolved_template = False
         # A vars file whose name is only known at runtime may redefine any play var.
         self.incomplete = False
-        self.vars_file_writes = set()
-        self.replayed_static_names = set()
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -1652,8 +1311,6 @@ def _template_include_filename(task, value, includes):
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
                   task_vars, role_params, include_params, extra_vars):
         variables = combine_vars(variables, layer)
-    runtime_inventory = (_STANDALONE_CONTEXT_NAMES - includes.play_vars.keys() - role_vars.keys()
-                         - task_vars.keys() - role_params.keys() - include_params.keys() - extra_vars.keys())
     # An unknown vars_files entry can redefine any name that no higher layer than vars_files sets.
     above_vars_files = set(role_vars).union(task_vars, role_params, include_params)
 
@@ -1670,15 +1327,9 @@ def _template_include_filename(task, value, includes):
     def is_runtime(name):
         if name in loop_names:
             return True
-        if includes.all_vars is None and name in runtime_inventory:
+        if (includes.incomplete and name not in extra_vars and name not in above_vars_files
+                and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
             return True
-        if includes.incomplete and name not in above_vars_files:
-            if name in includes.vars_file_writes and (name not in extra_vars or (
-                    DEFAULT_HASH_BEHAVIOUR == "merge" and isinstance(extra_vars[name], dict))):
-                return True
-            if (name not in includes.replayed_static_names and name not in extra_vars
-                    and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)):
-                return True
         if not _can_write_var(includes.runtime_writes, name):
             return False
         # A scalar extra var replaces any runtime value. A mapping under
