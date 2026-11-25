@@ -44,6 +44,7 @@ STATS_MARKER = "__ANSIROLL_STATS__"
 # compiler bakes it into the generated source; target hosts usually have no
 # Ansible, and any Ansible they do have is irrelevant to the compiled semantics.
 _ANSIROLL_CORE_VERSION = None
+_ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 _GATHER_STRING_METHODS = {"split", "rsplit", "strip", "lstrip", "rstrip"}
 
 
@@ -4038,10 +4039,14 @@ class Runtime:
                  check_mode=False, diff_mode=False, on_result=None, become_password=None, profile=False,
                  extra_vars=None, skip_run_once=False, pretty=False,
                  module_bundle=None, resource_reader=None,
-                 host_var_overrides=None, native_only=False):
+                 host_var_overrides=None, native_only=False, inventory_defaults=None):
         self.modules = modules
-        self._initial_host_vars = dict(host_vars or {})
-        self.vars = dict(self._initial_host_vars)
+        # Standalone defaults are available to tasks without entering the host
+        # state that deferred vars-file selectors read and later plays inherit.
+        self._inventory_defaults = inventory_defaults or {}
+        self.vars = dict(host_vars or {})
+        self._play_var_names = set()
+        self._initial_host_vars = self._task_host_vars()
         self.python = python or sys.executable
         self.check_mode = check_mode
         self.diff_mode = diff_mode
@@ -4068,7 +4073,6 @@ class Runtime:
         self._set_fact_overrides = dict(host_var_overrides or {})
         # include_vars results: above task vars, below set_fact/register.
         self._include_vars_layer = {}
-        self._play_var_names = set()
         self._module_fact_layer = {}
         self._facts_gathered = False
         self.native_only = bool(native_only)
@@ -4105,7 +4109,7 @@ class Runtime:
         self._strict_var_resolution = False
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
-        self.host = self.vars.get("inventory_hostname") or _hostname()
+        self.host = self._initial_host_vars.get("inventory_hostname") or _hostname()
         self.failed = False
         if self.become_password is None:
             # Fall back to ansible_become_pass from the vars (e.g. baked group_vars),
@@ -4123,8 +4127,15 @@ class Runtime:
                     pass
 
     # ---- context / templating -------------------------------------------
+    def _task_host_vars(self):
+        values = {**self._inventory_defaults, **self.vars}
+        if ("inventory_hostname" in self._inventory_defaults and not values["inventory_hostname"]
+                and "inventory_hostname" not in self._play_var_names):
+            values["inventory_hostname"] = self._inventory_defaults["inventory_hostname"]
+        return values
+
     def ctx(self, *overlays, base=None):
-        d = dict(self.vars if base is None else base)
+        d = self._task_host_vars() if base is None else dict(base)
         for o in overlays:
             if o:
                 d.update(o)
@@ -4982,7 +4993,7 @@ class Runtime:
         role_defaults = task.get("role_defaults") or {}
         role_vars = task.get("role_vars") or {}
         ctx.update(role_defaults)
-        ctx.update(self.vars)
+        ctx.update(self._task_host_vars())
         ctx.update(role_vars)
         ctx.update(overlay)
         higher_vars = self._layered_ctx({}, overlay, task.get("role_params"))
@@ -6557,7 +6568,7 @@ class Runtime:
         if not (params or block_vars):
             return scope
         ctx = dict(handler.get("role_defaults") or {})
-        ctx.update(self.vars)
+        ctx.update(self._task_host_vars())
         ctx.update(handler.get("role_vars") or {})
         ctx.update(scope)
         higher = self._layered_ctx({}, role_params=handler.get("role_params"))
@@ -7243,6 +7254,14 @@ def _hostname():
         return "localhost"
 
 
+def _inventory_hostname_short(host):
+    name = str(host)
+    if _core_at_least(2, 13) and any(
+            re.match(pattern, name, flags) for pattern, flags in _ANSIROLL_INVENTORY_ADDRESS_PATTERNS):
+        return name
+    return name.split(".", 1)[0]
+
+
 def _state_json_default(value):
     # The final state can include lazy play vars which were never resolved.
     return None if _is_undef(value) else str(value)
@@ -7254,10 +7273,18 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
          resource_reader=None, engine_bootstrap=None, native_only=False):
     runtime_started = time.monotonic()
     host_vars = dict(host_vars or {})
+    host = host_vars.get("inventory_hostname") or _hostname()
+    inventory_defaults = {
+        "inventory_hostname_short": _mark_unsafe(_inventory_hostname_short(host)),
+        "group_names": ["ungrouped"],
+    }
+    if host_vars.get("inventory_hostname"):
+        host_vars["inventory_hostname"] = _mark_unsafe(host)
+    else:
+        inventory_defaults["inventory_hostname"] = _mark_unsafe(host)
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}
-    host = host_vars.get("inventory_hostname") or _hostname()
     profile_totals = {}
     task_profile_totals = {}
     task_wall_totals = {}
@@ -7291,7 +7318,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
                      host_var_overrides=host_var_overrides,
-                     native_only=native_only)
+                     native_only=native_only, inventory_defaults=inventory_defaults)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
         engine_profile["runtime_init"] += time.monotonic() - init_started

@@ -30,6 +30,193 @@ def _module_zip(entries):
     return base64.b64encode(out.getvalue()).decode("ascii")
 
 
+@pytest.mark.parametrize(("hostname", "injected"), [
+    ("localhost", {}),
+    ("node.example.test", {}),
+    ("192.0.2.7", {}),
+    ("127.000.000.001", {}),
+    ("::ffff:192.0.2.7", {}),
+    ("::ffff:192.0.2.7%eth.1", {}),
+    ("{{ 2 + 2 }}.example.test", {}),
+    ("", {}),
+    ("launcher.example.test", {"inventory_hostname": "selected.example.test"}),
+    ("node.example.test", {"inventory_hostname_short": "alias", "group_names": ["workers", "blue"]}),
+    ("node.example.test", {"inventory_hostname_short": "", "group_names": []}),
+])
+def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
+    import socket
+
+    from ansible.inventory.host import Host
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  tasks:
+    - debug:
+        msg:
+          name: '{{ inventory_hostname }}'
+          short: '{{ inventory_hostname_short }}'
+          groups: '{{ group_names }}'
+""")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    env = dict(os.environ, ANSIROLL_HOST=hostname, ANSIROLL_RAW="1")
+    env.pop("ANSIROLL_EXTRA_VARS", None)
+    env.pop("ANSIROLL_VARS_FILE", None)
+    command = [sys.executable, str(compiled)]
+    if injected:
+        runner = ("import json, runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__', "
+                  "init_globals={'_INJECTED_VARS': json.loads(sys.argv[2])})")
+        command = [sys.executable, "-c", runner, str(compiled), json.dumps(injected)]
+    completed = subprocess.run(command, env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    name = injected.get("inventory_hostname", hostname) or socket.gethostname()
+    short = Host(name).get_magic_vars()["inventory_hostname_short"]
+    assert frame["result"]["msg"] == {
+        "name": name, "short": injected.get("inventory_hostname_short", short),
+        "groups": injected.get("group_names", ["ungrouped"]),
+    }
+
+
+@pytest.mark.parametrize(("host", "selector", "short_override"), [
+    ("node.example.test", "inventory_hostname_short | default(profile)", None),
+    ("node.example.test", "inventory_hostname_short | default(profile)", "override"),
+    ("", "inventory_hostname | default(profile, true)", None),
+])
+def test_standalone_vars_file_uses_only_explicit_inventory_inputs(tmp_path, host, selector, short_override):
+    import socket
+
+    from ansible.inventory.host import Host
+    from ansiroll import compile_playbook
+
+    play = """- hosts: all
+  gather_facts: false
+  vars_files:
+    - "profiles/{{ %s }}.yml"
+  tasks:
+    - debug:
+        msg: '{{ inventory_hostname }}:{{ inventory_hostname_short }}:{{ selected }}'
+""" % selector
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(play * 2)
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "deployment.yml").write_text("selected: deployment\n")
+    (profiles / "override.yml").write_text("selected: override\n")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    inputs = {"profile": "deployment"}
+    if short_override:
+        inputs["inventory_hostname_short"] = short_override
+    env = dict(os.environ, ANSIROLL_HOST=host, ANSIROLL_RAW="1", ANSIROLL_EXTRA_VARS=json.dumps(inputs))
+    env.pop("ANSIROLL_VARS_FILE", None)
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    messages = [json.loads(line.split(" ", 1)[1])["result"]["msg"] for line in completed.stdout.splitlines()
+                if line.startswith("__ANSIROLL_RESULT__ ")]
+    name = host or socket.gethostname()
+    short = short_override or Host(name).get_magic_vars()["inventory_hostname_short"]
+    assert messages == [f"{name}:{short}:{short_override or 'deployment'}"] * 2
+
+
+def test_freezing_keeps_inventory_dependent_play_vars_dynamic(tmp_path):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    selected_name: "{{ inventory_hostname_short | default('fallback') }}"
+  tasks:
+    - debug: {msg: '{{ selected_name }}'}
+""")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook), freeze_playbook_vars=True)[0])
+    env = dict(os.environ, ANSIROLL_HOST="node.example.test", ANSIROLL_RAW="1")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "node"
+
+
+def test_inventory_defaults_apply_when_preparing_role_handler_variables():
+    from ansiroll.runtime import _INCLUDE_PARAMS_KEY, Runtime
+
+    runtime = Runtime({}, "", {"inventory_hostname": "node.example.test"},
+                      inventory_defaults={"inventory_hostname_short": "node"})
+    handler = {"args": {"msg": "{{ short }}"}}
+    scope = runtime._handler_scope(
+        handler, {_INCLUDE_PARAMS_KEY: {"short": "{{ inventory_hostname_short | default('missing') }}"}})
+    assert runtime.template(handler["args"]["msg"], runtime._task_ctx(handler, scope)) == "node"
+
+
+def test_explicit_empty_play_hostname_takes_precedence_over_inventory_default():
+    from ansiroll.runtime import Runtime
+
+    runtime = Runtime({}, "", {"inventory_hostname": ""}, inventory_defaults={"inventory_hostname": "node"})
+    assert runtime.ctx()["inventory_hostname"] == "node"
+    runtime.run_play({"vars": {"inventory_hostname": ""}})
+    assert runtime._task_ctx({}, {})["inventory_hostname"] == ""
+
+
+@pytest.mark.parametrize(("variables", "expression"), [
+    ("", "'no' if group_names is defined else true"),
+    ("  vars:\n    checksum_flag: \"{{ 'no' if group_names is defined else true }}\"\n",
+     "checksum_flag | default(true)"),
+])
+def test_tree_shaking_keeps_official_stat_for_inventory_dependent_args(tmp_path, variables, expression):
+    from ansiroll import compile_playbook
+
+    source = tmp_path / "data"
+    source.write_text("checksum input\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+%s  tasks:
+    - ansible.builtin.stat:
+        path: %s
+        get_checksum: "{{ %s }}"
+""" % (variables, json.dumps(str(source)), expression))
+    compiled = tmp_path / "compiled.py"
+    contents, manifest = compile_playbook(str(playbook), tree_shake=True, freeze_playbook_vars=True)
+    assert "ansible.builtin.stat" in manifest["modules"]
+    assert "ansible.builtin.stat" not in manifest["accelerated_only_modules"]
+    compiled.write_text(contents)
+    env = dict(os.environ, ANSIROLL_RAW="1", ANSIROLL_ACCELERATED_MODULES="stat")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["stat"]["exists"]
+    assert "checksum" not in frame["result"]["stat"]
+
+
+@pytest.mark.parametrize("expression", ["group_names is defined", "play_flag | default(false)"])
+def test_tree_shaking_keeps_inventory_dependent_extra_var_condition(tmp_path, expression):
+    from ansiroll import compile_playbook
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    play_flag: '{{ group_names is defined }}'
+  tasks:
+    - debug: {msg: inventory is available}
+      when: run_task
+""")
+    contents, _ = compile_playbook(str(playbook), tree_shake=True,
+                                   extra_vars={"run_task": "{{ " + expression + " }}"})
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(contents)
+    env = dict(os.environ, ANSIROLL_RAW="1")
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True, check=True)
+    frame, = [json.loads(line.split(" ", 1)[1]) for line in completed.stdout.splitlines()
+              if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert frame["result"]["msg"] == "inventory is available"
+
+
 def test_bundle_union_deduplicates_identical_import_paths():
     shared = {"ansible/module_utils/shared.py": b"VALUE = 1\n"}
     modules = {
