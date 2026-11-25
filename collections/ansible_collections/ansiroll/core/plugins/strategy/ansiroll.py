@@ -954,7 +954,7 @@ class StrategyModule(StrategyBase):
 
     @staticmethod
     def _restore_play_fallback(value, undefined, errors=(), mapping_keys=(), *, runtime_marker=None):
-        from ansiroll.runtime import _restore_delegated_mapping_keys
+        from ansiroll.runtime import _replace_delegated_values, _restore_delegated_mapping_keys
 
         if not undefined and not errors and not mapping_keys:
             return value
@@ -981,17 +981,15 @@ class StrategyModule(StrategyBase):
                 missing = UndefinedMarker(hint=message, _no_template_source=True)
 
                 def error_marker(message):
-                    return CapturedExceptionMarker(AnsibleError(message))
+                    from ansible._internal._templating._utils import TemplateContext
+
+                    # A received marker has no local source template.
+                    with TemplateContext(template_value=None, templar=None, options=None):
+                        return CapturedExceptionMarker(AnsibleError(message))
 
         markers = [(path, missing) for path in undefined]
         markers.extend((path, error_marker(message)) for path, message in errors)
-        for path, marker in markers:
-            if not path:
-                return marker
-            container = value
-            for key in path[:-1]:
-                container = container[key]
-            container[path[-1]] = marker
+        value = _replace_delegated_values(value, markers)
         return _restore_delegated_mapping_keys(value, mapping_keys)
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
