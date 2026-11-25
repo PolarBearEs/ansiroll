@@ -1554,7 +1554,7 @@ class StrategyModule(StrategyBase):
         if status == "failed" and not is_item:
             self._tqm.send_callback(method, tr, ignore_errors=ignored)
             return not ignored
-        if status == "changed" and not frame.get("no_log") and result_data.get("diff"):
+        if status == "changed" and frame.get("diff_mode") and not frame.get("no_log") and result_data.get("diff"):
             self._tqm.send_callback("v2_on_file_diff", tr)
         self._tqm.send_callback(method, tr)
         return False

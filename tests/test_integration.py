@@ -5702,6 +5702,7 @@ def test_expanded_include_resolves_execution_mode_before_dispatch(tmp_path, monk
     (tmp_path / "child.yml").write_text(f"""- command: child
   check_mode: "{{{{ {mode} }}}}"
   diff: "{{{{ omit }}}}"
+  failed_when: false
 """)
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, check_mode=False)
     calls = []
@@ -5712,6 +5713,30 @@ def test_expanded_include_resolves_execution_mode_before_dispatch(tmp_path, monk
     runtime.run_play(_compiled_plays(compile_playbook(str(path))[0], tmp_path)[0])
     assert runtime.failed == (mode == "invalid")
     assert calls == ([(True, True)] if mode == "omit" else [])
+
+
+@pytest.mark.parametrize("diff", [False, True])
+def test_expanded_include_only_reports_module_diffs_when_enabled(tmp_path, diff):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "diff_module.py").write_text("""
+from ansible.module_utils.basic import AnsibleModule
+
+module = AnsibleModule(argument_spec={})
+module.exit_json(changed=True, diff={"before": "", "after": "unconditional-diff-marker\\n"})
+""")
+    (tmp_path / "child.yml").write_text("- diff_module:\n")
+    play = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          diff: """ + json.dumps(diff)
+    result = _run_strategy_play(tmp_path, play, "-e", "ansible_python_interpreter=" + sys.executable)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("+unconditional-diff-marker" in result.stdout) == diff
 
 
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):

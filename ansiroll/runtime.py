@@ -4159,6 +4159,7 @@ class Runtime:
         self._facts_gathered = False
         self.native_only = bool(native_only)
         self._task_provenance = {}
+        self._task_diff_modes = {}
         self.skip_run_once = bool(skip_run_once)
         self.pretty = bool(pretty)
         self.module_bundle = module_bundle
@@ -4529,6 +4530,7 @@ class Runtime:
             "ignored": ignored,
             "is_item": is_item,
             "no_log": no_log,
+            "diff_mode": self._task_diff_modes.get(id(node), False),
             "result": emitted_result,
             "provenance": self._task_provenance.get(
                 id(node), {"mode": "native-agent"}
@@ -5797,6 +5799,7 @@ class Runtime:
         res["_ansiroll_no_log"] = no_log
         if concrete is not task:
             self._task_provenance[id(task)] = self._task_provenance.pop(id(concrete), {"mode": "native-agent"})
+            self._task_diff_modes[id(task)] = self._task_diff_modes.pop(id(concrete), False)
         if notifications is not None and not _result_failed(res):
             notifications.extend(names)
         return res, fact_host
@@ -5903,7 +5906,13 @@ class Runtime:
                 )
                 if args_cache is not None:
                     args_cache["execution_modes"] = modes
+        except Exception as ex:
+            return {"failed": True, "changed": False,
+                    "msg": "ansiroll: task raised %s: %s" % (type(ex).__name__, ex),
+                    "_ansiroll_unknown_outcome": True}
+        try:
             self.check_mode, self.diff_mode, become = modes
+            self._task_diff_modes[id(task)] = self.diff_mode
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
