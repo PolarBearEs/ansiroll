@@ -4224,11 +4224,16 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
     ("lookup('vars', 'TIMEOUT_SECONDS' | lower)", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_value' | replace('value', 'seconds'))", "{timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
+    ("lookup('vars', key)", "{key: timeout_seconds, timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('ansible.builtin.vars', key)", "{key: timeout_seconds, timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
 ])
 def test_controller_timeout_detects_type_and_vars_lookup_dependencies(
         tmp_path, monkeypatch, expression, play_vars, override, expected):
+    from ansiroll.loader import _core_version
+
+    if _core_version(include_patch=True) < (2, 11, 12) and expression.startswith("lookup('ansible.builtin.vars'"):
+        pytest.skip("Ansible 2.10 and early 2.11 do not load the fully qualified vars lookup's options")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_1", "abc")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_a", "abc")
     playbook = tmp_path / "play.yml"
@@ -5801,7 +5806,7 @@ def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
     - assert:
         that: seeded == 'during_task'
       when: inventory_hostname == 'beta'
-""", inventory="alpha,beta,",
+""", "-e", json.dumps({"ansible_python_interpreter": sys.executable}), inventory="alpha,beta,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
