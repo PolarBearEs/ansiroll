@@ -2896,10 +2896,13 @@ class Runtime:
                  check_mode=False, diff_mode=False, on_result=None, become_password=None, profile=False,
                  extra_vars=None, skip_run_once=False, pretty=False,
                  module_bundle=None, resource_reader=None,
-                 host_var_overrides=None, native_only=False):
+                 host_var_overrides=None, native_only=False, inventory_defaults=None):
         self.modules = modules
-        self._initial_host_vars = dict(host_vars or {})
-        self.vars = dict(self._initial_host_vars)
+        # Standalone defaults are available to tasks without entering the host
+        # state that deferred vars-file selectors read and later plays inherit.
+        self._inventory_defaults = inventory_defaults or {}
+        self.vars = dict(host_vars or {})
+        self._initial_host_vars = {**self._inventory_defaults, **self.vars}
         self.python = python or sys.executable
         self.check_mode = check_mode
         self.diff_mode = diff_mode
@@ -2982,7 +2985,7 @@ class Runtime:
 
     # ---- context / templating -------------------------------------------
     def ctx(self, *overlays, base=None):
-        d = dict(self.vars if base is None else base)
+        d = {**self._inventory_defaults, **self.vars} if base is None else dict(base)
         for o in overlays:
             if o:
                 d.update(o)
@@ -3838,6 +3841,7 @@ class Runtime:
         # register < role params < include params < extra vars < loop item.
         ctx = {}
         ctx.update(task.get("role_defaults") or {})
+        ctx.update(self._inventory_defaults)
         ctx.update(self.vars)
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
@@ -6106,8 +6110,10 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     host_vars = dict(host_vars or {})
     host = host_vars.get("inventory_hostname") or _hostname()
     host_vars["inventory_hostname"] = _mark_unsafe(host)
-    host_vars.setdefault("inventory_hostname_short", _mark_unsafe(_inventory_hostname_short(host)))
-    host_vars.setdefault("group_names", ["ungrouped"])
+    inventory_defaults = {
+        "inventory_hostname_short": _mark_unsafe(_inventory_hostname_short(host)),
+        "group_names": ["ungrouped"],
+    }
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}
@@ -6144,7 +6150,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
                      host_var_overrides=host_var_overrides,
-                     native_only=native_only)
+                     native_only=native_only, inventory_defaults=inventory_defaults)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
         engine_profile["runtime_init"] += time.monotonic() - init_started

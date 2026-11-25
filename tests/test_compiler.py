@@ -81,6 +81,38 @@ def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
     }
 
 
+@pytest.mark.parametrize("short_override", [None, "override"])
+def test_standalone_vars_file_uses_only_explicit_inventory_inputs(tmp_path, short_override):
+    from ansiroll import compile_playbook
+
+    play = """- hosts: all
+  gather_facts: false
+  vars_files:
+    - "profiles/{{ inventory_hostname_short | default(profile) }}.yml"
+  tasks:
+    - debug:
+        msg: '{{ inventory_hostname_short }}:{{ selected }}'
+"""
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(play * 2)
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "deployment.yml").write_text("selected: deployment\n")
+    (profiles / "override.yml").write_text("selected: override\n")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    inputs = {"profile": "deployment"}
+    if short_override:
+        inputs["inventory_hostname_short"] = short_override
+    env = dict(os.environ, ANSIROLL_HOST="node.example.test", ANSIROLL_RAW="1", ANSIROLL_EXTRA_VARS=json.dumps(inputs))
+    env.pop("ANSIROLL_VARS_FILE", None)
+    completed = subprocess.run([sys.executable, str(compiled)], env=env, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    messages = [json.loads(line.split(" ", 1)[1])["result"]["msg"] for line in completed.stdout.splitlines()
+                if line.startswith("__ANSIROLL_RESULT__ ")]
+    assert messages == ["override:override" if short_override else "node:deployment"] * 2
+
+
 def test_freezing_keeps_inventory_dependent_play_vars_dynamic(tmp_path):
     from ansiroll import compile_playbook
 
