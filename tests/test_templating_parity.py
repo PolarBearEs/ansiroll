@@ -1088,6 +1088,31 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     assert not (tmp_path / "check-only.txt").exists()
 
 
+@pytest.mark.parametrize("strategy", ["linear", "ansiroll.core.ansiroll"])
+def test_delegated_template_redacts_registered_diff(tmp_path, strategy):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    hide_output: true
+  tasks:
+    - template:
+        src: source.j2
+        dest: "{{ playbook_dir }}/output.txt"
+      delegate_to: localhost
+      no_log: "{{ hide_output }}"
+      register: saved
+    - assert:
+        quiet: true
+        that:
+          - saved.diff[0].before == ''
+          - "'no_log: true' in saved.diff[0].after"
+""", {"source.j2": "new synthetic text\n", "output.txt": "old synthetic text\n"})
+    messages, recap = _ansible(path, tmp_path, strategy=strategy, diff=True)
+    assert recap[3] == "0", messages
+    assert (tmp_path / "output.txt").read_text() == "new synthetic text\n"
+
+
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 @pytest.mark.parametrize(("source", "value", "newline", "expected"), [
     ("{{ value }}\n", "ready", "\n", b"ready\n"),

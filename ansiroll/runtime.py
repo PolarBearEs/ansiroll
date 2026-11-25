@@ -8352,6 +8352,7 @@ def agent_main():
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
                 "diff_mode": bool(rt.diff_mode),
+                "no_log": bool(task.get("no_log")),
                 "fallback": bool(task.get("fallback")),
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),

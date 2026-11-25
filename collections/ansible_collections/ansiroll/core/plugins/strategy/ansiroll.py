@@ -991,6 +991,7 @@ class StrategyModule(StrategyBase):
             rt.diff_mode = bool(frame.get("diff_mode"))
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
+                "no_log": bool(frame.get("no_log")),
                 "_baked": {src: raw},
                 "_baked_meta": {src: {
                     "fullpath": fullpath,
