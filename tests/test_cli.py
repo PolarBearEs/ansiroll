@@ -853,7 +853,11 @@ def test_playbook_open_observer_bypasses_a_populated_vault_cache(tmp_path):
     opened = []
     loader.on_playbook_open = lambda path, st: opened.append((Path(os.fsdecode(path)), st.st_ino))
     Playbook.load(str(playbook), loader=loader)
-    assert opened == [(playbook, playbook.stat().st_ino)]
+    identity = (playbook, playbook.stat().st_ino)
+    assert opened == [identity]
+    playbook.unlink()
+    assert len(Playbook.load(str(playbook), loader=loader).get_plays()) == 1
+    assert opened == [identity]
 
 
 def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):

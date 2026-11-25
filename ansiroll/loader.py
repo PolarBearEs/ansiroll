@@ -522,6 +522,7 @@ def _make_rewriting_loader(DataLoader):
             super().__init__()
             self.on_playbook_open = None
             self._opening_playbook = False
+            self._observed_playbook_cache = {}
             self._deferred_import_fields = {}
 
         def _get_file_contents(self, file_name):
@@ -550,19 +551,23 @@ def _make_rewriting_loader(DataLoader):
 
             return self._decrypt_if_vault_data(Origin(path=path).tag(data))
 
-        def load_from_file(self, *args, **kwargs):
+        def load_from_file(self, file_name, *args, **kwargs):
             # Playbooks, task files, and vars files can have the same YAML shape.
             reader = sys._getframe(1).f_code
             playbook = reader is playbook_reader
             role_tasks = reader is role_reader and sys._getframe(1).f_locals.get("subdir") in ("tasks", "handlers")
             opening_playbook = self._opening_playbook
             self._opening_playbook = playbook
+            observe = playbook and self.on_playbook_open is not None
             try:
-                if playbook and self.on_playbook_open is not None:
-                    # A vars-file read may have cached these bytes without
-                    # observing the input inode. Open the playbook itself.
-                    kwargs["cache"] = "none" if _core_version() >= (2, 17) else False
-                data = super().load_from_file(*args, **kwargs)
+                if observe:
+                    path = self.path_dwim(file_name)
+                    # Only reuse parsed data whose input inode was observed.
+                    if self._FILE_CACHE.get(path) is not self._observed_playbook_cache.get(path):
+                        self._FILE_CACHE.pop(path, None)
+                data = super().load_from_file(file_name, *args, **kwargs)
+                if observe:
+                    self._observed_playbook_cache[path] = self._FILE_CACHE.get(path)
             finally:
                 self._opening_playbook = opening_playbook
             if not (playbook or role_tasks or reader in task_readers):
