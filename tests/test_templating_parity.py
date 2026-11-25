@@ -155,6 +155,97 @@ def test_implicit_setup_arguments_override_module_defaults(tmp_path, use_strateg
     assert messages == ["subset", "full"]
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores eagerly render module default mappings")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_copies_only_live_default_mapping_members(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  vars:
+    setup_defaults:
+      gather_subset: "{{ missing_and_overridden }}"
+      filter: [ansible_distribution, "{{ extra_filter | default(omit) }}"]
+  module_defaults:
+    ansible.builtin.setup: "{{ setup_defaults }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores eagerly render module default mappings")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_gather_action_defaults_take_precedence_over_setup_defaults(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.gather_facts:
+      filter: [ansible_distribution]
+    ansible.builtin.setup:
+      filter: "{{ missing_and_overridden }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_defaults_read_public_role_vars(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  roles: [settings]
+  module_defaults:
+    ansible.builtin.setup:
+      filter: "{{ fact_filter }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", {
+        "roles/settings/defaults/main.yml": "fact_filter: [ansible_distribution]\n",
+        "roles/settings/tasks/main.yml": "[]\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+def test_strategy_setup_defaults_use_the_host_selected_vars_file(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  vars:
+    fact_filter: [ansible_hostname]
+  vars_files: ['site-{{ inventory_hostname }}.yml']
+  module_defaults:
+    ansible.builtin.setup:
+      filter: "{{ fact_filter }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", {"site-localhost.yml": "fact_filter: [ansible_distribution]\n"}, use_strategy=True)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup evaluates path defaults differently")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_uses_default_fact_path_when_explicit_value_is_null(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: "{{ none }}"
+  module_defaults:
+    ansible.builtin.setup:
+      fact_path: "{{ playbook_dir }}/facts"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {"facts/probe.fact": '{"value":"default path"}\n'}, use_strategy=use_strategy)
+    assert messages == ["default path"]
+
+
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_setup_resolves_options_in_their_native_scope(tmp_path, use_strategy):
     messages, _ = _assert_parity(tmp_path, """

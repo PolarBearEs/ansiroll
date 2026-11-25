@@ -2471,6 +2471,28 @@ def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_p
     assert called == [("ansible.builtin.setup", {"fact_path": "/west", "gather_subset": ["!all", "network"]})]
 
 
+def test_standalone_setup_defaults_use_launch_selected_vars_and_final_vars_scope(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ['vars-{{ profile }}.yml']
+  module_defaults:
+    ansible.builtin.setup:
+      filter: "{{ vars.fact_filter }}"
+  tasks: []
+""")
+    (tmp_path / "vars-active.yml").write_text("fact_filter: [ansible_distribution]\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "active"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called[0][0] == "ansible.builtin.setup"
+    assert called[0][1]["filter"] == ["ansible_distribution"]
+
+
 def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

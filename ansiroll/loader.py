@@ -664,10 +664,20 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
+    gather = gather_facts
+    if gather is None:
+        gather = play.gather_facts
+        if gather is None:
+            gather = C.DEFAULT_GATHERING != "explicit"
+    setup_defaults = _setup_module_defaults(play, "ansible.builtin.setup") if gather else []
+    gather_defaults = _setup_module_defaults(play, "ansible.builtin.gather_facts") if gather else []
     scoped_options = {
         key: value for key in ("fact_path", "gather_subset")
         if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
     }
+    default_sources = _tag_untrusted(setup_defaults + gather_defaults)
+    if any(_selector_template_sources(default_sources)):
+        scoped_options["module_defaults"] = default_sources
     ordered_vars_files = [] if (
         gather_facts is None and play.gather_facts is not False
         and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
@@ -733,13 +743,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if runtime_writes is not None:
         runtime_writes.update(includes.runtime_writes)
     _assign_runtime_ids(tasks, handlers)
-    # The strategy supplies the iterator's filtered setup decision. Standalone
-    # uses the play keyword and the controller's default gathering policy.
-    gather = gather_facts
-    if gather is None:
-        gather = play.gather_facts
-        if gather is None:
-            gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
     core_version = _core_version()
@@ -771,7 +774,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if deferred:
         result["deferred_vars_files"] = deferred
     if gather:
-        setup_defaults = _setup_module_defaults(play)
         setup_options = {
             name: value
             for name in ("gather_subset", "fact_path")
@@ -780,11 +782,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         # Older cores expose their default subset on the loaded Play. Leave
         # the equivalent setup default implicit when the play did not set it.
         play_data = play.get_ds() or {}
-        if (not setup_defaults and setup_options.get("gather_subset") == ["all"]
+        if (not (setup_defaults or gather_defaults) and setup_options.get("gather_subset") == ["all"]
                 and "gather_subset" not in play_data):
             del setup_options["gather_subset"]
         if setup_defaults:
             result["gather_setup_defaults"] = _tag_untrusted(setup_defaults)
+        if gather_defaults:
+            result["gather_action_defaults"] = _tag_untrusted(gather_defaults)
+        if setup_defaults or gather_defaults:
             if "gather_timeout" not in play_data and play.gather_timeout is not None:
                 result["gather_timeout"] = play.gather_timeout
         if setup_options:
@@ -862,12 +867,14 @@ def _apply_force_handlers_default(play):
         pass
 
 
-def _setup_module_defaults(play):
-    action = "ansible.builtin.setup"
+def _setup_module_defaults(play, action):
     defaults = {}
-    for layer in play.module_defaults or ():
+    layers = play.module_defaults or ()
+    if isinstance(layers, dict):
+        layers = (layers,)
+    for layer in layers:
         defaults.update(layer)
-    groups = (play._action_groups or {}).get(action, ())
+    groups = (getattr(play, "_action_groups", None) or {}).get(action, ())
     inherited = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
     inherited.append(defaults.get(action))
     return [entry for entry in inherited if entry]

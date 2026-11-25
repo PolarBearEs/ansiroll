@@ -528,21 +528,34 @@ class StrategyModule(StrategyBase):
     def _gather_setup_options(self, host, gather_task):
         from ansiroll.loader import _core_version
 
-        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
-                   if key in gather_task.args}
-        error = None
-        if options:
-            try:
-                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
-                values["ansible_search_path"] = gather_task.get_search_path()
-                options = self._mk_templar(values).template(options)
-                if _core_version() < (2, 19) and (omit := values.get("omit")):
-                    from ansible.executor.task_executor import remove_omit
+        try:
+            values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+            values["ansible_search_path"] = gather_task.get_search_path()
+            templar = self._mk_templar(values)
+            task = gather_task.copy()
+            task.args = dict(gather_task.args)
+            if _core_version() >= (2, 19):
+                from ansible.executor.module_common import _apply_action_arg_defaults
 
-                    options = remove_omit(options, omit)
-            except AnsibleError as ex:
-                error = str(ex)
-        return {"options": options if error is None else {}, "error": error}
+                task.post_validate(templar=templar._engine)
+                options = {key: value for key, value in task.args.items() if value is not None}
+                options = _apply_action_arg_defaults("ansible.builtin.setup", task, options, templar)
+            else:
+                from ansible.executor.module_common import get_action_args_with_defaults
+                from ansible.executor.task_executor import remove_omit
+
+                task.post_validate(templar=templar)
+                args = {key: value for key, value in task.args.items() if value is not None}
+                groups = {"action_groups": getattr(self._cur_play, "_action_groups", {})} if _core_version() >= (2, 12) else {}
+                args = get_action_args_with_defaults(
+                    "ansible.builtin.gather_facts", args, task.module_defaults, templar, **groups)
+                if omit := values.get("omit"):
+                    args = remove_omit(args, omit)
+                options = get_action_args_with_defaults(
+                    "ansible.builtin.setup", args, task.module_defaults, templar, **groups)
+        except (AnsibleError, ValueError, TypeError) as ex:
+            return {"options": {}, "error": str(ex)}
+        return {"options": options, "error": None}
 
     def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
         host_failed = False

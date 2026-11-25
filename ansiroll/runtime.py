@@ -995,6 +995,16 @@ def _strip_omit(args):
     return args
 
 
+def _setup_omit(args):
+    if not _core_at_least(2, 19):
+        return _fail_on_undef(_strip_omit(args))
+    if isinstance(args, dict):
+        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT}
+    if isinstance(args, (list, tuple)):
+        return [_setup_omit(value) for value in args if value != _OMIT]
+    return _fail_on_undef(args)
+
+
 def _fail_on_undef(value):
     """Raise the captured error of any Undefined nested in a value."""
     if isinstance(value, dict):
@@ -4585,7 +4595,9 @@ class Runtime:
                 task_blocks = dict(option_blocks)
                 for layer in (self._include_vars_layer, self._set_fact_overrides):
                     _clear_vars_file_blocks(task_blocks, layer, merge_vars_files)
-                option_contexts["fact_path"] = (self._layered_ctx(self.ctx(option_vars)), task_blocks)
+                setup_task_scope = self._layered_ctx(self.ctx(option_vars))
+                setup_task_scope["vars"] = _vars_snapshot(setup_task_scope)
+                option_contexts["fact_path"] = (setup_task_scope, task_blocks)
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -4596,6 +4608,7 @@ class Runtime:
                 gather_timeout=play.get("gather_timeout"),
                 setup_options=play.get("gather_setup_options"),
                 setup_defaults=play.get("gather_setup_defaults"),
+                gather_defaults=play.get("gather_action_defaults"),
                 option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
@@ -6818,10 +6831,25 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
+    def _render_setup_defaults(self, layers, explicit_args, ctx):
+        defaults = {}
+        for entry in layers or ():
+            if isinstance(entry, str):
+                entry = self.templater.render_string(entry, ctx, strict=True)
+                if isinstance(entry, _LazyTplDict):
+                    entry = entry._raw
+            if _is_undef(entry):
+                _fail_on_undef(entry)
+            if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
+                raise ValueError("setup module defaults must resolve to a dictionary")
+            defaults.update(entry)
+        inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
+        return _setup_omit(self.template(inherited, ctx, strict=True))
+
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None, setup_defaults=None, option_contexts=None):
+                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -6847,11 +6875,11 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            if self.gather_setup_fn is not None and setup_options:
+            if self.gather_setup_fn is not None and (setup_options or setup_defaults or gather_defaults):
                 controller_setup = self.gather_setup_fn()
                 if controller_setup["error"] is not None:
                     raise ValueError(controller_setup["error"])
-                resolved_options = controller_setup["options"]
+                setup_args = controller_setup["options"]
             else:
                 authored_options = dict(setup_options or {})
                 if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
@@ -6866,24 +6894,17 @@ class Runtime:
                             if inputs is None or _vars_file_reads_blocked(blocks, paths):
                                 raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
                     resolved_options[key] = self.template(value, scope, strict=True)
-                resolved_options = _fail_on_undef(_strip_omit(resolved_options))
-                if _core_at_least(2, 19) and isinstance(resolved_options.get("gather_subset"), list):
-                    resolved_options["gather_subset"] = [item for item in resolved_options["gather_subset"]
-                                                         if item != _OMIT]
-            setup_args = {key: value for key, value in resolved_options.items() if value is not None}
-            gather_timeout = self._gather_timeout_for_run(
-                gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
-            if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
-                setup_args["gather_timeout"] = gather_timeout
-            defaults = {}
-            for entry in setup_defaults or ():
-                if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
-                    entry = _fail_on_undef(self.template(entry, ctx, strict=True))
-                if not isinstance(entry, dict):
-                    raise ValueError("setup module defaults must resolve to a dictionary")
-                defaults.update(entry)
-            inherited = {key: value for key, value in defaults.items() if key not in setup_args}
-            setup_args.update(_fail_on_undef(_strip_omit(self.template(inherited, ctx, strict=True))))
+                if not _core_at_least(2, 18) and resolved_options.get("gather_subset") == _OMIT:
+                    resolved_options["gather_subset"] = ["all"]
+                setup_args = {key: value for key, value in _setup_omit(resolved_options).items() if value is not None}
+                gather_timeout = self._gather_timeout_for_run(
+                    gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
+                if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
+                    setup_args["gather_timeout"] = gather_timeout
+                if gather_defaults or setup_defaults:
+                    defaults_ctx, _ = (option_contexts or {}).get("fact_path", (ctx, ()))
+                    for layers in (gather_defaults, setup_defaults):
+                        setup_args.update(self._render_setup_defaults(layers, setup_args, defaults_ctx))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
