@@ -4418,6 +4418,9 @@ class Runtime:
         # Reporting only; recap tallies are applied explicitly by the caller so
         # rescued/ignored/loop semantics match Ansible.
         emitted_result = result
+        include_register = None
+        include = node.get("type") == "include"
+        send_register = self.on_result and include and node.get("register") and not is_item
         if node.get("no_log"):
             emitted_result = {
                 "censored": ("the output has been hidden due to the fact that "
@@ -4426,6 +4429,18 @@ class Runtime:
             if is_item:
                 item = "(censored due to no_log)"
                 emitted_result["_ansible_item_label"] = item
+            if send_register:
+                include_register = _pack_delegated_value(result)
+        elif include:
+            try:
+                json.dumps((result, item), default=str)
+            except TypeError:
+                # Leave presentation JSON-safe and keep the original keys for register.
+                packed = _pack_delegated_value(result)
+                emitted_result = packed["value"]
+                item = _pack_delegated_value(item)["value"] if item is not None else None
+                if send_register:
+                    include_register = packed
         if name is None:
             started_node, started_name = self._started_task_name
             name = started_name if started_node is node else self._node_name(node)
@@ -4447,8 +4462,8 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
-            if node.get("type") == "include" and node.get("no_log") and node.get("register") and not is_item:
-                frame["include_register"] = _pack_delegated_value(result)
+            if include_register is not None:
+                frame["include_register"] = include_register
             if (not is_item and not node.get("no_log") and node.get("register")
                     and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
                 entries = result["results"] if "results" in result else [result]
@@ -7746,6 +7761,31 @@ def _pack_delegated_value(value):
     return result
 
 
+def _restore_delegated_mapping_keys(value, mapping_keys):
+    def restore_key(key):
+        if isinstance(key, list):
+            return tuple(restore_key(part) for part in key)
+        if isinstance(key, dict):
+            from datetime import date, datetime
+
+            if "bytes" in key:
+                return base64.b64decode(key["bytes"], validate=True)
+            if "date" in key:
+                return date.fromisoformat(key["date"])
+            return datetime.fromisoformat(key["datetime"])
+        return key
+
+    # Decode inner mappings before changing the keys used to reach them.
+    for path, keys in reversed(mapping_keys):
+        container = value
+        for key in path:
+            container = container[key]
+        entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
+        container.clear()
+        container.update(entries)
+    return value
+
+
 def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=None):
     """Materialize an agent-only alias after the controller asks for it."""
     try:
@@ -7838,10 +7878,13 @@ def agent_main():
     host = g.get("_INJECTED_HOST") or _hostname()
     host_vars = {"inventory_hostname": host}
     host_vars.update(g.get("_BAKED_GROUP_VARS") or {})
-    if "_INJECTED_VARS" in g:
-        host_vars.update(g["_INJECTED_VARS"])
-    extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
+    injected_vars = g.get("_INJECTED_VARS") or {}
     host_var_overrides = g.get("_INJECTED_HOST_VAR_OVERRIDES") or {}
+    mapping_keys = g.get("_INJECTED_VAR_MAPPING_KEYS") or {}
+    _restore_delegated_mapping_keys(injected_vars, mapping_keys.get("host", ()))
+    _restore_delegated_mapping_keys(host_var_overrides, mapping_keys.get("overrides", ()))
+    host_vars.update(injected_vars)
+    extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
     specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
     specialized_vars.update(g.get("_FROZEN_VARS") or {})
     conflicts = sorted(k for k, value in specialized_vars.items()

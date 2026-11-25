@@ -2215,7 +2215,8 @@ def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_pat
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern native tuple keys")
-def test_strategy_censored_include_can_transport_tuple_mapping_keys(tmp_path):
+@pytest.mark.parametrize("no_log", [False, True])
+def test_strategy_include_register_preserves_tuple_mapping_keys_across_plays(tmp_path, no_log):
     path = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -2224,10 +2225,17 @@ def test_strategy_censored_include_can_transport_tuple_mapping_keys(tmp_path):
       loop: "{{ [{(1, 2): 'private'}] }}"
       when: false
       register: selected
-      no_log: true
-""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+      no_log: %s
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert:
+        quiet: true
+        that: selected.results[0].item[(1, 2)] == 'private'
+""" % str(no_log).lower(), {"child.yml": "- debug: {msg: unexpected body}\n"})
     messages, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
     assert messages == []
+    assert recap[3] == "0"
     assert recap[4] == "1"
 
 
