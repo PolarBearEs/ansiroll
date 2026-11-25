@@ -4026,11 +4026,16 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
     ("lookup('vars', 'TIMEOUT_SECONDS' | lower)", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_value' | replace('value', 'seconds'))", "{timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
+    ("lookup('vars', key)", "{key: timeout_seconds, timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('ansible.builtin.vars', key)", "{key: timeout_seconds, timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
 ])
 def test_controller_timeout_detects_type_and_vars_lookup_dependencies(
         tmp_path, monkeypatch, expression, play_vars, override, expected):
+    from ansiroll.loader import _core_version
+
+    if _core_version(include_patch=True) < (2, 11, 12) and expression.startswith("lookup('ansible.builtin.vars'"):
+        pytest.skip("Ansible 2.10 and early 2.11 do not load the fully qualified vars lookup's options")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_1", "abc")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_a", "abc")
     playbook = tmp_path / "play.yml"
@@ -5603,7 +5608,7 @@ def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
     - assert:
         that: seeded == 'during_task'
       when: inventory_hostname == 'beta'
-""", inventory="alpha,beta,",
+""", "-e", json.dumps({"ansible_python_interpreter": sys.executable}), inventory="alpha,beta,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -5651,6 +5656,72 @@ RETRY_OPTIONS    - assert:
         ).replace("RECIPIENT", "marker == 'first'" if mixed else "marker is undefined"),
         inventory="origin,recipient,",
     )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("templated_action", [False, True])
+def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path, templated_action):
+    from ansiroll.loader import _core_version
+
+    if templated_action and _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""ACTION:
+    "{{ item.key }}": "{{ item.value }}"
+  delegate_to: recipient
+  delegate_facts: "{{ item.route }}"
+  loop:
+    - {key: local_marker, value: local, route: false}
+    - {key: remote_marker, value: remote, route: true}
+  register: fact_results
+  retries: 2
+  delay: 0
+  until: item.route is false or fact_results.attempts >= 2
+""".replace("ACTION", '- action: "{{ fact_action }}"\n  args' if templated_action else "- set_fact"))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+    fact_action: set_fact
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - fact_results.results[1].attempts == 2
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_routes_literal_false_delegation_in_dynamic_roles(tmp_path, flag):
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- set_fact:
+    local_marker: "{{ item }}"
+  delegate_to: recipient
+  delegate_facts: FLAG
+  loop: [first, second]
+""".replace("FLAG", flag))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
+""", inventory="origin,recipient,")
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
