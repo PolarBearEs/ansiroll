@@ -5049,7 +5049,7 @@ def test_strategy_allows_on_target_delegation_when_fact_flag_is_false(tmp_path, 
     route_facts: false
   tasks:
     - set_fact: {marker: value}
-      delegate_to: localhost
+      delegate_to: "{{ missing_host }}"
       delegate_facts: "{{ FLAG }}"
     - assert: {that: "marker == 'value'"}
 """.replace("FLAG", flag), inventory="origin,",

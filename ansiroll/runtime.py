@@ -5615,13 +5615,15 @@ class Runtime:
         concrete = task
         if task.get("delegate_to") and task["action"].rsplit(".", 1)[-1] == "set_fact":
             try:
-                target = _fail_on_undef(self.template(task["delegate_to"], ctx))
-                if target == _OMIT:
-                    target = None
-                elif not isinstance(target, str) or not target:
-                    raise ValueError("delegate_to must resolve to a nonempty host name")
                 flag = _fail_on_undef(self.template(task.get("delegate_facts", False), ctx))
                 delegate_facts = flag != _OMIT and _boolean(flag, strict=True)
+                target = None
+                if delegate_facts or not self.delegate_on_target:
+                    target = _fail_on_undef(self.template(task["delegate_to"], ctx))
+                    if target == _OMIT:
+                        target = None
+                    elif not isinstance(target, str) or not target:
+                        raise ValueError("delegate_to must resolve to a nonempty host name")
                 fact_host = self._delegated_fact_host(target) if delegate_facts else None
                 if self.delegate_on_target and fact_host is not None:
                     raise ValueError("delegate_facts is incompatible with ansiroll_delegate_on_target")
