@@ -4585,6 +4585,11 @@ class Runtime:
                 option_contexts["gather_subset"] = (option_ctx, option_blocks)
                 host_vars = {key: value for key, value in self._task_host_vars().items()
                              if key not in self._include_vars_layer and key not in self._set_fact_overrides}
+                if merge_setup_scope:
+                    inject_facts = self.vars["__ansiroll_controller_config"].get("INJECT_FACTS_AS_VARS", True)
+                    for key, value in self._module_fact_layer.items():
+                        if inject_facts or key == "ansible_local":
+                            host_vars.setdefault(key, value)
                 task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
                 task_blocks = {}
                 if vars_files:
@@ -5002,7 +5007,7 @@ class Runtime:
                                  % (item,))
         return selector_vars if before_setup else selected
 
-    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False):
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -5018,6 +5023,12 @@ class Runtime:
             analysis = _selector_scope(expression, ctx)
             for call in analysis[2]:
                 method = call.node
+                if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
+                        and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
+                                              for arg in call.args)
+                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
+                        and not (call.dyn_args or call.dyn_kwargs)):
+                    continue
                 if not (isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS):
                     return None
             for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
@@ -6879,7 +6890,8 @@ class Runtime:
                     if blocks:
                         for source, _, _ in _selector_template_sources(value):
                             paths = set()
-                            inputs = self._pre_setup_template_inputs(source, scope, selector=True, paths=paths)
+                            inputs = self._pre_setup_template_inputs(
+                                source, scope, selector=True, paths=paths, setup_lookups=True)
                             if inputs is None or _vars_file_reads_blocked(blocks, paths):
                                 raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
                     resolved_options[key] = self.template(value, scope, strict=True)

@@ -2497,6 +2497,56 @@ def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(
     assert called == [("ansible.builtin.setup", {"fact_path": "/controller-facts"})]
 
 
+def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["vars-{{ lookup('vars', 'profile') }}.yml"]
+  fact_path: "{{ lookup('env', 'ANSIROLL_INDEPENDENT_FACT_PATH') }}"
+  tasks: []
+""")
+    (tmp_path / "vars-late.yml").write_text("unrelated: value\n")
+    monkeypatch.setenv("ANSIROLL_INDEPENDENT_FACT_PATH", "/independent")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "late"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert called == [("ansible.builtin.setup", {"fact_path": "/independent"})]
+    assert runtime.vars["unrelated"] == "value"
+
+
+def test_implicit_fact_path_merges_cached_facts_with_set_fact(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  tasks:
+    - set_fact:
+        ansible_local: {settings: {other: true}}
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ ansible_local.settings.directory }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        return {"ansible_facts": {"ansible_local": {"settings": {"directory": "/cached"}}}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    for play in _compiled_plays(source, tmp_path):
+        runtime.run_play(play)
+    assert called == [("ansible.builtin.setup", {}), ("ansible.builtin.setup", {"fact_path": "/cached"})]
+
+
 def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
