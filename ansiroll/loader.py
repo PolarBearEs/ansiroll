@@ -2181,7 +2181,7 @@ def _convert_task(task, actions, basedir):
 
     args = _clean_args(task.args)
     unarchive = action.rsplit(".", 1)[-1] == "unarchive"
-    builtin_unarchive = unarchive and find_module(action)[1] == "ansible.builtin.unarchive"
+    builtin_unarchive = unarchive and _is_builtin_unarchive(action)
     if builtin_unarchive and "copy" in args:
         literal_copy = _source_flag(args["copy"])
         if literal_copy is not None:
@@ -2580,6 +2580,17 @@ def _bake_sources(node, task, basedir):
     node["_baked"] = baked
     if meta:
         node["_baked_meta"] = meta
+
+
+def _is_builtin_unarchive(action):
+    path, resolved = find_module(action)
+    if resolved == "ansible.builtin.unarchive":
+        return True
+    if path and action in ("unarchive", "ansible.legacy.unarchive"):
+        # Core 2.10 can report the requested alias as the resolved name.
+        builtin, _ = find_module("ansible.builtin.unarchive")
+        return bool(builtin and os.path.realpath(path) == os.path.realpath(builtin))
+    return False
 
 
 def _remote_src(args, *, unarchive=False):
