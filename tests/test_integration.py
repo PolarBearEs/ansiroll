@@ -2775,6 +2775,30 @@ def test_ordered_timeout_does_not_keep_unselected_compile_value(tmp_path, monkey
     assert called == [("ansible.builtin.setup", {"gather_timeout": 20})]
 
 
+def test_standalone_replays_later_vars_file_after_launch_selected_earlier_file(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    flavor: default
+  vars_files: ['gather-{{ profile }}.yml', '{{ flavor }}.yml']
+  tasks:
+    - assert:
+        that:
+          - flavor == 'custom'
+          - picked == 'custom'
+""")
+    (tmp_path / "gather-runtime.yml").write_text("flavor: custom\n")
+    (tmp_path / "default.yml").write_text("picked: default\n")
+    (tmp_path / "custom.yml").write_text("picked: custom\n")
+    source, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True,
+                            env={**os.environ, "ANSIROLL_EXTRA_VARS": '{"profile": "runtime"}'}, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_ordered_task_vars_files_merge_with_compile_only_timeout(tmp_path, monkeypatch):
     from ansible import constants as C
 

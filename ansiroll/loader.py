@@ -642,11 +642,14 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    ordered_vars_files = [] if (
-        gather_facts is None and play.gather_facts is not False
-        and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
-        and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
-    ) else None
+    vars_file_entries = _as_list(getattr(play, "vars_files", None))
+    replay_order = any(_is_templated(filename)
+                       for entry in vars_file_entries[:-1]
+                       for filename in _as_list(entry))
+    early_timeout = (play.gather_facts is not False
+                     and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
+                     and _is_templated(play.gather_timeout))
+    ordered_vars_files = [] if gather_facts is None and (replay_order or early_timeout) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
