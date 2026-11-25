@@ -4143,6 +4143,7 @@ class Runtime:
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
+        self.on_rescue = None
         self._started_task_name = (None, None)
         self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
         self.templater = _Templater()
@@ -4902,6 +4903,8 @@ class Runtime:
                 }
                 self.vars.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
+                if self.on_rescue is not None:
+                    self.on_rescue(ex.task, ex.result)
                 yield from self._failed_include_steps(ex)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
@@ -7992,6 +7995,11 @@ def agent_main():
                  resource_reader=g.get("_ansiroll_resource_read"))
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
+    rt.on_rescue = lambda task, result: _chan_send(resp_fd, {
+        "t": "rescue",
+        "task": task.get("runtime_id") or task.get("uuid"),
+        "result": _pack_include_value(result),
+    })
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):

@@ -569,6 +569,10 @@ class StrategyModule(StrategyBase):
                 self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "rescue":
+                task = task_map.get(frame.get("task"))
+                if task is not None:
+                    self._mirror_rescued_failure(host, task, frame["result"])
             elif t == "delegate":
                 delegate_started = time.monotonic()
                 chan.send({"t": "delegate_result",
@@ -605,6 +609,25 @@ class StrategyModule(StrategyBase):
                 break
             last_frame = now
         return host_failed
+
+    def _mirror_rescued_failure(self, host, task, result):
+        # This is variable state for later plays. Display has already received
+        # the ordinary result frame with any no_log censoring applied.
+        if _UnifiedTaskResult is None:
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            failed_task = wrap_var(task.serialize())
+            value = wrap_var(result["value"])
+        else:
+            failed_task = task.dump_attrs()
+            value = result["value"]
+        failure = self._restore_play_fallback(
+            value, result["undefined"], result.get("errors", ()), result.get("mapping_keys", ()),
+        )
+        self._variable_manager.set_nonpersistent_facts(host.name, {
+            "ansible_failed_task": failed_task,
+            "ansible_failed_result": failure,
+        })
 
     @staticmethod
     def _read_controller_source(path, *, role_task=None):

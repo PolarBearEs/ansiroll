@@ -4833,6 +4833,34 @@ def test_strategy_honors_play_level_local_connection(tmp_path):
     assert "ok=1" in proc.stdout
 
 
+@pytest.mark.parametrize("no_log", [False, True])
+def test_strategy_preserves_rescued_failure_facts_in_later_plays(tmp_path, no_log):
+    failure = "rescued-failure-marker"
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - name: Original failure
+          fail:
+            msg: FAILURE_MARKER
+          no_log: NO_LOG
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - ansible_failed_result.msg == 'FAILURE_MARKER'
+          - ansible_failed_task.name == 'Original failure'
+""".replace("NO_LOG", str(no_log).lower()).replace("FAILURE_MARKER", failure))
+    assert result.returncode == 0, result.stdout + result.stderr
+    if no_log:
+        assert failure not in result.stdout + result.stderr
+
+
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
