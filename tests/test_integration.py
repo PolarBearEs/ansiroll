@@ -6476,6 +6476,34 @@ def _run_vars_file_include_profile(plan, profile):
     return runtime, [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
 
 
+def test_vars_file_include_keeps_binding_when_optional_file_is_missing(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 15):
+        pytest.skip("Ansible Core before 2.15 requires the vars file")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files:
+    - 'profile-{{ profile }}.yml'
+    - 'optional-{{ profile }}.yml'
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    (tmp_path / "profile-normal.yml").write_text("task_file: unused.yml\n")
+    (tmp_path / "profile-alternate.yml").write_text("task_file: keep.yml\n")
+    (tmp_path / "optional-normal.yml").write_text("task_file: override.yml\n")
+    for name in ("keep", "override"):
+        (tmp_path / f"{name}.yml").write_text(f"- debug: {{msg: {name}}}\n")
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile, expected in (("normal", "override"), ("alternate", "keep")):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [expected]
+
+
 @pytest.mark.parametrize("selector", ["mapping-member", "controller-default", "literal-wrapper", "many-profiles"])
 def test_vars_file_include_retains_portable_choices(tmp_path, selector):
     instruction = "- include_tasks: '{{ cfg.task_file }}'\n" if selector == "mapping-member" else "- include_tasks: '{{ task_file }}'\n"
@@ -6582,8 +6610,8 @@ def test_vars_file_alternate_static_import_uses_safe_candidate_scope(tmp_path, m
         assert messages == ["imported-alternate"]
 
 
-@pytest.mark.parametrize("alias", ["{{ child }}", "{{ child_alias }}"])
-def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, alias):
+@pytest.mark.parametrize("alias", ["{{ child }}", "{{ child_alias }}", "{{ cfg.child }}"])
+def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, alias, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
@@ -6593,7 +6621,9 @@ def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, 
     - include_tasks: '{{ task_file }}'
 """)
     for profile in ("normal", "alternate"):
-        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: entry.yml\nchild: {profile}.yml\n")
+        child = "{{ child }}" if profile == "alternate" else "normal.yml"
+        (tmp_path / f"profile-{profile}.yml").write_text(
+            f"task_file: entry.yml\nchild: {profile}.yml\ncfg: {{child: '{child}'}}\n")
         (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: imported-{profile}}}\n")
     (tmp_path / "entry.yml").write_text(f"- import_tasks: '{alias}'\n")
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
@@ -6601,6 +6631,14 @@ def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, 
         runtime, messages = _run_vars_file_include_profile(plan, profile)
         assert not runtime.failed, messages
         assert messages == [f"imported-{profile}"]
+
+    secret = "ANSIROLL_TEST_ALT_IMPORT_SECRET"
+    monkeypatch.setenv(secret, "must-not-be-captured")
+    (tmp_path / "alternate.yml").write_text(f'''- debug:
+    msg: "{{{{ lookup('env', '{secret}') }}}}"
+''')
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "must-not-be-captured" not in json.dumps(plan)
 
 
 def test_vars_file_include_retains_native_static_import_magic(tmp_path):

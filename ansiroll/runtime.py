@@ -704,9 +704,19 @@ def _literal_vars_input(value):
     return value
 
 
-def _vars_input_at(scope, name, path):
+def _raw_include_input(value):
+    if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
+        return str(value)
+    if isinstance(value, (_LazyTplDict, _LazyTplList)):
+        return value._raw
+    return value
+
+
+def _vars_input_at(scope, name, path, *, raw_containers=False):
     value = scope.get(name, _MISSING_VARS_FILE_INPUT)
     for member in path:
+        if raw_containers:
+            value = _raw_include_input(value)
         value = _literal_vars_input(value)
         if member is None:
             # None marks a branch choice rather than a member lookup.
@@ -746,12 +756,7 @@ def _same_vars_input(left, right):
 
 
 def _include_input_at(scope, name, path):
-    value = _vars_input_at(scope, name, path)
-    if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
-        return str(value)
-    if isinstance(value, (_LazyTplDict, _LazyTplList)):
-        return value._raw
-    return value
+    return _raw_include_input(_vars_input_at(scope, name, path, raw_containers=True))
 
 
 def _clear_vars_file_blocks(blocked, mapping, merge_hashes):

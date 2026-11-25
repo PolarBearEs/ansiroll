@@ -963,7 +963,7 @@ def _selected_include_lookup_nodes(nodes):
         node = dict(node)
         if "include_selector" in node:
             node["tasks"] = [branch for branch in node["tasks"]
-                             if branch["include_variant"] == node["compile_selection"]]
+                             if branch["include_build_selected"]]
         for key in ("block", "rescue", "always", "tasks", "handlers"):
             if node.get(key):
                 node[key] = _selected_include_lookup_nodes(node[key])
@@ -1865,9 +1865,8 @@ def _vars_file_variant_choices(entry, scope, constraints):
 
     directories = [folder for path in entry["dirs"] for folder in (
         (os.path.join(path, entry["subdir"]), path) if entry.get("subdir") else (path,))]
+    matched = False
     for path, data in entry["files"].items():
-        if not isinstance(data, list):
-            continue
         spellings = [path, *(os.path.relpath(path, directory) for directory in directories)]
         matching = set()
         default_matches = set()
@@ -1882,22 +1881,32 @@ def _vars_file_variant_choices(entry, scope, constraints):
                                 name not in scope or fallback[1] and not scope[name]):
                             default_matches.add((name, match[1]))
         if not matching:
-            yield data, constraints
+            matched = True
+            if isinstance(data, list):
+                yield data, constraints
         else:
             for name, value in sorted(matching):
                 if name in constraints and constraints[name] is None:
                     authored = scope.get(name)
                     if ((name, value) in default_matches or not isinstance(authored, str)
                             or _is_templated(authored) or authored == value):
-                        yield data, constraints
+                        matched = True
+                        if isinstance(data, list):
+                            yield data, constraints
                     continue
                 if constraints.get(name, value) != value:
+                    continue
+                matched = True
+                if not isinstance(data, list):
                     continue
                 yield data, {**constraints, name: value}
                 if name not in constraints and (scope.get(name) == value or (name, value) in default_matches):
                     # This file can be chosen without a launch override, so
                     # a later assignment can supply the next filename's selector.
                     yield data, {**constraints, name: None}
+    if not matched and not can_skip and all(field is not None for _, field in fields) and _core_version() >= (2, 15):
+        # Modern Core keeps the preceding vars when no templated candidate exists.
+        yield [], constraints
 
 
 def _include_variant_key(task, sources, includes, *, portable=False):
@@ -2089,7 +2098,8 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             actions.update(variant_actions)
             writes.update(branch.runtime_writes | branch.variant_writes)
             body = {"type": "block", "block": expanded["tasks"], "include_variant": _include_variant_label(key),
-                    "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref")}
+                    "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref"),
+                    "include_build_selected": build_selected}
             if variant_inputs is not None:
                 body["include_variant_inputs"] = variant_inputs
             bodies.append(body)
