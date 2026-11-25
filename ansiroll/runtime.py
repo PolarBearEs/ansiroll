@@ -5532,9 +5532,14 @@ class Runtime:
         try:
             check_override = task.get("check_mode")
             if check_override is not None:
-                if isinstance(check_override, str):
-                    check_override = self.template(check_override, ctx)
-                self.check_mode = _boolean(check_override)
+                check_override = _fail_on_undef(self.template(check_override, ctx))
+                omit_token = ctx.get("omit")
+                if (check_override == _OMIT or (
+                        isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__")
+                        and check_override == omit_token)):
+                    check_override = task.get("check_mode_on_omit")
+                if check_override is not None:
+                    self.check_mode = _boolean(check_override, strict=True)
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):

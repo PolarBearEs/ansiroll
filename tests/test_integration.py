@@ -4750,6 +4750,45 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None):
     )
 
 
+def test_standalone_task_omit_preserves_invocation_check_mode(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - command: /bin/true
+      check_mode: "{{ omit }}"
+""")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, check_mode=True)
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert runtime.stats["skipped"] == 1
+    assert not runtime.failed
+
+
+@pytest.mark.parametrize("parent_override", [False, True], ids=["invocation", "parent"])
+def test_strategy_preserves_check_mode_on_omit(tmp_path, parent_override):
+    directives = "      check_mode: false\n" if parent_override else ""
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - copy:
+            content: sample
+            dest: "{{ playbook_dir }}/result"
+          check_mode: "{{ omit }}"
+""" + directives
+    output = tmp_path / "result"
+    expected = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
+                                  environment={"ANSIBLE_STRATEGY": "linear"})
+    assert expected.returncode == 0, expected.stdout + expected.stderr
+    native_wrote_file = output.exists()
+    if native_wrote_file:
+        output.unlink()
+    actual = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local")
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    assert output.exists() == native_wrote_file
+
+
 def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):
     (tmp_path / "settings-localhost.yml").write_text(
         'value: "{{ lookup(\'env\', \'ANSIROLL_TEST_HOST_SELECTED_ENV\') }}"\n'
