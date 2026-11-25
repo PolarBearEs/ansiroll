@@ -1514,6 +1514,98 @@ def test_debug_and_set_fact_register():
     assert rt.stats["ok"] == 2
 
 
+def test_delegated_set_fact_is_visible_through_hostvars_only():
+    rt, frames = run([
+        _task("1", "route", "set_fact", args={"marker": "target value"},
+              delegate_to="recipient", delegate_facts=True, register="issued"),
+        _task("2", "show", "debug", args={"msg": "{{ hostvars.recipient.marker }}"}),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert "marker" not in rt.vars
+    assert rt.vars["issued"]["ansible_facts"]["marker"] == "target value"
+    assert by_name(frames, "show")[0]["result"]["msg"] == "target value"
+
+
+def test_delegated_set_fact_publishes_only_after_a_successful_loop():
+    rt, frames = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item }}"},
+              delegate_to="recipient", delegate_facts="y", register="issued",
+              loop=[1, 2], failed_when=["item == 2"], ignore_errors=True),
+        _task("2", "local", "set_fact", args={"marker": "local"},
+              delegate_to="{{ missing | default(omit) }}", delegate_facts=True),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert rt.vars["hostvars"]["recipient"] == {}
+    assert rt.vars["issued"]["failed"]
+    assert rt.vars["marker"] == "local"
+    assert by_name(frames, "local")[0]["status"] == "ok"
+
+
+def test_delegated_set_fact_preserves_loop_order_when_target_is_current_host():
+    rt, _ = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item.value }}"},
+              delegate_to="{{ item.host | default(omit) }}", delegate_facts=True,
+              loop=[{"host": "origin", "value": "first"}, {"value": "last"}]),
+    ], host_vars={"inventory_hostname": "origin"})
+    assert rt.vars["marker"] == "last"
+
+
+def test_delegated_set_fact_routes_each_loop_item():
+    rt, _ = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item.value }}"},
+              delegate_to="{{ item.host | default(omit) }}", delegate_facts="{{ item.route }}",
+              loop=[
+                  {"value": "remote", "host": "recipient", "route": True},
+                  {"value": "local", "host": "recipient", "route": False},
+              ]),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert rt.vars["hostvars"]["recipient"] == {"marker": "remote"}
+    assert rt.vars["marker"] == "local"
+
+
+def test_local_cacheable_facts_feed_later_delegated_loop_items():
+    rt, _ = run([
+        _task("1", "increment", "set_fact",
+              args={"marker": "{{ (ansible_facts.marker | default(0) | int) + 1 }}", "cacheable": True},
+              delegate_to="recipient", delegate_facts=False, loop=[1, 2]),
+    ], host_vars={"inventory_hostname": "origin", "ansible_facts": {}, "hostvars": {"recipient": {}}})
+    assert rt.vars["ansible_facts"]["marker"] == 2
+    assert rt.vars["hostvars"]["recipient"] == {}
+
+
+def test_delegated_cacheable_fact_preserves_explicit_ansible_facts():
+    rt, _ = run([
+        _task("1", "explicit", "set_fact", args={"ansible_facts": "explicit"},
+              delegate_to="recipient", delegate_facts=True),
+        _task("2", "cached", "set_fact", args={"marker": "written", "cacheable": True},
+              delegate_to="recipient", delegate_facts=True),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert rt.vars["hostvars"]["recipient"]["ansible_facts"] == "explicit"
+    assert rt.vars["hostvars"]["recipient"]["marker"] == "written"
+
+
+def test_delegated_fact_writes_share_implicit_localhost_aliases():
+    rt, _ = run([
+        _task("1", "send", "set_fact", args={"first": "shared"},
+              delegate_to="127.0.0.1", delegate_facts=True),
+        _task("2", "send", "set_fact", args={"last": "shared"},
+              delegate_to="localhost", delegate_facts=True),
+        _task("3", "send", "set_fact", args={"explicit": "kept"},
+              delegate_to="::1", delegate_facts=True),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"localhost": {"inventory_hostname": "localhost"},
+                                                               "::1": {"inventory_hostname": "::1"}}})
+    assert rt.vars["hostvars"]["localhost"]["first"] == "shared"
+    assert rt.vars["hostvars"]["127.0.0.1"]["last"] == "shared"
+    assert rt.vars["hostvars"]["::1"] == {"inventory_hostname": "::1", "explicit": "kept"}
+
+
+def test_set_fact_keeps_completed_local_writes_after_a_later_loop_error():
+    rt, _ = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item }}"},
+              delegate_to="recipient", delegate_facts=False,
+              loop=["first", "second"], loop_pause="{{ undefined_pause }}", ignore_errors=True),
+    ], host_vars={"inventory_hostname": "origin"})
+    assert rt.vars["marker"] == "first"
+
+
 def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):
     import ansiroll.runtime as runtime_mod
 
