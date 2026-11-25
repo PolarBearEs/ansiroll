@@ -5632,6 +5632,33 @@ def test_strategy_full_check_mode_omit_matches_native(tmp_path, expression):
     assert not (tmp_path / "result").exists()
 
 
+@pytest.mark.parametrize(("expression", "invocation_check", "valid"), [
+    ('{% macro m() %}{{ omit }}{% endmacro %}{{ m() != "" }}', True, True),
+    ("{{ omit | string }}", False, False),
+    ("{# explanation #}true", False, True),
+])
+def test_strategy_validates_native_check_mode_buffers(tmp_path, expression, invocation_check, valid):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native keyword values")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: "{{ playbook_dir }}/result"
+        state: touch
+      check_mode: CHECK_MODE
+""".replace("CHECK_MODE", json.dumps(expression))
+    opts = ["-c", "local", "-e", "ansible_python_interpreter=" + sys.executable]
+    if invocation_check:
+        opts.append("--check")
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, *opts, environment={"ANSIBLE_STRATEGY": strategy})
+        assert (result.returncode == 0) == valid, result.stdout + result.stderr
+        assert not (tmp_path / "result").exists()
+
+
 def test_strategy_rejects_padded_legacy_check_mode_omit(tmp_path):
     from ansiroll.loader import _core_version
 

@@ -162,6 +162,7 @@ class _WorkerStderr:
 
 # __ANSIROLL_JINJA_BUNDLE__
 import jinja2  # type: ignore
+from jinja2.nativetypes import NativeCodeGenerator
 
 
 # Sentinel for the `omit` magic variable; args/env entries equal to it are
@@ -2938,30 +2939,22 @@ def _concretize(value):
     return value
 
 
-class _KeywordTemplateSegment(str):
-    # Jinja's text generator calls str() on each finalized segment.
-    # Preserve identity until concatenation can distinguish a sole omit.
-    def __str__(self):
-        return self
+class _KeywordOmit:
+    def __repr__(self):
+        return "<<Omit>>"
 
 
-_KEYWORD_OMIT_SEGMENT = _KeywordTemplateSegment()
-_KEYWORD_NULL_SEGMENT = _KeywordTemplateSegment()
+_KEYWORD_OMIT = _KeywordOmit()
 
 
 def _concat_keyword_segments(nodes):
-    parts = [part for part in nodes if part is not _KEYWORD_NULL_SEGMENT]
-    if len(parts) == 1:
-        return parts[0]
-    return "".join(parts) if parts else _KEYWORD_NULL_SEGMENT
+    parts = [part for part in nodes if part is not None]
+    if len(parts) < 2:
+        return parts[0] if parts else None
+    return "".join(str(_fail_on_undef(part)) for part in parts if part is not _KEYWORD_OMIT)
 
 
 def _finalize_text_segment(context, value):
-    if context.get(_CHECK_MODE_TEMPLATE) is True:
-        if isinstance(value, _Omit):
-            return _KEYWORD_OMIT_SEGMENT
-        if value is None:
-            return _KEYWORD_NULL_SEGMENT
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
         native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
@@ -3304,6 +3297,21 @@ class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
         super().visit_Name(node, frame)
         if node.ctx == "load":
             self.write(")")
+
+
+class _KeywordCodeGenerator(_AnsirollCodeGenerator, NativeCodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        self.writeline("concat = environment.concat")
+
+    def _output_child_to_const(self, node, frame, finalize):
+        if not isinstance(node, jinja2.nodes.TemplateData):
+            raise jinja2.nodes.Impossible()
+        return super()._output_child_to_const(node, frame, finalize)
+
+
+class _ConditionalKeywordCodeGenerator(_ConditionalCodeGenerator, _KeywordCodeGenerator):
+    pass
 
 
 class _AnsirollContext(jinja2.runtime.Context):
@@ -3703,7 +3711,7 @@ class _Templater:
     def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
-        if "{{" not in text and "{%" not in text:
+        if not _looks_templated(text) and not (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text):
             if file_newline is not None and _legacy_templating():
                 return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
             return text
@@ -3956,6 +3964,9 @@ class _Templater:
                 keyword_env = env.overlay()
                 keyword_env.keep_trailing_newline = False
                 keyword_env.concat = _concat_keyword_segments
+                keyword_env.finalize = _concretize
+                keyword_env.code_generator_class = (
+                    _ConditionalKeywordCodeGenerator if lazy_names else _KeywordCodeGenerator)
                 self._keyword_environments[env] = keyword_env
             env = self._keyword_environments[env]
         if file_newline is not None:
@@ -3992,10 +4003,6 @@ class _Templater:
                     self._template_cache[template_key] = tmpl
                 if native_keyword:
                     result = _concat_keyword_segments(tmpl.generate(**ctx))
-                    if result is _KEYWORD_OMIT_SEGMENT:
-                        result = _OMIT
-                    elif result is _KEYWORD_NULL_SEGMENT:
-                        result = None
                 else:
                     result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
@@ -5902,9 +5909,9 @@ class Runtime:
                     native_keyword = _core_at_least(2, 19)
                     check_ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
                     if native_keyword and isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__"):
-                        check_ctx["omit"] = _OMIT
+                        check_ctx["omit"] = _KEYWORD_OMIT
                 check_override = _fail_on_undef(self.template(check_override, check_ctx))
-                if (isinstance(check_override, _Omit) or (
+                if (check_override is _KEYWORD_OMIT or isinstance(check_override, _Omit) or (
                         _legacy_templating() and isinstance(omit_token, str)
                         and omit_token.startswith("__omit_place_holder__") and check_override == omit_token)):
                     if not _core_at_least(2, 17):
