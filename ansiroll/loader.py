@@ -2035,7 +2035,6 @@ def _convert_task(task, actions, basedir):
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
         "check_mode": getattr(task, "check_mode", None),
-        **_inheritable_boolean_keywords(task, "diff", getattr(task, "diff", None)),
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
@@ -3493,21 +3492,17 @@ def _numeric_or_template(value, cast):
 
 
 def _ignore_errors_keywords(task):
-    value = task.ignore_errors
-    return _inheritable_boolean_keywords(task, "ignore_errors", False if value is None else value)
-
-
-def _inheritable_boolean_keywords(task, keyword, value):
-    result = {keyword: _tag_untrusted(value)}
+    value = _boolean_or_template(task.ignore_errors)
+    result = {"ignore_errors": value}
     if isinstance(value, str):
         try:
             from ansible.playbook.base import Sentinel
 
-            inherited = task._get_parent_attribute(keyword, omit=True)
+            inherited = task._get_parent_attribute("ignore_errors", omit=True)
         except (ImportError, TypeError):  # Older cores use the keyword default.
             return result
         if inherited is not Sentinel and inherited is not None:
-            result[keyword + "_on_omit"] = _boolean_or_template(inherited)
+            result["ignore_errors_on_omit"] = _boolean_or_template(inherited)
     return result
 
 

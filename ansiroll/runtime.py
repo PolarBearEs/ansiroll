@@ -5524,7 +5524,6 @@ class Runtime:
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
-        inherited_diff_mode = self.diff_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
@@ -5536,13 +5535,6 @@ class Runtime:
                 if isinstance(check_override, str):
                     check_override = self.template(check_override, ctx)
                 self.check_mode = _boolean(check_override)
-            diff_override = task.get("diff") if task.get("special") == "template" else None
-            if diff_override is not None:
-                value = _fail_on_undef(self.template(diff_override, ctx))
-                if isinstance(value, _Omit):
-                    value = task.get("diff_on_omit")
-                if value is not None and value != _OMIT:
-                    self.diff_mode = _boolean(value, strict=True)
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -5627,7 +5619,6 @@ class Runtime:
             self._module_source_bytes = None
             self._module_env = None
             self.check_mode = inherited_check_mode
-            self.diff_mode = inherited_diff_mode
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
@@ -7825,8 +7816,6 @@ def agent_main():
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
                 "diff_mode": bool(rt.diff_mode),
-                "no_log": bool(task.get("no_log")),
-                "max_diff_size": task.get("_max_diff_size"),
                 "fallback": bool(task.get("fallback")),
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),

@@ -969,14 +969,11 @@ class StrategyModule(StrategyBase):
         except (OSError, AnsibleError) as ex:
             return {"failed": True, "changed": False, "msg": "template: %s" % ex}
         rt = self._local_runtime(become_pass)
-        previous = rt.check_mode, rt.diff_mode, rt.become_user
+        previous = rt.check_mode, rt.become_user
         try:
             rt.check_mode = bool(frame.get("check_mode"))
-            rt.diff_mode = bool(frame.get("diff_mode"))
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
-                "no_log": bool(frame.get("no_log")),
-                "_max_diff_size": frame.get("max_diff_size"),
                 "_baked": {src: raw},
                 "_baked_meta": {src: {
                     "fullpath": fullpath,
@@ -1027,7 +1024,7 @@ class StrategyModule(StrategyBase):
                     job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
             return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
         finally:
-            rt.check_mode, rt.diff_mode, rt.become_user = previous
+            rt.check_mode, rt.become_user = previous
 
     def _run_include_vars(self, frame):
         """include_vars reads controller-side files; resolve and parse here."""

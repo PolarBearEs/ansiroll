@@ -964,40 +964,6 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     assert not (tmp_path / "check-only.txt").exists()
 
 
-@pytest.mark.parametrize("suppression", ["no_log", "inherited_diff"])
-def test_delegated_template_protects_registered_diff(tmp_path, suppression):
-    if suppression == "inherited_diff" and not MODERN_TEMPLATING:
-        pytest.skip("parent diff fallback requires modern omit semantics")
-    keywords = ("          no_log: true\n"
-                if suppression == "no_log" else "          diff: '{{ omit }}'\n")
-    parent = "      diff: false\n" if suppression == "inherited_diff" else ""
-    assertion = ("'sensitive rendered value' not in (rendered.diff | default([]) | string)"
-                 if suppression == "no_log" else "rendered.diff | default([]) | length == 0")
-    path = _write(tmp_path, """
-- hosts: localhost
-  gather_facts: false
-  tasks:
-    - block:
-        - template:
-            src: sample.j2
-            dest: "{{ playbook_dir }}/check-only.txt"
-          delegate_to: localhost
-          check_mode: true
-          register: rendered
-KEYWORDS
-PARENT
-    - assert:
-        quiet: true
-        that: >-
-          ASSERTION
-""".replace("KEYWORDS\n", keywords).replace("PARENT\n", parent).replace("ASSERTION", assertion),
-                  {"sample.j2": "sensitive rendered value\n"})
-    expected = _ansible(path, tmp_path, diff=True)
-    assert expected[1][3] == "0"
-    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", diff=True) == expected
-    assert not (tmp_path / "check-only.txt").exists()
-
-
 def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
     path = _write(tmp_path, """
@@ -1016,29 +982,6 @@ def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch)
     _, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
     assert recap == ("1", "1", "0", "0", "0", "0", "0")
     assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\ntype=list\n"
-
-
-def test_delegated_template_honors_configured_diff_size(tmp_path, monkeypatch):
-    monkeypatch.setenv("ANSIBLE_MAX_DIFF_SIZE", "10")
-    path = _write(tmp_path, """
-- hosts: localhost
-  gather_facts: false
-  tasks:
-    - template:
-        src: sample.j2
-        dest: "{{ playbook_dir }}/check-only.txt"
-      check_mode: true
-      delegate_to: localhost
-      register: rendered
-    - assert:
-        quiet: true
-        that:
-          - rendered.diff[0].src_larger == 10
-          - rendered.diff[0].after is undefined
-""", {"sample.j2": "sensitive rendered value\n"})
-    expected = _ansible(path, tmp_path, diff=True)
-    assert expected[1][3] == "0"
-    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", diff=True) == expected
 
 
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
