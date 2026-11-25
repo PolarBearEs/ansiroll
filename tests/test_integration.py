@@ -126,9 +126,12 @@ def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_p
     script = tmp_path / "compiled.py"
     script.write_text(source)
 
+    environment = os.environ.copy()
+    environment.pop("ANSIROLL_VARS_FILE", None)
+
     def run(profile):
         return subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
-                              env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
+                              env={**environment, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
                               timeout=20)
 
     safe = run("safe")
@@ -137,6 +140,30 @@ def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_p
     error = run("blocked")
     assert error.returncode == 1, error.stdout + error.stderr
     assert "synthetic read denial for candidate" in error.stderr
+
+
+def test_deferred_vars_file_uses_validated_source_bytes(tmp_path, monkeypatch):
+    from ansible.parsing.dataloader import DataLoader
+    from ansiroll.loader import _bundled_vars_file
+
+    source = tmp_path / "candidate.yml"
+    source.write_text('value: "{{ preserved_template }}"\n')
+    monkeypatch.setattr(DataLoader, "load_from_file",
+                        lambda *args, **kwargs: pytest.fail("candidate must not be reopened"))
+    assert _bundled_vars_file(str(source)) == [{"value": "{{ preserved_template }}"}]
+
+
+def test_deferred_vars_file_rejects_nonregular_descriptor(tmp_path, monkeypatch):
+    import stat
+    from ansiroll.loader import _bundled_vars_file
+
+    source = tmp_path / "candidate.yml"
+    source.write_text("value: example\n")
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fstat", lambda fd: SimpleNamespace(st_mode=stat.S_IFIFO))
+        result = _bundled_vars_file(str(source))
+    assert "expected a regular file" in result["__ansiroll_vars_file_error__"]
+    assert result["rc"] == 1
 
 
 def test_ordered_vars_files_capture_env_before_later_overrides(tmp_path, monkeypatch):

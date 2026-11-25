@@ -1057,7 +1057,7 @@ def _deferred_vars_files(play, basedir, entries):
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
                     if found not in files and os.path.isfile(found):
-                        files[found] = _bundled_vars_file(play, found)
+                        files[found] = _bundled_vars_file(found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
         if unmodeled:
             entry["unmodeled"] = unmodeled
@@ -1065,19 +1065,31 @@ def _deferred_vars_files(play, basedir, entries):
     return deferred
 
 
-def _bundled_vars_file(play, path):
+def _bundled_vars_file(path):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
+    from ansible.module_utils.common.text.converters import to_text
+    from ansible.parsing.dataloader import DataLoader
+
+    def open_nonblocking(filename, flags):
+        return os.open(filename, flags | os.O_NONBLOCK)
 
     try:
-        with open(path, "rb") as fh:
-            # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-            # select.
-            if b"$ANSIBLE_VAULT" in fh.read():
-                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                        % path}
-        loaded = _load_vars_file(play, path)
+        with open(path, "rb", opener=open_nonblocking) as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise ValueError("expected a regular file")
+            data = to_text(fh.read(), errors="surrogate_or_strict")
+        if _deferred_vars_file_contains_vault(data):
+            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                    % path}
+        try:
+            from ansible._internal._datatag._tags import TrustedAsTemplate
+        except ImportError:
+            pass
+        else:
+            data = TrustedAsTemplate().tag(data)
+        loaded = DataLoader().load(data, file_name=path, show_content=False)
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
@@ -1085,6 +1097,42 @@ def _bundled_vars_file(play, path):
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+
+
+def _deferred_vars_file_contains_vault(data):
+    if "$ANSIBLE_VAULT" in data:
+        return True
+    if data.lstrip().startswith(("{", "[")):
+        import json
+
+        contains_vault = False
+
+        def check_mapping(mapping):
+            nonlocal contains_vault
+            contains_vault |= "__ansible_vault" in mapping
+            return mapping
+
+        try:
+            json.loads(data, object_hook=check_mapping)
+        except ValueError:
+            pass
+        else:
+            return contains_vault
+    if "!" not in data:
+        return False
+    import yaml
+
+    try:
+        # Inspect tags before constructing values. A Vault value used as a
+        # mapping key may be decrypted by the YAML constructor itself.
+        return any(
+            event.tag in ("!vault", "!vault-encrypted")
+            for event in yaml.parse(data, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+            if isinstance(event, yaml.ScalarEvent)
+        )
+    except yaml.YAMLError:
+        # The Ansible loader supplies the diagnostic for malformed input.
+        return False
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
