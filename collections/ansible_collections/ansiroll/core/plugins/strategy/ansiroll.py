@@ -919,17 +919,31 @@ class StrategyModule(StrategyBase):
                 "changed": False,
                 "msg": "template: could not find controller source %r" % src,
             }
-        source = self._read_controller_source(src, role_task=None if os.path.isabs(src) else source_task)
-        if "error" in source:
-            return {"failed": True, "changed": False, "msg": "template: " + source["error"]}
-        raw = base64.b64decode(source["data"]).decode("utf-8", "surrogateescape")
-        rt = self._local_runtime(become_pass)
-        previous_become_user = rt.become_user
+        loader = source_task._loader if source_task is not None else self._loader
+        search_path = source_task.get_search_path() if source_task is not None else []
         try:
+            fullpath = loader.path_dwim_relative_stack(search_path, "templates", src)
+            if not os.path.isfile(loader.path_dwim(fullpath)):
+                return {"failed": True, "changed": False, "msg": "template: source is not a regular file"}
+            data, _ = loader._get_file_contents(fullpath)
+            raw = data.decode("utf-8", "surrogateescape")
+            st = os.stat(fullpath)
+        except (OSError, AnsibleError) as ex:
+            return {"failed": True, "changed": False, "msg": "template: %s" % ex}
+        rt = self._local_runtime(become_pass)
+        previous = rt.check_mode, rt.diff_mode, rt.become_user
+        try:
+            rt.check_mode = bool(frame.get("check_mode"))
+            rt.diff_mode = bool(frame.get("diff_mode"))
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
                 "_baked": {src: raw},
-                "_baked_meta": {src: source["meta"]},
+                "_baked_meta": {src: {
+                    "fullpath": fullpath,
+                    "mtime": st.st_mtime,
+                    "uid": st.st_uid,
+                    "mode": stat.S_IMODE(st.st_mode),
+                }},
             }
             job_vars = dict(frame.get("vars") or {})
             if names := frame.get("lazy_template_vars"):
@@ -973,7 +987,7 @@ class StrategyModule(StrategyBase):
                     job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
             return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
         finally:
-            rt.become_user = previous_become_user
+            rt.check_mode, rt.diff_mode, rt.become_user = previous
 
     def _run_include_vars(self, frame):
         """include_vars reads controller-side files; resolve and parse here."""
