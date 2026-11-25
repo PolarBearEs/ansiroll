@@ -730,7 +730,9 @@ class StrategyModule(StrategyBase):
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
         if action == "template" and local:
-            return self._run_local_template(frame, become_pass, resolve_play_var)
+            task_key = frame.get("runtime_id") or frame.get("uuid")
+            source_task = (task_map or {}).get(task_key)
+            return self._run_local_template(frame, become_pass, resolve_play_var, source_task=source_task)
         if frame.get("fallback") or not local:
             reason = ("delegate_to: %s (non-local delegation)" % to if to
                       else "controller-coupled action %s" % frame.get("action"))
@@ -945,36 +947,40 @@ class StrategyModule(StrategyBase):
             container.update(entries)
         return value
 
-    def _run_local_template(self, frame, become_pass, resolve_play_var=None):
-        """Render a runtime-created controller file through the in-memory runtime."""
+    def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
+        """Resolve and render the controller's template through the in-memory runtime."""
         args = dict(frame.get("args") or {})
         src = args.get("src")
-        if not src or not os.path.isfile(src):
+        if not isinstance(src, str) or not src:
             return {
                 "failed": True,
                 "changed": False,
                 "msg": "template: could not find controller source %r" % src,
             }
+        loader = source_task._loader if source_task is not None else self._loader
+        search_path = source_task.get_search_path() if source_task is not None else []
         try:
-            with open(src, "rb") as fh:
-                raw = fh.read().decode("utf-8", "surrogateescape")
-                st = os.fstat(fh.fileno())
-        except OSError as ex:
-            return {"failed": True, "changed": False, "msg": str(ex)}
+            fullpath = loader.path_dwim_relative_stack(search_path, "templates", src)
+            if not os.path.isfile(loader.path_dwim(fullpath)):
+                return {"failed": True, "changed": False, "msg": "template: source is not a regular file"}
+            data, _ = loader._get_file_contents(fullpath)
+            raw = data.decode("utf-8", "surrogateescape")
+            st = os.stat(fullpath)
+        except (OSError, AnsibleError) as ex:
+            return {"failed": True, "changed": False, "msg": "template: %s" % ex}
         rt = self._local_runtime(become_pass)
-        previous_become_user = rt.become_user
+        previous = rt.check_mode, rt.become_user
         try:
+            rt.check_mode = bool(frame.get("check_mode"))
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
                 "_baked": {src: raw},
-                "_baked_meta": {
-                    src: {
-                        "fullpath": os.path.abspath(src),
-                        "mtime": st.st_mtime,
-                        "uid": st.st_uid,
-                        "mode": stat.S_IMODE(st.st_mode),
-                    },
-                },
+                "_baked_meta": {src: {
+                    "fullpath": fullpath,
+                    "mtime": st.st_mtime,
+                    "uid": st.st_uid,
+                    "mode": stat.S_IMODE(st.st_mode),
+                }},
             }
             job_vars = dict(frame.get("vars") or {})
             if names := frame.get("lazy_template_vars"):
@@ -1018,7 +1024,7 @@ class StrategyModule(StrategyBase):
                     job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
             return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
         finally:
-            rt.become_user = previous_become_user
+            rt.check_mode, rt.become_user = previous
 
     def _run_include_vars(self, frame):
         """include_vars reads controller-side files; resolve and parse here."""
