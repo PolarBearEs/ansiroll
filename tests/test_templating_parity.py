@@ -24,6 +24,7 @@ from ansiroll.compiler import compile_playbook  # noqa: E402
 from ansiroll.loader import parse_playbook  # noqa: E402
 
 MODERN_TEMPLATING = Version(__version__) >= Version("2.19")
+LEGACY_SETUP = Version(__version__) < Version("2.12")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RECAP_RE = re.compile(
@@ -119,13 +120,15 @@ def test_implicit_setup_applies_templated_module_defaults(tmp_path, use_strategy
   gather_facts: true
   vars:
     setup_defaults:
-      filter: [ansible_distribution]
+      filter: DISTRIBUTION_FILTER
   module_defaults:
-    ansible.builtin.setup: "{{ setup_defaults }}"
+    SETUP_ACTION: "{{ setup_defaults }}"
   tasks:
     - debug:
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
-""", use_strategy=use_strategy)
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
+        "DISTRIBUTION_FILTER", "ansible_distribution" if LEGACY_SETUP else "[ansible_distribution]"),
+        use_strategy=use_strategy)
     assert messages == ["filtered"]
 
 
@@ -193,6 +196,7 @@ def test_implicit_gather_action_defaults_take_precedence_over_setup_defaults(tmp
     assert messages == ["filtered"]
 
 
+@pytest.mark.skipif(LEGACY_SETUP, reason="uses the modern setup action name")
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_path, use_strategy):
     messages, _ = _assert_parity(tmp_path, """
@@ -209,6 +213,26 @@ def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_pat
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
 """, use_strategy=use_strategy)
     assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup handles a templated null differently")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_applies_setup_default_after_explicit_null(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ none }}"
+  module_defaults:
+    ansible.builtin.gather_facts:
+      fact_path: "{{ playbook_dir }}/gather"
+    ansible.builtin.setup:
+      fact_path: "{{ playbook_dir }}/setup"
+  tasks:
+    - debug:
+        msg: "{{ ansible_local.probe.value }}"
+""", {"setup/probe.fact": '{"value":"setup"}', "gather/probe.fact": '{"value":"gather"}'},
+        use_strategy=use_strategy)
+    assert messages == ["setup"]
 
 
 @pytest.mark.skipif(Version(__version__) >= Version("2.12"), reason="only older cores use legacy setup")
@@ -234,13 +258,14 @@ def test_implicit_setup_defaults_read_public_role_vars(tmp_path, use_strategy):
   gather_facts: true
   roles: [settings]
   module_defaults:
-    ansible.builtin.setup:
+    SETUP_ACTION:
       filter: "{{ fact_filter }}"
   tasks:
     - debug:
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
-""", {
-        "roles/settings/defaults/main.yml": "fact_filter: [ansible_distribution]\n",
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"), {
+        "roles/settings/defaults/main.yml": (
+            "fact_filter: ansible_distribution\n" if LEGACY_SETUP else "fact_filter: [ansible_distribution]\n"),
         "roles/settings/tasks/main.yml": "[]\n",
     }, use_strategy=use_strategy)
     assert messages == ["filtered"]
@@ -254,12 +279,15 @@ def test_strategy_setup_defaults_use_the_host_selected_vars_file(tmp_path):
     fact_filter: [ansible_hostname]
   vars_files: ['site-{{ inventory_hostname }}.yml']
   module_defaults:
-    ansible.builtin.setup:
+    SETUP_ACTION:
       filter: "{{ fact_filter }}"
   tasks:
     - debug:
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
-""", {"site-localhost.yml": "fact_filter: [ansible_distribution]\n"}, use_strategy=True)
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"), {
+        "site-localhost.yml": (
+            "fact_filter: ansible_distribution\n" if LEGACY_SETUP else "fact_filter: [ansible_distribution]\n"),
+    }, use_strategy=True)
     assert messages == ["filtered"]
 
 
@@ -268,12 +296,15 @@ def test_strategy_setup_default_uses_controller_file_lookup(tmp_path):
 - hosts: localhost
   gather_facts: true
   module_defaults:
-    ansible.builtin.setup:
-      filter: '{{ [lookup("file", "fact-filter.txt")] }}'
+    SETUP_ACTION:
+      filter: 'FILTER_EXPRESSION'
   tasks:
     - debug:
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
-""", {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=True)
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
+        "FILTER_EXPRESSION", '{{ lookup("file", "fact-filter.txt") }}' if LEGACY_SETUP
+        else '{{ [lookup("file", "fact-filter.txt")] }}'),
+        {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=True)
     assert messages == ["filtered"]
 
 

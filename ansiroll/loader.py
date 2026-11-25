@@ -421,7 +421,8 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                 for export in exports
             ],
             "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
-            "task_search_path": play.get_search_path(),
+            "task_search_path": (play.get_search_path() if hasattr(play, "get_search_path")
+                                 else [play._loader.get_basedir()]),
         })
     return result
 
@@ -700,6 +701,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             gather = C.DEFAULT_GATHERING != "explicit"
     setup_defaults = _setup_module_defaults(play, "ansible.builtin.setup") if gather else []
     gather_defaults = _setup_module_defaults(play, "ansible.builtin.gather_facts") if gather else []
+    if (setup_defaults or gather_defaults) and _core_version() >= (2, 19):
+        explicit = {
+            key for key in ("fact_path", "gather_subset")
+            if key in (play.get_ds() or {})
+            and (value := getattr(play, key, None)) is not None
+            and not any(_selector_template_sources(_tag_untrusted(value)))
+        }
+        if explicit:
+            setup_defaults, gather_defaults = (
+                [{key: value for key, value in layer.items() if key not in explicit}
+                 if isinstance(layer, dict) else layer for layer in defaults]
+                for defaults in (setup_defaults, gather_defaults)
+            )
     scoped_options = {
         key: value for key in ("fact_path", "gather_subset")
         if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))

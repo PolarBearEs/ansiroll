@@ -7105,10 +7105,20 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
-    def _render_setup_defaults(self, layers, explicit_args, ctx):
+    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked):
+        def check_dependencies(value):
+            for source, _, _ in _selector_template_sources(value):
+                paths = set()
+                inputs = self._pre_setup_template_inputs(
+                    source, ctx, selector=True, paths=paths, setup_lookups=True)
+                if inputs is None or _vars_file_reads_blocked(blocked, paths):
+                    raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
+
         defaults = {}
         for entry in layers or ():
             if isinstance(entry, str):
+                if blocked:
+                    check_dependencies(entry)
                 entry = self.templater.render_string(entry, ctx, strict=True)
                 if isinstance(entry, _LazyTplDict):
                     entry = entry._raw
@@ -7118,6 +7128,8 @@ class Runtime:
                 raise ValueError("setup module defaults must resolve to a dictionary")
             defaults.update(entry)
         inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
+        if blocked:
+            check_dependencies(inherited)
         return _setup_omit(self.template(inherited, ctx, strict=True))
 
     def gather_facts(self, environment=None, become=False, become_user=None,
@@ -7179,9 +7191,9 @@ class Runtime:
                 if not _core_at_least(2, 18) and resolved_options.get("gather_subset") == _OMIT:
                     config = ctx.get("__ansiroll_controller_config", {})
                     resolved_options["gather_subset"] = config.get("DEFAULT_GATHER_SUBSET", ["all"])
-                setup_args = {key: value for key, value in _setup_omit(resolved_options).items() if value is not None}
-                if "gather_subset" in setup_args:
-                    subset = setup_args["gather_subset"]
+                setup_args = _setup_omit(resolved_options)
+                subset = setup_args.get("gather_subset")
+                if subset is not None:
                     if not isinstance(subset, list):
                         subset = [subset]
                     if not all(isinstance(item, str) for item in subset):
@@ -7192,10 +7204,12 @@ class Runtime:
                 if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                     setup_args["gather_timeout"] = gather_timeout
                 if gather_defaults or setup_defaults:
-                    defaults_ctx, _ = (option_contexts or {}).get("fact_path", (ctx, ()))
-                    setup_args.update(self._render_setup_defaults(gather_defaults, setup_args, defaults_ctx))
-                    setup_args = {key: value for key, value in setup_args.items() if key != "parallel" and value is not None}
-                    setup_args.update(self._render_setup_defaults(setup_defaults, setup_args, defaults_ctx))
+                    defaults_ctx, defaults_blocks = (option_contexts or {}).get("fact_path", (ctx, ()))
+                    setup_args.update(self._render_setup_defaults(gather_defaults, setup_args, defaults_ctx, defaults_blocks))
+                    setup_args.pop("parallel", None)
+                setup_args = {key: value for key, value in setup_args.items() if value is not None}
+                if setup_defaults:
+                    setup_args.update(self._render_setup_defaults(setup_defaults, setup_args, defaults_ctx, defaults_blocks))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts

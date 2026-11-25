@@ -2699,6 +2699,56 @@ def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, 
     assert runtime.vars["unrelated"] == "value"
 
 
+def test_setup_defaults_do_not_capture_an_overridden_controller_lookup(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    if Version(__version__) < Version("2.19"):
+        pytest.skip("older cores eagerly render module defaults")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  module_defaults:
+    ansible.builtin.setup:
+      gather_subset: "{{ lookup('env', 'ANSIROLL_SHADOWED_SETUP_SUBSET') }}"
+  tasks: []
+""")
+    monkeypatch.setenv("ANSIROLL_SHADOWED_SETUP_SUBSET", "synthetic-private-setup-subset")
+    source, _ = compile_playbook(str(playbook))
+    assert "synthetic-private-setup-subset" not in json.dumps(_compiled_plays(source, tmp_path))
+
+
+def test_setup_defaults_check_vars_file_dependencies_before_gathering(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    if Version(__version__) < Version("2.19"):
+        pytest.skip("uses modern setup arguments")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars:
+    fact_filter: [ansible_hostname]
+  vars_files: ["vars-{{ lookup('vars', 'profile') }}.yml"]
+  module_defaults:
+    ansible.builtin.setup:
+      filter: "{{ fact_filter }}"
+  tasks: []
+""")
+    (tmp_path / "vars-late.yml").write_text("fact_filter: [ansible_distribution]\n")
+    source, _ = compile_playbook(str(playbook))
+    frames, called = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "late"},
+                      on_result=frames.append)
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append(args) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert runtime.failed
+    assert "setup module defaults require a vars file" in frames[0]["result"]["msg"]
+    assert not called
+
+
 def test_implicit_fact_path_sees_empty_local_facts_when_injection_is_disabled(tmp_path, monkeypatch):
     from ansible import constants as C
 
