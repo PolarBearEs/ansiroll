@@ -4105,6 +4105,7 @@ class Runtime:
         self._module_source_bytes = None  # baked unarchive input for the next worker call
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
+        self.gather_setup_fn = None  # resolve implicit setup options using controller task scope
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
         self._started_task_name = (None, None)
@@ -4559,12 +4560,32 @@ class Runtime:
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = None
             blocked_timeout_inputs = {}
-            if timeout_template and vars_files:
+            option_scope = play.get("gather_setup_scope")
+            if (timeout_template or option_scope) and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files,
-                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {})},
+                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {}),
+                     **((option_scope or {}).get("defaults") or {})},
                     blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic)
             setup_ctx = self._layered_ctx(self.ctx(play_vars, timeout_vars))
+            option_contexts = {}
+            if option_scope:
+                layers = (*option_scope["role_exports"], self.extra_vars, option_scope["magic"])
+                option_vars = _f_combine(
+                    option_scope["defaults"], play_vars if timeout_vars is None else timeout_vars,
+                    *layers, recursive=merge_vars_files)
+                option_ctx = self.ctx(option_vars, base={
+                    name: self.vars[name]
+                    for name in ("__ansiroll_controller_env", "__ansiroll_controller_config")
+                })
+                option_blocks = dict(blocked_timeout_inputs)
+                for layer in layers:
+                    _clear_vars_file_blocks(option_blocks, layer, merge_vars_files)
+                option_contexts["gather_subset"] = (option_ctx, option_blocks)
+                task_blocks = dict(option_blocks)
+                for layer in (self._include_vars_layer, self._set_fact_overrides):
+                    _clear_vars_file_blocks(task_blocks, layer, merge_vars_files)
+                option_contexts["fact_path"] = (self._layered_ctx(self.ctx(option_vars)), task_blocks)
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -4575,6 +4596,7 @@ class Runtime:
                 gather_timeout=play.get("gather_timeout"),
                 setup_options=play.get("gather_setup_options"),
                 setup_defaults=play.get("gather_setup_defaults"),
+                option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
             )
@@ -6799,7 +6821,7 @@ class Runtime:
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None, setup_defaults=None):
+                     setup_options=None, setup_defaults=None, option_contexts=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -6825,10 +6847,30 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            resolved_options = _fail_on_undef(_strip_omit(self.template(setup_options or {}, ctx, strict=True)))
+            if self.gather_setup_fn is not None and setup_options:
+                controller_setup = self.gather_setup_fn()
+                if controller_setup["error"] is not None:
+                    raise ValueError(controller_setup["error"])
+                resolved_options = controller_setup["options"]
+            else:
+                authored_options = dict(setup_options or {})
+                if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
+                    authored_options.pop("fact_path", None)
+                resolved_options = {}
+                for key, value in authored_options.items():
+                    scope, blocks = (option_contexts or {}).get(key, (ctx, ()))
+                    if blocks:
+                        for source, _, _ in _selector_template_sources(value):
+                            paths = set()
+                            inputs = self._pre_setup_template_inputs(source, scope, selector=True, paths=paths)
+                            if inputs is None or _vars_file_reads_blocked(blocks, paths):
+                                raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
+                    resolved_options[key] = self.template(value, scope, strict=True)
+                resolved_options = _fail_on_undef(_strip_omit(resolved_options))
+                if _core_at_least(2, 19) and isinstance(resolved_options.get("gather_subset"), list):
+                    resolved_options["gather_subset"] = [item for item in resolved_options["gather_subset"]
+                                                         if item != _OMIT]
             setup_args = {key: value for key, value in resolved_options.items() if value is not None}
-            if not _core_at_least(2, 13) and not setup_args.get("fact_path"):
-                setup_args.pop("fact_path", None)
             gather_timeout = self._gather_timeout_for_run(
                 gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
@@ -7806,6 +7848,15 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
+
+    def _gather_setup():
+        _chan_send(resp_fd, {"t": "gather_setup"})
+        reply = _chan_recv()
+        if not reply or reply.get("t") != "gather_setup_result":
+            raise RuntimeError("controller did not return setup options")
+        return reply["setup"]
+
+    rt.gather_setup_fn = _gather_setup
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
             # Only the agent has the play's bundled filters and lookup plugins.
