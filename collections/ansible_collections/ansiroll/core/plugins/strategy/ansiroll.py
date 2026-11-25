@@ -1805,7 +1805,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
                 host, task = ((result.host, result.task) if _UnifiedTaskResult is not None else
                               (result._host, result._task))
                 key = (host.name, task._uuid)
-                if self._routed_fact_task(key):
+                if self._routed_fact_task(key, task):
                     target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
                     self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
             return send_callback(method, *args, **kwargs)
@@ -1833,10 +1833,11 @@ class _SetFactLinearStrategy(_LinearStrategy):
             else:
                 self._tqm.send_callback = original
 
-    def _routed_fact_task(self, key):
+    def _routed_fact_task(self, key, resolved):
         original = self._queued_task_cache.get(key, {}).get("task")
-        return (original is not None and original.action in C._ACTION_SET_FACT and original.delegate_to
-                and _delegated_fact_flag(original.delegate_facts) is not False)
+        return (original is not None and original.delegate_to
+                and (resolved.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT)
+                and original.delegate_facts is not None and original.delegate_facts is not False)
 
     def _fact_recipient(self, name):
         if not isinstance(name, str):
@@ -1889,7 +1890,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
             return result
         key = (host.name, task._uuid)
         routes = self._fact_routes.pop(key, ())
-        if not self._routed_fact_task(key):
+        if not routes and not self._routed_fact_task(key, task):
             return result
         if data.loop_results is None:
             if data.delegated_host:

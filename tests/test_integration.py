@@ -5652,10 +5652,15 @@ RETRY_OPTIONS    - assert:
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path):
+@pytest.mark.parametrize("templated_action", [False, True])
+def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path, templated_action):
+    from ansiroll.loader import _core_version
+
+    if templated_action and _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
     tasks = tmp_path / "roles" / "route_sample" / "tasks"
     tasks.mkdir(parents=True)
-    (tasks / "main.yml").write_text("""- set_fact:
+    (tasks / "main.yml").write_text("""ACTION:
     "{{ item.key }}": "{{ item.value }}"
   delegate_to: recipient
   delegate_facts: "{{ item.route }}"
@@ -5666,12 +5671,13 @@ def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path
   retries: 2
   delay: 0
   until: item.route is false or fact_results.attempts >= 2
-""")
+""".replace("ACTION", '- action: "{{ fact_action }}"\n  args' if templated_action else "- set_fact"))
     proc = _run_strategy_play(tmp_path, """- hosts: origin
   gather_facts: false
   connection: local
   vars:
     selected_role: route_sample
+    fact_action: set_fact
   tasks:
     - include_role:
         name: "{{ selected_role }}"
@@ -5682,6 +5688,32 @@ def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path
           - hostvars.recipient.local_marker is undefined
           - hostvars.recipient.remote_marker == 'remote'
           - fact_results.results[1].attempts == 2
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_routes_literal_false_delegation_in_dynamic_roles(tmp_path, flag):
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- set_fact:
+    local_marker: "{{ item }}"
+  delegate_to: recipient
+  delegate_facts: FLAG
+  loop: [first, second]
+""".replace("FLAG", flag))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
 """, inventory="origin,recipient,")
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
