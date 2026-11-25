@@ -2183,7 +2183,7 @@ class _PlayVarScope(dict):
         self.task_containers = {}
         self.active_task_bindings = []
         self.resolved_snapshot = {}
-        if ctx.get(_DEFER_LOOKUP_NAMES):
+        if ctx.get(_DEFER_LOOKUP_NAMES) or any(isinstance(value, _DelegatedTemplateValue) for value in ctx.values()):
             view = _DeferredPlayVarView
         else:
             view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
@@ -3674,7 +3674,7 @@ class _Templater:
         if isinstance(ctx, _PlayVarScope):
             return ctx
         if (ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
-                or any(isinstance(value, _PlayVarTemplate) or _is_deferred_block_var(value)
+                or any(isinstance(value, (_PlayVarTemplate, _DelegatedTemplateValue)) or _is_deferred_block_var(value)
                        for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
         return ctx
@@ -5299,9 +5299,10 @@ class Runtime:
         # Inherited lookups can be reached through aliases in task vars.
         mixed_lookup = self.templater._contains_mixed_lookup(
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
-        if task.get("delegate_to") and task.get("special") == "template":
-            mixed_lookup = mixed_lookup or any(_is_deferred_block_var(value) for value in ctx.values())
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
+        block_template = (task.get("delegate_to") and task.get("special") == "template"
+                          and any(_is_deferred_block_var(value) for value in ctx.values()))
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
+                                      defer=looped or mixed_lookup or block_template))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -5321,7 +5322,7 @@ class Runtime:
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
-                if mixed_lookup and key in task_vars:
+                if (mixed_lookup or block_template) and key in task_vars:
                     host_task_bindings[key] = value
                 # An alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
@@ -6510,7 +6511,7 @@ class Runtime:
             ack["changed"] = True
         return ack
 
-    def _run_file_action(self, name, task, args, ctx, become=False):
+    def _run_file_action(self, name, task, args, ctx, become=False, *, template_vars=None):
         """Run template/copy like their action plugins, with src baked at
         compile time.
 
@@ -6642,16 +6643,21 @@ class Runtime:
                         uid = pwd.getpwuid(uid).pw_name if uid is not None else uid
                     except Exception:
                         pass
-                    tctx.setdefault("template_host", platform.node())
-                    tctx.setdefault("template_path", src)
-                    tctx.setdefault("template_fullpath", fullpath)
-                    tctx.setdefault("template_destpath", dest)
-                    tctx.setdefault("template_mtime",
-                                    _dt.datetime.fromtimestamp(meta["mtime"])
-                                    if meta.get("mtime") is not None else None)
-                    tctx.setdefault("template_uid", uid)
-                    tctx.setdefault("template_run_date", _dt.datetime.now())
-                    tctx.setdefault("ansible_managed", "Ansible managed")
+                    action_vars = {
+                        "template_host": platform.node(),
+                        "template_path": src,
+                        "template_fullpath": fullpath,
+                        "template_destpath": dest,
+                        "template_mtime": (_dt.datetime.fromtimestamp(meta["mtime"])
+                                           if meta.get("mtime") is not None else None),
+                        "template_uid": uid,
+                        "template_run_date": _dt.datetime.now(),
+                        "ansible_managed": "Ansible managed",
+                    }
+                    action_vars = {key: value for key, value in action_vars.items() if key not in tctx}
+                    tctx.update(action_vars)
+                    if template_vars is not None:
+                        template_vars.update(action_vars)
                 except Exception:
                     pass
                 try:
@@ -8271,7 +8277,9 @@ def agent_main():
                 ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
-            defer_template = action == "template" and ctx.get(_DEFER_LOOKUP_NAMES)
+            defer_template = action == "template" and (
+                ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
+            )
             if defer_template:
                 resolve_keys = {"omit"}
             deferred = {} if resolve_keys is not None else None
@@ -8302,6 +8310,8 @@ def agent_main():
                 if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
                     requested_names.add("hostvars")
                 frame["lazy_template_vars"] = sorted(requested_names)
+                # Transport can be lazy while Jinja resolves each referenced name.
+                frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES))
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
@@ -8309,6 +8319,11 @@ def agent_main():
                 member = reply.get("member")
                 fallback = None
                 if member is None and isinstance(name, str) and name in requested_names:
+                    if defer_template and (template_vars := reply.get("template_vars")):
+                        for key in ("template_mtime", "template_run_date"):
+                            if template_vars.get(key) is not None:
+                                template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
+                        scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
                     fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
                 elif members is not None and type(member) is int and 0 <= member < len(members):
                     fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)

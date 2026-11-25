@@ -1071,6 +1071,58 @@ def test_delegated_template_does_not_run_unused_block_lookups(tmp_path):
     assert not marker.exists()
 
 
+def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        details:
+          path: "{{ template_destpath }}"
+          year: "{{ template_run_date.year }}"
+""", {"sample.j2": "{{ details.path }}|{{ vars.details.year }}\n"})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    expected_text = output.read_text()
+    assert expected_text.startswith(str(output) + "|")
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="checks native template name resolution")
+def test_delegated_template_resolves_referenced_block_lookup(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        referenced: >-
+          {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}
+        unused: >-
+          {{ lookup('pipe', 'printf unused >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}
+""", {"sample.j2": "{{ 'untouched' if true else referenced }}\n"})
+    marker = tmp_path / "lookups"
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    assert marker.read_text() == "used"
+    marker.unlink()
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert marker.read_text() == "used"
+
+
 def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     from ansiroll.loader import _core_version
 
