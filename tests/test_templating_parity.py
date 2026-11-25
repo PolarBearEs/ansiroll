@@ -2073,6 +2073,38 @@ def test_include_loop_censors_no_log_item_values(tmp_path):
     assert "synthetic-private-item" not in result.stdout + result.stderr
 
 
+def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [synthetic-private-item]
+      when: false
+      register: selected
+      no_log: true
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert:
+        quiet: true
+        that: selected is skipped
+""", {"child.yml": "- debug: {msg: unexpected body}\n"}, use_strategy=True)
+    assert messages == []
+
+
+def test_empty_ordinary_loop_skips_validation_of_extended_metadata(tmp_path):
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: unexpected}
+      loop: []
+      loop_control: {extended: "{{ undefined_extended }}"}
+""")
+    assert recap[4] == "1"
+
+
 def test_undefined_and_false_loop_conditions(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost

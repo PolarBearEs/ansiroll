@@ -4447,6 +4447,8 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if node.get("type") == "include" and node.get("no_log") and node.get("register") and not is_item:
+                frame["include_register"] = result
             if (not is_item and not node.get("no_log") and node.get("register")
                     and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
                 entries = result["results"] if "results" in result else [result]
@@ -5349,7 +5351,7 @@ class Runtime:
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
-        metadata_flags = self._loop_metadata_flags(task, base_ctx)
+        metadata_flags = self._loop_metadata_flags(task, base_ctx) if items else None
         for i, it in enumerate(items):
             ctx = dict(base_ctx)
             ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))

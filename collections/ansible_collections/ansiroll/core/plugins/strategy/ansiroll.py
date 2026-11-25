@@ -1445,6 +1445,8 @@ class StrategyModule(StrategyBase):
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action in ("include_tasks", "include_role") and "include_register" in frame:
+                    registered_result = frame["include_register"]
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
                     registered_result = _without_delegated_metadata(result_data)
