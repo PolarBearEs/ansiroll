@@ -4734,7 +4734,7 @@ class Runtime:
                     targets[variant["include_id"]] = tasks, handlers
                 if variant.get("tasks_ref"):
                     tasks, handlers = targets.get(variant["tasks_ref"], (tasks, handlers))
-            except (ValueError, jinja2.TemplateError) as error:
+            except Exception as error:
                 result = {"changed": False, "failed": True, "msg": str(error)}
         if result is not None:
             self._store_register(node, result)

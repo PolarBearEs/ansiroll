@@ -1219,12 +1219,13 @@ class _UnbundledVaultFile(ValueError):
     pass
 
 
-def _load_plain_ansible_source(path):
+def _load_plain_ansible_source(path, *, opener=None):
     """Parse one validated snapshot of a source that must be unencrypted."""
     from ansible.module_utils.common.text.converters import to_text
     from ansible.parsing.dataloader import DataLoader
 
-    with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as fh:
+    source_opener = opener or _open_role_source
+    with open(path, "rb", opener=lambda name, _: source_opener(name)) as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
             raise ValueError("expected a regular file")
         data = to_text(fh.read(), errors="surrogate_or_strict")
@@ -1240,7 +1241,9 @@ def _load_plain_ansible_source(path):
 
 
 def _ansible_source_contains_vault(data):
-    if "$ANSIBLE_VAULT" in data:
+    from ansible.parsing.vault import is_encrypted
+
+    if is_encrypted(data):
         return True
     if data.lstrip().startswith(("{", "[")):
         import json
@@ -1712,17 +1715,18 @@ def _vars_file_include_variants(task, source, includes):
             scopes = list(expanded.values())
     variants = {}
     for scope in scopes:
-        branch = _IncludeVariables(scope, includes.all_vars, includes.runtime_writes)
+        branch = _IncludeVariables(_native_include_values(scope), includes.all_vars, includes.runtime_writes)
         filename = _template_include_filename(task, source, branch)
         if isinstance(filename, str) and not _is_templated(filename):
             variants.setdefault(filename, []).append(scope)
     result = {}
     for filename, candidates in variants.items():
-        branch = _IncludeVariables(candidates[0], includes.all_vars, includes.runtime_writes)
+        base_scope = candidates[0]
+        branch = _IncludeVariables(_native_include_values(base_scope), includes.all_vars, includes.runtime_writes)
         branch.vars_file_scopes = candidates
         branch.vars_file_writes = {
-            key for scope in candidates for key in scope.keys() | branch.play_vars.keys()
-            if key not in branch.play_vars or key not in scope or scope[key] != branch.play_vars[key]
+            key for scope in candidates for key in scope.keys() | base_scope.keys()
+            if key not in base_scope or key not in scope or scope[key] != base_scope[key]
         }
         result[filename] = branch
     return result, sorted(names)
@@ -1761,9 +1765,16 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                     continue
                 variant_task = task.copy()
                 variant_task._ansiroll_include_variant_filename = filename
-                expanded = _expand_include_tasks(variant_task, raw_fname, filename, path, actions, basedir,
-                                                 only_tags, skip_tags, branch)
+                variant_actions = set()
+                try:
+                    expanded = _expand_include_tasks(variant_task, raw_fname, filename, path,
+                                                     variant_actions, basedir, only_tags, skip_tags, branch)
+                except Exception:
+                    if filename == default_filename:
+                        raise
+                    continue
                 if expanded is not None and expanded.get("type") == "include":
+                    actions.update(variant_actions)
                     bodies.append({"type": "block", "block": expanded["tasks"], "include_variant": filename,
                                    "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref")})
             if not bodies:
@@ -1782,18 +1793,19 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
 
 @contextmanager
 def _include_source_loader(loader, plaintext_only, roots):
-    if not plaintext_only:
+    original = vars(loader).get("load_from_file")
+    if not plaintext_only or getattr(original, "_ansiroll_plaintext_guard", False):
         yield
         return
-    original = vars(loader).get("load_from_file")
 
     def read(path, *args, **kwargs):
         resolved = loader.path_dwim(path)
         physical = os.path.realpath(resolved)
         if not any(os.path.commonpath((root, physical)) == root for root in roots):
             raise ValueError("runtime-only task source is outside the playbook and role directories")
-        return _rewrite_includes(_load_plain_ansible_source(resolved))
+        return _rewrite_includes(_load_plain_ansible_source(physical, opener=_open_linked_role_source))
 
+    read._ansiroll_plaintext_guard = True
     loader.load_from_file = read
     try:
         yield
@@ -1864,9 +1876,10 @@ def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_t
         include_id = _new_include_id()
         _INCLUDE_STACK[key] = include_id
         try:
-            tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
-                                               skip_tags=skip_tags, includes=includes)
-                                 for b in blocks) if c]
+            with _include_source_loader(task._loader, includes.compile_selected_vars is None, roots):
+                tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
+                                                   skip_tags=skip_tags, includes=includes)
+                                     for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
     role_defaults, role_vars = _role_vars(task)
@@ -1884,6 +1897,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "action": action,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
+        "no_log": bool(getattr(task, "no_log", False)),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -2156,6 +2170,7 @@ def _template_include_filename(task, value, includes):
 
     if _depends_on_vars(value, variables, is_runtime):
         return None
+    variables["playbook_dir"] = task._loader.get_basedir()
     try:
         from ansible.template import Templar
         try:
@@ -2169,6 +2184,20 @@ def _template_include_filename(task, value, includes):
     if isinstance(resolved, str) and not _is_templated(resolved):
         includes.resolved_template = True
     return resolved
+
+
+def _native_include_values(value):
+    if isinstance(value, dict):
+        if set(value) == {"__ansiroll_unsafe__"}:
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            return wrap_var(value["__ansiroll_unsafe__"])
+        return {key: _native_include_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_native_include_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_native_include_values(item) for item in value)
+    return value
 
 
 def _is_literal_include_template(value):
