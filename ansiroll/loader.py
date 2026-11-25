@@ -2019,6 +2019,7 @@ def _convert_task(task, actions, basedir):
         "search_path": _raw_search_path(task, basedir),
         **_ignore_errors_keywords(task),
         "no_log": bool(getattr(task, "no_log", False)),
+        "ignore_unreachable": _boolean_or_template(getattr(task, "ignore_unreachable", False)),
         "async_val": int(getattr(task, "async_val", 0) or 0),
         "poll": int(getattr(task, "poll", 0) or 0),
         "run_once": getattr(task, "run_once", None),
