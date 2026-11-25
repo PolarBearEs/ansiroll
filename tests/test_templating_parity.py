@@ -215,10 +215,13 @@ def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_pat
     assert messages == ["filtered"]
 
 
-@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup handles a templated null differently")
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 @pytest.mark.parametrize("value", ["none", "omit"])
-def test_implicit_setup_applies_setup_default_after_explicit_empty_value(tmp_path, use_strategy, value):
+def test_implicit_setup_applies_setup_default_after_explicit_empty_value(tmp_path, monkeypatch, use_strategy, value):
+    if not MODERN_TEMPLATING:
+        if LEGACY_SETUP or not use_strategy or value != "none":
+            pytest.skip("only modern Core has the same omit and null semantics in both launch modes")
+        monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "true")
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: true

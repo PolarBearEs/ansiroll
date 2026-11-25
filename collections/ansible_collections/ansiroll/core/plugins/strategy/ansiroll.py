@@ -551,13 +551,12 @@ class StrategyModule(StrategyBase):
                 from ansible.executor.task_executor import remove_omit
 
                 task.post_validate(templar=templar)
-                args = {key: value for key, value in task.args.items() if value is not None}
                 legacy = _core_version() < (2, 12)
                 groups = {} if legacy else {"action_groups": getattr(self._cur_play, "_action_groups", {})}
                 setup_action = "ansible.legacy.setup" if legacy else "ansible.builtin.setup"
                 args = get_action_args_with_defaults(
                     task.action if legacy else "ansible.builtin.gather_facts",
-                    args, task.module_defaults, templar, **groups)
+                    task.args, task.module_defaults, templar, **groups)
                 if omit := values.get("omit"):
                     args = remove_omit(args, omit)
                 args = {key: value for key, value in args.items() if key != "parallel" and value is not None}
