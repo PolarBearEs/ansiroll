@@ -502,7 +502,7 @@ class StrategyModule(StrategyBase):
         become_pass = self._resolve_become_password(hv, templar)
         agent_source = (
             self._agent_header(host, hv, become_pass)
-            + self._controller_lookup_header(selected_vars_files)
+            + self._controller_lookup_header(hv, selected_vars_files)
             + "_INJECTED_GATHER_FACTS = %r\n" % gather_facts
             + source
         )
@@ -522,13 +522,36 @@ class StrategyModule(StrategyBase):
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
                 host, chan, task_map, hv, templar, become_pass, play_context,
-                selected_vars_files=selected_vars_files)
+                selected_vars_files=selected_vars_files,
+                gather_task=task_map.get("__gather_facts__") if gather_facts else None)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
         finally:
             chan.close()
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, selected_vars_files=()):
+    def _gather_setup_options(self, host, gather_task):
+        from ansiroll.loader import _core_version
+
+        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
+                   if key in gather_task.args}
+        if options.get("gather_subset") == ["all"] and "gather_subset" not in (self._cur_play.get_ds() or {}):
+            del options["gather_subset"]
+        error = None
+        if options:
+            try:
+                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+                values["ansible_search_path"] = gather_task.get_search_path()
+                options = self._mk_templar(values).template(options)
+                if _core_version() < (2, 19) and (omit := values.get("omit")):
+                    from ansible.executor.task_executor import remove_omit
+
+                    options = remove_omit(options, omit)
+            except AnsibleError as ex:
+                error = str(ex)
+        return {"options": options if error is None else {}, "error": error}
+
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *,
+              selected_vars_files=(), gather_task=None):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -573,6 +596,11 @@ class StrategyModule(StrategyBase):
                 self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "gather_setup":
+                data = (self._gather_setup_options(host, gather_task) if gather_task is not None
+                        else {"error": "implicit setup was not scheduled"})
+                gather_task = None
+                chan.send({"t": "gather_setup_result", "setup": data})
             elif t == "delegate":
                 delegate_started = time.monotonic()
                 chan.send({"t": "delegate_result",
@@ -595,8 +623,9 @@ class StrategyModule(StrategyBase):
                     "source": source_result,
                 })
             elif t == "vars_files":
-                chan.send({"t": "vars_files_result",
-                           "result": self._resolved_vars_file_state(host, selected_vars_files)})
+                state = self._resolved_vars_file_state(
+                    host, selected_vars_files, task=task_map.get("__gather_facts__"), snapshot=hv)
+                chan.send({"t": "vars_files_result", "result": state})
             elif t == "warning":
                 display.warning(frame["message"])
             elif t == "error":
@@ -1177,11 +1206,11 @@ class StrategyModule(StrategyBase):
                 + "_INJECTED_FAST_FACTS = %r\n"
                 % _truthy(os.environ.get("ANSIROLL_FAST_FACTS", "")))
 
-    def _host_vars_and_lookup_sources(self, host):
+    def _host_vars_and_lookup_sources(self, host, *, task=None):
         selected = []
         manager = self._variable_manager
         if self._deferred_vars_file_keys is None:
-            return dict(manager.get_vars(host=host, play=self._cur_play)), selected
+            return dict(manager.get_vars(host=host, play=self._cur_play, task=task)), selected
 
         # Observe the vars_files reads made directly by this host's native
         # variable manager. Inventory plugins can also use load_from_file.
@@ -1201,32 +1230,43 @@ class StrategyModule(StrategyBase):
 
         loader.load_from_file = capture
         try:
-            return dict(manager.get_vars(host=host, play=self._cur_play)), selected
+            return dict(manager.get_vars(host=host, play=self._cur_play, task=task)), selected
         finally:
             if original_override is None:
                 del loader.load_from_file
             else:
                 loader.load_from_file = original_override
 
-    def _resolved_vars_file_state(self, host, initial_files):
+    def _resolved_vars_file_state(self, host, initial_files, *, task=None, snapshot=None):
         if self._deferred_vars_file_keys is None:
             return {"error": "unexpected request for vars_files"}
         try:
-            current_vars, files = self._host_vars_and_lookup_sources(host)
+            current_vars, files = self._host_vars_and_lookup_sources(host, task=task)
         except AnsibleError as ex:
             return {"error": str(ex)}
-        keys = set(self._deferred_vars_file_keys)
-        for loaded in (*initial_files, *files):
-            for mapping in loaded if isinstance(loaded, list) else (loaded,):
-                if isinstance(mapping, dict):
-                    keys.update(mapping)
+        active_keys = self._vars_file_keys(files)
+        keys = self._deferred_vars_file_keys | self._vars_file_keys(initial_files) | active_keys
+        refreshed = {key: current_vars[key] for key in keys & current_vars.keys()}
+        missing = sorted(keys - current_vars.keys(), key=str)
+        if snapshot is not None:
+            for key in missing:
+                snapshot.pop(key, None)
+            snapshot.update(refreshed)
         mapping_keys = []
         return {
-            "vars": _json_blob({key: current_vars[key] for key in keys & current_vars.keys()}, mapping_keys),
-            "missing": sorted(keys - current_vars.keys(), key=str),
+            "vars": _json_blob(refreshed, mapping_keys),
+            "names": sorted(set(self._cur_play.vars or {}) | active_keys, key=str),
+            "missing": missing,
             "mapping_keys": mapping_keys,
-            "controller_lookups": self._controller_lookups(files),
+            "controller_lookups": self._controller_lookups(
+                {key: current_vars[key] for key in active_keys & current_vars.keys()}),
         }
+
+    @staticmethod
+    def _vars_file_keys(files):
+        return {key for loaded in files
+                for mapping in (loaded if isinstance(loaded, list) else (loaded,))
+                if isinstance(mapping, dict) for key in mapping}
 
     @staticmethod
     def _controller_lookups(selected_vars_files):
@@ -1239,11 +1279,13 @@ class StrategyModule(StrategyBase):
             "controller_config": _controller_config_values(config_names),
         }
 
-    def _controller_lookup_header(self, selected_vars_files):
-        if not selected_vars_files:
+    def _controller_lookup_header(self, variables, selected_vars_files):
+        keys = self._vars_file_keys(selected_vars_files) & variables.keys()
+        if not keys:
             return ""
+        sources = {key: variables[key] for key in keys}
         return "_INJECTED_CONTROLLER_LOOKUPS = __import__('json').loads(%r)\n" % json.dumps(
-            self._controller_lookups(selected_vars_files), default=str)
+            self._controller_lookups(sources), default=str)
 
     # ---- channel transport ----------------------------------------------
     def _open_channel(self, host, play_context, hv, templar):
@@ -1486,6 +1528,8 @@ class StrategyModule(StrategyBase):
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = result_data.get("ansible_facts")
+            if task_key == "__gather_facts__" and status == "ok":
+                facts = frame.get("gathered_facts", facts)
             if action == "include_vars":
                 # The controller has already stored the original tagged values.
                 facts = None
