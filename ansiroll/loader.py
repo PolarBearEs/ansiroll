@@ -434,8 +434,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
-                          _selector_template_sources)
+    from .runtime import (_first_found_embedded_templates, _is_literal_vars_lookup, _selector_input_paths,
+                          _selector_projection_cycle, _selector_scope, _selector_template_sources)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
@@ -468,6 +468,11 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 or selector and _is_literal_vars_lookup(call)
             ):
                 return None
+            if (selector and isinstance(method, nodes.Name) and method.name == "lookup" and call.args
+                    and isinstance(call.args[0], nodes.Const)
+                    and call.args[0].value in ("first_found", "ansible.builtin.first_found")):
+                pending.extend((template, (), (None, template), ancestors)
+                               for template in _first_found_embedded_templates(call))
             if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
                 plugin = call.args[0].value.rsplit(".", 1)[-1]
@@ -1071,7 +1076,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                             paths=paths, unknown_lookup=unknown_lookup)
                         if dependencies is not None and not unknown_lookup:
-                            if "first_found" in filename and _vars_first_found_patterns(filename, True) is not None:
+                            if "first_found" in filename and _vars_first_found_patterns(filename, basedir, True) is not None:
                                 defer_for_order |= bool(dependencies[1] - extra_replacements - selector_magic.keys())
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
                             if requires_controller:
@@ -1208,17 +1213,34 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
-def _vars_first_found_patterns(source, allow_short_name):
-    """Model positional first_found filenames using bounded glob patterns."""
+def _vars_first_found_patterns(source, basedir, allow_short_name):
+    """Model built-in first_found filenames using bounded glob patterns."""
+    import glob
+
     from jinja2 import Environment, TemplateSyntaxError, nodes
     from .runtime import _first_found_list_option
+
+    named_homes = {}
+
+    def filename_pattern(name):
+        if name.startswith("~"):
+            home = name.split("/", 1)[0]
+            expanded_home = os.path.expanduser(home)
+            if home != "~" and expanded_home != home:
+                named_homes[home] = expanded_home
+        return _vars_file_glob_pattern(os.path.expanduser(name))
+
+    def option_can_be_empty(term):
+        if isinstance(term, (nodes.List, nodes.Tuple)):
+            return all(option_can_be_empty(item) for item in term.items)
+        return not isinstance(term, (nodes.Const, nodes.Concat))
 
     def term_patterns(term, separators="[;,]"):
         if isinstance(term, nodes.Const) and isinstance(term.value, str):
             values = re.split(separators, term.value) if separators else [term.value]
-            return [_vars_file_glob_pattern(os.path.expanduser(name)) for name in values]
+            return [filename_pattern(name) for name in values]
         if isinstance(term, nodes.Name):
-            return ["*"]
+            return [glob.escape(basedir) if term.name == "playbook_dir" else "*"]
         if isinstance(term, (nodes.List, nodes.Tuple)):
             return [pattern for item in term.items for pattern in term_patterns(item, separators)]
         if isinstance(term, (nodes.Add, nodes.Concat)):
@@ -1263,13 +1285,16 @@ def _vars_first_found_patterns(source, allow_short_name):
             filenames = [pattern for term in terms for pattern in term_patterns(term, separator)]
         paths = options.get("paths")
         directories = option_patterns(paths, "[,:;]") if paths is not None else []
+        plugin = call.args[0].value
         if not modern and not use_file_option:
-            return call.args[0].value, filenames
-        path_terms = paths.items if isinstance(paths, (nodes.List, nodes.Tuple)) else [paths]
-        if not directories or any(not isinstance(term, nodes.Const) for term in path_terms):
+            return plugin, filenames, named_homes
+        if option_can_be_empty(paths):
             directories.insert(0, "")
-        return call.args[0].value, [os.path.join(directory, filename)
-                                   for directory in directories for filename in filenames]
+        patterns = [os.path.join(directory, filename) for directory in directories for filename in filenames]
+        if not modern and option_can_be_empty(files) and option_can_be_empty(paths):
+            # With neither option set, legacy Core falls back to its positional terms.
+            patterns.extend(pattern for term in terms for pattern in term_patterns(term, None))
+        return plugin, patterns, named_homes
     except (TemplateSyntaxError, ValueError):
         return None
 
@@ -1348,10 +1373,10 @@ def _deferred_vars_files(play, basedir, entries):
                 has_local_override = any(os.path.isfile(os.path.join(root, "lookup_plugins", "first_found.py"))
                                          for root in dirs)
                 modeled = _vars_first_found_patterns(
-                    name, bool(resolved and not has_local_override
+                    name, basedir, bool(resolved and not has_local_override
                                and os.path.realpath(resolved) == os.path.realpath(builtin_first_found.__file__)))
                 if modeled is not None:
-                    plugin, patterns = modeled
+                    plugin, patterns, named_homes = modeled
                     candidates = set()
                     for pattern in patterns:
                         for root in first_found_roots:
@@ -1364,7 +1389,7 @@ def _deferred_vars_files(play, basedir, entries):
                                     files[path] = _bundled_vars_file(play, path)
                     first_found[name] = {"plugin": plugin, "patterns": patterns,
                                          "roots": first_found_roots, "files": sorted(candidates),
-                                         "home": os.path.expanduser("~")}
+                                         "home": os.path.expanduser("~"), "named_homes": named_homes}
                     continue
             if _vars_file_has_dynamic_directory(name):
                 unmodeled.append(name)

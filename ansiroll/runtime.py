@@ -1604,6 +1604,15 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _first_found_embedded_templates(call):
+    nodes = jinja2.nodes
+    for arg in [*call.args[1:], *(keyword.value for keyword in call.kwargs)]:
+        literals = (arg,) if isinstance(arg, nodes.Const) else arg.find_all(nodes.Const)
+        for literal in literals:
+            if _looks_templated(literal.value):
+                yield literal.value
+
+
 def _first_found_list_option(value):
     if not isinstance(value, str):
         return value
@@ -1639,8 +1648,13 @@ def _first_found_vars_file(args, kwargs, selector):
         for folder in paths or ("",):
             for filename in group:
                 candidate = os.path.join(folder, filename) if folder else filename
-                if candidate.startswith("~/"):
-                    candidate = os.path.join(selector["home"], candidate[2:])
+                if candidate.startswith("~"):
+                    home, _, relative = candidate.partition("/")
+                    directory = selector.get("named_homes", {}).get(home)
+                    if home == "~":
+                        directory = selector["home"]
+                    if directory is not None:
+                        candidate = os.path.join(directory, relative) if relative else directory
                 if ".." in candidate.split(os.path.sep):
                     raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
                 for root in selector["roots"]:
@@ -5294,11 +5308,8 @@ class Runtime:
                 if (selector and modeled and isinstance(method, nodes.Name) and method.name == "lookup"
                         and call.args and isinstance(call.args[0], nodes.Const)
                         and call.args[0].value == modeled["plugin"]):
-                    for arg in [*call.args[1:], *(kw.value for kw in call.kwargs)]:
-                        literals = (arg,) if isinstance(arg, nodes.Const) else arg.find_all(nodes.Const)
-                        pending.extend((literal.value, (), None, ()) for literal in literals
-                                       if isinstance(literal.value, str)
-                                       and ("{{" in literal.value or "{%" in literal.value))
+                    pending.extend((template, (), (None, template), ancestors)
+                                   for template in _first_found_embedded_templates(call))
                     continue
                 if selector and _is_literal_vars_lookup(call):
                     continue

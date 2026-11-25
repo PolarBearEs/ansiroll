@@ -287,6 +287,81 @@ def test_first_found_vars_files_replays_selected_timeout_before_setup(tmp_path, 
     assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
 
 
+def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: dev, variant: compile}
+  vars_files:
+    - selectors-{{ variant }}.yml
+    - "{{ lookup('first_found', ['{{ profile }}.yml']) }}"
+  tasks: []
+""")
+    (tmp_path / "selectors-compile.yml").write_text("profile: dev\n")
+    (tmp_path / "selectors-launch.yml").write_text("profile: prod\n")
+    (tmp_path / "dev.yml").write_text("selected: development\n")
+    (tmp_path / "prod.yml").write_text("selected: production\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"variant": "launch"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+@pytest.mark.parametrize("location", ["named-home", "playbook-dir"])
+def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch, location):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "prod.yml").write_text("selected: production\n")
+    if location == "named-home":
+        expanduser = os.path.expanduser
+
+        def fake_expanduser(path):
+            if isinstance(path, str) and path.partition("/")[0] == "~ansiroll_test":
+                _, _, rest = path.partition("/")
+                return str(profiles / rest)
+            return expanduser(path)
+
+        monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
+        paths = "['~ansiroll_test']"
+    else:
+        paths = "[playbook_dir ~ '/profiles']"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', [profile ~ '.yml'], files=[profile ~ '.yml'], paths=PATHS) }}"
+  tasks: []
+""".replace("PATHS", paths))
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+def test_legacy_first_found_vars_files_bundles_positional_fallback(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 16):
+        pytest.skip("this Core does not try the files override before positional terms")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', ['nested/' ~ profile ~ '.yml'], files=overrides) }}"
+  tasks: []
+""")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "prod.yml").write_text("selected: production\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod", "overrides": []})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
 def test_first_found_vars_files_preserves_bundled_custom_lookup(tmp_path):
     lookup_dir = tmp_path / "lookup_plugins"
     lookup_dir.mkdir()
