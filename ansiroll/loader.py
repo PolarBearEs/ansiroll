@@ -1222,23 +1222,28 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
 
     named_homes = {}
 
-    def filename_pattern(name):
-        if name.startswith("~"):
-            home = name.split("/", 1)[0]
-            expanded_home = os.path.expanduser(home)
-            if home != "~" and expanded_home != home:
-                named_homes[home] = expanded_home
-        return _vars_file_glob_pattern(os.path.expanduser(name))
+    def expand_home(pattern):
+        if not pattern.startswith("~"):
+            return pattern
+        home, separator, tail = pattern.partition("/")
+        expanded_home = os.path.expanduser(home)
+        if expanded_home == home:
+            return pattern
+        if home != "~":
+            named_homes[home] = expanded_home
+        return glob.escape(expanded_home) + separator + tail
 
     def option_can_be_empty(term):
         if isinstance(term, (nodes.List, nodes.Tuple)):
             return all(option_can_be_empty(item) for item in term.items)
-        return not isinstance(term, (nodes.Const, nodes.Concat))
+        if isinstance(term, nodes.Concat):
+            return all(option_can_be_empty(item) for item in term.nodes)
+        return not isinstance(term, nodes.Const) or term.value == ""
 
     def term_patterns(term, separators="[;,]"):
         if isinstance(term, nodes.Const) and isinstance(term.value, str):
             values = re.split(separators, term.value) if separators else [term.value]
-            return [filename_pattern(name) for name in values]
+            return [_vars_file_glob_pattern(name) for name in values]
         if isinstance(term, nodes.Name):
             return [glob.escape(basedir) if term.name == "playbook_dir" else "*"]
         if isinstance(term, (nodes.List, nodes.Tuple)):
@@ -1287,14 +1292,14 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
         directories = option_patterns(paths, "[,:;]") if paths is not None else []
         plugin = call.args[0].value
         if not modern and not use_file_option:
-            return plugin, filenames, named_homes
+            return plugin, [expand_home(filename) for filename in filenames], named_homes
         if option_can_be_empty(paths):
             directories.insert(0, "")
         patterns = [os.path.join(directory, filename) for directory in directories for filename in filenames]
         if not modern and option_can_be_empty(files) and option_can_be_empty(paths):
             # With neither option set, legacy Core falls back to its positional terms.
             patterns.extend(pattern for term in terms for pattern in term_patterns(term, None))
-        return plugin, patterns, named_homes
+        return plugin, [expand_home(pattern) for pattern in patterns], named_homes
     except (TemplateSyntaxError, ValueError):
         return None
 

@@ -308,12 +308,11 @@ def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp
     assert runtime.vars["selected"] == "production"
 
 
-@pytest.mark.parametrize("location", ["named-home", "playbook-dir"])
+@pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation"])
 def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch, location):
     profiles = tmp_path / "profiles"
-    profiles.mkdir()
-    (profiles / "prod.yml").write_text("selected: production\n")
-    if location == "named-home":
+    filename = "profile ~ '.yml'"
+    if location in ("named-home", "joined-home"):
         expanduser = os.path.expanduser
 
         def fake_expanduser(path):
@@ -323,18 +322,28 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
             return expanduser(path)
 
         monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
-        paths = "['~ansiroll_test']"
+        if location == "named-home":
+            paths = "['~ansiroll_test']"
+        else:
+            filename = "'~ansiroll_test/' ~ profile ~ '.yml'"
+            paths = "['profiles']"
+            profiles /= "~ansiroll_test"
+    elif location == "empty-concatenation":
+        profiles = tmp_path
+        paths = "[prefix ~ '']"
     else:
         paths = "[playbook_dir ~ '/profiles']"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "prod.yml").write_text("selected: production\n")
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
-    - "{{ lookup('first_found', [profile ~ '.yml'], files=[profile ~ '.yml'], paths=PATHS) }}"
+    - "{{ lookup('first_found', [FILENAME], files=[FILENAME], paths=PATHS) }}"
   tasks: []
-""".replace("PATHS", paths))
+""".replace("PATHS", paths).replace("FILENAME", filename))
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
-    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod", "prefix": ""})
     runtime.run_play(plan)
     assert not runtime.failed
     assert runtime.vars["selected"] == "production"
