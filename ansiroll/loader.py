@@ -156,9 +156,25 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
         if compiled_play_vars is not None:
             node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope,
                                                 replay_files=bool(node.get("ordered_vars_files"))))
-        if node.get("ordered_vars_files"):
-            node.update(_gather_timeout_file_scope(
-                play, node["ordered_vars_files"], node.get("gather_timeout_template")))
+        scoped_options = node.pop("_gather_setup_scoped", None)
+        setup_compile_vars = node.pop("_gather_setup_compile_vars", None)
+        if node.get("ordered_vars_files") or scoped_options:
+            setup_layers = _gather_timeout_file_scope(
+                play, node.get("ordered_vars_files") or (), node.get("gather_timeout_template"),
+                scoped_options=scoped_options, setup_compile_vars=setup_compile_vars)
+            lookups = setup_layers.pop("_setup_controller_lookups", {})
+            env_names = lookups.get("env", ())
+            if env_names:
+                node.setdefault("controller_env", {}).update({
+                    name: os.environ[name] for name in sorted(env_names) if name in os.environ
+                })
+            node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
+            if scoped_options:
+                setup_layers["gather_setup_scope"]["controller_lookups"] = {
+                    "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
+                    "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
+                }
+            node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
         _assign_stable_uuids(node["tasks"], node["handlers"], uuids)
@@ -305,8 +321,8 @@ def _gather_selector_magic(play):
     return manager._get_magic_variables(play=play, host=None, task=None, include_hostvars=True, **magic_args)
 
 
-def _gather_timeout_file_scope(play, entries, runtime):
-    """Keep original file order and the play layers needed by a runtime timeout."""
+def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, setup_compile_vars=None):
+    """Keep the play layers used by early vars-file and setup option expressions."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
     from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
@@ -325,7 +341,23 @@ def _gather_timeout_file_scope(play, entries, runtime):
         export_replacements.update(key for key, value in export.items()
                                    if C.DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict))
     selector_names = set()
+    computed_selector_names = set()
     timeout_names = set(runtime["names"]) if runtime is not None else set()
+    setup_names = set()
+    computed = set()
+    setup_lookups = {"env": set(), "config": set()}
+    lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
+    for layer in (*exports, play.get_variable_manager().extra_vars, magic):
+        lookup_scope = combine_vars(lookup_scope, layer)
+    for source, _, _ in _selector_template_sources(scoped_options or {}):
+        dependencies = _gather_timeout_dependencies(
+            source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            computed=computed, retain_mutable=True)
+        if dependencies is not None:
+            setup_names.update(dependencies[1])
+        _gather_timeout_dependencies(
+            source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            computed=computed, lookups=setup_lookups)
     file_aliases = {}
     file_names = set()
     for entry in entries:
@@ -334,7 +366,7 @@ def _gather_timeout_file_scope(play, entries, runtime):
         for source in entry.get("names", ()):
             dependencies = _gather_timeout_dependencies(
                 source, selector_scope, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
-                retain_mutable=True)
+                computed=computed_selector_names, retain_mutable=True)
             if dependencies is not None:
                 selector_names.update(dependencies[1])
         files = [entry["static_vars"]] if "static_vars" in entry else entry["files"].values()
@@ -346,9 +378,12 @@ def _gather_timeout_file_scope(play, entries, runtime):
                 for key, value in mapping.items():
                     for source, _, _ in _selector_template_sources(value):
                         file_aliases.setdefault(key, set()).add(source)
+    if computed_selector_names:
+        selector_names.update(defaults)
     for names, scope, shadowed in (
         (selector_names, selector_scope, {}),
         (timeout_names, timeout_scope, export_replacements),
+        (setup_names, timeout_scope, export_replacements),
     ):
         pending = list(names)
         while pending:
@@ -376,18 +411,31 @@ def _gather_timeout_file_scope(play, entries, runtime):
             {key: value for key, value in export.items() if runtime.get("computed_vars") or key in timeout_names}
             for export in exports
         ])
-    return {
+    result = {
         "vars_file_defaults": _tag_untrusted({key: defaults[key] for key in sorted(selector_names & defaults.keys())}),
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
+    if scoped_options:
+        result["_setup_controller_lookups"] = setup_lookups
+        result["gather_setup_scope"] = _tag_untrusted({
+            "defaults": {key: value for key, value in defaults.items() if computed or key in setup_names},
+            "role_exports": [
+                {key: value for key, value in export.items() if computed or key in setup_names}
+                for export in exports
+            ],
+            "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
+            "task_search_path": play.get_search_path(),
+        })
+    return result
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_scope, _selector_template_sources
+    from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
+                          _selector_template_sources)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
@@ -415,8 +463,17 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
         analysis = _selector_scope(expression, key_scope, retain_mutable=retain_mutable)
         for call in analysis[2]:
             method = call.node
-            if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
+            if not allow_controller and not (
+                isinstance(method, nodes.Getattr) and method.attr in scalar_methods
+                or selector and _is_literal_vars_lookup(call)
+            ):
                 return None
+            if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
+                    and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
+                plugin = call.args[0].value.rsplit(".", 1)[-1]
+                if plugin in lookups:
+                    lookups[plugin].update(arg.value for arg in call.args[1:]
+                                           if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
                                                 resolve_aliases=resolve_aliases, analysis=analysis,
                                                 retain_mutable=retain_mutable):
@@ -640,6 +697,7 @@ def _rewrite_includes(data, *, playbook=False, defer_import_fields=None):
 def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                   all_vars=None, runtime_writes=None, gather_facts=None):
     from ansible import constants as C
+    from .runtime import _selector_template_sources
 
     if basedir is None:
         try:
@@ -647,11 +705,18 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
-    ordered_vars_files = [] if (
-        gather_facts is None and play.gather_facts is not False
-        and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
-        and isinstance(play.gather_timeout, str) and _is_templated(play.gather_timeout)
-    ) else None
+    vars_file_entries = _as_list(getattr(play, "vars_files", None))
+    replay_order = any(_is_templated(filename)
+                       for entry in vars_file_entries[:-1]
+                       for filename in _as_list(entry))
+    scoped_options = {
+        key: value for key in ("fact_path", "gather_subset")
+        if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
+    }
+    early_setup = (play.gather_facts is not False
+                   and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
+                   and (scoped_options or _is_templated(play.gather_timeout)))
+    ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
@@ -659,11 +724,16 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
     for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
         deferred[index]["files"].update(selected)
-        deferred[index]["checked_paths"] = checked_paths
+        deferred[index].setdefault("checked_paths", {}).update(checked_paths)
         if controller_candidates:
             deferred[index]["controller_candidates"] = controller_candidates
         if selected:
             deferred[index]["has_compile_selection"] = True
+    ordered_writes = None
+    ordered_lookup_sources = []
+    if ordered_vars_files and deferred:
+        ordered_writes, ordered_lookup_sources = _ordered_vars_file_inputs(
+            [[_tag_untrusted(play.vars or {})], *ordered_vars_files], deferred, order_deferred)
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
@@ -678,15 +748,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
-    for index, entry in enumerate(deferred):
-        if index not in order_deferred or entry.get("unmodeled"):
-            includes.incomplete = True
-        for data in entry["files"].values():
-            if not isinstance(data, list):
-                includes.incomplete = True
-                continue
-            for mapping in data:
-                includes.vars_file_writes.update(mapping)
+    includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
+                              for index, entry in enumerate(deferred))
+    includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
+        key for entry in deferred for data in entry["files"].values() if isinstance(data, list)
+        for mapping in data for key in mapping
+    }
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -749,17 +816,34 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
+    if gather:
+        setup_options = {
+            name: value
+            for name in ("gather_subset", "fact_path")
+            if (value := getattr(play, name, None)) is not None
+        }
+        # Older cores expose their default subset on the loaded Play. Leave
+        # the equivalent setup default implicit when the play did not set it.
+        if setup_options.get("gather_subset") == ["all"] and "gather_subset" not in (play.get_ds() or {}):
+            del setup_options["gather_subset"]
+        if setup_options:
+            result["gather_setup_options"] = _tag_untrusted(setup_options)
+        if gather_facts is None and scoped_options:
+            result["_gather_setup_scoped"] = scoped_options
+            result["_gather_setup_compile_vars"] = play_vars
     # Retain authored selectors and compile-selected definitions, including
     # definitions needed during ordered replay before later files shadow them.
     lookup_sources = {
         **result,
         "deferred_vars_files": [entry["names"] for entry in deferred],
-        "selected_vars_files": [entry[0] for entry in order_deferred.values()],
-        "ordered_static_vars": [
-            entry for entry in (ordered_vars_files or ()) if deferred and not isinstance(entry, int)
-        ],
+        "ordered_vars_file_inputs": ordered_lookup_sources,
     }
+    lookup_sources.pop("gather_setup_options", None)
+    lookup_sources.pop("_gather_setup_scoped", None)
+    lookup_sources.pop("_gather_setup_compile_vars", None)
     names = _controller_env_names(lookup_sources)
+    if "_gather_setup_scoped" in result:
+        result["_gather_compile_env_names"] = sorted(names)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -799,7 +883,68 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             for entry in ordered_vars_files
         ]
         result["vars_file_play_vars"] = _tag_untrusted(play.vars or {})
+        result["ordered_vars_file_mutable_names"] = sorted(ordered_writes or ())
     return result
+
+
+def _ordered_vars_file_inputs(ordered, deferred, compile_selections):
+    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+    from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
+
+    merge = DEFAULT_HASH_BEHAVIOUR == "merge"
+    rewritten, selector_reads, mutable = set(), set(), set()
+    sources = []
+
+    def alias_reads(value):
+        for source, _, _ in _selector_template_sources(value):
+            dependencies = _gather_timeout_dependencies(
+                source, {}, _GATHER_STRING_METHODS, allow_controller=True, retain_mutable=True)
+            if dependencies is not None:
+                yield from dependencies[1]
+
+    for slot in reversed(ordered):
+        if isinstance(slot, int):
+            entry = deferred[slot]
+            definitions = {}
+            for contents in entry["files"].values():
+                if isinstance(contents, list):
+                    for mapping in contents:
+                        for key, value in mapping.items():
+                            definitions.setdefault(key, []).append(value)
+                            if key not in rewritten:
+                                mutable.add(key)
+            # A launch-selected file can supply aliases used by later selectors.
+            # Follow those references, but collect lookups only from eligible
+            # mappings that were actually selected during compilation.
+            pending = list(selector_reads & definitions.keys())
+            while pending:
+                key = pending.pop()
+                for value in definitions[key]:
+                    new_reads = set(alias_reads(value)) - selector_reads
+                    selector_reads.update(new_reads)
+                    pending.extend(new_reads & definitions.keys())
+            mappings = next(iter(compile_selections.get(slot, ({},))[0].values()), [])
+        else:
+            mappings = slot
+        for mapping in reversed(mappings):
+            visible = {key: value for key, value in mapping.items()
+                       if key in selector_reads or key not in rewritten}
+            sources.append(visible)
+            replaced = {key for key, value in mapping.items()
+                        if not merge or not isinstance(value, dict) or value.keys() in (
+                            {"__ansiroll_unsafe__"}, {"__ansiroll_vault__"})}
+            if not isinstance(slot, int):
+                selector_reads.difference_update(replaced)
+                rewritten.update(replaced)
+            for value in visible.values():
+                selector_reads.update(alias_reads(value))
+        if isinstance(slot, int):
+            for source in entry["names"]:
+                dependencies = _gather_timeout_dependencies(
+                    source, {}, _GATHER_STRING_METHODS, selector=True, allow_controller=True, retain_mutable=True)
+                if dependencies is not None:
+                    selector_reads.update(dependencies[1])
+    return mutable, sources
 
 
 def _apply_force_handlers_default(play):
@@ -919,18 +1064,23 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     selector_vars = hash_scope if hash_scope is not None else {**role_defaults, **out}
                     inputs = combine_vars(combine_vars(selector_vars, compile_extra_vars), selector_magic)
                     portable = _gather_timeout_dependencies(filename, inputs, _GATHER_STRING_METHODS, selector=True)
+                    requires_controller, required_plugins = _vars_filename_controller_requirements(filename, portable)
                     # A templated leading directory cannot be bundled by the
                     # filename glob. Keep its known choice unless order requires replay.
-                    if portable is not None and not (filename.startswith(("{{", "{%")) and "/" in filename):
+                    if portable is not None and not _vars_file_has_dynamic_directory(filename):
                         defer_for_order |= bool(portable[1] - extra_replacements - selector_magic.keys())
                     dependencies = portable
                     paths, unknown_lookup = set(), set()
-                    if portable is None:
+                    if portable is None or requires_controller:
                         dependencies = _gather_timeout_dependencies(
                             filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                             paths=paths, unknown_lookup=unknown_lookup)
                         if dependencies is not None and not unknown_lookup:
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
+                            if requires_controller:
+                                controller_inputs["controller_only"] = True
+                            if required_plugins:
+                                controller_inputs["jinja_plugins"] = required_plugins
                     if unresolved and dependencies is not None:
                         earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
                         for index, previous in enumerate(earlier, start=scanned):
@@ -950,7 +1100,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             scope.update({key: _tag_untrusted(inputs[key], template_syntax_only=True)
                                           for key in affected if key in inputs})
                             paths.update((key, ()) for key in affected)
-                            controller_inputs = {"inputs": scope, "paths": sorted(paths, key=repr)}
+                            controller_inputs = {"inputs": scope, "paths": sorted(paths, key=repr),
+                                                 "controller_only": requires_controller}
+                            if required_plugins:
+                                controller_inputs["jinja_plugins"] = required_plugins
                 # Template the playbook's own string: it keeps the trust tag that a substituted copy loses.
                 selector_vars = dict(hash_scope if hash_scope is not None else {**role_defaults, **out},
                                      playbook_dir=basedir)
@@ -1013,6 +1166,38 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     return out
 
 
+@lru_cache(maxsize=1)
+def _vars_filename_template_environment():
+    from .runtime import _Templater
+
+    return _Templater().env
+
+
+def _vars_filename_controller_requirements(source, portable):
+    from jinja2 import nodes, TemplateSyntaxError
+    from .runtime import _selector_template_sources
+
+    env = _vars_filename_template_environment()
+    values = portable[0].values() if portable is not None else ()
+    sources = [source, *(alias for value in values for alias, _, _ in _selector_template_sources(value))]
+    missing_filters = set()
+    missing_tests = set()
+    for candidate in sources:
+        try:
+            parsed = env.parse(candidate)
+        except TemplateSyntaxError:
+            return True, {}
+        missing_filters.update(node.name for node in parsed.find_all(nodes.Filter) if node.name not in env.filters)
+        missing_tests.update(node.name for node in parsed.find_all(nodes.Test) if node.name not in env.tests)
+        for call in parsed.find_all(nodes.Call):
+            if (isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
+                    and call.args and isinstance(call.args[0], nodes.Const)
+                    and str(call.args[0].value).rsplit(".", 1)[-1] in ("file", "pipe")):
+                return True, {}
+    required = {kind: sorted(names) for kind, names in (("filters", missing_filters), ("tests", missing_tests)) if names}
+    return bool(required), required
+
+
 def _load_vars_file(play, path):
     try:
         return play._loader.load_from_file(path, trusted_as_template=True)
@@ -1026,6 +1211,44 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _vars_file_has_dynamic_directory(name):
+    return name.startswith(("{{", "{%")) and any(
+        os.path.sep in literal for literal in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+
+
+def _finite_vars_file_names(source):
+    """Return closed literal alternatives of inline conditional file names."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    def choices(node):
+        if isinstance(node, nodes.TemplateData):
+            return [node.data]
+        if isinstance(node, nodes.Const) and isinstance(node.value, str):
+            return [node.value]
+        if isinstance(node, nodes.CondExpr):
+            if isinstance(node.test, nodes.Const):
+                return choices(node.expr1 if node.test.value else node.expr2)
+            result = choices(node.expr1) + choices(node.expr2)
+            if len(result) <= 128:
+                return result
+        if isinstance(node, (nodes.Template, nodes.Output, nodes.Concat)):
+            parts = node.body if isinstance(node, nodes.Template) else node.nodes
+            paths = [""]
+            for part in parts:
+                suffixes = choices(part)
+                if len(paths) * len(suffixes) > 128:
+                    break
+                paths = [head + tail for head in paths for tail in suffixes]
+            else:
+                return paths
+        raise ValueError("nonliteral vars file selector")
+
+    try:
+        return dict.fromkeys(choices(Environment(keep_trailing_newline=True).parse(source)))
+    except (TemplateSyntaxError, ValueError):
+        return None
+
+
 def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -1035,6 +1258,8 @@ def _deferred_vars_files(play, basedir, entries):
     as an error marker that aborts the run if it is selected.
     """
     import glob
+    from ansible.errors import AnsibleFileNotFound
+    from .runtime import _vars_file_glob_covers
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
@@ -1045,25 +1270,53 @@ def _deferred_vars_files(play, basedir, entries):
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
-        unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
-        for name in names:
-            if name in unmodeled:
+        checked_paths = {}
+        unmodeled = []
+        for position, name in enumerate(names):
+            if _vars_file_has_dynamic_directory(name):
+                unmodeled.append(name)
                 continue
-            pattern = _vars_file_glob_pattern(name)
-            if name.startswith(os.path.sep):
-                patterns = [pattern]
-            else:
-                patterns = []
+            if not _is_templated(name):
+                try:
+                    path = (play._loader.path_dwim_relative_stack(play.get_search_path(), subdir, name)
+                            if subdir else play._loader.path_dwim(name))
+                except AnsibleFileNotFound:
+                    continue
+                if not os.path.exists(path):
+                    continue
+                path = os.path.normpath(path)
+                checked_paths[name] = path
+                if path not in files:
+                    files[path] = _bundled_vars_file(play, path)
+                # A literal match succeeds or raises a read error before
+                # Ansible can consider any remaining first-found candidates.
+                names = names[:position + 1]
+                break
+            pattern = _vars_file_glob_pattern(os.path.expanduser(name))
+            finite_names = _finite_vars_file_names(name) if _is_templated(name) else None
+            variants = ([(expanded, glob.escape(expanded)) for candidate in finite_names
+                         if os.pardir not in candidate.split(os.path.sep)
+                         and _vars_file_glob_covers(pattern, expanded := os.path.expanduser(candidate))]
+                        if finite_names else [(name, pattern)])
+            patterns = []
+            for candidate, variant in variants:
+                if os.path.isabs(os.path.expanduser(candidate)):
+                    patterns.append(variant)
+                    continue
                 for d in dirs:
-                    if subdir and name.split("/")[0] != subdir:
-                        patterns.append(os.path.join(glob.escape(d), subdir, pattern))
-                    patterns.append(os.path.join(glob.escape(d), pattern))
+                    if subdir and (_core_version() < (2, 21) or candidate.split("/")[0] != subdir):
+                        patterns.append(os.path.join(glob.escape(d), subdir, variant))
+                    patterns.append(os.path.join(glob.escape(d), variant))
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
-                    if found not in files and os.path.isfile(found):
+                    if found not in files and (os.path.isfile(found) or os.path.isdir(found)):
                         files[found] = _bundled_vars_file(play, found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
+        if checked_paths:
+            entry["checked_paths"] = checked_paths
+        if any(name.startswith("~/") for name in names):
+            entry["controller_home"] = os.path.expanduser("~")
         if unmodeled:
             entry["unmodeled"] = unmodeled
         deferred.append(entry)
@@ -1074,22 +1327,89 @@ def _bundled_vars_file(play, path):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
+    if not os.path.isfile(path):
+        return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: expected a regular file" % path, "rc": 1}
     try:
-        with open(path, "rb") as fh:
-            # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-            # select.
-            if b"$ANSIBLE_VAULT" in fh.read():
-                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                        % path}
-        loaded = _load_vars_file(play, path)
+        loaded = _load_plain_ansible_source(play._loader.path_dwim(path))
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
         return _tag_untrusted(preprocess_vars(loaded))
+    except _UnbundledVaultFile:
+        return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                % path}
     except Exception as ex:
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: %s" % (path, ex),
                 "rc": 4 if isinstance(ex, AnsibleParserError) else 1}
+
+
+class _UnbundledVaultFile(ValueError):
+    pass
+
+
+def _load_plain_ansible_source(path):
+    """Parse one validated snapshot of a source that must be unencrypted."""
+    from ansible.module_utils.common.text.converters import to_text
+    from ansible.parsing.dataloader import DataLoader
+
+    with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as fh:
+        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+            raise ValueError("expected a regular file")
+        data = to_text(fh.read(), errors="surrogate_or_strict")
+    if _ansible_source_contains_vault(data):
+        raise _UnbundledVaultFile(path)
+    try:
+        from ansible._internal._datatag._tags import TrustedAsTemplate
+    except ImportError:
+        pass
+    else:
+        data = TrustedAsTemplate().tag(data)
+    return DataLoader().load(data, file_name=path, show_content=False)
+
+
+def _ansible_source_contains_vault(data):
+    if "$ANSIBLE_VAULT" in data:
+        return True
+    if data.lstrip().startswith(("{", "[")):
+        import json
+        try:
+            from ansible._internal._json._profiles._legacy import Decoder
+            from ansible.parsing.vault import EncryptedString
+        except ImportError:
+            from ansible.parsing.ajson import AnsibleJSONDecoder as Decoder
+            from ansible.parsing.yaml.objects import AnsibleVaultEncryptedUnicode as EncryptedString
+        try:
+            decoded = json.loads(data, cls=Decoder)
+        except Exception:
+            # Ansible retries the whole document as YAML if JSON decoding fails.
+            pass
+        else:
+            pending = [decoded]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, EncryptedString):
+                    return True
+                if isinstance(value, dict):
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+            return False
+    if "!" not in data:
+        return False
+    import yaml
+
+    try:
+        # Inspect tags before constructing values. A Vault value used as a
+        # mapping key may be decrypted by the YAML constructor itself.
+        return any(
+            event.tag in ("!vault", "!vault-encrypted")
+            for event in yaml.parse(data, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+            if isinstance(event, yaml.ScalarEvent)
+        )
+    except (yaml.YAMLError, UnicodeError, RecursionError):
+        # The Ansible loader supplies the diagnostic for malformed input.
+        return False
 
 
 def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
