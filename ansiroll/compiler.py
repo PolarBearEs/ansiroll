@@ -272,6 +272,7 @@ def _shadowed_var_names(plays):
         names.update(node.get("role_params") or {})
         names.update(_runtime_write_names(
             node.get("action"), node.get("args") or {}, node.get("register"),
+            raw_params_is_fact=node.get("set_fact_raw_params_is_fact", False),
         ))
         names.update(_loop_shadowed_names(node))
     for play in plays:

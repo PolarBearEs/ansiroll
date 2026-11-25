@@ -5576,6 +5576,22 @@ def test_expanded_set_fact_args_prevent_conflicting_freeze(tmp_path):
         compile_playbook(str(playbook), freeze_vars=["status"])
 
 
+def test_explicit_raw_params_fact_allows_unrelated_freeze(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    status: before
+    _raw_params: before
+    inputs: {status: after}
+  tasks:
+    - set_fact: {_raw_params: '{{ inputs }}'}
+""")
+    compile_playbook(str(playbook), freeze_vars=["status"])
+    with pytest.raises(ValueError, match="cannot freeze '_raw_params'"):
+        compile_playbook(str(playbook), freeze_vars=["_raw_params"])
+
+
 def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path):
     from ansiroll.loader import _core_version
 
@@ -5602,20 +5618,23 @@ def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_delegated_set_fact_keeps_free_form_scalar(tmp_path):
+@pytest.mark.parametrize("payload, expression", [("scalar", "'scalar'"), ("{inner: keep}", "{'inner': 'keep'}")])
+def test_delegated_set_fact_keeps_free_form_argument(tmp_path, payload, expression):
     from ansiroll.loader import _core_version
 
     if _core_version() < (2, 21):
         pytest.skip("checks free-form argument processing on Core 2.21")
     playbook = """- hosts: origin
   gather_facts: false
-  vars: {payload: scalar}
+  vars: {payload: %s, inner: untouched}
   tasks:
     - set_fact: '{{ payload }}'
       delegate_to: recipient
     - assert:
-        that: vars['_raw_params'] == 'scalar'
-"""
+        that:
+          - "vars['_raw_params'] == %s"
+          - inner == 'untouched'
+""" % (payload, expression)
     for strategy in ("linear", "ansiroll.core.ansiroll"):
         result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
                                     environment={"ANSIBLE_STRATEGY": strategy})

@@ -1667,14 +1667,30 @@ def _loop_binding_names(loop_var, index_var, extended):
     return names
 
 
-def _runtime_write_names(action, args, register):
+def _set_fact_raw_params_is_fact(task):
+    from ansible.parsing.splitter import split_args
+
+    # Delegated free-form arguments retain the same key as native Core.
+    if getattr(task, "delegate_to", None):
+        return True
+    source = task.get_ds() or {}
+    forms = (source.get("args"), source.get(task.action), source.get("action"), source.get("local_action"))
+    return any(
+        (isinstance(form, dict) and "_raw_params" in form)
+        or (isinstance(form, str) and any(token.startswith("_raw_params=") for token in split_args(form)))
+        for form in forms
+    )
+
+
+def _runtime_write_names(action, args, register, *, raw_params_is_fact=False):
     """Return variable writes, using None for a write with unknown names."""
     names = set(register if isinstance(register, dict) else [register]) if register else set()
     action = str(action or "").rsplit(".", 1)[-1]
     if action == "set_fact":
         names.update(None if _is_templated(key) else key
                      for key in args if key not in ("cacheable", "_variable_params"))
-        if "_variable_params" in args or (set(args) == {"_raw_params"} and _is_templated(args["_raw_params"])):
+        if "_variable_params" in args or (
+                not raw_params_is_fact and set(args) == {"_raw_params"} and _is_templated(args["_raw_params"])):
             names.add(None)
     elif action == "include_vars":
         name = args.get("name")
@@ -1754,8 +1770,11 @@ class _IncludeVariables:
                 self.record_writes(node.rescue)
                 self.record_writes(node.always)
             elif isinstance(node, Task):
+                args = node.args or {}
+                raw_params_is_fact = ("_raw_params" in args and node.action.rsplit(".", 1)[-1] == "set_fact"
+                                      and _set_fact_raw_params_is_fact(node))
                 self.runtime_writes.update(
-                    _runtime_write_names(node.action, node.args or {}, node.register)
+                    _runtime_write_names(node.action, args, node.register, raw_params_is_fact=raw_params_is_fact)
                 )
 
 
@@ -2439,14 +2458,7 @@ def _convert_task(task, actions, basedir):
         if trusted_keys:
             node["set_fact_key_templates"] = trusted_keys
         if "_raw_params" in args:
-            from ansible.parsing.splitter import split_args
-
-            source = task.get_ds() or {}
-            forms = (source.get("args"), source.get(action), source.get("action"), source.get("local_action"))
-            node["set_fact_raw_params_is_fact"] = any(
-                (isinstance(form, dict) and "_raw_params" in form)
-                or (isinstance(form, str) and any(token.startswith("_raw_params=") for token in split_args(form)))
-                for form in forms)
+            node["set_fact_raw_params_is_fact"] = _set_fact_raw_params_is_fact(task)
     if action.split(".")[-1] == "assert":
         node["args"] = {k: v if k == "that" else _tag_untrusted(v)
                         for k, v in node["args"].items()}
