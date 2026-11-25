@@ -334,11 +334,16 @@ class StrategyModule(StrategyBase):
             return self._tqm.RUN_ERROR
         if linear_reason:
             if self._delegate_on_target:
+                if hasattr(play, "get_path"):
+                    source = play.get_path()
+                else:
+                    path, line, _ = getattr(play.get_ds(), "ansible_pos", ("", 0, 0))
+                    source = "%s:%s" % (path, line) if path else ""
                 display.warning(
                     "ansiroll_delegate_on_target has no effect during core linear fallback for play %r "
                     "on batch hosts %s (%s). Ansible handles delegation for this batch (play source %s)."
                     % (play.name or play.get_name(), ", ".join(host.name for host in hosts),
-                       linear_reason, play.get_path())
+                       linear_reason, source)
                 )
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
