@@ -194,6 +194,40 @@ def test_implicit_gather_action_defaults_take_precedence_over_setup_defaults(tmp
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.gather_facts:
+      parallel: false
+      filter: null
+    ansible.builtin.setup:
+      filter: [ansible_distribution]
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(Version(__version__) >= Version("2.12"), reason="only older cores use legacy setup")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_honors_legacy_module_default_names(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    setup:
+      filter: ansible_distribution
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_setup_defaults_read_public_role_vars(tmp_path, use_strategy):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost

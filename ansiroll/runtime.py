@@ -7064,6 +7064,13 @@ class Runtime:
                 if controller_setup["error"] is not None:
                     raise ValueError(controller_setup["error"])
                 setup_args = controller_setup["options"]
+                # Older gather tasks carry setup's default values even when
+                # the only authored argument resolves to omit.
+                if (not _core_at_least(2, 13) and gather_timeout is None and not timeout_template
+                        and "gather_subset" not in (setup_options or {}) and not (setup_defaults or gather_defaults)
+                        and setup_args in ({"gather_subset": ["all"]},
+                                           {"gather_subset": ["all"], "gather_timeout": 10})):
+                    setup_args = {}
             else:
                 authored_options = dict(setup_options or {})
                 if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
@@ -7096,8 +7103,9 @@ class Runtime:
                     setup_args["gather_timeout"] = gather_timeout
                 if gather_defaults or setup_defaults:
                     defaults_ctx, _ = (option_contexts or {}).get("fact_path", (ctx, ()))
-                    for layers in (gather_defaults, setup_defaults):
-                        setup_args.update(self._render_setup_defaults(layers, setup_args, defaults_ctx))
+                    setup_args.update(self._render_setup_defaults(gather_defaults, setup_args, defaults_ctx))
+                    setup_args = {key: value for key, value in setup_args.items() if key != "parallel" and value is not None}
+                    setup_args.update(self._render_setup_defaults(setup_defaults, setup_args, defaults_ctx))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts

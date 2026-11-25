@@ -908,7 +908,13 @@ def _setup_module_defaults(play, action):
         defaults.update(layer)
     groups = (getattr(play, "_action_groups", None) or {}).get(action, ())
     inherited = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
-    inherited.append(defaults.get(action))
+    if _core_version() < (2, 12):
+        short = action.rsplit(".", 1)[-1]
+        inherited.append(defaults.get(short))
+        if short == "setup":
+            inherited.append(defaults.get("ansible.legacy.setup"))
+    else:
+        inherited.append(defaults.get(action))
     return [entry for entry in inherited if entry]
 
 

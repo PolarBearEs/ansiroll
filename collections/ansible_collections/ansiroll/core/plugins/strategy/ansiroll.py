@@ -538,7 +538,7 @@ class StrategyModule(StrategyBase):
                 from ansible.executor.module_common import _apply_action_arg_defaults
 
                 task.post_validate(templar=templar._engine)
-                options = {key: value for key, value in task.args.items() if value is not None}
+                options = {key: value for key, value in task.args.items() if key != "parallel" and value is not None}
                 options = _apply_action_arg_defaults("ansible.builtin.setup", task, options, templar)
             else:
                 from ansible.executor.module_common import get_action_args_with_defaults
@@ -546,13 +546,17 @@ class StrategyModule(StrategyBase):
 
                 task.post_validate(templar=templar)
                 args = {key: value for key, value in task.args.items() if value is not None}
-                groups = {"action_groups": getattr(self._cur_play, "_action_groups", {})} if _core_version() >= (2, 12) else {}
+                legacy = _core_version() < (2, 12)
+                groups = {} if legacy else {"action_groups": getattr(self._cur_play, "_action_groups", {})}
+                setup_action = "ansible.legacy.setup" if legacy else "ansible.builtin.setup"
                 args = get_action_args_with_defaults(
-                    "ansible.builtin.gather_facts", args, task.module_defaults, templar, **groups)
+                    task.action if legacy else "ansible.builtin.gather_facts",
+                    args, task.module_defaults, templar, **groups)
                 if omit := values.get("omit"):
                     args = remove_omit(args, omit)
+                args = {key: value for key, value in args.items() if key != "parallel" and value is not None}
                 options = get_action_args_with_defaults(
-                    "ansible.builtin.setup", args, task.module_defaults, templar, **groups)
+                    setup_action, args, task.module_defaults, templar, **groups)
         except (AnsibleError, ValueError, TypeError) as ex:
             return {"options": {}, "error": str(ex)}
         return {"options": options, "error": None}

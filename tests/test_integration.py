@@ -2483,6 +2483,32 @@ def test_implicit_setup_passes_play_gather_timeout(tmp_path, monkeypatch, timeou
         assert calls == [("ansible.builtin.setup", expected)]
 
 
+@pytest.mark.parametrize("authored_timeout", [None, 10])
+def test_legacy_controller_setup_keeps_fast_facts_for_implicit_options(monkeypatch, authored_timeout):
+    import ansiroll.runtime as runtime_module
+    from ansiroll.accelerated_modules import facts
+
+    monkeypatch.setattr(runtime_module, "_core_at_least", lambda major, minor: (2, 12) >= (major, minor))
+    monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    options = {"gather_subset": ["all"], "gather_timeout": 10}
+    runtime.gather_setup_fn = lambda: {"options": options, "error": None}
+    calls = []
+
+    def collect_facts(**kwargs):
+        calls.append("fast")
+        return {"ansible_facts": {}}
+
+    def run_setup(action, args, **kwargs):
+        calls.append((action, args))
+        return {"ansible_facts": {}}
+
+    monkeypatch.setattr(facts, "run", collect_facts)
+    monkeypatch.setattr(runtime, "run_module", run_setup)
+    assert runtime.gather_facts(setup_options={"fact_path": "{{ omit }}"}, gather_timeout=authored_timeout)
+    assert calls == (["fast"] if authored_timeout is None else [("ansible.builtin.setup", options)])
+
+
 def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
