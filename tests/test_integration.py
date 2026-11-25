@@ -5556,6 +5556,9 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
     assert not (tmp_path / "dry.txt").exists()
     assert (tmp_path / "real.txt").read_text() == "visible-diff"
     assert "private_debug_message" not in proc.stdout
+    if runner != "standalone":
+        assert "+visible-diff" in proc.stdout
+        assert "+template diff" in proc.stdout
 
 
 def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, monkeypatch):
@@ -5583,6 +5586,130 @@ def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, m
     runtime.run_play(_compiled_plays(source, tmp_path)[0])
     assert not runtime.failed
     assert recorded == [("first", False), ("second", False)]
+
+
+@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
+def test_expanded_include_matches_apply_var_scope_and_resolves_no_log_per_item(tmp_path, runner):
+    from ansiroll.loader import _core_version
+
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          vars:
+            chosen: "{{ flavor | default('fallback') }}"
+          no_log: "{{ false }}"
+"""
+    (tmp_path / "child.yml").write_text("""- debug:
+    msg: "{{ chosen }}-visible-applied-keyword"
+- debug:
+    msg: "{{ chosen }}-{{ 'visible-marker' if item == 'show' else 'private-marker' }}"
+  vars:
+    flavor: child
+  no_log: "{{ item == 'hide' }}"
+  loop: [show, hide]
+""")
+    if runner == "standalone":
+        path = tmp_path / "play.yml"
+        path.write_text(playbook)
+        artifact = tmp_path / "compiled.py"
+        artifact.write_text(compile_playbook(str(path))[0])
+        proc = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, text=True, capture_output=True)
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "fallback-visible-applied-keyword" in proc.stdout
+    prefix = "child" if _core_version() < (2, 19) else "fallback"
+    assert f"{prefix}-visible-marker" in proc.stdout
+    assert "private-marker" not in proc.stdout + proc.stderr
+
+
+def test_recursive_include_keeps_inherited_no_log(tmp_path):
+    (tmp_path / "a.yml").write_text("""- set_fact:
+    depth: "{{ depth | default(0) | int + 1 }}"
+- include_tasks: b.yml
+""")
+    (tmp_path / "b.yml").write_text("""- debug:
+    msg: "{{ 'initial-visible-marker' if depth | int == 1 else 'recursive-private-marker' }}"
+- include_tasks:
+    file: a.yml
+    apply: {no_log: true}
+  when: depth | int == 1
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - include_tasks:
+        file: a.yml
+        apply: {no_log: false}
+""")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "initial-visible-marker" in proc.stdout
+    assert "recursive-private-marker" not in proc.stdout + proc.stderr
+
+
+def test_expanded_include_censors_results_and_preserves_run_once_state(tmp_path):
+    (tmp_path / "child.yml").write_text("""- set_fact:
+    protected_value: hidden-fact-marker
+    cacheable: true
+  register: protected_result
+  run_once: true
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  connection: local
+  gather_facts: false
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply: {no_log: true}
+- hosts: all
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        quiet: true
+        that:
+          - protected_value.startswith('hidden-')
+          - protected_result.ansible_facts.protected_value == protected_value
+          - ansible_facts.protected_value == protected_value
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "hidden-fact-marker" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("mode", ["omit", "invalid"])
+def test_expanded_include_resolves_execution_mode_before_dispatch(tmp_path, monkeypatch, mode):
+    from ansiroll.loader import _core_version
+
+    if mode == "omit" and _core_version() < (2, 19):
+        pytest.skip("modern Core restores the parent keyword after omission")
+    path = tmp_path / "play.yml"
+    path.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {invalid: typo}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply: {check_mode: true, diff: true}
+""")
+    (tmp_path / "child.yml").write_text(f"""- command: child
+  check_mode: "{{{{ {mode} }}}}"
+  diff: "{{{{ omit }}}}"
+""")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, check_mode=False)
+    calls = []
+    monkeypatch.setattr(runtime, "_run_accelerated_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda *args, **kwargs: calls.append((runtime.check_mode, runtime.diff_mode))
+                        or {"changed": False})
+    runtime.run_play(_compiled_plays(compile_playbook(str(path))[0], tmp_path)[0])
+    assert runtime.failed == (mode == "invalid")
+    assert calls == ([(True, True)] if mode == "omit" else [])
 
 
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):

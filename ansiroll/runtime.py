@@ -4482,14 +4482,17 @@ class Runtime:
     def _tally(self, bucket):
         self.stats[bucket] = self.stats.get(bucket, 0) + 1
 
-    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None):
+    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None, no_log=None):
         # Reporting only; recap tallies are applied explicitly by the caller so
         # rescued/ignored/loop semantics match Ansible.
         emitted_result = result
         include_register = None
+        private_result = None
         include = node.get("type") == "include"
         send_register = self.on_result and include and node.get("register") and not is_item
-        if node.get("no_log"):
+        if no_log is None:
+            no_log = bool(node.get("no_log"))
+        if no_log:
             emitted_result = {
                 "censored": ("the output has been hidden due to the fact that "
                              "'no_log: true' was specified for this result")
@@ -4499,6 +4502,12 @@ class Runtime:
                 emitted_result["_ansible_item_label"] = item
             if send_register:
                 include_register = _pack_include_value(result)
+            if getattr(self, "_controller_result_transport", False) and not include:
+                if node.get("register") and not is_item:
+                    private_result = _pack_include_value(result)
+                elif isinstance(result.get("ansible_facts"), dict):
+                    state = {key: result[key] for key in ("ansible_facts", "_ansible_facts_cacheable") if key in result}
+                    private_result = _pack_include_value(state)
         elif include and _contains_typed_mapping_keys((result, item)):
             # Leave presentation JSON-safe and keep the original keys for register.
             packed = _pack_include_value(result)
@@ -4519,6 +4528,7 @@ class Runtime:
             "status": status,
             "ignored": ignored,
             "is_item": is_item,
+            "no_log": no_log,
             "result": emitted_result,
             "provenance": self._task_provenance.get(
                 id(node), {"mode": "native-agent"}
@@ -4529,7 +4539,9 @@ class Runtime:
         if self.on_result:
             if include_register is not None:
                 frame["include_register"] = include_register
-            if (not is_item and not node.get("no_log") and node.get("register")
+            if private_result is not None:
+                frame["private_result"] = private_result
+            if (not is_item and (not no_log or private_result is not None) and node.get("register")
                     and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
                 entries = result["results"] if "results" in result else [result]
                 references = {}
@@ -4812,6 +4824,7 @@ class Runtime:
         if node.get("tasks_ref"):
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
+        include_no_log = bool(node.get("no_log"))
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
         metadata_flags = None
         if items:
@@ -4825,9 +4838,11 @@ class Runtime:
                       "msg": "No items in the list"}
         if result is None and items is None:
             result, ignore = self._task_gate(node, base_ctx)
+            if result is None:
+                include_no_log, result = self._resolve_task_no_log(node, base_ctx)
         if result is not None:
             self._store_register(node, result)
-            self.emit(node, _status_of(result), result, ignored=ignore)
+            self.emit(node, _status_of(result), result, ignored=ignore, no_log=include_no_log)
             if result.get("skipped"):
                 self._tally("skipped")
             elif ignore:
@@ -4848,7 +4863,7 @@ class Runtime:
             result = {"changed": False, "include": node.get("file")}
             loop_vars = {}
             if not looped:
-                selected.append((base_ctx, loop_vars, result, item))
+                selected.append((base_ctx, loop_vars, result, item, include_no_log))
                 break
             try:
                 loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
@@ -4858,6 +4873,9 @@ class Runtime:
                 break
             ctx = {**base_ctx, **loop_vars}
             blocked, ignored = self._task_gate(node, ctx)
+            item_no_log = include_no_log
+            if blocked is None:
+                item_no_log, blocked = self._resolve_task_no_log(node, ctx)
             if blocked is not None:
                 if _result_failed(blocked) and not _core_at_least(2, 19):
                     legacy_failure = (blocked, ignored)
@@ -4889,21 +4907,23 @@ class Runtime:
                 failed_items_ignored = failed_items_ignored and ignored
             reported = {**result, **loop_vars}
             if not _result_failed(result) and not result.get("skipped"):
-                selected.append((ctx, loop_vars, reported, item))
-            results.append((item, result, reported))
+                selected.append((ctx, loop_vars, reported, item, item_no_log))
+            results.append((item, result, reported, item_no_log))
             if stop:
                 break
 
         failure = None
         if looped:
+            aggregate_no_log = any(hidden for _, _, _, hidden in results)
             if legacy_failure is not None:
                 aggregate, ignored = legacy_failure
+                aggregate_no_log = aggregate_no_log or include_no_log
                 selected.clear()
             else:
-                failed = any(_result_failed(outcome) for _, outcome, _ in results)
-                skipped = all(outcome.get("skipped") for _, outcome, _ in results)
+                failed = any(_result_failed(outcome) for _, outcome, _, _ in results)
+                skipped = all(outcome.get("skipped") for _, outcome, _, _ in results)
                 aggregate = {"changed": False, "failed": failed,
-                             "results": [reported for _, _, reported in results]}
+                             "results": [reported for _, _, reported, _ in results]}
                 if failed:
                     aggregate["msg"] = "One or more items failed"
                 elif skipped:
@@ -4911,14 +4931,15 @@ class Runtime:
                 else:
                     aggregate["msg"] = "All items completed"
                 ignored = ignore_loop if _core_at_least(2, 21) else failed_items_ignored
-                for item, outcome, reported in results:
+                for item, outcome, reported, item_no_log in results:
                     status = _status_of(outcome)
                     if status != "ok":
-                        self.emit(node, status, reported, item=item, ignored=ignored, is_item=True, name=name)
+                        self.emit(node, status, reported, item=item, ignored=ignored, is_item=True,
+                                  name=name, no_log=item_no_log)
             self._store_register(node, aggregate)
             status = _status_of(aggregate)
             if status != "ok":
-                self.emit(node, status, aggregate, ignored=ignored, name=name)
+                self.emit(node, status, aggregate, ignored=ignored, name=name, no_log=aggregate_no_log)
             if status == "failed":
                 if ignored:
                     self._tally("ok")
@@ -4929,7 +4950,7 @@ class Runtime:
                 self._tally("skipped")
 
         scopes = []
-        for ctx, loop_vars, result, item in selected:
+        for ctx, loop_vars, result, item, item_no_log in selected:
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
             params.update(loop_vars)
             scope = _with_high_vars(overlay, params)
@@ -4939,7 +4960,7 @@ class Runtime:
             include_params.update(invocation_params)
             include_params.update(loop_vars)
             scope[_INCLUDE_PARAMS_KEY] = include_params
-            self.emit(node, "ok", result, item=item, is_item=looped, name=name)
+            self.emit(node, "ok", result, item=item, is_item=looped, name=name, no_log=item_no_log)
             if not looped:
                 self._store_register(node, result)
             if tally_ok:
@@ -4947,7 +4968,7 @@ class Runtime:
             self._add_handlers(handlers, scope, b)
             scopes.append(scope)
         if looped and status == "ok" and node.get("register"):
-            self.emit(node, status, aggregate, ignored=ignored, name=name)
+            self.emit(node, status, aggregate, ignored=ignored, name=name, no_log=aggregate_no_log)
         if failure is not None:
             if scopes:
                 failure.pending_includes = (tasks, scopes, b)
@@ -5389,6 +5410,7 @@ class Runtime:
         self.emit_start(task)
 
         notifications = []
+        no_log = bool(task.get("no_log"))
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
@@ -5399,10 +5421,12 @@ class Runtime:
                 except Exception as ex:
                     res = {"failed": True, "changed": False, "msg": str(ex)}
                     ignore = self._ignore_before_validation(task)
+            no_log = res.pop("_ansiroll_no_log", no_log)
         else:
             res, ignore = self._task_gate(task, base_ctx)
             if res is None:
                 res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
+                no_log = res.pop("_ansiroll_no_log", no_log)
                 if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
                     self._absorb_facts(task, res, fact_host)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
@@ -5417,7 +5441,7 @@ class Runtime:
         status = _status_of(res)
         if status == "unreachable" and task.get("loop") is None:
             ignore_unreachable = self._ignores_unreachable(task, base_ctx)
-        self.emit(task, status, res, ignored=ignore)
+        self.emit(task, status, res, ignored=ignore, no_log=no_log)
 
         if status == "unreachable":
             if not ignore_unreachable:
@@ -5534,6 +5558,7 @@ class Runtime:
         )
         pending_facts = []
         loop_succeeded = False
+        aggregate_no_log = False
         try:
             for i, it in enumerate(items):
                 fact_host = None
@@ -5542,8 +5567,10 @@ class Runtime:
                 if i > 0 and task.get("loop_pause"):
                     time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
                 res, ignore = self._task_gate(task, ctx)
+                no_log = bool(task.get("no_log"))
                 if res is None:
                     res, fact_host = self._exec_notifying_task(task, ctx, become, notifications)
+                    no_log = res.pop("_ansiroll_no_log", no_log)
                     if fact_host is None:
                         if commits_delegated_facts:
                             pending_facts.append((None, dict(res)))
@@ -5560,6 +5587,7 @@ class Runtime:
                             base_ctx["ansible_facts"] = {
                                 **(cached if isinstance(cached, dict) else {}), **_normalized_facts(facts),
                             }
+                aggregate_no_log = aggregate_no_log or no_log
                 res["item"] = it
                 if task.get("loop_label") is not None:
                     label_ctx = dict(ctx)
@@ -5586,8 +5614,9 @@ class Runtime:
                             # Older executors emitted the item before evaluating
                             # break_when, then returned the task-level error.
                             self.emit(task, _status_of(res), res, item=it,
-                                      ignored=ignore, is_item=True)
-                            return {"failed": True, "changed": False, "msg": str(ex)}, ignore
+                                      ignored=ignore, is_item=True, no_log=no_log)
+                            return {"failed": True, "changed": False, "msg": str(ex),
+                                    "_ansiroll_no_log": aggregate_no_log}, ignore
                         res["failed"] = True
                         res["break_when_result"] = str(ex)
                         stop = True
@@ -5611,7 +5640,7 @@ class Runtime:
                 ignore_loop = ignore_loop or ignore
                 if fact_host is not None:
                     pending_facts.append((fact_host, res))
-                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
+                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log)
                 if stop:
                     break
             loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
@@ -5629,6 +5658,8 @@ class Runtime:
             agg["msg"] = "One or more items failed"
         elif agg.get("unreachable"):
             agg["msg"] = "One or more items were unreachable"
+        if items:
+            agg["_ansiroll_no_log"] = aggregate_no_log
         return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
     def _resolve_task_loop(self, task, ctx):
@@ -5734,13 +5765,16 @@ class Runtime:
     def _exec_notifying_task(self, task, ctx, become, notifications):
         # Like TaskExecutor.post_validate, resolve notify after when and
         # before dispatch, including on unchanged tasks and per loop item.
+        no_log, blocked = self._resolve_task_no_log(task, ctx)
+        if blocked is not None:
+            return {**blocked, "_ansiroll_no_log": no_log}, None
         try:
             names = self._notification_names(task, ctx)
         except Exception as ex:
             return {"failed": True, "changed": False,
-                    "msg": "Failed to template notify: %s" % ex}, None
+                    "msg": "Failed to template notify: %s" % ex, "_ansiroll_no_log": no_log}, None
         fact_host = None
-        concrete = task
+        concrete = task if task.get("no_log") in (None, no_log) else dict(task, no_log=no_log)
         if task.get("delegate_to") and task["action"].rsplit(".", 1)[-1] == "set_fact":
             try:
                 flag = _fail_on_undef(self.template(task.get("delegate_facts", False), ctx))
@@ -5755,11 +5789,12 @@ class Runtime:
                 fact_host = self._delegated_fact_host(target) if delegate_facts else None
                 if self.delegate_on_target and fact_host is not None:
                     raise ValueError("delegate_facts is incompatible with ansiroll_delegate_on_target")
-                concrete = dict(task, delegate_to=target, delegate_facts=bool(fact_host))
+                concrete = dict(concrete, delegate_to=target, delegate_facts=bool(fact_host))
             except Exception as ex:
                 return {"failed": True, "changed": False,
-                        "msg": "Failed to resolve delegated fact host: %s" % ex}, None
+                        "msg": "Failed to resolve delegated fact host: %s" % ex, "_ansiroll_no_log": no_log}, None
         res = self._exec_with_retries(concrete, ctx, become)
+        res["_ansiroll_no_log"] = no_log
         if concrete is not task:
             self._task_provenance[id(task)] = self._task_provenance.pop(id(concrete), {"mode": "native-agent"})
         if notifications is not None and not _result_failed(res):
@@ -5833,6 +5868,22 @@ class Runtime:
             args_cache["args"] = self.template(raw_args, ctx)
         return args_cache["args"]
 
+    def _execution_flag(self, task, key, ctx, default):
+        value = task.get(key)
+        if value is None:
+            return default
+        value = _fail_on_undef(self.template(value, ctx))
+        if isinstance(value, _Omit):
+            value = task.get(key + "_on_omit", default)
+        return default if value is None else _boolean(value, strict=True)
+
+    def _resolve_task_no_log(self, task, ctx):
+        try:
+            return self._execution_flag(task, "no_log", ctx, False), None
+        except Exception as ex:
+            # A failed no_log expression must never expose its diagnostics.
+            return True, {"failed": True, "changed": False, "msg": str(ex)}
+
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
@@ -5845,17 +5896,11 @@ class Runtime:
         try:
             modes = args_cache.get("execution_modes") if args_cache is not None else None
             if modes is None:
-                resolved = []
-                for key, inherited in (("check_mode", inherited_check_mode), ("diff", inherited_diff_mode),
-                                       ("become_override", become)):
-                    value = task.get(key)
-                    if value is not None:
-                        value = _fail_on_undef(self.template(value, ctx))
-                    if value is None or isinstance(value, _Omit):
-                        resolved.append(inherited)
-                    else:
-                        resolved.append(_boolean(value, strict=key != "check_mode"))
-                modes = tuple(resolved)
+                modes = (
+                    self._execution_flag(task, "check_mode", ctx, inherited_check_mode),
+                    self._execution_flag(task, "diff", ctx, inherited_diff_mode),
+                    self._execution_flag(task, "become_override", ctx, become),
+                )
                 if args_cache is not None:
                     args_cache["execution_modes"] = modes
             self.check_mode, self.diff_mode, become = modes
@@ -8246,6 +8291,7 @@ def agent_main():
                  module_bundle=g.get("_ansiroll_import_bytes"),
                  resource_reader=g.get("_ansiroll_resource_read"))
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
+    rt._controller_result_transport = True
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
 

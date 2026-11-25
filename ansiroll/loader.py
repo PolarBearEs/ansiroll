@@ -1854,7 +1854,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "action": action,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
-        "no_log": bool(getattr(task, "no_log", False)),
+        **_execution_keyword(task, "no_log"),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -1984,7 +1984,12 @@ def _include_scope(task):
 
 
 def _include_scope_key(task):
-    return tuple(repr(sorted(scope.items())) for scope in _include_scope(task))
+    keywords = ("become_user", "ignore_errors", "ignore_unreachable", "environment", "tags")
+    return (
+        *(repr(sorted(scope.items())) for scope in _include_scope(task)),
+        tuple(repr(getattr(task, key, None)) for key in keywords),
+        tuple(repr(_execution_keyword(task, key)) for key in ("check_mode", "diff", "no_log", "become")),
+    )
 
 
 def _too_many_include_contexts(key):
@@ -2349,17 +2354,17 @@ def _convert_task(task, actions, basedir):
         "search_dirs": _search_dirs(task, basedir, "files"),
         "search_path": _raw_search_path(task, basedir),
         **_ignore_errors_keywords(task),
-        "no_log": bool(getattr(task, "no_log", False)),
+        **_execution_keyword(task, "no_log"),
         "ignore_unreachable": _boolean_or_template(getattr(task, "ignore_unreachable", False)),
         "async_val": int(getattr(task, "async_val", 0) or 0),
         "poll": int(getattr(task, "poll", 0) or 0),
         "run_once": getattr(task, "run_once", None),
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
-        "check_mode": _tag_untrusted(getattr(task, "check_mode", None)),
-        "diff": _tag_untrusted(getattr(task, "diff", None)),
+        **_execution_keyword(task, "check_mode"),
+        **_execution_keyword(task, "diff"),
         "become": bool(task.become),
-        "become_override": _tag_untrusted(task.become),
+        **_execution_keyword(task, "become", node_key="become_override"),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)
@@ -3855,6 +3860,24 @@ def _ignore_errors_keywords(task):
             return result
         if inherited is not Sentinel and inherited is not None:
             result["ignore_errors_on_omit"] = _boolean_or_template(inherited)
+    return result
+
+
+def _execution_keyword(task, keyword, *, node_key=None):
+    from ansible.playbook.base import Sentinel
+
+    key = node_key or keyword
+    value = _tag_untrusted(getattr(task, keyword, None))
+    result = {key: value}
+    if _is_templated(value) and _core_version() >= (2, 19):
+        inherited = task._get_parent_attribute(keyword, omit=True)
+        if inherited is not Sentinel:
+            from ansible.module_utils.parsing.convert_bool import boolean
+
+            try:
+                result[key + "_on_omit"] = boolean(inherited) if inherited is not None else False
+            except TypeError:
+                result[key + "_on_omit"] = "invalid"
     return result
 
 
