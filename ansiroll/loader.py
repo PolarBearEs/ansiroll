@@ -168,6 +168,11 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                     name: os.environ[name] for name in sorted(env_names) if name in os.environ
                 })
             node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
+            if scoped_options:
+                setup_layers["gather_setup_scope"]["controller_lookups"] = {
+                    "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
+                    "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
+                }
             node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
@@ -816,6 +821,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     lookup_sources.pop("gather_setup_options", None)
     lookup_sources.pop("_gather_setup_scoped", None)
     names = _controller_env_names(lookup_sources)
+    if "_gather_setup_scoped" in result:
+        result["_gather_compile_env_names"] = sorted(names)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ

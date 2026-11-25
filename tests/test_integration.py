@@ -2497,6 +2497,38 @@ def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(
     assert called == [("ansible.builtin.setup", {"fact_path": "/controller-facts"})]
 
 
+def test_implicit_setup_requires_explicit_input_for_an_uncaptured_controller_value(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {profile: public}
+  vars_files: ['vars-{{ profile }}.yml']
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "vars-public.yml").write_text("directory: /public\n")
+    (tmp_path / "vars-alternate.yml").write_text(
+        '''directory: '{{ lookup("env", "ANSIROLL_DORMANT_SETUP_DIRECTORY") }}'\n''')
+    monkeypatch.setenv("ANSIROLL_DORMANT_SETUP_DIRECTORY", "/synthetic-private-directory")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "/synthetic-private-directory" not in json.dumps(plan)
+    for extra, expected in (({}, "/public"), ({"profile": "alternate"}, None),
+                            ({"profile": "alternate", "directory": "/portable"}, "/portable")):
+        frames, called = [], []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra, on_result=frames.append)
+        monkeypatch.setattr(runtime, "run_module", lambda action, args, **kwargs:
+                            called.append(args) or {"ansible_facts": {}})
+        runtime.run_play(plan)
+        if expected is None:
+            assert runtime.failed
+            assert "uncaptured controller env value" in frames[0]["result"]["msg"]
+            assert not called
+        else:
+            assert not runtime.failed
+            assert called == [{"fact_path": expected}]
+
+
 def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
@@ -2545,6 +2577,42 @@ def test_implicit_fact_path_merges_cached_facts_with_set_fact(tmp_path, monkeypa
     for play in _compiled_plays(source, tmp_path):
         runtime.run_play(play)
     assert called == [("ansible.builtin.setup", {}), ("ansible.builtin.setup", {"fact_path": "/cached"})]
+
+
+@pytest.mark.parametrize("explicit_host_value", [False, True])
+def test_implicit_fact_path_reads_persistent_vars_and_respects_fact_injection(tmp_path, monkeypatch,
+                                                                        explicit_host_value):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_INJECT_FACT_VARS", "False")
+    monkeypatch.setattr(C, "INJECT_FACTS_AS_VARS", False)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {directory: /stale}
+  tasks:
+    - set_fact: {suffix: persistent}
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ directory | default('/current') }}/{{ ansible_distribution | default('fallback') }}/{{ ansible_facts.distribution }}/{{ suffix }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    host_vars = {"inventory_hostname": "localhost"}
+    if explicit_host_value:
+        host_vars["ansible_distribution"] = "inventory"
+    runtime = Runtime({}, "", host_vars)
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append(args)
+        return {"ansible_facts": {"ansible_distribution": "gathered"}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    for play in _compiled_plays(source, tmp_path):
+        runtime.run_play(play)
+    segment = "inventory" if explicit_host_value else "fallback"
+    assert called == [{}, {"fact_path": f"/current/{segment}/gathered/persistent"}]
 
 
 def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):

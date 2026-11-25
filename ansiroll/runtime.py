@@ -87,7 +87,8 @@ def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
-                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
+                "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_setup_controller_lookups",
+                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -1584,6 +1585,12 @@ _ANSIBLE_TESTS = {
 
 def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name).rsplit(".", 1)[-1]
+    setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
+        known = setup_lookups.get(name, ())
+        if any(str(term) not in known for term in args):
+            raise ValueError("setup requires an uncaptured controller %s value; pass the option's input through "
+                             "extra vars or select the vars file at compile time" % name)
     if name == "vars":
         vals = []
         for a in args:
@@ -4062,6 +4069,7 @@ class Runtime:
         self.vars = dict(host_vars or {})
         self._play_var_names = set()
         self._initial_host_vars = self._task_host_vars()
+        self._vars_file_host_vars = self._initial_host_vars
         self.python = python or sys.executable
         self.check_mode = check_mode
         self.diff_mode = diff_mode
@@ -4582,14 +4590,20 @@ class Runtime:
                 option_blocks = dict(blocked_timeout_inputs)
                 for layer in layers:
                     _clear_vars_file_blocks(option_blocks, layer, merge_setup_scope)
+                option_ctx["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
                 option_contexts["gather_subset"] = (option_ctx, option_blocks)
-                host_vars = {key: value for key, value in self._task_host_vars().items()
-                             if key not in self._include_vars_layer and key not in self._set_fact_overrides}
-                if merge_setup_scope:
-                    inject_facts = self.vars["__ansiroll_controller_config"].get("INJECT_FACTS_AS_VARS", True)
-                    for key, value in self._module_fact_layer.items():
-                        if inject_facts or key == "ansible_local":
-                            host_vars.setdefault(key, value)
+                config = self.vars["__ansiroll_controller_config"]
+                facts = self._module_fact_layer
+                inject_facts = config.get("INJECT_FACTS_AS_VARS", True)
+                visible_facts = {key: value for key, value in facts.items() if inject_facts or key == "ansible_local"}
+                host_vars = _f_combine(self._vars_file_host_vars, visible_facts, recursive=merge_setup_scope)
+                if facts:
+                    cached_facts = host_vars.get("ansible_facts")
+                    host_vars["ansible_facts"] = _f_combine(
+                        cached_facts if isinstance(cached_facts, dict) else {}, _normalized_facts(facts),
+                        recursive=merge_setup_scope)
+                for name in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
+                    host_vars[name] = self.vars[name]
                 task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
                 task_blocks = {}
                 if vars_files:
@@ -4604,6 +4618,7 @@ class Runtime:
                 for layer in task_layers:
                     _clear_vars_file_blocks(task_blocks, layer, merge_setup_scope)
                 task_scope = self.ctx(_f_combine(task_vars, *task_layers, recursive=merge_setup_scope), base={})
+                task_scope["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
                 task_scope.pop("vars", None)
                 task_scope["vars"] = _vars_snapshot(task_scope)
                 option_contexts["fact_path"] = (task_scope, task_blocks)
@@ -7429,6 +7444,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         "worker_startup": 0.0,
     }
     rt = None
+    vars_file_host_vars = {**inventory_defaults, **host_vars}
     host_var_overrides = {}
     include_vars_layer = {}
     module_fact_layer = {}
@@ -7449,6 +7465,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      native_only=native_only, inventory_defaults=inventory_defaults)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
+        rt._vars_file_host_vars = vars_file_host_vars
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
