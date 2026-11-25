@@ -2375,12 +2375,16 @@ def test_other_strategy_host_reads_tuple_keys_from_an_include_register(tmp_path)
   tasks:
     - debug:
         msg: "{{ hostvars['source'].selected.results[0].item[(1, 2)] }}"
-""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+    - debug:
+        msg: "{{ hostvars['source'].scoped[1] }}"
+""", {"child.yml": "- debug: {msg: unexpected body}\n",
+          "host_vars/source.yml": "scoped: {1: '{{ inventory_hostname }}'}\n"})
     result = subprocess.run(ansible_playbook_command() + ["-i", "source,observer,", "-c", "local", str(path)],
                             cwd=tmp_path, env={**_env(), "ANSIBLE_STRATEGY": "ansiroll.core.ansiroll"},
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert '"msg": "received"' in result.stdout
+    assert '"msg": "source"' in result.stdout
 
 
 def test_empty_ordinary_loop_skips_validation_of_extended_metadata(tmp_path):

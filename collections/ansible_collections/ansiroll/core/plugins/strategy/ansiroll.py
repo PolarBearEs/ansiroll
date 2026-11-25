@@ -1810,19 +1810,21 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
             if key in ("hostvars", "vars"):
                 continue
             try:
-                # Core's HostVars view can reject typed keys while templating
-                # a register. Its raw value remains safe to copy as data.
+                value = source[key]
+                if not preserve_keys or not _contains_typed_mapping_keys(value):
+                    json.dumps(value, default=str)
+            except Exception:
+                # Core can reject typed keys when reading a register. Keep
+                # raw data only when its ordinary source-host view failed.
                 value = raw.get(key) if isinstance(raw, dict) else None
-                if not _contains_typed_mapping_keys(value):
-                    value = source[key]
-                if preserve_keys and _contains_typed_mapping_keys(value):
+                if not preserve_keys or not _contains_typed_mapping_keys(value):
+                    continue
+                try:
                     packed = _pack_delegated_value(value)
                     if packed["undefined"] or packed.get("errors"):
                         continue
-                else:
-                    json.dumps(value, default=str)
-            except Exception:
-                continue
+                except Exception:
+                    continue
             safe[key] = value
         out[str(name)] = safe
     return out
