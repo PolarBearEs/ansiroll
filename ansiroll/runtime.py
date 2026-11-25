@@ -4086,6 +4086,7 @@ class Runtime:
         # the flattened host snapshot. Those values (set_fact/register) outrank
         # play vars, a distinction that is otherwise lost after serialization.
         self._set_fact_overrides = dict(host_var_overrides or {})
+        self._delegated_ansible_facts_overrides = set()
         # include_vars results: above task vars, below set_fact/register.
         self._include_vars_layer = {}
         self._module_fact_layer = {}
@@ -5263,7 +5264,10 @@ class Runtime:
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
-        delegated_facts = []
+        commits_delegated_facts = task.get("delegate_to") and (
+            task.get("action", "").rsplit(".", 1)[-1] == "set_fact"
+        )
+        pending_facts = []
         for i, it in enumerate(items):
             fact_host = None
             ctx = dict(base_ctx)
@@ -5273,7 +5277,7 @@ class Runtime:
             res, ignore = self._task_gate(task, ctx)
             if res is None:
                 res, fact_host = self._exec_notifying_task(task, ctx, become, notifications)
-                if fact_host is None:
+                if fact_host is None and not commits_delegated_facts:
                     self._absorb_facts(task, res)
                 facts = res.get("ansible_facts") if fact_host is None else None
                 if isinstance(facts, _IncludedVars):
@@ -5330,8 +5334,8 @@ class Runtime:
                 else:
                     agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
             ignore_loop = ignore_loop or ignore
-            if fact_host is not None:
-                delegated_facts.append((fact_host, res))
+            if commits_delegated_facts:
+                pending_facts.append((fact_host, res))
             self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
             if stop:
                 break
@@ -5345,8 +5349,8 @@ class Runtime:
             agg["msg"] = "One or more items failed"
         elif agg.get("unreachable"):
             agg["msg"] = "One or more items were unreachable"
-        if not (agg["failed"] or agg.get("unreachable")):
-            for fact_host, result in delegated_facts:
+        for fact_host, result in pending_facts:
+            if fact_host is None or not (agg["failed"] or agg.get("unreachable")):
                 self._absorb_facts(task, result, fact_host)
         return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
 
@@ -6587,7 +6591,9 @@ class Runtime:
                 target = dict(hostvars.get(fact_host) or {})
                 exposed = {key: value for key, value in facts.items() if key not in self.extra_vars}
                 target.update(exposed)
-                if (res.get("_ansible_facts_cacheable") and "ansible_facts" not in exposed
+                if "ansible_facts" in exposed:
+                    self._delegated_ansible_facts_overrides.add(fact_host)
+                if (res.get("_ansible_facts_cacheable") and fact_host not in self._delegated_ansible_facts_overrides
                         and "ansible_facts" not in self.extra_vars):
                     cached = target.get("ansible_facts")
                     target["ansible_facts"] = {
@@ -7389,6 +7395,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     }
     rt = None
     host_var_overrides = {}
+    delegated_ansible_facts_overrides = set()
     include_vars_layer = {}
     module_fact_layer = {}
     for play in plays:
@@ -7408,6 +7415,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
                      native_only=native_only, inventory_defaults=inventory_defaults)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
+        rt._delegated_ansible_facts_overrides = delegated_ansible_facts_overrides
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()

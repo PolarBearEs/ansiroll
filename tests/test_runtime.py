@@ -1539,6 +1539,39 @@ def test_delegated_set_fact_publishes_only_after_a_successful_loop():
     assert by_name(frames, "local")[0]["status"] == "ok"
 
 
+def test_delegated_set_fact_preserves_loop_order_when_target_is_current_host():
+    rt, _ = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item.value }}"},
+              delegate_to="{{ item.host | default(omit) }}", delegate_facts=True,
+              loop=[{"host": "origin", "value": "first"}, {"value": "last"}]),
+    ], host_vars={"inventory_hostname": "origin"})
+    assert rt.vars["marker"] == "last"
+
+
+def test_delegated_set_fact_routes_each_loop_item():
+    rt, _ = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item.value }}"},
+              delegate_to="{{ item.host | default(omit) }}", delegate_facts="{{ item.route }}",
+              loop=[
+                  {"value": "remote", "host": "recipient", "route": True},
+                  {"value": "local", "host": "recipient", "route": False},
+              ]),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert rt.vars["hostvars"]["recipient"] == {"marker": "remote"}
+    assert rt.vars["marker"] == "local"
+
+
+def test_delegated_cacheable_fact_preserves_explicit_ansible_facts():
+    rt, _ = run([
+        _task("1", "explicit", "set_fact", args={"ansible_facts": "explicit"},
+              delegate_to="recipient", delegate_facts=True),
+        _task("2", "cached", "set_fact", args={"marker": "written", "cacheable": True},
+              delegate_to="recipient", delegate_facts=True),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"recipient": {}}})
+    assert rt.vars["hostvars"]["recipient"]["ansible_facts"] == "explicit"
+    assert rt.vars["hostvars"]["recipient"]["marker"] == "written"
+
+
 def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):
     import ansiroll.runtime as runtime_mod
 

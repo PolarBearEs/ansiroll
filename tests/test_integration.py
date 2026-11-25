@@ -4756,6 +4756,8 @@ def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
           - routed_fact is undefined
           - loop_fact == 'remote'
           - hostvars['localhost'].routed_fact == 'one'
+          - hostvars['127.0.0.1'].routed_fact == 'one'
+          - hostvars['::1'].routed_fact == 'one'
 """,
         inventory="origin,recipient,",
         environment={"ANSIROLL_PROVENANCE": "1"},
@@ -4784,6 +4786,23 @@ def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
 """, inventory="alpha,beta,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - set_fact: {marker: value}
+      delegate_to: localhost
+      delegate_facts: true
+""", inventory="origin,",
+    )
+    assert proc.returncode != 0
+    assert "with ansiroll_delegate_on_target" in " ".join(proc.stderr.split())
 
 
 def test_strategy_native_only_rejects_linear_fallback(tmp_path):

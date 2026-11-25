@@ -44,7 +44,7 @@ DOCUMENTATION = """
     author: PolarBearEs
 """
 
-from ansible import context
+from ansible import constants as C, context
 from ansible.errors import AnsibleError
 from ansible.plugins.strategy import StrategyBase
 from ansible.plugins.loader import connection_loader
@@ -313,6 +313,12 @@ class StrategyModule(StrategyBase):
             and getattr(task, "delegate_facts", None)
             for task in task_map.values()
         ):
+            if self._delegate_on_target:
+                display.error(
+                    "ansiroll: delegated set_fact with delegate_facts is incompatible "
+                    "with ansiroll_delegate_on_target"
+                )
+                return self._tqm.RUN_ERROR
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
@@ -1750,8 +1756,8 @@ def _hostvars_snapshot(hostvars):
     try:
         names = list(hostvars)
         implicit_local = getattr(getattr(hostvars, "_inventory", None), "localhost", None)
-        if implicit_local is not None and implicit_local.name not in names:
-            names.append(implicit_local.name)
+        if implicit_local is not None:
+            names.extend(alias for alias in C.LOCALHOST if alias not in names)
     except Exception:
         return out
     for name in names:
