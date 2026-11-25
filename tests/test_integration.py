@@ -2536,6 +2536,51 @@ def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(
     assert called == [("ansible.builtin.setup", {"fact_path": "/controller-facts"})]
 
 
+def test_standalone_setup_captures_only_the_active_query_from_selected_vars(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: [selected.yml]
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "selected.yml").write_text(
+        """directory: '{{ (query("env", "ANSIROLL_SELECTED_SETUP_QUERY") | first) if true else (query("env", "ANSIROLL_UNREACHABLE_SETUP_QUERY") | first) }}'\n""")
+    monkeypatch.setenv("ANSIROLL_SELECTED_SETUP_QUERY", "/query-facts")
+    monkeypatch.setenv("ANSIROLL_UNREACHABLE_SETUP_QUERY", "synthetic-unreachable-secret")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert plan["controller_env"] == {"ANSIROLL_SELECTED_SETUP_QUERY": "/query-facts"}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert calls == [{"fact_path": "/query-facts"}]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_standalone_setup_uses_the_host_view_and_cache_namespace(tmp_path, monkeypatch, cached):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars:
+    directory: /play
+  fact_path: "{{ hostvars[inventory_hostname].directory if ansible_facts == {} else ansible_facts.ansible_local.directory }}"
+  tasks: []
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {
+        "inventory_hostname": "localhost", "directory": "/inventory", "ansible_facts": {"inventory": True},
+    })
+    if cached:
+        runtime._module_fact_layer = {"ansible_local": {"directory": "/cached"}}
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert calls == [{"fact_path": "/cached" if cached else "/inventory"}]
+
+
 def test_implicit_setup_requires_explicit_input_for_an_uncaptured_controller_value(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

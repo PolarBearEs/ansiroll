@@ -157,10 +157,11 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
             node.update(_compile_gather_timeout(play, vm, loader, compiled_play_vars, hash_scope,
                                                 replay_files=bool(node.get("ordered_vars_files"))))
         scoped_options = node.pop("_gather_setup_scoped", None)
+        setup_compile_vars = node.pop("_gather_setup_compile_vars", None)
         if node.get("ordered_vars_files") or scoped_options:
             setup_layers = _gather_timeout_file_scope(
                 play, node.get("ordered_vars_files") or (), node.get("gather_timeout_template"),
-                scoped_options=scoped_options)
+                scoped_options=scoped_options, setup_compile_vars=setup_compile_vars)
             lookups = setup_layers.pop("_setup_controller_lookups", {})
             env_names = lookups.get("env", ())
             if env_names:
@@ -320,7 +321,7 @@ def _gather_selector_magic(play):
     return manager._get_magic_variables(play=play, host=None, task=None, include_hostvars=True, **magic_args)
 
 
-def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
+def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, setup_compile_vars=None):
     """Keep the play layers used by early vars-file and setup option expressions."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
@@ -344,6 +345,9 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
     setup_names = set()
     computed = set()
     setup_lookups = {"env": set(), "config": set()}
+    lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
+    for layer in (*exports, play.get_variable_manager().extra_vars, magic):
+        lookup_scope = combine_vars(lookup_scope, layer)
     for source, _, _ in _selector_template_sources(scoped_options or {}):
         dependencies = _gather_timeout_dependencies(
             source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
@@ -351,7 +355,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
         if dependencies is not None:
             setup_names.update(dependencies[1])
         _gather_timeout_dependencies(
-            source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
+            source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
             computed=computed, lookups=setup_lookups)
     file_aliases = {}
     file_names = set()
@@ -417,6 +421,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None):
                 for export in exports
             ],
             "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
+            "task_search_path": play.get_search_path(),
         })
     return result
 
@@ -808,6 +813,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             result["gather_setup_options"] = _tag_untrusted(setup_options)
         if gather_facts is None and scoped_options:
             result["_gather_setup_scoped"] = scoped_options
+            result["_gather_setup_compile_vars"] = play_vars
     # Retain authored selectors and compile-selected definitions, including
     # definitions needed during ordered replay before later files shadow them.
     lookup_sources = {
@@ -820,6 +826,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     lookup_sources.pop("gather_setup_options", None)
     lookup_sources.pop("_gather_setup_scoped", None)
+    lookup_sources.pop("_gather_setup_compile_vars", None)
     names = _controller_env_names(lookup_sources)
     if "_gather_setup_scoped" in result:
         result["_gather_compile_env_names"] = sorted(names)

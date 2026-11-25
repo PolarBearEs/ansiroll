@@ -137,6 +137,19 @@ def test_implicit_setup_resolves_options_in_their_native_scope(tmp_path, use_str
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_exposes_task_search_path(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: "{{ ansible_search_path[0] }}/facts"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {"facts/probe.fact": '{"value":"search-path"}\n'}, use_strategy=use_strategy)
+    assert messages == ["search-path"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_setup_reads_public_role_fact_path(tmp_path, use_strategy):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost

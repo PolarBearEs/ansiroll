@@ -4646,13 +4646,7 @@ class Runtime:
                 inject_facts = config.get("INJECT_FACTS_AS_VARS", True)
                 visible_facts = {key: value for key, value in facts.items() if inject_facts or key == "ansible_local"}
                 host_vars = _f_combine(self._vars_file_host_vars, visible_facts, recursive=merge_setup_scope)
-                if facts:
-                    cached_facts = host_vars.get("ansible_facts")
-                    host_vars["ansible_facts"] = _f_combine(
-                        cached_facts if isinstance(cached_facts, dict) else {}, _normalized_facts(facts),
-                        recursive=merge_setup_scope)
-                else:
-                    host_vars.setdefault("ansible_facts", {})
+                host_vars["ansible_facts"] = _normalized_facts(facts, preserve_local=True)
                 for name in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
                     host_vars[name] = self.vars[name]
                 task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
@@ -4669,6 +4663,17 @@ class Runtime:
                 for layer in task_layers:
                     _clear_vars_file_blocks(task_blocks, layer, merge_setup_scope)
                 task_scope = self.ctx(_f_combine(task_vars, *task_layers, recursive=merge_setup_scope), base={})
+                task_scope["ansible_search_path"] = option_scope.get("task_search_path") or []
+                host_view = _f_combine(
+                    {key: value for key, value in host_vars.items()
+                     if key != "hostvars" and not key.startswith("__ansiroll_")},
+                    self._include_vars_layer, self._set_fact_overrides, self.extra_vars,
+                    recursive=merge_setup_scope,
+                )
+                self._pin_magic_vars(host_view)
+                hostviews = dict(host_vars.get("hostvars") or {})
+                hostviews[self.host] = host_view
+                task_scope["hostvars"] = hostviews
                 task_scope["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
                 task_scope.pop("vars", None)
                 task_scope["vars"] = _vars_snapshot(task_scope)
