@@ -5795,6 +5795,70 @@ def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_strategy_keeps_mixed_run_once_fact_writes_in_loop_order(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("checks the unified fact layers used by Ansible 2.21")
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - action: "{{ item.action }}"
+      args: "{{ item.args }}"
+      loop:
+        - action: set_fact
+          args: {ansible_distribution: batch_value, cacheable: true}
+          route: false
+        - action: setup
+          args: {gather_subset: [min], filter: [ansible_distribution]}
+          route: true
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+    - assert:
+        that: (ansible_facts.distribution == 'batch_value') == (inventory_hostname == 'origin')
+""", "-e", json.dumps({"ansible_python_interpreter": sys.executable}), inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_ignores_deferred_group_callbacks_in_later_handler_fact_routing(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if not (2, 19) <= _core_version() < (2, 21):
+        pytest.skip("checks legacy result publication for templated actions")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {scheduled_action: group_by}
+    - debug: {msg: first}
+      changed_when: true
+      notify: route
+    - meta: flush_handlers
+    - set_fact: {scheduled_action: set_fact}
+    - debug: {msg: second}
+      changed_when: true
+      notify: route
+    - meta: flush_handlers
+    - assert:
+        that:
+          - local_marker == 'first'
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'second'
+  handlers:
+    - name: route
+      action: "{{ scheduled_action }}"
+      args: "{{ item[scheduled_action] }}"
+      loop:
+        - {group_by: {key: first}, set_fact: {local_marker: first}, route: false}
+        - {group_by: {key: second}, set_fact: {remote_marker: second}, route: true}
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
