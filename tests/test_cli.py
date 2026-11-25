@@ -804,6 +804,35 @@ def test_compile_rejects_destinations_aliasing_a_transitive_import(tmp_path, des
     assert imported.read_bytes() == original
 
 
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_compile_protects_import_previously_read_through_vars_files(tmp_path, encrypted):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    imported = tmp_path / "child.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    vault_args = []
+    if encrypted:
+        from ansible.parsing.vault import VaultLib, VaultSecret
+
+        password = tmp_path / "vault-password"
+        password.write_text("fixture-password\n")
+        secret = VaultSecret(b"fixture-password")
+        original = VaultLib([("default", secret)]).encrypt(original, secret=secret)
+        vault_args = ["--vault-password-file", str(password)]
+    imported.write_bytes(original)
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files: [child.yml]
+  tasks: []
+- import_playbook: child.yml
+""")
+    command = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(imported)]
+    result = subprocess.run(command + vault_args, capture_output=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert b"points to input playbook" in result.stderr
+    assert imported.read_bytes() == original
+
+
 def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
     playbook = tmp_path / "play.yml"
     destination = tmp_path / "stdout"

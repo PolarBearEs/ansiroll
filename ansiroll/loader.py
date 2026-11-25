@@ -558,6 +558,10 @@ def _make_rewriting_loader(DataLoader):
             opening_playbook = self._opening_playbook
             self._opening_playbook = playbook
             try:
+                if playbook and self.on_playbook_open is not None:
+                    # A vars-file read may have cached these bytes without
+                    # observing the input inode. Open the playbook itself.
+                    kwargs["cache"] = "none" if _core_version() >= (2, 19) else False
                 data = super().load_from_file(*args, **kwargs)
             finally:
                 self._opening_playbook = opening_playbook
