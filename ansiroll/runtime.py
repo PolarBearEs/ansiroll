@@ -4687,6 +4687,20 @@ class Runtime:
         deferred_scopes = [] if items and handlers else None
         if result is None and deferred_scopes is None:
             result, ignore = self._task_gate(node, base_ctx)
+        filename = node.get("file")
+        if result is None and "include_selector" in node:
+            try:
+                filename = _fail_on_undef(self.template(node["include_selector"], base_ctx, strict=True))
+                variant = next((entry for entry in tasks if entry["include_variant"] == filename), None)
+                if variant is None:
+                    raise ValueError("no bundled task file matches %r" % filename)
+                tasks = variant["block"]
+                if variant.get("include_id"):
+                    targets[variant["include_id"]] = tasks, handlers
+                if variant.get("tasks_ref"):
+                    tasks, handlers = targets.get(variant["tasks_ref"], (tasks, handlers))
+            except (ValueError, jinja2.TemplateError) as error:
+                result = {"changed": False, "failed": True, "msg": str(error)}
         if result is not None:
             self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore)
@@ -4703,7 +4717,7 @@ class Runtime:
         invocation_params = node.get("include_params", node.get("vars")) or {}
         # Ansible loads all successful role-loop handlers before running any body.
         for i, item in enumerate(items if looped else [None]):
-            result = {"changed": False, "include": node.get("file")}
+            result = {"changed": False, "include": filename}
             loop_vars = {}
             if looped:
                 loop_vars = self._loop_item_vars(node, items, i, base_ctx)
@@ -5061,6 +5075,16 @@ class Runtime:
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
         ctx.update(higher_vars)
+        if "include_selector_inputs" in task and self.vars.get("__ansiroll_controller_config", {}).get(
+                "DEFAULT_HASH_BEHAVIOUR") == "merge":
+            layers = (role_defaults, self._task_host_vars(), role_vars, overlay, task.get("vars") or {},
+                      self._include_vars_layer, self._set_fact_overrides, task.get("role_params") or {},
+                      overlay.get(_HIGH_VARS_KEY) or {}, self.extra_vars)
+            inputs = set(task["include_selector_inputs"])
+            raw = [{key: mapping[key]._raw if isinstance(mapping[key], _LazyTplDict) else mapping[key]
+                    for key in inputs & mapping.keys()} for mapping in layers]
+            merged = _f_combine(*raw, recursive=True)
+            ctx.update(self.template_vars(merged, ctx, dynamic=True))
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]

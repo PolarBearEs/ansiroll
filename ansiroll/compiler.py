@@ -668,7 +668,7 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache, recursive_loops
             )
             if not node["block"]:
                 node["rescue"] = []
-            if not node["block"] and not node["always"]:
+            if not node["block"] and not node["always"] and "include_variant" not in node:
                 stats["removed_nodes"] += 1
                 continue
         elif kind == "include":

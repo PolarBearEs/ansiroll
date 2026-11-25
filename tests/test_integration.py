@@ -3941,12 +3941,14 @@ def test_controller_timeout_rechecks_projected_branch(tmp_path, monkeypatch, exp
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
-@pytest.mark.parametrize("alternate_vars, fallback", [
-    ("seconds: 45\n", False),
-    ("seconds: 45\ntask_file: other.yml\n", True),
-    ("seconds: [\n", True),
+@pytest.mark.parametrize("alternate_vars, alternate_error", [
+    ("seconds: 45\n", None),
+    ("seconds: 45\ntask_file: other.yml\n", "no bundled task file matches 'other.yml'"),
+    ("seconds: [\n", "Invalid vars_files file"),
 ])
-def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, alternate_vars, fallback):
+def test_ordered_timeout_only_errors_for_the_selected_unavailable_include(tmp_path, alternate_vars, alternate_error):
+    from ansiroll.runtime import VarsFilesError
+
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars: {profile: default, task_file: tasks.yml}
@@ -3960,19 +3962,35 @@ def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, al
     (tmp_path / "settings-alternate.yml").write_text(alternate_vars)
     (tmp_path / "tasks.yml").write_text("- debug: {msg: included-marker}\n")
     source, manifest = compile_playbook(str(playbook))
-    assert bool(manifest["fallback_tasks"]) == fallback
+    assert not manifest["fallback_tasks"]
     plan = _compiled_plays(source, tmp_path)[0]
-    assert ("included-marker" in json.dumps(plan)) != fallback
+    for profile in ("default", "alternate"):
+        frames = []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile},
+                          on_result=frames.append)
+        runtime.run_module = lambda *args, **kwargs: {"ansible_facts": {}}
+        if profile == "alternate" and alternate_error == "Invalid vars_files file":
+            try:
+                runtime.run_play(plan)
+            except VarsFilesError as error:
+                assert alternate_error in str(error)
+            else:
+                assert runtime.failed
+                assert all(frame["action"] == "gather_facts" for frame in frames)
+        else:
+            runtime.run_play(plan)
+            messages = [frame["result"].get("msg") for frame in frames]
+            assert (alternate_error if profile == "alternate" and alternate_error else "included-marker") in messages
 
 
-@pytest.mark.parametrize(("task_vars", "fallback"), [
-    ("{unrelated: 1}", True),
-    ("{task_file: default.yml}", False),
+@pytest.mark.parametrize(("task_vars", "expected"), [
+    ("{unrelated: 1}", "included-alternate"),
+    ("{task_file: default.yml}", "included-default"),
 ])
 @pytest.mark.parametrize("selector", ["cfg.task_file", "(cfg | default({})).task_file",
                                        "(cfg | default({}, true)).task_file", "(cfg or {}).task_file"])
 def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, monkeypatch,
-                                                                    task_vars, fallback, selector):
+                                                                    task_vars, expected, selector):
     from ansible import constants as C
 
     monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
@@ -3992,8 +4010,14 @@ def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, 
     (tmp_path / "settings-alternate.yml").write_text("seconds: 45\ncfg: {task_file: alternate.yml}\n")
     (tmp_path / "default.yml").write_text("- debug: {msg: included-default}\n")
     (tmp_path / "alternate.yml").write_text("- debug: {msg: included-alternate}\n")
-    _, manifest = compile_playbook(str(playbook))
-    assert bool(manifest["fallback_tasks"]) == fallback
+    source, manifest = compile_playbook(str(playbook))
+    assert not manifest["fallback_tasks"]
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "alternate"},
+                      on_result=frames.append)
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert expected in [frame["result"].get("msg") for frame in frames]
 
 
 @pytest.mark.parametrize(("template", "overrides", "expected"), [
@@ -5454,7 +5478,9 @@ def test_strategy_runs_over_a_real_ssh_channel(tmp_path):
             server.wait(timeout=5)
 
 
-def test_standalone_selects_include_from_launch_selected_vars_file(tmp_path):
+@pytest.mark.parametrize("tree_shake", [False, True])
+@pytest.mark.parametrize("shared_parent", [False, True])
+def test_standalone_selects_include_from_launch_selected_vars_file(tmp_path, monkeypatch, tree_shake, shared_parent):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
@@ -5465,12 +5491,27 @@ def test_standalone_selects_include_from_launch_selected_vars_file(tmp_path):
 """)
     vars_dir = tmp_path / "vars"
     vars_dir.mkdir()
+    if shared_parent:
+        (tmp_path / "shared").mkdir()
+        (tmp_path / "shared" / "entry.yml").write_text("- include_tasks: '{{ nested_file }}'\n")
     for profile in ("dev", "prod"):
-        (vars_dir / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
-        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: selected-profile-{profile}}}\n")
+        directory = tmp_path / profile
+        directory.mkdir()
+        if shared_parent:
+            variant = f"task_file: shared/entry.yml\nnested_file: ../{profile}/nested.yml\n"
+        else:
+            variant = f"task_file: {profile}/entry.yml\nnested_file: nested.yml\n"
+            (directory / "entry.yml").write_text("- include_tasks: '{{ nested_file }}'\n")
+        (vars_dir / f"profile-{profile}.yml").write_text(variant)
+        (directory / "nested.yml").write_text(f"- debug: {{msg: selected-profile-{profile}}}\n")
+    with (tmp_path / "prod" / "nested.yml").open("a") as handle:
+        handle.write('''- debug: {msg: '{{ lookup("env", "ANSIROLL_ALT_INCLUDE_SECRET", default="unavailable") }}'}\n''')
+    monkeypatch.setenv("ANSIROLL_ALT_INCLUDE_SECRET", "synthetic-alt-include-secret")
     script = tmp_path / "compiled.py"
-    script.write_text(compile_playbook(str(playbook))[0])
-    for path in (*vars_dir.iterdir(), tmp_path / "dev.yml", tmp_path / "prod.yml"):
+    source, _ = compile_playbook(str(playbook), tree_shake=tree_shake)
+    assert "ANSIROLL_ALT_INCLUDE_SECRET" not in _compiled_plays(source, tmp_path)[0].get("controller_env", {})
+    script.write_text(source)
+    for path in tmp_path.glob("*/*.yml"):
         path.unlink()
     for extra, expected in (({}, "dev"), ({"profile": "prod"}, "prod")):
         result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
