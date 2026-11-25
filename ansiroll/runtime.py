@@ -3944,7 +3944,8 @@ class _Templater:
                         _fail_on_undef(value)
                     result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
                 elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
-                    result = str(_as_text(result))
+                    result = (str(_finalize_text_segment(ctx, result)) if result is None
+                              else str(_as_text(result)))
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
                 result_newlines = len(result) - len(result.rstrip("\n"))
