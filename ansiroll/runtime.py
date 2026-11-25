@@ -4107,6 +4107,7 @@ class Runtime:
         self._module_source_bytes = None  # baked unarchive input for the next worker call
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
+        self.delegate_on_target = False
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
         self._started_task_name = (None, None)
@@ -5482,6 +5483,8 @@ class Runtime:
                 flag = _fail_on_undef(self.template(task.get("delegate_facts", False), ctx))
                 delegate_facts = flag != _OMIT and _boolean(flag, strict=True)
                 fact_host = self._delegated_fact_host(target) if delegate_facts else None
+                if self.delegate_on_target and fact_host is not None:
+                    raise ValueError("delegate_facts is incompatible with ansiroll_delegate_on_target")
                 concrete = dict(task, delegate_to=target, delegate_facts=bool(fact_host))
             except Exception as ex:
                 return {"failed": True, "changed": False,
@@ -7866,6 +7869,7 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
+    rt.delegate_on_target = delegate_on_target
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
             # Only the agent has the play's bundled filters and lookup plugins.

@@ -4920,19 +4920,21 @@ def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     assert "with ansiroll_delegate_on_target" in " ".join(proc.stderr.split())
 
 
-def test_strategy_allows_on_target_delegation_with_a_constant_false_flag(tmp_path):
+@pytest.mark.parametrize("flag", ["false", "route_facts"])
+def test_strategy_allows_on_target_delegation_when_fact_flag_is_false(tmp_path, flag):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
   gather_facts: false
   connection: local
   vars:
     ansiroll_delegate_on_target: true
+    route_facts: false
   tasks:
     - set_fact: {marker: value}
       delegate_to: localhost
-      delegate_facts: "{{ false }}"
+      delegate_facts: "{{ FLAG }}"
     - assert: {that: "marker == 'value'"}
-""", inventory="origin,",
+""".replace("FLAG", flag), inventory="origin,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 

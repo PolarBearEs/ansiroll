@@ -305,21 +305,22 @@ class StrategyModule(StrategyBase):
                 item for item in controller_reasons
                 if item.get("kind") != "delegate"
             ]
+        fact_routes = [
+            _delegated_fact_flag(getattr(task, "delegate_facts", None))
+            for task in task_map.values()
+            if str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
+            and getattr(task, "delegate_to", None)
+        ]
+        if self._delegate_on_target and True in fact_routes:
+            display.error(
+                "ansiroll: delegated set_fact with delegate_facts is incompatible "
+                "with ansiroll_delegate_on_target"
+            )
+            return self._tqm.RUN_ERROR
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
-        elif any(
-            str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
-            and getattr(task, "delegate_to", None)
-            and _may_delegate_facts(getattr(task, "delegate_facts", None))
-            for task in task_map.values()
-        ):
-            if self._delegate_on_target:
-                display.error(
-                    "ansiroll: delegated set_fact with delegate_facts is incompatible "
-                    "with ansiroll_delegate_on_target"
-                )
-                return self._tqm.RUN_ERROR
+        elif not self._delegate_on_target and any(flag is not False for flag in fact_routes):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
@@ -1764,8 +1765,8 @@ def _truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _may_delegate_facts(value):
-    """Keep a native agent for a flag known to be false without evaluating lookups."""
+def _delegated_fact_flag(value):
+    """Resolve literal flags without evaluating templates that depend on runtime vars."""
     from ansiroll.runtime import _boolean
 
     if value is None:
@@ -1775,7 +1776,7 @@ def _may_delegate_facts(value):
     try:
         return _boolean(value, strict=True)
     except TypeError:
-        return True
+        return None
 
 
 def _extra_vars(variable_manager):
