@@ -93,6 +93,25 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
     return expected
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("custom_path", [True, False], ids=["custom", "omit"])
+def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypatch, use_strategy, custom_path):
+    monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")
+    facts = tmp_path / "facts"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: FACT_PATH
+  tasks:
+    - debug:
+        msg: "{{ 'full' if ansible_facts.distribution is defined else 'subset' }}/{{ (ansible_local | default({})).get('ansiroll_setup_probe', {}).get('value', 'missing') }}"
+""".replace("FACT_PATH", json.dumps(str(facts) if custom_path else "{{ omit }}")), {
+        "facts/ansiroll_setup_probe.fact": '{"value":"custom"}\n',
+    }, use_strategy=use_strategy)
+    assert messages == ["subset/custom" if custom_path else "subset/missing"]
+
+
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
     (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local import')\n")
     result = subprocess.run(

@@ -744,6 +744,18 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
+    if gather:
+        setup_options = {
+            name: value
+            for name in ("gather_subset", "fact_path")
+            if (value := getattr(play, name, None)) is not None
+        }
+        # Older cores expose their default subset on the loaded Play. Leave
+        # the equivalent setup default implicit when the play did not set it.
+        if setup_options.get("gather_subset") == ["all"] and "gather_subset" not in (play.get_ds() or {}):
+            del setup_options["gather_subset"]
+        if setup_options:
+            result["gather_setup_options"] = _tag_untrusted(setup_options)
     # Replaying a selector after an earlier deferred file may bundle new
     # candidates. Their lookup names do not authorize copying controller data.
     environment_sources = {**result, "deferred_vars_files": [
