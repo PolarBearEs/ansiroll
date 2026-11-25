@@ -93,6 +93,130 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
     return expected
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("custom_path", [True, False], ids=["custom", "omit"])
+def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypatch, use_strategy, custom_path):
+    monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")
+    facts = tmp_path / "facts"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: FACT_PATH
+  tasks:
+    - debug:
+        msg: "{{ 'full' if ansible_facts.distribution is defined else 'subset' }}/{{ (ansible_local | default({})).get('ansiroll_setup_probe', {}).get('value', 'missing') }}"
+""".replace("FACT_PATH", json.dumps(str(facts) if custom_path else "{{ omit }}")), {
+        "facts/ansiroll_setup_probe.fact": '{"value":"custom"}\n',
+    }, use_strategy=use_strategy)
+    assert messages == ["subset/custom" if custom_path else "subset/missing"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_resolves_options_in_their_native_scope(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        subsets: [all]
+        directory: "{{ playbook_dir }}/facts"
+- hosts: localhost
+  gather_facts: true
+  vars:
+    subsets: ['!all', '!min', local]
+    directory: "{{ playbook_dir }}/unselected"
+  gather_subset: "{{ subsets }}"
+  fact_path: "{{ PATH_EXPRESSION if ansible_facts is defined and ansible_facts == {} else omit }}"
+  tasks:
+    - debug:
+        msg: "{{ ansible_local.probe.value }}/{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"
+""".replace("PATH_EXPRESSION", "vars.directory" if MODERN_TEMPLATING else "directory"),
+                                 {"facts/probe.fact": '{"value":"early"}\n'}, use_strategy=use_strategy)
+    assert messages == ["early/subset"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_exposes_task_search_path(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: "{{ ansible_search_path[0] }}/facts"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {"facts/probe.fact": '{"value":"search-path"}\n'}, use_strategy=use_strategy)
+    assert messages == ["search-path"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_reads_public_role_fact_path(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: "{{ directory }}"
+  roles: [profile]
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {
+        "roles/profile/defaults/main.yml": 'directory: "{{ playbook_dir }}/facts"\n',
+        "roles/profile/tasks/main.yml": "[]\n",
+        "facts/probe.fact": '{"value":"role-default"}\n',
+    }, use_strategy=use_strategy)
+    assert messages == ["role-default"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores keep omit placeholders in lists")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_drops_omitted_subset_entries(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local, "{{ optional_subset | default(omit) }}"]
+  fact_path: "{{ playbook_dir }}/facts"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {"facts/probe.fact": '{"value":"omit"}\n'}, use_strategy=use_strategy)
+    assert messages == ["omit"]
+
+
+def test_strategy_resolves_implicit_fact_path_lookup_on_controller(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: '{{ lookup("file", "fact-directory.txt") }}'
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {
+        "files/fact-directory.txt": str(tmp_path / "facts") + "\n",
+        "facts/probe.fact": '{"value":"controller"}\n',
+    }, use_strategy=True)
+    assert messages == ["controller"]
+
+
+def test_standalone_implicit_fact_path_uses_vars_file_selected_by_cached_facts(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', distribution]
+  tasks: []
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  vars_files: ["vars-{{ 'cached' if ansible_facts.os_family is defined else 'before' }}.yml"]
+  fact_path: "{{ directory }}"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {
+        "vars-cached.yml": 'directory: "{{ playbook_dir }}/facts"\n',
+        "vars-before.yml": 'directory: "{{ playbook_dir }}/missing"\n',
+        "facts/probe.fact": '{"value":"cached"}\n',
+    })
+    assert messages == ["cached"]
+
+
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
     (tmp_path / "tests.py").write_text("raise RuntimeError('unexpected playbook-local import')\n")
     result = subprocess.run(
