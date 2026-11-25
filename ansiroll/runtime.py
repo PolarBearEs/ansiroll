@@ -5843,16 +5843,21 @@ class Runtime:
         included_vars = None
         included_vars_reference = None
         try:
-            check_override = task.get("check_mode")
-            if check_override is not None:
-                if isinstance(check_override, str):
-                    check_override = self.template(check_override, ctx)
-                self.check_mode = _boolean(check_override)
-            diff_override = task.get("diff")
-            if diff_override is not None:
-                if isinstance(diff_override, str):
-                    diff_override = self.template(diff_override, ctx)
-                self.diff_mode = _boolean(diff_override)
+            modes = args_cache.get("execution_modes") if args_cache is not None else None
+            if modes is None:
+                resolved = []
+                for key, inherited in (("check_mode", inherited_check_mode), ("diff", inherited_diff_mode)):
+                    value = task.get(key)
+                    if value is not None:
+                        value = _fail_on_undef(self.template(value, ctx))
+                    if value is None or isinstance(value, _Omit):
+                        resolved.append(inherited)
+                    else:
+                        resolved.append(_boolean(value, strict=key == "diff"))
+                modes = tuple(resolved)
+                if args_cache is not None:
+                    args_cache["execution_modes"] = modes
+            self.check_mode, self.diff_mode = modes
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):

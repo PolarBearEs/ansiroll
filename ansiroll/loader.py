@@ -1790,7 +1790,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         stable_template = raw_fname
     key = ("tasks", physical_path, _include_path_spelling(path),
            id(role) if role is not None else None, _is_handler(task),
-           _include_search_context(task, stable_template, fname), scope)
+           _include_search_context(task, stable_template, fname), scope, repr(args.get("apply")))
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
@@ -1806,7 +1806,8 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             handler = _is_handler(task)
             parent = task
             if args.get("apply"):
-                include = task.copy()
+                include = task.copy(exclude_parent=True)
+                include._parent = task._parent
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
             blocks = load_list_of_blocks(
@@ -2355,8 +2356,8 @@ def _convert_task(task, actions, basedir):
         "run_once": getattr(task, "run_once", None),
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
-        "check_mode": getattr(task, "check_mode", None),
-        "diff": getattr(task, "diff", None),
+        "check_mode": _tag_untrusted(getattr(task, "check_mode", None)),
+        "diff": _tag_untrusted(getattr(task, "diff", None)),
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),

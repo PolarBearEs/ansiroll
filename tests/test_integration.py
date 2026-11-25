@@ -5499,7 +5499,9 @@ def test_strategy_honors_play_level_local_connection(tmp_path):
 
 @pytest.mark.parametrize("runner", ["standalone", "strategy", "linear"])
 def test_expanded_include_applies_task_keywords(tmp_path, runner):
-    (tmp_path / "child.yml").write_text("""- name: Write dry-run file
+    (tmp_path / "child.yml").write_text("""
+- debug: {msg: private_debug_message}
+- name: Write dry-run file
   register: dry_result
   copy:
     content: secret-dry-run
@@ -5542,7 +5544,7 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not (tmp_path / "dry.txt").exists()
     assert (tmp_path / "real.txt").read_text() == "visible-diff"
-    assert "secret-dry-run" not in proc.stdout
+    assert "private_debug_message" not in proc.stdout
 
 
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
