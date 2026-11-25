@@ -2902,7 +2902,7 @@ class Runtime:
         # state that deferred vars-file selectors read and later plays inherit.
         self._inventory_defaults = inventory_defaults or {}
         self.vars = dict(host_vars or {})
-        self._initial_host_vars = {**self._inventory_defaults, **self.vars}
+        self._initial_host_vars = self._task_host_vars()
         self.python = python or sys.executable
         self.check_mode = check_mode
         self.diff_mode = diff_mode
@@ -2966,7 +2966,7 @@ class Runtime:
         self._strict_var_resolution = False
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
-        self.host = self.vars.get("inventory_hostname") or _hostname()
+        self.host = self._initial_host_vars.get("inventory_hostname") or _hostname()
         self.failed = False
         if self.become_password is None:
             # Fall back to ansible_become_pass from the vars (e.g. baked group_vars),
@@ -2984,8 +2984,14 @@ class Runtime:
                     pass
 
     # ---- context / templating -------------------------------------------
+    def _task_host_vars(self):
+        values = {**self._inventory_defaults, **self.vars}
+        if "inventory_hostname" in self._inventory_defaults and not values["inventory_hostname"]:
+            values["inventory_hostname"] = self._inventory_defaults["inventory_hostname"]
+        return values
+
     def ctx(self, *overlays, base=None):
-        d = {**self._inventory_defaults, **self.vars} if base is None else dict(base)
+        d = self._task_host_vars() if base is None else dict(base)
         for o in overlays:
             if o:
                 d.update(o)
@@ -3841,8 +3847,7 @@ class Runtime:
         # register < role params < include params < extra vars < loop item.
         ctx = {}
         ctx.update(task.get("role_defaults") or {})
-        ctx.update(self._inventory_defaults)
-        ctx.update(self.vars)
+        ctx.update(self._task_host_vars())
         ctx.update(task.get("role_vars") or {})
         ctx.update(overlay)
         higher_vars = self._layered_ctx({}, overlay, task.get("role_params"))
@@ -5403,7 +5408,7 @@ class Runtime:
         if not (params or block_vars):
             return scope
         ctx = dict(handler.get("role_defaults") or {})
-        ctx.update(self.vars)
+        ctx.update(self._task_host_vars())
         ctx.update(handler.get("role_vars") or {})
         ctx.update(scope)
         higher = self._layered_ctx({}, role_params=handler.get("role_params"))
@@ -6109,11 +6114,14 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     runtime_started = time.monotonic()
     host_vars = dict(host_vars or {})
     host = host_vars.get("inventory_hostname") or _hostname()
-    host_vars["inventory_hostname"] = _mark_unsafe(host)
     inventory_defaults = {
         "inventory_hostname_short": _mark_unsafe(_inventory_hostname_short(host)),
         "group_names": ["ungrouped"],
     }
+    if host_vars.get("inventory_hostname"):
+        host_vars["inventory_hostname"] = _mark_unsafe(host)
+    else:
+        inventory_defaults["inventory_hostname"] = _mark_unsafe(host)
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}
