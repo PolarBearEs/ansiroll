@@ -1657,6 +1657,9 @@ def _first_found_vars_file(args, kwargs, selector):
                         candidate = os.path.join(directory, relative) if relative else directory
                 if ".." in candidate.split(os.path.sep):
                     raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
+                if not os.path.isabs(candidate) and not selector.get("search_path_matches", True):
+                    raise ValueError("first_found ansible_search_path differs from the bundled search paths; "
+                                     "recompile with the current search paths")
                 for root in selector["roots"]:
                     path = os.path.normpath(os.path.join(root, candidate))
                     if path in bundled:
@@ -5177,25 +5180,17 @@ class Runtime:
                 selector_blocks = {}
             for raw in entry["names"]:
                 first_found = entry.get("first_found", {}).get(raw)
+                search_path_matches = True
                 if first_found:
-                    ctx["__ansiroll_first_found"] = first_found
-                    if "search_path_known" in first_found and (
-                            not first_found["search_path_known"]
-                            or not _same_vars_input(ctx.get("ansible_search_path", []), first_found["search_path"])):
-                        if before_setup:
-                            for mappings in entry["files"].values():
-                                if isinstance(mappings, list):
-                                    for mapping in mappings:
-                                        blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
-                            break
-                        raise VarsFilesError(
-                            "first_found ansible_search_path differs from the bundled search paths; "
-                            "recompile with the current search paths")
+                    if "search_path_known" in first_found:
+                        search_path_matches = first_found["search_path_known"] and _same_vars_input(
+                            ctx.get("ansible_search_path", []), first_found["search_path"])
+                    ctx["__ansiroll_first_found"] = dict(first_found, search_path_matches=search_path_matches)
                 else:
                     ctx.pop("__ansiroll_first_found", None)
                 checked = entry.get("controller_candidates", {}).get(raw)
                 paths = {(key, tuple(path)) for key, path in checked["paths"]} if checked else set()
-                reuse_checked = checked and not _vars_file_reads_blocked(selector_blocks, paths) and all(
+                reuse_checked = checked and search_path_matches and not _vars_file_reads_blocked(selector_blocks, paths) and all(
                     _same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
                     for key, path in paths
                 )
@@ -5224,19 +5219,20 @@ class Runtime:
                         inputs["ansible_search_path"] = ctx.get("ansible_search_path", _MISSING_VARS_FILE_INPUT)
                 try:
                     name = checked["name"] if reuse_checked else _fail_on_undef(self.template(raw, ctx))
-                except jinja2.UndefinedError as ex:
-                    if before_setup:
-                        break
-                    if first_found and isinstance(ex, _CapturedTemplateError):
-                        raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
-                    if self.vars.get("module_setup") or self._facts_gathered:
-                        raise VarsFilesError("an undefined variable was found when attempting to template the "
-                                             "vars_files item %r: %s" % (item, ex))
-                    sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
-                                     % (item,))
-                    break
                 except Exception as ex:
                     if before_setup:
+                        if not search_path_matches:
+                            for mappings in entry["files"].values():
+                                if isinstance(mappings, list):
+                                    for mapping in mappings:
+                                        blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
+                        break
+                    if isinstance(ex, jinja2.UndefinedError) and not (first_found and isinstance(ex, _CapturedTemplateError)):
+                        if self.vars.get("module_setup") or self._facts_gathered:
+                            raise VarsFilesError("an undefined variable was found when attempting to template the "
+                                                 "vars_files item %r: %s" % (item, ex))
+                        sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
+                                         % (item,))
                         break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):

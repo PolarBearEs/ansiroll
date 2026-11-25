@@ -218,6 +218,41 @@ def test_first_found_vars_files_uses_authored_search_path_order(tmp_path):
         runtime.run_play(plan)
 
 
+def test_first_found_vars_files_uses_absolute_candidate_before_search_path(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    unbundled = tmp_path / "unbundled"
+    unbundled.mkdir()
+    (tmp_path / "prod.yml").write_text("selected: absolute\n")
+    (unbundled / "fallback.yml").write_text("selected: unbundled\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_search_path: '{{ lookup_roots }}'
+  vars_files:
+    - "{{ lookup('first_found', [playbook_dir ~ '/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'absolute'}
+""")
+    inputs = {"profile": "prod", "lookup_roots": [str(unbundled)]}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(inputs), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    (tmp_path / "prod.yml").unlink()
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=inputs)
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={**inputs, "profile": "missing"})
+    with pytest.raises(VarsFilesError, match="differs from the bundled search paths"):
+        runtime.run_play(plan)
+
+
 def test_first_found_vars_files_normalizes_string_options(tmp_path):
     from ansiroll.loader import _core_version
     from tests import ansible_playbook_command
