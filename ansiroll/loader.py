@@ -387,7 +387,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import _selector_input_paths, _selector_projection_cycle, _selector_scope, _selector_template_sources
+    from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
+                          _selector_template_sources)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
@@ -415,7 +416,10 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
         analysis = _selector_scope(expression, key_scope, retain_mutable=retain_mutable)
         for call in analysis[2]:
             method = call.node
-            if not allow_controller and not (isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
+            if not allow_controller and not (
+                isinstance(method, nodes.Getattr) and method.attr in scalar_methods
+                or selector and _is_literal_vars_lookup(call)
+            ):
                 return None
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
                                                 resolve_aliases=resolve_aliases, analysis=analysis,

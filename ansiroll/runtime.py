@@ -396,6 +396,18 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
     return bindings, unreachable, calls, closure_reads, closure_nodes
 
 
+def _is_literal_vars_lookup(call):
+    """Whether selector analysis can enumerate every variable read by a lookup."""
+    nodes = jinja2.nodes
+    return (
+        isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
+        and call.dyn_args is None and call.dyn_kwargs is None and call.args
+        and isinstance(call.args[0], nodes.Const)
+        and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
+        and all(isinstance(arg, nodes.Const) and isinstance(arg.value, str) for arg in call.args[1:])
+    )
+
+
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
                           *, resolve_aliases=False, analysis=None, retain_mutable=False):
     """Yield variable names and literal member paths read by a selector."""
@@ -5207,12 +5219,7 @@ class Runtime:
                                        if isinstance(literal.value, str)
                                        and ("{{" in literal.value or "{%" in literal.value))
                     continue
-                if (selector and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
-                        and call.dyn_args is None and call.dyn_kwargs is None and call.args
-                        and isinstance(call.args[0], nodes.Const)
-                        and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
-                        and all(isinstance(arg, nodes.Const) and isinstance(arg.value, str)
-                                for arg in call.args[1:])):
+                if selector and _is_literal_vars_lookup(call):
                     continue
                 return None
             for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,

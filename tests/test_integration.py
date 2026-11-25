@@ -3020,6 +3020,28 @@ def test_standalone_replays_later_vars_file_after_launch_selected_earlier_file(t
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_ordinary_vars_replay_defers_a_first_selector_with_literal_vars_lookup(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    profile: default
+  vars_files:
+    - "profile-{{ lookup('vars', 'profile') }}.yml"
+    - "settings-{{ lookup('vars', 'tier') }}.yml"
+  tasks:
+    - assert: {that: picked == 'launch'}
+""")
+    (tmp_path / "profile-default.yml").write_text("tier: default\n")
+    (tmp_path / "profile-launch.yml").write_text("tier: launch\n")
+    (tmp_path / "settings-default.yml").write_text("picked: default\n")
+    (tmp_path / "settings-launch.yml").write_text("picked: launch\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "launch"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
 def test_ordinary_vars_replay_keeps_the_controller_only_compile_selection(tmp_path):
     from ansiroll.runtime import VarsFilesError
 
