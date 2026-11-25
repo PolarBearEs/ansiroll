@@ -2682,7 +2682,8 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     head, tail = _literal_role_source_edges(src)
     head_dir, _, basename_head = head.rpartition(os.sep)
     prefix_dir = os.path.normpath(prefix)
-    if basename_head in (".", "..") or os.path.normpath(head_dir) != prefix_dir:
+    if (basename_head in (".", "..") or ".." in head_dir.split(os.sep)
+            or os.path.normpath(head_dir) != prefix_dir):
         basename_head = ""
     fixed_path = ""
     literal_tail = ()
@@ -2724,10 +2725,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     aliases = {path: target for path, target in aliases.items() if target in directories}
     suffix = fixed_path[1:].split(os.sep) if os.sep in fixed_path[1:] else ()
 
-    def matches_source(relative, filename, alias_candidates, requires_basename_head):
-        if requires_basename_head and (os.path.normpath(os.path.dirname(relative)) != prefix_dir
-                                       or not filename.startswith(basename_head)):
-            return False
+    def matches_source(relative, filename, alias_candidates):
         if fixed_path and not ((os.sep + relative).endswith(fixed_path) or relative in alias_candidates):
             return False
         return os.sep in tail or filename.endswith(tail)
@@ -2830,7 +2828,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 for filename in claimed_names.intersection(files):
                     path = os.path.join(directory, filename)
                     relative = os.path.relpath(path, base)
-                    if matches_source(relative, filename, alias_candidates, requires_basename_head):
+                    if matches_source(relative, filename, alias_candidates):
                         mode = _role_source_mode(path)
                         if mode is not None and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                             special_paths.add(relative)
@@ -2850,10 +2848,18 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             for fn in sorted(files):
                 full = os.path.join(root, fn)
                 rel = os.path.relpath(full, base)
-                if not matches_source(rel, fn, alias_candidates, requires_basename_head):
+                if not matches_source(rel, fn, alias_candidates):
                     continue
                 mode = _role_source_mode(full)
                 if mode is None:
+                    continue
+                if requires_basename_head and (os.path.normpath(os.path.dirname(rel)) != prefix_dir
+                                               or not fn.startswith(basename_head)):
+                    # A different root can still select this normalized name
+                    # via traversal. Retain blockers without opening any payload.
+                    if not stat.S_ISREG(mode):
+                        root_blocks[rel] = stat.S_ISDIR(mode)
+                        blockers.setdefault(rel, set()).add(root_index)
                     continue
                 earlier_sources = []
                 for earlier_base, earlier_index in skipped:
