@@ -5229,3 +5229,28 @@ def test_strategy_runs_over_a_real_ssh_channel(tmp_path):
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+
+
+def test_standalone_selects_include_from_launch_selected_vars_file(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: dev}
+  vars_files: ['vars/profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    vars_dir = tmp_path / "vars"
+    vars_dir.mkdir()
+    for profile in ("dev", "prod"):
+        (vars_dir / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: selected-profile-{profile}}}\n")
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(playbook))[0])
+    for path in (*vars_dir.iterdir(), tmp_path / "dev.yml", tmp_path / "prod.yml"):
+        path.unlink()
+    for extra, expected in (({}, "dev"), ({"profile": "prod"}, "prod")):
+        result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
+                                env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps(extra)}, timeout=20)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"selected-profile-{expected}" in result.stdout
