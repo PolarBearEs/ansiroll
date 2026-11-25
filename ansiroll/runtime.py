@@ -5904,6 +5904,8 @@ class Runtime:
                     args = _fail_on_undef(_strip_omit(
                         self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
+                    if self._is_builtin_unarchive(task):
+                        self._normalize_unarchive_options(args)
                     res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
@@ -5918,6 +5920,8 @@ class Runtime:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
                     self._render_action_args(task.get("args") or {}, ctx, args_cache)))
+                if self._is_builtin_unarchive(task):
+                    self._normalize_unarchive_options(args)
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
                     res = self._run_async_module(
@@ -6090,10 +6094,20 @@ class Runtime:
             return "./" + normalized
         return normalized
 
+    @staticmethod
+    def _is_builtin_unarchive(task):
+        return task.get("_builtin_unarchive", task.get("action") in ("unarchive", "ansible.builtin.unarchive"))
+
+    @staticmethod
+    def _normalize_unarchive_options(args):
+        if "copy" in args:
+            if "remote_src" in args:
+                raise ValueError("parameters are mutually exclusive: ('copy', 'remote_src')")
+            args["remote_src"] = not _ansible_boolean(args.pop("copy"))
+
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
-        name = str(task.get("action") or "").split(".")[-1]
-        if name != "unarchive" or _ansible_boolean(args.get("remote_src", False)):
+        if not self._is_builtin_unarchive(task) or _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         key = self._baked_source_key(task, src)
