@@ -7,6 +7,7 @@ standalone script; debug messages and the recap must match.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -49,13 +50,13 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
         ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
-         "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
+         "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
     return _summary(proc.stdout, proc.stderr)
@@ -1095,6 +1096,36 @@ def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeyp
     output.unlink()
     assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
     assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="checks legacy non-native lookup location")
+def test_delegated_template_resolves_legacy_block_lookup_on_controller(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    monkeypatch.setenv("ANSIROLL_TEST_LOOKUP_HOST", "controller")
+    interpreter = tmp_path / "agent-python"
+    interpreter.write_text(
+        "#!/bin/sh\nexport ANSIROLL_TEST_LOOKUP_HOST=agent\n"
+        + "exec " + shlex.quote(sys.executable) + ' "$@"\n')
+    interpreter.chmod(0o755)
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        location: "{{ lookup('pipe', 'echo $ANSIROLL_TEST_LOOKUP_HOST') }}"
+""", {"sample.j2": "location={{ location }}\n"})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path, interpreter=str(interpreter))
+    assert output.read_text() == "location=controller\n"
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll",
+                    interpreter=str(interpreter)) == expected
+    assert output.read_text() == "location=controller\n"
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="checks native template name resolution")

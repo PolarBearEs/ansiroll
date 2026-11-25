@@ -8321,6 +8321,12 @@ def agent_main():
             members = [] if defer_template else None
             if defer_template:
                 requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+                if _legacy_non_native(ctx) and not ctx.get(_DEFER_LOOKUP_NAMES):
+                    # Legacy scalar block aliases were sent as template source.
+                    # Let the controller evaluate that source when the file uses it.
+                    requested_names.difference_update(
+                        name for name, value in ctx.items() if isinstance(value, _BlockVarTemplate)
+                    )
                 if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
                     requested_names.add("hostvars")
                 frame["lazy_template_vars"] = sorted(requested_names)
