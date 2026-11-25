@@ -3360,6 +3360,7 @@ class _Templater:
         self._expr_cache = {}
         self._condition_list_cache = {}
         self._template_cache = {}
+        self._file_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
         self._current_ctx = {}
@@ -3638,10 +3639,12 @@ class _Templater:
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
-    def render_string(self, text, ctx, _depth=0, strict=False):
+    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if "{{" not in text and "{%" not in text:
+            if file_newline is not None and _legacy_templating():
+                return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
             return text
         ctx = self._play_var_scope(ctx, strict)
         previous = self._current_ctx
@@ -3655,7 +3658,7 @@ class _Templater:
             # A Python plugin can read an alias that starts a nested template.
             # Its Jinja expressions still need lazy hostvars entries.
             with self._plugin_arg_scope(None):
-                result = self._render_string(text, ctx, strict)
+                result = self._render_string(text, ctx, strict, file_newline=file_newline)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -3871,20 +3874,31 @@ class _Templater:
                     pending.extend(value)
         return False
 
-    def _render_string(self, text, ctx, strict=False):
+    def _render_string(self, text, ctx, strict=False, *, file_newline=None):
+        stripped = text.strip()
+        expr = _bare_template_expression(stripped, lex=self.env.lex)
+        if expr is None:
+            # Full templates keep their existing rendering and newline behavior.
+            file_newline = None
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
-        template_key = (text, strict, lazy_names)
-        stripped = text.strip()
+        if file_newline is not None:
+            key = (env, file_newline)
+            if key not in self._file_environments:
+                file_env = env.overlay()
+                file_env.keep_trailing_newline = False
+                file_env.newline_sequence = file_newline
+                self._file_environments[key] = file_env
+            env = self._file_environments[key]
+        template_key = (text, strict, lazy_names, file_newline)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
-        expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is not None:
-            expr_key = (expr, strict, lazy_names)
+            expr_key = (expr, strict, lazy_names, file_newline)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(text.strip(), env, ctx, strict)
@@ -3915,6 +3929,27 @@ class _Templater:
                 return _captured_jinja_error(e)
         try:
             result = _concretize(result)
+            if file_newline is not None and expr is not None:
+                # The lexer applies whitespace controls before deciding whether
+                # a native result needs text conversion.
+                tokens = list(env.lex(text))
+                prefix = tokens[0][2] if tokens[0][1] == "data" else ""
+                suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
+                prefix = prefix.replace("\n", file_newline)
+                suffix = suffix.replace("\n", file_newline)
+                legacy = _legacy_templating()
+                if prefix or suffix:
+                    value = "" if not legacy and isinstance(result, _Omit) else result
+                    if _core_at_least(2, 13):
+                        _fail_on_undef(value)
+                    result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
+                elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
+                    result = (str(_finalize_text_segment(ctx, result)) if result is None
+                              else str(_as_text(result)))
+            if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
+                source_newlines = len(text) - len(text.rstrip("\n"))
+                result_newlines = len(result) - len(result.rstrip("\n"))
+                result += file_newline * (source_newlines - result_newlines)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
                 # when a later assertion member reads a cached alias.
@@ -3932,7 +3967,7 @@ class _Templater:
         expr = str(expr)
         ctx = self._play_var_scope(ctx, strict)
         lazy_names = bool(ctx.get(_DEFER_LOOKUP_NAMES))
-        expr_key = (expr, strict, lazy_names)
+        expr_key = (expr, strict, lazy_names, None)
         previous = self._current_ctx
         self._current_ctx = ctx
         try:
@@ -6304,6 +6339,8 @@ class Runtime:
             if name == "template":
                 tctx = dict(ctx)
                 tctx[_TEMPLATE_FILE_TEXT] = True
+                if isinstance(tctx.get("omit"), str) and tctx["omit"] == _OMIT:
+                    tctx["omit"] = _OMIT
                 try:
                     import platform
                     import pwd
@@ -6325,7 +6362,7 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    rendered = self.templater.render_string(raw, tctx)
+                    rendered = self.templater.render_string(raw, tctx, file_newline=newline_sequence)
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
