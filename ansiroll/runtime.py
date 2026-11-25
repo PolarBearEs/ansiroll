@@ -88,6 +88,7 @@ def _vars_snapshot(ctx):
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
                 "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_vars_file_selector",
+                "__ansiroll_setup_controller_lookups",
                 _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
@@ -169,6 +170,7 @@ class _Omit(str):
 
 
 _OMIT = _Omit("__omit_place_holder__ansiroll")
+_LOCALHOST_NAMES = ("localhost", "127.0.0.1", "::1")
 _NO_CONDITIONAL_LIST = object()
 _MISSING_VARS_FILE_INPUT = object()
 _UNRESOLVED_SELECTOR_KEY = object()
@@ -404,7 +406,9 @@ def _is_literal_vars_lookup(call):
         and call.dyn_args is None and call.dyn_kwargs is None and call.args
         and isinstance(call.args[0], nodes.Const)
         and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")
-        and all(isinstance(arg, nodes.Const) and isinstance(arg.value, str) for arg in call.args[1:])
+        and all(isinstance(arg, nodes.Const) and isinstance(arg.value, str)
+                and not _looks_templated(arg.value) and "{#" not in arg.value
+                for arg in call.args[1:])
     )
 
 
@@ -1648,6 +1652,12 @@ def _lookup_values(name, args, kwargs, ctx=None):
     name = str(name).rsplit(".", 1)[-1]
     if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
         raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
+    setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
+        known = setup_lookups.get(name, ())
+        if any(str(term) not in known for term in args):
+            raise ValueError("setup requires an uncaptured controller %s value; pass the option's input through "
+                             "extra vars or select the vars file at compile time" % name)
     if name == "vars":
         vals = []
         for a in args:
@@ -4187,6 +4197,7 @@ class Runtime:
         # the flattened host snapshot. Those values (set_fact/register) outrank
         # play vars, a distinction that is otherwise lost after serialization.
         self._set_fact_overrides = dict(host_var_overrides or {})
+        self._delegated_ansible_facts_overrides = set()
         # include_vars results: above task vars, below set_fact/register.
         self._include_vars_layer = {}
         self._module_fact_layer = {}
@@ -4206,6 +4217,8 @@ class Runtime:
         self._module_source_bytes = None  # baked unarchive input for the next worker call
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
+        self.gather_setup_fn = None  # resolve implicit setup options using controller task scope
+        self.delegate_on_target = False
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.on_task_start = None
         self._started_task_name = (None, None)
@@ -4668,20 +4681,76 @@ class Runtime:
         vars_file_play_vars = play.get("vars_file_play_vars", timeout_template.get("play_vars", play_vars))
         merge_vars_files = (ordered_files is not None and
                             self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge")
+        merge_setup_scope = self.vars["__ansiroll_controller_config"].get("DEFAULT_HASH_BEHAVIOUR") == "merge"
         vars_file_defaults = play.get("vars_file_defaults", timeout_template.get("vars_file_defaults")) or {}
         vars_file_magic = play.get("vars_file_magic") or {}
         early_files = {}
         if play.get("gather_facts") and not gather_cached:
             timeout_vars = None
             blocked_timeout_inputs = {}
-            if (timeout_template or ordered_files is not None) and vars_files:
+            option_scope = play.get("gather_setup_scope")
+            if (timeout_template or option_scope or ordered_files is not None) and vars_files:
                 timeout_vars = self._resolve_deferred_vars_files(
                     vars_file_play_vars, vars_files, early_files,
-                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {})},
+                    {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {}),
+                     **((option_scope or {}).get("defaults") or {})},
                     blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic,
                     ordered=ordered_files is not None, deferred_entries=deferred_files)
             setup_ctx = self._layered_ctx(self.ctx(play_vars if timeout_template or timeout_vars is None else {},
                                                    timeout_vars))
+            option_contexts = {}
+            if option_scope:
+                layers = (*option_scope["role_exports"], self.extra_vars, option_scope["magic"])
+                option_vars = _f_combine(
+                    option_scope["defaults"], play_vars if timeout_vars is None else timeout_vars,
+                    *layers, recursive=merge_setup_scope)
+                option_ctx = self.ctx(option_vars, base={
+                    name: self.vars[name]
+                    for name in ("__ansiroll_controller_env", "__ansiroll_controller_config")
+                })
+                option_blocks = dict(blocked_timeout_inputs)
+                for layer in layers:
+                    _clear_vars_file_blocks(option_blocks, layer, merge_setup_scope)
+                option_ctx["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
+                option_contexts["gather_subset"] = (option_ctx, option_blocks)
+                config = self.vars["__ansiroll_controller_config"]
+                facts = self._module_fact_layer
+                inject_facts = config.get("INJECT_FACTS_AS_VARS", True)
+                visible_facts = facts if inject_facts else {"ansible_local": facts.get("ansible_local", {})}
+                host_vars = _f_combine(self._vars_file_host_vars, visible_facts, recursive=merge_setup_scope)
+                host_vars["ansible_facts"] = _normalized_facts(facts, preserve_local=True)
+                for name in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
+                    host_vars[name] = self.vars[name]
+                task_vars = _f_combine(option_scope["defaults"], host_vars, play_vars, recursive=merge_setup_scope)
+                task_blocks = {}
+                if vars_files:
+                    task_vars = self._resolve_deferred_vars_files(
+                        vars_file_play_vars, vars_files, early_files,
+                        {**vars_file_defaults, **option_scope["defaults"]},
+                        blocked_inputs=task_blocks, merge_hashes=merge_setup_scope, magic=vars_file_magic,
+                        pre_setup_host_vars=host_vars, ordered=ordered_files is not None,
+                        deferred_entries=deferred_files,
+                    )
+                task_layers = (*option_scope["role_exports"], self._include_vars_layer,
+                               self._set_fact_overrides, self.extra_vars, option_scope["magic"])
+                for layer in task_layers:
+                    _clear_vars_file_blocks(task_blocks, layer, merge_setup_scope)
+                task_scope = self.ctx(_f_combine(task_vars, *task_layers, recursive=merge_setup_scope), base={})
+                task_scope["ansible_search_path"] = option_scope.get("task_search_path") or []
+                host_view = _f_combine(
+                    {key: value for key, value in host_vars.items()
+                     if key != "hostvars" and not key.startswith("__ansiroll_")},
+                    self._include_vars_layer, self._set_fact_overrides, self.extra_vars,
+                    recursive=merge_setup_scope,
+                )
+                self._pin_magic_vars(host_view)
+                hostviews = dict(host_vars.get("hostvars") or {})
+                hostviews[self.host] = host_view
+                task_scope["hostvars"] = hostviews
+                task_scope["__ansiroll_setup_controller_lookups"] = option_scope.get("controller_lookups")
+                task_scope.pop("vars", None)
+                task_scope["vars"] = _vars_snapshot(task_scope)
+                option_contexts["fact_path"] = (task_scope, task_blocks)
             gathered = self.gather_facts(
                 play.get("environment"),
                 become=bool(play.get("become")),
@@ -4690,6 +4759,8 @@ class Runtime:
                 ignore_errors=play.get("ignore_errors"),
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
+                setup_options=play.get("gather_setup_options"),
+                option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
             )
@@ -5026,7 +5097,7 @@ class Runtime:
 
     def _resolve_deferred_vars_files(self, play_vars, entries, early_files, defaults, *,
                                      blocked_inputs=None, merge_hashes=False, magic=None, ordered=False,
-                                     deferred_entries=()):
+                                     deferred_entries=(), pre_setup_host_vars=None):
         """Resolve each vars file in order, reusing early matches with unchanged inputs."""
         # During early replay each blocked variable records the member paths
         # that later assignments have definitely replaced.
@@ -5043,7 +5114,8 @@ class Runtime:
         else:
             base = {key: value for key, value in self.vars.items() if key not in self._set_fact_overrides}
         selected = dict(play_vars)
-        selector_vars = _f_combine(defaults, None if before_setup else base, selected, recursive=merge_hashes)
+        selector_base = pre_setup_host_vars if before_setup else base
+        selector_vars = _f_combine(defaults, selector_base, selected, recursive=merge_hashes)
 
         def apply_files(mappings):
             nonlocal selected, selector_vars
@@ -5190,7 +5262,7 @@ class Runtime:
                                  % (item,))
         return selector_vars if before_setup else selected
 
-    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False):
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -5220,6 +5292,12 @@ class Runtime:
                                        and ("{{" in literal.value or "{%" in literal.value))
                     continue
                 if selector and _is_literal_vars_lookup(call):
+                    continue
+                if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
+                        and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
+                                              for arg in call.args)
+                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
+                        and not (call.dyn_args or call.dyn_kwargs)):
                     continue
                 return None
             for name, path in _selector_input_paths(expression, remaining, ctx, resolve_aliases=True,
@@ -5389,8 +5467,9 @@ class Runtime:
         else:
             res, ignore = self._task_gate(task, base_ctx)
             if res is None:
-                res = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
-                self._absorb_facts(task, res)
+                res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
+                if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
+                    self._absorb_facts(task, res, fact_host)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
@@ -5515,73 +5594,96 @@ class Runtime:
         ignore_loop = False
         failed_items_ignored = True
         metadata_flags = self._loop_metadata_flags(task, base_ctx) if items else None
-        for i, it in enumerate(items):
-            ctx = dict(base_ctx)
-            ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
-            if i > 0 and task.get("loop_pause"):
-                time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
-            res, ignore = self._task_gate(task, ctx)
-            if res is None:
-                res = self._exec_notifying_task(task, ctx, become, notifications)
-                self._absorb_facts(task, res)
-                facts = res.get("ansible_facts")
-                if isinstance(facts, _IncludedVars):
-                    base_ctx.update({key: self.vars[key] for key in facts})
-                elif isinstance(facts, dict):
-                    action = (task.get("action") or "").rsplit(".", 1)[-1]
-                    base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
-            res["item"] = it
-            if task.get("loop_label") is not None:
-                label_ctx = dict(ctx)
-                if task.get("register"):
-                    label_ctx[task["register"]] = res
-                try:
-                    label = self.template(task["loop_label"], label_ctx)
-                    if _is_undef(label):
-                        label._fail_with_undefined_error()
-                    res["_ansible_item_label"] = label
-                except Exception as ex:
-                    res = {"failed": True, "changed": False, "item": it,
-                           "msg": "Failed to template loop_control.label: %s" % ex}
-            stop = False
-            bw = task.get("loop_break_when")
-            if bw:
-                bctx = dict(ctx)
-                if task.get("register"):
-                    bctx[task["register"]] = _registered_result(task, res)
-                try:
-                    stop = self.when(bw, bctx, keyword="break_when")
-                except ConditionalError as ex:
-                    if not _core_at_least(2, 21):
-                        # Older executors emitted the item before evaluating
-                        # break_when, then returned the task-level error.
-                        self.emit(task, _status_of(res), res, item=it,
-                                  ignored=ignore, is_item=True)
-                        return {"failed": True, "changed": False, "msg": str(ex)}, ignore
-                    res["failed"] = True
-                    res["break_when_result"] = str(ex)
-                    stop = True
-            tally_changed = res.pop(
-                "_ansiroll_tally_changed", res.get("changed", False)
-            )
-            agg["results"].append(res)
-            agg["changed"] = agg["changed"] or res.get("changed", False)
-            if tally_changed:
-                agg["_ansiroll_tally_changed"] = True
-            if _result_failed(res):
-                agg["failed"] = True
-                failed_items_ignored = failed_items_ignored and ignore
-            if res.get("unreachable"):
-                agg["unreachable"] = True
-                ignored = self._ignores_unreachable(task, ctx)
-                if _core_at_least(2, 21):
-                    agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", False) or ignored
-                else:
-                    agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
-            ignore_loop = ignore_loop or ignore
-            self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
-            if stop:
-                break
+        commits_delegated_facts = task.get("delegate_to") and (
+            task.get("action", "").rsplit(".", 1)[-1] == "set_fact"
+        )
+        pending_facts = []
+        loop_succeeded = False
+        try:
+            for i, it in enumerate(items):
+                fact_host = None
+                ctx = dict(base_ctx)
+                ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
+                if i > 0 and task.get("loop_pause"):
+                    time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
+                res, ignore = self._task_gate(task, ctx)
+                if res is None:
+                    res, fact_host = self._exec_notifying_task(task, ctx, become, notifications)
+                    if fact_host is None:
+                        if commits_delegated_facts:
+                            pending_facts.append((None, dict(res)))
+                        else:
+                            self._absorb_facts(task, res)
+                    facts = res.get("ansible_facts") if fact_host is None else None
+                    if isinstance(facts, _IncludedVars):
+                        base_ctx.update({key: self.vars[key] for key in facts})
+                    elif isinstance(facts, dict):
+                        action = (task.get("action") or "").rsplit(".", 1)[-1]
+                        base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
+                        if commits_delegated_facts and action == "set_fact":
+                            cached = base_ctx.get("ansible_facts")
+                            base_ctx["ansible_facts"] = {
+                                **(cached if isinstance(cached, dict) else {}), **_normalized_facts(facts),
+                            }
+                res["item"] = it
+                if task.get("loop_label") is not None:
+                    label_ctx = dict(ctx)
+                    if task.get("register"):
+                        label_ctx[task["register"]] = res
+                    try:
+                        label = self.template(task["loop_label"], label_ctx)
+                        if _is_undef(label):
+                            label._fail_with_undefined_error()
+                        res["_ansible_item_label"] = label
+                    except Exception as ex:
+                        res = {"failed": True, "changed": False, "item": it,
+                               "msg": "Failed to template loop_control.label: %s" % ex}
+                stop = False
+                bw = task.get("loop_break_when")
+                if bw:
+                    bctx = dict(ctx)
+                    if task.get("register"):
+                        bctx[task["register"]] = _registered_result(task, res)
+                    try:
+                        stop = self.when(bw, bctx, keyword="break_when")
+                    except ConditionalError as ex:
+                        if not _core_at_least(2, 21):
+                            # Older executors emitted the item before evaluating
+                            # break_when, then returned the task-level error.
+                            self.emit(task, _status_of(res), res, item=it,
+                                      ignored=ignore, is_item=True)
+                            return {"failed": True, "changed": False, "msg": str(ex)}, ignore
+                        res["failed"] = True
+                        res["break_when_result"] = str(ex)
+                        stop = True
+                tally_changed = res.pop(
+                    "_ansiroll_tally_changed", res.get("changed", False)
+                )
+                agg["results"].append(res)
+                agg["changed"] = agg["changed"] or res.get("changed", False)
+                if tally_changed:
+                    agg["_ansiroll_tally_changed"] = True
+                if _result_failed(res):
+                    agg["failed"] = True
+                    failed_items_ignored = failed_items_ignored and ignore
+                if res.get("unreachable"):
+                    agg["unreachable"] = True
+                    ignored = self._ignores_unreachable(task, ctx)
+                    if _core_at_least(2, 21):
+                        agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", False) or ignored
+                    else:
+                        agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
+                ignore_loop = ignore_loop or ignore
+                if fact_host is not None:
+                    pending_facts.append((fact_host, res))
+                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
+                if stop:
+                    break
+            loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
+        finally:
+            for fact_host, result in pending_facts:
+                if fact_host is None or loop_succeeded:
+                    self._absorb_facts(task, result, fact_host)
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
@@ -5701,11 +5803,33 @@ class Runtime:
             names = self._notification_names(task, ctx)
         except Exception as ex:
             return {"failed": True, "changed": False,
-                    "msg": "Failed to template notify: %s" % ex}
-        res = self._exec_with_retries(task, ctx, become)
+                    "msg": "Failed to template notify: %s" % ex}, None
+        fact_host = None
+        concrete = task
+        if task.get("delegate_to") and task["action"].rsplit(".", 1)[-1] == "set_fact":
+            try:
+                flag = _fail_on_undef(self.template(task.get("delegate_facts", False), ctx))
+                delegate_facts = flag != _OMIT and _boolean(flag, strict=True)
+                target = None
+                if delegate_facts or not self.delegate_on_target:
+                    target = _fail_on_undef(self.template(task["delegate_to"], ctx))
+                    if target == _OMIT:
+                        target = None
+                    elif not isinstance(target, str) or not target:
+                        raise ValueError("delegate_to must resolve to a nonempty host name")
+                fact_host = self._delegated_fact_host(target) if delegate_facts else None
+                if self.delegate_on_target and fact_host is not None:
+                    raise ValueError("delegate_facts is incompatible with ansiroll_delegate_on_target")
+                concrete = dict(task, delegate_to=target, delegate_facts=bool(fact_host))
+            except Exception as ex:
+                return {"failed": True, "changed": False,
+                        "msg": "Failed to resolve delegated fact host: %s" % ex}, None
+        res = self._exec_with_retries(concrete, ctx, become)
+        if concrete is not task:
+            self._task_provenance[id(task)] = self._task_provenance.pop(id(concrete), {"mode": "native-agent"})
         if notifications is not None and not _result_failed(res):
             notifications.extend(names)
-        return res
+        return res, fact_host
 
     def _exec_with_retries(self, task, ctx, become=False):
         until = task.get("until")
@@ -6182,7 +6306,6 @@ class Runtime:
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s'" % k}
                 facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
-            self.vars.update(facts)
             return {
                 "changed": False,
                 "ansible_facts": facts,
@@ -6795,7 +6918,18 @@ class Runtime:
                 if key not in self._play_var_names and key not in self._include_vars_layer
                 and key not in self._set_fact_overrides and key not in self.extra_vars}
 
-    def _absorb_facts(self, task, res):
+    def _delegated_fact_host(self, target):
+        if target not in _LOCALHOST_NAMES:
+            return target
+        hostvars = self.vars.get("hostvars") or {}
+        if target in hostvars:
+            entry = hostvars[target]
+            return next(name for name in hostvars if name in _LOCALHOST_NAMES and hostvars[name] is entry)
+        if self.host in _LOCALHOST_NAMES:
+            return self.host
+        return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
+
+    def _absorb_facts(self, task, res, fact_host=None):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -6809,6 +6943,30 @@ class Runtime:
             # Facts are module output: never templated (Ansible marks them unsafe).
             facts = _mark_unsafe(facts)
             short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
+            if fact_host is not None and fact_host != self.host:
+                hostvars = dict(self.vars.get("hostvars") or {})
+                if fact_host not in hostvars and fact_host not in _LOCALHOST_NAMES:
+                    return
+                previous = hostvars.get(fact_host)
+                target = dict(previous or {})
+                exposed = {key: value for key, value in facts.items() if key not in self.extra_vars}
+                target.update(exposed)
+                if "ansible_facts" in exposed:
+                    self._delegated_ansible_facts_overrides.add(fact_host)
+                if (res.get("_ansible_facts_cacheable") and fact_host not in self._delegated_ansible_facts_overrides
+                        and "ansible_facts" not in self.extra_vars):
+                    cached = target.get("ansible_facts")
+                    target["ansible_facts"] = {
+                        **(cached if isinstance(cached, dict) else {}),
+                        **_normalized_facts(facts, preserve_local=True),
+                    }
+                hostvars[fact_host] = target
+                if fact_host in _LOCALHOST_NAMES:
+                    for alias in _LOCALHOST_NAMES:
+                        if alias != self.host and (alias not in hostvars or hostvars[alias] is previous):
+                            hostvars[alias] = target
+                self.vars["hostvars"] = hostvars
+                return
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
@@ -7051,7 +7209,8 @@ class Runtime:
 
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
-                     gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=()):
+                     gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
+                     setup_options=None, option_contexts=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -7077,7 +7236,38 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            setup_args = {}
+            if self.gather_setup_fn is not None and setup_options:
+                controller_setup = self.gather_setup_fn()
+                if controller_setup["error"] is not None:
+                    raise ValueError(controller_setup["error"])
+                resolved_options = controller_setup["options"]
+            else:
+                authored_options = dict(setup_options or {})
+                if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
+                    authored_options.pop("fact_path", None)
+                resolved_options = {}
+                for key, value in authored_options.items():
+                    scope, blocks = (option_contexts or {}).get(key, (ctx, ()))
+                    if blocks:
+                        for source, _, _ in _selector_template_sources(value):
+                            paths = set()
+                            inputs = self._pre_setup_template_inputs(
+                                source, scope, selector=True, paths=paths, setup_lookups=True)
+                            if inputs is None or _vars_file_reads_blocked(blocks, paths):
+                                raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
+                    resolved_options[key] = self.template(value, scope, strict=True)
+                resolved_options = _fail_on_undef(_strip_omit(resolved_options))
+                if _core_at_least(2, 19) and isinstance(resolved_options.get("gather_subset"), list):
+                    resolved_options["gather_subset"] = [item for item in resolved_options["gather_subset"]
+                                                         if item != _OMIT]
+                if "gather_subset" in resolved_options and resolved_options["gather_subset"] is not None:
+                    subset = resolved_options["gather_subset"]
+                    if not isinstance(subset, list):
+                        subset = [subset]
+                    if not all(isinstance(item, str) for item in subset):
+                        raise ValueError("gather_subset items must be strings")
+                    resolved_options["gather_subset"] = subset
+            setup_args = {key: value for key, value in resolved_options.items() if value is not None}
             gather_timeout = self._gather_timeout_for_run(
                 gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
             if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
@@ -7602,6 +7792,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     rt = None
     vars_file_host_vars = {**inventory_defaults, **host_vars}
     host_var_overrides = {}
+    delegated_ansible_facts_overrides = set()
     include_vars_layer = {}
     module_fact_layer = {}
     for play in plays:
@@ -7622,6 +7813,7 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
         rt._vars_file_host_vars = vars_file_host_vars
+        rt._delegated_ansible_facts_overrides = delegated_ansible_facts_overrides
         engine_profile["runtime_init"] += time.monotonic() - init_started
         try:
             play_started = time.monotonic()
@@ -8108,6 +8300,16 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
+
+    def _gather_setup():
+        _chan_send(resp_fd, {"t": "gather_setup"})
+        reply = _chan_recv()
+        if not reply or reply.get("t") != "gather_setup_result":
+            raise RuntimeError("controller did not return setup options")
+        return reply["setup"]
+
+    rt.gather_setup_fn = _gather_setup
+    rt.delegate_on_target = delegate_on_target
     if not delegate_on_target:
         def _delegate(task, args, become, ctx):
             # Only the agent has the play's bundled filters and lookup plugins.
