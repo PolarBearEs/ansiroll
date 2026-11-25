@@ -256,6 +256,9 @@ def test_compile_dynamic_role_source_retries_transient_lease(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize(("template", "selected", "unrelated"), [
+    ("sites/{{ selection }}.j2", "sites/app.j2", "sites/.env"),
+    ("sites/prod-{{ selection }}.j2", "sites/prod-web.j2", "sites/staging-private.j2"),
+    ("sites/prod-   {{- selection }}.j2", "sites/prod-web.j2", "sites/staging-private.j2"),
     ("sites/{{ selection }}.j2", "sites/app.j2", "sites/notes.txt"),
     ("sites/{{ selection -}}   .j2", "sites/app.j2", "sites/notes.txt"),
     ("sites/{{ selection | default('}}') }}.j2", "sites/app.j2", "sites/notes.txt"),
@@ -297,6 +300,67 @@ def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_pa
 
     _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
     assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+
+
+def test_compile_dynamic_role_source_keeps_a_reachable_parent_path(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {selection: 'dir/../fallback'}
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: {src: "sites/prod-{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/templates/sites/prod-dir/placeholder": "not a template",
+        "roles/r/templates/sites/fallback.j2": "selected through parent traversal\n"})
+    _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
+    assert (tmp_path / "rendered.txt").read_text() == "selected through parent traversal\n"
+
+
+def test_compile_dynamic_role_source_prefix_keeps_symlink_parent_path(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {selection: app}
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: {src: "link/../prod-{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/templates/prod-app.j2": "normalized template\n",
+        "roles/r/templates/nested/prod-app.j2": "traversed template\n"})
+    templates = tmp_path / "roles/r/templates"
+    (templates / "nested/child").mkdir()
+    (templates / "link").symlink_to("nested/child", target_is_directory=True)
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    output = tmp_path / "rendered.txt"
+    assert output.read_text() == "normalized template\n"
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert output.read_text() == "normalized template\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires a POSIX FIFO")
+def test_compile_dynamic_role_source_prefix_keeps_blocker_from_earlier_root(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {selection: 'branch/../fallback'}
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- template: {src: "sites/prod-{{ selection }}.j2", dest: "rendered.txt"}
+""", "roles/r/sites/prod-other/placeholder": "",
+        "roles/r/sites/fallback.j2": "unreachable earlier template\n",
+        "templates/sites/prod-branch/placeholder": "",
+        "templates/sites/fallback.j2": "selected template\n"})
+    early = tmp_path / "roles/r/templates/sites"
+    early.mkdir(parents=True)
+    os.mkfifo(early / "fallback.j2")
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    output = tmp_path / "rendered.txt"
+    assert output.read_text() == "selected template\n"
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert output.read_text() == "selected template\n"
 
 
 @pytest.mark.parametrize("prefix", ["templates/", "./templates/"])
