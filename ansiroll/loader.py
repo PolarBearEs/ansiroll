@@ -776,6 +776,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             if node:
                 tasks.append(node)
         handlers = _convert_handlers(handler_blocks, play_actions, basedir, includes)
+        includes.runtime_writes.update(includes.variant_writes)
         # Includes can expose additional writes, including writes that precede
         # another include on a later loop iteration. Revisit provisional paths
         # when the set grows, keeping only the final graph and task IDs.
@@ -1785,6 +1786,7 @@ class _IncludeVariables:
         self.vars_file_writes = set()
         self.vars_file_plan = None
         self.vars_file_scopes = None
+        self.static_import_reads = set()
         # When candidate contents are unknown, any play var can change.
         self.incomplete = False
         self.unresolved_vars_file = False
@@ -1826,7 +1828,7 @@ def _vars_file_simple_field(source):
         return None
     pieces = []
     field = None
-    defaulted = False
+    fallback = None
     for part in body[0].nodes:
         if isinstance(part, nodes.TemplateData):
             pieces.append(re.escape(part.data))
@@ -1835,13 +1837,14 @@ def _vars_file_simple_field(source):
             if (part.kwargs or part.dyn_args or part.dyn_kwargs or len(part.args) > 2
                     or any(not isinstance(arg, nodes.Const) for arg in part.args)):
                 return None
-            defaulted = True
+            default = part.args[0].value if part.args else ""
+            fallback = ("" if default is None else str(default), bool(len(part.args) == 2 and part.args[1].value))
             part = part.node
         if field is not None or not isinstance(part, nodes.Name):
             return None
         field = part.name
         pieces.append(r"([^/]*)")
-    return (field, re.compile("".join(pieces)), defaulted) if field is not None else None
+    return (field, re.compile("".join(pieces)), fallback) if field is not None else None
 
 
 def _vars_file_variant_choices(entry, scope, constraints):
@@ -1867,26 +1870,31 @@ def _vars_file_variant_choices(entry, scope, constraints):
             continue
         spellings = [path, *(os.path.relpath(path, directory) for directory in directories)]
         matching = set()
+        default_matches = set()
         for _, field in fields:
             if field is not None:
-                name, pattern, _ = field
+                name, pattern, fallback = field
                 for spelling in spellings:
                     match = pattern.fullmatch(spelling)
                     if match is not None:
                         matching.add((name, match[1]))
+                        if fallback is not None and fallback[0] == match[1] and (
+                                name not in scope or fallback[1] and not scope[name]):
+                            default_matches.add((name, match[1]))
         if not matching:
             yield data, constraints
         else:
             for name, value in sorted(matching):
                 if name in constraints and constraints[name] is None:
                     authored = scope.get(name)
-                    if not isinstance(authored, str) or _is_templated(authored) or authored == value:
+                    if ((name, value) in default_matches or not isinstance(authored, str)
+                            or _is_templated(authored) or authored == value):
                         yield data, constraints
                     continue
                 if constraints.get(name, value) != value:
                     continue
                 yield data, {**constraints, name: value}
-                if name not in constraints and scope.get(name) == value:
+                if name not in constraints and (scope.get(name) == value or (name, value) in default_matches):
                     # This file can be chosen without a launch override, so
                     # a later assignment can supply the next filename's selector.
                     yield data, {**constraints, name: None}
@@ -1955,6 +1963,8 @@ def _vars_file_include_variants(task, sources, includes):
                     for mapping in candidate:
                         merged = combine_vars(merged, mapping)
                     expanded.setdefault((repr(merged), tuple(sorted(binding.items()))), (merged, binding))
+                    if len(expanded) > 4096:
+                        raise ValueError("too many vars-file replay states for include_tasks; simplify the file selectors")
                     projected.add(tuple(repr(_vars_input_at(merged, key, path)) for key, path in ordered_paths))
                     if len(projected) > 256:
                         return {}, ()
@@ -1970,16 +1980,19 @@ def _vars_file_include_variants(task, sources, includes):
             variants.setdefault(key, []).append(scope)
     result = {}
     for filename, candidates in variants.items():
-        base_scope = candidates[0]
-        branch = _IncludeVariables(
-            _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes)
-        branch.vars_file_scopes = candidates
-        branch.vars_file_writes = {
-            key for scope in candidates for key in scope.keys() | base_scope.keys()
-            if key not in base_scope or key not in scope or scope[key] != base_scope[key]
-        }
-        result[filename] = branch
+        result[filename] = _include_variant_branch(includes, candidates[0], candidates)
     return result, sorted(names)
+
+
+def _include_variant_branch(includes, base_scope, candidates):
+    branch = _IncludeVariables(
+        _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes)
+    branch.vars_file_scopes = candidates
+    branch.vars_file_writes = {
+        key for scope in candidates for key in scope.keys() | base_scope.keys()
+        if key not in base_scope or key not in scope or scope[key] != base_scope[key]
+    }
+    return branch
 
 
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
@@ -1989,6 +2002,8 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if not isinstance(raw_fname, str):
         return None
     fname = _template_include_filename(task, raw_fname, includes) if _is_templated(raw_fname) else raw_fname
+    if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
+        return None
     parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
     if fname is None or (parents and includes.vars_file_scopes is not None):
         sources = (raw_fname, *parents)
@@ -2028,9 +2043,10 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     roots = {os.path.realpath(basedir)}
     if role is not None:
         roots.add(os.path.realpath(role._role_path))
-    for key, branch in variants.items():
+    pending = [(key, branch, key == default_key, ()) for key, branch in reversed(tuple(variants.items()))]
+    while pending:
+        key, branch, build_selected, known_reads = pending.pop()
         fname = key if isinstance(key, str) else key[0]
-        build_selected = key == default_key
         branch.compile_selected_vars = includes.compile_selected_vars if build_selected else None
         if build_selected:
             branch.play_vars = includes.compile_selected_vars
@@ -2051,11 +2067,32 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             if build_selected:
                 raise
             continue
+        reads = sorted(set(known_reads) | {
+            (name, path) for name, path in branch.static_import_reads if name in branch.vars_file_writes
+        }, key=repr)
+        variant_inputs = None
+        if reads:
+            variant_inputs, selected, alternatives = _partition_include_import_scopes(task, branch, reads)
+            if alternatives:
+                if len(pending) + len(bodies) + len(alternatives) >= 256:
+                    raise ValueError("too many static import bindings for include_tasks")
+                # Re-expand each group in isolation so static imports resolve
+                # in its scope, even when they share an entry path.
+                groups = [(branch.play_vars, selected, build_selected)]
+                groups.extend((scopes[0], scopes, False) for scopes in alternatives)
+                pending.extend(
+                    (key, _include_variant_branch(includes, scope, scopes), selected_at_build, reads)
+                    for scope, scopes, selected_at_build in reversed(groups)
+                )
+                continue
         if expanded is not None and expanded.get("type") == "include":
             actions.update(variant_actions)
             writes.update(branch.runtime_writes | branch.variant_writes)
-            bodies.append({"type": "block", "block": expanded["tasks"], "include_variant": _include_variant_label(key),
-                           "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref")})
+            body = {"type": "block", "block": expanded["tasks"], "include_variant": _include_variant_label(key),
+                    "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref")}
+            if variant_inputs is not None:
+                body["include_variant_inputs"] = variant_inputs
+            bodies.append(body)
     if not bodies:
         return None
     includes.variant_writes.update(writes - includes.runtime_writes)
@@ -2065,7 +2102,9 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     node["include_selector"] = _tag_untrusted(raw_fname)
     if len(sources) > 1:
         node["include_parent_selectors"] = _tag_untrusted(list(sources[1:]))
-    node["include_selector_inputs"] = inputs
+    node["include_selector_inputs"] = sorted(set(inputs) | {
+        name for body in bodies for name, _, _, _ in body.get("include_variant_inputs", ())
+    })
     node["compile_selection"] = _include_variant_label(default_key)
     if default_inputs is not None and any(variant["include_variant"] == node["compile_selection"] for variant in bodies):
         node["include_compile_inputs"] = default_inputs
@@ -2076,16 +2115,33 @@ def _include_variant_label(key):
     return list(key) if isinstance(key, tuple) else key
 
 
-def _compile_include_inputs(task, sources, includes):
-    from .runtime import _MISSING_VARS_FILE_INPUT, _vars_input_at
+def _partition_include_import_scopes(task, branch, reads):
+    variables, _ = _include_template_variables(task, branch)
+    selected_inputs = _include_input_snapshot(variables, reads)
+    partitions = {}
+    for scope in branch.vars_file_scopes or ():
+        sample = _IncludeVariables(_native_include_values(scope), branch.all_vars, set())
+        variables, _ = _include_template_variables(task, sample)
+        signature = repr(_include_input_snapshot(variables, reads))
+        partitions.setdefault(signature, []).append(scope)
+    selected_scopes = partitions.pop(repr(selected_inputs), [])
+    return selected_inputs, selected_scopes, list(partitions.values())
 
+
+def _compile_include_inputs(task, sources, includes):
     variables, _ = _include_template_variables(task, includes)
     paths = set()
     for source in sources:
         if _gather_timeout_dependencies(source, variables, selector=True, allow_controller=True, paths=paths) is None:
             return None
+    return _include_input_snapshot(variables, sorted(paths, key=repr))
+
+
+def _include_input_snapshot(variables, paths):
+    from .runtime import _MISSING_VARS_FILE_INPUT, _vars_input_at
+
     inputs = []
-    for name, path in sorted(paths, key=repr):
+    for name, path in paths:
         value = _vars_input_at(variables, name, path)
         if value is _MISSING_VARS_FILE_INPUT:
             inputs.append((name, path, False, None))
@@ -2154,8 +2210,14 @@ def _include_import_scope(task, includes):
         current = kwargs.get("task")
         if current is None:
             return get_vars(*args, **kwargs)
-        variables, _ = _include_template_variables(current, includes)
-        if includes.compile_selected_vars is None and current.action in (*C._ACTION_IMPORT_TASKS, *C._ACTION_IMPORT_ROLE):
+        play = kwargs.get("play")
+        if play is not None:
+            candidate_play = play.copy()
+            candidate_play.vars = includes.play_vars
+            candidate_play.vars_files = []
+            kwargs["play"] = candidate_play
+        variables = get_vars(*args, **kwargs)
+        if current.action in (*C._ACTION_IMPORT_TASKS, *C._ACTION_IMPORT_ROLE):
             # The native parser templates the operand and its ancestry before
             # opening a file. Validate both before it can run controller lookups.
             sources = [current.args]
@@ -2169,9 +2231,17 @@ def _include_import_scope(task, includes):
             from .runtime import _selector_template_sources
 
             templates = [source for value in sources for source, _, _ in _selector_template_sources(value)]
-            variables = _portable_include_scope(templates, variables)
-            if variables is None:
-                raise ValueError("runtime-only import uses a controller-only template")
+            for source in templates:
+                reads = set()
+                if _gather_timeout_dependencies(
+                        source, variables, selector=True, allow_controller=True, computed=set(), paths=reads):
+                    includes.static_import_reads.update(reads)
+                else:
+                    includes.static_import_reads.update((name, ()) for name in includes.vars_file_writes)
+            if includes.compile_selected_vars is None:
+                variables = _portable_include_scope(templates, variables)
+                if variables is None:
+                    raise ValueError("runtime-only import uses a controller-only template")
         return variables
 
     manager.get_vars = scoped_get_vars
