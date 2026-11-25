@@ -4920,6 +4920,23 @@ def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     assert "with ansiroll_delegate_on_target" in " ".join(proc.stderr.split())
 
 
+def test_strategy_allows_on_target_delegation_with_a_constant_false_flag(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - set_fact: {marker: value}
+      delegate_to: localhost
+      delegate_facts: "{{ false }}"
+    - assert: {that: "marker == 'value'"}
+""", inventory="origin,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_native_only_rejects_linear_fallback(tmp_path):
     proc = _run_strategy_play(
         tmp_path,

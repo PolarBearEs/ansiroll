@@ -25,6 +25,7 @@ import base64
 import json
 import inspect
 import os
+import re
 import shlex
 import stat
 import struct
@@ -310,7 +311,7 @@ class StrategyModule(StrategyBase):
         elif any(
             str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
             and getattr(task, "delegate_to", None)
-            and getattr(task, "delegate_facts", None)
+            and _may_delegate_facts(getattr(task, "delegate_facts", None))
             for task in task_map.values()
         ):
             if self._delegate_on_target:
@@ -1755,6 +1756,20 @@ def _truthy(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _may_delegate_facts(value):
+    """Keep a native agent for a flag known to be false without evaluating lookups."""
+    from ansiroll.runtime import _boolean
+
+    if value is None:
+        return False
+    if isinstance(value, str) and re.fullmatch(r"\s*\{\{-?\s*(?:false|False|0)\s*-?\}\}\s*", value):
+        return False
+    try:
+        return _boolean(value, strict=True)
+    except TypeError:
+        return True
 
 
 def _extra_vars(variable_manager):

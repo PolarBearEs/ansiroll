@@ -1572,6 +1572,30 @@ def test_delegated_cacheable_fact_preserves_explicit_ansible_facts():
     assert rt.vars["hostvars"]["recipient"]["marker"] == "written"
 
 
+def test_delegated_fact_writes_share_implicit_localhost_aliases():
+    rt, _ = run([
+        _task("1", "send", "set_fact", args={"first": "shared"},
+              delegate_to="127.0.0.1", delegate_facts=True),
+        _task("2", "send", "set_fact", args={"last": "shared"},
+              delegate_to="localhost", delegate_facts=True),
+        _task("3", "send", "set_fact", args={"explicit": "kept"},
+              delegate_to="::1", delegate_facts=True),
+    ], host_vars={"inventory_hostname": "origin", "hostvars": {"localhost": {"inventory_hostname": "localhost"},
+                                                               "::1": {"inventory_hostname": "::1"}}})
+    assert rt.vars["hostvars"]["localhost"]["first"] == "shared"
+    assert rt.vars["hostvars"]["127.0.0.1"]["last"] == "shared"
+    assert rt.vars["hostvars"]["::1"] == {"inventory_hostname": "::1", "explicit": "kept"}
+
+
+def test_set_fact_keeps_completed_local_writes_after_a_later_loop_error():
+    rt, _ = run([
+        _task("1", "assign", "set_fact", args={"marker": "{{ item }}"},
+              delegate_to="recipient", delegate_facts=False,
+              loop=["first", "second"], loop_pause="{{ undefined_pause }}", ignore_errors=True),
+    ], host_vars={"inventory_hostname": "origin"})
+    assert rt.vars["marker"] == "first"
+
+
 def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):
     import ansiroll.runtime as runtime_mod
 
