@@ -333,6 +333,11 @@ class StrategyModule(StrategyBase):
             )
             return self._tqm.RUN_ERROR
         if linear_reason:
+            if self._delegate_on_target:
+                display.warning(
+                    "ansiroll_delegate_on_target has no effect during core linear fallback (%s). "
+                    "Ansible handles delegation for this play." % linear_reason
+                )
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
             # scheduling. Reuse core linear for this compatibility-only case.

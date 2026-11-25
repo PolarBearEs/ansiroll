@@ -5025,6 +5025,33 @@ def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     assert "with ansiroll_delegate_on_target" in " ".join((proc.stdout + proc.stderr).split())
 
 
+@pytest.mark.parametrize("on_target", [False, True])
+def test_strategy_reports_unavailable_on_target_delegation_in_linear_fallback(tmp_path, on_target):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {marker: skipped}
+      when: false
+      delegate_to: recipient
+      delegate_facts: true
+    - set_fact: {expected_marker: reached}
+      when: inventory_hostname == 'origin'
+      delegate_to: recipient
+      delegate_facts: true
+    - assert:
+        that:
+          - hostvars.recipient.marker is undefined
+          - hostvars.recipient.expected_marker == 'reached'
+""", "-e", json.dumps({"ansiroll_delegate_on_target": on_target}),
+        inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    warning = "ansiroll_delegate_on_target has no effect during core linear fallback"
+    assert (warning in " ".join(proc.stderr.split())) is on_target
+
+
 def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
