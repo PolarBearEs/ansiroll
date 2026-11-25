@@ -3893,7 +3893,7 @@ class _Templater:
         has_lookup = self._has_lookup_call(stripped)
         expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is not None:
-            expr_key = (expr, strict, lazy_names)
+            expr_key = (expr, strict, lazy_names, file_newline)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(text.strip(), env, ctx, strict)
@@ -3930,10 +3930,10 @@ class _Templater:
                 tokens = list(env.lex(text))
                 prefix = tokens[0][2] if tokens[0][1] == "data" else ""
                 suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
-                if prefix or suffix or _legacy_templating():
-                    value = "" if isinstance(result, _Omit) and (prefix or suffix) else result
-                    if not isinstance(value, _Omit):
-                        result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
+                legacy = _legacy_templating()
+                if prefix or suffix or legacy:
+                    value = "" if not legacy and isinstance(result, _Omit) else result
+                    result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
                 result_newlines = len(result) - len(result.rstrip("\n"))
@@ -3955,7 +3955,7 @@ class _Templater:
         expr = str(expr)
         ctx = self._play_var_scope(ctx, strict)
         lazy_names = bool(ctx.get(_DEFER_LOOKUP_NAMES))
-        expr_key = (expr, strict, lazy_names)
+        expr_key = (expr, strict, lazy_names, None)
         previous = self._current_ctx
         self._current_ctx = ctx
         try:

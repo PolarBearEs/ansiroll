@@ -897,6 +897,37 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     assert output.read_bytes() == expected
 
 
+def test_template_file_newline_mode_does_not_affect_later_expressions():
+    from ansiroll.runtime import Runtime
+
+    templater = Runtime({}, "", {}).templater
+    source = '{{ "a\nb" }}'
+    assert templater.render_string(source, {}, file_newline="\r\n") == "a\r\nb"
+    assert templater.render_string(source, {}, file_newline="\n") == "a\nb"
+    assert templater.render_string(source, {}) == "a\nb"
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy templates render omit placeholder text")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_legacy_template_file_keeps_omit_text_between_whitespace(tmp_path, delegated):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""),
+                  {"sample.j2": " {{ missing | default(omit) }}\n"})
+    output = tmp_path / "rendered.txt"
+    summary = _ansible(path, tmp_path)
+    assert re.fullmatch(r" __omit_place_holder__\w+\n", output.read_text())
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == summary
+    assert re.fullmatch(r" __omit_place_holder__\w+\n", output.read_text())
+
+
 def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
     path = _write(tmp_path, """
