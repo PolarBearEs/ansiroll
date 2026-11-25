@@ -217,11 +217,12 @@ def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_pat
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup handles a templated null differently")
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
-def test_implicit_setup_applies_setup_default_after_explicit_null(tmp_path, use_strategy):
+@pytest.mark.parametrize("value", ["none", "omit"])
+def test_implicit_setup_applies_setup_default_after_explicit_empty_value(tmp_path, use_strategy, value):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: true
-  fact_path: "{{ none }}"
+  fact_path: "{{ EMPTY_VALUE }}"
   module_defaults:
     ansible.builtin.gather_facts:
       fact_path: "{{ playbook_dir }}/gather"
@@ -230,9 +231,27 @@ def test_implicit_setup_applies_setup_default_after_explicit_null(tmp_path, use_
   tasks:
     - debug:
         msg: "{{ ansible_local.probe.value }}"
-""", {"setup/probe.fact": '{"value":"setup"}', "gather/probe.fact": '{"value":"gather"}'},
+""".replace("EMPTY_VALUE", value),
+        {"setup/probe.fact": '{"value":"setup"}', "gather/probe.fact": '{"value":"gather"}'},
         use_strategy=use_strategy)
     assert messages == ["setup"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="modern Core does not eagerly render overridden defaults")
+def test_implicit_setup_eagerly_renders_legacy_defaults(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  module_defaults:
+    SETUP_ACTION:
+      gather_subset: "{{ undefined_setup_default }}"
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"))
+    _, expected = _ansible(path, tmp_path)
+    _, result = _ansiroll(path, tmp_path)
+    assert expected[3] == "1"
+    assert result == expected
 
 
 @pytest.mark.skipif(Version(__version__) >= Version("2.12"), reason="only older cores use legacy setup")
