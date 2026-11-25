@@ -907,6 +907,24 @@ def test_template_file_newline_mode_does_not_affect_later_expressions():
     assert templater.render_string(source, {}) == "a\nb"
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores stringify undefined collection members")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_does_not_overwrite_destination_for_undefined_collection_member(tmp_path, delegated):
+    output = tmp_path / "rendered.txt"
+    output.write_text("existing content\n")
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""),
+                              {"sample.j2": " {{ [missing] }}\n"}, use_strategy=delegated)
+    assert recap[3] == "1"
+    assert output.read_text() == "existing content\n"
+
+
 @pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy templates render omit placeholder text")
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 def test_legacy_template_file_keeps_omit_text_between_whitespace(tmp_path, delegated):

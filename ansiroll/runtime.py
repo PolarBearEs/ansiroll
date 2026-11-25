@@ -3933,6 +3933,8 @@ class _Templater:
                 legacy = _legacy_templating()
                 if prefix or suffix or legacy:
                     value = "" if not legacy and isinstance(result, _Omit) else result
+                    if not legacy:
+                        _fail_on_undef(value)
                     result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
