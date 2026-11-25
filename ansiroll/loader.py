@@ -1983,10 +1983,11 @@ def _include_scope(task):
 
 
 def _include_scope_key(task):
+    apply = (task.args or {}).get("apply") or {}
     return (
         *(repr(sorted(scope.items())) for scope in _include_scope(task)),
-        repr(getattr(task, "check_mode", None)),
-        repr(((task.args or {}).get("apply") or {}).get("check_mode")),
+        repr(task._get_parent_attribute("check_mode")),
+        (repr(apply["check_mode"]),) if "check_mode" in apply else (),
     )
 
 

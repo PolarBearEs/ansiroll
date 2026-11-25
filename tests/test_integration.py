@@ -5511,6 +5511,42 @@ def test_strategy_preserves_check_mode_on_omit(tmp_path, scope):
     assert output.exists() == native_wrote_file
 
 
+@pytest.mark.parametrize(("action", "invocation_check", "delegated"), [
+    ("copy", True, False),
+    ("template", True, False),
+    ("template", True, True),
+    ("raw_copy", False, False),
+])
+def test_strategy_restores_copy_transfer_check_mode_on_omit(tmp_path, action, invocation_check, delegated):
+    (tmp_path / "input.txt").write_text("payload\n")
+    file_action = "copy" if action == "raw_copy" else action
+    source_arg = "content: payload" if action == "copy" else "src: input.txt"
+    tasks = f"""- {file_action}:
+    {source_arg}
+    dest: "{{{{ playbook_dir }}}}/result"
+"""
+    if action == "raw_copy":
+        tasks += "    raw: true\n"
+    tasks += '  check_mode: "{{ omit }}"\n'
+    if delegated:
+        tasks += "  delegate_to: localhost\n"
+    playbook = ("- hosts: localhost\n  gather_facts: false\n  tasks:\n    - block:\n"
+                + textwrap.indent(tasks, "        ")
+                + f"      check_mode: {str(not invocation_check).lower()}\n")
+    opts = ["-c", "local", "-e", "ansible_python_interpreter=" + sys.executable]
+    if invocation_check:
+        opts.append("--check")
+    output = tmp_path / "result"
+    native = _run_strategy_play(tmp_path, playbook, *opts, environment={"ANSIBLE_STRATEGY": "linear"})
+    assert native.returncode == 0, native.stdout + native.stderr
+    native_wrote_file = output.exists()
+    if native_wrote_file:
+        output.unlink()
+    actual = _run_strategy_play(tmp_path, playbook, *opts)
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    assert output.exists() == native_wrote_file
+
+
 def test_standalone_role_inherits_check_mode_without_apply(tmp_path):
     tasks = tmp_path / "roles" / "child" / "tasks"
     tasks.mkdir(parents=True)
@@ -5567,6 +5603,27 @@ def test_strategy_preserves_rendered_false_check_mode(tmp_path, expression):
         output.unlink()
 
 
+@pytest.mark.parametrize("expression", ["{% if true %}{{ omit }}{% endif %}", " {{ omit }} ", " {{- omit -}} "])
+def test_strategy_full_check_mode_omit_matches_native(tmp_path, expression):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native omit values")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: "{{ playbook_dir }}/result"
+        state: touch
+      check_mode: CHECK_MODE
+""".replace("CHECK_MODE", json.dumps(expression))
+    opts = ["--check", "-c", "local", "-e", "ansible_python_interpreter=" + sys.executable]
+    native = _run_strategy_play(tmp_path, playbook, *opts, environment={"ANSIBLE_STRATEGY": "linear"})
+    actual = _run_strategy_play(tmp_path, playbook, *opts)
+    assert actual.returncode == native.returncode, actual.stdout + actual.stderr + native.stdout + native.stderr
+    assert not (tmp_path / "result").exists()
+
+
 def test_compiled_check_mode_omit_fallback_does_not_capture_parent_lookup(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
@@ -5612,6 +5669,50 @@ def test_recursive_include_preserves_its_inherited_check_mode(tmp_path):
             assert written == expected
         for file in files:
             file.unlink()
+
+
+def test_standalone_recursive_include_preserves_null_check_mode(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires Core's native check mode inheritance")
+    child = tmp_path / "child.yml"
+    child.write_text("""- file:
+    path: "{{ playbook_dir }}/result-{{ depth | default(0) }}"
+    state: touch
+  check_mode: "{{ omit }}"
+- set_fact:
+    depth: "{{ (depth | default(0) | int) + 1 }}"
+- block:
+    - include_tasks: child.yml
+      when: depth | int < 2
+  check_mode: null
+""")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+"""
+    native = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
+                                "-e", "ansible_python_interpreter=" + sys.executable,
+                                environment={"ANSIBLE_STRATEGY": "linear"})
+    assert native.returncode == 0, native.stdout + native.stderr
+    assert sorted(file.name for file in tmp_path.glob("result-*")) == ["result-1"]
+    (tmp_path / "result-1").unlink()
+    artifact = tmp_path / "compiled.py"
+    source, _ = compile_playbook(str(tmp_path / "play.yml"), python_interpreter=sys.executable)
+    artifact.write_text(source)
+    run = """import runpy, sys
+compiled = runpy.run_path(sys.argv[1])
+sys.exit(compiled['main'](
+    compiled['PLAYS'], compiled['MODULES'], compiled['ANSIBALLZ_CODE'], check_mode=True,
+    module_bundle=compiled['_ansiroll_import_bytes'], resource_reader=compiled['_ansiroll_resource_read'],
+))
+"""
+    actual = subprocess.run([sys.executable, "-c", run, str(artifact)], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=20)
+    assert actual.returncode == 0, actual.stdout + actual.stderr
+    assert sorted(file.name for file in tmp_path.glob("result-*")) == ["result-1"]
 
 
 def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):

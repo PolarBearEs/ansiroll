@@ -2937,9 +2937,23 @@ def _concretize(value):
     return value
 
 
+class _KeywordTemplateSegment(str):
+    # Jinja's text generator calls str() on each finalized segment.
+    # Preserve identity until concatenation can distinguish a sole omit.
+    def __str__(self):
+        return self
+
+
+_KEYWORD_OMIT_SEGMENT = _KeywordTemplateSegment()
+_KEYWORD_NULL_SEGMENT = _KeywordTemplateSegment()
+
+
 def _finalize_text_segment(context, value):
-    if isinstance(value, _Omit) and context.get("__ansiroll_check_mode_template"):
-        return ""
+    if context.get("__ansiroll_check_mode_template"):
+        if isinstance(value, _Omit):
+            return _KEYWORD_OMIT_SEGMENT
+        if value is None:
+            return _KEYWORD_NULL_SEGMENT
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
         native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
@@ -3908,7 +3922,10 @@ class _Templater:
 
     def _render_string(self, text, ctx, strict=False, *, file_newline=None):
         stripped = text.strip()
-        expr = _bare_template_expression(stripped, lex=self.env.lex)
+        check_mode_template = ctx.get("__ansiroll_check_mode_template")
+        expr = None
+        if not check_mode_template or stripped == text:
+            expr = _bare_template_expression(stripped, lex=self.env.lex)
         if expr is None:
             # Full templates keep their existing rendering and newline behavior.
             file_newline = None
@@ -3950,7 +3967,14 @@ class _Templater:
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-                result = tmpl.render(**ctx)
+                if check_mode_template:
+                    parts = [part for part in tmpl.generate(**ctx) if part is not _KEYWORD_NULL_SEGMENT]
+                    if len(parts) == 1 and parts[0] is _KEYWORD_OMIT_SEGMENT:
+                        result = _OMIT
+                    else:
+                        result = "".join(parts) if parts else None
+                else:
+                    result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
                 return _captured_jinja_error(
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
@@ -4133,6 +4157,7 @@ class Runtime:
         self.python = python or sys.executable
         self.check_mode = check_mode
         self._invocation_check_mode = check_mode
+        self._copy_transfer_check_mode = None
         self.diff_mode = diff_mode
         self.on_result = on_result
         self.become_password = become_password
@@ -5839,6 +5864,7 @@ class Runtime:
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
+        inherited_transfer_check_mode = self._copy_transfer_check_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
@@ -5854,9 +5880,12 @@ class Runtime:
                     if isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__"):
                         check_ctx["omit"] = _OMIT
                 check_override = _fail_on_undef(self.template(check_override, check_ctx))
-                if (check_override == _OMIT or (
-                        isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__")
-                        and check_override == omit_token)):
+                if (isinstance(check_override, _Omit) or (
+                        _legacy_templating() and isinstance(omit_token, str)
+                        and omit_token.startswith("__omit_place_holder__") and check_override == omit_token)):
+                    if not _core_at_least(2, 17):
+                        # Older copy actions gate transfer on PlayContext.
+                        self._copy_transfer_check_mode = self._invocation_check_mode
                     check_override = task.get("check_mode_on_omit", inherited_check_mode)
                     if check_override == "invocation":
                         check_override = self._invocation_check_mode
@@ -5947,6 +5976,7 @@ class Runtime:
             self._module_source_bytes = None
             self._module_env = None
             self.check_mode = inherited_check_mode
+            self._copy_transfer_check_mode = inherited_transfer_check_mode
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
@@ -6744,7 +6774,10 @@ class Runtime:
             if self.diff_mode and not raw:
                 result["diff"].append(self._copy_diff(
                     task, dest_file, data, source_display, from_content, become))
-            if self.check_mode:
+            transfer_check_mode = self._copy_transfer_check_mode
+            if transfer_check_mode is None:
+                transfer_check_mode = self.check_mode
+            if transfer_check_mode:
                 result["changed"] = True
                 return result
             if raw:
@@ -8291,6 +8324,8 @@ def agent_main():
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),
             }
+            if action == "template" and rt._copy_transfer_check_mode is not None:
+                frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
             if lazy_play is not None and deferred:
                 frame["deferred_vars"] = deferred
             if lazy_play:
