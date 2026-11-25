@@ -5722,6 +5722,24 @@ def test_strategy_reports_unavailable_on_target_delegation_in_linear_fallback(tm
         assert "batch hosts last" not in warnings
 
 
+def test_strategy_warns_for_each_unnamed_play_in_linear_fallback(tmp_path):
+    play = """- hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - debug: {msg: controller only}
+"""
+    proc = _run_strategy_play(tmp_path, play * 2, inventory="origin,recipient,")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    warnings = " ".join(proc.stderr.split())
+    assert warnings.count("ansiroll_delegate_on_target has no effect during core linear fallback") == 2
+    assert "play.yml:1" in warnings
+    assert f"play.yml:{len(play.splitlines()) + 1}" in warnings
+
+
 def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
