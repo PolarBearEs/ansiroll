@@ -100,6 +100,35 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+@pytest.mark.parametrize("subdirectory", [False, True], ids=["positional", "keywords"])
+def test_standalone_vars_file_first_found_uses_launch_value_and_bundled_first_match(tmp_path, subdirectory):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ LOOKUP }}"
+  tasks:
+    - assert:
+        that: selected == expected
+""".replace("LOOKUP", "lookup('first_found', files=[profile ~ '.yml', 'fallback.yml'], paths=['nested'])"
+            if subdirectory else "lookup('first_found', [profile ~ '.yml', 'fallback.yml'])"))
+    files = tmp_path / ("files/nested" if subdirectory else "files")
+    files.mkdir(parents=True)
+    (files / "prod.yml").write_text("selected: production\n")
+    (files / "fallback.yml").write_text("selected: fallback\n")
+    source, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    (files / "prod.yml").unlink()
+    (files / "fallback.yml").unlink()
+    for profile, expected in (("prod", "production"), ("missing", "fallback")):
+        result = subprocess.run(
+            [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=20,
+            env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile, "expected": expected})},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_ordered_vars_files_capture_env_before_later_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_ORDERED_PREFIX", "compile")
     monkeypatch.setenv("ANSIROLL_TEST_ORDERED_SELECTOR", "chosen")

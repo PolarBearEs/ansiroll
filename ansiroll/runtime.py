@@ -1612,6 +1612,25 @@ def _lookup_values(name, args, kwargs, ctx=None):
         if isinstance(controller_config, dict):
             return [controller_config.get(str(a)) for a in args]
         return [None for _a in args]
+    if name == "first_found" and ctx is not None and "__ansiroll_first_found" in ctx:
+        directories, bundled = ctx["__ansiroll_first_found"]
+        terms = _flatten_deep(args or [kwargs.get("files")])
+        explicit_paths = _flatten_deep([kwargs.get("paths")])
+        if not all(isinstance(term, str) for term in terms + explicit_paths):
+            raise ValueError("first_found filenames and paths must be strings")
+        filenames = [part.strip() for term in terms for part in re.split("[,;]", term) if part.strip()]
+        roots = [part.strip() for directory in explicit_paths
+                 for part in re.split("[,:;]", directory) if part.strip()] or [""]
+        for root in roots:
+            for filename in filenames:
+                for directory in directories:
+                    for search in (os.path.join(directory, "files"), directory):
+                        path = os.path.normpath(os.path.join(search, root, filename))
+                        if path in bundled:
+                            return [path]
+        if _boolean(kwargs.get("skip")):
+            return []
+        raise ValueError("No file was found when using first_found.")
     if name == "file":
         vals = []
         lstrip = kwargs.get("lstrip", False)
@@ -4872,6 +4891,10 @@ class Runtime:
             else:
                 selector_blocks = {}
             for raw in entry["names"]:
+                if raw in entry.get("first_found", {}):
+                    ctx["__ansiroll_first_found"] = (entry["dirs"], set(entry["first_found"][raw]))
+                else:
+                    ctx.pop("__ansiroll_first_found", None)
                 checked = entry.get("controller_candidates", {}).get(raw)
                 paths = {(key, tuple(path)) for key, path in checked["paths"]} if checked else set()
                 reuse_checked = checked and not _vars_file_reads_blocked(selector_blocks, paths) and all(

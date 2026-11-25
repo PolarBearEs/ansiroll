@@ -1021,6 +1021,49 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _vars_first_found_patterns(source):
+    """Model positional first_found filenames using bounded glob patterns."""
+    import glob
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    def term_patterns(term, separators="[;,]"):
+        if isinstance(term, nodes.Const) and isinstance(term.value, str):
+            return [glob.escape(name.strip()) for name in re.split(separators, term.value) if name.strip()]
+        if isinstance(term, nodes.Name):
+            return ["*"]
+        if isinstance(term, (nodes.List, nodes.Tuple)):
+            return [pattern for item in term.items for pattern in term_patterns(item, separators)]
+        if isinstance(term, (nodes.Add, nodes.Concat)):
+            terms = (term.left, term.right) if isinstance(term, nodes.Add) else term.nodes
+            segments = [term_patterns(segment, separators) for segment in terms]
+            if all(len(part) == 1 for part in segments):
+                return ["".join(part[0] for part in segments)]
+        raise ValueError("unmodeled first_found filename")
+
+    try:
+        parsed = Environment().parse(source).body
+        if len(parsed) != 1 or not isinstance(parsed[0], nodes.Output):
+            return None
+        expressions = [node for node in parsed[0].nodes
+                       if not isinstance(node, nodes.TemplateData) or node.data.strip()]
+        if len(expressions) != 1 or not isinstance(expressions[0], nodes.Call):
+            return None
+        call = expressions[0]
+        if not (isinstance(call.node, nodes.Name) and call.node.name == "lookup" and call.args
+                and isinstance(call.args[0], nodes.Const)
+                and call.args[0].value in ("first_found", "ansible.builtin.first_found")
+                and not (call.dyn_args or call.dyn_kwargs)
+                and all(keyword.key in ("files", "paths", "skip") for keyword in call.kwargs)):
+            return None
+        options = {keyword.key: keyword.value for keyword in call.kwargs}
+        terms = call.args[1:] or ([options["files"]] if "files" in options else [])
+        filenames = [pattern for term in terms for pattern in term_patterns(term)]
+        directories = term_patterns(options["paths"], "[,:;]") if "paths" in options else []
+        return [os.path.join(directory, filename) for directory in (directories or [""]) for filename in filenames]
+    except (TemplateSyntaxError, ValueError):
+        return None
+
+
 def _deferred_vars_files(play, basedir, entries):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
@@ -1040,8 +1083,22 @@ def _deferred_vars_files(play, basedir, entries):
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
+        first_found = {}
         unmodeled = [name for name in names if name.startswith(("{{", "{%")) and "/" in name]
         for name in names:
+            if _is_templated(name) and (patterns := _vars_first_found_patterns(name)) is not None:
+                candidates = set()
+                for pattern in patterns:
+                    for directory in dirs:
+                        for root in (os.path.join(directory, "files"), directory):
+                            for path in glob.glob(os.path.join(glob.escape(root), pattern)):
+                                if os.path.isfile(path):
+                                    path = os.path.normpath(path)
+                                    candidates.add(path)
+                                    if path not in files:
+                                        files[path] = _bundled_vars_file(play, path)
+                first_found[name] = sorted(candidates)
+                continue
             if name in unmodeled:
                 continue
             pattern = _vars_file_glob_pattern(name)
@@ -1059,6 +1116,8 @@ def _deferred_vars_files(play, basedir, entries):
                     if found not in files and os.path.isfile(found):
                         files[found] = _bundled_vars_file(play, found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
+        if first_found:
+            entry["first_found"] = first_found
         if unmodeled:
             entry["unmodeled"] = unmodeled
         deferred.append(entry)
