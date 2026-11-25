@@ -861,6 +861,33 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     assert output.read_text() == expected_text
 
 
+@pytest.mark.parametrize("src", ["sites/app.j2", "sites/{{ site }}.j2"])
+def test_delegated_template_uses_original_role_search_path(tmp_path, src):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    site: app
+  roles: [web]
+""", {
+        "roles/web/tasks/main.yml": (
+            '- template:\n'
+            f'    src: "{src}"\n'
+            '    dest: "{{ playbook_dir }}/rendered.txt"\n'
+            '  delegate_to: localhost\n'
+        ),
+        "roles/web/templates/sites/app.j2": "role template from {{ template_fullpath }}\n",
+        "sites/app.j2": "working directory file\n",
+    })
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    expected_text = "role template from " + str(tmp_path / "roles/web/templates/sites/app.j2") + "\n"
+    assert output.read_text() == expected_text
+    output.unlink()
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
 def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
     path = _write(tmp_path, """

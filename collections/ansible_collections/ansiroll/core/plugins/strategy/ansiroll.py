@@ -721,7 +721,9 @@ class StrategyModule(StrategyBase):
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
         if action == "template" and local:
-            return self._run_local_template(frame, become_pass, resolve_play_var)
+            task_key = frame.get("runtime_id") or frame.get("uuid")
+            source_task = (task_map or {}).get(task_key)
+            return self._run_local_template(frame, become_pass, resolve_play_var, source_task=source_task)
         if frame.get("fallback") or not local:
             reason = ("delegate_to: %s (non-local delegation)" % to if to
                       else "controller-coupled action %s" % frame.get("action"))
@@ -907,36 +909,27 @@ class StrategyModule(StrategyBase):
             container.update(entries)
         return value
 
-    def _run_local_template(self, frame, become_pass, resolve_play_var=None):
-        """Render a runtime-created controller file through the in-memory runtime."""
+    def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
+        """Resolve and render the controller's template through the in-memory runtime."""
         args = dict(frame.get("args") or {})
         src = args.get("src")
-        if not src or not os.path.isfile(src):
+        if not isinstance(src, str) or not src:
             return {
                 "failed": True,
                 "changed": False,
                 "msg": "template: could not find controller source %r" % src,
             }
-        try:
-            with open(src, "rb") as fh:
-                raw = fh.read().decode("utf-8", "surrogateescape")
-                st = os.fstat(fh.fileno())
-        except OSError as ex:
-            return {"failed": True, "changed": False, "msg": str(ex)}
+        source = self._read_controller_source(src, role_task=None if os.path.isabs(src) else source_task)
+        if "error" in source:
+            return {"failed": True, "changed": False, "msg": "template: " + source["error"]}
+        raw = base64.b64decode(source["data"]).decode("utf-8", "surrogateescape")
         rt = self._local_runtime(become_pass)
         previous_become_user = rt.become_user
         try:
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
                 "_baked": {src: raw},
-                "_baked_meta": {
-                    src: {
-                        "fullpath": os.path.abspath(src),
-                        "mtime": st.st_mtime,
-                        "uid": st.st_uid,
-                        "mode": stat.S_IMODE(st.st_mode),
-                    },
-                },
+                "_baked_meta": {src: source["meta"]},
             }
             job_vars = dict(frame.get("vars") or {})
             if names := frame.get("lazy_template_vars"):
