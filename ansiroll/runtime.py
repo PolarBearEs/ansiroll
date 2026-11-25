@@ -3714,9 +3714,14 @@ class _Templater:
             templated = _looks_templated(text)
         else:
             settings = dict(file_options)
-            templated = file_header or any(
-                settings.get(kind + "_start_string", getattr(self.env, kind + "_start_string")) in text
-                for kind in ("variable", "block", "comment"))
+            starts = [
+                settings.get(kind + "_start_string", getattr(self.env, kind + "_start_string"))
+                for kind in ("variable", "block", "comment")
+            ]
+            if (any(not isinstance(start, str) or not start for start in starts)
+                    or _core_at_least(2, 19) and len(set(starts)) != len(starts)):
+                raise ValueError("template opening delimiters must be distinct non-empty strings")
+            templated = file_header or any(start in text for start in starts)
         if not templated:
             if file_newline is not None and _legacy_templating():
                 return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
@@ -7674,7 +7679,10 @@ def _template_file_options(source, args):
                "lstrip_blocks": _boolean(args.get("lstrip_blocks", False))}
     for key in _TEMPLATE_ONLY_ARGS:
         if key.endswith(("_start_string", "_end_string")) and args.get(key) is not None:
-            options[key] = args[key]
+            value = args[key]
+            if not isinstance(value, (str, int, float, bool)):
+                raise ValueError("%s is expected to be a string" % key)
+            options[key] = str(value)
     has_header = source.startswith("#jinja2:")
     if has_header:
         header, delimiter, source = source.partition("\n")

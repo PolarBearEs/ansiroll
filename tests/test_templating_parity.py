@@ -1224,6 +1224,36 @@ def test_standalone_template_file_concatenates_buffered_native_values(tmp_path):
     assert output.read_bytes() == b"Hello 42|Capture 43|FILTER 44\n"
 
 
+@pytest.mark.parametrize(("template", "options", "expected_text"), [
+    ("a{# note +#}\nb\n", "", b"a\nb\n"),
+    ("12private34", "        comment_start_string: 12\n        comment_end_string: 34\n", b""),
+    ('#jinja2: comment_start_string: "{{", comment_end_string: "}}"\n{{ 6 * 7 }}\n', "", None),
+    ("plain text\n", '        comment_start_string: !unsafe "{{"\n', None),
+])
+def test_standalone_template_file_matches_comment_delimiter_handling(tmp_path, template, options, expected_text):
+    if options and Version(__version__) < Version("2.11"):
+        pytest.skip("custom comment arguments require Core 2.11+")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + options, {"sample.j2": template})
+    output = tmp_path / "rendered.txt"
+    output.write_bytes(b"existing\n")
+    expected = _ansible(path, tmp_path)
+    if expected_text is None and not MODERN_TEMPLATING:
+        expected_text = output.read_bytes()
+    assert expected[1][3] == ("1" if expected_text is None else "0")
+    content = b"existing\n" if expected_text is None else expected_text
+    assert output.read_bytes() == content
+    output.write_bytes(b"existing\n")
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == content
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 

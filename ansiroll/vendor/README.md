@@ -6,7 +6,9 @@
 - MarkupSafe 1.1.1
 
 These are the final releases of this dependency pair that support Python 3.5.
-The archive also contains both upstream license files.
+The archive also contains both upstream license files. Its comment lexer
+backports the `+` closing modifier so a comment can preserve the following
+newline when `trim_blocks` is enabled.
 
 Upstream artifacts used to build it:
 
@@ -16,7 +18,7 @@ Upstream artifacts used to build it:
   `29872e92839765e546828bb7754a68c418d927cd064fd4708fab9fe9c8bb116b`)
 
 The generated archive's SHA-256 is
-`ece6ccf6bbf11e7a27d10e7d0ad937934212d9bc497db1ab2a0649a463937d40`.
+`eee4c15a201f75acc3d5a59c731674b05e38aa53939b69291878855b58600eae`.
 
 `pyyaml-py35.zip` contains the pure-Python sources from PyYAML 5.3.1,
 stored under the private import name `ansiroll_yaml`. PyYAML 5.3.1 is the last
