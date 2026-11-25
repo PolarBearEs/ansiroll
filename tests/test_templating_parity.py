@@ -815,6 +815,72 @@ def test_untrusted_data_is_not_templated_again(tmp_path):
     assert msgs[-1] == "BASE,BASE-2"
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy):
+    from ansible import constants as C
+
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    empty_suffix: null
+  tasks:
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}/{{ 'second' }}"
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}/{{ empty_suffix }}"
+""", {"data.txt": "first"}, use_strategy=use_strategy)
+    null_suffix = "None" if not MODERN_TEMPLATING and C.DEFAULT_JINJA2_NATIVE else ""
+    assert messages == ["first/second", "first/" + null_suffix]
+
+
+def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "true")
+    monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    empty: null
+    alias: "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/{{ empty }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+""", {"sample.j2": "prefix={{ alias }}\n"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    expected_text = output.read_text()
+    suffix = "None" if (2, 13) <= _core_version() < (2, 19) else ""
+    assert expected_text == "prefix=controller/" + suffix + "\n"
+    output.unlink()
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+      vars:
+        alias: "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/tail"
+        payload: "{{ {'values': hostvars[inventory_hostname].values()} }}"
+""", {"sample.j2": "prefix={{ hostvars[inventory_hostname].alias }}\n"
+                      "type={{ payload['values'] | type_debug }}\n"})
+    _, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert recap == ("1", "1", "0", "0", "0", "0", "0")
+    assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\ntype=list\n"
+
+
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost
@@ -1859,6 +1925,48 @@ def test_delegated_task_ignores_unrelated_undefined_context_values(tmp_path):
 """, use_strategy=True)
     assert messages == ["fixture"]
     assert recap == ("2", "0", "0", "0", "0", "0", "0")
+
+
+def test_delegated_runtime_template_resolves_only_used_lookup_variables(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy:
+        dest: "{{ playbook_dir }}/runtime.j2"
+        content: !unsafe >-
+          {{ (vars.copy().settings.rows.copy() | first).copy().used }}|
+          {{ (vars.items() | selectattr('0', 'equalto', 'settings') | first)[1].rows.copy().pop(0).setdefault('used') }}|
+          {{ settings.rows[0].pop('used') }}|{{ 'untouched' if true else unused }}|
+          {{ alias.child | default('fallback') }}|
+          {%- set current = hostvars[inventory_hostname] -%}
+          {%- set first_key = current.keys() | first -%}
+          {{ current.values()[0] == current[first_key] }}|{{ current.items()[0][0] == first_key }}|
+          {%- set snapshot = current.copy() -%}
+          {{ snapshot.values()[0] == current[first_key] }}|{{ snapshot.items()[0][0] == first_key }}
+    - template:
+        src: "{{ playbook_dir }}/runtime.j2"
+        dest: "{{ playbook_dir }}/output.txt"
+      delegate_to: localhost
+      vars:
+        settings:
+          rows:
+            - used: >-
+                {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote) ~ '; printf hello') }}/tail
+              unused: >-
+                {{ lookup('pipe', 'printf sibling >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}/tail
+            - >-
+              {{ lookup('pipe', 'printf later >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}/tail
+        unused: >-
+          {{ lookup('pipe', 'printf unused >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}/tail
+        alias: "{{ missing }}"
+""")
+    _, recap = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert recap == ("2", "2", "0", "0", "0", "0", "0")
+    assert (tmp_path / "output.txt").read_text() == (
+        "hello/tail| hello/tail| hello/tail|untouched| fallback|True|True|True|True"
+    )
+    assert (tmp_path / "lookups").read_text() == "used"
 
 
 def test_until_and_assert_errors_and_invalid_ignore_errors(tmp_path):

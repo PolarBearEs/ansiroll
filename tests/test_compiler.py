@@ -153,6 +153,15 @@ def test_inventory_defaults_apply_when_preparing_role_handler_variables():
     assert runtime.template(handler["args"]["msg"], runtime._task_ctx(handler, scope)) == "node"
 
 
+def test_explicit_empty_play_hostname_takes_precedence_over_inventory_default():
+    from ansiroll.runtime import Runtime
+
+    runtime = Runtime({}, "", {"inventory_hostname": ""}, inventory_defaults={"inventory_hostname": "node"})
+    assert runtime.ctx()["inventory_hostname"] == "node"
+    runtime.run_play({"vars": {"inventory_hostname": ""}})
+    assert runtime._task_ctx({}, {})["inventory_hostname"] == ""
+
+
 @pytest.mark.parametrize(("variables", "expression"), [
     ("", "'no' if group_names is defined else true"),
     ("  vars:\n    checksum_flag: \"{{ 'no' if group_names is defined else true }}\"\n",

@@ -397,6 +397,10 @@ def _condition_value(condition, variables, templater):
         from jinja2 import meta as jinja_meta
         source = str(condition) if trusted else "{{ (%s) }}" % condition
         parsed = templater.env.parse(source)
+        # Jinja's undeclared-variable scan compiles and can fold constant
+        # filter operands in this AST. Check for runtime filters first.
+        if _uses_nondeterministic_filter(parsed):
+            return None
         referenced = jinja_meta.find_undeclared_variables(parsed)
     except Exception:
         return None
@@ -410,8 +414,6 @@ def _condition_value(condition, variables, templater):
     if global_names - variables.keys() - _DETERMINISTIC_GLOBALS:
         return None
     referenced.update(global_names & variables.keys())
-    if _uses_nondeterministic_filter(parsed):
-        return None
     # A fixed variable can still contain a template. Its defaults and tests
     # must see the runtime scope when a referenced name is absent here.
     def is_runtime_input(name):
