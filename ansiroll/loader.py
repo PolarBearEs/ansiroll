@@ -1344,6 +1344,8 @@ def _deferred_vars_files(play, basedir, entries):
                     for pattern in patterns:
                         for root in first_found_roots:
                             for path in glob.glob(os.path.join(glob.escape(root), pattern)):
+                                if not os.path.exists(path):
+                                    continue
                                 path = os.path.normpath(path)
                                 candidates.add(path)
                                 if path not in files:

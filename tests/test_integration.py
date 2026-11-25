@@ -124,7 +124,8 @@ def test_standalone_vars_file_first_found_uses_launch_value_and_bundled_first_ma
     files.mkdir(parents=True, exist_ok=True)
     (files / "prod.yml").write_text("selected: production\n")
     (files / "fallback.yml").write_text("selected: fallback\n")
-    choices = (("prod", "production"), ("missing", "fallback"))
+    (files / "dangling.yml").symlink_to("nonexistent.yml")
+    choices = (("prod", "production"), ("missing", "fallback"), ("dangling", "fallback"))
     for profile, expected in choices:
         native = subprocess.run(
             ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
