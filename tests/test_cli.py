@@ -833,6 +833,29 @@ def test_compile_protects_import_previously_read_through_vars_files(tmp_path, en
     assert imported.read_bytes() == original
 
 
+def test_playbook_open_observer_bypasses_a_populated_vault_cache(tmp_path):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansible.playbook import Playbook
+    from ansiroll.loader import _core_version, _make_rewriting_loader
+
+    playbook = tmp_path / "child.yml"
+    secret = VaultSecret(b"fixture-password")
+    secrets = [("default", secret)]
+    playbook.write_bytes(VaultLib(secrets).encrypt(
+        b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n", secret=secret))
+    loader = _make_rewriting_loader(DataLoader)
+    loader.set_vault_secrets(secrets)
+    loader.load_from_file(str(playbook), cache="vaulted" if _core_version() >= (2, 17) else True)
+    assert str(playbook) in loader._FILE_CACHE
+
+    opened = []
+    loader.on_playbook_open = lambda path, st: opened.append((Path(os.fsdecode(path)), st.st_ino))
+    Playbook.load(str(playbook), loader=loader)
+    assert opened == [(playbook, playbook.stat().st_ino)]
+
+
 def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
     playbook = tmp_path / "play.yml"
     destination = tmp_path / "stdout"
