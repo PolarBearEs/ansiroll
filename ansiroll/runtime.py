@@ -78,7 +78,7 @@ def _rendered_number(value, source, ctx):
     if isinstance(value, Number) and not isinstance(value, bool) and _legacy_non_native(ctx):
         # A bare name preserves the type only when its original value is numeric.
         bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source)
-        if bare is None or not isinstance(dict.get(ctx, bare[1]), Number):
+        if bare is None or not isinstance(dict.get(ctx, bare.group(1)), Number):
             return str(value)
     return value
 
@@ -7145,7 +7145,7 @@ class Runtime:
             # Legacy Ansible returns a bare null variable directly. Other
             # expressions that yield null render as an empty, invalid timeout.
             bare = re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", template["source"])
-            if not (bare and bare[1] in scope and scope[bare[1]] is None):
+            if not (bare and bare.group(1) in scope and scope[bare.group(1)] is None):
                 raise ValueError("gather_timeout must be an integer")
             value = template.get("null_representation")
             if value is None:
@@ -8339,7 +8339,8 @@ def agent_main():
         for play in plays:
             if not g.get("_INJECTED_GATHER_FACTS", True):
                 play = dict(play, gather_facts=False)
-            if controller_lookups := g.get("_INJECTED_CONTROLLER_LOOKUPS"):
+            controller_lookups = g.get("_INJECTED_CONTROLLER_LOOKUPS")
+            if controller_lookups:
                 play = {**play, **{
                     key: {**(play.get(key) or {}), **values}
                     for key, values in controller_lookups.items()

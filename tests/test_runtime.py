@@ -4539,3 +4539,47 @@ def test_conditions_keep_namespaced_facts_and_controller_precedence(monkeypatch,
     assert _override_ctx({"action": "debug"}, result, ctx) == ctx
     delegated = {"action": "setup", "delegate_to": "other", "delegate_facts": "{{ route_facts }}"}
     assert _override_ctx(delegated, result, ctx, rt.template) == (ctx if modern else effective)
+
+
+
+def _target_side_sources():
+    from ansiroll import compiler, runtime as runtime_module
+
+    package = os.path.dirname(compiler.__file__)
+    paths = [os.path.join(package, "runtime.py"), os.path.join(package, "worker.py")]
+    modules = os.path.join(package, "accelerated_modules")
+    paths += sorted(os.path.join(modules, name) for name in os.listdir(modules) if name.endswith(".py"))
+    for path in paths:
+        with open(path) as source:
+            yield os.path.relpath(path, package), source.read()
+    yield "compiler._FOOTER", compiler._FOOTER
+    yield "runtime.AGENT_BOOTSTRAP", runtime_module.AGENT_BOOTSTRAP
+    yield "compiler._bundle_bootstrap", compiler._bundle_bootstrap(b"")
+
+
+_TARGET_SIDE_SOURCES = list(_target_side_sources())
+
+
+@pytest.mark.parametrize("name, source", _TARGET_SIDE_SOURCES, ids=[name for name, _ in _TARGET_SIDE_SOURCES])
+def test_target_side_code_parses_on_python_35(name, source):
+    # Gateways still run Python 3.5 (stretch) and 3.7 (buster); one walrus broke every deploy to them. Best-effort, not
+    # exhaustive: 1_000, a trailing comma after *args or an async generator still get through, and so do 3.6+ APIs.
+    import ast
+
+    too_new = tuple(
+        getattr(ast, node, ())
+        for node in ("NamedExpr", "JoinedStr", "AnnAssign", "Match", "TryStar", "TypeAlias")
+    )
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        arguments = getattr(node, "args", None)
+        if (
+            isinstance(node, too_new)
+            or (isinstance(arguments, ast.arguments) and arguments.posonlyargs)
+            or getattr(node, "type_params", None)
+            or (isinstance(node, ast.comprehension) and node.is_async)
+            or (isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names))
+        ):
+            offenders.append("{}:{} {}".format(name, getattr(node, "lineno", "?"), type(node).__name__))
+    assert offenders == []
