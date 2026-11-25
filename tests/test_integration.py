@@ -5659,6 +5659,28 @@ def test_strategy_validates_native_check_mode_buffers(tmp_path, expression, invo
         assert not (tmp_path / "result").exists()
 
 
+def test_strategy_keeps_explicit_omit_like_variable_as_a_string(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native omit values")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: "{{ playbook_dir }}/result"
+        state: touch
+      vars: {omit: __omit_place_holder__user_value}
+      check_mode: "{{ omit is string }}"
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
+                                    "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (tmp_path / "result").exists()
+
+
 def test_strategy_rejects_padded_legacy_check_mode_omit(tmp_path):
     from ansiroll.loader import _core_version
 

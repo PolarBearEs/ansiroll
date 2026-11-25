@@ -17,6 +17,16 @@ from ansiroll.runtime import (
 )
 
 
+@pytest.mark.parametrize(("version", "expected"), [("2.19.0", True), ("2.19.1", False)])
+def test_check_mode_buffer_null_semantics_follow_core_patch(monkeypatch, version, expected):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", version)
+    templater = Runtime({}, "", {}).templater
+    expression = "{% set x %}{{ none }}{{ none }}{% endset %}{{ x is not none }}"
+    assert templater.render_string(expression, {runtime._CHECK_MODE_TEMPLATE: True}) is expected
+
+
 def _task(uuid, name, special, **kw):
     node = {"type": "task", "uuid": uuid, "name": name, "action": special,
             "special": special, "args": {}, "when": [], "loop": None,

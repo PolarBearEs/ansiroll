@@ -48,7 +48,7 @@ _ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 _GATHER_STRING_METHODS = {"split", "rsplit", "strip", "lstrip", "rstrip"}
 
 
-def _core_at_least(major, minor):
+def _core_at_least(major, minor, patch=0):
     """Feature gate on the compiling controller's ansible-core version."""
     version = _ANSIROLL_CORE_VERSION
     if not version:
@@ -57,8 +57,8 @@ def _core_at_least(major, minor):
             from ansible.release import __version__ as version
         except Exception:
             return False
-    match = re.match(r"^(\d+)\.(\d+)", str(version))
-    return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", str(version))
+    return bool(match) and tuple(int(value or 0) for value in match.groups()) >= (major, minor, patch)
 
 
 def _legacy_templating():
@@ -2948,7 +2948,10 @@ _KEYWORD_OMIT = _KeywordOmit()
 
 
 def _concat_keyword_segments(nodes):
-    parts = [part for part in nodes if part is not None]
+    if _core_at_least(2, 19, 1):
+        parts = [part for part in nodes if part is not None]
+    else:
+        parts = list(nodes)
     if len(parts) < 2:
         return parts[0] if parts else None
     return "".join(str(_fail_on_undef(part)) for part in parts if part is not _KEYWORD_OMIT)
@@ -5908,7 +5911,7 @@ class Runtime:
                 if isinstance(check_override, str):
                     native_keyword = _core_at_least(2, 19)
                     check_ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
-                    if native_keyword and isinstance(omit_token, str) and omit_token.startswith("__omit_place_holder__"):
+                    if native_keyword and omit_token is _OMIT:
                         check_ctx["omit"] = _KEYWORD_OMIT
                 check_override = _fail_on_undef(self.template(check_override, check_ctx))
                 if (check_override is _KEYWORD_OMIT or isinstance(check_override, _Omit) or (
