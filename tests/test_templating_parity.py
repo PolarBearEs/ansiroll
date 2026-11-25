@@ -2331,13 +2331,18 @@ def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_pat
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern native tuple keys")
 @pytest.mark.parametrize("no_log", [False, True])
-def test_strategy_include_register_preserves_tuple_mapping_keys_across_plays(tmp_path, no_log):
+@pytest.mark.parametrize(("item", "condition"), [
+    ("{(1, 2): 'private'}", "selected.results[0].item[(1, 2)] == 'private'"),
+    ("{1: 'int', '1': 'text'}", "selected.results[0].item[1] == 'int' and selected.results[0].item['1'] == 'text'"),
+    ("{range(3): 'range'}", "selected.results[0].item[range(3)] == 'range'"),
+])
+def test_strategy_include_register_preserves_typed_mapping_keys_across_plays(tmp_path, no_log, item, condition):
     path = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
   tasks:
     - include_tasks: child.yml
-      loop: "{{ [{(1, 2): 'private'}] }}"
+      loop: "{{ [%s] }}"
       when: false
       register: selected
       no_log: %s
@@ -2346,12 +2351,36 @@ def test_strategy_include_register_preserves_tuple_mapping_keys_across_plays(tmp
   tasks:
     - assert:
         quiet: true
-        that: selected.results[0].item[(1, 2)] == 'private'
-""" % str(no_log).lower(), {"child.yml": "- debug: {msg: unexpected body}\n"})
+        that: %s
+""" % (item, str(no_log).lower(), condition), {"child.yml": "- debug: {msg: unexpected body}\n"})
     messages, recap = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
     assert messages == []
     assert recap[3] == "0"
     assert recap[4] == "1"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern native tuple keys")
+def test_other_strategy_host_reads_tuple_keys_from_an_include_register(tmp_path):
+    path = _write(tmp_path, """
+- hosts: source
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: "{{ [{(1, 2): 'received'}] }}"
+      when: false
+      register: selected
+      no_log: true
+- hosts: observer
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: "{{ hostvars['source'].selected.results[0].item[(1, 2)] }}"
+""", {"child.yml": "- debug: {msg: unexpected body}\n"})
+    result = subprocess.run(ansible_playbook_command() + ["-i", "source,observer,", "-c", "local", str(path)],
+                            cwd=tmp_path, env={**_env(), "ANSIBLE_STRATEGY": "ansiroll.core.ansiroll"},
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"msg": "received"' in result.stdout
 
 
 def test_empty_ordinary_loop_skips_validation_of_extended_metadata(tmp_path):

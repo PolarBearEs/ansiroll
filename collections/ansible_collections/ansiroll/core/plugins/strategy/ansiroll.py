@@ -1750,6 +1750,7 @@ def _extra_vars(variable_manager):
 
 def _json_blob(values, mapping_keys=None):
     from ansiroll.loader import _tag_untrusted
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     # hostvars/vars are live controller objects that stringify uselessly; the
     # agent synthesizes ``vars``. Materialize hostvars without their recursive
@@ -1758,39 +1759,37 @@ def _json_blob(values, mapping_keys=None):
     if isinstance(values, dict):
         hostvars = values.get("hostvars")
         values = {k: v for k, v in values.items() if k not in ("hostvars", "vars")}
-        snapshot = _hostvars_snapshot(hostvars)
+        snapshot = _hostvars_snapshot(hostvars, preserve_keys=mapping_keys is not None)
         if snapshot:
             values["hostvars"] = snapshot
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
+        if mapping_keys is None or not _contains_typed_mapping_keys(values):
+            return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
     except Exception:
-        safe = {}
-        for k, v in (values or {}).items():
-            try:
-                v = _tag_untrusted(v, template_syntax_only=True)
+        pass
+    safe = {}
+    for k, v in (values or {}).items():
+        try:
+            v = _tag_untrusted(v, template_syntax_only=True)
+            if mapping_keys is not None and _contains_typed_mapping_keys(v):
+                packed = _pack_delegated_value(v)
+                if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
+                    continue
+                mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
+                v = packed["value"]
+            else:
                 json.dumps(v, default=str)
-            except TypeError:
-                if mapping_keys is None:
-                    continue
-                try:
-                    from ansiroll.runtime import _pack_delegated_value
-
-                    packed = _pack_delegated_value(v)
-                    if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
-                        continue
-                    mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
-                    v = packed["value"]
-                except Exception:
-                    continue
-            except Exception:
-                continue
-            safe[k] = v
-        return json.dumps(safe, default=str)
+        except Exception:
+            continue
+        safe[k] = v
+    return json.dumps(safe, default=str)
 
 
-def _hostvars_snapshot(hostvars):
+def _hostvars_snapshot(hostvars, *, preserve_keys=False):
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
+
     if hostvars is None:
         return {}
     out = {}
@@ -1798,18 +1797,31 @@ def _hostvars_snapshot(hostvars):
         names = list(hostvars)
     except Exception:
         return out
+    raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
     for name in names:
         try:
-            source = dict(hostvars[name])
+            source = hostvars[name]
+            keys = list(source)
+            raw = raw_get(name) if raw_get is not None else {}
         except Exception:
             continue
         safe = {}
-        for key, value in source.items():
+        for key in keys:
             if key in ("hostvars", "vars"):
                 continue
             try:
-                json.dumps(value, default=str)
-            except (TypeError, ValueError):
+                # Core's HostVars view can reject typed keys while templating
+                # a register. Its raw value remains safe to copy as data.
+                value = raw.get(key) if isinstance(raw, dict) else None
+                if not _contains_typed_mapping_keys(value):
+                    value = source[key]
+                if preserve_keys and _contains_typed_mapping_keys(value):
+                    packed = _pack_delegated_value(value)
+                    if packed["undefined"] or packed.get("errors"):
+                        continue
+                else:
+                    json.dumps(value, default=str)
+            except Exception:
                 continue
             safe[key] = value
         out[str(name)] = safe

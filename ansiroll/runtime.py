@@ -4465,17 +4465,14 @@ class Runtime:
                 item = "(censored due to no_log)"
                 emitted_result["_ansible_item_label"] = item
             if send_register:
-                include_register = _pack_delegated_value(result)
-        elif include:
-            try:
-                json.dumps((result, item), default=str)
-            except TypeError:
-                # Leave presentation JSON-safe and keep the original keys for register.
-                packed = _pack_delegated_value(result)
-                emitted_result = packed["value"]
-                item = _pack_delegated_value(item)["value"] if item is not None else None
-                if send_register:
-                    include_register = packed
+                include_register = _pack_include_value(result)
+        elif include and _contains_typed_mapping_keys((result, item)):
+            # Leave presentation JSON-safe and keep the original keys for register.
+            packed = _pack_include_value(result)
+            emitted_result = packed["value"]
+            item = _pack_include_value(item)["value"] if item is not None else None
+            if send_register:
+                include_register = packed
         if name is None:
             started_node, started_name = self._started_task_name
             name = started_name if started_node is node else self._node_name(node)
@@ -7784,6 +7781,8 @@ def _encode_delegated_key(key):
         return {"date": key.isoformat()}
     if isinstance(key, bytes):
         return {"bytes": base64.b64encode(key).decode("ascii")}
+    if isinstance(key, range):
+        return {"range": [key.start, key.stop, key.step]}
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
@@ -7798,6 +7797,31 @@ def _pack_delegated_value(value):
     return result
 
 
+def _contains_typed_mapping_keys(value):
+    pending = [value]
+    seen = set()
+    while pending:
+        member = pending.pop()
+        if isinstance(member, (dict, list, tuple)) and id(member) not in seen:
+            seen.add(id(member))
+            if isinstance(member, dict):
+                if any(not isinstance(key, str) for key in member):
+                    return True
+                pending.extend(member.values())
+            else:
+                pending.extend(member)
+    return False
+
+
+def _pack_include_value(value):
+    try:
+        return _pack_delegated_value(value)
+    except (TypeError, ValueError):
+        # A plugin can return arbitrary hashable objects. Such keys cannot
+        # cross the wire, but should not abort callbacks for an include.
+        return {"value": json.loads(json.dumps(value, default=str, skipkeys=True)), "undefined": []}
+
+
 def _restore_delegated_mapping_keys(value, mapping_keys):
     def restore_key(key):
         if isinstance(key, list):
@@ -7809,6 +7833,8 @@ def _restore_delegated_mapping_keys(value, mapping_keys):
                 return base64.b64decode(key["bytes"], validate=True)
             if "date" in key:
                 return date.fromisoformat(key["date"])
+            if "range" in key:
+                return range(*key["range"])
             return datetime.fromisoformat(key["datetime"])
         return key
 
