@@ -148,7 +148,7 @@ jobs:
                 return 0
               fi
             done
-            echo '::warning::GitHub did not return all required test results.' >&2
+            echo '::warning::Could not verify that all required jobs passed.' >&2
             return 1
           }
           if [[ -n "$CACHED_RUN" ]]; then
@@ -196,13 +196,19 @@ jobs:
           # Only create terminal checks. A force cancellation can skip the
           # reporter entirely, so it must not strand an in-progress check.
           current_revision() {
-            local delay pr actual_merge
+            local delay pr mergeable actual_merge
             for delay in 0 2 4; do
               ((delay == 0)) || sleep "$delay"
               pr=$(gh api "$api/pulls/$PR") || continue
               jq -e --arg head "$HEAD" --arg base "$BASE" '
                 .state == "open" and .head.sha == $head and .base.ref == "master" and .base.sha == $base
               ' <<< "$pr" >/dev/null || return 1
+              mergeable=$(jq -r '.mergeable' <<< "$pr")
+              case "$mergeable" in
+                null) continue ;;
+                true) ;;
+                *) return 1 ;;
+              esac
               actual_merge=$(jq -r '.merge_commit_sha // empty' <<< "$pr")
               [[ -n "$actual_merge" ]] || continue
               [[ "$actual_merge" == "$MERGE" ]]
@@ -216,10 +222,17 @@ jobs:
                 -f name="Amp CI / PR #$PR" -f head_sha="$HEAD" -f details_url="$details_url" \
                 -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" \
                 -f "output[summary]=$(printf 'Merge commit: %s\nBase commit: %s' "$MERGE" "$BASE")"); then
-                if ! current_revision; then
+                revision_status=0
+                current_revision || revision_status=$?
+                if ((revision_status)); then
+                  cancelled_title='PR revision changed'
+                  if ((revision_status == 2)); then
+                    cancelled_title='Could not verify the PR revision'
+                    ((report_error)) || report_error=1
+                  fi
                   gh api --silent --method PATCH "$api/check-runs/$check" \
                     -f status=completed -f conclusion=cancelled \
-                    -f 'output[title]=PR revision changed' \
+                    -f "output[title]=$cancelled_title" \
                     -f 'output[summary]=Run Reviewed PR CI for the current merge commit.' ||
                     { update_error=$?; ((report_error)) || report_error=$update_error; }
                 fi
