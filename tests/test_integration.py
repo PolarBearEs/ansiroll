@@ -2822,6 +2822,34 @@ def test_setup_defaults_check_vars_file_dependencies_before_gathering(tmp_path, 
     assert not called
 
 
+def test_setup_defaults_keep_legacy_omit_in_the_final_setup_arguments(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import _OMIT
+
+    version = _core_version()
+    action = "setup" if version < (2, 12) else "ansible.builtin.setup"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    SETUP_ACTION:
+      fact_path: "{{ omit }}"
+  tasks: []
+""".replace("SETUP_ACTION", action))
+    source, _ = compile_playbook(str(playbook))
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert len(calls) == 1
+    if version < (2, 19):
+        assert calls[0]["fact_path"] == _OMIT
+    else:
+        assert "fact_path" not in calls[0]
+
+
 def test_setup_defaults_ignore_blocked_overridden_mapping_member(tmp_path, monkeypatch):
     from ansiroll.loader import _core_version
 

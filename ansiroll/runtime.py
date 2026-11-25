@@ -7165,7 +7165,7 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
-    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked):
+    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False):
         def check_dependencies(value, *, mapping_shape=False):
             if not blocked:
                 return
@@ -7195,8 +7195,9 @@ class Runtime:
         inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
         if modern:
             check_dependencies(inherited)
-            inherited = self.template(inherited, ctx, strict=True)
-        return _setup_omit(inherited)
+            return _setup_omit(self.template(inherited, ctx, strict=True))
+        # Legacy Core removes omit before the setup action applies its own defaults.
+        return inherited if final_setup else _setup_omit(inherited)
 
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
@@ -7276,7 +7277,8 @@ class Runtime:
                     setup_args.pop("parallel", None)
                 setup_args = {key: value for key, value in setup_args.items() if value is not None}
                 if setup_defaults:
-                    setup_args.update(self._render_setup_defaults(setup_defaults, setup_args, defaults_ctx, defaults_blocks))
+                    setup_args.update(self._render_setup_defaults(
+                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
