@@ -1379,6 +1379,7 @@ class StrategyModule(StrategyBase):
                 # The controller has already stored the original tagged values.
                 facts = None
             is_set_fact = action == "set_fact"
+            fact_host = frame.get("fact_host") if is_set_fact else None
             cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
             if isinstance(facts, dict):
                 # Match StrategyBase: cacheable set_fact results populate the
@@ -1386,11 +1387,11 @@ class StrategyModule(StrategyBase):
                 # the higher-precedence nonpersistent host-var copy.
                 if not is_set_fact or cacheable:
                     self._variable_manager.set_host_facts(
-                        host.name, dict(facts)
+                        fact_host or host.name, dict(facts)
                     )
                 if is_set_fact:
                     self._variable_manager.set_nonpersistent_facts(
-                        host.name, dict(facts)
+                        fact_host or host.name, dict(facts)
                     )
 
             # Linear shares a run_once task's registered result and facts with
@@ -1408,7 +1409,7 @@ class StrategyModule(StrategyBase):
                             other.name,
                             {reg: dict(registered_result) for reg in registers},
                         )
-                    if isinstance(facts, dict):
+                    if isinstance(facts, dict) and fact_host is None:
                         if not is_set_fact or cacheable:
                             self._variable_manager.set_host_facts(
                                 other.name, dict(facts)

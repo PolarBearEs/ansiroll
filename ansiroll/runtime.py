@@ -4397,7 +4397,8 @@ class Runtime:
     def _tally(self, bucket):
         self.stats[bucket] = self.stats.get(bucket, 0) + 1
 
-    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None):
+    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None,
+             fact_host=None):
         # Reporting only; recap tallies are applied explicitly by the caller so
         # rescued/ignored/loop semantics match Ansible.
         emitted_result = result
@@ -4431,6 +4432,8 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if fact_host is not None:
+                frame["fact_host"] = fact_host
             if (not is_item and not node.get("no_log") and node.get("register")
                     and node.get("action", "").rsplit(".", 1)[-1] == "include_vars"):
                 entries = result["results"] if "results" in result else [result]
@@ -5116,6 +5119,7 @@ class Runtime:
         self.emit_start(task)
 
         notifications = []
+        fact_host = None
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
@@ -5129,8 +5133,8 @@ class Runtime:
         else:
             res, ignore = self._task_gate(task, base_ctx)
             if res is None:
-                res = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
-                self._absorb_facts(task, res)
+                res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
+                self._absorb_facts(task, res, fact_host)
         if task.get("register"):
             res.setdefault("failed", False)
             res.setdefault("changed", False)
@@ -5140,7 +5144,7 @@ class Runtime:
         if res.get("changed") and not _result_failed(res):
             self._queue_notify(notifications)
         status = _status_of(res)
-        self.emit(task, status, res, ignored=ignore)
+        self.emit(task, status, res, ignored=ignore, fact_host=fact_host)
 
         if _result_failed(res):
             if ignore:
@@ -5228,15 +5232,16 @@ class Runtime:
         ignore_loop = False
         failed_items_ignored = True
         for i, it in enumerate(items):
+            fact_host = None
             ctx = dict(base_ctx)
             ctx.update(self._loop_item_vars(task, items, i, base_ctx))
             if i > 0 and task.get("loop_pause"):
                 time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
             res, ignore = self._task_gate(task, ctx)
             if res is None:
-                res = self._exec_notifying_task(task, ctx, become, notifications)
-                self._absorb_facts(task, res)
-                facts = res.get("ansible_facts")
+                res, fact_host = self._exec_notifying_task(task, ctx, become, notifications)
+                self._absorb_facts(task, res, fact_host)
+                facts = res.get("ansible_facts") if fact_host in (None, self.host) else None
                 if isinstance(facts, _IncludedVars):
                     base_ctx.update({key: self.vars[key] for key in facts})
                 elif isinstance(facts, dict):
@@ -5268,7 +5273,7 @@ class Runtime:
                         # Older executors emitted the item before evaluating
                         # break_when, then returned the task-level error.
                         self.emit(task, _status_of(res), res, item=it,
-                                  ignored=ignore, is_item=True)
+                                  ignored=ignore, is_item=True, fact_host=fact_host)
                         return {"failed": True, "changed": False, "msg": str(ex)}, ignore
                     res["failed"] = True
                     res["break_when_result"] = str(ex)
@@ -5284,7 +5289,8 @@ class Runtime:
                 agg["failed"] = True
                 failed_items_ignored = failed_items_ignored and ignore
             ignore_loop = ignore_loop or ignore
-            self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True)
+            self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True,
+                      fact_host=fact_host)
             if stop:
                 break
         if not items:
@@ -5404,11 +5410,22 @@ class Runtime:
             names = self._notification_names(task, ctx)
         except Exception as ex:
             return {"failed": True, "changed": False,
-                    "msg": "Failed to template notify: %s" % ex}
+                    "msg": "Failed to template notify: %s" % ex}, None
+        fact_host = None
+        if (task.get("delegate_to") and task.get("delegate_facts")
+                and task["action"].rsplit(".", 1)[-1] == "set_fact"):
+            try:
+                if _to_bool(self.template(task["delegate_facts"], ctx)):
+                    fact_host = _fail_on_undef(self.template(task["delegate_to"], ctx))
+                    if not isinstance(fact_host, str) or not fact_host:
+                        raise ValueError("delegate_to must resolve to a nonempty host name")
+            except Exception as ex:
+                return {"failed": True, "changed": False,
+                        "msg": "Failed to resolve delegated fact host: %s" % ex}, None
         res = self._exec_with_retries(task, ctx, become)
         if notifications is not None and not _result_failed(res):
             notifications.extend(names)
-        return res
+        return res, fact_host
 
     def _exec_with_retries(self, task, ctx, become=False):
         until = task.get("until")
@@ -5885,7 +5902,6 @@ class Runtime:
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name '%s'" % k}
                 facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
-            self.vars.update(facts)
             return {
                 "changed": False,
                 "ansible_facts": facts,
@@ -6496,7 +6512,7 @@ class Runtime:
                 if key not in self._play_var_names and key not in self._include_vars_layer
                 and key not in self._set_fact_overrides and key not in self.extra_vars}
 
-    def _absorb_facts(self, task, res):
+    def _absorb_facts(self, task, res, fact_host=None):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -6510,6 +6526,18 @@ class Runtime:
             # Facts are module output: never templated (Ansible marks them unsafe).
             facts = _mark_unsafe(facts)
             short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
+            if fact_host is not None and fact_host != self.host:
+                hostvars = dict(self.vars.get("hostvars") or {})
+                target = dict(hostvars.get(fact_host) or {})
+                target.update(facts)
+                if res.get("_ansible_facts_cacheable"):
+                    target["ansible_facts"] = {
+                        **(target.get("ansible_facts") or {}),
+                        **_normalized_facts(facts),
+                    }
+                hostvars[fact_host] = target
+                self.vars["hostvars"] = hostvars
+                return
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)

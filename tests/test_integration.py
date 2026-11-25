@@ -4614,6 +4614,65 @@ def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     assert "failed=0" in proc.stdout
 
 
+def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
+    proc = _run_strategy_play(
+        tmp_path,
+        """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        routed_fact: one
+        cacheable: true
+      delegate_to: localhost
+      delegate_facts: true
+      register: issued
+    - set_fact:
+        loop_fact: "{{ item.value }}"
+      loop:
+        - {host: localhost, value: local}
+        - {host: recipient, value: remote}
+      delegate_to: "{{ item.host }}"
+      delegate_facts: true
+    - set_fact:
+        local_fact: stays_local
+      delegate_to: localhost
+      delegate_facts: false
+    - assert:
+        that:
+          - routed_fact is undefined
+          - loop_fact is undefined
+          - issued.ansible_facts.routed_fact == 'one'
+          - local_fact == 'stays_local'
+
+- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that:
+          - routed_fact == 'one'
+          - ansible_facts.routed_fact == 'one'
+          - loop_fact == 'local'
+          - issued is undefined
+          - local_fact is undefined
+
+- hosts: recipient
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that:
+          - routed_fact is undefined
+          - loop_fact == 'remote'
+""",
+        "-i", "origin,recipient",
+        environment={"ANSIROLL_PROVENANCE": "1"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '"mode": "controller-fallback"' in proc.stdout
+
+
 def test_strategy_native_only_rejects_linear_fallback(tmp_path):
     proc = _run_strategy_play(
         tmp_path,

@@ -1514,6 +1514,17 @@ def test_debug_and_set_fact_register():
     assert rt.stats["ok"] == 2
 
 
+def test_delegated_set_fact_is_visible_through_hostvars_only():
+    rt, frames = run([
+        _task("1", "route", "set_fact", args={"marker": "target value"},
+              delegate_to="recipient", delegate_facts=True, register="issued"),
+        _task("2", "show", "debug", args={"msg": "{{ hostvars.recipient.marker }}"}),
+    ])
+    assert "marker" not in rt.vars
+    assert rt.vars["issued"]["ansible_facts"]["marker"] == "target value"
+    assert by_name(frames, "show")[0]["result"]["msg"] == "target value"
+
+
 def test_deferred_play_vars_share_scope_with_nested_mapping_members(monkeypatch):
     import ansiroll.runtime as runtime_mod
 
