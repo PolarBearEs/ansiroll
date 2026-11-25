@@ -17,7 +17,7 @@ import time
 from copy import copy
 from functools import lru_cache
 
-from .compat import init_loader
+from .compat import find_module, init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
 from .accelerated_modules import can_accelerate
 
@@ -2180,6 +2180,12 @@ def _convert_task(task, actions, basedir):
     role_defaults, role_vars = _role_vars(task)
 
     args = _clean_args(task.args)
+    unarchive = action.rsplit(".", 1)[-1] == "unarchive"
+    builtin_unarchive = unarchive and find_module(action)[1] == "ansible.builtin.unarchive"
+    if builtin_unarchive and "copy" in args:
+        literal_copy = _source_flag(args["copy"])
+        if literal_copy is not None:
+            args["copy"] = literal_copy
     if action.split(".")[-1] == "assert" and "that" in args:
         args["that"] = _conditions(args["that"])
 
@@ -2228,6 +2234,8 @@ def _convert_task(task, actions, basedir):
     }
     if _is_handler(task):
         node.update(_handler_match(task))
+    if unarchive:
+        node["_builtin_unarchive"] = builtin_unarchive
     if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
                                        "ansible.legacy.async_status"):
         from ansible.plugins.loader import shell_loader
@@ -2259,7 +2267,7 @@ def _convert_task(task, actions, basedir):
         node["delegate_to"] = _tag_untrusted(delegate, template_syntax_only=True)
         node["delegate_facts"] = _boolean_or_template(node["delegate_facts"])
 
-    if action in BAKED_ACTIONS:
+    if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
         _bake_sources(node, task, basedir)
         if node["special"] is None:
             actions.add(action)
@@ -2554,7 +2562,7 @@ def _bake_sources(node, task, basedir):
         path = _find_needle(task, subdir, rel)
         if path is None:
             if remote is None:
-                return  # may be a target path if remote_src renders true
+                continue  # may be a target path if remote_src renders true
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
@@ -2590,11 +2598,23 @@ def _remote_src(args, *, unarchive=False):
 
 
 def _source_flag(value):
-    if _contains_dynamic_value(value):
-        return None
+    from ansible.parsing import vault
+    from .runtime import _ansible_boolean
+
     try:
-        from ansible.module_utils.parsing.convert_bool import boolean
-        return boolean(value, strict=False)
+        if isinstance(value, getattr(vault, "EncryptedString", ())) or getattr(value, "__ENCRYPTED__", False):
+            value = str(value)
+        if _contains_dynamic_value(value) and isinstance(_tag_untrusted(value, template_syntax_only=True), str):
+            from jinja2 import Environment, nodes
+
+            parsed = Environment().parse(value).body
+            if (len(parsed) == 1 and isinstance(parsed[0], nodes.Output) and len(parsed[0].nodes) == 1
+                    and isinstance(parsed[0].nodes[0], nodes.Const) and isinstance(parsed[0].nodes[0].value, bool)):
+                return parsed[0].nodes[0].value
+            return None
+        if isinstance(value, (dict, list, tuple)):
+            return None
+        return _ansible_boolean(value)
     except Exception:
         return None
 
