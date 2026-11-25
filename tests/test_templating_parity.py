@@ -964,6 +964,121 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     assert not (tmp_path / "check-only.txt").exists()
 
 
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+@pytest.mark.parametrize(("source", "value", "newline", "expected"), [
+    ("{{ value }}\n", "ready", "\n", b"ready\n"),
+    ("{{ value }}\n\n", "ready", "\n", b"ready\n\n"),
+    ("{{ value }}\n\n", "ready", "\r\n", b"ready\r\n\r\n"),
+    ("\t{{ value }}  \n", "ready", "\n", b"\tready  \n"),
+    ("{{ value -}}\n", "ready", "\n", b"ready\n"),
+    ("{{ value }}\n", "ready\n", "\n", b"ready\n"),
+    ("{{ value -}}\r\n\r\n", "ready\n", "\n", b"ready\n"),
+    ("{{ value -}}\n", "ready", "\r\n", b"ready\r\n"),
+    ("{{ value -}}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
+    ("alpha\r\nbeta\r\n", None, "\n", b"alpha\r\nbeta\r\n" if MODERN_TEMPLATING else b"alpha\nbeta\n"),
+    pytest.param("{% set value = 42 %}{{ value -}}\n", None, "\n", b"42",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native full-template scalar")),
+    (" {{ value }}\n", True, "\n", b" True\n"),
+    pytest.param(" {{ missing | default(omit) }}\n", None, "\n", b" \n",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native scalar omit semantics")),
+])
+def test_template_file_preserves_single_expression_whitespace(tmp_path, delegated, source, value, newline, expected):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    value: TEMPLATE_VALUE
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+        newline_sequence: TEMPLATE_NEWLINE
+""".replace("TEMPLATE_VALUE", json.dumps(value)).replace("TEMPLATE_NEWLINE", json.dumps(newline))
+                  + ("      delegate_to: localhost\n" if delegated else ""), {"sample.j2": source})
+    output = tmp_path / "rendered.txt"
+    summary = _ansible(path, tmp_path)
+    assert output.read_bytes() == expected
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == summary
+    assert output.read_bytes() == expected
+
+
+def test_template_file_newline_mode_does_not_affect_later_expressions():
+    from ansiroll.runtime import Runtime
+
+    templater = Runtime({}, "", {}).templater
+    source = '{{ "a\nb" }}'
+    assert templater.render_string(source, {}, file_newline="\r\n") == "a\r\nb"
+    assert templater.render_string(source, {}, file_newline="\n") == "a\nb"
+    assert templater.render_string(source, {}) == "a\nb"
+
+
+@pytest.mark.skipif(not Version("2.13") <= Version(__version__) < Version("2.19"),
+                    reason="legacy native finalizer for template files")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_restores_newline_after_legacy_native_null(tmp_path, monkeypatch, delegated):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "True")
+    monkeypatch.setattr(C, "DEFAULT_JINJA2_NATIVE", True)
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {value: null}
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""), {"sample.j2": "{{ value }}\n"})
+    output = tmp_path / "rendered.txt"
+    _ansible(path, tmp_path)
+    assert output.read_bytes() == b"None\n"
+    output.unlink()
+    if delegated:
+        _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+    else:
+        _ansiroll(path, tmp_path)
+    assert output.read_bytes() == b"None\n"
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.13"), reason="older cores stringify undefined collection members")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_does_not_overwrite_destination_for_undefined_collection_member(tmp_path, delegated):
+    output = tmp_path / "rendered.txt"
+    output.write_text("existing content\n")
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""),
+                              {"sample.j2": " {{ [missing] }}\n"}, use_strategy=delegated)
+    assert recap[3] == "1"
+    assert output.read_text() == "existing content\n"
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy templates render omit placeholder text")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_legacy_template_file_keeps_omit_text_between_whitespace(tmp_path, delegated):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""),
+                  {"sample.j2": " {{ missing | default(omit) }}\n"})
+    output = tmp_path / "rendered.txt"
+    summary = _ansible(path, tmp_path)
+    assert re.fullmatch(r" __omit_place_holder__\w+\n", output.read_text())
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == summary
+    assert re.fullmatch(r" __omit_place_holder__\w+\n", output.read_text())
+
+
 def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "controller")
     path = _write(tmp_path, """
