@@ -168,6 +168,11 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                     name: os.environ[name] for name in sorted(env_names) if name in os.environ
                 })
             node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
+            if scoped_options:
+                setup_layers["gather_setup_scope"]["controller_lookups"] = {
+                    "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
+                    "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
+                }
             node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
         # (unlike the strategy plugin), so make its identifiers reproducible.
@@ -830,6 +835,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     lookup_sources.pop("gather_setup_defaults", None)
     lookup_sources.pop("gather_action_defaults", None)
     names = _controller_env_names(lookup_sources)
+    if "_gather_setup_scoped" in result:
+        result["_gather_compile_env_names"] = sorted(names)
     if names:
         result["controller_env"] = {
             name: os.environ[name] for name in sorted(names) if name in os.environ
@@ -1198,14 +1205,14 @@ def _bundled_vars_file(play, path):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
-    with open(path, "rb") as fh:
-        # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
-        # select.
-        if b"$ANSIBLE_VAULT" in fh.read():
-            return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
-                    "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
-                    % path}
     try:
+        with open(path, "rb") as fh:
+            # Whole-file and inline !vault values both carry the header. Never ship a decrypted secret the run may not
+            # select.
+            if b"$ANSIBLE_VAULT" in fh.read():
+                return {"__ansiroll_vars_file_error__": "ansiroll: vars file %r holds vault-encrypted data, so it was not "
+                        "bundled for a name only known at run time; make the vars_files name resolvable at compile time"
+                        % path}
         loaded = _load_vars_file(play, path)
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
@@ -1662,6 +1669,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "action": action,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
+        "no_log": bool(getattr(task, "no_log", False)),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -2457,7 +2465,7 @@ def _bake_sources(node, task, basedir):
         return  # src lives on the target; the module reads it there
 
     subdir = "templates" if name == "template" else "files"
-    newline = None if name == "template" else ""
+    newline = ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
@@ -2801,7 +2809,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked."""
     if getattr(task, "_role", None) is None:
         return False
-    newline = "" if subdir == "files" else None
+    newline = ""
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
@@ -3370,7 +3378,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         return False
 
     assets, metadata, contents = {}, {}, {}
-    newline = "" if subdir == "files" else None
+    newline = ""
     remaining_linked_visits = 4096
     # Finish paths with the current number of symlinks before expanding paths
     # with one more, even when a path has many ordinary directories.
@@ -3602,9 +3610,10 @@ def _loop_control(task):
     if lc is None:
         return {}
     out = {}
-    if getattr(lc, "extended", None):
-        out["loop_extended"] = True
-        out["loop_extended_allitems"] = getattr(lc, "extended_allitems", True) is not False
+    if getattr(lc, "extended", None) is not None:
+        out["loop_extended"] = _boolean_or_template(lc.extended)
+    if getattr(lc, "extended_allitems", None) is not None:
+        out["loop_extended_allitems"] = _boolean_or_template(lc.extended_allitems)
     bw = getattr(lc, "break_when", None)
     if bw:
         out["loop_break_when"] = _conditions(bw)

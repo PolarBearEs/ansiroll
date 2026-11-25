@@ -926,6 +926,8 @@ class StrategyModule(StrategyBase):
 
     @staticmethod
     def _restore_play_fallback(value, undefined, errors=(), mapping_keys=(), *, runtime_marker=None):
+        from ansiroll.runtime import _restore_delegated_mapping_keys
+
         if not undefined and not errors and not mapping_keys:
             return value
         if runtime_marker is not None:
@@ -962,28 +964,7 @@ class StrategyModule(StrategyBase):
             for key in path[:-1]:
                 container = container[key]
             container[path[-1]] = marker
-        def restore_key(key):
-            if isinstance(key, list):
-                return tuple(restore_key(part) for part in key)
-            if isinstance(key, dict):
-                from datetime import date, datetime
-
-                if "bytes" in key:
-                    return base64.b64decode(key["bytes"], validate=True)
-                if "date" in key:
-                    return date.fromisoformat(key["date"])
-                return datetime.fromisoformat(key["datetime"])
-            return key
-
-        # Decode inner mappings before changing the keys used to reach them.
-        for path, keys in reversed(mapping_keys):
-            container = value
-            for key in path:
-                container = container[key]
-            entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
-            container.clear()
-            container.update(entries)
-        return value
+        return _restore_delegated_mapping_keys(value, mapping_keys)
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
@@ -1298,19 +1279,21 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
-        blob = _json_blob(hv)
+        mapping_keys = {"host": [], "overrides": []}
+        blob = _json_blob(hv, mapping_keys["host"])
         extra_blob = _json_blob(_extra_vars(self._variable_manager))
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
-        override_blob = _json_blob(nonpersistent)
+        override_blob = _json_blob(nonpersistent, mapping_keys["overrides"])
         return (
             "_INJECTED_HOST = %r\n"
             "_INJECTED_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_EXTRA_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_HOST_VAR_OVERRIDES = __import__('json').loads(%r)\n"
+            "_INJECTED_VAR_MAPPING_KEYS = __import__('json').loads(%r)\n"
             "_INJECTED_BECOME_PASS = %r\n"
-            % (host.name, blob, extra_blob, override_blob, become_pass)
+            % (host.name, blob, extra_blob, override_blob, json.dumps(mapping_keys), become_pass)
         )
 
     def _connect(self, host, play_context, hv, templar=None):
@@ -1489,6 +1472,12 @@ class StrategyModule(StrategyBase):
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             registered_result = result_data
             if registers and not frame.get("is_item"):
+                if action in ("include_tasks", "include_role") and "include_register" in frame:
+                    private = frame["include_register"]
+                    registered_result = self._restore_play_fallback(
+                        private["value"], private["undefined"], private.get("errors", ()),
+                        private.get("mapping_keys", ()),
+                    )
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
                     registered_result = _without_delegated_metadata(result_data)
@@ -1797,8 +1786,9 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values):
+def _json_blob(values, mapping_keys=None):
     from ansiroll.loader import _tag_untrusted
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     # hostvars/vars are live controller objects that stringify uselessly; the
     # agent synthesizes ``vars``. Materialize hostvars without their recursive
@@ -1807,26 +1797,37 @@ def _json_blob(values):
     if isinstance(values, dict):
         hostvars = values.get("hostvars")
         values = {k: v for k, v in values.items() if k not in ("hostvars", "vars")}
-        snapshot = _hostvars_snapshot(hostvars)
+        snapshot = _hostvars_snapshot(hostvars, preserve_keys=mapping_keys is not None)
         if snapshot:
             values["hostvars"] = snapshot
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
+        if mapping_keys is None or not _contains_typed_mapping_keys(values):
+            return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
     except Exception:
-        safe = {}
-        for k, v in (values or {}).items():
-            try:
-                v = _tag_untrusted(v, template_syntax_only=True)
+        pass
+    safe = {}
+    for k, v in (values or {}).items():
+        try:
+            v = _tag_untrusted(v, template_syntax_only=True)
+            if mapping_keys is not None and _contains_typed_mapping_keys(v):
+                packed = _pack_delegated_value(v)
+                if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
+                    continue
+                mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
+                v = packed["value"]
+            else:
                 json.dumps(v, default=str)
-                safe[k] = v
-            except Exception:
-                pass
-        return json.dumps(safe, default=str)
+        except Exception:
+            continue
+        safe[k] = v
+    return json.dumps(safe, default=str)
 
 
-def _hostvars_snapshot(hostvars):
+def _hostvars_snapshot(hostvars, *, preserve_keys=False):
+    from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
+
     if hostvars is None:
         return {}
     out = {}
@@ -1834,19 +1835,34 @@ def _hostvars_snapshot(hostvars):
         names = list(hostvars)
     except Exception:
         return out
+    raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
     for name in names:
         try:
-            source = dict(hostvars[name])
+            source = hostvars[name]
+            keys = list(source)
+            raw = raw_get(name) if raw_get is not None else {}
         except Exception:
             continue
         safe = {}
-        for key, value in source.items():
+        for key in keys:
             if key in ("hostvars", "vars"):
                 continue
             try:
-                json.dumps(value, default=str)
-            except (TypeError, ValueError):
-                continue
+                value = source[key]
+                if not preserve_keys or not _contains_typed_mapping_keys(value):
+                    json.dumps(value, default=str)
+            except Exception:
+                # Core can reject typed keys when reading a register. Keep
+                # raw data only when its ordinary source-host view failed.
+                value = raw.get(key) if isinstance(raw, dict) else None
+                if not preserve_keys or not _contains_typed_mapping_keys(value):
+                    continue
+                try:
+                    packed = _pack_delegated_value(value)
+                    if packed["undefined"] or packed.get("errors"):
+                        continue
+                except Exception:
+                    continue
             safe[key] = value
         out[str(name)] = safe
     return out

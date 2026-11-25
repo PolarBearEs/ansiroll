@@ -100,6 +100,45 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_path, monkeypatch):
+    import builtins
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files: ['vars-{{ profile }}.yml']
+  tasks:
+    - debug: {msg: "{{ selected }}"}
+""")
+    blocked = tmp_path / "vars-blocked.yml"
+    blocked.write_text("selected: unavailable\n")
+    (tmp_path / "vars-safe.yml").write_text("selected: selected-safe-candidate\n")
+    original_open = builtins.open
+
+    def deny_candidate(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) == str(blocked):
+            raise PermissionError("synthetic read denial for candidate")
+        return original_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "open", deny_candidate)
+        source, _ = compile_playbook(str(playbook))
+    script = tmp_path / "compiled.py"
+    script.write_text(source)
+
+    def run(profile):
+        return subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
+                              env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
+                              timeout=20)
+
+    safe = run("safe")
+    assert safe.returncode == 0, safe.stdout + safe.stderr
+    assert "selected-safe-candidate" in safe.stdout
+    error = run("blocked")
+    assert error.returncode == 1, error.stdout + error.stderr
+    assert "synthetic read denial for candidate" in error.stderr
+
+
 def test_ordered_vars_files_capture_env_before_later_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("ANSIROLL_TEST_ORDERED_PREFIX", "compile")
     monkeypatch.setenv("ANSIROLL_TEST_ORDERED_SELECTOR", "chosen")
@@ -2517,6 +2556,124 @@ def test_standalone_setup_defaults_use_launch_selected_vars_and_final_vars_scope
     runtime.run_play(plan)
     assert called[0][0] == "ansible.builtin.setup"
     assert called[0][1]["filter"] == ["ansible_distribution"]
+
+
+def test_implicit_setup_requires_explicit_input_for_an_uncaptured_controller_value(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {profile: public}
+  vars_files: ['vars-{{ profile }}.yml']
+  fact_path: "{{ directory }}"
+  tasks: []
+""")
+    (tmp_path / "vars-public.yml").write_text("directory: /public\n")
+    (tmp_path / "vars-alternate.yml").write_text(
+        '''directory: '{{ lookup("env", "ANSIROLL_DORMANT_SETUP_DIRECTORY") }}'\n''')
+    monkeypatch.setenv("ANSIROLL_DORMANT_SETUP_DIRECTORY", "/synthetic-private-directory")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "/synthetic-private-directory" not in json.dumps(plan)
+    for extra, expected in (({}, "/public"), ({"profile": "alternate"}, None),
+                            ({"profile": "alternate", "directory": "/portable"}, "/portable")):
+        frames, called = [], []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra, on_result=frames.append)
+        monkeypatch.setattr(runtime, "run_module", lambda action, args, **kwargs:
+                            called.append(args) or {"ansible_facts": {}})
+        runtime.run_play(plan)
+        if expected is None:
+            assert runtime.failed
+            assert "uncaptured controller env value" in frames[0]["result"]["msg"]
+            assert not called
+        else:
+            assert not runtime.failed
+            assert called == [{"fact_path": expected}]
+
+
+def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ["vars-{{ lookup('vars', 'profile') }}.yml"]
+  fact_path: "{{ lookup('env', 'ANSIROLL_INDEPENDENT_FACT_PATH') }}"
+  tasks: []
+""")
+    (tmp_path / "vars-late.yml").write_text("unrelated: value\n")
+    monkeypatch.setenv("ANSIROLL_INDEPENDENT_FACT_PATH", "/independent")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "late"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert called == [("ansible.builtin.setup", {"fact_path": "/independent"})]
+    assert runtime.vars["unrelated"] == "value"
+
+
+def test_implicit_fact_path_merges_cached_facts_with_set_fact(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  tasks:
+    - set_fact:
+        ansible_local: {settings: {other: true}}
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ ansible_local.settings.directory }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append((action, args))
+        return {"ansible_facts": {"ansible_local": {"settings": {"directory": "/cached"}}}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    for play in _compiled_plays(source, tmp_path):
+        runtime.run_play(play)
+    assert called == [("ansible.builtin.setup", {}), ("ansible.builtin.setup", {"fact_path": "/cached"})]
+
+
+@pytest.mark.parametrize("explicit_host_value", [False, True])
+def test_implicit_fact_path_reads_persistent_vars_and_respects_fact_injection(tmp_path, monkeypatch,
+                                                                        explicit_host_value):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_INJECT_FACT_VARS", "False")
+    monkeypatch.setattr(C, "INJECT_FACTS_AS_VARS", False)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars: {directory: /stale}
+  tasks:
+    - set_fact: {suffix: persistent}
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ directory | default('/current') }}/{{ ansible_distribution | default('fallback') }}/{{ ansible_facts.distribution }}/{{ suffix }}"
+  tasks: []
+""")
+    source, _ = compile_playbook(str(playbook))
+    host_vars = {"inventory_hostname": "localhost"}
+    if explicit_host_value:
+        host_vars["ansible_distribution"] = "inventory"
+    runtime = Runtime({}, "", host_vars)
+    called = []
+
+    def run_module(action, args, **kwargs):
+        called.append(args)
+        return {"ansible_facts": {"ansible_distribution": "gathered"}}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    for play in _compiled_plays(source, tmp_path):
+        runtime.run_play(play)
+    segment = "inventory" if explicit_host_value else "fallback"
+    assert called == [{}, {"fact_path": f"/current/{segment}/gathered/persistent"}]
 
 
 def test_compile_resolves_gather_timeout_in_controller_play_scope(tmp_path):
