@@ -7,6 +7,7 @@ standalone script; debug messages and the recap must match.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -49,13 +50,13 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
         ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
-         "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
+         "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
     return _summary(proc.stdout, proc.stderr)
@@ -215,6 +216,92 @@ def test_standalone_implicit_fact_path_uses_vars_file_selected_by_cached_facts(t
         "facts/probe.fact": '{"value":"cached"}\n',
     })
     assert messages == ["cached"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_follow_child_task_precedence(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact: {value: first}
+    - block:
+        - debug:
+            msg: "{{ value }} / {{ alias }} / {{ nested.leaf }}"
+        - set_fact: {value: second}
+        - debug:
+            msg: "{{ value }} / {{ alias }} / {{ nested.leaf }}"
+        - debug:
+            msg: "{{ other }} / {{ other_alias }}"
+          vars:
+            other: task
+      vars:
+        value: block
+        alias: "{{ value }}"
+        nested: {leaf: "{{ value }}"}
+        other: block
+        other_alias: "{{ other }}"
+""", use_strategy=use_strategy)
+    assert messages == ["first / first / first", "second / second / second", "task / task"]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.20"), reason="modern task vars snapshot behavior")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_preserve_the_preexecution_vars_snapshot(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ item }} / {{ from_snapshot }}"
+          loop: [current]
+        - debug:
+            msg: register-snapshot
+          register: out
+          failed_when: saw_register
+      vars:
+        from_snapshot: "{{ vars.item | default('snapshot') }}"
+        saw_register: "{{ vars.out is defined }}"
+""", use_strategy=use_strategy)
+    assert messages == ["current / snapshot", "register-snapshot"]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.20"), reason="modern templating cache behavior")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_and_containers_are_reused_in_a_render(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug:
+            msg: "{% for i in range(2) %}{% set unused = entries.append(i) if loop.first else none %}{{ entries | length }}{% endfor %}"
+        - debug:
+            msg: "{% set first = timestamp %}{% for i in range(2) %}{{ first == timestamp }}{% endfor %}"
+      vars:
+        entries: []
+        timestamp: "{{ now() }}"
+""", use_strategy=use_strategy)
+    assert messages == ["11", "TrueTrue"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy vars iteration exposes raw template text")
+def test_block_alias_source_is_preserved_during_legacy_vars_iteration(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "False")
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug: {msg: "{{ alias }} / {{ observed }}"}
+          vars:
+            observed: "{% for key, value in vars.items() if key == 'alias' %}{{ value }}{% endfor %}"
+      vars:
+        x: value
+        alias: "prefix={{ x }}"
+""")
+    assert messages == ["prefix=value / prefix={{ x }}"]
 
 
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
@@ -958,6 +1045,116 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
     assert messages == ["first/second", "first/" + null_suffix]
 
 
+def test_delegated_template_does_not_run_unused_block_lookups(tmp_path):
+    marker = tmp_path / "lookup-marker"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/one.txt"
+          delegate_to: localhost
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/two.txt"
+          delegate_to: localhost
+      vars:
+        unused: "{{ lookup('pipe', 'printf x >> MARKER_PATH') }}"
+""".replace("MARKER_PATH", str(marker)), {"sample.j2": "plain template\n"})
+    expected = _ansible(playbook, tmp_path)
+    assert not marker.exists()
+    (tmp_path / "one.txt").unlink()
+    (tmp_path / "two.txt").unlink()
+    actual = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert actual == expected
+    assert not marker.exists()
+
+
+def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    year = "vars.details.year" if MODERN_TEMPLATING else "details.year"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        details:
+          path: "{{ template_destpath }}"
+          year: "{{ template_run_date.year }}"
+""", {"sample.j2": "{{ details.path }}|{{ " + year + " }}\n"})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    expected_text = output.read_text()
+    assert expected_text.startswith(str(output) + "|")
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="checks legacy non-native lookup location")
+def test_delegated_template_resolves_legacy_block_lookup_on_controller(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    monkeypatch.setenv("ANSIROLL_TEST_LOOKUP_HOST", "controller")
+    interpreter = tmp_path / "agent-python"
+    interpreter.write_text(
+        "#!/bin/sh\nexport ANSIROLL_TEST_LOOKUP_HOST=agent\n"
+        + "exec " + shlex.quote(sys.executable) + ' "$@"\n')
+    interpreter.chmod(0o755)
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        location: "{{ lookup('pipe', 'echo $ANSIROLL_TEST_LOOKUP_HOST') }}"
+""", {"sample.j2": "location={{ location }}\n"})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path, interpreter=str(interpreter))
+    assert output.read_text() == "location=controller\n"
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll",
+                    interpreter=str(interpreter)) == expected
+    assert output.read_text() == "location=controller\n"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="checks native template name resolution")
+def test_delegated_template_resolves_referenced_block_lookup(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        referenced: >-
+          {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}
+        unused: >-
+          {{ lookup('pipe', 'printf unused >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}
+""", {"sample.j2": "{{ 'untouched' if true else referenced }}\n"})
+    marker = tmp_path / "lookups"
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    assert marker.read_text() == "used"
+    marker.unlink()
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert marker.read_text() == "used"
+
+
 def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     from ansiroll.loader import _core_version
 
@@ -978,7 +1175,8 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     output = tmp_path / "rendered.txt"
     expected = _ansible(path, tmp_path)
     expected_text = output.read_text()
-    suffix = "None" if (2, 13) <= _core_version() < (2, 19) else ""
+    version = _core_version()
+    suffix = "None" if version < (2, 12) or (2, 13) <= version < (2, 19) else ""
     assert expected_text == "prefix=controller/" + suffix + "\n"
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
@@ -2230,6 +2428,8 @@ def test_dynamic_include_when_uses_loop_item(tmp_path, action):
     assert messages == ["allowed", "second"]
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
+                    reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_include_loop_registers_results_and_tallies_ignored_failures(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
@@ -2433,6 +2633,8 @@ def test_include_loop_censors_no_log_item_values(tmp_path):
     assert "synthetic-private-item" not in result.stdout + result.stderr
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
+                    reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
