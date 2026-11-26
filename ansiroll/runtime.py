@@ -8340,7 +8340,8 @@ def agent_main():
                 member = reply.get("member")
                 fallback = None
                 if member is None and isinstance(name, str) and name in requested_names:
-                    if defer_template and (template_vars := reply.get("template_vars")):
+                    template_vars = reply.get("template_vars") if defer_template else None
+                    if template_vars:
                         for key in ("template_mtime", "template_run_date"):
                             if template_vars.get(key) is not None:
                                 template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
