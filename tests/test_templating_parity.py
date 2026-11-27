@@ -1892,6 +1892,25 @@ def test_template_file_leaves_unsupported_comment_arguments_to_copy(tmp_path):
     assert output.read_bytes() == b"existing\n"
 
 
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy template-file expression formatting")
+@pytest.mark.parametrize(("expression", "expected"), [("true", b"True\n"), ("[true, 1]", b"[True, 1]\n")])
+def test_legacy_template_header_preserves_expression_formatting(tmp_path, expression, expected):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "#jinja2: trim_blocks: False\n{{ " + expression + " }}\n"})
+    output = tmp_path / "rendered.txt"
+    native = _ansible(path, tmp_path)
+    assert output.read_bytes() == expected
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == native
+    assert output.read_bytes() == expected
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 

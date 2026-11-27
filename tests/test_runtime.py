@@ -1228,7 +1228,11 @@ def test_json_preserves_independently_mutated_list_views(filter_name):
     assert json.loads(result) == [[1, 2], [1]]
 
 
-def test_template_writes_json_with_nested_hostvars_entries(monkeypatch):
+def test_template_writes_nested_hostvars_entries(monkeypatch):
+    from ast import literal_eval
+
+    from ansiroll.runtime import _core_at_least
+
     runtime = Runtime({}, "", {"inventory_hostname": "h"})
     runtime.templater.env.globals["lookup"] = lambda name: "ready"
     task = _task("1", "Write hostvars", "template", vars={"alias": "{{ lookup('source') }}/tail"})
@@ -1238,7 +1242,8 @@ def test_template_writes_json_with_nested_hostvars_entries(monkeypatch):
         "template", {**task, "_baked": {"out.j2": source}}, {"src": "out.j2", "dest": "/out"},
         runtime._task_ctx(task, {}),
     )
-    assert "ready/tail" in json.loads(result)["values"]
+    rendered = literal_eval(result.decode("utf-8")) if _core_at_least(2, 19) else json.loads(result)
+    assert "ready/tail" in rendered["values"]
 
 
 def test_flatten_treats_lazy_hostvars_entries_as_lists():

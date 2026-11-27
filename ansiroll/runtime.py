@@ -4182,7 +4182,8 @@ class _Templater:
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
         expr = None
-        if ((check_mode_template is None or text == stripped)
+        legacy_header = file_header and not native_file
+        if (not legacy_header and (check_mode_template is None or text == stripped)
                 and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
             expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
         template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
