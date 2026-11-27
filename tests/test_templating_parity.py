@@ -3013,6 +3013,41 @@ def test_dynamic_include_when_uses_loop_item(tmp_path, action):
     assert messages == ["allowed", "second"]
 
 
+@pytest.mark.parametrize(("action", "use_strategy"), [
+    ("include_tasks: child.yml", False),
+    ("include_role: {name: child}", False),
+    ("include_tasks: child.yml", True),
+], ids=["standalone-tasks", "standalone-role", "strategy-tasks"])
+def test_mixed_include_loop_register_failed_keys(tmp_path, monkeypatch, action, use_strategy):
+    if use_strategy:
+        monkeypatch.setenv("ANSIROLL_NATIVE_ONLY", "1")
+    child = '- debug: {msg: "ran {{ item }}"}\n'
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ACTION
+      loop: [first, filtered, last]
+      when: item != 'filtered'
+      register: selected
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: >-
+          failed keys: {{ [selected.failed | default('absent'),
+                           selected.results[0].failed | default('absent'),
+                           selected.results[1].failed | default('absent'),
+                           selected.results[2].failed | default('absent')] | join('/') | lower }}
+""".replace("ACTION", action), {
+        "child.yml": child,
+        "roles/child/tasks/main.yml": child,
+    }, use_strategy=use_strategy)
+    failed = "false" if Version(__version__) >= Version("2.21") else "absent"
+    assert messages == ["ran first", "ran last", "failed keys: " + "/".join([failed] * 4)]
+    assert recap[3:5] == ("0", "0")
+
+
 @pytest.mark.skipif(Version(__version__) < Version("2.11"),
                     reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_include_loop_registers_results_and_tallies_ignored_failures(tmp_path):

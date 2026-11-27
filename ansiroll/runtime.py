@@ -5204,6 +5204,7 @@ class Runtime:
         ignore_loop = False
         failed_items_ignored = True
         legacy_failure = None
+        unified_results = _core_at_least(2, 21)
         for i, item in enumerate(items if looped else [None]):
             if not looped:
                 result = {"changed": False, "include": filename}
@@ -5233,10 +5234,12 @@ class Runtime:
                 legacy_failure = (result, ignored)
                 break
             # Older executors added loop metadata directly to the result before
-            # aggregating item status. Newer executors keep status separately.
-            if not _core_at_least(2, 21):
+            # aggregating item status and omitted failed on non-failing items.
+            # Unified results keep status separate and report failed explicitly.
+            if unified_results:
+                result.setdefault("failed", False)
+            else:
                 result.update(loop_vars)
-            result.setdefault("failed", False)
             stop = False
             if node.get("loop_break_when"):
                 break_ctx = dict(ctx)
@@ -5245,13 +5248,13 @@ class Runtime:
                 try:
                     stop = self.when(node["loop_break_when"], break_ctx, keyword="break_when")
                 except ConditionalError as ex:
-                    if not _core_at_least(2, 21):
+                    if not unified_results:
                         legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)}, ignored)
                         break
                     result.update(failed=True, break_when_result=str(ex))
                     stop = True
                 else:
-                    if _core_at_least(2, 21):
+                    if unified_results:
                         result["break_when_result"] = stop
             ignore_loop = ignore_loop or ignored
             if _result_failed(result):
@@ -5274,8 +5277,11 @@ class Runtime:
             else:
                 failed = any(_result_failed(outcome) for _, outcome, _, _ in results)
                 skipped = all(outcome.get("skipped") for _, outcome, _, _ in results)
-                aggregate = {"changed": False, "failed": failed,
+                aggregate = {"changed": False,
                              "results": [reported for _, _, reported, _ in results]}
+                # Preserve the existing register handling for all-skipped loops.
+                if failed or unified_results or skipped:
+                    aggregate["failed"] = failed
                 if failed:
                     aggregate["msg"] = "One or more items failed"
                 elif skipped:
