@@ -350,8 +350,62 @@ class LookupModule(LookupBase):
       filter: '{{ lookup("PLUGIN", "private.txt") }}'
   tasks: []
 """.replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace("PLUGIN", plugin), files)
+    # Ansible registers playbook-local plugin directories process-wide.
+    result = subprocess.run(
+        [sys.executable, "-c", "import json, sys; from ansiroll.loader import parse_playbook; "
+         "print(json.dumps(parse_playbook(sys.argv[1])[0], default=str))", str(path)],
+        env=_env(), cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "synthetic private contents" not in result.stdout
+
+
+@pytest.mark.parametrize("source", ["play-vars", "vars-files"])
+def test_implicit_setup_replays_file_lookups_reachable_at_launch(tmp_path, source):
+    def lookup(filename):
+        return f'lookup("file", "{filename}.txt")'
+
+    def expression(value):
+        return "{{ " + (value if LEGACY_SETUP else f"[{value}]") + " }}"
+
+    selected = lookup("production")
+    dead = lookup("unreachable")
+    alternate = f"({dead} if false else {selected})"
+    initial = lookup("default")
+    files = {
+        "files/default.txt": "ansible_hostname\n",
+        "files/production.txt": "ansible_distribution\n",
+        "files/unreachable.txt": "never capture this file\n",
+    }
+    if source == "vars-files":
+        definitions = "  vars_files: ['config-{{ profile }}.yml']\n"
+        files["config-dev.yml"] = "fact_filter: " + json.dumps(expression(initial))
+        files["config-prod.yml"] = "fact_filter: " + json.dumps(expression(alternate))
+    else:
+        definitions = "    fact_filter: " + json.dumps(expression(f"{initial} if profile == 'dev' else {alternate}")) + "\n"
+    path = _write(tmp_path, """
+- hosts: localhost
+  vars:
+    profile: dev
+DEFINITIONS  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ fact_filter }}'
+  tasks:
+    - assert:
+        that:
+          - ansible_facts.distribution is defined
+          - ansible_facts.hostname is undefined
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup")
+                  .replace("DEFINITIONS", definitions), files)
     plays, _ = parse_playbook(str(path))
-    assert "synthetic private contents" not in json.dumps(plays, default=str)
+    captured = plays[0]["gather_setup_scope"]["controller_lookups"]["file"]["file"]
+    assert set(captured) == {"default.txt", "production.txt"}
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(path))[0])
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path,
+                            env={**_env(), "ANSIROLL_EXTRA_VARS": '{"profile":"prod"}'},
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])

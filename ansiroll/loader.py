@@ -347,11 +347,12 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     timeout_names = set(runtime["names"]) if runtime is not None else set()
     setup_names = set()
     computed = set()
-    setup_lookups = {"env": set(), "config": set(), "file": {}}
+    setup_lookups = {"env": set(), "config": set()}
+    setup_sources = [source for source, _, _ in _selector_template_sources(scoped_options or {})]
     lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
     for layer in (*exports, play.get_variable_manager().extra_vars, magic):
         lookup_scope = combine_vars(lookup_scope, layer)
-    for source, _, _ in _selector_template_sources(scoped_options or {}):
+    for source in setup_sources:
         dependencies = _gather_timeout_dependencies(
             source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
             computed=computed, retain_mutable=True)
@@ -362,6 +363,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
             computed=computed, lookups=setup_lookups)
     file_aliases = {}
     file_names = set()
+    file_values = {}
     for entry in entries:
         for candidate in entry.get("controller_candidates", {}).values():
             selector_names.update(name for name, _ in candidate["paths"])
@@ -378,8 +380,19 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
             for mapping in contents:
                 file_names.update(mapping)
                 for key, value in mapping.items():
+                    if setup_sources and key not in export_replacements and key not in magic:
+                        file_values.setdefault(key, []).append(value)
                     for source, _, _ in _selector_template_sources(value):
                         file_aliases.setdefault(key, set()).add(source)
+    if setup_sources:
+        # File lookups can refer to explicitly authored assets in any reachable
+        # branch. Environment and config capture still follows the build scope.
+        file_lookups = {"file": {}}
+        for source in setup_sources:
+            _gather_timeout_dependencies(
+                source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
+                computed=computed, retain_mutable=True, lookups=file_lookups, alternate_values=file_values)
+        setup_lookups.update(file_lookups)
     if computed_selector_names:
         selector_names.update(defaults)
     for names, scope, shadowed in (
@@ -444,7 +457,8 @@ def _capture_setup_files(play, terms_by_alias):
     plugin = plugin_loader.lookup_loader.get("ansible.builtin.file", loader=loader)
     search_path = play.get_search_path() if hasattr(play, "get_search_path") else [loader.get_basedir()]
     variables = {"ansible_search_path": search_path}
-    plugin_dirs = [loader.get_basedir(), *(role._role_path for role in (play.roles or ()) if role._role_path)]
+    plugin_dirs = [loader.get_basedir(), *(role._role_path for role in (play.roles or ())
+                                          if role._role_path and not role._role_collection)]
     overrides_file = any(os.path.isfile(os.path.join(root, "lookup_plugins", "file.py")) for root in plugin_dirs)
     builtin_path = os.path.realpath(builtin_file.__file__)
     captured = {}
@@ -465,7 +479,7 @@ def _capture_setup_files(play, terms_by_alias):
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False, lookups=None):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -520,6 +534,9 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 paths.add((name, path))
             seen.add((name, path))
             names.add(name)
+            for value in (alternate_values or {}).get(name, ()):
+                pending.extend((alias, suffix, (name, location), ancestors)
+                               for alias, suffix, location in _selector_template_sources(value, path))
             if name not in variables:
                 continue
             value = variables[name]
