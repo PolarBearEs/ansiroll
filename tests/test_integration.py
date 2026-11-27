@@ -8006,6 +8006,24 @@ def test_strategy_warns_for_each_unnamed_play_in_linear_fallback(tmp_path):
     assert {"1", str(len(play.splitlines()) + 1)} <= locations
 
 
+def test_strategy_warns_for_each_import_of_a_play_in_linear_fallback(tmp_path):
+    (tmp_path / "imported.yml").write_text("""- hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - debug: {msg: controller only}
+""")
+    proc = _run_strategy_play(
+        tmp_path, "- import_playbook: imported.yml\n" * 2, inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    warnings = " ".join(proc.stderr.split())
+    assert warnings.count("ansiroll_delegate_on_target has no effect during core linear fallback") == 2
+    assert len(re.findall(r"imported\.yml:\s*1\b", warnings)) == 2
+
+
 def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin

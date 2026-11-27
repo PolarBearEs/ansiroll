@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, MappingView, Set
+from itertools import count
 
 DOCUMENTATION = """
     name: ansiroll
@@ -65,6 +66,7 @@ except Exception:  # 2.21+ uses UnifiedTaskResult; older cores use TaskResult
         pass
 
 display = Display()
+_fallback_warning_numbers = count(1)
 
 
 class _DelegatedPlayVariables:
@@ -370,9 +372,10 @@ class StrategyModule(StrategyBase):
                     source = "%s:%s" % (path, line) if path else ""
                 display.warning(
                     "ansiroll_delegate_on_target has no effect during core linear fallback for play %r "
-                    "on batch hosts %s (%s). Ansible handles delegation for this batch (play source %s)."
+                    "on batch hosts %s (%s). Ansible handles delegation for this batch "
+                    "(play source %s, fallback batch %d)."
                     % (play.name or play.get_name(), ", ".join(host.name for host in hosts),
-                       linear_reason, source)
+                       linear_reason, source, next(_fallback_warning_numbers))
                 )
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
