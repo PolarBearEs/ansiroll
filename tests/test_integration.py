@@ -564,19 +564,26 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     assert runtime.vars["selected"] == "production"
 
 
-@pytest.mark.parametrize("candidate", ["prod.yml/", "./prod.yml", "nested//../prod.yml"])
-def test_first_found_vars_files_preserves_relative_candidate_spelling(tmp_path, candidate):
+@pytest.mark.parametrize(("candidate", "expected"), [
+    ("'prod.yml/'", "fallback"),
+    ("'./prod.yml'", "production"),
+    ("'nested//../prod.yml'", "production"),
+    ("'nested//' ~ profile ~ '.yml'", "nested-production"),
+    ("'nested//../' ~ profile ~ '.yml'", "production"),
+    ("'missing//../' ~ profile ~ '.yml'", "fallback"),
+])
+def test_first_found_vars_files_preserves_relative_candidate_spelling(tmp_path, candidate, expected):
     from tests import ansible_playbook_command
 
     (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "prod.yml").write_text("selected: nested-production\n")
     (tmp_path / "prod.yml").write_text("selected: production\n")
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
-    expected = "fallback" if candidate.endswith("/") else "production"
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
-    - "{{ lookup('first_found', ['CANDIDATE', 'fallback.yml', profile ~ '.yml']) }}"
+    - "{{ lookup('first_found', [CANDIDATE, 'fallback.yml', profile ~ '.yml']) }}"
   tasks:
     - assert: {that: selected == 'EXPECTED'}
 """.replace("CANDIDATE", candidate).replace("EXPECTED", expected))

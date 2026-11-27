@@ -1763,12 +1763,15 @@ def _first_found_vars_file(args, kwargs, selector):
                     raise ValueError("first_found ansible_search_path differs from the bundled search paths; "
                                      "recompile with the current search paths")
                 roots = ("",) if absolute else selector["roots"]
+                relative_spelling = re.sub(r"/{2,}", "/", candidate) if not absolute else None
                 for root in roots:
                     candidate_path = os.path.join(root, candidate)
                     path = os.path.normpath(candidate_path)
-                    checked_path = path if absolute else candidate_path
+                    checked_path = path if absolute else os.path.join(root, relative_spelling)
                     exact_match = checked_path == path and not parent_relative
-                    if path in bundled and (exact_match or checked_path in (matched_spellings or ())):
+                    verified_spelling = checked_path in (matched_spellings or ()) or (
+                        not absolute and candidate_path in (matched_spellings or ()))
+                    if path in bundled and (exact_match or verified_spelling):
                         if _FIRST_FOUND_ENV_REFERENCE.search(candidate_path):
                             raise ValueError(environment_path_error)
                         return [path]

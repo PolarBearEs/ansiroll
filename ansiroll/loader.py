@@ -1531,8 +1531,9 @@ def _deferred_vars_files(play, basedir, entries):
                         if pattern.startswith("~") or absolute and _FIRST_FOUND_ENV_REFERENCE.search(pattern):
                             continue
                         absolute_parent = absolute and os.pardir in pattern.split(os.path.sep)
-                        # Core normalizes absolute candidates before looking for them.
-                        discovery = os.path.normpath(pattern) if absolute else pattern
+                        # Core normalizes absolute candidates. For relative ones,
+                        # collapse repeated separators but preserve dot components.
+                        discovery = os.path.normpath(pattern) if absolute else re.sub(r"/{2,}", "/", pattern)
                         for root in first_found_roots:
                             for path in glob.glob(os.path.join(glob.escape(root), discovery)):
                                 if not os.path.exists(path):
