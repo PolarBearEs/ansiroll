@@ -328,9 +328,15 @@ head='<full SHA confirmed in review>'
 gh workflow run reviewed-ci.yml --ref master -f pr_number="$pr" -f head_sha="$head"
 ```
 
-GitHub Actions event policy must allow `pull_request_target` for automatic
-head-check invalidation on PR updates. The invalidation job uses GitHub's API
-and runs without a checkout or test jobs.
+**Reconcile PR CI head checks** scans PRs targeting `master` on pushes to
+`master`. It scans all open PRs hourly at minute 23 UTC, including reopened
+PRs and PRs retargeted away from `master`. It runs from `master` and uses
+GitHub's API with permission to read PRs and update checks. GitHub can delay
+or skip scheduled scans. If GitHub disables the workflow after 60 days of
+repository inactivity, both push and scheduled cleanup stop. A maintainer can
+restore cleanup with `gh workflow enable reconcile-pr-ci.yml`. The separate
+**Manual Full PR CI** workflow runs only by dispatch. [GitHub Actions schedule
+behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
 ### Manual CI merge protection
 

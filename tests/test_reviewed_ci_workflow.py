@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/reviewed-ci.yml"
+WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
 HEAD = "a" * 40
 BASE = "b" * 40
 OLD_BASE = "c" * 40
@@ -27,11 +27,17 @@ CURRENT_PR = {
 @pytest.fixture
 def workflow():
     yaml = pytest.importorskip("yaml")
-    return yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+    return yaml.load((WORKFLOWS / "reviewed-ci.yml").read_text(), Loader=yaml.BaseLoader)
 
 
 @pytest.fixture
-def run_step(tmp_path, monkeypatch, workflow):
+def reconciliation_workflow():
+    yaml = pytest.importorskip("yaml")
+    return yaml.load((WORKFLOWS / "reconcile-pr-ci.yml").read_text(), Loader=yaml.BaseLoader)
+
+
+@pytest.fixture
+def run_step(tmp_path, monkeypatch, workflow, reconciliation_workflow):
     if not shutil.which("jq"):
         pytest.skip("workflow fixtures require jq")
     gh = tmp_path / "gh"
@@ -72,7 +78,8 @@ else:
             monkeypatch.setenv(key, value)
         for key, value in env.items():
             monkeypatch.setenv(key, value)
-        script = workflow["jobs"][job]["steps"][0]["run"]
+        jobs = {**workflow["jobs"], **reconciliation_workflow["jobs"]}
+        script = jobs[job]["steps"][0]["run"]
         result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True)
         assert result.returncode == expected_exit, result.stdout + result.stderr
         return [json.loads(line) for line in (tmp_path / "calls").read_text().splitlines()]
@@ -105,13 +112,15 @@ def test_reconcile_checks_for_the_current_pr_only(run_step, branch, cancelled):
     calls = run_step(
         "invalidate-head-checks",
         {
+            "pulls?state=open&per_page=100": f"12\t{HEAD}\t{BASE}\t{branch}",
             "pulls/12": f"12\t{HEAD}\t{BASE}\t{branch}",
             f"commits/{HEAD}/check-runs": "\n".join(
                 json.dumps({"check_runs": page}) for page in (checks, [report(7, owner, OLD_BASE)])
             ),
         },
-        EVENT_PR="12",
+        GITHUB_EVENT_NAME="schedule",
     )
+    assert "--paginate" in calls[0]
     listing = next(args for args in calls if f"repos/example/ansiroll/commits/{HEAD}/check-runs" in args)
     assert "--paginate" in listing
     assert "filter=all" in listing
@@ -122,21 +131,27 @@ def test_base_push_skips_a_pr_that_moved_since_listing(run_step):
     calls = run_step(
         "invalidate-head-checks",
         {
-            "pulls?state=open&base=master&per_page=100": f"12\t{HEAD}\t{BASE}\tmaster",
+            "pulls?state=open&per_page=100&base=master": f"12\t{HEAD}\t{BASE}\tmaster",
             "pulls/12": f"12\t{HEAD}\t{'e' * 40}\tmaster",
             f"commits/{HEAD}/check-runs": json.dumps({"check_runs": [report(1, "manual-full-ci:pr:12", OLD_BASE)]}),
         },
-        EVENT_PR="",
+        GITHUB_EVENT_NAME="push",
     )
     assert not any("PATCH" in args for args in calls)
 
 
-def test_synchronize_only_reconciles_head_checks(workflow):
-    assert "synchronize" in workflow["on"]["pull_request_target"]["types"]
-    assert "github.event.action == 'synchronize'" in workflow["jobs"]["invalidate-head-checks"]["if"]
+def test_schedule_only_reconciles_head_checks(workflow, reconciliation_workflow):
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert set(reconciliation_workflow["on"]) == {"push", "schedule"}
+    assert reconciliation_workflow["on"]["push"]["branches"] == ["master"]
+    assert set(reconciliation_workflow["jobs"]) == {"invalidate-head-checks"}
+    reconcile = reconciliation_workflow["jobs"]["invalidate-head-checks"]
+    assert "github.ref == 'refs/heads/master'" in reconcile["if"]
     assert "github.event_name == 'workflow_dispatch'" in workflow["jobs"]["reviewed-head"]["if"]
     assert workflow["jobs"]["tests"]["needs"] == "reviewed-head"
-    assert "uses" not in workflow["jobs"]["invalidate-head-checks"]["steps"][0]
+    assert reconcile["permissions"] == {"checks": "write", "pull-requests": "read"}
+    assert len(reconcile["steps"]) == 1
+    assert "uses" not in reconcile["steps"][0]
 
 
 @pytest.mark.parametrize(
