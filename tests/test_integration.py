@@ -5,6 +5,7 @@ Skipped automatically where ansible-core is not importable.
 
 import importlib.util
 import base64
+import errno
 import getpass
 import io
 import json
@@ -5647,6 +5648,37 @@ def test_strategy_reports_runtime_created_controller_source_open_error(tmp_path,
     assert result == {"error": "could not read controller source %r: mocked access denial" % str(source)}
 
 
+@pytest.mark.parametrize("busy_attempts", [1, 5])
+def test_strategy_retries_busy_runtime_created_controller_source(tmp_path, monkeypatch, busy_attempts):
+    strategy = _load_strategy_module()
+    source = tmp_path / "runtime.bin"
+    source.write_bytes(b"fixture")
+    real_open = os.open
+    attempts = []
+    delays = []
+
+    def open_source(path, flags):
+        assert flags & os.O_NONBLOCK
+        attempts.append(path)
+        if len(attempts) <= busy_attempts:
+            raise BlockingIOError(errno.EAGAIN, "mocked busy source")
+        return real_open(path, flags)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_source)
+        patch.setattr(time, "sleep", delays.append)
+        result = strategy.StrategyModule._read_controller_source(str(source))
+
+    if busy_attempts == 1:
+        assert attempts == [str(source)] * 2
+        assert delays == [0.05]
+        assert base64.b64decode(result["data"]) == b"fixture"
+    else:
+        assert attempts == [str(source)] * 5
+        assert delays == [0.05] * 4
+        assert "mocked busy source" in result["error"]
+
+
 def test_strategy_checks_runtime_created_controller_source_descriptor_before_reading(tmp_path, monkeypatch):
     strategy = _load_strategy_module()
     source = tmp_path / "runtime.bin"
@@ -5669,6 +5701,23 @@ def test_strategy_checks_runtime_created_controller_source_descriptor_before_rea
     with pytest.raises(OSError):
         os.fstat(fd)
     assert result == {"error": "controller source %r is not a regular file" % str(source)}
+
+
+def test_strategy_reports_runtime_created_controller_source_close_error(tmp_path, monkeypatch):
+    strategy = _load_strategy_module()
+    source = tmp_path / "runtime.bin"
+    source.write_bytes(b"fixture")
+    real_close = os.close
+
+    def report_close_error(fd):
+        real_close(fd)
+        raise OSError("mocked close error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "close", report_close_error)
+        result = strategy.StrategyModule._read_controller_source(str(source))
+
+    assert result == {"error": "could not read controller source %r: mocked close error" % str(source)}
 
 
 @pytest.mark.parametrize("action", ["copy", "template"])
