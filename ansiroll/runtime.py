@@ -7375,7 +7375,8 @@ class Runtime:
         ctx.setdefault("vars", ctx)
         if not params:
             return scope
-        return _with_high_vars(scope, self.template_vars(params, ctx, higher_vars=self.extra_vars))
+        return _with_high_vars(scope, self.template_vars(params, ctx, higher_vars=self.extra_vars,
+                                                        defer=_core_at_least(2, 19)))
 
     def _handlers_for(self, notification):
         """Indexes of the handlers a notification targets.

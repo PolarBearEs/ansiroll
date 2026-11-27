@@ -5797,6 +5797,77 @@ def test_standalone_role_inherits_check_mode_without_apply(tmp_path):
     assert output.exists() == native_wrote_file
 
 
+@pytest.mark.parametrize("simulate", [False, True])
+def test_role_check_mode_can_read_its_applied_vars(tmp_path, simulate):
+    tasks = tmp_path / "roles" / "child" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- file: {path: '{{ playbook_dir }}/result', state: touch}
+  check_mode: '{{ simulate }}'
+""")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - include_role:
+        name: child
+        apply:
+          vars: {simulate: SIMULATE}
+""".replace("SIMULATE", json.dumps(simulate))
+    output = tmp_path / "result"
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert output.exists() is (not simulate), result.stdout + result.stderr
+        if output.exists():
+            output.unlink()
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(tmp_path / "play.yml"), python_interpreter=sys.executable)[0])
+    result = subprocess.run([sys.executable, str(compiled)], cwd=tmp_path, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.exists() is (not simulate)
+
+
+def test_role_handler_check_mode_keeps_buffered_omit_parameter(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core preserves a native omit value in template buffers")
+    handlers = tmp_path / "roles" / "child" / "handlers"
+    handlers.mkdir(parents=True)
+    (handlers / "main.yml").write_text("""- name: record dry-run
+  file: {path: '{{ playbook_dir }}/result', state: touch}
+  check_mode: '{{ fallback }}'
+  register: handled
+""")
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - include_role: {name: child}
+      vars: {fallback: '{% if true %}{{ omit }}{% endif %}'}
+    - debug: {msg: notify}
+      changed_when: true
+      notify: record dry-run
+    - meta: flush_handlers
+    - assert: {that: handled is changed}
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "--check", "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (tmp_path / "result").exists()
+    source, _ = compile_playbook(str(tmp_path / "play.yml"))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, check_mode=True)
+    observed = []
+    monkeypatch.setattr(runtime, "_run_accelerated_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: observed.append(runtime.check_mode)
+                        or {"changed": True})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert observed == [True]
+
+
 @pytest.mark.parametrize("expression", ["{{ none }}", "{{ omit }}{{ false }}"])
 def test_strategy_preserves_rendered_false_check_mode(tmp_path, expression):
     from ansible.release import __version__

@@ -2344,7 +2344,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
         return None
     task._role_path = getattr(ri, "_role_path", None)
     key = ("role", task._role_path or name, tuple(sorted(from_files.items())),
-           _is_handler(task), _include_search_context(task), _include_scope_key(task))
+           _is_handler(task), _include_search_context(task), _include_scope_key(task), repr(args.get("apply")))
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
@@ -2405,6 +2405,8 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                                skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]
+            if parent is not task and parent.vars and tasks:
+                tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
         finally:
             _INCLUDE_STACK.pop(key, None)
             for root in role_roots:
