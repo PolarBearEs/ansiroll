@@ -424,7 +424,8 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                 for export in exports
             ],
             "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
-            "task_search_path": play.get_search_path(),
+            "task_search_path": (play.get_search_path() if hasattr(play, "get_search_path")
+                                 else [play._loader.get_basedir()]),
         })
     return result
 

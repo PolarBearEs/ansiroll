@@ -78,7 +78,7 @@ def _rendered_number(value, source, ctx):
     if isinstance(value, Number) and not isinstance(value, bool) and _legacy_non_native(ctx):
         # A bare name preserves the type only when its original value is numeric.
         bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source)
-        if bare is None or not isinstance(dict.get(ctx, bare[1]), Number):
+        if bare is None or not isinstance(dict.get(ctx, bare.group(1)), Number):
             return str(value)
     return value
 
@@ -2140,6 +2140,15 @@ class _TaskVarTemplate(str):
     """Source of a task variable that may need a loop binding."""
 
 
+class _BlockVarTemplate(_TaskVarTemplate):
+    """Inherited block alias resolved in the child task's context."""
+
+
+def _is_deferred_block_var(value):
+    return isinstance(value, _BlockVarTemplate) or (
+        isinstance(value, (_LazyTplDict, _LazyTplList)) and vars(value).get("_block_vars", False))
+
+
 class _DelegatedTemplateValue:
     """Read an agent variable or container member once, on demand."""
 
@@ -2179,7 +2188,7 @@ class _PlayVarScope(dict):
         self.task_containers = {}
         self.active_task_bindings = []
         self.resolved_snapshot = {}
-        if ctx.get(_DEFER_LOOKUP_NAMES):
+        if ctx.get(_DEFER_LOOKUP_NAMES) or any(isinstance(value, _DelegatedTemplateValue) for value in ctx.values()):
             view = _DeferredPlayVarView
         else:
             view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
@@ -2620,7 +2629,7 @@ class _DeferredPlayVarView(_ModernPlayVarView):
             source = source.source
         # Legacy iteration still exposes play template source, while accessed
         # containers retain their mutations in the snapshot.
-        if isinstance(source, _PlayVarTemplate):
+        if isinstance(source, (_PlayVarTemplate, _BlockVarTemplate)):
             return str(source)
         if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
                 isinstance(source, (_LazyTplDict, _LazyTplList)) and source._task_vars):
@@ -2946,9 +2955,10 @@ def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
         native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
-        # Ansible 2.13–2.18 reuse the native finalizer when switching the
-        # template action to a text environment. Earlier cores replace it.
-        if not native or (context.get(_TEMPLATE_FILE_TEXT) and not _core_at_least(2, 13)):
+        # Ansible 2.12 replaces the native finalizer for template files.
+        # Other legacy versions preserve native None stringification here.
+        text_finalizer = context.get(_TEMPLATE_FILE_TEXT) and _core_at_least(2, 12) and not _core_at_least(2, 13)
+        if not native or text_finalizer:
             return ""
     return _concretize(value)
 
@@ -3614,7 +3624,7 @@ class _Templater:
         if isinstance(value, _DelegatedTemplateValue):
             return value.resolve()
         self._observe_untrusted(value)
-        if type(value) in (str, _TaskVarTemplate, _PlayVarTemplate) and _looks_templated(value):
+        if type(value) in (str, _TaskVarTemplate, _BlockVarTemplate, _PlayVarTemplate) and _looks_templated(value):
             cache = None
             if isinstance(ctx, _PlayVarScope) and isinstance(value, _TaskVarTemplate):
                 cache = ctx.resolved_task
@@ -3670,7 +3680,8 @@ class _Templater:
         if isinstance(ctx, _PlayVarScope):
             return ctx
         if (ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
-                or any(isinstance(value, _PlayVarTemplate) for value in ctx.values())):
+                or any(isinstance(value, (_PlayVarTemplate, _DelegatedTemplateValue)) or _is_deferred_block_var(value)
+                       for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
@@ -3892,7 +3903,7 @@ class _Templater:
             value = pending.pop()
             if isinstance(value, (_LazyTplDict, _LazyTplList)):
                 value = value._raw
-            if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate):
+            if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate, _BlockVarTemplate):
                 stripped = value.strip()
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
@@ -4281,7 +4292,7 @@ class Runtime:
             return out
         return value
 
-    def template_vars(self, d, ctx, dynamic=False, higher_vars=None, defer=False):
+    def template_vars(self, d, ctx, dynamic=False, higher_vars=None, defer=False, block_vars=False):
         """Prepare variables with lazy containers and optional deferred templates.
 
         Legacy non-native templating also keeps scalar sources so its raw
@@ -4299,13 +4310,15 @@ class Runtime:
             if isinstance(v, str) and dynamic and ("{{" in v or "{%" in v):
                 out[k] = _PlayVarTemplate(v)
             elif defer and type(v) is str and _looks_templated(v):
-                out[k] = _TaskVarTemplate(v)
+                out[k] = _BlockVarTemplate(v) if block_vars else _TaskVarTemplate(v)
             elif isinstance(v, str) and not (legacy or defer):
                 out[k] = self.templater.render_string(v, base)
             elif isinstance(v, dict) and set(v.keys()) == {"__ansiroll_unsafe__"}:
                 out[k] = _UntrustedConditionValue(v["__ansiroll_unsafe__"])
             else:
                 out[k] = _lazy_container(v, self, base, dynamic or defer, task_vars=defer)
+                if block_vars and isinstance(out[k], (_LazyTplDict, _LazyTplList)):
+                    out[k]._block_vars = True
         return out
 
     @contextmanager
@@ -4971,8 +4984,10 @@ class Runtime:
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
+        # Resolve aliases when a child consumes them so its task vars and
+        # facts written during the block participate in normal precedence.
         scope.update(self.template_vars(
-            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay)))
+            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay), defer=True, block_vars=True))
         # Frames run strictly nested, so the block's conditions stay in force while its children are on the stack.
         inherited = self._inherited_when
         self._inherited_when = self._when_of(block)
@@ -5290,7 +5305,10 @@ class Runtime:
         # Inherited lookups can be reached through aliases in task vars.
         mixed_lookup = self.templater._contains_mixed_lookup(
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
+        block_template = (task.get("delegate_to") and task.get("special") == "template"
+                          and any(_is_deferred_block_var(value) for value in ctx.values()))
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
+                                      defer=looped or mixed_lookup or block_template))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -5310,7 +5328,7 @@ class Runtime:
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
-                if mixed_lookup and key in task_vars:
+                if (mixed_lookup or block_template) and key in task_vars:
                     host_task_bindings[key] = value
                 # An alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
@@ -5327,9 +5345,10 @@ class Runtime:
             ctx[_DEFER_LOOKUP_NAMES] = True
         loop_snapshot = looped and bool(task_vars)
         play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
-        if "vars" not in ctx or play_magic:
+        block_snapshot = any(_is_deferred_block_var(value) for value in ctx.values())
+        if "vars" not in ctx or play_magic or block_snapshot:
             snapshot = _vars_snapshot(ctx)
-            ctx["vars"] = _LoopVarsSnapshot(snapshot) if loop_snapshot else snapshot
+            ctx["vars"] = _LoopVarsSnapshot(snapshot) if (loop_snapshot or block_snapshot) else snapshot
         return ctx
 
     def run_task(self, task, overlay, become=False):
@@ -6552,7 +6571,7 @@ class Runtime:
             ack["changed"] = True
         return ack
 
-    def _run_file_action(self, name, task, args, ctx, become=False):
+    def _run_file_action(self, name, task, args, ctx, become=False, *, template_vars=None):
         """Run template/copy like their action plugins, with src baked at
         compile time.
 
@@ -6698,16 +6717,21 @@ class Runtime:
                         uid = pwd.getpwuid(uid).pw_name if uid is not None else uid
                     except Exception:
                         pass
-                    tctx.setdefault("template_host", platform.node())
-                    tctx.setdefault("template_path", src)
-                    tctx.setdefault("template_fullpath", fullpath)
-                    tctx.setdefault("template_destpath", dest)
-                    tctx.setdefault("template_mtime",
-                                    _dt.datetime.fromtimestamp(meta["mtime"])
-                                    if meta.get("mtime") is not None else None)
-                    tctx.setdefault("template_uid", uid)
-                    tctx.setdefault("template_run_date", _dt.datetime.now())
-                    tctx.setdefault("ansible_managed", "Ansible managed")
+                    action_vars = {
+                        "template_host": platform.node(),
+                        "template_path": src,
+                        "template_fullpath": fullpath,
+                        "template_destpath": dest,
+                        "template_mtime": (_dt.datetime.fromtimestamp(meta["mtime"])
+                                           if meta.get("mtime") is not None else None),
+                        "template_uid": uid,
+                        "template_run_date": _dt.datetime.now(),
+                        "ansible_managed": "Ansible managed",
+                    }
+                    action_vars = {key: value for key, value in action_vars.items() if key not in tctx}
+                    tctx.update(action_vars)
+                    if template_vars is not None:
+                        template_vars.update(action_vars)
                 except Exception:
                     pass
                 try:
@@ -7204,7 +7228,7 @@ class Runtime:
             # Legacy Ansible returns a bare null variable directly. Other
             # expressions that yield null render as an empty, invalid timeout.
             bare = re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", template["source"])
-            if not (bare and bare[1] in scope and scope[bare[1]] is None):
+            if not (bare and bare.group(1) in scope and scope[bare.group(1)] is None):
                 raise ValueError("gather_timeout must be an integer")
             value = template.get("null_representation")
             if value is None:
@@ -8327,7 +8351,9 @@ def agent_main():
                 ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
-            defer_template = action == "template" and ctx.get(_DEFER_LOOKUP_NAMES)
+            defer_template = action == "template" and (
+                ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
+            )
             if defer_template:
                 resolve_keys = {"omit"}
             deferred = {} if resolve_keys is not None else None
@@ -8355,9 +8381,17 @@ def agent_main():
             members = [] if defer_template else None
             if defer_template:
                 requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+                if _legacy_non_native(ctx) and not ctx.get(_DEFER_LOOKUP_NAMES):
+                    # Legacy scalar block aliases were sent as template source.
+                    # Let the controller evaluate that source when the file uses it.
+                    requested_names.difference_update(
+                        name for name, value in ctx.items() if isinstance(value, _BlockVarTemplate)
+                    )
                 if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
                     requested_names.add("hostvars")
                 frame["lazy_template_vars"] = sorted(requested_names)
+                # Transport can be lazy while Jinja resolves each referenced name.
+                frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES))
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
@@ -8365,6 +8399,12 @@ def agent_main():
                 member = reply.get("member")
                 fallback = None
                 if member is None and isinstance(name, str) and name in requested_names:
+                    template_vars = reply.get("template_vars") if defer_template else None
+                    if template_vars:
+                        for key in ("template_mtime", "template_run_date"):
+                            if template_vars.get(key) is not None:
+                                template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
+                        scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
                     fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
                 elif members is not None and type(member) is int and 0 <= member < len(members):
                     fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)
@@ -8398,7 +8438,8 @@ def agent_main():
         for play in plays:
             if not g.get("_INJECTED_GATHER_FACTS", True):
                 play = dict(play, gather_facts=False)
-            if controller_lookups := g.get("_INJECTED_CONTROLLER_LOOKUPS"):
+            controller_lookups = g.get("_INJECTED_CONTROLLER_LOOKUPS")
+            if controller_lookups:
                 play = {**play, **{
                     key: {**(play.get(key) or {}), **values}
                     for key, values in controller_lookups.items()
