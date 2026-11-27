@@ -5736,15 +5736,21 @@ def test_standalone_task_omit_preserves_invocation_check_mode(tmp_path):
 
 @pytest.mark.parametrize("parent", [None, False, True])
 @pytest.mark.parametrize("scope", ["block", "include"])
-@pytest.mark.parametrize("cli_become", [False, True])
+@pytest.mark.parametrize("cli_become", [False, True, None])
 def test_standalone_become_omit_preserves_enclosing_mode(tmp_path, monkeypatch, parent, scope, cli_become):
-    from ansible import context
+    from ansible import constants as C, context
     from ansible.utils.context_objects import CLIArgs
     from ansiroll.loader import _core_version
 
     if _core_version() < (2, 19):
         pytest.skip("requires native task keyword omission")
-    monkeypatch.setattr(context, "CLIARGS", CLIArgs(dict(context.CLIARGS, become=cli_become)))
+    cli_args = dict(context.CLIARGS)
+    cli_args.pop("become", None)
+    if cli_become is not None:
+        cli_args["become"] = cli_become
+    monkeypatch.setattr(context, "CLIARGS", CLIArgs(cli_args))
+    configured_become = cli_become is None
+    monkeypatch.setattr(C, "DEFAULT_BECOME", configured_become)
     child = "- ping:\n  become: '{{ omit }}'\n"
     if scope == "include":
         (tmp_path / "child.yml").write_text(child)
@@ -5759,30 +5765,102 @@ def test_standalone_become_omit_preserves_enclosing_mode(tmp_path, monkeypatch, 
     playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks:\n"
                         + textwrap.indent(child + tasks, "    "))
     source, _ = compile_playbook(str(playbook))
-    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    plan = _compiled_plays(source, tmp_path)[0]
+    default_become = configured_become if cli_become is None else cli_become
+
+    for inventory_become, expected in ((None, None), (False, False), (True, True), ("{# inventory #}false", False)):
+        host_vars = {"inventory_hostname": "localhost"}
+        if inventory_become is not None:
+            host_vars["ansible_become"] = inventory_become
+        runtime = Runtime({}, "", host_vars)
+        observed = []
+
+        def run_module(action, args, become=False):
+            observed.append(become)
+            return {"changed": False}
+
+        monkeypatch.setattr(runtime, "run_module", run_module)
+        runtime.run_play(plan)
+        assert not runtime.failed
+        if expected is None:
+            assert observed == [default_become, default_become if parent is None else parent]
+        else:
+            assert observed == [expected, expected]
+
+
+@pytest.mark.parametrize(("origin_become", "target_become", "expected"), [
+    (False, True, True),
+    (True, False, False),
+    (True, None, False),
+    (False, "{{ inventory_hostname != 'origin' }}", False),
+    (True, "{# inventory #}false", False),
+])
+def test_omitted_become_uses_delegated_host_inventory(tmp_path, monkeypatch, origin_become, target_become, expected):
+    from ansible import context
+    from ansible.utils.context_objects import CLIArgs
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native task keyword omission")
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.template import trust_as_template
+
+    monkeypatch.setattr(context, "CLIARGS", CLIArgs(dict(context.CLIARGS, become=False)))
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: origin
+  gather_facts: false
+  tasks:
+    - ping:
+      become: '{{ omit }}'
+      delegate_to: localhost
+""")
+    plays, _ = parse_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "origin", "ansible_become": origin_become})
+    controller_runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    origin = SimpleNamespace(name="origin")
+    target = SimpleNamespace(name="localhost")
     observed = []
 
     def run_module(action, args, become=False):
         observed.append(become)
         return {"changed": False}
 
-    monkeypatch.setattr(runtime, "run_module", run_module)
-    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    def get_vars(*, play, host, task):
+        assert host is target
+        value = trust_as_template(target_become) if isinstance(target_become, str) else target_become
+        return {"inventory_hostname": target.name, "ansible_become": value}
+
+    controller_runtime.run_module = run_module
+    strategy = object.__new__(_load_strategy_module().StrategyModule)
+    strategy._inventory = SimpleNamespace(get_host=lambda name: target if name == target.name else None)
+    strategy._variable_manager = SimpleNamespace(get_vars=get_vars)
+    strategy._cur_play = None
+    strategy._loader = DataLoader()
+    strategy._local_runtime = lambda password: controller_runtime
+
+    def delegate(task, args, become, ctx):
+        frame = {"action": task["action"], "args": args, "to": task["delegate_to"],
+                 "become": become, "become_omitted": task.get("become_omitted")}
+        return strategy._run_delegated(frame, origin, {}, None, None)
+
+    runtime.delegate_fn = delegate
+    runtime.run_play(plays[0])
     assert not runtime.failed
-    assert observed == [cli_become, cli_become if parent is None else parent]
+    assert observed == [expected]
 
 
 def test_strategy_distinguishes_null_and_unset_check_mode(tmp_path):
     from ansiroll.loader import _core_version
 
-    if _core_version() < (2, 19):
-        pytest.skip("requires native task keyword validation")
+    version = _core_version()
     playbook = """- hosts: localhost
   connection: local
   gather_facts: false
   tasks:
     - file: {path: '{{ playbook_dir }}/unset', state: touch}
     - file: {path: '{{ playbook_dir }}/null', state: touch}
+      check_mode: null
+    - copy: {dest: '{{ playbook_dir }}/copied', content: fixture}
       check_mode: null
     - block:
         - file: {path: '{{ playbook_dir }}/inherited', state: touch}
@@ -5797,10 +5875,13 @@ def test_strategy_distinguishes_null_and_unset_check_mode(tmp_path):
         assert result.returncode == 0, result.stdout + result.stderr
         for name in ("unset", "inherited"):
             assert not (tmp_path / name).exists()
-        for name in ("null", "overridden"):
+        expected = {"null": version >= (2, 14), "overridden": version >= (2, 14),
+                    "copied": version >= (2, 17)}
+        for name, writes in expected.items():
             marker = tmp_path / name
-            assert marker.is_file(), result.stdout
-            marker.unlink()
+            assert marker.is_file() is writes, result.stdout
+            if writes:
+                marker.unlink()
 
 
 @pytest.mark.parametrize("scope", ["invocation", "parent", "tasks-apply", "role-apply", "play", "raw-parent"])

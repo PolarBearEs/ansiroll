@@ -867,9 +867,26 @@ class StrategyModule(StrategyBase):
         to = frame.get("to")
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
+        task_key = frame.get("runtime_id") or frame.get("uuid")
+        source_task = (task_map or {}).get(task_key)
+        if local and frame.get("become_omitted"):
+            from ansiroll.runtime import _boolean
+
+            target = self._inventory.get_host(to)
+            if target is not None:
+                try:
+                    target_vars = self._variable_manager.get_vars(play=self._cur_play, host=target, task=source_task)
+                    target_vars["inventory_hostname"] = hv.get("inventory_hostname", host.name)
+                    inventory_become = target_vars.get("ansible_become")
+                    if inventory_become is not None:
+                        target_templar = self._mk_templar(target_vars)
+                        if target_templar is not None:
+                            inventory_become = target_templar.template(inventory_become)
+                        become = _boolean(inventory_become, strict=True)
+                        frame = dict(frame, become=become)
+                except (AnsibleError, TypeError) as ex:
+                    return {"failed": True, "changed": False, "msg": "Failed to resolve ansible_become: %s" % ex}
         if action == "template" and local:
-            task_key = frame.get("runtime_id") or frame.get("uuid")
-            source_task = (task_map or {}).get(task_key)
             return self._run_local_template(frame, become_pass, resolve_play_var, source_task=source_task)
         if frame.get("fallback") or not local:
             reason = ("delegate_to: %s (non-local delegation)" % to if to

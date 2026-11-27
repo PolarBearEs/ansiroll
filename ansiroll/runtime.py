@@ -281,8 +281,8 @@ def _decode_included_var(value):
     return value
 
 
-def _looks_templated(value):
-    return isinstance(value, str) and ("{{" in value or "{%" in value)
+def _looks_templated(value, *, comments=False):
+    return isinstance(value, str) and ("{{" in value or "{%" in value or comments and "{#" in value)
 
 
 def _selector_local_values(names, bindings, variables=None):
@@ -925,7 +925,7 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
     if isinstance(value, str):
         if condition_text and not isinstance(value, _TrustedAsTemplateValue):
             return _UntrustedConditionValue(value)
-        if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+        if _looks_templated(value, comments=True) and not isinstance(value, _NO_TEMPLATE):
             return _UnsafeText(value)
         return value
     if isinstance(value, (dict, list, tuple, _HostVarEntries, _RawSnapshotMapping, _RawSnapshotList)):
@@ -3899,7 +3899,7 @@ class _Templater:
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if file_newline is None:
-            templated = _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text)
+            templated = _looks_templated(text, comments=ctx.get(_CHECK_MODE_TEMPLATE) is not None)
         else:
             settings = dict(file_options)
             starts = [
@@ -3949,7 +3949,7 @@ class _Templater:
         if isinstance(result, str):
             # Rendered output is data: like Ansible, it is never templated
             # again (trusted variable values are templated when looked up).
-            return (_UnsafeText(result) if _looks_templated(result)
+            return (_UnsafeText(result) if _looks_templated(result, comments=True)
                     else str(result) if isinstance(result, _UnsafeTemplate)
                     else result)
         return _rendered_number(result, text, ctx)
@@ -6352,8 +6352,14 @@ class Runtime:
             if check_mode and fallback == "invalid":
                 raise ValueError("invalid inherited check_mode value")
             value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
+            if key == "become_override" and not (self.delegate_fn and task.get("delegate_to")):
+                inventory_become = ctx.get("ansible_become")
+                if inventory_become is not None:
+                    value = self._execution_flag_value(inventory_become, self._check_mode_template_context(ctx))
+                    return _boolean(value, strict=True), omitted
         if value is None:
-            return (False if check_mode and authored is not None else default), omitted
+            explicit_check_mode = check_mode and (authored is not None or task.get("check_mode_null"))
+            return (False if explicit_check_mode else default), omitted
         return _boolean(value, strict=True), omitted
 
     def _execution_flag_value(self, value, ctx, *, check_mode=False, on_omit=False):
@@ -6425,11 +6431,12 @@ class Runtime:
             if modes is None:
                 check_mode, check_omitted = self._execution_flag(task, "check_mode", ctx, inherited_check_mode)
                 diff_mode, _ = self._execution_flag(task, "diff", ctx, inherited_diff_mode)
-                become, _ = self._execution_flag(task, "become_override", ctx, become)
+                become, become_omitted = self._execution_flag(task, "become_override", ctx, become)
                 # Older copy actions gate transfer on PlayContext.
-                transfer_mode = (self._invocation_check_mode if check_omitted and not _core_at_least(2, 17)
+                keep_transfer_mode = check_omitted or task.get("check_mode_null")
+                transfer_mode = (self._invocation_check_mode if keep_transfer_mode and not _core_at_least(2, 17)
                                  else inherited_transfer_check_mode)
-                modes = check_mode, diff_mode, become, transfer_mode
+                modes = check_mode, diff_mode, become, transfer_mode, become_omitted
                 if args_cache is not None:
                     args_cache["execution_modes"] = modes
         except Exception as ex:
@@ -6437,7 +6444,7 @@ class Runtime:
                     "msg": "ansiroll: task raised %s: %s" % (type(ex).__name__, ex),
                     "_ansiroll_unknown_outcome": True}
         try:
-            self.check_mode, self.diff_mode, become, self._copy_transfer_check_mode = modes
+            self.check_mode, self.diff_mode, become, self._copy_transfer_check_mode, become_omitted = modes
             self._task_diff_modes[id(task)] = self.diff_mode
             become_user = task.get("become_user")
             if become_user:
@@ -6481,7 +6488,8 @@ class Runtime:
                     if self._is_builtin_unarchive(task):
                         self._normalize_unarchive_options(args)
                     self._executed_task_args = args
-                    res = self.delegate_fn(task, args, become, ctx)
+                    delegate_task = dict(task, become_omitted=True) if become_omitted else task
+                    res = self.delegate_fn(delegate_task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
                         # Preserve trust only for controller inventory metadata.
@@ -8779,7 +8787,7 @@ def _chan_send(out_fd, obj):
 
 
 def _delegate_template_value(value):
-    if isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
+    if isinstance(value, _NO_TEMPLATE) and _looks_templated(value, comments=True):
         return {"__ansiroll_unsafe__": str(value)}
     if isinstance(value, (dict, _RawSnapshotMapping)):
         return {key: _delegate_template_value(item) for key, item in value.items()}
@@ -8843,7 +8851,7 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), sc
     if scalars is not None and isinstance(value, (_dt.date, bytes, range)):
         scalars.append((path, _encode_delegated_key(value)))
         return None
-    if unsafe_paths is not None and isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
+    if unsafe_paths is not None and isinstance(value, _NO_TEMPLATE) and _looks_templated(value, comments=True):
         unsafe_paths.append(path)
     return value
 
@@ -9077,7 +9085,7 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
                     deferred[key] = "task" if value._task_vars else "play"
                     value = value._raw
                 elif isinstance(value, _RegisteredResult) or (
-                        isinstance(value, _NO_TEMPLATE) and _looks_templated(value)):
+                        isinstance(value, _NO_TEMPLATE) and _looks_templated(value, comments=True)):
                     deferred[key] = "data"
                 if (lazy_play is not None and deferred.get(key) == "play"
                         and (controller_vars or {}).get(key) != value):
@@ -9233,6 +9241,8 @@ def agent_main():
             }
             if action == "template" and rt._copy_transfer_check_mode is not None:
                 frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
+            if task.get("become_omitted"):
+                frame["become_omitted"] = True
             if lazy_play is not None and deferred:
                 frame["deferred_vars"] = deferred
             if lazy_play:

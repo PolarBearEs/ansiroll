@@ -1620,7 +1620,7 @@ def _tag_untrusted(value, template_syntax_only=False):
 
     def walk(v):
         if isinstance(v, str) and untrusted(v):
-            if not template_syntax_only or "{{" in v or "{%" in v:
+            if not template_syntax_only or "{{" in v or "{%" in v or "{#" in v:
                 return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
             return {_FactKeyTemplate(k) if isinstance(k, str) and ("{{" in k or "{%" in k)
@@ -4960,11 +4960,11 @@ def _execution_keyword(task, keyword, *, node_key=None):
     value = getattr(task, keyword, None)
     if isinstance(value, _AppliedExecutionFlag):
         return {key: {"__ansiroll_apply_flag__": value.keyword}}
-    if keyword == "check_mode" and value is None and _core_version() >= (2, 19):
+    if keyword == "check_mode" and value is None and _core_version() >= (2, 14):
         # The public value is None for both an unset keyword and an explicit
-        # null. Core validates the latter as false, even under --check.
+        # null. Core 2.14+ dispatches modules using the task's flag directly.
         if task._get_parent_attribute(keyword) is None:
-            value = False
+            return {key: None, "check_mode_null": True}
     value = _tag_untrusted(value)
     result = {key: value}
     if keyword == "check_mode" and isinstance(value, str):
@@ -5003,9 +5003,9 @@ def _execution_omit_fallback(value, *, keyword=None):
         if keyword == "check_mode":
             return {"__ansiroll_invocation_check_mode__": True}
         if keyword == "become":
-            from ansible import context
+            from ansible import constants as C, context
 
-            return bool(context.CLIARGS.get("become"))
+            return bool(context.CLIARGS.get("become", C.DEFAULT_BECOME))
         return None
     if _is_execution_flag_template(value, keyword):
         return _tag_untrusted(value)
