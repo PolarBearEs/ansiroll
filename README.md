@@ -68,6 +68,11 @@ python3 -m ansiroll.cli compile playbook.yml -o - | python3 -
 Keep stdout and stderr separate. Send stdout to a pipe or file because a terminal
 can transform the generated source.
 
+A standalone artifact can contain plaintext from a Vault-encrypted source
+selected at compile time. For named output, the compiler creates a fresh
+owner-only file with mode `0700`. To redirect stdout to a file, use a new path
+and set `umask 077` before redirecting. The shell controls access to that file.
+
 Configure any Python startup hooks, such as `sitecustomize`, to send their
 messages to stderr so they cannot add text to the pipeline before Ansiroll runs.
 When Ansiroll and Ansible are installed in the interpreter's environment, use
