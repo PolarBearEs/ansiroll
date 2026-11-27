@@ -5804,7 +5804,9 @@ def test_strategy_restores_resolved_include_apply_check_mode(tmp_path, include, 
     assert observed == [not writes]
 
 
-@pytest.mark.parametrize("case", ["looped", "buffered", "vars", "vars-native", "raw-parent", "tasks-raw-parent"])
+@pytest.mark.parametrize("case", [
+    "looped", "buffered", "vars", "vars-native", "vars-nested-omit", "raw-parent", "tasks-raw-parent",
+])
 def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatch, case):
     from ansiroll.loader import _core_version
 
@@ -5814,7 +5816,11 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
     (role / "tasks").mkdir(parents=True)
     (role / "vars").mkdir()
     (role / "vars" / "main.yml").write_text("toggle: false\n")
-    child_mode = {"vars": "mode", "vars-native": "mode is boolean"}.get(case, "omit")
+    child_mode = {
+        "vars": "mode",
+        "vars-native": "mode is boolean",
+        "vars-nested-omit": "label == '[]-suffix'",
+    }.get(case, "omit")
     task_file = tmp_path / "child.yml" if case == "tasks-raw-parent" else role / "tasks" / "main.yml"
     task_file.write_text("""- file:
     path: "{{ playbook_dir }}/result-{{ item | default('only') }}"
@@ -5826,6 +5832,7 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
         "buffered": "check_mode: '{% if simulate %}{{ true }}{% else %}{{ omit }}{% endif %}'",
         "vars": "vars: {mode: '{{ toggle }}'}",
         "vars-native": "vars: {mode: '{% if true %}{{ true }}{% endif %}'}",
+        "vars-nested-omit": "vars: {label: '{{ [omit] }}-suffix'}",
         "raw-parent": "check_mode: '{{ omit }}'",
         "tasks-raw-parent": "check_mode: '{% if true %}{{ omit }}{% endif %}'",
     }[case]

@@ -3071,7 +3071,7 @@ def _concat_keyword_segments(nodes):
              for part in nodes if preserve_none or part is not None]
     if len(parts) < 2:
         return parts[0] if parts else None
-    return "".join(str(_fail_on_undef(part)) for part in parts if part is not _KEYWORD_OMIT)
+    return "".join(str(_setup_omit(part)) for part in parts if part is not _KEYWORD_OMIT)
 
 
 def _finalize_text_segment(context, value):
