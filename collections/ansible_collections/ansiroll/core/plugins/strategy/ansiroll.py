@@ -332,7 +332,10 @@ class StrategyModule(StrategyBase):
             and _has_delegated_fact_flag(task)
         ]
         linear_reason = None
-        if self._requires_linear_fallback:
+        if any(item["kind"] == "vars-file-include" for item in controller_reasons):
+            self._requires_linear_fallback = True
+            linear_reason = "vars-file task selection requires core linear"
+        elif self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
         elif any(item["kind"] == "vault-source" for item in controller_reasons):
             linear_reason = "Vault source selection requires core linear"
@@ -1937,6 +1940,8 @@ def _controller_fallbacks(play_node):
                     kind = "vault-source"
                 elif node.get("_file_source_argument_layers"):
                     kind = "file-source-arguments"
+                elif node.get("vars_file_include_fallback"):
+                    kind = "vars-file-include"
                 elif node.get("_deferred_apply_include"):
                     kind = "apply-include"
                 found.append({

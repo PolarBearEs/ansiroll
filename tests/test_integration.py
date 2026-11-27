@@ -25,7 +25,7 @@ import pytest
 
 pytest.importorskip("ansible")
 
-from ansiroll.compiler import _build_bundles, compile_playbook  # noqa: E402
+from ansiroll.compiler import _build_bundles, _walk_play_nodes, compile_playbook  # noqa: E402
 from ansiroll.cli import _load_extra_vars  # noqa: E402
 from ansiroll.embed import ModuleEmbedder  # noqa: E402
 from ansiroll import embed as embed_module  # noqa: E402
@@ -4636,12 +4636,14 @@ def test_controller_timeout_rechecks_projected_branch(tmp_path, monkeypatch, exp
     assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
 
 
-@pytest.mark.parametrize("alternate_vars, fallback", [
-    ("seconds: 45\n", False),
-    ("seconds: 45\ntask_file: other.yml\n", True),
-    ("seconds: [\n", False),
+@pytest.mark.parametrize("alternate_vars, alternate_error", [
+    ("seconds: 45\n", None),
+    ("seconds: 45\ntask_file: other.yml\n", "no bundled task file matches 'other.yml'"),
+    ("seconds: [\n", "Invalid vars_files file"),
 ])
-def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, alternate_vars, fallback):
+def test_ordered_timeout_only_errors_for_the_selected_unavailable_include(tmp_path, alternate_vars, alternate_error):
+    from ansiroll.runtime import VarsFilesError
+
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   vars: {profile: default, task_file: tasks.yml}
@@ -4655,19 +4657,35 @@ def test_ordered_timeout_only_defers_includes_with_uncertain_inputs(tmp_path, al
     (tmp_path / "settings-alternate.yml").write_text(alternate_vars)
     (tmp_path / "tasks.yml").write_text("- debug: {msg: included-marker}\n")
     source, manifest = compile_playbook(str(playbook))
-    assert bool(manifest["fallback_tasks"]) == fallback
+    assert not manifest["fallback_tasks"]
     plan = _compiled_plays(source, tmp_path)[0]
-    assert ("included-marker" in json.dumps(plan)) != fallback
+    for profile in ("default", "alternate"):
+        frames = []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": profile},
+                          on_result=frames.append)
+        runtime.run_module = lambda *args, **kwargs: {"ansible_facts": {}}
+        if profile == "alternate" and alternate_error == "Invalid vars_files file":
+            try:
+                runtime.run_play(plan)
+            except VarsFilesError as error:
+                assert alternate_error in str(error)
+            else:
+                assert runtime.failed
+                assert all(frame["action"] == "gather_facts" for frame in frames)
+        else:
+            runtime.run_play(plan)
+            messages = [frame["result"].get("msg") for frame in frames]
+            assert (alternate_error if profile == "alternate" and alternate_error else "included-marker") in messages
 
 
-@pytest.mark.parametrize(("task_vars", "fallback"), [
-    ("{unrelated: 1}", True),
-    ("{task_file: default.yml}", False),
+@pytest.mark.parametrize(("task_vars", "expected"), [
+    ("{unrelated: 1}", "included-alternate"),
+    ("{task_file: default.yml}", "included-default"),
 ])
 @pytest.mark.parametrize("selector", ["cfg.task_file", "(cfg | default({})).task_file",
                                        "(cfg | default({}, true)).task_file", "(cfg or {}).task_file"])
 def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, monkeypatch,
-                                                                    task_vars, fallback, selector):
+                                                                    task_vars, expected, selector):
     from ansible import constants as C
 
     monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
@@ -4687,8 +4705,14 @@ def test_ordered_timeout_checks_which_merged_members_an_include_reads(tmp_path, 
     (tmp_path / "settings-alternate.yml").write_text("seconds: 45\ncfg: {task_file: alternate.yml}\n")
     (tmp_path / "default.yml").write_text("- debug: {msg: included-default}\n")
     (tmp_path / "alternate.yml").write_text("- debug: {msg: included-alternate}\n")
-    _, manifest = compile_playbook(str(playbook))
-    assert bool(manifest["fallback_tasks"]) == fallback
+    source, manifest = compile_playbook(str(playbook))
+    assert not manifest["fallback_tasks"]
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "alternate"},
+                      on_result=frames.append)
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert expected in [frame["result"].get("msg") for frame in frames]
 
 
 @pytest.mark.parametrize(("template", "overrides", "expected"), [
@@ -8354,3 +8378,773 @@ def test_strategy_runs_over_a_real_ssh_channel(tmp_path):
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+
+
+@pytest.mark.parametrize("tree_shake", [False, True])
+@pytest.mark.parametrize("shared_parent", [False, True])
+def test_standalone_selects_include_from_launch_selected_vars_file(tmp_path, monkeypatch, tree_shake, shared_parent):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: dev}
+  vars_files: ['vars/profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    vars_dir = tmp_path / "vars"
+    vars_dir.mkdir()
+    if shared_parent:
+        (tmp_path / "shared").mkdir()
+        (tmp_path / "shared" / "entry.yml").write_text("- include_tasks: '{{ nested_file }}'\n")
+    for profile in ("dev", "prod"):
+        directory = tmp_path / profile
+        directory.mkdir()
+        if shared_parent:
+            variant = f"task_file: shared/entry.yml\nnested_file: ../{profile}/nested.yml\n"
+        else:
+            variant = f"task_file: {profile}/entry.yml\nnested_file: nested.yml\n"
+            (directory / "entry.yml").write_text("- include_tasks: '{{ nested_file }}'\n")
+        (vars_dir / f"profile-{profile}.yml").write_text(variant)
+        (directory / "nested.yml").write_text(f"- debug: {{msg: selected-profile-{profile}}}\n")
+    with (tmp_path / "prod" / "nested.yml").open("a") as handle:
+        handle.write('''# $ANSIBLE_VAULT in a comment is ordinary text.
+- debug: {msg: '{{ lookup("env", "ANSIROLL_ALT_INCLUDE_SECRET", default="unavailable") }}'}
+''')
+    monkeypatch.setenv("ANSIROLL_ALT_INCLUDE_SECRET", "synthetic-alt-include-secret")
+    script = tmp_path / "compiled.py"
+    source, _ = compile_playbook(str(playbook), tree_shake=tree_shake)
+    assert "ANSIROLL_ALT_INCLUDE_SECRET" not in _compiled_plays(source, tmp_path)[0].get("controller_env", {})
+    script.write_text(source)
+    for path in tmp_path.glob("*/*.yml"):
+        path.unlink()
+    for extra, expected in (({}, "dev"), ({"profile": "prod"}, "prod")):
+        result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True,
+                                env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps(extra)}, timeout=20)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"selected-profile-{expected}" in result.stdout
+
+
+@pytest.mark.parametrize("nested_role", [False, True])
+def test_vars_file_alternate_include_does_not_embed_encrypted_task_bodies(tmp_path, nested_role):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    secret = VaultSecret(b"password")
+    vault = VaultLib([("default", secret)])
+    password = tmp_path / "vault-password"
+    password.write_text("password\n")
+    (tmp_path / "profile-normal.yml").write_text("task_file: normal.yml\n")
+    (tmp_path / "profile-private.yml").write_text("task_file: sealed.yml\n")
+    (tmp_path / "normal.yml").write_text("- debug: {msg: ordinary-body}\n")
+    encrypted = vault.encrypt(b"- debug: {msg: synthetic-private-body}\n", secret=secret)
+    if nested_role:
+        (tmp_path / "sealed.yml").write_text("- include_role: {name: sealed_role}\n")
+        tasks = tmp_path / "roles" / "sealed_role" / "tasks"
+        tasks.mkdir(parents=True)
+        (tasks / "main.yml").write_bytes(encrypted)
+    else:
+        (tmp_path / "sealed.yml").write_bytes(encrypted)
+    source, _ = compile_playbook(str(playbook), vault_password_file=str(password))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "synthetic-private-body" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
+@pytest.mark.parametrize("selection_error", ["missing-variant", "render-error"])
+def test_vars_file_include_selection_failure_is_censored_and_rescued(tmp_path, selection_error):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - block:
+        - include_tasks: '{{ task_file }}'
+          no_log: true
+      rescue:
+        - debug: {msg: rescued-include-selection}
+""")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: {profile}}}\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    if selection_error == "render-error":
+        node = next(node for node in _walk_play_nodes([plan]) if "include_selector" in node)
+        node["include_selector"] = "{{ 1 // divisor }}{{ task_file }}"
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"task_file": "synthetic-private-launch-value", "divisor": 0})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert "rescued-include-selection" in json.dumps(frames)
+    assert "censored" in json.dumps(frames)
+    assert "synthetic-private-launch-value" not in json.dumps(frames)
+
+
+@pytest.mark.parametrize("invalid", ["body", "nul", "lookup"])
+def test_vars_file_alternate_include_conversion_error_leaves_default_usable(tmp_path, monkeypatch, invalid):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    (tmp_path / "profile-normal.yml").write_text("task_file: normal.yml\n")
+    alternate = {
+        "body": "task_file: alternate.yml\n",
+        "nul": 'task_file: "invalid\\0.yml"\n',
+        "lookup": """task_file: '{{ lookup("env", "ANSIROLL_ALT_FILENAME") }}'\n""",
+    }
+    monkeypatch.setenv("ANSIROLL_ALT_FILENAME", "synthetic-private-filename.yml")
+    (tmp_path / "profile-alternate.yml").write_text(alternate[invalid])
+    (tmp_path / "normal.yml").write_text("- debug: {msg: default-body}\n")
+    (tmp_path / "alternate.yml").write_text(
+        "- set_fact: {task_file: future.yml}\n- copy: {src: [invalid], dest: /unused}\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    node = next(node for node in _walk_play_nodes([plan]) if "include_selector" in node)
+    assert [variant["include_variant"] for variant in node["tasks"]] == ["normal.yml"]
+
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append)
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert "default-body" in json.dumps(frames)
+    assert "synthetic-private-filename.yml" not in json.dumps(plan)
+
+
+def test_vars_file_include_combines_launch_mapping_and_checks_each_loop_item(tmp_path, monkeypatch):
+    from ansible import constants as C
+
+    monkeypatch.setenv("ANSIBLE_HASH_BEHAVIOUR", "merge")
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ cfg.task_file }}'
+      loop: [false, true]
+      when: item
+""")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"cfg: {{task_file: {profile}.yml}}\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: selected-{profile}}}\n")
+    source, _ = compile_playbook(str(playbook))
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "alternate", "cfg": {"unrelated": 1}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed, json.dumps(frames)
+    assert [frame["result"]["msg"] for frame in frames
+            if frame.get("result", {}).get("msg", "").startswith("selected-")] == ["selected-alternate"]
+
+
+@pytest.mark.parametrize("shared_parent", [False, True])
+def test_vars_file_include_matches_native_nested_parent_path(tmp_path, shared_parent):
+    playbook = """- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+"""
+    for profile in ("normal", "alternate"):
+        directory = tmp_path / profile
+        directory.mkdir()
+        if shared_parent:
+            (tmp_path / f"profile-{profile}.yml").write_text(
+                f"task_file: shared/entry.yml\nchild_directory: {profile}\n")
+            (directory / "child.yml").write_text(f"- debug: {{msg: {profile}-child}}\n")
+        else:
+            (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}/entry.yml\n")
+            (directory / "entry.yml").write_text("""- include_tasks: child.yml
+  vars: {task_file: rebound/entry.yml}
+""")
+            (directory / "child.yml").write_text("- debug: {msg: original-child}\n")
+    if shared_parent:
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        (shared / "entry.yml").write_text("""- include_tasks: child.yml
+  vars: {task_file: '{{ child_directory }}/entry.yml'}
+""")
+        (shared / "child.yml").write_text("- debug: {msg: original-child}\n")
+    rebound = tmp_path / "rebound"
+    rebound.mkdir()
+    (rebound / "child.yml").write_text("- debug: {msg: rebound-child}\n")
+    native = _run_strategy_play(tmp_path, playbook, "-e", "profile=alternate",
+                                environment={"ANSIBLE_STRATEGY": "linear"})
+    assert native.returncode == 0, native.stdout + native.stderr
+    native_messages = [message for message in ("original-child", "rebound-child", "alternate-child")
+                       if message in native.stdout]
+    assert len(native_messages) == 1
+    source, _ = compile_playbook(str(tmp_path / "play.yml"))
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "alternate"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed, json.dumps(frames)
+    messages = [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
+    assert messages == native_messages
+
+
+@pytest.mark.parametrize("dependency", [False, True])
+def test_vars_file_alternate_can_load_a_role_from_roles_path(tmp_path, monkeypatch, dependency):
+    from ansible import constants as C
+
+    role_tasks = tmp_path / "external" / "roles" / "path_role" / "tasks"
+    role_tasks.mkdir(parents=True)
+    (role_tasks / "main.yml").write_text("- debug: {msg: external-role-body}\n")
+    if dependency:
+        metadata = role_tasks.parent / "meta"
+        metadata.mkdir()
+        (metadata / "main.yml").write_text("dependencies: [sibling_role]\n")
+        sibling = role_tasks.parents[1] / "sibling_role" / "tasks"
+        sibling.mkdir(parents=True)
+        (sibling / "main.yml").write_text("- debug: {msg: sibling-role-body}\n")
+    monkeypatch.setattr(C, "DEFAULT_ROLES_PATH", [str(role_tasks.parents[1])])
+    project = tmp_path / "project"
+    project.mkdir()
+    playbook = project / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    for profile in ("normal", "alternate"):
+        (project / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+    (project / "normal.yml").write_text("- debug: {msg: default-body}\n")
+    (project / "alternate.yml").write_text("- include_role: {name: path_role}\n")
+    source, _ = compile_playbook(str(playbook))
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "alternate"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed, json.dumps(frames)
+    assert "external-role-body" in json.dumps(frames)
+    assert ("sibling-role-body" in json.dumps(frames)) == dependency
+
+
+def _run_vars_file_include_profile(plan, profile, **extra_vars):
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": profile, **extra_vars})
+    runtime.run_play(plan)
+    return runtime, [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
+
+
+def test_vars_file_include_uses_controller_fallback_for_host_selection(tmp_path):
+    (tmp_path / "profile-localhost.yml").write_text("task_file: selected.yml\n")
+    (tmp_path / "default.yml").write_text("- fail: {msg: compile-default-chosen}\n")
+    (tmp_path / "selected.yml").write_text("- debug: {msg: host-selected-include}\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars: {task_file: default.yml}
+  vars_files: ['profile-{{ inventory_hostname }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "host-selected-include" in result.stdout
+
+
+def test_vars_file_include_replays_inside_a_literal_include_role(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_role: {name: wrapper}
+""")
+    role_tasks = tmp_path / "roles" / "wrapper" / "tasks"
+    role_tasks.mkdir(parents=True)
+    (role_tasks / "main.yml").write_text("- include_tasks: '{{ task_file }}'\n")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+        (role_tasks / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [f"chosen-{profile}"]
+
+
+@pytest.mark.parametrize("child_action", [None, "import_tasks", "include_tasks"],
+                         ids=["changed-entry", "nested-import", "nested-include"])
+def test_vars_file_include_rejects_changed_inputs_for_build_only_body(tmp_path, child_action):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ [task_file] | path_join }}'
+""")
+    for profile in ("normal", "alternate"):
+        entry = "entry.yml" if child_action else f"{profile}.yml"
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {entry}\nchild: {profile}.yml\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+    if child_action:
+        (tmp_path / "entry.yml").write_text(f"- {child_action}: '{{{{ child }}}}'\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime, messages = _run_vars_file_include_profile(plan, "normal")
+    assert not runtime.failed, messages
+    assert messages == ["chosen-normal"]
+
+    runtime, messages = _run_vars_file_include_profile(plan, "alternate")
+    assert runtime.failed
+    assert messages == ["include_tasks selector inputs changed and no alternate task file was bundled"]
+
+
+@pytest.mark.parametrize("child_action", ["include_tasks", "import_tasks"])
+def test_vars_file_include_build_only_parent_ignores_shadowed_child_input(tmp_path, child_action):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ [task_file] | path_join }}'
+""")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: entry.yml\nchild: {profile}.yml\n")
+    (tmp_path / "entry.yml").write_text(f"- {child_action}: '{{{{ child }}}}'\n  vars: {{child: fixed.yml}}\n")
+    (tmp_path / "fixed.yml").write_text("- debug: {msg: fixed-child}\n")
+    (tmp_path / "alternate.yml").write_text("- debug: {msg: alternate-child}\n")
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == ["fixed-child"]
+
+    runtime, messages = _run_vars_file_include_profile(plan, "alternate", child="alternate.yml")
+    assert runtime.failed
+    assert messages == ["include_tasks selector inputs changed and no alternate task file was bundled"]
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["shared-entry", "different-children"])
+def test_vars_file_include_keeps_compile_snapshot_for_shared_variant_key(tmp_path, nested):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    (tmp_path / "profile-normal.yml").write_text("task_file: '{{ [\"entry.yml\"] | path_join }}'\nchild: normal.yml\n")
+    (tmp_path / "profile-alternate.yml").write_text("task_file: entry.yml\nchild: alternate.yml\n")
+    entry = "- include_tasks: '{{ child }}'\n" if nested else "- debug: {msg: shared-entry}\n"
+    (tmp_path / "entry.yml").write_text(entry)
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [f"chosen-{profile}" if nested else "shared-entry"]
+
+
+def test_vars_file_include_keeps_binding_when_optional_file_is_missing(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 15):
+        pytest.skip("Ansible Core before 2.15 requires the vars file")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files:
+    - 'profile-{{ profile }}.yml'
+    - 'optional-{{ profile }}.yml'
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    (tmp_path / "profile-normal.yml").write_text("task_file: unused.yml\n")
+    (tmp_path / "profile-alternate.yml").write_text("task_file: keep.yml\n")
+    (tmp_path / "optional-normal.yml").write_text("task_file: override.yml\n")
+    for name in ("keep", "override"):
+        (tmp_path / f"{name}.yml").write_text(f"- debug: {{msg: {name}}}\n")
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile, expected in (("normal", "override"), ("alternate", "keep")):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [expected]
+
+
+@pytest.mark.parametrize("selector", ["mapping-member", "controller-default", "literal-wrapper", "many-profiles"])
+def test_vars_file_include_retains_portable_choices(tmp_path, selector):
+    instruction = "- include_tasks: '{{ cfg.task_file }}'\n" if selector == "mapping-member" else "- include_tasks: '{{ task_file }}'\n"
+    if selector == "literal-wrapper":
+        (tmp_path / "wrapper.yml").write_text(instruction)
+        instruction = "- include_tasks: wrapper.yml\n"
+    profiles = ["normal", "alternate"]
+    if selector == "many-profiles":
+        profiles.extend(f"other-{number}" for number in range(257))
+    for number, profile in enumerate(profiles):
+        filename = "normal.yml" if profile == "normal" else "alternate.yml"
+        if selector == "mapping-member":
+            values = f"""cfg:
+  task_file: {filename}
+  unused: '{{{{ ["other"] | path_join }}}}'
+"""
+        elif selector == "controller-default" and profile == "normal":
+            values = """task_file: '{{ ["normal.yml"] | path_join }}'\n"""
+        else:
+            values = f"task_file: {filename}\nunrelated: {number}\n"
+        (tmp_path / f"profile-{profile}.yml").write_text(values)
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+""" + textwrap.indent(instruction, "    "))
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [f"chosen-{profile}"]
+
+
+@pytest.mark.parametrize("first_found", [False, True])
+def test_vars_file_include_excludes_unreachable_bodies(tmp_path, first_found):
+    extra = ""
+    selection = "'{{ prefix }}-{{ suffix }}.yml'"
+    files = """- 'prefix-{{ profile }}.yml'
+    - 'suffix-{{ profile }}.yml'"""
+    if first_found:
+        extra = ", task_file: unreachable.yml"
+        selection = "'{{ task_file }}'"
+        files = """- ['profile-{{ profile | default("normal") }}.yml', fallback.yml]"""
+        (tmp_path / "fallback.yml").write_text("task_file: normal-normal.yml\n")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"prefix-{profile}.yml").write_text(f"prefix: {profile}\n")
+        (tmp_path / f"suffix-{profile}.yml").write_text(f"suffix: {profile}\n")
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}-{profile}.yml\n")
+        (tmp_path / f"{profile}-{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+    for filename in ("normal-alternate.yml", "alternate-normal.yml", "unreachable.yml"):
+        (tmp_path / filename).write_text("- debug: {msg: unreachable-body-marker}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normalEXTRA}
+  vars_files:
+    FILES
+  tasks:
+    - include_tasks: SELECTION
+""".replace("EXTRA", extra).replace("FILES", files).replace("SELECTION", selection))
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert "unreachable-body-marker" not in json.dumps(plan)
+    runtime, messages = _run_vars_file_include_profile(plan, "alternate")
+    assert not runtime.failed, messages
+    assert messages == ["chosen-alternate"]
+
+
+@pytest.mark.parametrize("alias", ["vars", "ansible.legacy.vars", "ansible.builtin.vars"])
+def test_vars_file_alternate_selector_rejects_shadowed_vars_lookup(tmp_path, monkeypatch, alias):
+    from types import SimpleNamespace
+
+    from ansible.plugins.loader import lookup_loader
+    from ansible.plugins.lookup import vars as builtin_vars
+    from ansiroll.loader import _core_version, _portable_include_scope
+
+    plugin = tmp_path / "vars.py"
+    resolved = SimpleNamespace(plugin_resolved_path=str(plugin))
+    monkeypatch.setattr(lookup_loader, "find_plugin_with_context", lambda name: resolved)
+    task = SimpleNamespace(get_search_path=lambda: [str(tmp_path)],
+                           _loader=SimpleNamespace(get_basedir=lambda: str(tmp_path)))
+    source = ["{{ filename }}"]
+    filename = "{{ lookup('" + alias + "', 'child') }}"
+    if _core_version() >= (2, 19):
+        from ansible.template import trust_as_template
+
+        filename = trust_as_template(filename)
+    variables = {"filename": filename, "child": "child.yml"}
+    assert _portable_include_scope(task, source, variables) is None
+
+    resolved.plugin_resolved_path = builtin_vars.__file__
+    assert _portable_include_scope(task, source, variables) == variables
+    directory = tmp_path / "lookup_plugins"
+    directory.mkdir()
+    (directory / "vars.py").touch()
+    result = _portable_include_scope(task, source, variables)
+    assert (result is not None) is (alias == "ansible.builtin.vars")
+
+
+@pytest.mark.parametrize(("kind", "expression"), [("filter", "child | lower"), ("test", "child is string")])
+@pytest.mark.parametrize("location", ["playbook", "configured"])
+def test_vars_file_alternate_selector_rejects_controller_jinja_plugins(tmp_path, monkeypatch, kind, expression, location):
+    from types import SimpleNamespace
+
+    from ansible.plugins.loader import filter_loader, test_loader
+    from ansiroll.loader import _core_version, _portable_include_scope
+
+    loader = filter_loader if kind == "filter" else test_loader
+    plugin_dir = tmp_path / (kind + "_plugins" if location == "playbook" else "configured")
+    paths = [SimpleNamespace(path=str(plugin_dir), internal=False)] if location == "configured" else []
+    monkeypatch.setattr(loader, "_get_paths_with_context", lambda: paths)
+    task = SimpleNamespace(get_search_path=lambda: [str(tmp_path)],
+                           _loader=SimpleNamespace(get_basedir=lambda: str(tmp_path)))
+    filename = "{{ " + expression + " }}"
+    if _core_version() >= (2, 19):
+        from ansible.template import trust_as_template
+
+        filename = trust_as_template(filename)
+    variables = {"filename": filename, "child": "child.yml"}
+    assert _portable_include_scope(task, ["{{ filename }}"], variables) == variables
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.py").touch()
+    assert _portable_include_scope(task, ["{{ filename }}"], variables) is None
+
+
+@pytest.mark.parametrize("controller_lookup", [False, True])
+def test_vars_file_alternate_static_import_uses_safe_candidate_scope(tmp_path, monkeypatch, controller_lookup):
+    for profile in ("normal", "alternate"):
+        directory = tmp_path / profile
+        directory.mkdir()
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}/entry.yml\n")
+        child = "child.yml"
+        if controller_lookup and profile == "alternate":
+            monkeypatch.setenv("ANSIROLL_ALT_IMPORT", "child.yml")
+            child = '{{ lookup("env", "ANSIROLL_ALT_IMPORT") }}'
+        (directory / "entry.yml").write_text(f"- import_tasks: '{child}'\n")
+        (directory / "child.yml").write_text(f"- debug: {{msg: imported-{profile}}}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime, messages = _run_vars_file_include_profile(plan, "normal")
+    assert not runtime.failed, messages
+    assert messages == ["imported-normal"]
+    if controller_lookup:
+        assert "imported-alternate" not in json.dumps(plan)
+    else:
+        runtime, messages = _run_vars_file_include_profile(plan, "alternate")
+        assert not runtime.failed, messages
+        assert messages == ["imported-alternate"]
+
+
+@pytest.mark.parametrize("shared_entry", [True, False])
+@pytest.mark.parametrize("alias, unsafe", [
+    ("{{ child }}", False), ("{{ child_alias }}", False), ("{{ cfg.child }}", False), ("{{ child }}", True),
+])
+def test_vars_file_static_import_checks_child_binding(tmp_path, alias, unsafe, shared_entry, monkeypatch):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal, child_alias: '{{ child }}'}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    for profile in ("normal", "alternate"):
+        child = "{{ child }}" if profile == "alternate" else "normal.yml"
+        tag = "!unsafe " if unsafe and profile == "alternate" else ""
+        entry = "entry.yml" if shared_entry else f"entry-{profile}.yml"
+        (tmp_path / f"profile-{profile}.yml").write_text(
+            f"task_file: {entry}\nchild: {tag}{profile}.yml\ncfg: {{child: '{child}'}}\n")
+        (tmp_path / entry).write_text(f"- import_tasks: '{alias}'\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: imported-{profile}}}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [f"imported-{profile}"]
+
+    if not shared_entry:
+        (tmp_path / "override.yml").write_text("- debug: {msg: imported-override}\n")
+        runtime, messages = _run_vars_file_include_profile(
+            plan, "alternate", child="override.yml", cfg={"child": "override.yml"})
+        assert runtime.failed, messages
+        assert messages == ["no bundled task file matches 'entry-alternate.yml'"]
+
+    secret = "ANSIROLL_TEST_ALT_IMPORT_SECRET"
+    monkeypatch.setenv(secret, "must-not-be-captured")
+    (tmp_path / "alternate.yml").write_text(f'''- debug:
+    msg: "{{{{ lookup('env', '{secret}') }}}}"
+''')
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "must-not-be-captured" not in json.dumps(plan)
+
+
+def test_vars_file_include_variant_retains_applied_keywords(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires include-time apply keyword rendering")
+    for profile, hidden in (("normal", False), ("alternate", True)):
+        (tmp_path / f"profile-{profile}.yml").write_text(
+            f"task_file: {profile}.yml\nhide: {json.dumps(hidden)}\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: '{{{{ chosen }}}}-{profile}'}}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks:
+        file: '{{ task_file }}'
+        apply:
+          vars: {chosen: applied}
+          no_log: '{{ hide }}'
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile, hidden in (("normal", False), ("alternate", True)):
+        frames = []
+        runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                          extra_vars={"profile": profile})
+        runtime.run_play(plan)
+        assert not runtime.failed, frames
+        result = next(frame["result"] for frame in frames if frame["action"] == "debug")
+        if hidden:
+            assert "censored" in result
+        else:
+            assert result["msg"] == "applied-normal"
+
+
+def test_vars_file_include_retains_native_static_import_magic(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+        (tmp_path / f"{profile}.yml").write_text(
+            """- import_tasks: "{{ 'child.yml' if ansible_playbook_python is defined else 'missing.yml' }}"\n""")
+    (tmp_path / "child.yml").write_text("- debug: {msg: imported-child}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == ["imported-child"]
+
+
+def test_vars_file_include_rebinds_defaulted_filename_variable(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {choice: build}
+  vars_files:
+    - 'transition-{{ choice }}.yml'
+    - "first-{{ profile | default('normal') }}.yml"
+    - 'second-{{ profile }}.yml'
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    files = {
+        "transition-build.yml": "profile: build",
+        "transition-launch.yml": "{}",
+        "first-build.yml": "{}",
+        "first-normal.yml": "profile: next",
+        "second-build.yml": "task_file: build.yml",
+        "second-next.yml": "task_file: launch.yml",
+        "build.yml": "- debug: {msg: build-body}",
+        "launch.yml": "- debug: {msg: launch-body}",
+    }
+    for name, source in files.items():
+        (tmp_path / name).write_text(source + "\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"choice": "launch"})
+    runtime.run_play(plan)
+    assert not runtime.failed, frames
+    assert [frame["result"]["msg"] for frame in frames if frame.get("action") == "debug"] == ["launch-body"]
+
+
+def test_vars_file_variant_writes_invalidate_an_earlier_include_path(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal, subsequent: original.yml}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: wrapper.yml
+      loop: [1, 2]
+""")
+    sources = {
+        "profile-normal.yml": "variant: normal.yml",
+        "profile-alternate.yml": "variant: alternate.yml",
+        "wrapper.yml": "- name: earlier include\n  include_tasks: '{{ subsequent }}'\n- include_tasks: '{{ variant }}'",
+        "normal.yml": "- set_fact: {subsequent: updated.yml}",
+        "alternate.yml": "- debug: {msg: alternate}",
+        "original.yml": "- debug: {msg: original}",
+        "updated.yml": "- debug: {msg: updated}",
+    }
+    for name, source in sources.items():
+        (tmp_path / name).write_text(source + "\n")
+    _, manifest = compile_playbook(str(playbook))
+    assert any(task["name"] == "earlier include" for task in manifest["fallback_tasks"])
+
+
+def test_skipped_include_with_non_string_filename_compiles(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {task_file: 1}
+  tasks:
+    - include_tasks: '{{ task_file }}'
+      when: false
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
+@pytest.mark.parametrize("prefix", ["", "{{ playbook_dir }}/"])
+def test_vars_file_include_resolves_unsafe_filename_as_literal(tmp_path, prefix):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: 'PREFIX{{ task_file }}'
+""".replace("PREFIX", prefix))
+    (tmp_path / "profile-normal.yml").write_text("task_file: normal.yml\n")
+    (tmp_path / "profile-alternate.yml").write_text("task_file: !unsafe alternate.yml\n")
+    (tmp_path / "normal.yml").write_text("- debug: {msg: default-body}\n")
+    (tmp_path / "alternate.yml").write_text("- debug: {msg: alternate-body}\n")
+    source, _ = compile_playbook(str(playbook))
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "alternate"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert "alternate-body" in json.dumps(frames)
