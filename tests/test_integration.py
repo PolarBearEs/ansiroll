@@ -557,23 +557,29 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     assert runtime.vars["selected"] == "production"
 
 
-def test_first_found_vars_files_rejects_unverified_absolute_environment_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("absolute", [True, False], ids=["absolute", "matched-relative"])
+def test_first_found_vars_files_rejects_unverified_environment_path(tmp_path, monkeypatch, absolute):
     from ansiroll.runtime import VarsFilesError
     from tests import ansible_playbook_command
 
     directory = tmp_path / "controller-selected"
     directory.mkdir()
     (directory / "prod.yml").write_text("selected: requested\n")
+    if not absolute:
+        literal = tmp_path / "$ANSIROLL_TEST_FIRST_FOUND_DIR"
+        literal.mkdir()
+        (literal / "prod.yml").write_text("selected: literal\n")
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
     monkeypatch.setenv("ANSIROLL_TEST_FIRST_FOUND_DIR", directory.name)
     playbook = tmp_path / "play.yml"
+    prefix = "playbook_dir ~ '/" if absolute else "'"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
-    - "{{ lookup('first_found', [playbook_dir ~ '/$ANSIROLL_TEST_FIRST_FOUND_DIR/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+    - "{{ lookup('first_found', [PREFIX$ANSIROLL_TEST_FIRST_FOUND_DIR/' ~ profile ~ '.yml', 'fallback.yml']) }}"
   tasks:
     - assert: {that: selected == 'requested'}
-""")
+""".replace("PREFIX", prefix))
     native = subprocess.run(
         ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
         cwd=tmp_path, capture_output=True, text=True, timeout=30,
