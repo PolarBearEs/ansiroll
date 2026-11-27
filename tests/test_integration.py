@@ -5792,6 +5792,32 @@ def test_strategy_retains_rescued_assert_conditions_from_dynamic_args(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_strategy_preserves_finalized_set_fact_args_after_rescue(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("checks native finalized failed-task arguments on Core 2.21")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  vars: {source_value: finalized}
+  tasks:
+    - block:
+        - set_fact:
+            bad-key: '{{ source_value }}'
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  gather_facts: false
+  vars: {source_value: changed}
+  tasks:
+    - assert:
+        that: ansible_failed_task.args['bad-key'] == 'finalized'
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_preserves_undefined_rescued_arguments_in_later_agents(tmp_path):
     from ansiroll.loader import _core_version
 

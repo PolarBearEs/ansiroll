@@ -6497,6 +6497,7 @@ class Runtime:
         if "args" not in args_cache:
             args_cache["args"] = self._set_fact_args(task, ctx)
         args = args_cache["args"]
+        self._executed_task_args = args
         cacheable = _boolean(args.get("cacheable", False), strict=True)
         modern = _core_at_least(2, 19)
         reserved = {"true", "false", "none", "True", "False", "None", "not"}
@@ -8402,10 +8403,33 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), sc
     return value
 
 
+class _LegacyDatetimeKey:
+    """An exact datetime key that exceeds the legacy interpreter's range."""
+
+    __slots__ = ("_timestamp",)
+
+    def __init__(self, timestamp):
+        self._timestamp = timestamp
+
+    def isoformat(self):
+        return self._timestamp
+
+    def __hash__(self):
+        return hash((_LegacyDatetimeKey, self._timestamp))
+
+    def __eq__(self, other):
+        if not isinstance(other, _LegacyDatetimeKey):
+            return NotImplemented
+        return self._timestamp == other._timestamp
+
+    def __repr__(self):
+        return "_LegacyDatetimeKey(%r)" % self._timestamp
+
+
 def _encode_delegated_key(key):
     from datetime import date, datetime
 
-    if isinstance(key, datetime):
+    if isinstance(key, (datetime, _LegacyDatetimeKey)):
         return {"datetime": key.isoformat()}
     if isinstance(key, date):
         return {"date": key.isoformat()}
@@ -8455,7 +8479,7 @@ def _pack_include_value(value, *, preserve_scalars=False):
         return {"value": json.loads(json.dumps(value, default=str, skipkeys=True)), "undefined": []}
 
 
-def _decode_delegated_key(key):
+def _decode_delegated_key(key, *, mapping_key=True):
     if isinstance(key, list):
         return tuple(_decode_delegated_key(part) for part in key)
     if isinstance(key, dict):
@@ -8488,12 +8512,13 @@ def _decode_delegated_key(key):
                                    microseconds=int(micros or 0))
             if sign == "-":
                 offset = -offset
-            return _legacy_offset_datetime(value, offset)
+            key_text = key["datetime"] if mapping_key else None
+            return _legacy_offset_datetime(value, offset, key_text)
         return value
     return key
 
 
-def _legacy_offset_datetime(value, offset):
+def _legacy_offset_datetime(value, offset, key_text):
     try:
         return (value - offset).replace(tzinfo=_dt.timezone.utc)
     except OverflowError:
@@ -8506,6 +8531,9 @@ def _legacy_offset_datetime(value, offset):
         try:
             value += adjustment
         except OverflowError:
+            if key_text is not None:
+                # Clamping a key could overwrite a distinct entry.
+                return _LegacyDatetimeKey(key_text)
             # Offsets of 24 hours are invalid. Use the closest instant the
             # legacy interpreter can represent when even 23:59 is too small.
             value = _dt.datetime.min if adjustment.days < 0 else _dt.datetime.max
@@ -8525,7 +8553,8 @@ def _replace_delegated_values(value, replacements):
 
 def _restore_rescue_scalars(packed):
     return _replace_delegated_values(
-        packed["value"], ((path, _decode_delegated_key(scalar)) for path, scalar in packed.get("scalars", ())))
+        packed["value"], ((path, _decode_delegated_key(scalar, mapping_key=False))
+                          for path, scalar in packed.get("scalars", ())))
 
 
 def _restore_delegated_mapping_keys(value, mapping_keys):

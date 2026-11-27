@@ -74,6 +74,9 @@ def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch
         "above_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-extreme)),
     }
     packed = runtime._pack_include_value({**values, **bounds}, preserve_scalars=True)
+    first_key = bounds["below_min"]
+    second_key = datetime.datetime.min.replace(tzinfo=datetime.timezone(extreme - datetime.timedelta(seconds=15)))
+    packed_keys = runtime._pack_include_value({first_key: "first", second_key: "second", first_key.isoformat(): "text"})
     legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime,
                                       min=datetime.datetime.min, max=datetime.datetime.max)
     monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime,
@@ -85,6 +88,9 @@ def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch
     assert restored["near_max"].isoformat() == "9999-12-31T23:59:29.999999-00:01"
     assert restored["below_min"].isoformat() == "0001-01-01T00:00:00+23:59"
     assert restored["above_max"].isoformat() == "9999-12-31T23:59:59.999999-23:59"
+    restored_keys = runtime._restore_delegated_mapping_keys(packed_keys["value"], packed_keys["mapping_keys"])
+    assert list(restored_keys.values()) == ["first", "second", "text"]
+    assert runtime._pack_include_value(restored_keys)["mapping_keys"] == packed_keys["mapping_keys"]
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():
