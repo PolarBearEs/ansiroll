@@ -3354,6 +3354,74 @@ def test_unresolved_vars_files_name_leaves_templated_include_to_runtime(tmp_path
     assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
 
 
+@pytest.mark.parametrize(("binding", "name", "extension", "selected"), [
+    ("index_var", "{{ binding_name }}", False, ["zero", "one"]),
+    ("loop_var", "{{ binding_name }}", False, ["one", "zero"]),
+    ("index_var", "slot{# loop index #}", False, ["zero", "one"]),
+    ("index_var", "{{ binding_name }}", True, ["zero", "one"]),
+], ids=["index", "item", "index-with-comment", "jinja-extension"])
+def test_nested_include_selector_defers_templated_loop_binding(tmp_path, monkeypatch, binding, name, extension, selected):
+    selector = "{{ selected }}"
+    if extension:
+        monkeypatch.setenv("ANSIBLE_JINJA2_EXTENSIONS", "jinja2.ext.do")
+        selector = "{% do slot %}" + selector
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    binding_name: slot
+    slot: 42
+    selected: "{{ slot }}.yml"
+  tasks:
+    - include_tasks: outer.yml
+      loop: [1, 0]
+      loop_control:
+        BINDING: "NAME_TEMPLATE"
+    - include_tasks: literal_parent.yml
+      loop: [one, two]
+      loop_control:
+        index_var: "{{ binding_name }}"
+""".replace("BINDING", binding).replace("NAME_TEMPLATE", name),
+        "outer.yml": "- name: Select task file\n  include_tasks: " + json.dumps(selector) + "\n",
+        "literal_parent.yml": """
+- include_tasks: "{{ 'literal.yml' }}"
+""", "literal.yml": "- debug: msg=literal\n", "0.yml": "- debug: msg=zero\n",
+        "1.yml": "- debug: msg=one\n", "42.yml": "- debug: msg=wrong\n"})
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    assert expected[0] == selected + ["literal", "literal"]
+    _source, manifest = compile_playbook(str(playbook))
+    assert [item["name"] for item in manifest["fallback_tasks"]] == ["Select task file"]
+    assert _ansible(playbook, strategy="ansiroll.core.ansiroll", returncode=0) == expected
+
+
+def test_deferred_loop_include_keeps_delegated_fact_routing(tmp_path):
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  vars: {binding_name: slot, slot: 42}
+  tasks:
+    - include_tasks: outer.yml
+      loop: [one]
+      loop_control:
+        index_var: "{{ binding_name }}"
+    - debug:
+        msg: "local={{ marker | default('missing') }} remote={{ hostvars.recipient.marker | default('missing') }}"
+""", "outer.yml": '- include_tasks: "{{ slot }}.yml"\n', "0.yml": """
+- set_fact:
+    marker: "{{ entry.value }}"
+  delegate_to: recipient
+  delegate_facts: "{{ entry.route }}"
+  loop_control: {loop_var: entry}
+  loop:
+    - {value: local, route: false}
+    - {value: remote, route: true}
+"""})
+    messages, _ = _ansible(tmp_path / "pb.yml", "-i", "recipient,",
+                           strategy="ansiroll.core.ansiroll", returncode=0)
+    assert messages == ["local=local remote=remote"]
+
+
 def test_unresolved_vars_files_name_keeps_includes_named_by_extra_vars_or_literals(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost

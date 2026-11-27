@@ -1892,7 +1892,7 @@ def _has_dynamic_include(nodes):
     return False
 
 
-def _depends_on_vars(value, variables, matches):
+def _depends_on_vars(value, variables, matches, *, unknown_is_dependency=False):
     """Follow Jinja variable references through known values."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -1911,7 +1911,7 @@ def _depends_on_vars(value, variables, matches):
         try:
             parsed = env.parse(value)
         except TemplateSyntaxError:
-            return False
+            return unknown_is_dependency
         for call in parsed.find_all(nodes.Call):
             if (not isinstance(call.node, nodes.Name)
                     or call.node.name not in ("lookup", "query", "q")):
@@ -2224,12 +2224,33 @@ def _record_build_only_selector_reads(includes, higher_layers, reads):
                                                 for name, path in reads if name not in _MAGIC_VAR_NAMES)
 
 
+def _has_templated_loop_binding(task):
+    while task is not None:
+        if getattr(task, "loop", None) is not None:
+            for name in (_loop_var(task), _index_var(task)):
+                if isinstance(name, str) and any(token in name for token in ("{{", "{%", "{#")):
+                    return True
+        task = _include_parent(task)
+    return False
+
+
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand an include and any bodies selected by replayed vars files."""
     args = task.args or {}
     raw_fname = args.get("_raw_params") or args.get("file")
     if not isinstance(raw_fname, str):
         return None
+    parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
+    sources = (raw_fname, *parents)
+    # Core renders loop binding names in the live task scope. An authored name
+    # template can shadow any variable used in the filename or parent search path.
+    if _has_templated_loop_binding(task) and any(
+            _depends_on_vars(source, {}, lambda name: True, unknown_is_dependency=True)
+            for source in sources):
+        node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
+        node["_deferred_loop_include"] = True
+        node["fallback_reason"] = "include_tasks with templated loop bindings requires core linear"
+        return node
     fname = _template_include_filename(task, raw_fname, includes) if _is_templated(raw_fname) else raw_fname
     if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
         return None
@@ -2242,9 +2263,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                                          paths=reads, unknown_lookup=unknown_lookup) is None or unknown_lookup):
             reads.update((name, ()) for name in includes.build_only_selector_names)
         _record_build_only_selector_reads(includes, higher_layers, reads)
-    parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
     if fname is None or (parents and includes.vars_file_scopes is not None):
-        sources = (raw_fname, *parents)
         variants, inputs = _vars_file_include_variants(task, sources, includes)
         if fname is None and not variants and any(
                 value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):

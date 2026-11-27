@@ -335,6 +335,9 @@ class StrategyModule(StrategyBase):
         if any(item["kind"] == "vars-file-include" for item in controller_reasons):
             self._requires_linear_fallback = True
             linear_reason = "vars-file task selection requires core linear"
+        elif any(item["kind"] == "loop-include" for item in controller_reasons):
+            self._requires_linear_fallback = True
+            linear_reason = "include_tasks with templated loop bindings requires core linear"
         elif self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
         elif any(item["kind"] == "vault-source" for item in controller_reasons):
@@ -1944,6 +1947,8 @@ def _controller_fallbacks(play_node):
                     kind = "vars-file-include"
                 elif node.get("_deferred_apply_include"):
                     kind = "apply-include"
+                elif node.get("_deferred_loop_include"):
+                    kind = "loop-include"
                 found.append({
                     "kind": kind,
                     "task": node.get("name") or node.get("action"),
