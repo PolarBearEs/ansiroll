@@ -564,6 +564,64 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     assert runtime.vars["selected"] == "production"
 
 
+@pytest.mark.parametrize("candidate", ["prod.yml/", "./prod.yml", "nested//../prod.yml"])
+def test_first_found_vars_files_preserves_relative_candidate_spelling(tmp_path, candidate):
+    from tests import ansible_playbook_command
+
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "prod.yml").write_text("selected: production\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    expected = "fallback" if candidate.endswith("/") else "production"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', ['CANDIDATE', 'fallback.yml', profile ~ '.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'EXPECTED'}
+""".replace("CANDIDATE", candidate).replace("EXPECTED", expected))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == expected
+
+
+def test_first_found_vars_files_rejects_unresolved_named_home(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    home = "~ansiroll_unresolved_fixture_user"
+    assert os.path.expanduser(home) == home
+    wrong_root = tmp_path / "files" / home
+    wrong_root.mkdir(parents=True)
+    (wrong_root / "prod.yml").write_text("selected: wrong-root-fixture-marker\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', ['HOME_DIR/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'fallback'}
+""".replace("HOME_DIR", home))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "wrong-root-fixture-marker" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    with pytest.raises(VarsFilesError, match="unresolved home"):
+        runtime.run_play(plan)
+
+
 @pytest.mark.parametrize("spelling", ["absolute", "matched-relative", "tilde"])
 def test_first_found_vars_files_rejects_unverified_environment_path(tmp_path, monkeypatch, spelling):
     from ansiroll.runtime import VarsFilesError

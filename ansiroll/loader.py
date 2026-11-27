@@ -1525,19 +1525,22 @@ def _deferred_vars_files(play, basedir, entries):
                     first_found_roots, search_path, known_search_path = first_found_search
                     plugin, patterns, named_homes = modeled
                     candidates = set()
-                    parent_paths = set()
+                    matched_spellings = set()
                     for pattern in patterns:
-                        absolute_parent = os.path.isabs(pattern) and os.pardir in pattern.split(os.path.sep)
+                        absolute = os.path.isabs(pattern)
+                        if pattern.startswith("~") or absolute and _FIRST_FOUND_ENV_REFERENCE.search(pattern):
+                            continue
+                        absolute_parent = absolute and os.pardir in pattern.split(os.path.sep)
                         # Core normalizes absolute candidates before looking for them.
-                        discovery = os.path.normpath(pattern) if absolute_parent else pattern
+                        discovery = os.path.normpath(pattern) if absolute else pattern
                         for root in first_found_roots:
                             for path in glob.glob(os.path.join(glob.escape(root), discovery)):
                                 if not os.path.exists(path):
                                     continue
-                                if absolute_parent or os.pardir in path.split(os.path.sep):
-                                    # Relative paths retain the spelling reached from their search root.
-                                    parent_paths.add(path)
                                 normalized = os.path.normpath(path)
+                                if absolute_parent or path != normalized:
+                                    # Relative candidates must match with their original spelling.
+                                    matched_spellings.add(path)
                                 candidates.add(normalized)
                                 # Match the literal candidate for diagnostics without letting
                                 # path_dwim load data from an environment-expanded path.
@@ -1545,7 +1548,7 @@ def _deferred_vars_files(play, basedir, entries):
                                     files[normalized] = _bundled_vars_file(play, normalized)
                     first_found[name] = {"plugin": plugin, "patterns": patterns,
                                          "roots": first_found_roots, "files": sorted(candidates),
-                                         "parent_paths": sorted(parent_paths),
+                                         "matched_spellings": sorted(matched_spellings),
                                          "home": os.path.expanduser("~"), "named_homes": named_homes,
                                          "search_path": search_path, "search_path_known": known_search_path}
                     continue

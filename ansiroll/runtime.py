@@ -1669,7 +1669,7 @@ def _first_found_vars_file(args, kwargs, selector):
             terms = (files,)
         filenames = [tuple(split_terms((term,), "[,;]")) if modern else (term,) for term in split_terms(terms)]
     bundled = selector["files"]
-    parent_paths = selector.get("parent_paths")
+    matched_spellings = selector.get("matched_spellings", selector.get("parent_paths"))
     render_candidate = selector.get("render_candidate")
     environment_path_error = ("first_found paths with environment references require selecting "
                               "the vars_files name at compile time")
@@ -1691,11 +1691,13 @@ def _first_found_vars_file(args, kwargs, selector):
                     directory = selector.get("named_homes", {}).get(home)
                     if home == "~":
                         directory = selector["home"]
-                    if directory is not None:
-                        candidate = os.path.join(directory, relative) if relative else directory
+                    if directory is None:
+                        raise ValueError("first_found cannot replay unresolved home %r; select the vars_files name "
+                                         "at compile time" % home)
+                    candidate = os.path.join(directory, relative) if relative else directory
                 covered = any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"])
                 parent_relative = os.pardir in candidate.split(os.path.sep)
-                if parent_relative and (not covered or parent_paths is None):
+                if parent_relative and (not covered or matched_spellings is None):
                     raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
                 absolute = os.path.isabs(candidate)
                 if not absolute and not selector.get("search_path_matches", True):
@@ -1706,7 +1708,8 @@ def _first_found_vars_file(args, kwargs, selector):
                     candidate_path = os.path.join(root, candidate)
                     path = os.path.normpath(candidate_path)
                     checked_path = path if absolute else candidate_path
-                    if path in bundled and (not parent_relative or checked_path in parent_paths):
+                    exact_match = checked_path == path and not parent_relative
+                    if path in bundled and (exact_match or checked_path in (matched_spellings or ())):
                         if _FIRST_FOUND_ENV_REFERENCE.search(candidate_path):
                             raise ValueError(environment_path_error)
                         return [path]
