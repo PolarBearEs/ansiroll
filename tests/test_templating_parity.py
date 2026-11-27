@@ -258,6 +258,27 @@ def test_implicit_setup_eagerly_renders_legacy_defaults(tmp_path):
     assert result == expected
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("fail_on_undefined", [True, False], ids=["strict", "keep-undefined"])
+def test_implicit_setup_validates_unrelated_defaults_on_legacy_core(
+        tmp_path, monkeypatch, use_strategy, fail_on_undefined):
+    if MODERN_TEMPLATING and not fail_on_undefined:
+        pytest.skip("modern Core does not offer the legacy undefined-variable setting")
+    if not MODERN_TEMPLATING:
+        monkeypatch.setenv("ANSIBLE_ERROR_ON_UNDEFINED_VARS", str(fail_on_undefined))
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_subset: ['!all', '!min', distribution]
+  module_defaults:
+    COPY_ACTION:
+      owner: "{{ undefined_copy_owner }}"
+      group: "{{ [undefined_copy_group] }}"
+  tasks: []
+""".replace("COPY_ACTION", "copy" if LEGACY_SETUP else "ansible.builtin.copy"),
+        use_strategy=use_strategy)
+    assert recap[3] == ("1" if fail_on_undefined and not MODERN_TEMPLATING else "0")
+
+
 @pytest.mark.skipif(Version(__version__) >= Version("2.12"), reason="only older cores use legacy setup")
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_setup_honors_legacy_module_default_names(tmp_path, use_strategy):
@@ -331,6 +352,64 @@ def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strate
                               else '{{ [lookup("PLUGIN", "fact-filter.txt")] }}').replace("PLUGIN", plugin)),
         {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=use_strategy)
     assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("mode", ["ignore", "warn", "strict"])
+@pytest.mark.parametrize("invocation", ["lookup", "query", "wantlist"])
+def test_implicit_setup_replays_missing_controller_file(tmp_path, monkeypatch, mode, invocation):
+    if mode == "strict" and not MODERN_TEMPLATING:
+        monkeypatch.setenv("ANSIBLE_ERROR_ON_UNDEFINED_VARS", "False")
+    call = "query" if invocation == "query" else "lookup"
+    options = ", wantlist=True" if invocation == "wantlist" else ""
+    found = "None" if invocation == "lookup" else "[]"
+    fallback = "'ansible_distribution'" if LEGACY_SETUP else "['ansible_distribution']"
+    expression = '{{ (%s("file", "present.txt", "missing.txt", errors="%s"%s) == %s) | ternary(%s, omit) }}' % (
+        call, mode, options, found, fallback)
+    path = _write(tmp_path, """
+- hosts: localhost
+  module_defaults:
+    SETUP_ACTION:
+      filter: FILTER_EXPRESSION
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup")
+       .replace("FILTER_EXPRESSION", json.dumps(expression)),
+        {"files/present.txt": "ansible_hostname\n"})
+
+    expected = _ansible(path, tmp_path)
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(path))[0])
+    # The runner must use the controller's result even if a target file exists.
+    (tmp_path / "files/missing.txt").write_text("ansible_hostname\n")
+    proc = subprocess.run([sys.executable, str(script)], cwd=tmp_path,
+                          env=_env(), capture_output=True, text=True, timeout=30)
+    assert _summary(proc.stdout, proc.stderr) == expected
+    if mode == "strict":
+        assert expected[1][3] == "1"
+        assert "missing.txt" in proc.stdout
+    else:
+        assert expected[0] == ["filtered"]
+        assert ("[WARNING]" in proc.stderr and "missing.txt" in proc.stderr) == (mode == "warn")
+
+
+def test_implicit_setup_cannot_suppress_uncaptured_controller_file(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  vars:
+    filter_file: target.txt
+  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ query("file", filter_file, errors="ignore") or ["ansible_distribution"] }}'
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(path))[0])
+    (tmp_path / "target.txt").write_text("ansible_hostname\n")
+    proc = subprocess.run([sys.executable, str(script)], cwd=tmp_path,
+                          env=_env(), capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0
+    assert "setup requires an uncaptured controller file 'target.txt'" in proc.stdout
 
 
 @pytest.mark.parametrize("plugin", ["example.custom.file", "file"])

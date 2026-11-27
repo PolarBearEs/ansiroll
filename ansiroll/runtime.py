@@ -286,25 +286,46 @@ def _looks_templated(value):
 
 
 def _selector_local_values(names, bindings, variables=None):
-    """Follow assignment-time names to constants, leaving other locals opaque."""
-    values = dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)
-    for name, sources in names.items():
-        visited = set()
-        while len(sources) == 1:
-            source, = sources
-            if isinstance(source, jinja2.nodes.Const):
-                literal = source.value
-                values[name] = _UnsafeText(literal) if isinstance(literal, str) else literal
-                break
-            if not isinstance(source, jinja2.nodes.Name) or id(source) in visited:
-                break
-            visited.add(id(source))
-            sources = bindings.get(id(source), {}).get(source.name, ())
-            if not sources and variables is not None:
-                value = _selector_vars_key(source, variables, ())
-                if isinstance(value, (str, int, float, bool, type(None))):
-                    values[name] = value
-    return values
+    """Resolve scalar assignments using the bindings visible at their definition."""
+    unknown = _UNRESOLVED_SELECTOR_KEY
+    nodes = jinja2.nodes
+    cache = {}
+
+    def resolve(sources, depth):
+        if len(sources) != 1 or depth >= 64:
+            return unknown
+        source, = sources
+        if isinstance(source, nodes.Const):
+            return _selector_literal(source.value)
+        if not isinstance(source, (nodes.Name, nodes.Call)):
+            return unknown
+        key = id(source)
+        if key not in cache:
+            scope = bindings.get(key, {})
+
+            def resolve_name(node):
+                if node.name in scope:
+                    return resolve(scope[node.name], depth + 1)
+                if variables is not None:
+                    return _selector_vars_key(node, variables, ())
+                return unknown
+
+            value = _selector_vars_key(source, variables or {}, resolve_name=resolve_name)
+            cache[key] = (_selector_literal(value)
+                          if isinstance(value, (str, int, float, bool, type(None))) else unknown)
+        return cache[key]
+
+    return {name: resolve(sources, 0) for name, sources in names.items()}
+
+
+def _selector_literal(value):
+    return _UnsafeText(value) if isinstance(value, str) else value
+
+
+def _is_selector_string_call(node):
+    nodes = jinja2.nodes
+    return (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Getattr)
+            and node.node.attr in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None)
 
 
 def _selector_scope(expression, variables, *, retain_mutable=False):
@@ -441,8 +462,9 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
             local = names.copy()
         for child in node.iter_child_nodes():
             visit(child, local, top if local is names else context)
-        if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(
-                node.node, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Const)):
+        if (isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name)
+                and (isinstance(node.node, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Const))
+                     or _is_selector_string_call(node.node))):
             names[node.target.name] = frozenset({node.node})
         elif isinstance(node, (nodes.Assign, nodes.AssignBlock)):
             names.update(dict.fromkeys(target_names(node.target), unknown_local))
@@ -638,13 +660,14 @@ def _selector_default_uses_fallback(value, boolean):
     return not truth if boolean is True and truth is not None else None
 
 
-def _selector_vars_key(node, variables, aliases=None, *, template_variables=None):
+def _selector_vars_key(node, variables, aliases=None, *, template_variables=None, resolve_name=None):
     """Resolve known values without running template plugins."""
     if template_variables is None:
         template_variables = variables
 
     def resolve(child):
-        return _selector_vars_key(child, variables, aliases, template_variables=template_variables)
+        return _selector_vars_key(child, variables, aliases, template_variables=template_variables,
+                                  resolve_name=resolve_name)
 
     unknown = _UNRESOLVED_SELECTOR_KEY
     missing = _MISSING_VARS_FILE_INPUT
@@ -667,11 +690,13 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
         if truth is not None:
             return not truth
     if isinstance(node, jinja2.nodes.Name):
+        if resolve_name is not None:
+            return resolve_name(node)
         value = variables.get(node.name, missing)
         if value is None or value is missing:
             return value
         if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
-            return value["__ansiroll_unsafe__"]
+            return _selector_literal(value["__ansiroll_unsafe__"])
         if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
             return value
         if isinstance(value, (int, float, dict, list, tuple)):
@@ -704,18 +729,16 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
                 return unknown
             left = right
         return True
-    if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
-        method = node.node.attr
-        if method in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None:
-            value = resolve(node.node.node)
-            args = [resolve(arg) for arg in node.args]
-            kwargs = {kw.key: resolve(kw.value) for kw in node.kwargs}
-            if isinstance(value, str) and all(arg is not unknown and arg is not missing
-                                              for arg in (*args, *kwargs.values())):
-                try:
-                    return getattr(str, method)(value, *args, **kwargs)
-                except (TypeError, ValueError, OverflowError):
-                    return unknown
+    if _is_selector_string_call(node):
+        value = resolve(node.node.node)
+        args = [resolve(arg) for arg in node.args]
+        kwargs = {kw.key: resolve(kw.value) for kw in node.kwargs}
+        if isinstance(value, str) and all(arg is not unknown and arg is not missing
+                                          for arg in (*args, *kwargs.values())):
+            try:
+                return getattr(str, node.node.attr)(value, *args, **kwargs)
+            except (TypeError, ValueError, OverflowError):
+                return unknown
     if isinstance(node, jinja2.nodes.Getitem):
         value = resolve(node.node)
         index = resolve(node.arg)
@@ -1757,7 +1780,17 @@ def _lookup_values(name, args, kwargs, ctx=None):
         rstrip = kwargs.get("rstrip", True)
         if setup_lookups is not None:
             files = setup_lookups.get("file", {}).get(qualified_name, {})
+            failures = setup_lookups.get("file_errors", {}).get(qualified_name, {})
             for term in map(str, args):
+                if term in failures:
+                    message = "lookup plugin %r failed for controller file %r: %s" % (
+                        qualified_name, term, failures[term])
+                    mode = kwargs.get("errors", "strict")
+                    if mode == "warn":
+                        sys.stderr.write("[WARNING]: %s\n" % message)
+                    elif mode != "ignore":
+                        raise ValueError(message)
+                    return None
                 if term not in files:
                     raise ValueError("setup requires an uncaptured controller file %r" % term)
                 value = files[term]
@@ -1850,6 +1883,8 @@ def _lookup(name, *args, **kwargs):
     ctx = kwargs.pop("_ansiroll_ctx", None)
     wantlist = kwargs.pop("wantlist", False)
     vals = _lookup_values(name, args, kwargs, ctx)
+    if vals is None:
+        return [] if wantlist else None
     if wantlist:
         return vals
     if len(vals) == 1:
@@ -1860,7 +1895,8 @@ def _lookup(name, *args, **kwargs):
 def _query(name, *args, **kwargs):
     ctx = kwargs.pop("_ansiroll_ctx", None)
     kwargs.pop("wantlist", None)
-    return _lookup_values(name, args, kwargs, ctx)
+    vals = _lookup_values(name, args, kwargs, ctx)
+    return [] if vals is None else vals
 
 
 def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
@@ -4529,7 +4565,7 @@ class Runtime:
             # set_fact: they outrank play/role/block/task vars.
             self._set_fact_overrides[name] = self.vars[name]
 
-    def template(self, value, ctx, _seen=None, strict=False):
+    def template(self, value, ctx, _seen=None, strict=False, *, keep_undefined=False):
         if isinstance(value, (dict, list, tuple)):
             if _seen is None:
                 _seen = set()
@@ -4544,13 +4580,21 @@ class Runtime:
             if set(value.keys()) == {"__ansiroll_vault__"}:
                 return value
             # Ansible leaves mapping keys literal.
-            return {_mark_unsafe_key(k): self.template(v, ctx, _seen, strict)
+            return {_mark_unsafe_key(k): self.template(v, ctx, _seen, strict, keep_undefined=keep_undefined)
                     for k, v in value.items()}
         if isinstance(value, list):
-            return [self.template(v, ctx, _seen, strict) for v in value]
+            return [self.template(v, ctx, _seen, strict, keep_undefined=keep_undefined) for v in value]
         if isinstance(value, tuple):
-            return tuple(self.template(v, ctx, _seen, strict) for v in value)
+            return tuple(self.template(v, ctx, _seen, strict, keep_undefined=keep_undefined) for v in value)
         if isinstance(value, str):
+            if keep_undefined:
+                try:
+                    return _fail_on_undef(self.template(value, ctx, _seen, strict))
+                except _CapturedTemplateError:
+                    raise
+                except jinja2.UndefinedError:
+                    # Legacy Ansible keeps the source of an unresolved expression.
+                    return value
             out = self.templater.render_string(value, ctx, strict=strict)
             if isinstance(out, (dict, list, tuple, _RawSnapshotMapping, _RawSnapshotList)) and out is not value:
                 # A bare expression returned a container that may hold lazy
@@ -5019,6 +5063,7 @@ class Runtime:
                 setup_options=play.get("gather_setup_options"),
                 setup_defaults=play.get("gather_setup_defaults"),
                 gather_defaults=play.get("gather_action_defaults"),
+                legacy_defaults=play.get("gather_legacy_defaults"),
                 option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
@@ -7862,22 +7907,31 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
-    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False):
-        def check_dependencies(value, *, mapping_shape=False):
-            if not blocked:
-                return
-            for source, _, _ in _selector_template_sources(value):
-                paths = set()
-                inputs = self._pre_setup_template_inputs(
-                    source, ctx, selector=True, paths=paths, setup_lookups=True, mapping_shape=mapping_shape)
-                if inputs is None or _vars_file_reads_blocked(blocked, paths):
-                    raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
+    def _check_setup_default_dependencies(self, value, ctx, blocked, *, mapping_shape=False):
+        if not blocked:
+            return
+        for source, _, _ in _selector_template_sources(value):
+            paths = set()
+            inputs = self._pre_setup_template_inputs(
+                source, ctx, selector=True, paths=paths, setup_lookups=True, mapping_shape=mapping_shape)
+            if inputs is None or _vars_file_reads_blocked(blocked, paths):
+                raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
 
+    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False,
+                               legacy_defaults=None):
+        if legacy_defaults:
+            # Legacy Core templates the whole defaults map before selecting an action.
+            self._check_setup_default_dependencies(legacy_defaults, ctx, blocked)
+            config = ctx.get("__ansiroll_controller_config", {})
+            keep_undefined = config.get("DEFAULT_UNDEFINED_VAR_BEHAVIOR") is False
+            rendered = _fail_on_undef(self.template(
+                legacy_defaults, ctx, strict=True, keep_undefined=keep_undefined))
+            layers = [rendered[key] for key in layers or ()]
         defaults = {}
         modern = _core_at_least(2, 19)
         for entry in layers or ():
-            if isinstance(entry, str):
-                check_dependencies(entry, mapping_shape=modern)
+            if isinstance(entry, str) and not legacy_defaults:
+                self._check_setup_default_dependencies(entry, ctx, blocked, mapping_shape=modern)
                 entry = self.templater.render_string(entry, ctx, strict=True)
                 if isinstance(entry, _LazyTplDict):
                     entry = entry._raw
@@ -7885,13 +7939,13 @@ class Runtime:
                 _fail_on_undef(entry)
             if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
                 raise ValueError("setup module defaults must resolve to a dictionary")
-            if not modern:
-                check_dependencies(entry)
+            if not modern and not legacy_defaults:
+                self._check_setup_default_dependencies(entry, ctx, blocked)
                 entry = _fail_on_undef(self.template(entry, ctx, strict=True))
             defaults.update(entry)
         inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
         if modern:
-            check_dependencies(inherited)
+            self._check_setup_default_dependencies(inherited, ctx, blocked)
             return _setup_omit(self.template(inherited, ctx, strict=True))
         # Legacy Core removes omit before the setup action applies its own defaults.
         return inherited if final_setup else _setup_omit(inherited)
@@ -7899,7 +7953,8 @@ class Runtime:
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None):
+                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None,
+                     legacy_defaults=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -7925,7 +7980,8 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            if self.gather_setup_fn is not None and (setup_options or setup_defaults or gather_defaults):
+            has_module_defaults = bool(setup_defaults or gather_defaults or legacy_defaults)
+            if self.gather_setup_fn is not None and (setup_options or has_module_defaults):
                 controller_setup = self.gather_setup_fn()
                 if controller_setup["error"] is not None:
                     raise ValueError(controller_setup["error"])
@@ -7967,15 +8023,17 @@ class Runtime:
                     gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
                 if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                     setup_args["gather_timeout"] = gather_timeout
-                if gather_defaults or setup_defaults:
+                if has_module_defaults:
                     defaults_ctx, defaults_blocks = (option_contexts or {}).get("fact_path", (ctx, ()))
                     gather_args = {**setup_args, **{key: value for key, value in resolved_options.items() if value == _OMIT}}
-                    setup_args.update(self._render_setup_defaults(gather_defaults, gather_args, defaults_ctx, defaults_blocks))
+                    setup_args.update(self._render_setup_defaults(
+                        gather_defaults, gather_args, defaults_ctx, defaults_blocks, legacy_defaults=legacy_defaults))
                     setup_args.pop("parallel", None)
                 setup_args = {key: value for key, value in setup_args.items() if value is not None}
-                if setup_defaults:
+                if setup_defaults or legacy_defaults:
                     setup_args.update(self._render_setup_defaults(
-                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True))
+                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True,
+                        legacy_defaults=legacy_defaults))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
