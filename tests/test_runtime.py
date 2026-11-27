@@ -605,6 +605,106 @@ class FilterModule:
     assert json.loads(str(result)) == [[[[1], 1], [[1], 1], "[[1], 1]"], True]
 
 
+@pytest.mark.parametrize("consumer", ["list", "first", "resume"])
+def test_generator_filter_preserves_mutations_at_exhaustion(monkeypatch, consumer):
+    from ansiroll import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    runtime.templater.register_plugins([{"kind": "filter", "name": "generate_inventory", "source": """
+def generate_inventory(values, finish):
+    row = [values, {'values': values, 'count': 0, ''.join(('drop', ' key')): 0}, [values, (values, [])]]
+    yield row
+    assert finish, 'advanced past the first yield'
+    yield row
+    row[1]['count'] = 1
+    row[1]['plugin'] = 3
+    row[1][''.join(('shared', ' key'))] = 'plugin'
+    del row[1]['drop key']
+    row[2][1][1].append(values)
+    row.append('done')
+    values.append(2)
+
+class FilterModule:
+    def filters(self):
+        return {'generate_inventory': generate_inventory}
+"""}])
+    task = _task("1", "Consume a generator with a final mutation", "debug",
+                 vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% set iterator = entry | generate_inventory(finish) %}")
+    ctx = runtime._task_ctx(task, {"finish": consumer != "first"})
+    if consumer != "first":
+        if consumer == "resume":
+            template += ("{% set entries = [iterator | first, iterator | first] %}"
+                         "{% set ignored = entries[0][1].update(consumer=2) %}"
+                         "{% set ignored = entries[0][1].update({'shared key': 'consumer'}) %}"
+                         "{% set ignored = entries[0][1].pop('drop key') %}"
+                         "{% set ignored = entries[0][1].update({'drop key': 'consumer'}) %}"
+                         "{% set ignored = entries[0][1].pop('values') %}"
+                         "{% set ignored = entries[0].append('consumer-tail') %}"
+                         "{% set ignored = entries[0][2].append('inner-tail') %}"
+                         "{% set ignored = iterator | list %}")
+        else:
+            template += "{% set entries = iterator | list %}"
+        template += ("{{ [entries, entries[0] is sameas entries[1], "
+                     "entries[0][0] is sameas entries[0][2][1][1][0], "
+                     "entries[0][1].keys() | list] | to_json }}")
+        if consumer == "resume":
+            mapping = {"count": 1, "consumer": 2, "shared key": "plugin", "plugin": 3}
+        else:
+            mapping = {"values": [1, 2], "count": 1, "plugin": 3, "shared key": "plugin"}
+        inner = [[1, 2], [[1, 2], [[1, 2]]]]
+        row = [[1, 2], mapping, inner]
+        if consumer == "resume":
+            row.append("consumer-tail")
+            inner.append("inner-tail")
+        row.append("done")
+        expected = [[row, row], True, True, list(mapping)]
+    else:
+        template += "{{ iterator | first | to_json }}"
+        expected = [[1], {"values": [1], "count": 0, "drop key": 0}, [[1], [[1], []]]]
+    assert json.loads(str(runtime.template(template, ctx))) == expected
+
+
+def test_exhausted_generator_filter_preserves_replaced_dict_key_without_comparing_keys(monkeypatch):
+    from ansiroll import runtime as runtime_module
+
+    class Key:
+        __hash__ = object.__hash__
+
+        def __eq__(self, other):
+            pytest.fail("generator restoration compared unrelated dict keys")
+
+    def generate(values):
+        assert type(values) is list
+        row = {Key(): values}
+        yield row
+        row.clear()
+        row[Key()] = values
+        return "finished"
+
+    monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": [1]})
+    captured = []
+    runtime.templater.env.globals["capture"] = lambda value: captured.append(value) or ""
+    runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
+    task = _task("1", "Read a raw inventory argument", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
+    template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{{ capture(entry) }}")
+    runtime.template(template, runtime._task_ctx(task, {}))
+    entry, = captured
+    iterator = runtime_module._wrap_custom_plugin(generate, runtime.templater)(entry)
+    row = next(iterator)
+    original_key = next(iter(row))
+    with pytest.raises(StopIteration) as stop:
+        next(iterator)
+    assert stop.value.value == "finished"
+    assert next(iter(row)) is not original_key
+    assert list(row.values())[0] is entry
+
+
 def test_custom_filter_result_keeps_plugin_owned_collections(monkeypatch):
     from ansiroll import runtime as runtime_module
 
