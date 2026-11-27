@@ -31,7 +31,7 @@ import re
 import shlex
 from collections.abc import Generator, ItemsView, KeysView, MutableMapping, MutableSequence, ValuesView
 from contextlib import contextmanager
-from functools import wraps
+from functools import partial, wraps
 from itertools import groupby
 from numbers import Number
 
@@ -72,6 +72,7 @@ def _legacy_non_native(ctx):
 
 _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
+_CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
 _INCLUDE_APPLY_FLAGS = "__ansiroll_apply_flags"
 
 
@@ -90,7 +91,7 @@ def _vars_snapshot(ctx):
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
                 "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_vars_file_selector",
                 "__ansiroll_setup_controller_lookups",
-                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT, _INCLUDE_APPLY_FLAGS}
+                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT, _INCLUDE_APPLY_FLAGS, _CHECK_MODE_TEMPLATE}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -162,6 +163,7 @@ class _WorkerStderr:
 
 # __ANSIROLL_JINJA_BUNDLE__
 import jinja2  # type: ignore
+from jinja2.nativetypes import NativeCodeGenerator
 
 
 # Sentinel for the `omit` magic variable; args/env entries equal to it are
@@ -756,13 +758,25 @@ def _literal_vars_input(value):
     if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
         text = value["__ansiroll_unsafe__"]
         if isinstance(text, str) and not _looks_templated(text):
-            return text
+            return str(text)
+    if isinstance(value, _NO_TEMPLATE) and not _looks_templated(value):
+        return str(value)
     return value
 
 
-def _vars_input_at(scope, name, path):
+def _raw_include_input(value):
+    if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
+        return str(value)
+    if isinstance(value, (_LazyTplDict, _LazyTplList)):
+        return value._raw
+    return value
+
+
+def _vars_input_at(scope, name, path, *, raw_containers=False):
     value = scope.get(name, _MISSING_VARS_FILE_INPUT)
     for member in path:
+        if raw_containers:
+            value = _raw_include_input(value)
         value = _literal_vars_input(value)
         if member is None:
             # None marks a branch choice rather than a member lookup.
@@ -799,6 +813,10 @@ def _same_vars_input(left, right):
     if isinstance(left, (list, tuple)):
         return len(left) == len(right) and all(_same_vars_input(a, b) for a, b in zip(left, right))
     return left == right
+
+
+def _include_input_at(scope, name, path):
+    return _raw_include_input(_vars_input_at(scope, name, path, raw_containers=True))
 
 
 def _clear_vars_file_blocks(blocked, mapping, merge_hashes):
@@ -1001,6 +1019,7 @@ def _trust_set_fact_value(value):
 # merges include params after the nonpersistent fact cache).
 _HIGH_VARS_KEY = "__ansiroll_high_vars__"
 _INCLUDE_PARAMS_KEY = "__ansiroll_include_params__"
+_RESCUE_FACT_NAMES = frozenset(("ansible_failed_task", "ansible_failed_result"))
 
 
 def _with_high_vars(overlay, values):
@@ -1079,9 +1098,9 @@ def _setup_omit(args):
     if not _core_at_least(2, 19):
         return _fail_on_undef(_strip_omit(args))
     if isinstance(args, dict):
-        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT}
+        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT and value is not _KEYWORD_OMIT}
     if isinstance(args, (list, tuple)):
-        return [_setup_omit(value) for value in args if value != _OMIT]
+        return [_setup_omit(value) for value in args if value != _OMIT and value is not _KEYWORD_OMIT]
     return _fail_on_undef(args)
 
 
@@ -1145,10 +1164,11 @@ def _condition_contains_string(value, string_type):
 class TaskFailed(Exception):
     """Raised when a task fails and is not ignored (drives block/rescue)."""
 
-    def __init__(self, name, task=None, result=None):
+    def __init__(self, name, task=None, result=None, *, executed_args=None):
         super(TaskFailed, self).__init__(name)
         self.task = task or {"name": name}
         self.result = result or {"failed": True, "msg": str(name)}
+        self.executed_args = executed_args
         self.pending_includes = None
 
 
@@ -1228,6 +1248,8 @@ def _vault_source_recompile_note(task):
 
 
 def _to_bool(value):
+    if value is _KEYWORD_OMIT:
+        return False
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -2010,6 +2032,10 @@ def _read_lazy_member(container, value):
             ctx.active_task_bindings.pop()
     if binding is not None and isinstance(resolved, (_LazyTplDict, _LazyTplList)):
         resolved._task_binding = binding
+    if isinstance(resolved, _Omit):
+        templater = getattr(container._rt, "templater", None)
+        if templater is not None:
+            return _keyword_omit_value(resolved, templater._current_ctx)
     return resolved
 
 
@@ -3150,6 +3176,27 @@ def _concretize(value):
     return value
 
 
+class _KeywordOmit:
+    def __repr__(self):
+        return "<<Omit>>"
+
+
+_KEYWORD_OMIT = _KeywordOmit()
+
+
+def _keyword_omit_value(value, ctx):
+    return _KEYWORD_OMIT if isinstance(value, _Omit) and ctx.get(_CHECK_MODE_TEMPLATE) is True else value
+
+
+def _concat_keyword_segments(nodes):
+    preserve_none = not _core_at_least(2, 19, 1)
+    parts = [_KEYWORD_OMIT if isinstance(part, _Omit) else part
+             for part in nodes if preserve_none or part is not None]
+    if len(parts) < 2:
+        return parts[0] if parts else None
+    return "".join(str(_setup_omit(part)) for part in parts if part is not _KEYWORD_OMIT)
+
+
 def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
@@ -3468,6 +3515,12 @@ class _ConditionalName:
 
 
 class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        if getattr(self.environment, "concat", None) is _concat_keyword_segments:
+            # Bundled Jinja refers to its global concatenator in buffers.
+            self.writeline("concat = environment.concat")
+
     def func(self, name):
         # A Python plugin can call back into any generated template body,
         # including recursive loops and blocks, without a new render_string.
@@ -3488,6 +3541,61 @@ class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
         super().visit_Name(node, frame)
         if node.ctx == "load":
             self.write(")")
+
+
+class _FileCodeGenerator(_AnsirollCodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        # Jinja 2.11 uses its string-only global concat unless we bind the
+        # file environment's concatenator in the root and block functions.
+        self.writeline("concat = environment.concat")
+
+    def _output_child_to_const(self, node, frame, finalize):
+        if not isinstance(node, jinja2.nodes.TemplateData):
+            raise jinja2.nodes.Impossible()
+        return super()._output_child_to_const(node, frame, finalize)
+
+    def _output_child_pre(self, node, frame, finalize):
+        if finalize.src is not None:
+            self.write(finalize.src)
+
+    def _output_child_post(self, node, frame, finalize):
+        if finalize.src is not None:
+            self.write(")")
+
+
+class _ConditionalFileCodeGenerator(_ConditionalCodeGenerator, _FileCodeGenerator):
+    pass
+
+
+def _concat_file_output(nodes):
+    preserve_none = not _core_at_least(2, 19, 1)
+    values = [value for value in nodes if preserve_none or value is not None]
+    if len(values) < 2:
+        return values[0] if values else None
+    return "".join("None" if value is None else _native_file_text(value)
+                   for value in values if not isinstance(value, _Omit))
+
+
+def _native_file_text(value):
+    if value is None:
+        return ""
+    return str(_fail_on_undef(_mark_unsafe(value)))
+
+
+class _KeywordCodeGenerator(_AnsirollCodeGenerator, NativeCodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        self.writeline("concat = environment.concat")
+
+    def _output_child_to_const(self, node, frame, finalize):
+        if not isinstance(node, jinja2.nodes.TemplateData):
+            raise jinja2.nodes.Impossible()
+        return super()._output_child_to_const(node, frame, finalize)
+
+
+class _ConditionalKeywordCodeGenerator(_ConditionalCodeGenerator, _KeywordCodeGenerator):
+    pass
 
 
 class _AnsirollContext(jinja2.runtime.Context):
@@ -3520,13 +3628,19 @@ class _AnsirollContext(jinja2.runtime.Context):
             return jinja2.runtime.missing
         value = self.parent[key]
         if isinstance(value, _PlayVarTemplate) and isinstance(scope, _PlayVarView):
-            return scope.scope[key]
-        templater = getattr(self.environment, "_ansiroll_templater", None)
-        if templater is None or str(key).startswith("__ansiroll"):
-            return value
-        context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
-        return templater.resolve_variable(
-            key, value, context, strict=self.environment.undefined is _StrictAnsirollUndefined)
+            value = scope.scope[key]
+        else:
+            templater = getattr(self.environment, "_ansiroll_templater", None)
+            if templater is not None and not str(key).startswith("__ansiroll"):
+                context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
+                value = templater.resolve_variable(
+                    key, value, context, strict=self.environment.undefined is _StrictAnsirollUndefined)
+        return _keyword_omit_value(value, self.parent)
+
+
+class _KeywordContext(_AnsirollContext):
+    def call(__self, __obj, *args, **kwargs):
+        return _keyword_omit_value(super().call(__obj, *args, **kwargs), __self.parent)
 
 
 class _PluginDict(dict):
@@ -3570,12 +3684,12 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message, missing=missing)
 
 
-def _bare_template_expression(text, *, lex=None):
+def _bare_template_expression(text, *, lex=None, verify=False):
     stripped = text.strip()
     if not (stripped.startswith("{{") and stripped.endswith("}}")):
         return None
     inner = stripped[2:-2]
-    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
+    if not (verify or "{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
             or inner.endswith(("-", "}"))):
         return inner.strip()
     try:
@@ -3605,6 +3719,7 @@ class _Templater:
         self._condition_list_cache = {}
         self._template_cache = {}
         self._file_environments = {}
+        self._keyword_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
         self._current_ctx = {}
@@ -3696,9 +3811,12 @@ class _Templater:
         for term in terms:
             key = str(term)
             if key in ctx and not key.startswith("__ansiroll"):
-                value = self.resolve_variable(key, ctx[key], ctx)
+                value = _keyword_omit_value(self.resolve_variable(key, ctx[key], ctx), ctx)
                 view[key] = _LookupHostVars(value) if key == "hostvars" and isinstance(value, _LazyTplDict) else value
         return view
+
+    def _keyword_member(self, access, container, key):
+        return _keyword_omit_value(access(container, key), self._current_ctx)
 
     def _g_lookup(self, name, *a, **k):
         try:
@@ -3895,10 +4013,22 @@ class _Templater:
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
-    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None):
+    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None, file_options=(), file_header=False):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
-        if "{{" not in text and "{%" not in text:
+        if file_newline is None:
+            templated = _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text)
+        else:
+            settings = dict(file_options)
+            starts = [
+                settings.get(kind + "_start_string", getattr(self.env, kind + "_start_string"))
+                for kind in ("variable", "block", "comment")
+            ]
+            if (any(not isinstance(start, str) or not start for start in starts)
+                    or _core_at_least(2, 19) and len(set(starts)) != len(starts)):
+                raise ValueError("template opening delimiters must be distinct non-empty strings")
+            templated = file_header or any(start in text for start in starts)
+        if not templated:
             if file_newline is not None and _legacy_templating():
                 return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
             return text
@@ -3914,7 +4044,8 @@ class _Templater:
             # A Python plugin can read an alias that starts a nested template.
             # Its Jinja expressions still need lazy hostvars entries.
             with self._plugin_arg_scope(None):
-                result = self._render_string(text, ctx, strict, file_newline=file_newline)
+                result = self._render_string(
+                    text, ctx, strict, file_newline=file_newline, file_options=file_options, file_header=file_header)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -4130,31 +4261,55 @@ class _Templater:
                     pending.extend(value)
         return False
 
-    def _render_string(self, text, ctx, strict=False, *, file_newline=None):
+    def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=(), file_header=False):
         stripped = text.strip()
-        expr = _bare_template_expression(stripped, lex=self.env.lex)
-        if expr is None:
-            # Full templates keep their existing rendering and newline behavior.
-            file_newline = None
+        check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
+        native_keyword = check_mode_template is True
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
+        native_file = file_newline is not None and not _legacy_templating()
+        if native_keyword:
+            if env not in self._keyword_environments:
+                keyword_env = env.overlay()
+                keyword_env.context_class = _KeywordContext
+                keyword_env.getattr = partial(self._keyword_member, env.getattr)
+                keyword_env.getitem = partial(self._keyword_member, env.getitem)
+                keyword_env.keep_trailing_newline = False
+                keyword_env.trim_blocks = True
+                keyword_env.concat = _concat_keyword_segments
+                keyword_env.finalize = _concretize
+                keyword_env.code_generator_class = (
+                    _ConditionalKeywordCodeGenerator if lazy_names else _KeywordCodeGenerator)
+                self._keyword_environments[env] = keyword_env
+            env = self._keyword_environments[env]
         if file_newline is not None:
-            key = (env, file_newline)
+            key = (env, file_newline, file_options, native_file)
             if key not in self._file_environments:
+                settings = {"newline_sequence": file_newline, "keep_trailing_newline": False, **dict(file_options)}
                 file_env = env.overlay()
-                file_env.keep_trailing_newline = False
-                file_env.newline_sequence = file_newline
+                for option, value in settings.items():
+                    setattr(file_env, option, value)
+                if native_file:
+                    file_env.code_generator_class = _ConditionalFileCodeGenerator if lazy_names else _FileCodeGenerator
+                    file_env.concat = _concat_file_output
+                    file_env.finalize = _concretize
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
-        template_key = (text, strict, lazy_names, file_newline)
+        expr = None
+        legacy_header = file_header and not native_file
+        if (not legacy_header and (check_mode_template is None or text == stripped)
+                and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
+            expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
+        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
+        template_key = (text, *template_options)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
         if expr is not None:
-            expr_key = (expr, strict, lazy_names, file_newline)
+            expr_key = (expr, *template_options)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(text.strip(), env, ctx, strict)
@@ -4174,7 +4329,14 @@ class _Templater:
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-                result = tmpl.render(**ctx)
+                if native_file:
+                    # Bundled Jinja uses the global text concatenator in
+                    # Template.render, even when the overlay has a native one.
+                    result = _concat_file_output(tmpl.root_render_func(tmpl.new_context(ctx)))
+                elif native_keyword:
+                    result = _concat_keyword_segments(tmpl.generate(**ctx))
+                else:
+                    result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
                 return _captured_jinja_error(
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
@@ -4191,8 +4353,8 @@ class _Templater:
                 tokens = list(env.lex(text))
                 prefix = tokens[0][2] if tokens[0][1] == "data" else ""
                 suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
-                prefix = prefix.replace("\n", file_newline)
-                suffix = suffix.replace("\n", file_newline)
+                prefix = prefix.replace("\n", env.newline_sequence)
+                suffix = suffix.replace("\n", env.newline_sequence)
                 legacy = _legacy_templating()
                 if prefix or suffix:
                     value = "" if not legacy and isinstance(result, _Omit) else result
@@ -4204,8 +4366,13 @@ class _Templater:
                               else str(_as_text(result)))
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
+                if file_header and source_newlines == len(text):
+                    # Removing the header also consumed a trailing LF.
+                    source_newlines += 1
                 result_newlines = len(result) - len(result.rstrip("\n"))
-                result += file_newline * (source_newlines - result_newlines)
+                # Core 2.14–2.18 restore using the overlay's newline sequence.
+                restored_newline = env.newline_sequence if not native_file and _core_at_least(2, 14) else file_newline
+                result += restored_newline * (source_newlines - result_newlines)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
                 # when a later assertion member reads a cached alias.
@@ -4352,11 +4519,14 @@ class Runtime:
         self._inventory_defaults = inventory_defaults or {}
         self.vars = dict(host_vars or {})
         self._play_var_names = set()
+        self._replayed_play_vars = {}
         self._initial_host_vars = self._task_host_vars()
         self._legacy_omit_token = self._initial_host_vars.get("omit", _OMIT)
         self._vars_file_host_vars = self._initial_host_vars
         self.python = python or sys.executable
         self.check_mode = check_mode
+        self._invocation_check_mode = check_mode
+        self._copy_transfer_check_mode = None
         self.diff_mode = diff_mode
         self.on_result = on_result
         self.become_password = become_password
@@ -4405,6 +4575,9 @@ class Runtime:
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.controller_vars_files_fn = None
         self.on_task_start = None
+        self.on_rescue = None
+        self.on_rescue_overrides = None
+        self._executed_task_args = None
         self._started_task_name = (None, None)
         self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
         self.templater = _Templater()
@@ -4987,6 +5160,7 @@ class Runtime:
                 merge_hashes=merge_vars_files, magic=vars_file_magic, ordered=ordered_files is not None,
                 deferred_entries=deferred_files)
             active_play_vars = play_vars
+        self._replayed_play_vars = play_vars if merge_vars_files else {}
         self._play_var_names = set(active_play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -5073,6 +5247,39 @@ class Runtime:
         if node.get("tasks_ref"):
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
+
+        def select_body(ctx):
+            if "include_selector" not in node:
+                return node.get("file"), tasks, handlers
+
+            def inputs_match(inputs, scope=ctx):
+                return all(_same_vars_input(_include_input_at(scope, name, path),
+                                            value if present else _MISSING_VARS_FILE_INPUT)
+                           for name, path, present, value in inputs)
+
+            compile_inputs = node.get("include_compile_inputs")
+            extra_inputs = node.get("include_compile_extra_inputs", ())
+            if (compile_inputs is not None and inputs_match(compile_inputs)
+                    and inputs_match(extra_inputs, self.extra_vars)):
+                key = node["compile_selection"]
+            elif node.get("include_build_only"):
+                raise ValueError("include_tasks selector inputs changed and no alternate task file was bundled")
+            else:
+                key = _fail_on_undef(self.template(node["include_selector"], ctx, strict=True))
+                if "include_parent_selectors" in node:
+                    key = [key, *(_fail_on_undef(self.template(source, ctx, strict=True))
+                                  for source in node["include_parent_selectors"])]
+            filename = key[0] if isinstance(key, list) else key
+            variant = next((entry for entry in tasks if entry["include_variant"] == key
+                            and inputs_match(entry.get("include_variant_inputs", ()))), None)
+            if variant is None:
+                raise ValueError("no bundled task file matches %r" % filename)
+            body = variant["block"]
+            if variant.get("include_id"):
+                targets[variant["include_id"]] = body, handlers
+            body, body_handlers = targets.get(variant.get("tasks_ref"), (body, handlers))
+            return filename, body, body_handlers
+
         include_no_log = bool(node.get("no_log"))
         apply_flags = {}
         apply_vars = {}
@@ -5091,6 +5298,11 @@ class Runtime:
             result, ignore = self._task_gate(node, base_ctx)
             if result is None:
                 include_no_log, apply_flags, apply_vars, result = self._prepare_include(node, base_ctx)
+                if result is None:
+                    try:
+                        filename, body, body_handlers = select_body(base_ctx)
+                    except Exception as error:
+                        result = {"changed": False, "failed": True, "msg": str(error)}
         if result is not None:
             self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore, no_log=include_no_log)
@@ -5100,7 +5312,7 @@ class Runtime:
                 self._tally("ok")
                 self._tally("ignored")
             else:
-                raise TaskFailed(node.get("name"), node, result)
+                raise TaskFailed(name, node, result)
             return
         tally_ok = node.get("tally_include_ok", True)
         looped = items is not None
@@ -5111,10 +5323,9 @@ class Runtime:
         failed_items_ignored = True
         legacy_failure = None
         for i, item in enumerate(items if looped else [None]):
-            result = {"changed": False, "include": node.get("file")}
-            loop_vars = {}
             if not looped:
-                selected.append((base_ctx, loop_vars, result, item, include_no_log))
+                result = {"changed": False, "include": filename}
+                selected.append((base_ctx, {}, result, item, include_no_log, body, body_handlers, apply_flags, apply_vars))
                 break
             try:
                 loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
@@ -5125,13 +5336,20 @@ class Runtime:
             ctx = {**base_ctx, **loop_vars}
             blocked, ignored = self._task_gate(node, ctx)
             item_no_log = include_no_log
+            item_flags, item_vars = {}, {}
             if blocked is None:
-                item_no_log, blocked = self._resolve_task_no_log(node, ctx)
-            if blocked is not None:
-                if _result_failed(blocked) and not _core_at_least(2, 19):
-                    legacy_failure = (blocked, ignored)
-                    break
+                item_no_log, item_flags, item_vars, blocked = self._prepare_include(node, ctx)
+            if blocked is None:
+                try:
+                    filename, body, body_handlers = select_body(ctx)
+                    result = {"changed": False, "include": filename}
+                except Exception as error:
+                    result = {"changed": False, "failed": True, "msg": str(error)}
+            else:
                 result = blocked
+            if _result_failed(result) and not _core_at_least(2, 19):
+                legacy_failure = (result, ignored)
+                break
             # Older executors added loop metadata directly to the result before
             # aggregating item status. Newer executors keep status separately.
             if not _core_at_least(2, 21):
@@ -5158,7 +5376,8 @@ class Runtime:
                 failed_items_ignored = failed_items_ignored and ignored
             reported = {**result, **loop_vars}
             if not _result_failed(result) and not result.get("skipped"):
-                selected.append((ctx, loop_vars, reported, item, item_no_log))
+                selected.append((ctx, loop_vars, reported, item, item_no_log, body, body_handlers,
+                                 item_flags, item_vars))
             results.append((item, result, reported, item_no_log))
             if stop:
                 break
@@ -5196,14 +5415,15 @@ class Runtime:
                     self._tally("ok")
                     self._tally("ignored")
                 else:
-                    failure = TaskFailed(node.get("name"), node, aggregate)
+                    failure = TaskFailed(name, node, aggregate)
             elif status == "skipped":
                 self._tally("skipped")
 
         scopes = []
-        body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
-        for ctx, loop_vars, result, item, item_no_log in selected:
-            params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
+        for ctx, loop_vars, result, item, item_no_log, body, body_handlers, apply_flags, apply_vars in selected:
+            body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
+            params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars,
+                                        defer=_core_at_least(2, 19))
             params.update(loop_vars)
             scope = _with_high_vars(body_overlay, params)
             if apply_flags:
@@ -5219,15 +5439,15 @@ class Runtime:
                 self._store_register(node, result)
             if tally_ok:
                 self._tally("ok")
-            self._add_handlers(handlers, scope, b)
-            scopes.append(scope)
+            self._add_handlers(body_handlers, scope, b)
+            scopes.append((body, scope))
         if looped and status == "ok" and node.get("register"):
             self.emit(node, status, aggregate, ignored=ignored, name=name, no_log=aggregate_no_log)
         if failure is not None:
             if scopes:
-                failure.pending_includes = (tasks, scopes, b)
+                failure.pending_includes = (scopes, b)
             raise failure
-        yield from self._included_body_steps(tasks, scopes, b)
+        yield from self._included_body_steps(scopes, b)
 
     def _prepare_include(self, node, ctx):
         no_log, failure = self._resolve_task_no_log(node, ctx)
@@ -5236,20 +5456,23 @@ class Runtime:
         if failure is not None or not (authored_flags or authored_vars):
             return no_log, {}, {}, failure
         try:
-            flags = _fail_on_undef(self.template(authored_flags, ctx))
+            flags = {
+                key: self._execution_flag_value(value, ctx, check_mode=key == "check_mode")
+                for key, value in authored_flags.items()
+            }
             for key, value in flags.items():
-                if isinstance(value, _Omit):
+                if isinstance(value, _Omit) or value is _KEYWORD_OMIT:
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
                     flags[key] = self._bound_apply_flag(inherited, ctx)
-            applied_vars = _setup_omit(self.template(authored_vars, ctx))
+            applied_vars = _setup_omit(self.template(authored_vars, self._check_mode_template_context(ctx)))
         except Exception as ex:
             return no_log or "no_log" in authored_flags, {}, {}, {
                 "failed": True, "changed": False, "msg": str(ex),
             }
         return no_log, flags, applied_vars, None
 
-    def _included_body_steps(self, tasks, scopes, become):
-        for scope in scopes:
+    def _included_body_steps(self, scopes, become):
+        for tasks, scope in scopes:
             yield self._node_steps(tasks, scope, become)
 
     def _failed_include_steps(self, failure):
@@ -5287,12 +5510,17 @@ class Runtime:
                 self._tally("rescued")
                 # Saved as nonpersistent facts (set_fact level) that outlive
                 # the rescue (StrategyBase._process_pending_results).
+                failed_task = {**ex.task, "name": ex.args[0]}
+                if ex.executed_args is not None:
+                    failed_task["args"] = ex.executed_args
                 failed_facts = {
-                    "ansible_failed_task": ex.task,
+                    "ansible_failed_task": failed_task,
                     "ansible_failed_result": ex.result,
                 }
                 self.vars.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
+                if self.on_rescue is not None:
+                    self.on_rescue(failed_task, ex.result, ex.executed_args)
                 yield from self._failed_include_steps(ex)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
@@ -5622,9 +5850,32 @@ class Runtime:
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
         block_template = (task.get("delegate_to") and task.get("special") == "template"
                           and any(_is_deferred_block_var(value) for value in ctx.values()))
+        # Keep child aliases lazy when an include parameter still needs the
+        # complete child context, including the native check-mode omit value.
+        include_aliases = bool(task_vars) and any(
+            isinstance(value, _TaskVarTemplate) or isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic
+            for value in (higher_vars.get(name) for name in overlay.get(_INCLUDE_PARAMS_KEY, ()))
+        )
+        check_mode_aliases = bool(task_vars) and _core_at_least(2, 19) and _looks_templated(task.get("check_mode"))
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
-                                      defer=looped or mixed_lookup or block_template))
+                                      defer=looped or mixed_lookup or block_template
+                                      or include_aliases or check_mode_aliases))
         ctx.update(higher_vars)
+        if "include_selector_inputs" in task and self.vars.get("__ansiroll_controller_config", {}).get(
+                "DEFAULT_HASH_BEHAVIOUR") == "merge":
+            inputs = set(task["include_selector_inputs"])
+            host = self._task_host_vars()
+            for key in inputs & (self._replayed_play_vars.keys() | self.extra_vars.keys()):
+                host.pop(key, None)
+                if key in self._vars_file_host_vars:
+                    host[key] = self._vars_file_host_vars[key]
+            layers = (role_defaults, host, self._replayed_play_vars, role_vars, overlay, task.get("vars") or {},
+                      self._include_vars_layer, self._set_fact_overrides, task.get("role_params") or {},
+                      overlay.get(_HIGH_VARS_KEY) or {}, self.extra_vars)
+            raw = [{key: mapping[key]._raw if isinstance(mapping[key], _LazyTplDict) else mapping[key]
+                    for key in inputs & mapping.keys()} for mapping in layers]
+            merged = _f_combine(*raw, recursive=True)
+            ctx.update(self.template_vars(merged, ctx, dynamic=True))
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
@@ -5698,6 +5949,7 @@ class Runtime:
             return False
 
     def _run_task(self, task, overlay, become=False):
+        self._executed_task_args = None
         special = task.get("special")
         if special in ("meta_flush_handlers", "meta_clear_host_errors"):
             conditions = self._when_of(task)
@@ -5707,9 +5959,9 @@ class Runtime:
                         return
                 except ConditionalError as ex:
                     result = {"failed": True, "changed": False, "msg": str(ex)}
-                    self.emit_start(task)
+                    name = self.emit_start(task)
                     self.emit(task, "failed", result)
-                    raise TaskFailed(task.get("name"), task, result)
+                    raise TaskFailed(name, task, result)
             if special == "meta_flush_handlers":
                 self.emit_start(task)
                 inherited = self._inherited_when
@@ -5726,15 +5978,18 @@ class Runtime:
         if self._skips_run_once(task, base_ctx):
             # Linear emits no skipped event for hosts outside run_once.
             return
-        self.emit_start(task)
+        name = self.emit_start(task)
 
         notifications = []
         no_log = bool(task.get("no_log"))
+        rescue_overrides = ([] if self.on_rescue_overrides is not None
+                            and task["action"].rsplit(".", 1)[-1] == "set_fact" else None)
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
                 try:
-                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications)
+                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications,
+                                                 rescue_overrides=rescue_overrides)
                 except TaskFailed:
                     raise
                 except Exception as ex:
@@ -5747,7 +6002,8 @@ class Runtime:
                 res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
                 no_log = res.pop("_ansiroll_no_log", no_log)
                 if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
-                    self._absorb_facts(task, res, fact_host)
+                    self._absorb_facts(task, res, fact_host,
+                                       rescue_overrides=rescue_overrides if no_log else None, no_log=no_log)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
@@ -5758,6 +6014,12 @@ class Runtime:
         if res.get("changed") and not (_result_failed(res) or res.get("unreachable")):
             self._queue_notify(notifications)
         status = _status_of(res)
+        if rescue_overrides:
+            if status not in ("ok", "changed"):
+                # Public item facts are visible even when a later item fails.
+                rescue_overrides = [write for write in rescue_overrides if not write[1]]
+            if rescue_overrides:
+                self.on_rescue_overrides(rescue_overrides)
         if status == "unreachable" and task.get("loop") is None:
             ignore_unreachable = self._ignores_unreachable(task, base_ctx)
         self.emit(task, status, res, ignored=ignore, no_log=no_log)
@@ -5778,7 +6040,15 @@ class Runtime:
                 self._tally("changed" if tally_changed else "ok")
                 self._tally("ignored")
             else:
-                raise TaskFailed(task.get("name"), task, dict(res))
+                # Aggregate loop failures retain the task-level args.
+                executed_args = self._executed_task_args if task.get("loop") is None else None
+                if executed_args is not None and not _core_at_least(2, 19):
+                    try:
+                        _fail_on_undef(executed_args)
+                    except jinja2.UndefinedError:
+                        # Legacy Core retains the authored args when validation fails.
+                        executed_args = None
+                raise TaskFailed(name, task, dict(res), executed_args=executed_args)
         elif res.get("skipped"):
             self._tally("skipped")
         else:
@@ -5867,7 +6137,7 @@ class Runtime:
         return (self._loop_control_bool(task, "loop_extended", False, ctx),
                 self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
-    def _run_loop(self, task, items, base_ctx, become=False, notifications=None):
+    def _run_loop(self, task, items, base_ctx, become=False, notifications=None, *, rescue_overrides=None):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
@@ -5892,9 +6162,9 @@ class Runtime:
                     no_log = res.pop("_ansiroll_no_log", no_log)
                     if fact_host is None:
                         if commits_delegated_facts:
-                            pending_facts.append((None, dict(res)))
+                            pending_facts.append((None, dict(res), no_log))
                         else:
-                            self._absorb_facts(task, res)
+                            self._absorb_facts(task, res, rescue_overrides=rescue_overrides, no_log=no_log)
                     facts = res.get("ansible_facts") if fact_host is None else None
                     if isinstance(facts, _IncludedVars):
                         base_ctx.update({key: self.vars[key] for key in facts})
@@ -5960,15 +6230,15 @@ class Runtime:
                         agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
                 ignore_loop = ignore_loop or ignore
                 if fact_host is not None:
-                    pending_facts.append((fact_host, res))
+                    pending_facts.append((fact_host, res, no_log))
                 self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log)
                 if stop:
                     break
             loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
         finally:
-            for fact_host, result in pending_facts:
+            for fact_host, result, no_log in pending_facts:
                 if fact_host is None or loop_succeeded:
-                    self._absorb_facts(task, result, fact_host)
+                    self._absorb_facts(task, result, fact_host, rescue_overrides=rescue_overrides, no_log=no_log)
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
@@ -6213,15 +6483,47 @@ class Runtime:
         return args_cache["args"]
 
     def _execution_flag(self, task, key, ctx, default):
-        value = self._execution_flag_value(task.get(key), ctx)
+        authored = task.get(key)
+        check_mode = key == "check_mode"
+        omit_token = ctx.get("omit")
+        value = self._execution_flag_value(authored, ctx, check_mode=check_mode)
+        legacy_omit = (check_mode and _legacy_templating() and isinstance(omit_token, str)
+                       and omit_token.startswith("__omit_place_holder__") and value == omit_token)
+        omitted = isinstance(value, _Omit) or value is _KEYWORD_OMIT or legacy_omit
+        if omitted:
+            fallback = task.get(key + "_on_omit", default)
+            if check_mode and fallback == "invocation":
+                return self._invocation_check_mode, omitted
+            if check_mode and fallback == "invalid":
+                raise ValueError("invalid inherited check_mode value")
+            value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
         if value is None:
-            return default
-        if isinstance(value, _Omit):
-            value = self._execution_flag_value(task.get(key + "_on_omit", default), ctx)
-        return default if value is None else _boolean(value, strict=True)
+            return (False if check_mode and authored is not None else default), omitted
+        return _boolean(value, strict=True), omitted
 
-    def _execution_flag_value(self, value, ctx):
-        return _fail_on_undef(self.template(self._bound_apply_flag(value, ctx), ctx))
+    def _execution_flag_value(self, value, ctx, *, check_mode=False, on_omit=False):
+        value = self._bound_apply_flag(value, ctx)
+        if check_mode:
+            if isinstance(value, dict):
+                if value == {"__ansiroll_invocation_check_mode__": True}:
+                    return self._invocation_check_mode
+                if "__ansiroll_raw_apply_check_mode__" in value:
+                    # A child's omit restores and validates the original
+                    # inherited keyword without evaluating it again.
+                    if on_omit:
+                        raise ValueError("invalid inherited check_mode value")
+                    value = value["__ansiroll_raw_apply_check_mode__"]
+            if isinstance(value, str):
+                ctx = self._check_mode_template_context(ctx)
+        return _fail_on_undef(self.template(value, ctx))
+
+    @staticmethod
+    def _check_mode_template_context(ctx):
+        native_keyword = _core_at_least(2, 19)
+        ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
+        if native_keyword and ctx.get("omit") is _OMIT:
+            ctx["omit"] = _KEYWORD_OMIT
+        return ctx
 
     @staticmethod
     def _bound_apply_flag(value, ctx):
@@ -6231,7 +6533,8 @@ class Runtime:
 
     def _resolve_task_no_log(self, task, ctx):
         try:
-            return self._execution_flag(task, "no_log", ctx, False), None
+            value, _ = self._execution_flag(task, "no_log", ctx, False)
+            return value, None
         except Exception as ex:
             # A failed no_log expression must never expose its diagnostics.
             return True, {"failed": True, "changed": False, "msg": str(ex)}
@@ -6255,6 +6558,7 @@ class Runtime:
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
+        inherited_transfer_check_mode = self._copy_transfer_check_mode
         inherited_diff_mode = self.diff_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
@@ -6264,11 +6568,13 @@ class Runtime:
         try:
             modes = args_cache.get("execution_modes") if args_cache is not None else None
             if modes is None:
-                modes = (
-                    self._execution_flag(task, "check_mode", ctx, inherited_check_mode),
-                    self._execution_flag(task, "diff", ctx, inherited_diff_mode),
-                    self._execution_flag(task, "become_override", ctx, become),
-                )
+                check_mode, check_omitted = self._execution_flag(task, "check_mode", ctx, inherited_check_mode)
+                diff_mode, _ = self._execution_flag(task, "diff", ctx, inherited_diff_mode)
+                become, _ = self._execution_flag(task, "become_override", ctx, become)
+                # Older copy actions gate transfer on PlayContext.
+                transfer_mode = (self._invocation_check_mode if check_omitted and not _core_at_least(2, 17)
+                                 else inherited_transfer_check_mode)
+                modes = check_mode, diff_mode, become, transfer_mode
                 if args_cache is not None:
                     args_cache["execution_modes"] = modes
         except Exception as ex:
@@ -6276,7 +6582,7 @@ class Runtime:
                     "msg": "ansiroll: task raised %s: %s" % (type(ex).__name__, ex),
                     "_ansiroll_unknown_outcome": True}
         try:
-            self.check_mode, self.diff_mode, become = modes
+            self.check_mode, self.diff_mode, become, self._copy_transfer_check_mode = modes
             self._task_diff_modes[id(task)] = self.diff_mode
             become_user = task.get("become_user")
             if become_user:
@@ -6319,6 +6625,7 @@ class Runtime:
                     ))
                     if self._is_builtin_unarchive(task):
                         self._normalize_unarchive_options(args)
+                    self._executed_task_args = args
                     res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
@@ -6335,6 +6642,7 @@ class Runtime:
                     self._render_action_args(task.get("args") or {}, ctx, args_cache, source_task=task)))
                 if self._is_builtin_unarchive(task):
                     self._normalize_unarchive_options(args)
+                self._executed_task_args = args
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
                     res = self._run_async_module(
@@ -6366,6 +6674,7 @@ class Runtime:
             self._module_source_bytes = None
             self._module_env = None
             self.check_mode = inherited_check_mode
+            self._copy_transfer_check_mode = inherited_transfer_check_mode
             self.diff_mode = inherited_diff_mode
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
@@ -6646,6 +6955,17 @@ class Runtime:
                 and set(args) == {"_raw_params"}
                 and isinstance(args["_raw_params"], dict)):
             args = dict(args["_raw_params"])
+        if name == "assert" and "_variable_params" in args:
+            # Legacy Core parses a templated argument mapping into this field.
+            params = args["_variable_params"]
+            if params == _OMIT or params == ctx.get("omit", _OMIT):
+                params = {}
+            if not isinstance(params, dict):
+                _fail_on_undef(params)
+                raise ValueError("assert args must resolve to a dictionary")
+            args = {**params, **{key: value for key, value in args.items() if key != "_variable_params"}}
+        authored = task.get("args") or {}
+        self._executed_task_args = {**args, "that": authored["that"]} if name == "assert" and "that" in authored else args
         if name == "debug":
             for key, value in args.items():
                 try:
@@ -6704,6 +7024,7 @@ class Runtime:
         if "args" not in args_cache:
             args_cache["args"] = self._set_fact_args(task, ctx)
         args = args_cache["args"]
+        self._executed_task_args = args
         cacheable = _boolean(args.get("cacheable", False), strict=True)
         modern = _core_at_least(2, 19)
         reserved = {"true", "false", "none", "True", "False", "None", "not"}
@@ -7169,11 +7490,13 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    rendered = self.templater.render_string(raw, tctx, file_newline=newline_sequence)
+                    raw, options, header = _template_file_options(raw, args, self.on_warning)
+                    rendered = self.templater.render_string(
+                        raw, tctx, file_newline=newline_sequence, file_options=options, file_header=header)
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
-                    rendered = _as_text(rendered)
+                    rendered = _native_file_text(rendered) if _core_at_least(2, 19) else _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
@@ -7187,7 +7510,7 @@ class Runtime:
                 # follow and dest on to copy and drops template-only options.
                 args["mode"] = lmode if lmode is not None else args.get("mode")
                 args["follow"] = _ansible_bool(args.get("follow", False))
-                for key in _TEMPLATE_ONLY_ARGS:
+                for key in _template_task_only_args():
                     args.pop(key, None)
             else:
                 data = raw.encode("utf-8", "surrogateescape")
@@ -7259,7 +7582,10 @@ class Runtime:
             if self.diff_mode and not raw:
                 result["diff"].append(self._copy_diff(
                     task, dest_file, data, source_display, from_content, become))
-            if self.check_mode:
+            transfer_check_mode = self._copy_transfer_check_mode
+            if transfer_check_mode is None:
+                transfer_check_mode = self.check_mode
+            if transfer_check_mode:
                 result["changed"] = True
                 return result
             if raw:
@@ -7395,7 +7721,7 @@ class Runtime:
             return self.host
         return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
 
-    def _absorb_facts(self, task, res, fact_host=None):
+    def _absorb_facts(self, task, res, fact_host=None, *, rescue_overrides=None, no_log=False):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -7436,6 +7762,10 @@ class Runtime:
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
+                if rescue_overrides is not None:
+                    writes = {name: facts[name] for name in _RESCUE_FACT_NAMES & facts.keys()}
+                    if writes:
+                        rescue_overrides.append((writes, no_log, bool(res.get("_ansible_facts_cacheable"))))
                 if not res.get("_ansible_facts_cacheable"):
                     self.vars.setdefault("ansible_facts", {})
                     return
@@ -7509,7 +7839,8 @@ class Runtime:
         ctx.setdefault("vars", ctx)
         if not params:
             return scope
-        return _with_high_vars(scope, self.template_vars(params, ctx, higher_vars=self.extra_vars))
+        return _with_high_vars(scope, self.template_vars(params, ctx, higher_vars=self.extra_vars,
+                                                        defer=_core_at_least(2, 19)))
 
     def _handlers_for(self, notification):
         """Indexes of the handlers a notification targets.
@@ -8172,6 +8503,58 @@ _DEFAULT_REAL_FILE_ARGS = frozenset((
 ))
 
 
+def _template_task_only_args():
+    if _core_at_least(2, 11):
+        return _TEMPLATE_ONLY_ARGS
+    return tuple(key for key in _TEMPLATE_ONLY_ARGS if key not in ("comment_start_string", "comment_end_string"))
+
+
+def _template_file_options(source, args, warn):
+    import ast
+
+    options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
+               "lstrip_blocks": _boolean(args.get("lstrip_blocks", False))}
+    for key in _template_task_only_args():
+        if key.endswith(("_start_string", "_end_string")) and args.get(key) is not None:
+            value = args[key]
+            if not isinstance(value, (str, int, float, bool)):
+                raise ValueError("%s is expected to be a string" % key)
+            options[key] = str(value)
+    if _core_at_least(2, 15) and not _core_at_least(2, 19):
+        # Legacy Core validates task overrides when creating the Jinja overlay.
+        # Inline headers are applied afterward and bypass that check.
+        variable = options.get("variable_start_string", "{{")
+        if variable in (options.get("block_start_string", "{%"), options.get("comment_start_string", "{#")):
+            raise ValueError("block, variable and comment start strings must be different")
+    has_header = source.startswith("#jinja2:")
+    if has_header:
+        modern = _core_at_least(2, 19)
+        header, delimiter, source = source.partition("\n")
+        if not delimiter:
+            raise ValueError("missing newline after #jinja2 override")
+        overrides = {}
+        nullable = ("line_statement_prefix", "line_comment_prefix")
+        booleans = ("trim_blocks", "lstrip_blocks", "keep_trailing_newline")
+        for entry in header[len("#jinja2:"):].split(","):
+            key, value = entry.split(":", 1)
+            key = key.strip()
+            if key not in _TEMPLATE_ONLY_ARGS[:-3] + booleans + nullable:
+                if modern:
+                    raise ValueError("invalid #jinja2 override %r" % key)
+                warn("Could not find Jinja2 environment setting to override: %r" % key)
+                continue
+            overrides[key] = ast.literal_eval(value.strip())
+        if modern:
+            for key, value in overrides.items():
+                expected = bool if key in booleans else str
+                if value is None and key in nullable:
+                    continue
+                if not isinstance(value, expected) or (key == "newline_sequence" and value not in ("\n", "\r", "\r\n")):
+                    raise ValueError("invalid value for #jinja2 override %r: %r" % (key, value))
+        options.update(overrides)
+    return source, tuple(sorted(options.items())), has_header
+
+
 class _CopyActionError(Exception):
     pass
 
@@ -8567,19 +8950,23 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, unsafe_paths):
+def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, scalars, unsafe_paths):
     try:
-        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path, unsafe_paths)
+        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path, scalars, unsafe_paths)
     except _CapturedTemplateError as error:
         errors.append((path, str(error)))
-    except jinja2.UndefinedError:
-        undefined.append(path)
+    except jinja2.UndefinedError as error:
+        if error.__cause__ is None:
+            undefined.append(path)
+        else:
+            # Native Ansible chains a deferred template error to its cause.
+            errors.append((path, str(error.__cause__)))
     except Exception as error:
         errors.append((path, "%s: %s" % (type(error).__name__, error)))
     return None
 
 
-def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), unsafe_paths=None):
+def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), scalars=None, unsafe_paths=None):
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
@@ -8591,22 +8978,48 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), un
             mapping_keys.append((path, [{"fact_template": str(key)} if isinstance(key, _FactKeyTemplate)
                                         else key for key in keys]))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys,
-                                                    (*path, wire_key), unsafe_paths)
+                                                    (*path, wire_key), scalars, unsafe_paths)
                 for wire_key, key in zip(wire_keys, keys)}
     if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys,
-                                          (*path, index), unsafe_paths)
+                                          (*path, index), scalars, unsafe_paths)
                 for index in range(len(value))]
     value = _fail_on_undef(value)
+    if scalars is not None and isinstance(value, (_dt.date, bytes, range)):
+        scalars.append((path, _encode_delegated_key(value)))
+        return None
     if unsafe_paths is not None and isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
         unsafe_paths.append(path)
     return value
 
 
+class _LegacyDatetimeKey:
+    """An exact datetime key that exceeds the legacy interpreter's range."""
+
+    __slots__ = ("_timestamp",)
+
+    def __init__(self, timestamp):
+        self._timestamp = timestamp
+
+    def isoformat(self):
+        return self._timestamp
+
+    def __hash__(self):
+        return hash((_LegacyDatetimeKey, self._timestamp))
+
+    def __eq__(self, other):
+        if not isinstance(other, _LegacyDatetimeKey):
+            return NotImplemented
+        return self._timestamp == other._timestamp
+
+    def __repr__(self):
+        return "_LegacyDatetimeKey(%r)" % self._timestamp
+
+
 def _encode_delegated_key(key):
     from datetime import date, datetime
 
-    if isinstance(key, datetime):
+    if isinstance(key, (datetime, _LegacyDatetimeKey)):
         return {"datetime": key.isoformat()}
     if isinstance(key, date):
         return {"date": key.isoformat()}
@@ -8617,15 +9030,18 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
-def _pack_delegated_value(value, *, preserve_unsafe=False):
+def _pack_delegated_value(value, *, preserve_scalars=False, preserve_unsafe=False):
     undefined, errors, mapping_keys = [], [], []
+    scalars = [] if preserve_scalars else None
     unsafe_paths = [] if preserve_unsafe else None
-    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, unsafe_paths=unsafe_paths)
+    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, scalars=scalars, unsafe_paths=unsafe_paths)
     result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
     if errors:
         result["errors"] = errors
     if mapping_keys:
         result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
+    if scalars:
+        result["scalars"] = scalars
     if unsafe_paths:
         result["unsafe_paths"] = unsafe_paths
     return result
@@ -8647,39 +9063,104 @@ def _contains_typed_mapping_keys(value):
     return False
 
 
-def _pack_include_value(value, *, preserve_unsafe=False):
+def _pack_include_value(value, *, preserve_scalars=False, preserve_unsafe=False):
     try:
-        return _pack_delegated_value(value, preserve_unsafe=preserve_unsafe)
+        return _pack_delegated_value(value, preserve_scalars=preserve_scalars, preserve_unsafe=preserve_unsafe)
     except (TypeError, ValueError):
         # A plugin can return arbitrary hashable objects. Such keys cannot
         # cross the wire, but should not abort callbacks for an include.
         return {"value": json.loads(json.dumps(value, default=str, skipkeys=True)), "undefined": []}
 
 
+def _decode_delegated_key(key, *, mapping_key=True):
+    if isinstance(key, list):
+        return tuple(_decode_delegated_key(part) for part in key)
+    if isinstance(key, dict):
+        if "fact_template" in key:
+            return _FactKeyTemplate(key["fact_template"])
+        if "bytes" in key:
+            return base64.b64decode(key["bytes"], validate=True)
+        if "date" in key:
+            return _dt.date(*map(int, key["date"].split("-")))
+        if "range" in key:
+            return range(*key["range"])
+        timestamp = key["datetime"]
+        sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
+        fromisoformat = getattr(_dt.datetime, "fromisoformat", None)
+        if fromisoformat is not None and not sub_minute:
+            return fromisoformat(timestamp)
+        # Python 3.5 and 3.6 accept %z offsets without a colon.
+        format_string = "%Y-%m-%dT%H:%M:%S"
+        if sub_minute:
+            timestamp = timestamp[:sub_minute.start()]
+        elif re.search(r"[+-]\d\d:\d\d$", timestamp):
+            timestamp = timestamp[:-3] + timestamp[-2:]
+            format_string += "%z"
+        if "." in timestamp:
+            format_string = format_string.replace("%S", "%S.%f")
+        value = fromisoformat(timestamp) if fromisoformat is not None else _dt.datetime.strptime(timestamp, format_string)
+        if sub_minute:
+            sign, hours, minutes, seconds, micros = sub_minute.groups()
+            offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
+                                   microseconds=int(micros or 0))
+            if sign == "-":
+                offset = -offset
+            if fromisoformat is not None:
+                # fromisoformat can discard offsets smaller than one second.
+                return value.replace(tzinfo=_dt.timezone(offset))
+            # Older interpreters require offsets aligned to a whole minute.
+            key_text = key["datetime"] if mapping_key else None
+            return _legacy_offset_datetime(value, offset, key_text)
+        return value
+    return key
+
+
+def _legacy_offset_datetime(value, offset, key_text):
+    try:
+        return (value - offset).replace(tzinfo=_dt.timezone.utc)
+    except OverflowError:
+        # Round away from zero so the local time moves back into range.
+        minute = _dt.timedelta(minutes=1)
+        aligned = min(abs(offset) // minute + 1, 1439) * minute
+        if offset.days < 0:
+            aligned = -aligned
+        adjustment = aligned - offset
+        try:
+            value += adjustment
+        except OverflowError:
+            if key_text is not None:
+                # Clamping a key could overwrite a distinct entry.
+                return _LegacyDatetimeKey(key_text)
+            # Offsets of 24 hours are invalid. Use the closest instant the
+            # legacy interpreter can represent when even 23:59 is too small.
+            value = _dt.datetime.min if adjustment.days < 0 else _dt.datetime.max
+        return value.replace(tzinfo=_dt.timezone(aligned))
+
+
+def _replace_delegated_values(value, replacements):
+    for path, replacement in replacements:
+        if not path:
+            return replacement
+        container = value
+        for key in path[:-1]:
+            container = container[key]
+        container[path[-1]] = replacement
+    return value
+
+
+def _restore_rescue_scalars(packed):
+    return _replace_delegated_values(
+        packed["value"], ((path, _decode_delegated_key(scalar, mapping_key=False))
+                          for path, scalar in packed.get("scalars", ())))
+
+
 def _restore_delegated_mapping_keys(value, mapping_keys):
-    def restore_key(key):
-        if isinstance(key, list):
-            return tuple(restore_key(part) for part in key)
-        if isinstance(key, dict):
-            from datetime import date, datetime
-
-            if "fact_template" in key:
-                return _FactKeyTemplate(key["fact_template"])
-            if "bytes" in key:
-                return base64.b64decode(key["bytes"], validate=True)
-            if "date" in key:
-                return date.fromisoformat(key["date"])
-            if "range" in key:
-                return range(*key["range"])
-            return datetime.fromisoformat(key["datetime"])
-        return key
-
     # Decode inner mappings before changing the keys used to reach them.
     for path, keys in reversed(mapping_keys):
         container = value
         for key in path:
             container = container[key]
-        entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
+        entries = {_decode_delegated_key(key): container[str(index)] for index, key in enumerate(keys)}
         container.clear()
         container.update(entries)
     return value
@@ -8783,6 +9264,15 @@ def agent_main():
     _restore_delegated_mapping_keys(injected_vars, mapping_keys.get("host", ()))
     _restore_delegated_mapping_keys(host_var_overrides, mapping_keys.get("overrides", ()))
     host_vars.update(injected_vars)
+    rescue = g.get("_INJECTED_RESCUE_FACTS")
+    if rescue:
+        restored = _restore_rescue_scalars(rescue)
+        missing = _AnsirollUndefined(hint="Undefined element in rescued task state")
+        replacements = [(path, missing) for path in rescue.get("undefined", ())]
+        replacements.extend((path, _captured(message)) for path, message in rescue.get("errors", ()))
+        restored = _replace_delegated_values(restored, replacements)
+        _restore_delegated_mapping_keys(restored, rescue.get("mapping_keys", ()))
+        host_var_overrides.update(_mark_unsafe(restored))
     extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
     _restore_delegated_mapping_keys(extra_vars, mapping_keys.get("extra", ()))
     specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
@@ -8827,9 +9317,22 @@ def agent_main():
                  skip_run_once=skip_run_once,
                  module_bundle=g.get("_ansiroll_import_bytes"),
                  resource_reader=g.get("_ansiroll_resource_read"))
+    rt._invocation_check_mode = bool(g.get("_INJECTED_INVOCATION_CHECK_MODE", check_mode))
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt._controller_result_transport = True
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
+    rt.on_rescue = lambda task, result, args: _chan_send(resp_fd, {
+        "t": "rescue",
+        "task": task.get("runtime_id") or task.get("uuid"),
+        "name": task.get("name"),
+        "result": _pack_include_value(result, preserve_scalars=True),
+        "args": _pack_include_value(args, preserve_scalars=True) if args is not None else None,
+    })
+    rt.on_rescue_overrides = lambda writes: _chan_send(resp_fd, {
+        "t": "rescue_overrides",
+        "writes": [(_pack_include_value(facts, preserve_scalars=True), no_log, cacheable)
+                   for facts, no_log, cacheable in writes],
+    })
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
 
     def _gather_setup():
@@ -8873,6 +9376,8 @@ def agent_main():
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),
             }
+            if action == "template" and rt._copy_transfer_check_mode is not None:
+                frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
             if lazy_play is not None and deferred:
                 frame["deferred_vars"] = deferred
             if lazy_play:

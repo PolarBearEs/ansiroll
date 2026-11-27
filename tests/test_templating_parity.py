@@ -1673,9 +1673,27 @@ def test_delegated_template_redacts_registered_diff(tmp_path, strategy):
     ("{{ value -}}\r\n\r\n", "ready\n", "\n", b"ready\n"),
     ("{{ value -}}\n", "ready", "\r\n", b"ready\r\n"),
     ("{{ value -}}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
+    ("first\n{% if true %}second{% endif -%}\n", None, "\r\n", b"first\r\nsecond\r\n"),
+    ("#jinja2: newline_sequence: '\\r\\n'\nfirst\n{% if true %}second{% endif -%}\n",
+     None, "\n", b"first\r\nsecond\r\n" if Version("2.14") <= Version(__version__) < Version("2.19")
+     else b"first\r\nsecond\n"),
+    ("#jinja2: trim_blocks: False\n", None, "\n", b"" if MODERN_TEMPLATING else b"\n"),
+    ("hello{# note -#} \n", None, "\n", b"hello\n"),
+    ("hello\r\n{% set x = 1 -%}\r\n\r\n", None, "\n", b"hello\n"),
+    ("{{ value }}{# note -#}\n", 42, "\n", b"42" if MODERN_TEMPLATING else b"42\n"),
+    ("{# note -#}\n", None, "\n", b"" if MODERN_TEMPLATING else b"\n"),
     ("alpha\r\nbeta\r\n", None, "\n", b"alpha\r\nbeta\r\n" if MODERN_TEMPLATING else b"alpha\nbeta\n"),
     pytest.param("{% set value = 42 %}{{ value -}}\n", None, "\n", b"42",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native full-template scalar")),
+    pytest.param("answer={{ none }}\n", None, "\n",
+                 b"answer=None\n" if Version(__version__) < Version("2.19.1") else b"answer=\n",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern None output segments")),
+    pytest.param("{{ 42 }}{{ none }}\n", None, "\n",
+                 b"42None\n" if Version(__version__) < Version("2.19.1") else b"42",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern None output segments")),
+    ("{% if true %}{{ true }}{% endif %}", None, "\n", b"True"),
+    ("{% if true %}{{ [true, 'ready'] }}{% endif %}", None, "\n", b"[True, 'ready']"),
+    ("{% if true %}{{ {'value': true} }}{% endif %}", None, "\n", b"{'value': True}"),
     (" {{ value }}\n", True, "\n", b" True\n"),
     pytest.param(" {{ missing | default(omit) }}\n", None, "\n", b" \n",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native scalar omit semantics")),
@@ -1699,6 +1717,197 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     output.unlink()
     actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
     assert actual == summary
+    assert output.read_bytes() == expected
+
+
+@pytest.mark.parametrize("override", ['trim_blocks: "False"', 'newline_sequence: "X"', 'unknown_option: 1'])
+def test_modern_template_rejects_invalid_header_without_writing(tmp_path, override):
+    if not MODERN_TEMPLATING:
+        pytest.skip("modern Core validates the template header")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": f"#jinja2: {override}\nstart{{# note #}}\nend\n", "rendered.txt": "original"})
+    for run in (_ansible, _ansiroll):
+        _, recap = run(path, tmp_path)
+        assert recap[3] == "1"
+        assert (tmp_path / "rendered.txt").read_text() == "original"
+
+
+def test_legacy_template_keeps_valid_header_options_alongside_an_unknown_key(tmp_path):
+    if MODERN_TEMPLATING:
+        pytest.skip("legacy Core ignores unknown template header options")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "#jinja2: unknown_option: 1, trim_blocks: False\nstart{# note #}\nend\n"})
+    output = tmp_path / "rendered.txt"
+    _, recap = _ansible(path, tmp_path)
+    assert recap[3] == "0"
+    assert output.read_bytes() == b"start\nend\n"
+    output.unlink()
+    _, recap = _ansiroll(path, tmp_path)
+    assert recap[3] == "0"
+    assert output.read_bytes() == b"start\nend\n"
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.11"), reason="custom comment arguments require Core 2.11+")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_honors_comments_and_trim_blocks(tmp_path, delegated):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: comment.j2
+        dest: "{{ playbook_dir }}/comment.txt"
+DELEGATION    - template:
+        src: block.j2
+        dest: "{{ playbook_dir }}/trimmed.txt"
+DELEGATION    - template:
+        src: block.j2
+        dest: "{{ playbook_dir }}/untrimmed.txt"
+        trim_blocks: false
+DELEGATION    - template:
+        src: custom.j2
+        dest: "{{ playbook_dir }}/custom.txt"
+        comment_start_string: "[["
+        comment_end_string: "]]"
+DELEGATION    - template:
+        src: header.j2
+        dest: "{{ playbook_dir }}/header.txt"
+DELEGATION    - template:
+        src: line-directives.j2
+        dest: "{{ playbook_dir }}/line-directives.txt"
+DELEGATION    - template:
+        src: overlapping-comment.j2
+        dest: "{{ playbook_dir }}/overlapping-comment.txt"
+        comment_start_string: !unsafe '{{#'
+        comment_end_string: '#}}'
+DELEGATION""".replace("DELEGATION", "      delegate_to: localhost\n" if delegated else ""), {
+        "comment.j2": "{# internal note #}",
+        "block.j2": "{% if true %}\nhello{% endif %}\n",
+        "custom.j2": "A {# literal\n[[ internal note ]]",
+        "header.j2": "#jinja2: trim_blocks: False\n{% if true %}\nhello{% endif %}\n",
+        "line-directives.j2": "#jinja2: line_statement_prefix: '%', line_comment_prefix: '##'\n"
+                              "% if true\nhello\n% endif\n## private\n",
+        "overlapping-comment.j2": "{{# private #}}",
+    })
+    outputs = {name: tmp_path / (name + ".txt") for name in (
+        "comment", "trimmed", "untrimmed", "custom", "header", "line-directives", "overlapping-comment",
+    )}
+
+    summary = _ansible(path, tmp_path)
+    expected = {name: output.read_bytes() for name, output in outputs.items()}
+    assert expected["comment"] == b""
+    assert expected["trimmed"].startswith(b"hello")
+    assert expected["untrimmed"].startswith(b"\nhello")
+    assert expected["header"].startswith(b"\nhello")
+    assert expected["custom"].startswith(b"A {# literal")
+    assert expected["line-directives"].strip() == b"hello"
+    assert expected["overlapping-comment"] == b""
+    for output in outputs.values():
+        output.unlink()
+    result = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert result == summary
+    assert {name: output.read_bytes() for name, output in outputs.items()} == expected
+
+
+def test_standalone_template_file_concatenates_buffered_native_values(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": """{% macro hello() %}Hello {{ 42 }}{% endmacro -%}
+{% set capture %}Capture {{ 43 }}{% endset -%}
+{{ hello() }}|{{ capture }}|{% filter upper %}Filter {{ 44 }}{% endfilter %}
+"""})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert output.read_bytes() == b"Hello 42|Capture 43|FILTER 44\n"
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"Hello 42|Capture 43|FILTER 44\n"
+
+
+@pytest.mark.parametrize(("template", "options", "expected_text"), [
+    ("a{# note +#}\nb\n", "", b"a\nb\n"),
+    ("12private34", "        comment_start_string: 12\n        comment_end_string: 34\n", b""),
+    ('#jinja2: comment_start_string: "{{", comment_end_string: "}}"\n{{ 6 * 7 }}\n', "", None),
+    ("plain text\n", '        comment_start_string: !unsafe "{{"\n', None),
+])
+def test_standalone_template_file_matches_comment_delimiter_handling(tmp_path, template, options, expected_text):
+    if options and Version(__version__) < Version("2.11"):
+        pytest.skip("custom comment arguments require Core 2.11+")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + options, {"sample.j2": template})
+    output = tmp_path / "rendered.txt"
+    output.write_bytes(b"existing\n")
+    expected = _ansible(path, tmp_path)
+    if expected_text is None and not MODERN_TEMPLATING and (not options or Version(__version__) < Version("2.15")):
+        expected_text = output.read_bytes()
+    assert expected[1][3] == ("1" if expected_text is None else "0")
+    content = b"existing\n" if expected_text is None else expected_text
+    assert output.read_bytes() == content
+    output.write_bytes(b"existing\n")
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == content
+
+
+@pytest.mark.skipif(Version(__version__) >= Version("2.11"), reason="requires Core 2.10 copy argument handling")
+def test_template_file_leaves_unsupported_comment_arguments_to_copy(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+        comment_start_string: "[["
+        comment_end_string: "]]"
+""", {"sample.j2": "a[[literal]]b\n"})
+    output = tmp_path / "rendered.txt"
+    output.write_bytes(b"existing\n")
+    expected = _ansible(path, tmp_path)
+    assert expected[1][3] == "1"
+    assert output.read_bytes() == b"existing\n"
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"existing\n"
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy template-file expression formatting")
+@pytest.mark.parametrize(("expression", "expected"), [("true", b"True\n"), ("[true, 1]", b"[True, 1]\n")])
+def test_legacy_template_header_preserves_expression_formatting(tmp_path, expression, expected):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "#jinja2: trim_blocks: False\n{{ " + expression + " }}\n"})
+    output = tmp_path / "rendered.txt"
+    native = _ansible(path, tmp_path)
+    assert output.read_bytes() == expected
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == native
     assert output.read_bytes() == expected
 
 
