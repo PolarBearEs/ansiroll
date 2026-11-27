@@ -1371,7 +1371,8 @@ def test_manifest_overwrite_can_truncate_only_the_validated_inode(monkeypatch, t
     ("truncate", errno.EINVAL),
     ("truncate", errno.ENOSYS),
 ])
-def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_path, destination, failure, error):
+def test_compile_reopens_validated_destination_with_truncation(
+        monkeypatch, cli_os, tmp_path, destination, failure, error):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     files = {"output": output, "manifest": manifest}
@@ -1427,12 +1428,13 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
         file = fdopen(fd, mode)
         return AppendOnly(file) if fd == append_fd and not reopened else file
 
-    monkeypatch.setattr(os, "open", open_append_only)
-    monkeypatch.setattr(os, "fdopen", wrap_append_handle)
+    cli_os.open = open_append_only
+    cli_os.fdopen = wrap_append_handle
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert len(reopened) == 1
     assert output.read_text() == source
     assert json.loads(manifest.read_text()) == data
+
 
 @pytest.mark.parametrize("manifest", [False, True])
 @pytest.mark.parametrize("reopen", [False, True])

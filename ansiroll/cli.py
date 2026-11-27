@@ -88,9 +88,6 @@ def main(argv=None, *, _standalone=False):
             return 2
         if args.output == "-":
             parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
-        if _diagnostics_may_be_playbook(args.playbook, 1, sys.stdout):
-            sys.stderr.write("ansiroll: stdout points to input playbook: %s\n" % args.playbook)
-            return 2
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -907,8 +904,11 @@ def _cmd_compile(args, stdout=None):
         check_input_destinations(check_paths=False)
 
     try:
-        if stdout is None and args.manifest:
-            _check_file_destinations(args.output, args.manifest)
+        if stdout is None:
+            if _diagnostics_may_be_playbook(args.playbook, 1, sys.stdout):
+                raise ValueError("stdout points to input playbook: %s" % args.playbook)
+            if args.manifest:
+                _check_file_destinations(args.output, args.manifest)
     except ValueError as ex:
         report("ansiroll: %s\n" % ex)
         return 2
