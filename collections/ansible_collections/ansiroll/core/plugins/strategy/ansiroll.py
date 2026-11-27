@@ -651,12 +651,7 @@ class StrategyModule(StrategyBase):
                 if task is not None:
                     self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"), frame.get("name"))
             elif t == "rescue_overrides":
-                private = _private_rescue_facts(self._variable_manager, host.name)
-                if private:
-                    facts = self._restore_rescue_value(frame["facts"])
-                    accepted = {name: value for name, value in facts.items() if name in private}
-                    if accepted:
-                        self._save_rescue_facts(host.name, accepted, accepted.keys())
+                self._mirror_rescue_overrides(host.name, frame["writes"])
             elif t == "gather_setup":
                 data = (self._gather_setup_options(host, gather_task) if gather_task is not None
                         else {"error": "implicit setup was not scheduled"})
@@ -728,13 +723,31 @@ class StrategyModule(StrategyBase):
         }
         self._save_rescue_facts(host.name, facts, facts.keys())
 
+    def _mirror_rescue_overrides(self, host_name, writes):
+        manager = self._variable_manager
+        previously_private = set(_private_rescue_facts(manager, host_name))
+        # Apply successful loop writes in order. A public item must not stop a
+        # later censored item updating a fact that was private before the loop.
+        for packed, no_log, cacheable in writes:
+            facts = self._restore_rescue_value(packed)
+            if no_log:
+                accepted = {name: value for name, value in facts.items() if name in previously_private}
+                if accepted:
+                    self._save_rescue_facts(host_name, accepted, accepted.keys())
+            else:
+                if cacheable:
+                    manager.set_host_facts(host_name, dict(facts))
+                self._save_rescue_facts(host_name, facts, ())
+
     def _save_rescue_facts(self, host_name, facts, private_names):
         manager = self._variable_manager
         manager.set_nonpersistent_facts(host_name, facts)
-        if private_names:
-            private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
-            stored = manager._nonpersistent_fact_cache[host_name]
-            private.setdefault(host_name, {}).update({key: stored[key] for key in private_names})
+        private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
+        tracked = private.setdefault(host_name, {})
+        for key in facts:
+            tracked.pop(key, None)
+        stored = manager._nonpersistent_fact_cache[host_name]
+        tracked.update({key: stored[key] for key in private_names})
 
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
@@ -1700,9 +1713,10 @@ class StrategyModule(StrategyBase):
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = state.get("ansible_facts")
-            if action == "set_fact" and "private_result" in frame and isinstance(facts, dict):
-                # Censored rescue overrides must be accepted by the rescue
-                # frame, which checks the existing private state and task status.
+            if (action == "set_fact" and isinstance(facts, dict)
+                    and ("private_result" in frame or frame.get("is_item"))):
+                # Loop items and censored rescue overrides are committed
+                # by the rescue frame after successful task completion.
                 from ansiroll.runtime import _RESCUE_FACT_NAMES
 
                 facts = {name: value for name, value in facts.items() if name not in _RESCUE_FACT_NAMES}

@@ -5596,7 +5596,8 @@ class Runtime:
 
         notifications = []
         no_log = bool(task.get("no_log"))
-        rescue_overrides = {} if self.on_rescue_overrides is not None and no_log else None
+        rescue_overrides = ([] if self.on_rescue_overrides is not None
+                            and task["action"].rsplit(".", 1)[-1] == "set_fact" else None)
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
@@ -5615,7 +5616,8 @@ class Runtime:
                 res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
                 no_log = res.pop("_ansiroll_no_log", no_log)
                 if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
-                    self._absorb_facts(task, res, fact_host, rescue_overrides=rescue_overrides)
+                    self._absorb_facts(task, res, fact_host,
+                                       rescue_overrides=rescue_overrides if no_log else None, no_log=no_log)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
@@ -5770,9 +5772,9 @@ class Runtime:
                     no_log = res.pop("_ansiroll_no_log", no_log)
                     if fact_host is None:
                         if commits_delegated_facts:
-                            pending_facts.append((None, dict(res)))
+                            pending_facts.append((None, dict(res), no_log))
                         else:
-                            self._absorb_facts(task, res, rescue_overrides=rescue_overrides)
+                            self._absorb_facts(task, res, rescue_overrides=rescue_overrides, no_log=no_log)
                     facts = res.get("ansible_facts") if fact_host is None else None
                     if isinstance(facts, _IncludedVars):
                         base_ctx.update({key: self.vars[key] for key in facts})
@@ -5838,15 +5840,15 @@ class Runtime:
                         agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
                 ignore_loop = ignore_loop or ignore
                 if fact_host is not None:
-                    pending_facts.append((fact_host, res))
+                    pending_facts.append((fact_host, res, no_log))
                 self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log)
                 if stop:
                     break
             loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
         finally:
-            for fact_host, result in pending_facts:
+            for fact_host, result, no_log in pending_facts:
                 if fact_host is None or loop_succeeded:
-                    self._absorb_facts(task, result, fact_host, rescue_overrides=rescue_overrides)
+                    self._absorb_facts(task, result, fact_host, rescue_overrides=rescue_overrides, no_log=no_log)
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
@@ -7287,7 +7289,7 @@ class Runtime:
             return self.host
         return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
 
-    def _absorb_facts(self, task, res, fact_host=None, *, rescue_overrides=None):
+    def _absorb_facts(self, task, res, fact_host=None, *, rescue_overrides=None, no_log=False):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -7329,7 +7331,9 @@ class Runtime:
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
                 if rescue_overrides is not None:
-                    rescue_overrides.update((name, facts[name]) for name in _RESCUE_FACT_NAMES & facts.keys())
+                    writes = {name: facts[name] for name in _RESCUE_FACT_NAMES & facts.keys()}
+                    if writes:
+                        rescue_overrides.append((writes, no_log, bool(res.get("_ansible_facts_cacheable"))))
                 if not res.get("_ansible_facts_cacheable"):
                     self.vars.setdefault("ansible_facts", {})
                     return
@@ -8596,11 +8600,12 @@ def _decode_delegated_key(key, *, mapping_key=True):
         if "range" in key:
             return range(*key["range"])
         timestamp = key["datetime"]
-        if hasattr(_dt.datetime, "fromisoformat"):
-            return _dt.datetime.fromisoformat(timestamp)
+        sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
+        fromisoformat = getattr(_dt.datetime, "fromisoformat", None)
+        if fromisoformat is not None and not sub_minute:
+            return fromisoformat(timestamp)
         # Python 3.5 and 3.6 accept %z offsets without a colon.
         format_string = "%Y-%m-%dT%H:%M:%S"
-        sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
         if sub_minute:
             timestamp = timestamp[:sub_minute.start()]
         elif re.search(r"[+-]\d\d:\d\d$", timestamp):
@@ -8608,14 +8613,17 @@ def _decode_delegated_key(key, *, mapping_key=True):
             format_string += "%z"
         if "." in timestamp:
             format_string = format_string.replace("%S", "%S.%f")
-        value = _dt.datetime.strptime(timestamp, format_string)
+        value = fromisoformat(timestamp) if fromisoformat is not None else _dt.datetime.strptime(timestamp, format_string)
         if sub_minute:
-            # These interpreters require offsets aligned to a whole minute.
             sign, hours, minutes, seconds, micros = sub_minute.groups()
             offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
                                    microseconds=int(micros or 0))
             if sign == "-":
                 offset = -offset
+            if fromisoformat is not None:
+                # fromisoformat can discard offsets smaller than one second.
+                return value.replace(tzinfo=_dt.timezone(offset))
+            # Older interpreters require offsets aligned to a whole minute.
             key_text = key["datetime"] if mapping_key else None
             return _legacy_offset_datetime(value, offset, key_text)
         return value
@@ -8834,8 +8842,10 @@ def agent_main():
         "result": _pack_include_value(result, preserve_scalars=True),
         "args": _pack_include_value(args, preserve_scalars=True) if args is not None else None,
     })
-    rt.on_rescue_overrides = lambda facts: _chan_send(resp_fd, {
-        "t": "rescue_overrides", "facts": _pack_include_value(facts, preserve_scalars=True),
+    rt.on_rescue_overrides = lambda writes: _chan_send(resp_fd, {
+        "t": "rescue_overrides",
+        "writes": [(_pack_include_value(facts, preserve_scalars=True), no_log, cacheable)
+                   for facts, no_log, cacheable in writes],
     })
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
 

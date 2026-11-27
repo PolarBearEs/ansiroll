@@ -5925,6 +5925,41 @@ LOOP
     assert "rejected-override" not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("final", ["public-override", "hidden-override"])
+def test_strategy_commits_final_rescue_write_with_per_item_no_log(tmp_path, final):
+    first = "hidden-override" if final == "public-override" else "public-override"
+    playbook = """- hosts: origin
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: saved-failure}
+          no_log: true
+      rescue:
+        - set_fact:
+            ansible_failed_result: {msg: '{{ item }}'}
+          no_log: "{{ item == 'hidden-override' }}"
+          loop: [FIRST, FINAL]
+- hosts: origin
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_result.msg == 'FINAL'
+      no_log: true
+- hosts: recipient
+  gather_facts: false
+  tasks:
+    - assert:
+        that: EXPECTED_PUBLIC
+"""
+    expected_public = ("hostvars.origin.ansible_failed_result is undefined" if final == "hidden-override"
+                       else "hostvars.origin.ansible_failed_result.msg == 'public-override'")
+    result = _run_strategy_play(tmp_path, playbook.replace("FIRST", first).replace("FINAL", final)
+                                .replace("EXPECTED_PUBLIC", expected_public), inventory="origin,recipient,")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "hidden-override" not in result.stdout + result.stderr
+
+
 def test_strategy_does_not_publish_censored_fact_under_an_untracked_rescue_name(tmp_path):
     proc = _run_strategy_play(tmp_path, """- hosts: origin
   gather_facts: false

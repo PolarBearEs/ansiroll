@@ -55,6 +55,19 @@ def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
 
 
+def test_rescued_datetime_keys_preserve_fractional_offsets():
+    from ansiroll import runtime
+
+    stamp = datetime.datetime(2025, 3, 1)
+    offsets = (100000, 200000, -100000)
+    keys = [stamp.replace(tzinfo=datetime.timezone(datetime.timedelta(microseconds=offset))) for offset in offsets]
+    original = dict(zip(keys, offsets))
+    packed = runtime._pack_include_value(original)
+    restored = runtime._restore_delegated_mapping_keys(packed["value"], packed["mapping_keys"])
+    assert restored == original
+    assert [key.isoformat() for key in restored] == [key.isoformat() for key in keys]
+
+
 def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch):
     from ansiroll import runtime
 
