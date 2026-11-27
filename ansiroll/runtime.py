@@ -5271,6 +5271,7 @@ class Runtime:
                 aggregate, ignored = legacy_failure
                 aggregate_no_log = aggregate_no_log or include_no_log
                 selected.clear()
+                status = _status_of(aggregate)
             else:
                 failed = any(_result_failed(outcome) for _, outcome, _, _ in results)
                 skipped = all(outcome.get("skipped") for _, outcome, _, _ in results)
@@ -5278,18 +5279,22 @@ class Runtime:
                              "results": [reported for _, _, reported, _ in results]}
                 if failed:
                     aggregate["msg"] = "One or more items failed"
-                elif skipped:
+                elif skipped and _core_at_least(2, 11):
                     aggregate.update(skipped=True, msg="All items skipped")
                 else:
                     aggregate["msg"] = "All items completed"
+                    if skipped:
+                        # 2.10's callback counts an all-skipped loop even though
+                        # the executor omits the aggregate skip and failure flags.
+                        del aggregate["failed"]
+                status = "skipped" if skipped and not failed else _status_of(aggregate)
                 ignored = ignore_loop if _core_at_least(2, 21) else failed_items_ignored
                 for item, outcome, reported, item_no_log in results:
-                    status = _status_of(outcome)
-                    if status != "ok":
-                        self.emit(node, status, reported, item=item, ignored=ignored, is_item=True,
+                    item_status = _status_of(outcome)
+                    if item_status != "ok":
+                        self.emit(node, item_status, reported, item=item, ignored=ignored, is_item=True,
                                   name=name, no_log=item_no_log)
             self._store_register(node, aggregate)
-            status = _status_of(aggregate)
             if status != "ok":
                 self.emit(node, status, aggregate, ignored=ignored, name=name, no_log=aggregate_no_log)
             if status == "failed":
