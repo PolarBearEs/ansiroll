@@ -1000,6 +1000,7 @@ def _trust_set_fact_value(value):
 # merges include params after the nonpersistent fact cache).
 _HIGH_VARS_KEY = "__ansiroll_high_vars__"
 _INCLUDE_PARAMS_KEY = "__ansiroll_include_params__"
+_RESCUE_FACT_NAMES = frozenset(("ansible_failed_task", "ansible_failed_result"))
 
 
 def _with_high_vars(overlay, values):
@@ -1144,10 +1145,11 @@ def _condition_contains_string(value, string_type):
 class TaskFailed(Exception):
     """Raised when a task fails and is not ignored (drives block/rescue)."""
 
-    def __init__(self, name, task=None, result=None):
+    def __init__(self, name, task=None, result=None, *, executed_args=None):
         super(TaskFailed, self).__init__(name)
         self.task = task or {"name": name}
         self.result = result or {"failed": True, "msg": str(name)}
+        self.executed_args = executed_args
         self.pending_includes = None
 
 
@@ -4287,6 +4289,9 @@ class Runtime:
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
         self.controller_vars_files_fn = None
         self.on_task_start = None
+        self.on_rescue = None
+        self.on_rescue_overrides = None
+        self._executed_task_args = None
         self._started_task_name = (None, None)
         self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
         self.templater = _Templater()
@@ -4982,7 +4987,7 @@ class Runtime:
                 self._tally("ok")
                 self._tally("ignored")
             else:
-                raise TaskFailed(node.get("name"), node, result)
+                raise TaskFailed(name, node, result)
             return
         tally_ok = node.get("tally_include_ok", True)
         looped = items is not None
@@ -5078,7 +5083,7 @@ class Runtime:
                     self._tally("ok")
                     self._tally("ignored")
                 else:
-                    failure = TaskFailed(node.get("name"), node, aggregate)
+                    failure = TaskFailed(name, node, aggregate)
             elif status == "skipped":
                 self._tally("skipped")
 
@@ -5169,12 +5174,17 @@ class Runtime:
                 self._tally("rescued")
                 # Saved as nonpersistent facts (set_fact level) that outlive
                 # the rescue (StrategyBase._process_pending_results).
+                failed_task = {**ex.task, "name": ex.args[0]}
+                if ex.executed_args is not None:
+                    failed_task["args"] = ex.executed_args
                 failed_facts = {
-                    "ansible_failed_task": ex.task,
+                    "ansible_failed_task": failed_task,
                     "ansible_failed_result": ex.result,
                 }
                 self.vars.update(failed_facts)
                 self._set_fact_overrides.update(failed_facts)
+                if self.on_rescue is not None:
+                    self.on_rescue(failed_task, ex.result, ex.executed_args)
                 yield from self._failed_include_steps(ex)
                 yield self._node_steps(rescue, scope, b_become)
         except TaskFailed as ex:
@@ -5553,6 +5563,7 @@ class Runtime:
             return False
 
     def _run_task(self, task, overlay, become=False):
+        self._executed_task_args = None
         special = task.get("special")
         if special in ("meta_flush_handlers", "meta_clear_host_errors"):
             conditions = self._when_of(task)
@@ -5562,9 +5573,9 @@ class Runtime:
                         return
                 except ConditionalError as ex:
                     result = {"failed": True, "changed": False, "msg": str(ex)}
-                    self.emit_start(task)
+                    name = self.emit_start(task)
                     self.emit(task, "failed", result)
-                    raise TaskFailed(task.get("name"), task, result)
+                    raise TaskFailed(name, task, result)
             if special == "meta_flush_handlers":
                 self.emit_start(task)
                 inherited = self._inherited_when
@@ -5581,15 +5592,18 @@ class Runtime:
         if self._skips_run_once(task, base_ctx):
             # Linear emits no skipped event for hosts outside run_once.
             return
-        self.emit_start(task)
+        name = self.emit_start(task)
 
         notifications = []
         no_log = bool(task.get("no_log"))
+        rescue_overrides = ([] if self.on_rescue_overrides is not None
+                            and task["action"].rsplit(".", 1)[-1] == "set_fact" else None)
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
                 try:
-                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications)
+                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications,
+                                                 rescue_overrides=rescue_overrides)
                 except TaskFailed:
                     raise
                 except Exception as ex:
@@ -5602,7 +5616,8 @@ class Runtime:
                 res, fact_host = self._exec_notifying_task(task, base_ctx, effective_become, notifications)
                 no_log = res.pop("_ansiroll_no_log", no_log)
                 if fact_host is None or not (_result_failed(res) or res.get("unreachable")):
-                    self._absorb_facts(task, res, fact_host)
+                    self._absorb_facts(task, res, fact_host,
+                                       rescue_overrides=rescue_overrides if no_log else None, no_log=no_log)
         ignore_unreachable = res.pop("_ansiroll_ignore_unreachable", False)
         if task.get("register"):
             res.setdefault("failed", False)
@@ -5613,6 +5628,12 @@ class Runtime:
         if res.get("changed") and not (_result_failed(res) or res.get("unreachable")):
             self._queue_notify(notifications)
         status = _status_of(res)
+        if rescue_overrides:
+            if status not in ("ok", "changed"):
+                # Public item facts are visible even when a later item fails.
+                rescue_overrides = [write for write in rescue_overrides if not write[1]]
+            if rescue_overrides:
+                self.on_rescue_overrides(rescue_overrides)
         if status == "unreachable" and task.get("loop") is None:
             ignore_unreachable = self._ignores_unreachable(task, base_ctx)
         self.emit(task, status, res, ignored=ignore, no_log=no_log)
@@ -5633,7 +5654,15 @@ class Runtime:
                 self._tally("changed" if tally_changed else "ok")
                 self._tally("ignored")
             else:
-                raise TaskFailed(task.get("name"), task, dict(res))
+                # Aggregate loop failures retain the task-level args.
+                executed_args = self._executed_task_args if task.get("loop") is None else None
+                if executed_args is not None and not _core_at_least(2, 19):
+                    try:
+                        _fail_on_undef(executed_args)
+                    except jinja2.UndefinedError:
+                        # Legacy Core retains the authored args when validation fails.
+                        executed_args = None
+                raise TaskFailed(name, task, dict(res), executed_args=executed_args)
         elif res.get("skipped"):
             self._tally("skipped")
         else:
@@ -5722,7 +5751,7 @@ class Runtime:
         return (self._loop_control_bool(task, "loop_extended", False, ctx),
                 self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
-    def _run_loop(self, task, items, base_ctx, become=False, notifications=None):
+    def _run_loop(self, task, items, base_ctx, become=False, notifications=None, *, rescue_overrides=None):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
@@ -5747,9 +5776,9 @@ class Runtime:
                     no_log = res.pop("_ansiroll_no_log", no_log)
                     if fact_host is None:
                         if commits_delegated_facts:
-                            pending_facts.append((None, dict(res)))
+                            pending_facts.append((None, dict(res), no_log))
                         else:
-                            self._absorb_facts(task, res)
+                            self._absorb_facts(task, res, rescue_overrides=rescue_overrides, no_log=no_log)
                     facts = res.get("ansible_facts") if fact_host is None else None
                     if isinstance(facts, _IncludedVars):
                         base_ctx.update({key: self.vars[key] for key in facts})
@@ -5815,15 +5844,15 @@ class Runtime:
                         agg["_ansiroll_ignore_unreachable"] = agg.get("_ansiroll_ignore_unreachable", True) and ignored
                 ignore_loop = ignore_loop or ignore
                 if fact_host is not None:
-                    pending_facts.append((fact_host, res))
+                    pending_facts.append((fact_host, res, no_log))
                 self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log)
                 if stop:
                     break
             loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
         finally:
-            for fact_host, result in pending_facts:
+            for fact_host, result, no_log in pending_facts:
                 if fact_host is None or loop_succeeded:
-                    self._absorb_facts(task, result, fact_host)
+                    self._absorb_facts(task, result, fact_host, rescue_overrides=rescue_overrides, no_log=no_log)
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
@@ -6174,6 +6203,7 @@ class Runtime:
                     ))
                     if self._is_builtin_unarchive(task):
                         self._normalize_unarchive_options(args)
+                    self._executed_task_args = args
                     res = self.delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
@@ -6190,6 +6220,7 @@ class Runtime:
                     self._render_action_args(task.get("args") or {}, ctx, args_cache, source_task=task)))
                 if self._is_builtin_unarchive(task):
                     self._normalize_unarchive_options(args)
+                self._executed_task_args = args
                 self._module_source_bytes = self._baked_module_source(task, args)
                 if task.get("async_val") and int(task.get("poll") or 0) == 0:
                     res = self._run_async_module(
@@ -6501,6 +6532,17 @@ class Runtime:
                 and set(args) == {"_raw_params"}
                 and isinstance(args["_raw_params"], dict)):
             args = dict(args["_raw_params"])
+        if name == "assert" and "_variable_params" in args:
+            # Legacy Core parses a templated argument mapping into this field.
+            params = args["_variable_params"]
+            if params == _OMIT or params == ctx.get("omit", _OMIT):
+                params = {}
+            if not isinstance(params, dict):
+                _fail_on_undef(params)
+                raise ValueError("assert args must resolve to a dictionary")
+            args = {**params, **{key: value for key, value in args.items() if key != "_variable_params"}}
+        authored = task.get("args") or {}
+        self._executed_task_args = {**args, "that": authored["that"]} if name == "assert" and "that" in authored else args
         if name == "debug":
             for key, value in args.items():
                 try:
@@ -6559,6 +6601,7 @@ class Runtime:
         if "args" not in args_cache:
             args_cache["args"] = self._set_fact_args(task, ctx)
         args = args_cache["args"]
+        self._executed_task_args = args
         cacheable = _boolean(args.get("cacheable", False), strict=True)
         modern = _core_at_least(2, 19)
         reserved = {"true", "false", "none", "True", "False", "None", "not"}
@@ -7250,7 +7293,7 @@ class Runtime:
             return self.host
         return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
 
-    def _absorb_facts(self, task, res, fact_host=None):
+    def _absorb_facts(self, task, res, fact_host=None, *, rescue_overrides=None, no_log=False):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
             self.vars.update(refreshed_vars)
@@ -7291,6 +7334,10 @@ class Runtime:
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
+                if rescue_overrides is not None:
+                    writes = {name: facts[name] for name in _RESCUE_FACT_NAMES & facts.keys()}
+                    if writes:
+                        rescue_overrides.append((writes, no_log, bool(res.get("_ansible_facts_cacheable"))))
                 if not res.get("_ansible_facts_cacheable"):
                     self.vars.setdefault("ansible_facts", {})
                     return
@@ -8422,19 +8469,23 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, unsafe_paths):
+def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, scalars, unsafe_paths):
     try:
-        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path, unsafe_paths)
+        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path, scalars, unsafe_paths)
     except _CapturedTemplateError as error:
         errors.append((path, str(error)))
-    except jinja2.UndefinedError:
-        undefined.append(path)
+    except jinja2.UndefinedError as error:
+        if error.__cause__ is None:
+            undefined.append(path)
+        else:
+            # Native Ansible chains a deferred template error to its cause.
+            errors.append((path, str(error.__cause__)))
     except Exception as error:
         errors.append((path, "%s: %s" % (type(error).__name__, error)))
     return None
 
 
-def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), unsafe_paths=None):
+def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), scalars=None, unsafe_paths=None):
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
@@ -8446,22 +8497,48 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), un
             mapping_keys.append((path, [{"fact_template": str(key)} if isinstance(key, _FactKeyTemplate)
                                         else key for key in keys]))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys,
-                                                    (*path, wire_key), unsafe_paths)
+                                                    (*path, wire_key), scalars, unsafe_paths)
                 for wire_key, key in zip(wire_keys, keys)}
     if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys,
-                                          (*path, index), unsafe_paths)
+                                          (*path, index), scalars, unsafe_paths)
                 for index in range(len(value))]
     value = _fail_on_undef(value)
+    if scalars is not None and isinstance(value, (_dt.date, bytes, range)):
+        scalars.append((path, _encode_delegated_key(value)))
+        return None
     if unsafe_paths is not None and isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
         unsafe_paths.append(path)
     return value
 
 
+class _LegacyDatetimeKey:
+    """An exact datetime key that exceeds the legacy interpreter's range."""
+
+    __slots__ = ("_timestamp",)
+
+    def __init__(self, timestamp):
+        self._timestamp = timestamp
+
+    def isoformat(self):
+        return self._timestamp
+
+    def __hash__(self):
+        return hash((_LegacyDatetimeKey, self._timestamp))
+
+    def __eq__(self, other):
+        if not isinstance(other, _LegacyDatetimeKey):
+            return NotImplemented
+        return self._timestamp == other._timestamp
+
+    def __repr__(self):
+        return "_LegacyDatetimeKey(%r)" % self._timestamp
+
+
 def _encode_delegated_key(key):
     from datetime import date, datetime
 
-    if isinstance(key, datetime):
+    if isinstance(key, (datetime, _LegacyDatetimeKey)):
         return {"datetime": key.isoformat()}
     if isinstance(key, date):
         return {"date": key.isoformat()}
@@ -8472,15 +8549,18 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
-def _pack_delegated_value(value, *, preserve_unsafe=False):
+def _pack_delegated_value(value, *, preserve_scalars=False, preserve_unsafe=False):
     undefined, errors, mapping_keys = [], [], []
+    scalars = [] if preserve_scalars else None
     unsafe_paths = [] if preserve_unsafe else None
-    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, unsafe_paths=unsafe_paths)
+    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, scalars=scalars, unsafe_paths=unsafe_paths)
     result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
     if errors:
         result["errors"] = errors
     if mapping_keys:
         result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
+    if scalars:
+        result["scalars"] = scalars
     if unsafe_paths:
         result["unsafe_paths"] = unsafe_paths
     return result
@@ -8502,39 +8582,104 @@ def _contains_typed_mapping_keys(value):
     return False
 
 
-def _pack_include_value(value, *, preserve_unsafe=False):
+def _pack_include_value(value, *, preserve_scalars=False, preserve_unsafe=False):
     try:
-        return _pack_delegated_value(value, preserve_unsafe=preserve_unsafe)
+        return _pack_delegated_value(value, preserve_scalars=preserve_scalars, preserve_unsafe=preserve_unsafe)
     except (TypeError, ValueError):
         # A plugin can return arbitrary hashable objects. Such keys cannot
         # cross the wire, but should not abort callbacks for an include.
         return {"value": json.loads(json.dumps(value, default=str, skipkeys=True)), "undefined": []}
 
 
+def _decode_delegated_key(key, *, mapping_key=True):
+    if isinstance(key, list):
+        return tuple(_decode_delegated_key(part) for part in key)
+    if isinstance(key, dict):
+        if "fact_template" in key:
+            return _FactKeyTemplate(key["fact_template"])
+        if "bytes" in key:
+            return base64.b64decode(key["bytes"], validate=True)
+        if "date" in key:
+            return _dt.date(*map(int, key["date"].split("-")))
+        if "range" in key:
+            return range(*key["range"])
+        timestamp = key["datetime"]
+        sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
+        fromisoformat = getattr(_dt.datetime, "fromisoformat", None)
+        if fromisoformat is not None and not sub_minute:
+            return fromisoformat(timestamp)
+        # Python 3.5 and 3.6 accept %z offsets without a colon.
+        format_string = "%Y-%m-%dT%H:%M:%S"
+        if sub_minute:
+            timestamp = timestamp[:sub_minute.start()]
+        elif re.search(r"[+-]\d\d:\d\d$", timestamp):
+            timestamp = timestamp[:-3] + timestamp[-2:]
+            format_string += "%z"
+        if "." in timestamp:
+            format_string = format_string.replace("%S", "%S.%f")
+        value = fromisoformat(timestamp) if fromisoformat is not None else _dt.datetime.strptime(timestamp, format_string)
+        if sub_minute:
+            sign, hours, minutes, seconds, micros = sub_minute.groups()
+            offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
+                                   microseconds=int(micros or 0))
+            if sign == "-":
+                offset = -offset
+            if fromisoformat is not None:
+                # fromisoformat can discard offsets smaller than one second.
+                return value.replace(tzinfo=_dt.timezone(offset))
+            # Older interpreters require offsets aligned to a whole minute.
+            key_text = key["datetime"] if mapping_key else None
+            return _legacy_offset_datetime(value, offset, key_text)
+        return value
+    return key
+
+
+def _legacy_offset_datetime(value, offset, key_text):
+    try:
+        return (value - offset).replace(tzinfo=_dt.timezone.utc)
+    except OverflowError:
+        # Round away from zero so the local time moves back into range.
+        minute = _dt.timedelta(minutes=1)
+        aligned = min(abs(offset) // minute + 1, 1439) * minute
+        if offset.days < 0:
+            aligned = -aligned
+        adjustment = aligned - offset
+        try:
+            value += adjustment
+        except OverflowError:
+            if key_text is not None:
+                # Clamping a key could overwrite a distinct entry.
+                return _LegacyDatetimeKey(key_text)
+            # Offsets of 24 hours are invalid. Use the closest instant the
+            # legacy interpreter can represent when even 23:59 is too small.
+            value = _dt.datetime.min if adjustment.days < 0 else _dt.datetime.max
+        return value.replace(tzinfo=_dt.timezone(aligned))
+
+
+def _replace_delegated_values(value, replacements):
+    for path, replacement in replacements:
+        if not path:
+            return replacement
+        container = value
+        for key in path[:-1]:
+            container = container[key]
+        container[path[-1]] = replacement
+    return value
+
+
+def _restore_rescue_scalars(packed):
+    return _replace_delegated_values(
+        packed["value"], ((path, _decode_delegated_key(scalar, mapping_key=False))
+                          for path, scalar in packed.get("scalars", ())))
+
+
 def _restore_delegated_mapping_keys(value, mapping_keys):
-    def restore_key(key):
-        if isinstance(key, list):
-            return tuple(restore_key(part) for part in key)
-        if isinstance(key, dict):
-            from datetime import date, datetime
-
-            if "fact_template" in key:
-                return _FactKeyTemplate(key["fact_template"])
-            if "bytes" in key:
-                return base64.b64decode(key["bytes"], validate=True)
-            if "date" in key:
-                return date.fromisoformat(key["date"])
-            if "range" in key:
-                return range(*key["range"])
-            return datetime.fromisoformat(key["datetime"])
-        return key
-
     # Decode inner mappings before changing the keys used to reach them.
     for path, keys in reversed(mapping_keys):
         container = value
         for key in path:
             container = container[key]
-        entries = {restore_key(key): container[str(index)] for index, key in enumerate(keys)}
+        entries = {_decode_delegated_key(key): container[str(index)] for index, key in enumerate(keys)}
         container.clear()
         container.update(entries)
     return value
@@ -8638,6 +8783,15 @@ def agent_main():
     _restore_delegated_mapping_keys(injected_vars, mapping_keys.get("host", ()))
     _restore_delegated_mapping_keys(host_var_overrides, mapping_keys.get("overrides", ()))
     host_vars.update(injected_vars)
+    rescue = g.get("_INJECTED_RESCUE_FACTS")
+    if rescue:
+        restored = _restore_rescue_scalars(rescue)
+        missing = _AnsirollUndefined(hint="Undefined element in rescued task state")
+        replacements = [(path, missing) for path in rescue.get("undefined", ())]
+        replacements.extend((path, _captured(message)) for path, message in rescue.get("errors", ()))
+        restored = _replace_delegated_values(restored, replacements)
+        _restore_delegated_mapping_keys(restored, rescue.get("mapping_keys", ()))
+        host_var_overrides.update(_mark_unsafe(restored))
     extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
     _restore_delegated_mapping_keys(extra_vars, mapping_keys.get("extra", ()))
     specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
@@ -8685,6 +8839,18 @@ def agent_main():
     rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
     rt._controller_result_transport = True
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
+    rt.on_rescue = lambda task, result, args: _chan_send(resp_fd, {
+        "t": "rescue",
+        "task": task.get("runtime_id") or task.get("uuid"),
+        "name": task.get("name"),
+        "result": _pack_include_value(result, preserve_scalars=True),
+        "args": _pack_include_value(args, preserve_scalars=True) if args is not None else None,
+    })
+    rt.on_rescue_overrides = lambda writes: _chan_send(resp_fd, {
+        "t": "rescue_overrides",
+        "writes": [(_pack_include_value(facts, preserve_scalars=True), no_log, cacheable)
+                   for facts, no_log, cacheable in writes],
+    })
     rt.on_warning = lambda message: _chan_send(resp_fd, {"t": "warning", "message": message})
 
     def _gather_setup():

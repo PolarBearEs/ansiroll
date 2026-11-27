@@ -4,6 +4,7 @@ These use only the runtime "special" actions (debug/set_fact/fail/assert) and
 template/copy-with-content, so no Ansible or embedded modules are required.
 """
 
+import datetime
 import io
 import json
 import os
@@ -52,6 +53,57 @@ def run(tasks, host_vars=None, handlers=None, gather=False):
 
 def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
+
+
+def test_rescued_datetime_keys_preserve_fractional_offsets():
+    from ansiroll import runtime
+
+    stamp = datetime.datetime(2025, 3, 1)
+    offsets = (100000, 200000, -100000)
+    keys = [stamp.replace(tzinfo=datetime.timezone(datetime.timedelta(microseconds=offset))) for offset in offsets]
+    original = dict(zip(keys, offsets))
+    packed = runtime._pack_include_value(original)
+    restored = runtime._restore_delegated_mapping_keys(packed["value"], packed["mapping_keys"])
+    assert restored == original
+    assert [key.isoformat() for key in restored] == [key.isoformat() for key in keys]
+
+
+def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch):
+    from ansiroll import runtime
+
+    values = {"day": datetime.date(2025, 3, 1), "stamp": datetime.datetime(2025, 3, 1, 8, 30),
+              "aware": datetime.datetime(2025, 3, 1, 8, 30, 1, 123,
+                                         tzinfo=datetime.timezone(datetime.timedelta(hours=-3, minutes=-30)))}
+    sub_minute_offsets = (datetime.timedelta(seconds=30),
+                          -datetime.timedelta(hours=2, seconds=15, microseconds=321))
+    offset_values = {"offset_%d" % index: values["stamp"].replace(tzinfo=datetime.timezone(offset))
+                     for index, offset in enumerate(sub_minute_offsets)}
+    values.update(offset_values)
+    extreme = datetime.timedelta(hours=23, minutes=59, seconds=30)
+    bounds = {
+        "near_min": datetime.datetime.min.replace(tzinfo=datetime.timezone(sub_minute_offsets[0])),
+        "near_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-sub_minute_offsets[0])),
+        "below_min": datetime.datetime.min.replace(tzinfo=datetime.timezone(extreme)),
+        "above_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-extreme)),
+    }
+    packed = runtime._pack_include_value({**values, **bounds}, preserve_scalars=True)
+    first_key = bounds["below_min"]
+    second_key = datetime.datetime.min.replace(tzinfo=datetime.timezone(extreme - datetime.timedelta(seconds=15)))
+    packed_keys = runtime._pack_include_value({first_key: "first", second_key: "second", first_key.isoformat(): "text"})
+    legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime,
+                                      min=datetime.datetime.min, max=datetime.datetime.max)
+    monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime,
+                                                       timedelta=datetime.timedelta, timezone=datetime.timezone))
+    restored = runtime._restore_rescue_scalars(packed)
+    assert {name: restored[name] for name in values} == values
+    assert all(restored[name].tzinfo is datetime.timezone.utc for name in offset_values)
+    assert restored["near_min"].isoformat() == "0001-01-01T00:00:30+00:01"
+    assert restored["near_max"].isoformat() == "9999-12-31T23:59:29.999999-00:01"
+    assert restored["below_min"].isoformat() == "0001-01-01T00:00:00+23:59"
+    assert restored["above_max"].isoformat() == "9999-12-31T23:59:59.999999-23:59"
+    restored_keys = runtime._restore_delegated_mapping_keys(packed_keys["value"], packed_keys["mapping_keys"])
+    assert list(restored_keys.values()) == ["first", "second", "text"]
+    assert runtime._pack_include_value(restored_keys)["mapping_keys"] == packed_keys["mapping_keys"]
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():
