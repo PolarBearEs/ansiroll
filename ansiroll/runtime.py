@@ -3453,6 +3453,48 @@ def _wrap_custom_plugin(fn, templater):
     return wrapped
 
 
+def _keep_generator_mapping_edits(result, before, consumer):
+    # The generator and its consumer hold distinct dictionaries. Apply
+    # consumer edits to slots that the generator did not change.
+    current = {id(key): item for key, item in consumer.items()}
+    if tuple(current) == tuple(before) and all(value is before[key][1] for key, value in current.items()):
+        return
+    final_order = tuple(map(id, result))
+    final_ids = set(final_order)
+    retained = tuple(key for key in before if key in final_ids)
+    added = tuple(key for key in final_order if key not in before)
+    for identity, (key, _) in before.items():
+        if identity not in final_ids:
+            consumer.pop(key, None)
+    if final_order == retained + added:
+        # Apply deletions and additions in place when the generator has not
+        # moved an existing key. Consumer additions precede generator additions.
+        for key, value in result.items():
+            if id(key) not in before or value is not before[id(key)][1]:
+                consumer[key] = value
+        result.clear()
+        result.update(consumer)
+        return
+    for key, value in tuple(result.items()):
+        identity = id(key)
+        if identity in before and value is before[identity][1]:
+            if key not in consumer:
+                del result[key]
+            elif consumer[key] is not value:
+                result[key] = consumer[key]
+    for key, value in consumer.items():
+        if id(key) not in before and id(key) not in final_ids:
+            result.setdefault(key, value)
+
+
+def _keep_generator_list_edits(result, before, consumer):
+    if len(result) >= len(before) and all(old is new for old, new in zip(before, result)):
+        result[:len(before)] = consumer
+    elif len(result) == len(before) and len(consumer) >= len(before):
+        result[:] = [current if old is new else new for old, new, current in zip(before, result, consumer)]
+        result.extend(consumer[len(before):])
+
+
 class _ScopedGenerator(Generator):
     """Restore the caller's normalization scope while a generator is suspended."""
 
@@ -3461,16 +3503,84 @@ class _ScopedGenerator(Generator):
         self._templater = templater
         self._converted = converted
         self._restored = {}
+        self._yielded_members = {}
+
+    def _restore_yield(self, result, restored):
+        result = _restore_plugin_result(result, self._converted, restored, self._restored)
+        if restored:
+            for identity, (builtin, view) in restored.items():
+                if builtin is not view and type(builtin) in (list, dict):
+                    self._yielded_members[identity] = builtin.copy()
+        return result
+
+    def _finish(self):
+        if not self._yielded_members:
+            return
+        # Resolve each retained projection only once when the generator exits.
+        # A previously shared child can now require a copy of its own.
+        sources = _plugin_argument_sources(self._converted)
+        roots = tuple(self._restored[identity][0] for identity in self._yielded_members)
+        copies = _plugin_container_copies(
+            roots, lambda value: id(value) in sources or id(value) in self._restored, self._restored)
+        new_copies = copies - self._restored.keys() - sources.keys()
+        unchanged = self._restored.copy()
+
+        # A tuple cannot be updated in place. If a child now needs a new
+        # projection, replace the tuple wherever a mutable parent holds it.
+        kept_tuples = set()
+
+        def needs_new_copy(member):
+            identity = id(member)
+            if identity in new_copies:
+                return True
+            if type(member) is tuple and identity in unchanged and identity not in kept_tuples:
+                if any(needs_new_copy(item) for item in member):
+                    del unchanged[identity]
+                    new_copies.add(identity)
+                    return True
+                kept_tuples.add(identity)
+            return False
+
+        for builtin, _ in self._restored.values():
+            if type(builtin) is tuple:
+                needs_new_copy(builtin)
+
+        projections = dict((identity, entry[1]) for identity, entry in self._restored.items())
+        projections.update(sources)
+        edits = []
+        for identity, before in self._yielded_members.items():
+            builtin, view = self._restored[identity]
+            if type(builtin) is dict:
+                changed = any(a is not b or x is not y
+                              for (a, x), (b, y) in zip(before.items(), builtin.items()))
+                members = builtin.values()
+            else:
+                changed = any(a is not b for a, b in zip(before, builtin))
+                members = builtin
+            if len(before) != len(builtin) or changed or any(id(item) in new_copies for item in members):
+                del unchanged[identity]
+                if type(builtin) is dict:
+                    projected = {id(key): (key, projections.get(id(item), item)) for key, item in before.items()}
+                else:
+                    projected = [projections.get(id(item), item) for item in before]
+                edits.append((view, projected, view.copy()))
+        if len(unchanged) != len(self._restored):
+            _restore_plugin_argument(roots, sources, unchanged, copies=copies, previous=self._restored)
+            for view, before, consumer in edits:
+                if type(view) is dict:
+                    _keep_generator_mapping_edits(view, before, consumer)
+                else:
+                    _keep_generator_list_edits(view, before, consumer)
 
     def send(self, value):
         with self._templater._plugin_arg_scope(self._converted, self._restored) as restored:
             result = self._generator.send(value)
-        return _restore_plugin_result(result, self._converted, restored, self._restored)
+        return self._restore_yield(result, restored)
 
     def throw(self, *args):
         with self._templater._plugin_arg_scope(self._converted, self._restored) as restored:
             result = self._generator.throw(*args)
-        return _restore_plugin_result(result, self._converted, restored, self._restored)
+        return self._restore_yield(result, restored)
 
     def close(self):
         with self._templater._plugin_arg_scope(self._converted, self._restored):
@@ -3478,7 +3588,11 @@ class _ScopedGenerator(Generator):
 
 
 def _resume_scoped_generator(generator, templater, converted):
-    return (yield from _ScopedGenerator(generator, templater, converted))
+    scoped = _ScopedGenerator(generator, templater, converted)
+    try:
+        return (yield from scoped)
+    finally:
+        scoped._finish()
 
 
 def _wrap_filter(fn):
