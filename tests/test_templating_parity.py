@@ -1637,6 +1637,31 @@ def test_delegated_template_decrypts_vault_and_honors_check_mode(tmp_path, monke
     assert not (tmp_path / "check-only.txt").exists()
 
 
+@pytest.mark.parametrize("strategy", ["linear", "ansiroll.core.ansiroll"])
+def test_delegated_template_redacts_registered_diff(tmp_path, strategy):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    hide_output: true
+  tasks:
+    - template:
+        src: source.j2
+        dest: "{{ playbook_dir }}/output.txt"
+      delegate_to: localhost
+      no_log: "{{ hide_output }}"
+      register: saved
+    - assert:
+        quiet: true
+        that:
+          - saved.diff[0].before == ''
+          - "'no_log: true' in saved.diff[0].after"
+""", {"source.j2": "new synthetic text\n", "output.txt": "old synthetic text\n"})
+    messages, recap = _ansible(path, tmp_path, strategy=strategy, diff=True)
+    assert recap[3] == "0", messages
+    assert (tmp_path / "output.txt").read_text() == "new synthetic text\n"
+
+
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 @pytest.mark.parametrize(("source", "value", "newline", "expected"), [
     ("{{ value }}\n", "ready", "\n", b"ready\n"),
@@ -3004,6 +3029,100 @@ def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_pat
         that: selected is skipped
 """, {"child.yml": "- debug: {msg: unexpected body}\n"}, use_strategy=True)
     assert messages == []
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("looped", [False, True])
+def test_include_apply_vars_resolve_in_native_scope(tmp_path, use_strategy, looped):
+    include = """
+- hosts: localhost
+  gather_facts: false
+  vars: {flavor: outer}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          vars: {flavor: applied, chosen: '{{ flavor }}'}
+"""
+    if looped:
+        include += "      loop: [one]\n"
+    messages, _ = _assert_parity(tmp_path, include, {
+        "child.yml": "- debug: {msg: '{{ chosen }}'}\n  vars: {flavor: child}\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["outer" if MODERN_TEMPLATING and not looped else "child"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("looped", [False, True])
+def test_include_apply_vars_select_nested_filename_in_native_scope(tmp_path, use_strategy, looped):
+    include = """
+- hosts: localhost
+  gather_facts: false
+  vars: {flavor: outer}
+  tasks:
+    - include_tasks:
+        file: entry.yml
+        apply:
+          vars: {flavor: applied, selected: '{{ flavor }}.yml'}
+"""
+    if looped:
+        include += "      loop: [one]\n"
+    messages, _ = _assert_parity(tmp_path, include, {
+        "entry.yml": "- include_tasks: '{{ selected }}'\n",
+        "outer.yml": "- debug: {msg: outer-filename}\n",
+        "applied.yml": "- debug: {msg: applied-filename}\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["outer-filename" if MODERN_TEMPLATING and not looped else "applied-filename"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Core prepares non-looped apply vars at inclusion")
+def test_include_apply_runtime_binding_defers_nested_filename_expansion(tmp_path):
+    playbook = """
+- hosts: localhost
+  gather_facts: false
+  vars: {flavor: outer}
+  tasks:
+    - set_fact: {flavor: selected}
+    - include_tasks:
+        file: entry.yml
+        apply:
+          vars: {flavor: applied, selected_file: '{{ flavor }}.yml'}
+"""
+    files = {
+        "entry.yml": "- include_tasks: '{{ selected_file }}'\n",
+        "applied.yml": "- debug: {msg: wrong-filename}\n",
+        "selected.yml": "- debug: {msg: selected-at-runtime}\n",
+    }
+    path = _write(tmp_path, playbook, files)
+    _, manifest = compile_playbook(str(path))
+    assert manifest["fallback_tasks"]
+    messages, _ = _assert_parity(tmp_path, playbook, files, use_strategy=True)
+    assert messages == ["selected-at-runtime"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core uses unsafe string wrappers")
+def test_hidden_register_and_fact_keep_unsafe_values_in_next_strategy_play(tmp_path):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: !unsafe '{{ 6 * 7 }}'}
+      register: hidden
+      no_log: true
+    - set_fact:
+        hidden_fact: {value: !unsafe '{{ 6 * 7 }}'}
+      no_log: true
+- hosts: localhost
+  gather_facts: false
+  vars:
+    literal: !unsafe '{{ 6 * 7 }}'
+  tasks:
+    - assert:
+        quiet: true
+        that:
+          - hidden.msg == literal
+          - hidden_fact.value == literal
+""", use_strategy=True)
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern native tuple keys")
