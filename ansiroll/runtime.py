@@ -1752,6 +1752,9 @@ def _lookup_values(name, args, kwargs, ctx=None):
             return [controller_config.get(str(a)) for a in args]
         return [None for _a in args]
     if name == "file":
+        # Core 2.14+ falls back to the option default for explicit null.
+        if kwargs.get("rstrip", True) is None and _core_at_least(2, 14):
+            kwargs = dict(kwargs, rstrip=True)
         vals = []
         lstrip = kwargs.get("lstrip", False)
         rstrip = kwargs.get("rstrip", True)
