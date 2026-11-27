@@ -31,7 +31,7 @@ import re
 import shlex
 from collections.abc import Generator, ItemsView, KeysView, MutableMapping, MutableSequence, ValuesView
 from contextlib import contextmanager
-from functools import wraps
+from functools import partial, wraps
 from itertools import groupby
 from numbers import Number
 
@@ -2993,6 +2993,10 @@ class _KeywordOmit:
 _KEYWORD_OMIT = _KeywordOmit()
 
 
+def _keyword_omit_value(value, ctx):
+    return _KEYWORD_OMIT if isinstance(value, _Omit) and ctx.get(_CHECK_MODE_TEMPLATE) is True else value
+
+
 def _concat_keyword_segments(nodes):
     preserve_none = not _core_at_least(2, 19, 1)
     parts = [_KEYWORD_OMIT if isinstance(part, _Omit) else part
@@ -3400,9 +3404,12 @@ class _AnsirollContext(jinja2.runtime.Context):
                 context = scope.scope if isinstance(scope, _PlayVarView) else self.parent
                 value = templater.resolve_variable(
                     key, value, context, strict=self.environment.undefined is _StrictAnsirollUndefined)
-        if isinstance(value, _Omit) and self.parent.get(_CHECK_MODE_TEMPLATE) is True:
-            return _KEYWORD_OMIT
-        return value
+        return _keyword_omit_value(value, self.parent)
+
+
+class _KeywordContext(_AnsirollContext):
+    def call(__self, __obj, *args, **kwargs):
+        return _keyword_omit_value(super().call(__obj, *args, **kwargs), __self.parent)
 
 
 class _PluginDict(dict):
@@ -3573,9 +3580,12 @@ class _Templater:
         for term in terms:
             key = str(term)
             if key in ctx and not key.startswith("__ansiroll"):
-                value = self.resolve_variable(key, ctx[key], ctx)
+                value = _keyword_omit_value(self.resolve_variable(key, ctx[key], ctx), ctx)
                 view[key] = _LookupHostVars(value) if key == "hostvars" and isinstance(value, _LazyTplDict) else value
         return view
+
+    def _keyword_member(self, access, container, key):
+        return _keyword_omit_value(access(container, key), self._current_ctx)
 
     def _g_lookup(self, name, *a, **k):
         try:
@@ -4012,9 +4022,12 @@ class _Templater:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
-        if native_keyword and expr is None:
+        if native_keyword:
             if env not in self._keyword_environments:
                 keyword_env = env.overlay()
+                keyword_env.context_class = _KeywordContext
+                keyword_env.getattr = partial(self._keyword_member, env.getattr)
+                keyword_env.getitem = partial(self._keyword_member, env.getitem)
                 keyword_env.keep_trailing_newline = False
                 keyword_env.concat = _concat_keyword_segments
                 keyword_env.finalize = _concretize
@@ -4034,7 +4047,7 @@ class _Templater:
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
         if expr is not None:
-            expr_key = (expr, strict, lazy_names, file_newline)
+            expr_key = (expr, strict, lazy_names, file_newline, native_keyword)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(text.strip(), env, ctx, strict)
