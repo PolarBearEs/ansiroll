@@ -3240,6 +3240,94 @@ def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_pat
     assert messages == []
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="Core 2.21 separates include dispatch")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_modern_include_registers_exclude_dispatch_fields(tmp_path, use_strategy, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_NATIVE_ONLY", "1")
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      register: task_single
+      no_log: true
+    - include_tasks: child.yml
+      loop: [first, skipped, second]
+      when: item != 'skipped'
+      loop_control:
+        break_when: "'include' in task_loop"
+      register: task_loop
+    - include_tasks: child.yml
+      loop: [{include: payload}]
+      loop_control: {loop_var: include}
+      register: named_include
+    - assert:
+        quiet: true
+        that:
+          - "task_single == {'changed': false, 'failed': false}"
+          - task_loop.results | length == 3
+          - task_loop.results[1] is skipped
+          - task_loop.results | selectattr('include', 'defined') | list | length == 0
+          - task_loop.results | selectattr('include_args', 'defined') | list | length == 0
+          - named_include.results[0].include.include == 'payload'
+    - debug: {msg: "validated same-play results"}
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert:
+        quiet: true
+        that:
+          - "task_single == {'changed': false, 'failed': false}"
+          - "'include' not in task_loop.results[2]"
+          - named_include.results[0].include.include == 'payload'
+    - debug: {msg: "validated later-play results"}
+""", {"child.yml": "- debug: {msg: task body}\n"}, use_strategy=use_strategy)
+    assert messages == ["task body"] * 4 + ["validated same-play results", "validated later-play results"]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="Core 2.21 separates include dispatch")
+def test_modern_role_include_registers_exclude_dispatch_fields(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_role: {name: r}
+      register: single
+    - include_role: {name: r}
+      loop: [first, second]
+      register: multiple
+    - assert:
+        quiet: true
+        that:
+          - "single == {'changed': false, 'failed': false}"
+          - multiple.results | selectattr('include', 'defined') | list | length == 0
+          - multiple.results | selectattr('include_args', 'defined') | list | length == 0
+    - debug: {msg: "validated role results"}
+""", {"roles/r/tasks/main.yml": "- debug: {msg: role body}\n"})
+    assert messages == ["role body"] * 3 + ["validated role results"]
+
+
+@pytest.mark.skipif(Version(__version__) >= Version("2.21"), reason="legacy registered task filename")
+def test_legacy_task_include_register_keeps_filename(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      register: single
+    - include_tasks: child.yml
+      loop: [first, second]
+      register: multiple
+    - assert:
+        quiet: true
+        that:
+          - single.include == 'child.yml'
+          - multiple.results | map(attribute='include') | list == ['child.yml', 'child.yml']
+    - debug: {msg: "validated legacy results"}
+""", {"child.yml": "- debug: {msg: task body}\n"})
+    assert messages == ["task body"] * 3 + ["validated legacy results"]
+
+
 @pytest.mark.parametrize("use_strategy", [False, True])
 @pytest.mark.parametrize("looped", [False, True])
 def test_include_apply_vars_resolve_in_native_scope(tmp_path, use_strategy, looped):
