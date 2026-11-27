@@ -357,6 +357,36 @@ def test_first_found_vars_files_replays_selected_timeout_before_setup(tmp_path, 
     assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
 
 
+def test_first_found_vars_files_does_not_use_blocked_search_path_before_setup(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars:
+    stage: "{{ lookup('choice') }}"
+  vars_files:
+    - 'settings-{{ stage }}.yml'
+    - "{{ lookup('first_found', [profile ~ '.yml']) }}"
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "settings-production.yml").write_text("ansible_search_path: [/unbundled]\n")
+    directory = tmp_path if (2, 19) <= _core_version() < (2, 21) else tmp_path / "files"
+    directory.mkdir(exist_ok=True)
+    (directory / "timeout.yml").write_text("timeout_seconds: 23\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "timeout"})
+    runtime.templater._lookup_loaded["choice"] = lambda terms, variables: ["production"]
+    called = []
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: called.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.failed
+    assert not called
+    assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+
+
 def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

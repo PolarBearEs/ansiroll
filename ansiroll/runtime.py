@@ -5183,8 +5183,11 @@ class Runtime:
                 search_path_matches = True
                 if first_found:
                     if "search_path_known" in first_found:
-                        search_path_matches = first_found["search_path_known"] and _same_vars_input(
-                            ctx.get("ansible_search_path", []), first_found["search_path"])
+                        search_path_matches = (
+                            first_found["search_path_known"]
+                            and not _vars_file_reads_blocked(selector_blocks, {("ansible_search_path", ())})
+                            and _same_vars_input(ctx.get("ansible_search_path", []), first_found["search_path"])
+                        )
                     ctx["__ansiroll_first_found"] = dict(first_found, search_path_matches=search_path_matches)
                 else:
                     ctx.pop("__ansiroll_first_found", None)
