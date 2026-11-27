@@ -755,13 +755,20 @@ class StrategyModule(StrategyBase):
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
         """Read a runtime-created controller file for in-memory target transfer."""
-        if not path or (role_task is None and not os.path.isfile(path)):
+        if not path:
             return {"error": "controller source %r is not a regular file" % path}
         fd = None
         try:
             if role_task is None:
-                source = open(path, "rb")
-                fullpath = os.path.abspath(path)
+                try:
+                    source_path = os.fspath(path)
+                    # Skip known non-regular entries before requesting a read descriptor.
+                    if not os.path.isfile(source_path):
+                        return {"error": "controller source %r is not a regular file" % path}
+                    fullpath = os.path.abspath(source_path)
+                    fd = os.open(source_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+                except (TypeError, ValueError):
+                    return {"error": "controller source %r is not a regular file" % path}
             else:
                 from ansiroll.loader import _open_linked_role_source, _role_source_roots, _visible_below
 
@@ -783,11 +790,10 @@ class StrategyModule(StrategyBase):
                                          or not any(_visible_below(realpath, root) for root in roots.values())):
                         return {"error": "controller role source %r is excluded" % path}
                 fd = _open_linked_role_source(realpath)
-                source = os.fdopen(fd, "rb", closefd=False)
-            with source as fh:
-                st = os.fstat(fh.fileno())
-                if not stat.S_ISREG(st.st_mode):
-                    return {"error": "controller source %r is not a regular file" % path}
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return {"error": "controller source %r is not a regular file" % path}
+            with os.fdopen(fd, "rb", closefd=False) as fh:
                 data = fh.read()
             return {
                 "data": base64.b64encode(data).decode("ascii"),
