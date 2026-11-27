@@ -4630,6 +4630,33 @@ def test_unarchive_rejects_legacy_async_check_mode_before_creates(tmp_path):
     assert result["msg"] == "check mode and async cannot be used on same task."
 
 
+def test_unarchive_creates_reports_privileged_worker_error(tmp_path, monkeypatch):
+    rt = Runtime({}, "", {})
+    events = []
+
+    def start_worker(become):
+        assert become
+        raise RuntimeError("sudo authentication failed")
+
+    def stderr(become):
+        assert become
+        events.append("stderr")
+        return "worker startup diagnostics"
+
+    monkeypatch.setattr(rt, "_needs_become", lambda become: become)
+    monkeypatch.setattr(rt, "_get_worker", start_worker)
+    monkeypatch.setattr(rt, "_worker_stderr", stderr)
+    monkeypatch.setattr(rt, "_close_workers", lambda: events.append("close"))
+    task = _task("unpack", "Extract", None, action="ansible.builtin.unarchive",
+                 args={"src": "source.zip", "dest": str(tmp_path), "creates": str(tmp_path / "sentinel")})
+
+    result = rt._exec_with_retries(task, {}, become=True)
+
+    assert result["failed"] is True
+    assert "sudo authentication failed: worker startup diagnostics" in result["msg"]
+    assert events == ["stderr", "close"]
+
+
 def test_async_acknowledgment_loss_stops_retries(monkeypatch):
     rt = Runtime({"test": {"module_fqn": "test"}}, "", {})
     calls = []

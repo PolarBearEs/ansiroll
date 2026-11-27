@@ -6700,9 +6700,7 @@ class Runtime:
             return {"failed": True, "changed": False, "msg": "src (or content) and dest are required"}
         creates = self._remote_expand_user(creates, become)
         if self._needs_become(become):
-            result = self._run_worker_operation("path_exists", {"path": creates}, become=become)
-            if result is None:
-                raise RuntimeError("worker unavailable to check unarchive creates")
+            result = self._run_worker_operation("path_exists", {"path": creates}, become=become, raise_on_error=True)
             exists = result["exists"]
         else:
             exists = os.path.exists(creates)
@@ -7095,8 +7093,8 @@ class Runtime:
             self._close_workers()
             return None
 
-    def _run_worker_operation(self, op, args, become=False):
-        """Run an internal worker operation used by baked file writes."""
+    def _run_worker_operation(self, op, args, become=False, *, raise_on_error=False):
+        """Run an internal worker operation on the target filesystem."""
         try:
             w = self._get_worker(bool(become))
             self._frame_send(w["proc"], {
@@ -7107,8 +7105,13 @@ class Runtime:
             if response is None:
                 raise RuntimeError("worker closed unexpectedly")
             return response
-        except Exception:
+        except Exception as ex:
+            detail = self._worker_stderr(bool(become)) if raise_on_error else ""
             self._close_workers()
+            if raise_on_error:
+                if detail:
+                    raise RuntimeError("%s: %s" % (ex, detail)) from ex
+                raise
             return None
 
     def _async_dir_option(self, ctx, options, version):
