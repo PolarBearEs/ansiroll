@@ -487,3 +487,34 @@ def test_generated_agent_yaml_filters_work_under_agent_bootstrap():
 
     assert proc.returncode == 0, proc.stderr.decode()
     assert proc.stdout.decode().splitlines() == ["{'a': 1}", "a: 1"]
+
+
+@pytest.mark.parametrize("path, expected", [
+    ("{% set path = '/tmp/file' %}{{ path }}", 1),
+    ("{{ '/tmp/file' if range(1) | list else '/tmp/other' }}", 1),
+    ("{{ '/tmp/file' if range(1) | list else '/tmp/other:path' }}", 0),
+    ("{{ '/tmp/file' if range and range(1) | list else '/tmp/other' }}", 0),
+    ("{% for path in ['/tmp/file'] %}{{ path }}{% endfor %}", 1),
+    ("{% macro lookup(name) %}{{ name }}{% endmacro %}{{ lookup('/tmp/file') }}", 1),
+    ("{% set path = inventory_dir | default('/tmp/file') %}{{ path }}", 0),
+    ("{{ alias }}", 0),
+    ("{{ lookup('vars', 'path', default='/tmp/file') }}", 0),
+])
+def test_accelerator_specialization_distinguishes_jinja_locals_from_runtime_inputs(path, expected):
+    task = {"type": "task", "action": "ansible.builtin.stat",
+            "accelerator": "dynamic", "args": {"path": path}}
+    variables = {"alias": "{{ inventory_dir | default('/tmp/file') }}"}
+
+    assert _specialize_accelerators([{"tasks": [task]}], variables) == expected
+    assert task["accelerator"] == ("always" if expected else "dynamic")
+
+
+@pytest.mark.parametrize("layer", ["vars", "role_defaults", "include_params"])
+def test_accelerator_specialization_preserves_runtime_shadowing_of_jinja_globals(layer):
+    task = {
+        "type": "task", "action": "ansible.builtin.stat", "accelerator": "dynamic",
+        "args": {"path": "{{ '/tmp/file' if range(1) | list else '/tmp/other' }}"},
+        layer: {"range": "runtime_value"},
+    }
+    assert _specialize_accelerators([{"tasks": [task]}], {}) == 0
+    assert task["accelerator"] == "dynamic"

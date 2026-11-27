@@ -1892,12 +1892,18 @@ def _has_dynamic_include(nodes):
     return False
 
 
-def _depends_on_vars(value, variables, matches):
+def _depends_on_vars(value, variables, matches, *, callable_globals=()):
     """Follow Jinja variable references through known values."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import Environment, TemplateSyntaxError, meta, nodes
 
-    env = Environment()
+    env = Environment(optimized=False)
+    env.globals.clear()
+    env.filters.clear()
+    env.tests.clear()
     seen = set()
+
+    def placeholder(*args, **kwargs):
+        return None
 
     def walk(value):
         if isinstance(value, dict):
@@ -1912,8 +1918,20 @@ def _depends_on_vars(value, variables, matches):
             parsed = env.parse(value)
         except TemplateSyntaxError:
             return False
-        for call in parsed.find_all(nodes.Call):
+        # Jinja uses its compiler to discover external names. Let it analyze
+        # custom filters and tests without running any template code.
+        for node in parsed.find_all(nodes.Filter):
+            env.filters[node.name] = placeholder
+        for node in parsed.find_all(nodes.Test):
+            env.tests[node.name] = placeholder
+        try:
+            names = meta.find_undeclared_variables(parsed)
+        except TemplateSyntaxError:
+            return True
+        calls = tuple(parsed.find_all(nodes.Call))
+        for call in calls:
             if (not isinstance(call.node, nodes.Name)
+                    or call.node.name not in names
                     or call.node.name not in ("lookup", "query", "q")):
                 continue
             if not call.args or not isinstance(call.args[0], nodes.Const):
@@ -1927,8 +1945,14 @@ def _depends_on_vars(value, variables, matches):
                     return True
                 if depends_on_name(arg.value):
                     return True
-        return any(depends_on_name(node.name) for node in parsed.find_all(nodes.Name)
-                   if node.ctx == "load")
+        globals_called = (names - variables.keys()).intersection(callable_globals)
+        if globals_called:
+            # The compiler may validate a bounded result of a direct call.
+            # Reading the same global independently remains a dependency.
+            callees = {id(call.node) for call in calls if isinstance(call.node, nodes.Name)}
+            globals_called.difference_update(node.name for node in parsed.find_all(nodes.Name)
+                                             if node.ctx == "load" and id(node) not in callees)
+        return any(depends_on_name(name) for name in names - globals_called)
 
     def depends_on_name(name):
         if name in seen:
