@@ -5863,7 +5863,8 @@ def test_strategy_validates_native_check_mode_buffers(tmp_path, expression, invo
 
 
 @pytest.mark.parametrize("access", ["lookup('vars', 'fallback')", "query('vars', 'fallback')[0]",
-                                   "vars.fallback", "vars['fallback']", "vars.get('fallback')"])
+                                   "vars.fallback", "vars['fallback']", "vars.get('fallback')",
+                                   "mapping.values() | first", "(mapping.items() | first)[1]"])
 def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, access):
     from ansiroll.loader import _core_version
 
@@ -5880,6 +5881,7 @@ def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, acces
     - include_tasks: child.yml
       vars:
         fallback: '{{ omit }}'
+        mapping: {value: '{{ omit }}'}
 """
     for strategy in ("linear", "ansiroll.core.ansiroll"):
         result = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",
@@ -5887,6 +5889,28 @@ def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, acces
                                     environment={"ANSIBLE_STRATEGY": strategy})
         assert result.returncode == 0, result.stdout + result.stderr
         assert not (tmp_path / "result").exists(), result.stdout + result.stderr
+
+
+def test_strategy_check_mode_bool_filter_treats_omit_as_false(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native omit values")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - file:
+        path: '{{ playbook_dir }}/result'
+        state: touch
+      check_mode: '{{ omit | bool }}'
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                    "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (tmp_path / "result").is_file(), result.stdout + result.stderr
+        (tmp_path / "result").unlink()
 
 
 def test_strategy_keeps_explicit_omit_like_variable_as_a_string(tmp_path):

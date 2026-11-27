@@ -1169,6 +1169,8 @@ def _vault_source_recompile_note(task):
 
 
 def _to_bool(value):
+    if value is _KEYWORD_OMIT:
+        return False
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -1845,7 +1847,7 @@ def _read_lazy_member(container, value):
             ctx.active_task_bindings.pop()
     if binding is not None and isinstance(resolved, (_LazyTplDict, _LazyTplList)):
         resolved._task_binding = binding
-    return resolved
+    return _keyword_omit_value(resolved, container._rt.templater._current_ctx)
 
 
 class _LazyTplDict(dict):
