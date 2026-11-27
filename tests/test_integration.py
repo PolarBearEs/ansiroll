@@ -6479,6 +6479,162 @@ def test_rescued_loop_failure_retains_task_arguments(tmp_path):
     assert dispatches == [None]
 
 
+def test_strategy_preserves_rescued_loop_item_metadata(tmp_path):
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: loop failure}
+          loop: [first, second]
+          loop_control:
+            loop_var: account
+            index_var: position
+            extended: true
+      rescue:
+        - assert: &item_checks
+            that:
+              - ansible_failed_result.results[0].account == 'first'
+              - ansible_failed_result.results[0].ansible_loop_var == 'account'
+              - ansible_failed_result.results[0].position == 0
+              - ansible_failed_result.results[0].ansible_index_var == 'position'
+              - ansible_failed_result.results[0].ansible_loop.nextitem == 'second'
+              - ansible_failed_result.results[0].item is undefined
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert: *item_checks
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "(item=first)" in result.stdout
+
+
+def test_strategy_keeps_loop_bindings_separate_from_result_state(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("uses Core's separate loop bindings and result status")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: '{{ failed }}'}
+      loop: [first]
+      loop_control: {loop_var: failed}
+      register: successful
+    - assert:
+        that:
+          - not successful.failed
+          - successful.results[0].failed == 'first'
+    - block:
+        - fail: {msg: intended failure}
+          loop: [false]
+          loop_control: {loop_var: failed}
+      rescue:
+        - assert:
+            that:
+              - ansible_failed_result.failed
+              - not ansible_failed_result.results[0].failed
+    - debug: {msg: '{{ ansible_facts }}'}
+      loop: [{loop_only_marker: new}]
+      loop_control: {loop_var: ansible_facts}
+      register: named_facts
+    - assert:
+        that:
+          - named_facts.results[0].ansible_facts.loop_only_marker == 'new'
+          - loop_only_marker is undefined
+    - command: {argv: [/bin/echo, '{{ cmd }}']}
+      loop: [first]
+      loop_control: {loop_var: cmd}
+      register: command_result
+    - assert:
+        that:
+          - command_result.results[0].cmd == ['/bin/echo', 'first']
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert: {that: loop_only_marker is undefined}
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "rescued=1" in result.stdout
+
+
+def test_standalone_set_fact_fails_when_no_assignments_remain(tmp_path):
+    from ansiroll.loader import _core_version
+
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - set_fact:
+            probe: '{{ omit }}'
+            cacheable: true
+        - debug: {msg: block-continued}
+      rescue:
+        - debug: {msg: entered-rescue}
+"""
+    native = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                environment={"ANSIBLE_STRATEGY": "linear"})
+    source, _ = compile_playbook(str(tmp_path / "play.yml"))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source, encoding="utf-8")
+    standalone = subprocess.run([sys.executable, "-I", "-S", str(artifact)],
+                                capture_output=True, text=True, timeout=30)
+    fail_empty = _core_version() >= (2, 11)
+    for result in (native, standalone):
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert ("entered-rescue" in result.stdout) is fail_empty
+        assert ("block-continued" in result.stdout) is not fail_empty
+
+
+@pytest.mark.parametrize("no_log", [False, True])
+def test_strategy_preserves_trusted_set_fact_keys_between_plays(tmp_path, no_log):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires modern Core template trust metadata")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        saved:
+          '{{ fact_name }}': hello
+        ansible_failed_result:
+          '{{ rescue_name }}': still-trusted
+        untrusted:
+          !unsafe '{{ denied_name }}': literal
+        cacheable: true
+      no_log: CENSORED
+- hosts: localhost
+  gather_facts: false
+  vars: {fact_name: greeting, rescue_name: rescued_greeting, denied_name: unexpected}
+  tasks:
+    - set_fact: {}
+      args: '{{ saved }}'
+    - assert: {that: "greeting == 'hello'"}
+    - set_fact: {}
+      args: '{{ ansible_failed_result }}'
+    - assert: {that: "rescued_greeting == 'still-trusted'"}
+    - block:
+        - set_fact: {}
+          args: '{{ untrusted }}'
+        - fail: {msg: untrusted key expanded}
+      rescue:
+        - assert:
+            that:
+              - "'Invalid variable name' in ansible_failed_result.msg"
+              - unexpected is undefined
+""".replace("CENSORED", json.dumps(no_log))
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_retains_rescued_assert_conditions_from_dynamic_args(tmp_path):
     proc = _run_strategy_play(tmp_path, """- hosts: localhost
   connection: local
@@ -6648,12 +6804,18 @@ def test_strategy_commits_final_rescue_write_with_per_item_no_log(tmp_path, fina
     assert "hidden-override" not in result.stdout + result.stderr
 
 
-def test_strategy_does_not_publish_censored_fact_under_an_untracked_rescue_name(tmp_path):
+def test_strategy_keeps_censored_rescue_name_private_to_its_origin(tmp_path):
     proc = _run_strategy_play(tmp_path, """- hosts: origin
   gather_facts: false
   tasks:
     - set_fact:
         ansible_failed_result: {msg: untracked-private-value}
+      no_log: true
+- hosts: origin
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_result.msg == 'untracked-private-value'
       no_log: true
 - hosts: recipient
   gather_facts: false
@@ -6663,6 +6825,34 @@ def test_strategy_does_not_publish_censored_fact_under_an_untracked_rescue_name(
 """, inventory="origin,recipient,")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "untracked-private-value" not in proc.stdout + proc.stderr
+
+
+def test_strategy_keeps_untrusted_rescue_keys_literal_on_legacy_core(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 19):
+        pytest.skip("exercises legacy unsafe key metadata")
+    proc = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: placeholder}
+      rescue:
+        - set_fact:
+            ansible_failed_result:
+              '{{ allowed_name }}': value
+              !unsafe '{{ denied_name }}': censored-value
+          no_log: true
+- hosts: localhost
+  gather_facts: false
+  vars: {allowed_name: allowed, denied_name: denied}
+  tasks:
+    - set_fact: {}
+      args: '{{ ansible_failed_result }}'
+""", "-c", "local")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "Invalid variable name '{{ denied_name }}'" in proc.stdout
+    assert "censored-value" not in proc.stdout + proc.stderr
 
 
 def test_strategy_hostvars_preserve_extra_vars_shadowing_rescue_facts(tmp_path):

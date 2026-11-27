@@ -1020,6 +1020,25 @@ _HIGH_VARS_KEY = "__ansiroll_high_vars__"
 _INCLUDE_PARAMS_KEY = "__ansiroll_include_params__"
 _RESCUE_FACT_NAMES = frozenset(("ansible_failed_task", "ansible_failed_result"))
 
+# Core 2.21's structured result fields are exported before the loop bindings.
+# The module-specific result data is projected last.
+_CORE_RESULT_FIELDS = frozenset((
+    "changed", "failed", "unreachable", "skipped", "warnings", "deprecations",
+    "ansible_facts", "async_result", "exception", "finished", "msg", "rc",
+    "module_stderr", "module_stdout", "attempts", "retries", "diff",
+    "ansible_job_id", "ansible_stats", "skip_reason", "skipped_reason", "false_condition",
+    "changed_when_result", "failed_when_result", "break_when_result",
+    "changed_when_suppressed_exception", "failed_when_suppressed_exception",
+    "break_when_suppressed_exception", "ansible_loop_var", "ansible_index_var", "ansible_loop",
+))
+
+
+def _loop_item_result(result, bindings):
+    if not _core_at_least(2, 21):
+        return {**result, **bindings}
+    return {**result, **{key: value for key, value in bindings.items()
+                         if key not in result or key in _CORE_RESULT_FIELDS}}
+
 
 def _with_high_vars(overlay, values):
     out = dict(overlay)
@@ -4768,13 +4787,15 @@ class Runtime:
     def _tally(self, bucket):
         self.stats[bucket] = self.stats.get(bucket, 0) + 1
 
-    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None, no_log=None):
+    def emit(self, node, status, result, item=None, ignored=False, is_item=False, name=None, no_log=None,
+             *, loop_vars=None):
         # Reporting only; recap tallies are applied explicitly by the caller so
         # rescued/ignored/loop semantics match Ansible.
         emitted_result = result
         include_register = None
         private_result = None
         include = node.get("type") == "include"
+        controller_transport = getattr(self, "_controller_result_transport", False)
         send_register = self.on_result and include and node.get("register") and not is_item
         if no_log is None:
             no_log = bool(node.get("no_log"))
@@ -4788,12 +4809,6 @@ class Runtime:
                 emitted_result["_ansible_item_label"] = item
             if send_register:
                 include_register = _pack_include_value(result, preserve_unsafe=True)
-            if getattr(self, "_controller_result_transport", False) and not include:
-                if node.get("register") and not is_item:
-                    private_result = _pack_include_value(result, preserve_unsafe=True)
-                elif isinstance(result.get("ansible_facts"), dict):
-                    state = {key: result[key] for key in ("ansible_facts", "_ansible_facts_cacheable") if key in result}
-                    private_result = _pack_include_value(state, preserve_unsafe=True)
         elif include and _contains_typed_mapping_keys((result, item)):
             # Leave presentation JSON-safe and keep the original keys for register.
             packed = _pack_include_value(result, preserve_unsafe=bool(send_register))
@@ -4801,6 +4816,19 @@ class Runtime:
             item = _pack_include_value(item)["value"] if item is not None else None
             if send_register:
                 include_register = packed
+        if controller_transport and not include and (
+                no_log or node.get("action", "").rsplit(".", 1)[-1] == "set_fact"):
+            state = None
+            if node.get("register") and not is_item:
+                state = result
+            elif isinstance(result.get("ansible_facts"), dict):
+                state = {key: result[key] for key in ("ansible_facts", "_ansible_facts_cacheable") if key in result}
+            # Callback payloads use plain JSON keys. Send template-key
+            # metadata alongside them for the controller's variable cache.
+            if state is not None and (no_log or _contains_typed_mapping_keys(state)):
+                private_result = _pack_include_value(state, preserve_unsafe=True)
+        if loop_vars and not no_log and not controller_transport:
+            emitted_result = _loop_item_result(emitted_result, loop_vars)
         if name is None:
             started_node, started_name = self._started_task_name
             name = started_name if started_node is node else self._node_name(node)
@@ -4824,6 +4852,8 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if loop_vars and not no_log and controller_transport:
+                frame["loop_vars"] = loop_vars
             if (node.get("no_log") and status == "ok" and node.get("runtime_id") == "__gather_facts__"
                     and self.controller_vars_files_fn is not None and isinstance(result.get("ansible_facts"), dict)):
                 frame["gathered_facts"] = result["ansible_facts"]
@@ -5993,7 +6023,9 @@ class Runtime:
                 self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
     def _run_loop(self, task, items, base_ctx, become=False, notifications=None, *, rescue_overrides=None):
-        agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
+        agg = {"changed": False, "failed": False, "msg": "All items completed"}
+        item_results = []
+        all_items_skipped = True
         ignore_loop = False
         failed_items_ignored = True
         metadata_flags = self._loop_metadata_flags(task, base_ctx) if items else None
@@ -6007,7 +6039,8 @@ class Runtime:
             for i, it in enumerate(items):
                 fact_host = None
                 ctx = dict(base_ctx)
-                ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
+                loop_vars = self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags)
+                ctx.update(loop_vars)
                 if i > 0 and task.get("loop_pause"):
                     time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
                 res, ignore = self._task_gate(task, ctx)
@@ -6034,25 +6067,24 @@ class Runtime:
                                     **_normalized_facts(facts, preserve_local=True),
                                 }
                 aggregate_no_log = aggregate_no_log or no_log
-                res["item"] = it
                 if task.get("loop_label") is not None:
                     label_ctx = dict(ctx)
                     if task.get("register"):
-                        label_ctx[task["register"]] = res
+                        label_ctx[task["register"]] = _loop_item_result(res, loop_vars)
                     try:
                         label = self.template(task["loop_label"], label_ctx)
                         if _is_undef(label):
                             label._fail_with_undefined_error()
                         res["_ansible_item_label"] = label
                     except Exception as ex:
-                        res = {"failed": True, "changed": False, "item": it,
+                        res = {"failed": True, "changed": False,
                                "msg": "Failed to template loop_control.label: %s" % ex}
                 stop = False
                 bw = task.get("loop_break_when")
                 if bw:
                     bctx = dict(ctx)
                     if task.get("register"):
-                        bctx[task["register"]] = _registered_result(task, res)
+                        bctx[task["register"]] = _registered_result(task, _loop_item_result(res, loop_vars))
                     try:
                         stop = self.when(bw, bctx, keyword="break_when")
                     except ConditionalError as ex:
@@ -6060,7 +6092,7 @@ class Runtime:
                             # Older executors emitted the item before evaluating
                             # break_when, then returned the task-level error.
                             self.emit(task, _status_of(res), res, item=it,
-                                      ignored=ignore, is_item=True, no_log=no_log)
+                                      ignored=ignore, is_item=True, no_log=no_log, loop_vars=loop_vars)
                             return {"failed": True, "changed": False, "msg": str(ex),
                                     "_ansiroll_no_log": aggregate_no_log}, ignore
                         res["failed"] = True
@@ -6069,7 +6101,8 @@ class Runtime:
                 tally_changed = res.pop(
                     "_ansiroll_tally_changed", res.get("changed", False)
                 )
-                agg["results"].append(res)
+                item_results.append((res, loop_vars))
+                all_items_skipped = all_items_skipped and res.get("skipped", False)
                 agg["changed"] = agg["changed"] or res.get("changed", False)
                 if tally_changed:
                     agg["_ansiroll_tally_changed"] = True
@@ -6086,7 +6119,8 @@ class Runtime:
                 ignore_loop = ignore_loop or ignore
                 if fact_host is not None:
                     pending_facts.append((fact_host, res, no_log))
-                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log)
+                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log,
+                          loop_vars=loop_vars)
                 if stop:
                     break
             loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
@@ -6094,10 +6128,13 @@ class Runtime:
             for fact_host, result, no_log in pending_facts:
                 if fact_host is None or loop_succeeded:
                     self._absorb_facts(task, result, fact_host, rescue_overrides=rescue_overrides, no_log=no_log)
+        # Export bindings for registration and rescue after fact processing.
+        # Accounting above uses the raw result, independent of binding names.
+        agg["results"] = [_loop_item_result(result, loop_vars) for result, loop_vars in item_results]
         if not items:
             agg["skipped"] = True
             agg["msg"] = "No items in the list"
-        elif all(res.get("skipped") for res in agg["results"]):
+        elif all_items_skipped:
             agg["skipped"] = True
             agg["msg"] = "All items skipped"
         elif agg["failed"]:
@@ -6901,6 +6938,9 @@ class Runtime:
             if is_reserved or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", key):
                 return {"failed": True, "changed": False, "msg": "Invalid variable name '%s'" % key}
             facts[_trust_set_fact_value(key)] = _trust_set_fact_value(value)
+        if not facts and _core_at_least(2, 11):
+            return {"failed": True, "changed": False,
+                    "msg": "No key/value pairs provided, at least one is required for this action to succeed"}
         return {"changed": False, "ansible_facts": facts, "_ansible_facts_cacheable": cacheable}
 
     def _set_fact_args(self, task, ctx):
@@ -8927,12 +8967,12 @@ def _pack_include_value(value, *, preserve_scalars=False, preserve_unsafe=False)
         return {"value": json.loads(json.dumps(value, default=str, skipkeys=True)), "undefined": []}
 
 
-def _decode_delegated_key(key, *, mapping_key=True):
+def _decode_delegated_key(key, *, mapping_key=True, fact_template=_FactKeyTemplate):
     if isinstance(key, list):
         return tuple(_decode_delegated_key(part) for part in key)
     if isinstance(key, dict):
         if "fact_template" in key:
-            return _FactKeyTemplate(key["fact_template"])
+            return fact_template(key["fact_template"])
         if "bytes" in key:
             return base64.b64decode(key["bytes"], validate=True)
         if "date" in key:
@@ -9009,13 +9049,14 @@ def _restore_rescue_scalars(packed):
                           for path, scalar in packed.get("scalars", ())))
 
 
-def _restore_delegated_mapping_keys(value, mapping_keys):
+def _restore_delegated_mapping_keys(value, mapping_keys, *, fact_template=_FactKeyTemplate):
     # Decode inner mappings before changing the keys used to reach them.
     for path, keys in reversed(mapping_keys):
         container = value
         for key in path:
             container = container[key]
-        entries = {_decode_delegated_key(key): container[str(index)] for index, key in enumerate(keys)}
+        entries = {_decode_delegated_key(key, fact_template=fact_template): container[str(index)]
+                   for index, key in enumerate(keys)}
         container.clear()
         container.update(entries)
     return value

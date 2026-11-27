@@ -728,19 +728,13 @@ class StrategyModule(StrategyBase):
 
     def _mirror_rescue_overrides(self, host_name, writes):
         manager = self._variable_manager
-        previously_private = set(_private_rescue_facts(manager, host_name))
-        # Apply accepted writes in item order. A public item must not stop a
-        # later censored item updating a fact that was private before the loop.
+        # Apply writes in item order. The agent only sends censored writes
+        # when the task succeeds.
         for packed, no_log, cacheable in writes:
             facts = self._restore_rescue_value(packed)
-            if no_log:
-                accepted = {name: value for name, value in facts.items() if name in previously_private}
-                if accepted:
-                    self._save_rescue_facts(host_name, accepted, accepted.keys())
-            else:
-                if cacheable:
-                    manager.set_host_facts(host_name, dict(facts))
-                self._save_rescue_facts(host_name, facts, ())
+            if cacheable and not no_log:
+                manager.set_host_facts(host_name, dict(facts))
+            self._save_rescue_facts(host_name, facts, facts.keys() if no_log else ())
 
     def _save_rescue_facts(self, host_name, facts, private_names):
         manager = self._variable_manager
@@ -1067,6 +1061,13 @@ class StrategyModule(StrategyBase):
         markers = [(path, missing) for path in undefined]
         markers.extend((path, error_marker(message)) for path, message in errors)
         value = _replace_delegated_values(value, markers)
+        if mapping_keys and runtime_marker is None:
+            try:
+                from ansible.template import trust_as_template
+            except ImportError:
+                pass
+            else:
+                return _restore_delegated_mapping_keys(value, mapping_keys, fact_template=trust_as_template)
         return _restore_delegated_mapping_keys(value, mapping_keys)
 
     def _restore_private_result(self, packed, *, wrap_result=False):
@@ -1502,6 +1503,7 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
+        from ansiroll.loader import _core_version, _tag_untrusted
         from ansiroll.runtime import _pack_include_value
 
         mapping_keys = {"host": [], "extra": [], "overrides": []}
@@ -1513,6 +1515,10 @@ class StrategyModule(StrategyBase):
         rescue = _private_rescue_facts(self._variable_manager, host.name)
         override_blob = _json_blob(
             {key: value for key, value in nonpersistent.items() if key not in rescue}, mapping_keys["overrides"])
+        if rescue and _core_version() >= (2, 19):
+            # Modern Core restores native trust tags. Legacy already keeps
+            # explicit runtime key markers when restoring the wire data.
+            rescue = _tag_untrusted(rescue, tag_values=False)
         rescue_blob = json.dumps(_pack_include_value(rescue, preserve_scalars=True)) if rescue else "null"
         return (
             "_INJECTED_HOST = %r\n"
@@ -1719,7 +1725,7 @@ class StrategyModule(StrategyBase):
                 )
             facts = state.get("ansible_facts")
             if (action == "set_fact" and isinstance(facts, dict)
-                    and ("private_result" in frame or frame.get("is_item"))):
+                    and (frame.get("no_log") or frame.get("is_item"))):
                 # Commit rescue-name writes in item order after the task,
                 # with censored writes allowed only on success.
                 from ansiroll.runtime import _RESCUE_FACT_NAMES
@@ -1780,8 +1786,8 @@ class StrategyModule(StrategyBase):
             task = original.copy(exclude_parent=True)
             task._parent = original._parent
             task.no_log = frame["no_log"]
-        tr = self._make_result(host, task, result_data)
         is_item = frame.get("is_item")
+        tr = self._make_result(host, task, result_data, loop_vars=frame.get("loop_vars"), item=frame.get("item"))
         ignored = frame.get("ignored")
         if status == "unreachable" and is_item:
             # Ansible emits the task-level unreachable callback for the loop.
@@ -1796,8 +1802,10 @@ class StrategyModule(StrategyBase):
         self._tqm.send_callback(method, tr)
         return False
 
-    def _make_result(self, host, task, result_data):
+    def _make_result(self, host, task, result_data, *, loop_vars=None, item=None):
         result_data = dict(result_data)
+        if loop_vars:
+            result_data.setdefault("_ansible_item_label", item)
         # 2.19+ callbacks expect a structured error summary. Reconstruct one
         # from the agent's plain result so native-style diagnostics (including
         # task source context) are retained.
@@ -1856,7 +1864,15 @@ class StrategyModule(StrategyBase):
                 result_data["warnings"] = warnings
         if _UnifiedTaskResult is not None:
             unified = _UnifiedTaskResult.from_action_result_dict(dict(result_data))
+            if loop_vars:
+                unified.loop_var = loop_vars["ansible_loop_var"]
+                unified.loop_item = item
+                unified.loop_index_var = loop_vars.get("ansible_index_var")
+                unified.loop_index = loop_vars.get(unified.loop_index_var)
+                unified.loop_extended = loop_vars.get("ansible_loop")
             return _ResultClass(host, task, unified)
+        if loop_vars:
+            result_data.update(loop_vars)
         try:
             return _ResultClass(host, task, dict(result_data), task.dump_attrs())
         except TypeError:
