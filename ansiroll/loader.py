@@ -1787,6 +1787,7 @@ class _IncludeVariables:
         self.vars_file_plan = None
         self.vars_file_scopes = None
         self.static_import_reads = set()
+        self.build_only_import_names = set()
         # When candidate contents are unknown, any play var can change.
         self.incomplete = False
         self.unresolved_vars_file = False
@@ -2042,6 +2043,8 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             default_inputs = _compile_include_inputs(task, sources, default)
             if build_only and default_inputs is None:
                 return None
+            if build_only:
+                default.build_only_import_names = includes.vars_file_writes
             variants[default_key] = default
     bodies = []
     writes = set()
@@ -2073,11 +2076,17 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             if build_selected:
                 raise
             continue
-        reads = sorted(set(known_reads) | {
-            (name, path) for name, path in branch.static_import_reads if name in branch.vars_file_writes
-        }, key=repr)
+        import_names = branch.build_only_import_names if build_only else branch.vars_file_writes
+        reads = set(known_reads) | {
+            (name, path) for name, path in branch.static_import_reads if name in import_names
+        }
         variant_inputs = None
-        if reads:
+        if build_only and reads:
+            variables, _ = _include_template_variables(task, branch)
+            reads.difference_update((name, path) for name, path, _, _ in default_inputs)
+            default_inputs.extend(_include_input_snapshot(variables, sorted(reads, key=repr)))
+        elif reads:
+            reads = sorted(reads, key=repr)
             variant_inputs, selected, alternatives = _partition_include_import_scopes(task, branch, reads)
             if alternatives:
                 if len(pending) + len(bodies) + len(alternatives) >= 256:
@@ -2209,7 +2218,8 @@ def _include_import_scope(task, includes):
     from ansible import constants as C
     from ansible.playbook.task_include import TaskInclude
 
-    if includes.vars_file_scopes is None and includes.compile_selected_vars is not None:
+    native_scope = includes.vars_file_scopes is None and includes.compile_selected_vars is not None
+    if native_scope and not includes.build_only_import_names:
         yield
         return
 
@@ -2222,7 +2232,7 @@ def _include_import_scope(task, includes):
         if current is None:
             return get_vars(*args, **kwargs)
         play = kwargs.get("play")
-        if play is not None:
+        if play is not None and not native_scope:
             candidate_play = play.copy()
             candidate_play.vars = includes.play_vars
             candidate_play.vars_files = []
@@ -2243,12 +2253,14 @@ def _include_import_scope(task, includes):
 
             templates = [source for value in sources for source, _, _ in _selector_template_sources(value)]
             for source in templates:
-                reads = set()
+                reads, unknown_lookup = set(), set()
                 if _gather_timeout_dependencies(
-                        source, variables, selector=True, allow_controller=True, computed=set(), paths=reads):
+                        source, variables, selector=True, allow_controller=True, computed=set(), paths=reads,
+                        unknown_lookup=unknown_lookup if native_scope else None) and not unknown_lookup:
                     includes.static_import_reads.update(reads)
                 else:
-                    includes.static_import_reads.update((name, ()) for name in includes.vars_file_writes)
+                    names = includes.build_only_import_names if native_scope else includes.vars_file_writes
+                    includes.static_import_reads.update((name, ()) for name in names)
             if includes.compile_selected_vars is None:
                 variables = _portable_include_scope(templates, variables)
                 if variables is None:
