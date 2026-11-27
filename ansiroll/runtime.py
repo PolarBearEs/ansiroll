@@ -2951,7 +2951,7 @@ def _type_name(value):
                            (_DeferredVarItems, "ItemsView"), (_DeferredVarValues, "ValuesView")):
         if isinstance(value, internal):
             return name
-    if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
+    if type(value) in (_FactKeyTemplate, _UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
                        _TrustedAsTemplateValue):
         return "str"
     return type(value).__name__

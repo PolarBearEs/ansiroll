@@ -3008,7 +3008,9 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
 """ + unsafe_task + """
     - assert:
         quiet: true
-        that: greeting == 'hello'
+        that:
+          - greeting == 'hello'
+          - fact_args.keys() | list | first | type_debug == 'str'
 """, use_strategy=use_strategy)
 
 
