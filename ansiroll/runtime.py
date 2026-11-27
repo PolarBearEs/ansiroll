@@ -8327,12 +8327,23 @@ def _decode_delegated_key(key):
             return _dt.datetime.fromisoformat(timestamp)
         # Python 3.5 and 3.6 accept %z offsets without a colon.
         format_string = "%Y-%m-%dT%H:%M:%S"
-        if re.search(r"[+-]\d\d:\d\d$", timestamp):
+        sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
+        if sub_minute:
+            timestamp = timestamp[:sub_minute.start()]
+        elif re.search(r"[+-]\d\d:\d\d$", timestamp):
             timestamp = timestamp[:-3] + timestamp[-2:]
             format_string += "%z"
         if "." in timestamp:
             format_string = format_string.replace("%S", "%S.%f")
-        return _dt.datetime.strptime(timestamp, format_string)
+        value = _dt.datetime.strptime(timestamp, format_string)
+        if sub_minute:
+            # These interpreters require offsets aligned to a whole minute.
+            sign, hours, minutes, seconds, micros = sub_minute.groups()
+            offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
+                                   microseconds=int(micros or 0))
+            value = value + offset if sign == "-" else value - offset
+            value = value.replace(tzinfo=_dt.timezone.utc)
+        return value
     return key
 
 

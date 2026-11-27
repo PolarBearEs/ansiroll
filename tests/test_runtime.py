@@ -44,10 +44,18 @@ def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch
     values = {"day": datetime.date(2025, 3, 1), "stamp": datetime.datetime(2025, 3, 1, 8, 30),
               "aware": datetime.datetime(2025, 3, 1, 8, 30, 1, 123,
                                          tzinfo=datetime.timezone(datetime.timedelta(hours=-3, minutes=-30)))}
+    sub_minute_offsets = (datetime.timedelta(seconds=30),
+                          -datetime.timedelta(hours=2, seconds=15, microseconds=321))
+    offset_values = {"offset_%d" % index: values["stamp"].replace(tzinfo=datetime.timezone(offset))
+                     for index, offset in enumerate(sub_minute_offsets)}
+    values.update(offset_values)
     packed = runtime._pack_include_value(values, preserve_scalars=True)
     legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime)
-    monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime))
-    assert runtime._restore_rescue_scalars(packed) == values
+    monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime,
+                                                       timedelta=datetime.timedelta, timezone=datetime.timezone))
+    restored = runtime._restore_rescue_scalars(packed)
+    assert restored == values
+    assert all(restored[name].tzinfo is datetime.timezone.utc for name in offset_values)
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():
