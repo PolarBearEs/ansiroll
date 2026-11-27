@@ -3617,13 +3617,16 @@ class _Templater:
         try:
             ctx = self._current_ctx
             selector = (ctx or {}).get("__ansiroll_first_found")
-            if selector and name == selector["plugin"] and not _core_at_least(2, 19):
-                # Legacy Core templates each joined filename inside first_found.
+            legacy_first_found = selector and name == selector["plugin"] and not _core_at_least(2, 19)
+            a = tuple(self._template_lookup_term(v) for v in a)
+            k = {key: value if legacy_first_found and key in ("files", "paths") else self._template_lookup_arg(value)
+                 for key, value in k.items()}
+            if legacy_first_found:
+                # Core renders positional terms before entering the plugin.
+                # The plugin renders each joined candidate from the options.
                 lookup_ctx = dict(ctx, __ansiroll_first_found=dict(
                     selector, render_candidate=lambda candidate: self.render_string(candidate, ctx)))
             else:
-                a = tuple(self._template_lookup_term(v) for v in a)
-                k = {key: self._template_lookup_arg(value) for key, value in k.items()}
                 lookup_ctx = self._lookup_ctx(name, a)
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
