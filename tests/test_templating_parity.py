@@ -95,6 +95,69 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
     return expected
 
 
+def test_inline_template_backslashes_follow_ansible(tmp_path):
+    messages, recap = _assert_parity(tmp_path, r'''
+- hosts: localhost
+  gather_facts: false
+  vars:
+    tab_value: "before\tafter"
+    marker: rendered
+  tasks:
+    - debug:
+        msg: '{{ "before\tafter" }}'
+    - debug:
+        msg: '{{ "before\\tafter" }}'
+    - debug:
+        msg: "{{ 'before\tafter' }}"
+    - debug:
+        msg: '{{ tab_value }}'
+    - debug:
+        msg: 'outside\t{{ "inside\t" }}{% set value = "block\tvalue" %}{{ value }}'
+    - debug:
+        msg: '{{ "demo_suffix" | regex_replace("^(.*)_suffix$", "\1") }}'
+    - debug:
+        msg: condition matched
+      when: '"before\tafter" == tab_value'
+    - debug:
+        msg: '{{ "before\"after" }}'
+      ignore_errors: true
+    - debug:
+        msg: '{{ item }}'
+      loop:
+        - '{{ "{{ marker }} C:\xyz" }}'
+''')
+    expected = [r"before\tafter", r"before\\tafter", "before\tafter", "before\tafter",
+                "outside\\tinside\\tblock\tvalue", "demo", "condition matched"]
+    if MODERN_TEMPLATING:
+        expected.append(r'before\"after')
+    expected.append(r"{{ marker }} C:\xyz" if MODERN_TEMPLATING else r"rendered C:\xyz")
+    assert messages == expected
+    assert recap == ("9", "0", "0", "0", "0", "0", "0" if MODERN_TEMPLATING else "1")
+
+
+@pytest.mark.parametrize("prefix", ["", "prefix="], ids=["expression", "mixed"])
+def test_template_file_backslashes_follow_jinja(tmp_path, prefix):
+    source = prefix + r'{{ "before\tafter" }}'
+    playbook = _write(tmp_path, '''
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: 'SOURCE'
+    - template:
+        src: input.j2
+        dest: '{{ playbook_dir }}/output'
+    - debug:
+        msg: 'SOURCE'
+'''.replace("SOURCE", source), {"input.j2": source})
+    output = tmp_path / "output"
+    expected = _ansible(playbook, tmp_path)
+    assert output.read_bytes() == (prefix + "before\tafter").encode()
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert output.read_bytes() == (prefix + "before\tafter").encode()
+
+
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 @pytest.mark.parametrize("custom_path", [True, False], ids=["custom", "omit"])
 def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypatch, use_strategy, custom_path):

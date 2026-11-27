@@ -1310,12 +1310,12 @@ def test_tree_shake_keeps_recursive_include_loop_bindings(tmp_path):
 
 
 def test_freeze_playbook_vars_follows_runtime_dependencies(tmp_path):
-    _write(tmp_path, {"pb.yml": """
+    _write(tmp_path, {"pb.yml": r"""
 - hosts: localhost
   gather_facts: false
   vars:
     selected: initial
-    intermediate: "{{ selected }}"
+    intermediate: '{{ selected if "path\x" else "" }}'
     rendered: "{{ intermediate }}"
     collection: ["{{ rendered }}"]
     scoped: outer
@@ -2123,11 +2123,11 @@ def test_time_and_host_dependent_values_are_not_frozen_or_shaken(tmp_path, monke
     link = tmp_path / "link"
     link.symlink_to(tmp_path / "compile-target")
     monkeypatch.setenv("HOME", str(compile_home))
-    _write(tmp_path, {"pb.yml": """
+    _write(tmp_path, {"pb.yml": r"""
 - hosts: localhost
   gather_facts: false
   vars:
-    stamp: "{{ now().year }}"
+    stamp: '{{ now().year if "path\x" else 0 }}'
     home: "{{ '~' | expanduser }}"
     target: "{{ '%s' | realpath }}"
     alias: "{{ stamp }}"

@@ -1892,14 +1892,17 @@ def _has_dynamic_include(nodes):
     return False
 
 
-def _depends_on_vars(value, variables, matches):
+def _depends_on_vars(value, variables, matches, *, bare_condition=False):
     """Follow Jinja variable references through known values."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import TemplateSyntaxError, nodes
+    from .runtime import _AnsirollEnvironment
 
-    env = Environment()
+    env = _AnsirollEnvironment()
+    inline_env = None
     seen = set()
 
-    def walk(value):
+    def walk(value, bare=False):
+        nonlocal inline_env
         if isinstance(value, dict):
             if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                 return False
@@ -1909,7 +1912,12 @@ def _depends_on_vars(value, variables, matches):
         if not _is_templated(value):
             return False
         try:
-            parsed = env.parse(value)
+            if not bare and "\\" in value and "{{" in value:
+                if inline_env is None:
+                    inline_env = env.inline_overlay()
+                parsed = inline_env.parse(value)
+            else:
+                parsed = env.parse(value)
         except TemplateSyntaxError:
             return False
         for call in parsed.find_all(nodes.Call):
@@ -1936,7 +1944,7 @@ def _depends_on_vars(value, variables, matches):
         seen.add(name)
         return matches(name) or (name in variables and walk(variables[name]))
 
-    return walk(value)
+    return walk(value, bare_condition)
 
 
 class _IncludeVariables:

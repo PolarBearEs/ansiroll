@@ -154,7 +154,7 @@ def test_lookup_templates_nested_constant_terms(t):
 
 
 def test_lookup_templates_embedded_command(t):
-    assert render(t, "{{ lookup('pipe', 'printf \\\"{{ value }}\\\"') }}",
+    assert render(t, "{{ lookup('pipe', 'printf \"{{ value }}\"') }}",
                   value="hello") == "hello"
 
 

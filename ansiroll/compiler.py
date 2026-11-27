@@ -236,7 +236,7 @@ def _encode_rendered(value):
 def _freeze_value(value, context):
     from .runtime import Runtime
     runtime = Runtime({}, "", {})
-    if _runtime_dependent(value, context, runtime.templater.env):
+    if _runtime_dependent(value, context, runtime.templater):
         return None, False
     try:
         resolved = runtime.template(value, context)
@@ -404,7 +404,7 @@ def _condition_value(condition, variables, templater):
     try:
         from jinja2 import meta as jinja_meta
         source = str(condition) if trusted else "{{ (%s) }}" % condition
-        parsed = templater.env.parse(source)
+        parsed = templater.parse_inline(source) if trusted else templater.env.parse(source)
         # Jinja's undeclared-variable scan compiles and can fold constant
         # filter operands in this AST. Check for runtime filters first.
         if _uses_nondeterministic_filter(parsed):
@@ -478,7 +478,7 @@ _CONTROLLER_GLOBALS = frozenset(("lookup", "query", "q"))
 _DETERMINISTIC_GLOBALS = frozenset(("range", "dict", "cycler", "joiner", "namespace"))
 
 
-def _runtime_dependent(value, variables, env, _seen=None):
+def _runtime_dependent(value, variables, templater, _seen=None):
     """True when templating ``value`` (or a variable it references) calls a
     runtime-dependent global (now(), ...) or a host/time dependent filter, so its
     result is not known when compiling."""
@@ -486,22 +486,22 @@ def _runtime_dependent(value, variables, env, _seen=None):
     if isinstance(value, dict):
         if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
             return False
-        return any(_runtime_dependent(item, variables, env, seen)
+        return any(_runtime_dependent(item, variables, templater, seen)
                    for pair in value.items() for item in pair)
     if isinstance(value, (list, tuple)):
-        return any(_runtime_dependent(v, variables, env, seen) for v in value)
+        return any(_runtime_dependent(v, variables, templater, seen) for v in value)
     if not isinstance(value, str) or ("{{" not in value and "{%" not in value):
         return False
     from jinja2 import nodes
     try:
-        parsed = env.parse(value)
+        parsed = templater.parse_inline(value)
     except Exception:
         return False
     def depends(name):
         if name in seen:
             return False
         seen.add(name)
-        return _runtime_dependent(variables[name], variables, env, seen)
+        return _runtime_dependent(variables[name], variables, templater, seen)
 
     for call in parsed.find_all(nodes.Call):
         if not (isinstance(call.node, nodes.Name) and call.node.name in _CONTROLLER_GLOBALS
@@ -521,7 +521,7 @@ def _runtime_dependent(value, variables, env, _seen=None):
         if node.name in variables:
             if depends(node.name):
                 return True
-        elif (node.name in env.globals and node.name not in _CONTROLLER_GLOBALS
+        elif (node.name in templater.env.globals and node.name not in _CONTROLLER_GLOBALS
               and node.name not in _DETERMINISTIC_GLOBALS):
             return True
     return _uses_nondeterministic_filter(parsed)
@@ -585,7 +585,8 @@ def _simplify_when(conditions, variables, templater, stats, cache, shadowed=froz
     remaining = []
     for condition in conditions or []:
         # Masking a loop binding is not enough when another variable reads it, e.g. alias: "{{ env }}".
-        if shadowed and _depends_on_vars(_condition_source(condition), unmasked, shadowed.__contains__):
+        if shadowed and _depends_on_vars(_condition_source(condition), unmasked, shadowed.__contains__,
+                                         bare_condition=isinstance(condition, str)):
             remaining.append(condition)
             continue
         key = _condition_cache_key(condition)

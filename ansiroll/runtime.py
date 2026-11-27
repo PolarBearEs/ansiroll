@@ -3601,6 +3601,48 @@ def _bare_template_expression(text, *, lex=None, verify=False):
     return None
 
 
+class _InlineTemplateLexer(jinja2.lexer.Lexer):
+    def __init__(self, env):
+        super().__init__(env)
+        self._legacy = _legacy_templating()
+
+    def tokeniter(self, source, name, filename=None, state=None):
+        # Ansible preserves backslashes in inline {{ }} string literals.
+        # Jinja still interprets escapes in {% %} and in template files.
+        tokens = self._escape_strings(super().tokeniter(source, name, filename, state), state)
+        if self._legacy:
+            # Core through 2.18 re-lexes the escaped source. An escaped quote
+            # can therefore end a string, unlike on modern Core.
+            escaped = "".join(value for _, _, value in tokens)
+            tokens = super().tokeniter(escaped, name, filename, state)
+        yield from tokens
+
+    @staticmethod
+    def _escape_strings(tokens, state):
+        in_variable = state == "variable"
+        for lineno, kind, value in tokens:
+            if kind == "variable_begin":
+                in_variable = True
+            elif kind == "variable_end":
+                in_variable = False
+            elif in_variable and kind == "string":
+                value = value.replace("\\", "\\\\")
+            yield lineno, kind, value
+
+
+class _AnsirollEnvironment(jinja2.Environment):
+    _inline_lexer = None
+
+    @property
+    def lexer(self):
+        return self._inline_lexer or super().lexer
+
+    def inline_overlay(self):
+        env = self.overlay()
+        env._inline_lexer = _InlineTemplateLexer(env)
+        return env
+
+
 class _Templater:
     """Thin wrapper over the Jinja2 runtime."""
 
@@ -3612,6 +3654,7 @@ class _Templater:
         self._condition_list_cache = {}
         self._template_cache = {}
         self._file_environments = {}
+        self._inline_environments = {}
         self._keyword_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
@@ -3622,7 +3665,7 @@ class _Templater:
         self._lookup_sources = {}   # name -> python source (loaded on demand)
         self._lookup_loaded = {}    # name -> run(terms, variables) callable
         self._lookup_errors = {}    # name -> load error text
-        self.env = jinja2.Environment(
+        self.env = _AnsirollEnvironment(
             undefined=_AnsirollUndefined,
             keep_trailing_newline=True,
             finalize=(getattr(jinja2, "pass_context", None) or jinja2.contextfunction)(_finalize_text_segment),
@@ -4031,8 +4074,8 @@ class _Templater:
 
         return evaluate
 
-    def _conditional_list(self, text, env, ctx, strict):
-        key = (text, strict)
+    def _conditional_list(self, text, env, ctx):
+        key = (text, env)
         if key not in self._condition_list_cache:
             nodes = jinja2.nodes
             parsed = env.parse(text)
@@ -4056,14 +4099,26 @@ class _Templater:
             return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
-    def _has_lookup_call(self, text):
+    def _inline_environment(self, env, text):
+        if "\\" not in text or "{{" not in text:
+            return env
+        if env not in self._inline_environments:
+            self._inline_environments[env] = env.inline_overlay()
+        return self._inline_environments[env]
+
+    def parse_inline(self, text):
+        return self._inline_environment(self.env, text).parse(text)
+
+    def _has_lookup_call(self, text, env=None):
         if not _looks_templated(text) or not self._LOOKUP_CALL.search(text):
             return False
-        if text not in self._lookup_templates:
+        key = text if env is None else (text, env)
+        if key not in self._lookup_templates:
             nodes = jinja2.nodes
             has_lookup = defer_lookup = False
             try:
-                pending = [(self.env.parse(text), False, False)]
+                parsed = self.parse_inline(text) if env is None else env.parse(text)
+                pending = [(parsed, False, False)]
                 while pending:
                     node, in_lookup, composed = pending.pop()
                     if (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Name)
@@ -4087,8 +4142,8 @@ class _Templater:
             except jinja2.TemplateSyntaxError:
                 # Report a parser error only if the value is used.
                 pass
-            self._lookup_templates[text] = has_lookup, defer_lookup
-        return self._lookup_templates[text][0]
+            self._lookup_templates[key] = has_lookup, defer_lookup
+        return self._lookup_templates[key][0]
 
     def _contains_mixed_lookup(self, inherited, overrides, role_layers):
         # Scope maps may contain an entire inventory. A template that can
@@ -4181,20 +4236,22 @@ class _Templater:
                     file_env.finalize = _concretize
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
+        else:
+            env = self._inline_environment(env, text)
         expr = None
         legacy_header = file_header and not native_file
         if (not legacy_header and (check_mode_template is None or text == stripped)
                 and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
             expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
-        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
-        template_key = (text, *template_options)
+        template_key = (text, env)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
-        has_lookup = self._has_lookup_call(stripped)
+        has_lookup = (self._has_lookup_call(stripped) if file_newline is None
+                      else self._has_lookup_call(stripped, env))
         if expr is not None:
-            expr_key = (expr, *template_options)
+            expr_key = (expr, env)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
-                    sequence = self._conditional_list(text.strip(), env, ctx, strict)
+                    sequence = self._conditional_list(stripped, env, ctx)
                     if sequence is not _NO_CONDITIONAL_LIST:
                         return sequence
                 compiled = self._expr_cache.get(expr_key)
@@ -4705,7 +4762,7 @@ class Runtime:
             return False
         nodes = jinja2.nodes
         try:
-            parsed = self.templater.env.parse(condition.strip())
+            parsed = self.templater.parse_inline(condition.strip())
         except jinja2.TemplateError:
             return False
         if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output):
@@ -5625,7 +5682,7 @@ class Runtime:
                 return None
             ancestors = (*ancestors, (origin, remaining))
             try:
-                expression = self.templater.env.parse(source)
+                expression = self.templater.parse_inline(source)
             except jinja2.TemplateSyntaxError:
                 return None
             analysis = _selector_scope(expression, ctx)
@@ -6142,7 +6199,7 @@ class Runtime:
         for i, source in enumerate(loop):
             if type(source) is not str or type(items[i]) is not _UnsafeText:
                 continue
-            parsed = self.templater.env.parse(source)
+            parsed = self.templater.parse_inline(source)
             if all(isinstance(node, jinja2.nodes.Output) and
                    all(isinstance(part, (jinja2.nodes.Const, jinja2.nodes.TemplateData))
                        for part in node.nodes)
