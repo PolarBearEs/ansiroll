@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import MappingView
+from collections.abc import Mapping, MappingView, Set
 
 DOCUMENTATION = """
     name: ansiroll
@@ -99,6 +99,24 @@ class _DelegatedMemberError(StrictUndefined):
 
     def __repr__(self):
         self._fail_with_undefined_error()
+
+
+def _wrap_legacy_rescue_value(value):
+    from ansible.utils.unsafe_proxy import wrap_var
+
+    def wrap(member):
+        # Legacy wrap_var rebuilds ranges from a generator, which range does not accept.
+        if isinstance(member, range):
+            return member
+        if isinstance(member, Mapping):
+            return {wrap(key): wrap(item) for key, item in member.items()}
+        if isinstance(member, (list, tuple)):
+            return type(member)(wrap(item) for item in member)
+        if isinstance(member, Set):
+            return {wrap(item) for item in member}
+        return wrap_var(member)
+
+    return wrap(value)
 
 
 def _legacy_environment_validator(validate, aliases):
@@ -628,6 +646,12 @@ class StrategyModule(StrategyBase):
                 self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "rescue":
+                task = task_map.get(frame.get("task"))
+                if task is not None:
+                    self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"), frame.get("name"))
+            elif t == "rescue_overrides":
+                self._mirror_rescue_overrides(host.name, frame["writes"])
             elif t == "gather_setup":
                 data = (self._gather_setup_options(host, gather_task) if gather_task is not None
                         else {"error": "implicit setup was not scheduled"})
@@ -673,6 +697,57 @@ class StrategyModule(StrategyBase):
                 break
             last_frame = now
         return host_failed
+
+    def _restore_rescue_value(self, packed):
+        from ansiroll.runtime import _restore_rescue_scalars
+
+        value = _restore_rescue_scalars(packed)
+        if _UnifiedTaskResult is None:
+            value = _wrap_legacy_rescue_value(value)
+        return self._restore_play_fallback(
+            value, packed["undefined"], packed.get("errors", ()), packed.get("mapping_keys", ()))
+
+    def _mirror_rescued_failure(self, host, task, result, args=None, name=None):
+        # This is variable state for later plays. Display has already received
+        # the ordinary result frame with any no_log censoring applied.
+        failed_task = task.dump_attrs() if hasattr(task, "dump_attrs") else task.serialize()
+        if name is not None:
+            failed_task["name"] = name
+        if args is not None:
+            failed_task["args"] = self._restore_rescue_value(args)
+        if _UnifiedTaskResult is None:
+            failed_task = _wrap_legacy_rescue_value(failed_task)
+        facts = {
+            "ansible_failed_task": failed_task,
+            "ansible_failed_result": self._restore_rescue_value(result),
+        }
+        self._save_rescue_facts(host.name, facts, facts.keys())
+
+    def _mirror_rescue_overrides(self, host_name, writes):
+        manager = self._variable_manager
+        previously_private = set(_private_rescue_facts(manager, host_name))
+        # Apply accepted writes in item order. A public item must not stop a
+        # later censored item updating a fact that was private before the loop.
+        for packed, no_log, cacheable in writes:
+            facts = self._restore_rescue_value(packed)
+            if no_log:
+                accepted = {name: value for name, value in facts.items() if name in previously_private}
+                if accepted:
+                    self._save_rescue_facts(host_name, accepted, accepted.keys())
+            else:
+                if cacheable:
+                    manager.set_host_facts(host_name, dict(facts))
+                self._save_rescue_facts(host_name, facts, ())
+
+    def _save_rescue_facts(self, host_name, facts, private_names):
+        manager = self._variable_manager
+        manager.set_nonpersistent_facts(host_name, facts)
+        private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
+        tracked = private.setdefault(host_name, {})
+        for key in facts:
+            tracked.pop(key, None)
+        stored = manager._nonpersistent_fact_cache[host_name]
+        tracked.update({key: stored[key] for key in private_names})
 
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
@@ -953,7 +1028,7 @@ class StrategyModule(StrategyBase):
 
     @staticmethod
     def _restore_play_fallback(value, undefined, errors=(), mapping_keys=(), *, runtime_marker=None):
-        from ansiroll.runtime import _restore_delegated_mapping_keys
+        from ansiroll.runtime import _replace_delegated_values, _restore_delegated_mapping_keys
 
         if not undefined and not errors and not mapping_keys:
             return value
@@ -980,17 +1055,15 @@ class StrategyModule(StrategyBase):
                 missing = UndefinedMarker(hint=message, _no_template_source=True)
 
                 def error_marker(message):
-                    return CapturedExceptionMarker(AnsibleError(message))
+                    from ansible._internal._templating._utils import TemplateContext
+
+                    # A received marker has no local source template.
+                    with TemplateContext(template_value=None, templar=None, options=None):
+                        return CapturedExceptionMarker(AnsibleError(message))
 
         markers = [(path, missing) for path in undefined]
         markers.extend((path, error_marker(message)) for path, message in errors)
-        for path, marker in markers:
-            if not path:
-                return marker
-            container = value
-            for key in path[:-1]:
-                container = container[key]
-            container[path[-1]] = marker
+        value = _replace_delegated_values(value, markers)
         return _restore_delegated_mapping_keys(value, mapping_keys)
 
     def _restore_private_result(self, packed, *, wrap_result=False):
@@ -1426,21 +1499,27 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
+        from ansiroll.runtime import _pack_include_value
+
         mapping_keys = {"host": [], "extra": [], "overrides": []}
         blob = _json_blob(hv, mapping_keys["host"])
         extra_blob = _json_blob(_extra_vars(self._variable_manager), mapping_keys["extra"])
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
-        override_blob = _json_blob(nonpersistent, mapping_keys["overrides"])
+        rescue = _private_rescue_facts(self._variable_manager, host.name)
+        override_blob = _json_blob(
+            {key: value for key, value in nonpersistent.items() if key not in rescue}, mapping_keys["overrides"])
+        rescue_blob = json.dumps(_pack_include_value(rescue, preserve_scalars=True)) if rescue else "null"
         return (
             "_INJECTED_HOST = %r\n"
             "_INJECTED_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_EXTRA_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_HOST_VAR_OVERRIDES = __import__('json').loads(%r)\n"
+            "_INJECTED_RESCUE_FACTS = __import__('json').loads(%r)\n"
             "_INJECTED_VAR_MAPPING_KEYS = __import__('json').loads(%r)\n"
             "_INJECTED_BECOME_PASS = %r\n"
-            % (host.name, blob, extra_blob, override_blob, json.dumps(mapping_keys), become_pass)
+            % (host.name, blob, extra_blob, override_blob, rescue_blob, json.dumps(mapping_keys), become_pass)
         )
 
     def _connect(self, host, play_context, hv, templar=None):
@@ -1636,6 +1715,13 @@ class StrategyModule(StrategyBase):
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = state.get("ansible_facts")
+            if (action == "set_fact" and isinstance(facts, dict)
+                    and ("private_result" in frame or frame.get("is_item"))):
+                # Commit rescue-name writes in item order after the task,
+                # with censored writes allowed only on success.
+                from ansiroll.runtime import _RESCUE_FACT_NAMES
+
+                facts = {name: value for name, value in facts.items() if name not in _RESCUE_FACT_NAMES}
             if task_key == "__gather_facts__" and status == "ok":
                 facts = frame.get("gathered_facts", facts)
                 if isinstance(facts, dict):
@@ -2219,7 +2305,22 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     return json.dumps(safe, default=str)
 
 
+def _private_rescue_facts(manager, host_name):
+    private = getattr(manager, "_ansiroll_private_rescue_facts", {})
+    tracked = private.get(host_name, {})
+    if not tracked:
+        return {}
+    current = manager._nonpersistent_fact_cache.get(host_name, {})
+    active = {key: value for key, value in tracked.items() if key in current and current[key] is value}
+    if active:
+        private[host_name] = active
+    else:
+        private.pop(host_name, None)
+    return active
+
+
 def _hostvars_snapshot(hostvars, *, preserve_keys=False):
+    from ansiroll.loader import _core_version
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     if hostvars is None:
@@ -2232,12 +2333,35 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
             names.extend(alias for alias in C.LOCALHOST if alias not in names)
     except Exception:
         return out
-    raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
+    raw_get = getattr(hostvars, "raw_get", None)
+    manager = getattr(hostvars, "_variable_manager", None)
+    inventory = getattr(hostvars, "_inventory", None)
     for name in names:
         try:
-            source = hostvars[name]
+            host = inventory.get_host(name) if inventory is not None else None
+            private_names = _private_rescue_facts(manager, host.name if host else name)
+            if private_names:
+                from ansible.vars.hostvars import HostVarsVars
+
+                if host is None:
+                    continue
+                # Remove only the private fact layer before precedence is
+                # applied. This also keeps aliases from resolving it.
+                public_manager = object.__new__(type(manager))
+                vars(public_manager).update(vars(manager))
+                cache = manager._nonpersistent_fact_cache.copy()
+                cache[host.name] = {key: value for key, value in cache[host.name].items() if key not in private_names}
+                public_manager._nonpersistent_fact_cache = cache
+                raw = public_manager.get_vars(host=host, include_hostvars=False)
+                raw = {key: value for key, value in raw.items()
+                       if key not in ("vars", "hostvars")}
+                raw["vars"] = dict(raw)
+                host_kw = {"host": name} if _core_version() >= (2, 19) else {}
+                source = HostVarsVars(raw, loader=hostvars._loader, **host_kw)
+            else:
+                raw = raw_get(name) if raw_get is not None and preserve_keys else {}
+                source = hostvars[name]
             keys = list(source)
-            raw = raw_get(name) if raw_get is not None else {}
         except Exception:
             continue
         safe = {}

@@ -6306,6 +6306,417 @@ def test_strategy_honors_play_level_local_connection(tmp_path):
     assert "ok=1" in proc.stdout
 
 
+@pytest.mark.parametrize("no_log", [False, True])
+def test_strategy_preserves_rescued_failure_facts_in_later_plays(tmp_path, no_log):
+    failure = "rescued-failure-marker"
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    reason: first-play
+  tasks:
+    - block:
+        - name: Original failure in {{ reason }}
+          fail:
+            msg: FAILURE_MARKER
+          no_log: NO_LOG
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    reason: later-play
+  tasks:
+    - assert:
+        that:
+          - ansible_failed_result.msg == 'FAILURE_MARKER'
+          - ansible_failed_task.name == 'Original failure in first-play'
+""".replace("NO_LOG", str(no_log).lower()).replace("FAILURE_MARKER", failure))
+    assert result.returncode == 0, result.stdout + result.stderr
+    if no_log:
+        assert failure not in result.stdout + result.stderr
+
+
+def test_rescued_loop_failure_retains_task_arguments(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ item }}"
+          loop: [failed-first, succeeded-last]
+          failed_when: item == 'failed-first'
+      rescue:
+        - debug: {msg: rescued}
+""")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    dispatches = []
+    runtime.on_rescue = lambda task, result, args: dispatches.append(args)
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert runtime.vars["ansible_failed_task"]["args"]["msg"] == "{{ item }}"
+    assert dispatches == [None]
+
+
+def test_strategy_retains_rescued_assert_conditions_from_dynamic_args(tmp_path):
+    proc = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    checks:
+      that: ['1 == 2']
+  tasks:
+    - block:
+        - assert: "{{ checks }}"
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_task.args.that == ['1 == 2']
+""")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_preserves_finalized_set_fact_args_after_rescue(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("checks native finalized failed-task arguments on Core 2.21")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  vars: {source_value: finalized}
+  tasks:
+    - block:
+        - set_fact:
+            bad-key: '{{ source_value }}'
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  gather_facts: false
+  vars: {source_value: changed}
+  tasks:
+    - assert:
+        that: ansible_failed_task.args['bad-key'] == 'finalized'
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_preserves_undefined_rescued_arguments_in_later_agents(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("uses modern Core undefined argument markers")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ missing_argument }}"
+      rescue:
+        - assert:
+            that: ansible_failed_task.args.msg is undefined
+- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - assert:
+        that: ansible_failed_task.args.msg is undefined
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_preserves_captured_argument_errors_in_later_agents(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("uses modern Core captured argument errors")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ 1 / 0 }}"
+      rescue:
+        - debug: {msg: rescued}
+- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ ansible_failed_task.args.msg }}"
+        - fail: {msg: Expected a captured argument error}
+      rescue:
+        - assert:
+            that: "'division by zero' in ansible_failed_result.msg"
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(("looped", "no_log"), [(False, True), (True, True), (True, False)])
+def test_strategy_preserves_only_public_rescue_overrides_on_failure(tmp_path, looped, no_log):
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: saved-failure}
+          no_log: true
+      rescue:
+        - set_fact:
+            ansible_failed_result: {msg: override}
+          no_log: CENSORED
+          ignore_errors: true
+          failed_when: FAILURE_TEST
+LOOP
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_result.msg == 'EXPECTED'
+"""
+    result = _run_strategy_play(tmp_path, playbook.replace(
+        "FAILURE_TEST", "item == 1" if looped else "true"
+    ).replace("LOOP", "          loop: [0, 1]" if looped else "").replace(
+        "CENSORED", json.dumps(no_log)).replace("EXPECTED", "saved-failure" if no_log else "override"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    if no_log:
+        assert "override" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("final", ["public-override", "hidden-override"])
+def test_strategy_commits_final_rescue_write_with_per_item_no_log(tmp_path, final):
+    first = "hidden-override" if final == "public-override" else "public-override"
+    playbook = """- hosts: origin
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: saved-failure}
+          no_log: true
+      rescue:
+        - set_fact:
+            ansible_failed_result: {msg: '{{ item }}'}
+          no_log: "{{ item == 'hidden-override' }}"
+          loop: [FIRST, FINAL]
+- hosts: origin
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_result.msg == 'FINAL'
+      no_log: true
+- hosts: recipient
+  gather_facts: false
+  tasks:
+    - assert:
+        that: EXPECTED_PUBLIC
+"""
+    expected_public = ("hostvars.origin.ansible_failed_result is undefined" if final == "hidden-override"
+                       else "hostvars.origin.ansible_failed_result.msg == 'public-override'")
+    result = _run_strategy_play(tmp_path, playbook.replace("FIRST", first).replace("FINAL", final)
+                                .replace("EXPECTED_PUBLIC", expected_public), inventory="origin,recipient,")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "hidden-override" not in result.stdout + result.stderr
+
+
+def test_strategy_does_not_publish_censored_fact_under_an_untracked_rescue_name(tmp_path):
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  tasks:
+    - set_fact:
+        ansible_failed_result: {msg: untracked-private-value}
+      no_log: true
+- hosts: recipient
+  gather_facts: false
+  tasks:
+    - assert:
+        that: hostvars.origin.ansible_failed_result is undefined
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "untracked-private-value" not in proc.stdout + proc.stderr
+
+
+def test_strategy_hostvars_preserve_extra_vars_shadowing_rescue_facts(tmp_path):
+    inventory = tmp_path / "inventory.yml"
+    inventory.write_text("""all:
+  hosts:
+    origin:
+      failure_alias: "{{ ansible_failed_result.msg }}"
+    recipient:
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: private-rescue-value}
+          no_log: true
+      rescue:
+        - debug: {msg: rescued}
+- hosts: recipient
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - hostvars.origin.ansible_failed_result.msg == 'explicit-value'
+          - hostvars.origin.failure_alias == 'explicit-value'
+""", "-e", json.dumps({"ansible_failed_result": {"msg": "explicit-value"}}), inventory=str(inventory))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "private-rescue-value" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("write", ["inventory", "set_fact", "register", "replace-rescue"])
+def test_strategy_keeps_ordinary_rescue_names_in_hostvars(tmp_path, write):
+    inventory = tmp_path / "inventory.yml"
+    inventory.write_text("""all:
+  hosts:
+    origin:
+      ansible_failed_result: {msg: inventory-value}
+    recipient:
+""")
+    task = {
+        "inventory": "",
+        "set_fact": "    - set_fact: {ansible_failed_result: {msg: ordinary-value}}\n",
+        "register": "    - debug: {msg: ordinary-value}\n      register: ansible_failed_result\n",
+        "replace-rescue": """    - block:
+        - fail: {msg: private}
+          no_log: true
+      rescue:
+        - debug: {msg: recovered}
+    - set_fact: {ansible_failed_result: {msg: ordinary-value}}
+""",
+    }[write]
+    first_play = """- hosts: origin
+  connection: local
+  gather_facts: false
+  tasks:
+""" + task if task else ""
+    expected = "inventory-value" if write == "inventory" else "ordinary-value"
+    result = _run_strategy_play(tmp_path, first_play + f"""- hosts: recipient
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: hostvars.origin.ansible_failed_result.msg == '{expected}'
+""", inventory=str(inventory))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_transfers_rescue_state_only_to_originating_host(tmp_path):
+    inventory = tmp_path / "inventory.yml"
+    inventory.write_text("""all:
+  hosts:
+    origin:
+      rescue_summary: "{{ ansible_failed_result.msg | default('redacted') }}"
+      rescue_summary_via_vars: "{{ vars.ansible_failed_result.msg | default('redacted') }}"
+    recipient:
+""")
+    result = _run_strategy_play(tmp_path, """- hosts: origin
+  connection: local
+  gather_facts: false
+  vars:
+    reason: private-original-marker
+  tasks:
+    - block:
+        - fail:
+            msg: "{{ reason }}"
+          no_log: true
+      rescue:
+        - set_fact:
+            ansible_failed_result: {msg: private-replacement-marker}
+          no_log: true
+- hosts: recipient
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - hostvars.origin.ansible_failed_task is undefined
+          - hostvars.origin.ansible_failed_result is undefined
+          - hostvars.origin.rescue_summary | default('redacted') == 'redacted'
+          - hostvars.origin.rescue_summary_via_vars | default('redacted') == 'redacted'
+- hosts: all
+  connection: local
+  gather_facts: false
+  vars:
+    reason: changed
+  tasks:
+    - assert:
+        that:
+          - ansible_failed_result.msg == 'private-replacement-marker'
+          - ansible_failed_task.args.msg == 'private-original-marker'
+      when: inventory_hostname == 'origin'
+      no_log: true
+""", inventory=str(inventory))
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "private-original-marker" not in output
+    assert "private-replacement-marker" not in output
+
+
+@pytest.mark.parametrize("later_hosts", ["origin", "all"], ids=["later-agent", "later-linear"])
+def test_strategy_preserves_native_rescued_result_values(tmp_path, later_hosts):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("uses native datetime task results")
+    result = _run_strategy_play(tmp_path, """- hosts: origin
+  connection: local
+  gather_facts: false
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ now() }}"
+          failed_when: true
+          no_log: true
+      rescue:
+        - debug: {msg: rescued}
+- hosts: LATER_HOSTS
+  connection: local
+  gather_facts: false
+  tasks:
+    - assert:
+        that: ansible_failed_result.msg.year == now().year
+      when: inventory_hostname == 'origin'
+""".replace("LATER_HOSTS", later_hosts), inventory="origin,recipient,")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_preserves_legacy_native_ranges_in_rescue(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if not (2, 12) <= _core_version() < (2, 19):
+        pytest.skip("checks legacy native range values")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - fail: {msg: '{{ range(3) }}'}
+          no_log: true
+      rescue:
+        - assert:
+            that: ansible_failed_result.msg | list == [0, 1, 2]
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - ansible_failed_result.msg | list == [0, 1, 2]
+          - ansible_failed_task.args.msg | list == [0, 1, 2]
+""", environment={"ANSIBLE_JINJA2_NATIVE": "true"})
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("runner", ["standalone", "strategy", "linear"])
 def test_expanded_include_applies_task_keywords(tmp_path, runner):
     (tmp_path / "sample.j2").write_text("template diff\n")
