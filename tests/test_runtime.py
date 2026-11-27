@@ -4,6 +4,7 @@ These use only the runtime "special" actions (debug/set_fact/fail/assert) and
 template/copy-with-content, so no Ansible or embedded modules are required.
 """
 
+import datetime
 import io
 import json
 import os
@@ -35,6 +36,18 @@ def run(tasks, host_vars=None, handlers=None, gather=False):
 
 def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
+
+
+def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch):
+    from ansiroll import runtime
+
+    values = {"day": datetime.date(2025, 3, 1), "stamp": datetime.datetime(2025, 3, 1, 8, 30),
+              "aware": datetime.datetime(2025, 3, 1, 8, 30, 1, 123,
+                                         tzinfo=datetime.timezone(datetime.timedelta(hours=-3, minutes=-30)))}
+    packed = runtime._pack_include_value(values, preserve_scalars=True)
+    legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime)
+    monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime))
+    assert runtime._restore_rescue_scalars(packed) == values
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():

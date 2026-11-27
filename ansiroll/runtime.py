@@ -8319,10 +8319,20 @@ def _decode_delegated_key(key):
         if "bytes" in key:
             return base64.b64decode(key["bytes"], validate=True)
         if "date" in key:
-            return _dt.date.fromisoformat(key["date"])
+            return _dt.date(*map(int, key["date"].split("-")))
         if "range" in key:
             return range(*key["range"])
-        return _dt.datetime.fromisoformat(key["datetime"])
+        timestamp = key["datetime"]
+        if hasattr(_dt.datetime, "fromisoformat"):
+            return _dt.datetime.fromisoformat(timestamp)
+        # Python 3.5 and 3.6 accept %z offsets without a colon.
+        format_string = "%Y-%m-%dT%H:%M:%S"
+        if re.search(r"[+-]\d\d:\d\d$", timestamp):
+            timestamp = timestamp[:-3] + timestamp[-2:]
+            format_string += "%z"
+        if "." in timestamp:
+            format_string = format_string.replace("%S", "%S.%f")
+        return _dt.datetime.strptime(timestamp, format_string)
     return key
 
 
