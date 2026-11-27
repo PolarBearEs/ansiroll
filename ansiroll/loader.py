@@ -2152,14 +2152,20 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
         return None
     if includes.build_only_selector_names and _is_templated(raw_fname):
+        from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+        from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
+
         # This child is baked into a build-only parent body. Guard the
         # vars-file inputs it used even when the parent's filename is unchanged.
-        variables, _ = _include_template_variables(task, includes)
+        variables, higher_layers = _include_template_variables(task, includes)
+        replay_inputs = dict.fromkeys(includes.build_only_selector_names, frozenset())
+        for layer in higher_layers:
+            _clear_vars_file_blocks(replay_inputs, layer, DEFAULT_HASH_BEHAVIOUR == "merge")
         reads, unknown_lookup = set(), set()
         if (_gather_timeout_dependencies(raw_fname, variables, selector=True, allow_controller=True,
                                          paths=reads, unknown_lookup=unknown_lookup) is None or unknown_lookup):
             reads = {(name, ()) for name in includes.build_only_selector_names}
-        includes.compile_selector_reads.update(reads)
+        includes.compile_selector_reads.update(read for read in reads if _vars_file_reads_blocked(replay_inputs, [read]))
     parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
     if fname is None or (parents and includes.vars_file_scopes is not None):
         sources = (raw_fname, *parents)
@@ -2186,13 +2192,21 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             includes.compile_selected_vars, includes.all_vars, includes.runtime_writes | includes.variant_writes,
             controller_execution=includes.controller_execution)
         default_key = _include_variant_key(task, sources, default)
-        if default_key is not None and default_key not in variants:
+        if default_key is not None and (default_key not in variants or
+                                        _include_variant_key(task, sources, default, portable=True) != default_key):
             default_inputs = _compile_include_inputs(task, sources, default)
             if build_only and default_inputs is None:
                 return None
-            if build_only:
-                default.build_only_selector_names = includes.vars_file_writes
-            variants[default_key] = default
+            if default_key in variants:
+                # The same parent filename does not imply the same bindings
+                # for its child includes and imports.
+                scopes = variants[default_key].vars_file_scopes
+                variants[default_key] = _include_variant_branch(includes, default.play_vars,
+                                                                [default.play_vars, *scopes])
+            else:
+                if build_only:
+                    default.build_only_selector_names = includes.vars_file_writes
+                variants[default_key] = default
     bodies = []
     writes = set()
     role = getattr(task, "_role", None)
