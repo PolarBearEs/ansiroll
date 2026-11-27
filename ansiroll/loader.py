@@ -960,6 +960,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     config_names = _controller_config_names(lookup_sources)
     config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE",
                          "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
+    if core_version < (2, 19):
+        config_names.add("DEFAULT_NULL_REPRESENTATION")
     if setup_defaults or gather_defaults:
         config_names.add("DEFAULT_GATHER_SUBSET")
     if core_version >= (2, 19):
@@ -1992,7 +1994,7 @@ class _AppliedExecutionFlag(str):
 
 
 def _is_execution_flag_template(value, keyword):
-    return _is_templated(value) or (keyword == "check_mode" and isinstance(value, str) and "{#" in value)
+    return _is_templated(value) or (keyword in ("check_mode", "become") and isinstance(value, str) and "{#" in value)
 
 
 def _include_apply_flags(task, keywords, *, role=False):
@@ -4962,7 +4964,13 @@ def _execution_keyword(task, keyword, *, node_key=None):
     key = node_key or keyword
     value = getattr(task, keyword, None)
     if isinstance(value, _AppliedExecutionFlag):
-        return {key: {"__ansiroll_apply_flag__": value.keyword}}
+        binding = {"__ansiroll_apply_flag__": value.keyword}
+        result = {key: binding}
+        if keyword == "become":
+            # If apply was omitted, the binding can hold a raw parent
+            # template. A second omission restores that same raw value.
+            result[key + "_on_omit"] = binding
+        return result
     if keyword == "check_mode" and value is None and _core_version() >= (2, 14):
         # The public value is None for both an unset keyword and an explicit
         # null. Core 2.14+ dispatches modules using the task's flag directly.
@@ -4989,9 +4997,13 @@ def _execution_keyword(task, keyword, *, node_key=None):
                 result[key + "_on_omit"] = boolean(inherited) if inherited is not None else False
             except TypeError:
                 result[key + "_on_omit"] = "invalid"
+    elif keyword == "become" and _is_execution_flag_template(value, keyword):
+        # Before Core 2.14, omitting a keyword restored the field default.
+        inherited = task._get_parent_attribute(keyword, omit=True) if _core_version() >= (2, 14) else Sentinel
+        result[key + "_on_omit"] = _execution_omit_fallback(inherited, keyword=keyword)
     elif _is_templated(value) and _core_version() >= (2, 19):
         inherited = task._get_parent_attribute(keyword, omit=True)
-        if inherited is not Sentinel or keyword == "become":
+        if inherited is not Sentinel:
             result[key + "_on_omit"] = _execution_omit_fallback(inherited, keyword=keyword)
     return result
 

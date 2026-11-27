@@ -5742,8 +5742,6 @@ def test_standalone_become_omit_preserves_enclosing_mode(tmp_path, monkeypatch, 
     from ansible.utils.context_objects import CLIArgs
     from ansiroll.loader import _core_version
 
-    if _core_version() < (2, 19):
-        pytest.skip("requires native task keyword omission")
     cli_args = dict(context.CLIARGS)
     cli_args.pop("become", None)
     if cli_become is not None:
@@ -5783,7 +5781,8 @@ def test_standalone_become_omit_preserves_enclosing_mode(tmp_path, monkeypatch, 
         runtime.run_play(plan)
         assert not runtime.failed
         if expected is None:
-            assert observed == [default_become, default_become if parent is None else parent]
+            inherited = default_become if parent is None or _core_version() < (2, 14) else parent
+            assert observed == [default_become, inherited]
         else:
             assert observed == [expected, expected]
 
@@ -5911,6 +5910,115 @@ def test_standalone_become_omit_validates_inherited_template(tmp_path, monkeypat
     assert runtime.failed is (not expected)
     if runtime.failed:
         assert "invalid inherited become value" in frames[-1]["result"]["msg"]
+
+
+@pytest.mark.parametrize("scope", ["play", "block"])
+def test_standalone_become_null_overrides_enclosing_mode(tmp_path, monkeypatch, scope):
+    from ansible import context
+    from ansible.utils.context_objects import CLIArgs
+
+    monkeypatch.setattr(context, "CLIARGS", CLIArgs(dict(context.CLIARGS, become=True)))
+    tasks = "- ping:\n- ping:\n  become: null\n- ping:\n"
+    if scope == "block":
+        tasks = "- block:\n" + textwrap.indent(tasks, "    ") + "  become: null\n"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks:\n"
+                        + textwrap.indent(tasks, "    "))
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    observed = []
+    monkeypatch.setattr(runtime, "run_module", lambda action, args, become=False:
+                        observed.append(become) or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert observed == ([True, False, True] if scope == "play" else [False, False, False])
+
+
+@pytest.mark.parametrize("include", ["tasks", "looped-tasks", "looped-role"])
+@pytest.mark.parametrize(("apply", "inventory_become"), [
+    ("null", None), ("'{{ none }}'", None), ("'{# comment #}'", None), ("'{# comment #}false'", None),
+    ("'{% if true %}{{ omit }}{% endif %}'", None), ("'{{ mode }}'", None), ("'{{ none }}'", True),
+])
+def test_standalone_become_preserves_nullable_include_apply(tmp_path, monkeypatch, include, apply, inventory_become):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native include-time omission and null rendering")
+    if include == "looped-role":
+        child = tmp_path / "roles" / "child" / "tasks" / "main.yml"
+        child.parent.mkdir(parents=True)
+        invocation = "- include_role:\n    name: child\n"
+    else:
+        child = tmp_path / "child.yml"
+        invocation = "- include_tasks:\n    file: child.yml\n"
+    omit = "omit" in apply
+    raw_apply = include == "looped-tasks"
+    child.write_text("- ping:\n  check_mode: null\n- ping:\n  become: '{{ omit }}'\n")
+    invocation += "    apply:\n      become: " + apply + "\n"
+    if include.startswith("looped"):
+        invocation += "  loop: [sample]\n"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n"
+                        "  become: true\n  vars: {mode: !unsafe '{# literal #}false'}\n  tasks:\n"
+                        + textwrap.indent(invocation + "- ping:\n", "    "))
+    source, _ = compile_playbook(str(playbook))
+    host_vars = {"inventory_hostname": "localhost", "ansible_become": inventory_become}
+    runtime = Runtime({}, "", host_vars, check_mode=True)
+    observed = []
+    monkeypatch.setattr(runtime, "run_module", lambda action, args, become=False:
+                        observed.append((become, runtime.check_mode)) or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    if (raw_apply and omit) or apply == "'{{ mode }}'":
+        assert runtime.failed
+        assert observed == []
+    elif raw_apply and apply != "null":
+        # A looped task include retains its original apply map. Core can
+        # render the inherited template, but rejects it after a child omits.
+        assert runtime.failed
+        assert observed == [(False, False)]
+    else:
+        assert not runtime.failed
+        restored_become = omit if inventory_become is None else inventory_become
+        assert observed == [(omit, False), (restored_become, True), (True, True)]
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(("apply", "accepted"), [
+    ("'{{ null_mode }}'", (False, True)),
+    ("'{{ none }}'", (True,)),
+    ("'{# comment #}'", (True,)),
+    ("'{# comment #}{{ none }}'", (True,)),
+    ("'{% if true %}{{ none }}{% endif %}'", (True,)),
+    ('"{{ none }}\\n{# comment #}"', (True,)),
+    ("'{# comment #}{{ none | string }}'", ()),
+])
+def test_standalone_legacy_become_apply_null_rendering(tmp_path, monkeypatch, native, apply, accepted):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 19):
+        pytest.skip("requires legacy templating")
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", str(native))
+    monkeypatch.delenv("ANSIBLE_NULL_REPRESENTATION", raising=False)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  become: true
+  vars: {null_mode: null}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          become: APPLY
+""".replace("APPLY", apply))
+    (tmp_path / "child.yml").write_text("- ping:\n")
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    observed = []
+    monkeypatch.setattr(runtime, "run_module", lambda action, args, become=False:
+                        observed.append(become) or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert runtime.failed is (native not in accepted)
+    assert observed == ([False] if native in accepted else [])
 
 
 def test_strategy_distinguishes_null_and_unset_check_mode(tmp_path):
