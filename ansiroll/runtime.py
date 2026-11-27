@@ -5628,8 +5628,12 @@ class Runtime:
         if res.get("changed") and not (_result_failed(res) or res.get("unreachable")):
             self._queue_notify(notifications)
         status = _status_of(res)
-        if rescue_overrides and status in ("ok", "changed"):
-            self.on_rescue_overrides(rescue_overrides)
+        if rescue_overrides:
+            if status not in ("ok", "changed"):
+                # Public item facts are visible even when a later item fails.
+                rescue_overrides = [write for write in rescue_overrides if not write[1]]
+            if rescue_overrides:
+                self.on_rescue_overrides(rescue_overrides)
         if status == "unreachable" and task.get("loop") is None:
             ignore_unreachable = self._ignores_unreachable(task, base_ctx)
         self.emit(task, status, res, ignored=ignore, no_log=no_log)

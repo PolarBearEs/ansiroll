@@ -726,7 +726,7 @@ class StrategyModule(StrategyBase):
     def _mirror_rescue_overrides(self, host_name, writes):
         manager = self._variable_manager
         previously_private = set(_private_rescue_facts(manager, host_name))
-        # Apply successful loop writes in order. A public item must not stop a
+        # Apply accepted writes in item order. A public item must not stop a
         # later censored item updating a fact that was private before the loop.
         for packed, no_log, cacheable in writes:
             facts = self._restore_rescue_value(packed)
@@ -1715,8 +1715,8 @@ class StrategyModule(StrategyBase):
             facts = state.get("ansible_facts")
             if (action == "set_fact" and isinstance(facts, dict)
                     and ("private_result" in frame or frame.get("is_item"))):
-                # Loop items and censored rescue overrides are committed
-                # by the rescue frame after successful task completion.
+                # Commit rescue-name writes in item order after the task,
+                # with censored writes allowed only on success.
                 from ansiroll.runtime import _RESCUE_FACT_NAMES
 
                 facts = {name: value for name, value in facts.items() if name not in _RESCUE_FACT_NAMES}

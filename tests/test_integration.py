@@ -5895,8 +5895,8 @@ def test_strategy_preserves_captured_argument_errors_in_later_agents(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("looped", [False, True])
-def test_strategy_drops_failed_censored_rescue_overrides(tmp_path, looped):
+@pytest.mark.parametrize(("looped", "no_log"), [(False, True), (True, True), (True, False)])
+def test_strategy_preserves_only_public_rescue_overrides_on_failure(tmp_path, looped, no_log):
     playbook = """- hosts: localhost
   connection: local
   gather_facts: false
@@ -5906,8 +5906,8 @@ def test_strategy_drops_failed_censored_rescue_overrides(tmp_path, looped):
           no_log: true
       rescue:
         - set_fact:
-            ansible_failed_result: {msg: rejected-override}
-          no_log: true
+            ansible_failed_result: {msg: override}
+          no_log: CENSORED
           ignore_errors: true
           failed_when: FAILURE_TEST
 LOOP
@@ -5916,13 +5916,15 @@ LOOP
   gather_facts: false
   tasks:
     - assert:
-        that: ansible_failed_result.msg == 'saved-failure'
+        that: ansible_failed_result.msg == 'EXPECTED'
 """
     result = _run_strategy_play(tmp_path, playbook.replace(
         "FAILURE_TEST", "item == 1" if looped else "true"
-    ).replace("LOOP", "          loop: [0, 1]" if looped else ""))
+    ).replace("LOOP", "          loop: [0, 1]" if looped else "").replace(
+        "CENSORED", json.dumps(no_log)).replace("EXPECTED", "saved-failure" if no_log else "override"))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "rejected-override" not in result.stdout + result.stderr
+    if no_log:
+        assert "override" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("final", ["public-override", "hidden-override"])
