@@ -6347,16 +6347,25 @@ class Runtime:
         omitted = isinstance(value, _Omit) or value is _KEYWORD_OMIT or legacy_omit
         if omitted:
             fallback = task.get(key + "_on_omit", default)
-            if check_mode and fallback == "invocation":
+            if key == "become_override":
+                # Core validates the restored keyword before applying inventory
+                # settings. An apply binding can supply an include-time value.
+                value = self._bound_apply_flag(fallback, ctx)
+                try:
+                    value = value is not None and _boolean(value, strict=True)
+                except TypeError as ex:
+                    raise ValueError("invalid inherited become value") from ex
+                if not (self.delegate_fn and task.get("delegate_to")):
+                    inventory_become = ctx.get("ansible_become")
+                    if inventory_become is not None:
+                        value = self._execution_flag_value(inventory_become, self._check_mode_template_context(ctx))
+                        return _boolean(value, strict=True), omitted
+            elif check_mode and fallback == "invocation":
                 return self._invocation_check_mode, omitted
-            if check_mode and fallback == "invalid":
+            elif check_mode and fallback == "invalid":
                 raise ValueError("invalid inherited check_mode value")
-            value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
-            if key == "become_override" and not (self.delegate_fn and task.get("delegate_to")):
-                inventory_become = ctx.get("ansible_become")
-                if inventory_become is not None:
-                    value = self._execution_flag_value(inventory_become, self._check_mode_template_context(ctx))
-                    return _boolean(value, strict=True), omitted
+            else:
+                value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
         if value is None:
             explicit_check_mode = check_mode and (authored is not None or task.get("check_mode_null"))
             return (False if explicit_check_mode else default), omitted

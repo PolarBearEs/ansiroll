@@ -3092,7 +3092,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     except Exception:
         return None
     task._role_path = getattr(ri, "_role_path", None)
-    apply_options = _include_apply_flags(task, ("check_mode",), role=True)
+    apply_options = _include_apply_flags(task, ("check_mode", "become"), role=True)
     applied = args.get("apply") or {}
     render_apply = _core_version() >= (2, 19)
     key = ("role", task._role_path or name, tuple(sorted(from_files.items())),
@@ -3174,6 +3174,9 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_role", name, basedir,
                          role_defaults, role_vars, tasks, include_id, ref, handlers)
+    if "become" in apply_options.get("apply_flags", ()):
+        node.update(search_dirs=_search_dirs(task, basedir, "files"),
+                    search_path=_raw_search_path(task, basedir), role_magic=_role_magic(task))
     if render_apply and isinstance(applied, dict) and applied.get("vars"):
         node["apply_vars"] = _tag_untrusted(applied["vars"])
     node.update(apply_options)
