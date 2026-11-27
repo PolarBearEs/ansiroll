@@ -679,35 +679,41 @@ def _try_stat(path):
 
 
 def _cmd_compile(args, stdout=None):
-    input_path = None
-    input_stat = None
+    input_paths = {}
+    input_inodes = set()
 
-    def validate_input(info, name, path):
-        if info is None or input_stat is None:
+    def validate_input(info, name, path, *, check_paths=True):
+        if info is None:
             return
-        if not os.path.samestat(info, input_stat):
-            try:
-                current_input = os.stat(input_path)
-            except FileNotFoundError:
+        if (info.st_dev, info.st_ino) not in input_inodes:
+            if not check_paths:
                 return
-            except (OSError, UnicodeError) as ex:
-                raise ValueError("cannot check current input playbook: %s" % ex) from ex
-            if not os.path.samestat(info, current_input):
+            # Recheck the entry playbook last, immediately before writing.
+            for input_path in reversed(input_paths):
+                try:
+                    current_input = os.stat(input_path)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                except (OSError, UnicodeError) as ex:
+                    raise ValueError("cannot check current input playbook: %s" % ex) from ex
+                if os.path.samestat(info, current_input):
+                    break
+            else:
                 return
         raise ValueError("%s points to input playbook: %s" % (name, path))
 
-    def check_input_destinations():
+    def check_input_destinations(*, check_paths=True):
         if stdout is None:
-            validate_input(_try_stat(args.output), "output path", args.output)
+            validate_input(_try_stat(args.output), "output path", args.output, check_paths=check_paths)
         else:
-            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
+            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook, check_paths=check_paths)
         if args.manifest:
-            validate_input(_try_stat(args.manifest), "manifest path", args.manifest)
+            validate_input(_try_stat(args.manifest), "manifest path", args.manifest, check_paths=check_paths)
 
     def on_playbook_open(path, info):
-        nonlocal input_path, input_stat
-        input_path, input_stat = path, info
-        check_input_destinations()
+        input_paths[path] = None
+        input_inodes.add((info.st_dev, info.st_ino))
+        check_input_destinations(check_paths=False)
 
     try:
         if stdout is None and args.manifest:

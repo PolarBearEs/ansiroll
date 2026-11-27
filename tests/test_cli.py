@@ -773,6 +773,93 @@ def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path
     assert playbook.read_bytes() == original
 
 
+@pytest.mark.parametrize(("destination", "alias"), [
+    ("output", "direct"), ("output", "hardlink"), ("output", "symlink"),
+    ("manifest", "hardlink"), ("stdout", "direct"),
+])
+def test_compile_rejects_destinations_aliasing_a_transitive_import(tmp_path, destination, alias):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    (tmp_path / "nested").mkdir()
+    imported = tmp_path / "nested" / "child.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    imported.write_bytes(original)
+    (tmp_path / "parent.yml").write_text("- import_playbook: nested/child.yml\n")
+    playbook.write_text("- import_playbook: parent.yml\n")
+    target = imported if alias == "direct" else tmp_path / "alias"
+    if alias == "hardlink":
+        os.link(imported, target)
+    elif alias == "symlink":
+        target.symlink_to(imported)
+    command = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook)]
+    if destination == "stdout":
+        with target.open("ab") as stdout:
+            result = subprocess.run(command + ["-o", "-"], stdout=stdout, stderr=subprocess.PIPE, timeout=10)
+    else:
+        args = (["-o", str(target)] if destination == "output"
+                else ["-o", str(tmp_path / "compiled.py"), "-m", str(target)])
+        result = subprocess.run(command + args, capture_output=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert b"points to input playbook" in result.stderr
+    assert imported.read_bytes() == original
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_compile_protects_import_previously_read_through_vars_files(tmp_path, encrypted):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    imported = tmp_path / "child.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    vault_args = []
+    if encrypted:
+        from ansible.parsing.vault import VaultLib, VaultSecret
+
+        password = tmp_path / "vault-password"
+        password.write_text("fixture-password\n")
+        secret = VaultSecret(b"fixture-password")
+        original = VaultLib([("default", secret)]).encrypt(original, secret=secret)
+        vault_args = ["--vault-password-file", str(password)]
+    imported.write_bytes(original)
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files: [child.yml]
+  tasks: []
+- import_playbook: child.yml
+""")
+    command = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(imported)]
+    result = subprocess.run(command + vault_args, capture_output=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert b"points to input playbook" in result.stderr
+    assert imported.read_bytes() == original
+
+
+def test_playbook_open_observer_bypasses_a_populated_vault_cache(tmp_path):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansible.playbook import Playbook
+    from ansiroll.loader import _core_version, _make_rewriting_loader
+
+    playbook = tmp_path / "child.yml"
+    secret = VaultSecret(b"fixture-password")
+    secrets = [("default", secret)]
+    playbook.write_bytes(VaultLib(secrets).encrypt(
+        b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n", secret=secret))
+    loader = _make_rewriting_loader(DataLoader)
+    loader.set_vault_secrets(secrets)
+    loader.load_from_file(str(playbook), cache="vaulted" if _core_version() >= (2, 17) else True)
+    assert str(playbook) in loader._FILE_CACHE
+
+    opened = []
+    loader.on_playbook_open = lambda path, st: opened.append((Path(os.fsdecode(path)), st.st_ino))
+    Playbook.load(str(playbook), loader=loader)
+    identity = (playbook, playbook.stat().st_ino)
+    assert opened == [identity]
+    playbook.unlink()
+    assert len(Playbook.load(str(playbook), loader=loader).get_plays()) == 1
+    assert opened == [identity]
+
+
 def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
     playbook = tmp_path / "play.yml"
     destination = tmp_path / "stdout"

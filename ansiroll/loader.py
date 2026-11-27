@@ -588,13 +588,14 @@ def _make_rewriting_loader(DataLoader):
         def __init__(self):
             super().__init__()
             self.on_playbook_open = None
+            self._opening_playbook = False
+            self._observed_playbook_cache = {}
             self._deferred_import_fields = {}
 
         def _get_file_contents(self, file_name):
             observe = self.on_playbook_open
-            if observe is None:
+            if not self._opening_playbook or observe is None:
                 return super()._get_file_contents(file_name)
-            self.on_playbook_open = None
 
             from ansible.errors import AnsibleFileNotFound, AnsibleParserError
 
@@ -617,12 +618,25 @@ def _make_rewriting_loader(DataLoader):
 
             return self._decrypt_if_vault_data(Origin(path=path).tag(data))
 
-        def load_from_file(self, *args, **kwargs):
+        def load_from_file(self, file_name, *args, **kwargs):
             # Playbooks, task files, and vars files can have the same YAML shape.
             reader = sys._getframe(1).f_code
             playbook = reader is playbook_reader
             role_tasks = reader is role_reader and sys._getframe(1).f_locals.get("subdir") in ("tasks", "handlers")
-            data = super(RewritingDataLoader, self).load_from_file(*args, **kwargs)
+            opening_playbook = self._opening_playbook
+            self._opening_playbook = playbook
+            observe = playbook and self.on_playbook_open is not None
+            try:
+                if observe:
+                    path = self.path_dwim(file_name)
+                    # Only reuse parsed data whose input inode was observed.
+                    if self._FILE_CACHE.get(path) is not self._observed_playbook_cache.get(path):
+                        self._FILE_CACHE.pop(path, None)
+                data = super().load_from_file(file_name, *args, **kwargs)
+                if observe:
+                    self._observed_playbook_cache[path] = self._FILE_CACHE.get(path)
+            finally:
+                self._opening_playbook = opening_playbook
             if not (playbook or role_tasks or reader in task_readers):
                 return data
             return _rewrite_includes(data, playbook=playbook, defer_import_fields=self._defer_import_fields)
