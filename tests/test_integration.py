@@ -6514,6 +6514,28 @@ def test_vars_file_include_replays_inside_a_literal_include_role(tmp_path):
         assert messages == [f"chosen-{profile}"]
 
 
+def test_vars_file_include_rejects_changed_inputs_for_build_only_body(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_tasks: '{{ [task_file] | path_join }}'
+""")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+        (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime, messages = _run_vars_file_include_profile(plan, "normal")
+    assert not runtime.failed, messages
+    assert messages == ["chosen-normal"]
+
+    runtime, messages = _run_vars_file_include_profile(plan, "alternate")
+    assert runtime.failed
+    assert messages == ["include_tasks selector inputs changed and no alternate task file was bundled"]
+
+
 def test_vars_file_include_keeps_binding_when_optional_file_is_missing(tmp_path):
     from ansiroll.loader import _core_version
 

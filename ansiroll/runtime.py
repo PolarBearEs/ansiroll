@@ -4843,6 +4843,8 @@ class Runtime:
             compile_inputs = node.get("include_compile_inputs")
             if compile_inputs is not None and inputs_match(compile_inputs):
                 key = node["compile_selection"]
+            elif node.get("include_build_only"):
+                raise ValueError("include_tasks selector inputs changed and no alternate task file was bundled")
             else:
                 key = _fail_on_undef(self.template(node["include_selector"], ctx, strict=True))
                 if "include_parent_selectors" in node:

@@ -2031,6 +2031,7 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
         node["fallback_reason"] = "vars-file task selection requires core linear"
         return node
     raw_fname = sources[0]
+    build_only = not variants
     default_key = None
     default_inputs = None
     if includes.compile_selected_vars is not None:
@@ -2038,17 +2039,10 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             includes.compile_selected_vars, includes.all_vars, includes.runtime_writes | includes.variant_writes)
         default_key = _include_variant_key(task, sources, default)
         if default_key is not None and default_key not in variants:
-            if not variants:
-                fname = default_key if isinstance(default_key, str) else default_key[0]
-                path = _include_tasks_path(task, fname, default)
-                expanded = _expand_include_tasks(task, raw_fname, fname, path, actions,
-                                                 basedir, only_tags, skip_tags, default)
-                if expanded is not None:
-                    includes.variant_writes.update((default.runtime_writes | default.variant_writes)
-                                                   - includes.runtime_writes)
-                return expanded
-            variants[default_key] = default
             default_inputs = _compile_include_inputs(task, sources, default)
+            if build_only and default_inputs is None:
+                return None
+            variants[default_key] = default
     bodies = []
     writes = set()
     role = getattr(task, "_role", None)
@@ -2119,8 +2113,12 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
         name for body in bodies for name, _, _, _ in body.get("include_variant_inputs", ())
     })
     node["compile_selection"] = _include_variant_label(default_key)
+    if build_only:
+        node["include_build_only"] = True
     if default_inputs is not None and any(variant["include_variant"] == node["compile_selection"] for variant in bodies):
         node["include_compile_inputs"] = default_inputs
+        node["include_selector_inputs"] = sorted(set(node["include_selector_inputs"]) |
+                                                 {name for name, _, _, _ in default_inputs})
     return node
 
 
