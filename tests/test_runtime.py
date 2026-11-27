@@ -19,13 +19,13 @@ from ansiroll.runtime import (
 
 @pytest.mark.parametrize("survivor", ["ordinary", {"{{ name }}": "untrusted"}])
 def test_fact_key_metadata_follows_json_collision_winner(survivor):
-    from ansiroll.runtime import _FactKeyTemplate, _fact_key_template_paths, _restore_fact_key_templates
+    from ansiroll.runtime import _FactKeyTemplate, _encode_bundle_mapping_keys, _restore_bundle_mapping_keys
 
     source = {True: {_FactKeyTemplate("{{ name }}"): "lost"}, "true": survivor,
               "kept": {_FactKeyTemplate("{{ name }}"): "trusted"}}
-    decoded = json.loads(json.dumps(source))
-    paths = json.loads(json.dumps(_fact_key_template_paths(source)))
-    restored = _restore_fact_key_templates(decoded, paths)
+    encoded, paths = _encode_bundle_mapping_keys(source)
+    decoded = json.loads(json.dumps(encoded))
+    restored = _restore_bundle_mapping_keys(decoded, json.loads(json.dumps(paths)))
     assert restored["true"] == survivor
     if isinstance(survivor, dict):
         assert type(next(iter(restored["true"]))) is str

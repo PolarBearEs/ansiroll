@@ -3664,19 +3664,40 @@ def test_set_fact_preserves_an_explicit_raw_params_fact(tmp_path, use_strategy):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True])
-def test_set_fact_distinguishes_null_and_string_keys(tmp_path, use_strategy):
+@pytest.mark.parametrize("expanded", [False, True], ids=["direct", "expanded"])
+def test_set_fact_distinguishes_null_and_string_keys(tmp_path, use_strategy, expanded):
+    assignment = ("set_fact: {}\n          args: '{{ payload }}'" if expanded
+                  else "set_fact: {null: invalid}")
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    payload: {null: invalid, 'null': also-invalid}
+  tasks:
+    - block:
+        - ASSIGNMENT
+      rescue:
+        - debug: {msg: rejected-null-key}
+    - set_fact: {'null': valid}
+    - debug: {msg: "{{ vars['null'] }}"}
+""".replace("ASSIGNMENT", assignment), use_strategy=use_strategy)
+    assert messages == ["rejected-null-key", "valid"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Core sorts keys before dropping omitted values")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_rejects_mixed_key_types_before_omit(tmp_path, use_strategy):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
   tasks:
     - block:
-        - set_fact: {null: invalid}
+        - set_fact: {null: '{{ omit }}', good: written}
       rescue:
-        - debug: {msg: rejected-null-key}
-    - set_fact: {'null': valid}
-    - debug: {msg: "{{ vars['null'] }}"}
+        - debug: {msg: rejected-mixed-keys}
+    - assert: {that: good is undefined, quiet: true}
 """, use_strategy=use_strategy)
-    assert messages == ["rejected-null-key", "valid"]
+    assert messages == ["rejected-mixed-keys"]
 
 
 @pytest.mark.parametrize("use_strategy", [False, True])

@@ -176,34 +176,47 @@ class _FactKeyTemplate(str):
     """An authored mapping key that set_fact may evaluate."""
 
 
-def _fact_key_template_paths(value):
-    pending = [((), value)]
+def _encode_bundle_mapping_keys(value):
+    """Make JSON object keys while retaining null types and fact-name trust."""
     paths = []
-    while pending:
-        path, current = pending.pop()
+
+    def encode(current, path):
         if isinstance(current, dict):
+            null_key = None
+            if None in current:
+                null_key = "null"
+                while null_key in current:
+                    null_key += "_"
             # JSON object keys are strings. Keep only the last entry for a
             # spelling, just as json.loads does, before recording trust.
-            surviving = {str(key) if isinstance(key, str) else json.dumps(key): (key, item)
-                         for key, item in current.items()}
+            surviving = {}
+            for key, item in current.items():
+                name = str(key) if isinstance(key, str) else json.dumps(key)
+                surviving[null_key if key is None else name] = key, item
             keys = [name for name, (key, _) in surviving.items() if isinstance(key, _FactKeyTemplate)]
-            if keys:
-                paths.append((path, keys))
-            pending.extend(((*path, name), item) for name, (_, item) in surviving.items()
-                           if isinstance(item, (dict, list, tuple)))
-        elif isinstance(current, (list, tuple)):
-            pending.extend(((*path, index), item) for index, item in enumerate(current)
-                           if isinstance(item, (dict, list, tuple)))
-    return paths
+            if keys or null_key is not None:
+                paths.append((path, keys, null_key))
+            return {name: encode(item, (*path, name)) for name, (_, item) in surviving.items()}
+        if isinstance(current, (list, tuple)):
+            return [encode(item, (*path, index)) for index, item in enumerate(current)]
+        return current
+
+    return encode(value, ()), paths
 
 
-def _restore_fact_key_templates(value, paths):
-    for path, keys in paths:
+def _restore_bundle_mapping_keys(value, paths):
+    for path, keys, null_key in reversed(paths):
         mapping = value
         for member in path:
             mapping = mapping[member]
         keys = set(keys)
-        entries = [(_FactKeyTemplate(key) if key in keys else key, item) for key, item in mapping.items()]
+        entries = {}
+        for key, item in mapping.items():
+            if key == null_key:
+                key = None
+            elif key in keys:
+                key = _FactKeyTemplate(key)
+            entries[key] = item
         mapping.clear()
         mapping.update(entries)
     return value
@@ -6446,7 +6459,7 @@ class Runtime:
         return {"changed": False, "ansible_facts": facts, "_ansible_facts_cacheable": cacheable}
 
     def _set_fact_args(self, task, ctx):
-        raw = dict(task.get("set_fact_arg_items", task.get("args")) or {})
+        raw = dict(task.get("args") or {})
         modern = _core_at_least(2, 19)
         legacy_omit = ctx.get("omit") if not modern else None
 
@@ -6489,6 +6502,9 @@ class Runtime:
             elif free_form:
                 raw.pop("_raw_params")
         explicit_templates = set(task.get("set_fact_key_templates", ()))
+        if modern:
+            # Core sorts the combined keys before evaluating any values, including omit.
+            sorted(set(params) | raw.keys())
         # Modern Core checks only the surviving value for a key. Keeping a
         # lazy mapping here avoids evaluating shadowed aliases and lookups.
         args = {}

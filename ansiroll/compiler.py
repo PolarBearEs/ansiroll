@@ -913,7 +913,7 @@ def _module_archive_entries(raw):
 
 def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
                    frozen_vars=None):
-    from .runtime import _fact_key_template_paths
+    from .runtime import _encode_bundle_mapping_keys
 
     module_meta = {}
     module_archives = {}
@@ -941,20 +941,16 @@ def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
         if entries and play.get("ordered_vars_files"):
             index = {id(entry): position for position, entry in enumerate(entries)}
             play["ordered_vars_files"] = [index.get(id(entry), entry) for entry in play["ordered_vars_files"]]
-    for node in _walk_play_nodes(compact_plays):
-        if node.get("special") == "set_fact" and None in node["args"]:
-            # JSON object keys would turn YAML null into a valid fact name.
-            node["set_fact_arg_items"] = list(node.pop("args").items())
+    keys = {}
+    encoded_vars = {}
+    for name, value in (("plays", compact_plays), ("group_vars", group_vars or {}),
+                        ("specialized_vars", specialized_vars or {})):
+        encoded, keys[name] = _encode_bundle_mapping_keys(value)
+        encoded_vars[name + ".json"] = json.dumps(encoded, default=_json_default).encode("utf-8")
     data_entries = {
-        "plays.json": json.dumps(compact_plays, default=_json_default).encode("utf-8"),
-        "fact-key-templates.json": json.dumps({
-            "plays": _fact_key_template_paths(compact_plays),
-            "group_vars": _fact_key_template_paths(group_vars),
-        }).encode("utf-8"),
+        **encoded_vars,
+        "mapping-keys.json": json.dumps(keys).encode("utf-8"),
         "modules.json": json.dumps(module_meta, default=_json_default).encode("utf-8"),
-        "group_vars.json": json.dumps(group_vars or {}, default=_json_default).encode("utf-8"),
-        "specialized_vars.json": json.dumps(
-            specialized_vars or {}, default=_json_default).encode("utf-8"),
         "frozen_vars.json": json.dumps(
             frozen_vars or {}, default=_json_default).encode("utf-8"),
     }
@@ -1125,12 +1121,13 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
         "def _ansiroll_bundle_json(name):\n"
         "    return json.loads(_ansiroll_resource_read(name).decode('utf-8'))\n",
         "MODULES = _ansiroll_bundle_json('modules.json')\n",
-        "_ansiroll_fact_key_paths = _ansiroll_bundle_json('fact-key-templates.json')\n",
-        "PLAYS = _restore_fact_key_templates(_ansiroll_bundle_json('plays.json'), "
-        "_ansiroll_fact_key_paths['plays'])\n",
-        "_BAKED_GROUP_VARS = _restore_fact_key_templates(_ansiroll_bundle_json('group_vars.json'), "
-        "_ansiroll_fact_key_paths['group_vars'])\n",
-        "_SPECIALIZED_VARS = _ansiroll_bundle_json('specialized_vars.json')\n",
+        "_ansiroll_mapping_keys = _ansiroll_bundle_json('mapping-keys.json')\n",
+        "PLAYS = _restore_bundle_mapping_keys(_ansiroll_bundle_json('plays.json'), "
+        "_ansiroll_mapping_keys['plays'])\n",
+        "_BAKED_GROUP_VARS = _restore_bundle_mapping_keys(_ansiroll_bundle_json('group_vars.json'), "
+        "_ansiroll_mapping_keys['group_vars'])\n",
+        "_SPECIALIZED_VARS = _restore_bundle_mapping_keys(_ansiroll_bundle_json('specialized_vars.json'), "
+        "_ansiroll_mapping_keys['specialized_vars'])\n",
         "_FROZEN_VARS = {k: _decode_frozen_value(v) for k, v in "
         "_ansiroll_bundle_json('frozen_vars.json').items()}\n",
         "_ANSIROLL_BOOTSTRAP_SECONDS = (\n"
