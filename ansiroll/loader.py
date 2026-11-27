@@ -1788,6 +1788,7 @@ _INCLUDE_STACK = {}
 # link for compile-time include paths and variables.
 _INCLUDE_ROLE_PARENTS = {}
 _INCLUDE_IDS = [0]
+_UNRESOLVED_INCLUDE_VALUE = object()
 
 
 def _is_templated(value):
@@ -1924,6 +1925,10 @@ def _new_include_id():
     return "include-%d" % _INCLUDE_IDS[0]
 
 
+class _AppliedExecutionFlag(str):
+    """An inherited flag whose value is resolved by the include invocation."""
+
+
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand a compile-time-resolvable include_tasks.
 
@@ -1937,6 +1942,11 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if "{{" in fname or "{%" in fname:
         fname = _template_include_filename(task, fname, includes)
         if not isinstance(fname, str) or "{{" in fname or "{%" in fname:
+            if any(value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):
+                node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
+                node["_deferred_apply_include"] = True
+                node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
+                return node
             return None
     path = _include_tasks_path(task, fname, includes)
     if path is None or not os.path.exists(path):
@@ -1950,12 +1960,20 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         stable_template = raw_fname
     key = ("tasks", physical_path, _include_path_spelling(path),
            id(role) if role is not None else None, _is_handler(task),
-           _include_search_context(task, stable_template, fname), scope)
+           _include_search_context(task, stable_template, fname), scope, repr(args.get("apply")),
+           bool(args.get("apply")) and task.loop is not None)
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
+    apply_flags = {}
+    # Core's looped include uses its original apply mapping for child tasks.
+    applied = args.get("apply") or {}
+    render_apply = _core_version() >= (2, 19) and task.loop is None
+    if render_apply:
+        apply_flags = {flag: _tag_untrusted(applied[flag]) for flag in ("check_mode", "diff", "no_log", "become")
+                       if _is_templated(applied.get(flag))}
     if ref is None:
         try:
             from ansible.playbook.helpers import load_list_of_blocks
@@ -1966,16 +1984,16 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             handler = _is_handler(task)
             parent = task
             if args.get("apply"):
-                include = task.copy()
+                include = task.copy(exclude_parent=True)
+                include._parent = task._parent
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
+                if render_apply and parent.vars:
+                    parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
             blocks = load_list_of_blocks(
                 data, play=_play_of(task), task_include=parent, role=task._role,
                 use_handlers=handler, variable_manager=task.get_variable_manager(),
                 loader=task._loader)
-            if parent is not task:
-                for block in blocks:
-                    block.vars = dict(parent.vars, **(block.vars or {}))
         except Exception:
             return None
         includes.record_writes(blocks)
@@ -1991,6 +2009,10 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             for nested in nested_includes:
                 nested._ansiroll_stable_include = True
         include_id = _new_include_id()
+        for flag in apply_flags:
+            value = _AppliedExecutionFlag(getattr(parent, flag))
+            value.keyword = flag
+            setattr(parent, flag, value)
         _INCLUDE_STACK[key] = include_id
         try:
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
@@ -1998,9 +2020,18 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
+        if parent is not task and parent.vars and tasks and not render_apply:
+            tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", fname, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
+    if render_apply and applied.get("vars"):
+        node["apply_vars"] = _tag_untrusted(applied["vars"])
+    if apply_flags:
+        node["apply_flags"] = apply_flags
+        node["apply_omit_fallback"] = {
+            flag: _execution_omit_fallback(task._get_parent_attribute(flag, omit=True)) for flag in apply_flags
+        }
     return node
 
 
@@ -2013,7 +2044,8 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "action": action,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
-        "no_log": bool(getattr(task, "no_log", False)),
+        **_execution_keyword(task, "no_log"),
+        "run_once": getattr(task, "run_once", None),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -2135,7 +2167,7 @@ def _include_scope(task):
         task = _include_parent(task)
     scope, params = {}, {}
     for parent in reversed(parents):
-        variables = parent.vars or {}
+        variables = getattr(parent, "_ansiroll_apply_filename_vars", parent.vars) or {}
         scope.update(variables)
         if isinstance(parent, TaskInclude):
             params.update(variables)
@@ -2143,11 +2175,14 @@ def _include_scope(task):
 
 
 def _include_scope_key(task):
-    apply = (task.args or {}).get("apply") or {}
+    keywords = ("become_user", "ignore_errors", "ignore_unreachable", "environment", "tags", "run_once")
     return (
         *(repr(sorted(scope.items())) for scope in _include_scope(task)),
+        tuple(repr(getattr(task, key, None)) for key in keywords),
+        tuple(repr(_execution_keyword(task, key)) for key in ("check_mode", "diff", "no_log", "become")),
+        # A null parent and no parent both look unset on the include
+        # itself, but a child task that returns omit distinguishes them.
         repr(task._get_parent_attribute("check_mode")),
-        (repr(apply["check_mode"]),) if "check_mode" in apply else (),
     )
 
 
@@ -2209,6 +2244,30 @@ _MAGIC_VAR_NAMES = frozenset((
 
 def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
+    resolved = _template_include_value(task, value, includes)
+    if isinstance(resolved, str) and not _is_templated(resolved):
+        includes.resolved_template = True
+    return None if resolved is _UNRESOLVED_INCLUDE_VALUE else resolved
+
+
+def _compile_apply_filename_vars(task, variables, includes):
+    """Project non-looped apply bindings into the filename resolver's scope."""
+    compiled = {}
+    for name, value in variables.items():
+        if not _contains_dynamic_value(value):
+            compiled[name] = value
+            continue
+        # Templating a mapping lets Core drop an omitted value just as it does
+        # when finalizing the original apply arguments.
+        rendered = _template_include_value(task, {name: value}, includes)
+        if rendered is _UNRESOLVED_INCLUDE_VALUE:
+            compiled[name] = rendered
+        else:
+            compiled.update(rendered)
+    return compiled
+
+
+def _template_include_value(task, value, includes):
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
@@ -2274,7 +2333,7 @@ def _template_include_filename(task, value, includes):
         parent = _include_parent(parent)
 
     def is_runtime(name):
-        if name in loop_names:
+        if name in loop_names or variables.get(name) is _UNRESOLVED_INCLUDE_VALUE:
             return True
         if ((includes.incomplete or name in includes.vars_file_writes)
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
@@ -2289,7 +2348,7 @@ def _template_include_filename(task, value, includes):
         )
 
     if _depends_on_vars(value, variables, is_runtime):
-        return None
+        return _UNRESOLVED_INCLUDE_VALUE
     try:
         from ansible.template import Templar
         try:
@@ -2297,12 +2356,9 @@ def _template_include_filename(task, value, includes):
         except TypeError:
             templar = Templar(loader=task._loader)
             templar.available_variables = variables
-        resolved = templar.template(value, fail_on_undefined=True)
+        return templar.template(value, fail_on_undefined=True)
     except Exception:
-        return None
-    if isinstance(resolved, str) and not _is_templated(resolved):
-        includes.resolved_template = True
-    return resolved
+        return _UNRESOLVED_INCLUDE_VALUE
 
 
 def _is_literal_include_template(value):
@@ -2519,16 +2575,17 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
         "search_dirs": _search_dirs(task, basedir, "files"),
         "search_path": _raw_search_path(task, basedir),
         **_ignore_errors_keywords(task),
-        "no_log": bool(getattr(task, "no_log", False)),
+        **_execution_keyword(task, "no_log"),
         "ignore_unreachable": _boolean_or_template(getattr(task, "ignore_unreachable", False)),
         "async_val": int(getattr(task, "async_val", 0) or 0),
         "poll": int(getattr(task, "poll", 0) or 0),
         "run_once": getattr(task, "run_once", None),
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
-        **_task_check_mode(task),
-        "diff": getattr(task, "diff", None),
+        **_execution_keyword(task, "check_mode"),
+        **_execution_keyword(task, "diff"),
         "become": bool(task.become),
+        **_execution_keyword(task, "become", node_key="become_override"),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)
@@ -4188,31 +4245,55 @@ def _ignore_errors_keywords(task):
     return result
 
 
-def _task_check_mode(task):
-    value = _tag_untrusted(getattr(task, "check_mode", None))
-    result = {"check_mode": value}
-    if isinstance(value, str):
+def _execution_keyword(task, keyword, *, node_key=None):
+    from ansible.playbook.base import Sentinel
+
+    key = node_key or keyword
+    value = getattr(task, keyword, None)
+    if isinstance(value, _AppliedExecutionFlag):
+        return {key: {"__ansiroll_apply_flag__": value.keyword}}
+    value = _tag_untrusted(value)
+    result = {key: value}
+    if keyword == "check_mode" and isinstance(value, str):
         try:
-            from ansible.playbook.base import Sentinel
-
-            inherited = task._get_parent_attribute("check_mode", omit=True)
-        except (ImportError, TypeError):  # Older cores restore the keyword default.
-            result["check_mode_on_omit"] = "invocation"
+            inherited = task._get_parent_attribute(keyword, omit=True)
+        except TypeError:
+            inherited = Sentinel
+        if inherited is Sentinel:
+            result[key + "_on_omit"] = "invocation"
+        elif isinstance(inherited, _AppliedExecutionFlag):
+            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
+        elif _core_version() < (2, 19):
+            result[key + "_on_omit"] = bool(inherited)
         else:
-            if inherited is Sentinel:
-                result["check_mode_on_omit"] = "invocation"
-            elif inherited is None or _core_version() < (2, 19):
-                result["check_mode_on_omit"] = bool(inherited)
-            else:
-                from ansible.module_utils.parsing.convert_bool import boolean
+            from ansible.module_utils.parsing.convert_bool import boolean
 
-                # Core validates the restored value directly. It does not render
-                # a parent expression, so retain only the conversion outcome.
-                try:
-                    result["check_mode_on_omit"] = boolean(inherited)
-                except TypeError:
-                    result["check_mode_on_omit"] = "invalid"
+            # Core validates the restored task keyword without rendering it.
+            try:
+                result[key + "_on_omit"] = boolean(inherited) if inherited is not None else False
+            except TypeError:
+                result[key + "_on_omit"] = "invalid"
+    elif _is_templated(value) and _core_version() >= (2, 19):
+        inherited = task._get_parent_attribute(keyword, omit=True)
+        if inherited is not Sentinel:
+            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
     return result
+
+
+def _execution_omit_fallback(value):
+    from ansible.module_utils.parsing.convert_bool import boolean
+    from ansible.playbook.base import Sentinel
+
+    if isinstance(value, _AppliedExecutionFlag):
+        return {"__ansiroll_apply_flag__": value.keyword}
+    if value is Sentinel:
+        return None
+    if _is_templated(value):
+        return _tag_untrusted(value)
+    try:
+        return boolean(value) if value is not None else False
+    except TypeError:
+        return "invalid"
 
 
 def _boolean_or_template(value):
