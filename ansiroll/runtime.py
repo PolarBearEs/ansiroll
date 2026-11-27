@@ -48,7 +48,7 @@ _ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 _GATHER_STRING_METHODS = {"split", "rsplit", "strip", "lstrip", "rstrip"}
 
 
-def _core_at_least(major, minor):
+def _core_at_least(major, minor, patch=0):
     """Feature gate on the compiling controller's ansible-core version."""
     version = _ANSIROLL_CORE_VERSION
     if not version:
@@ -57,8 +57,8 @@ def _core_at_least(major, minor):
             from ansible.release import __version__ as version
         except Exception:
             return False
-    match = re.match(r"^(\d+)\.(\d+)", str(version))
-    return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", str(version))
+    return bool(match) and tuple(int(part or 0) for part in match.groups()) >= (major, minor, patch)
 
 
 def _legacy_templating():
@@ -4234,6 +4234,7 @@ class Runtime:
         self.vars = dict(host_vars or {})
         self._play_var_names = set()
         self._initial_host_vars = self._task_host_vars()
+        self._legacy_omit_token = self._initial_host_vars.get("omit", _OMIT)
         self._vars_file_host_vars = self._initial_host_vars
         self.python = python or sys.executable
         self.check_mode = check_mode
@@ -5411,6 +5412,9 @@ class Runtime:
             higher_vars.update(self.extra_vars)
         higher_vars.update(task.get("role_magic") or {})
         self._pin_magic_vars(higher_vars)
+        if task.get("special") == "set_fact" and _legacy_templating():
+            # Legacy Core adds the omit token after merging task variables.
+            higher_vars["omit"] = self._legacy_omit_token
         ctx.pop(_HIGH_VARS_KEY, None)
         ctx.pop(_INCLUDE_PARAMS_KEY, None)
         task_vars = {key: value for key, value in (task.get("vars") or {}).items()
@@ -6468,6 +6472,9 @@ class Runtime:
             value = args[key]
             if isinstance(key, _FactKeyTemplate):
                 key = _fail_on_undef(self.template(str(key), ctx))
+                if modern and isinstance(key, _Omit):
+                    return {"failed": True, "changed": False,
+                            "msg": "Invalid variable name: fact key resolved to omit"}
             if not isinstance(key, str):
                 return {"failed": True, "changed": False,
                         "msg": "Invalid variable name '%s' of type '%s'" % (key, type(key).__name__)}
@@ -6480,7 +6487,7 @@ class Runtime:
     def _set_fact_args(self, task, ctx):
         raw = dict(task.get("args") or {})
         modern = _core_at_least(2, 19)
-        legacy_omit = ctx.get("omit") if not modern else None
+        legacy_omit = self._legacy_omit_token if not modern else None
 
         def omitted(value):
             return isinstance(value, _Omit) or (
@@ -6515,8 +6522,11 @@ class Runtime:
             if not isinstance(params, dict) or set(params) == {"__ansiroll_unsafe__"}:
                 if free_form:
                     raw["_raw_params"] = params
-                elif modern and not omitted(params):
-                    raise ValueError("set_fact args must resolve to a dictionary")
+                elif modern:
+                    if not omitted(params):
+                        raise ValueError("set_fact args must resolve to a dictionary")
+                elif _core_at_least(2, 14, 3) or (_core_at_least(2, 13, 8) and not _core_at_least(2, 14)):
+                    raise ValueError("invalid or malformed argument: '%s'" % _as_text(params))
                 params = {}
             elif free_form:
                 raw.pop("_raw_params")

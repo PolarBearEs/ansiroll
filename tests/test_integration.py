@@ -5983,7 +5983,8 @@ def test_explicit_raw_params_fact_allows_unrelated_freeze(tmp_path):
         compile_playbook(str(playbook), freeze_vars=["_raw_params"])
 
 
-def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path):
+@pytest.mark.parametrize("args_default", ["{}", "none"], ids=["empty-mapping", "null"])
+def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path, args_default):
     from ansiroll.loader import _core_version
 
     if _core_version() >= (2, 19):
@@ -5995,18 +5996,26 @@ def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path
         explicit_marker: applied
         deep: [[{field: '{{ omit }}'}]]
         direct: [{field: '{{ omit }}'}]
-      args: '{{ optional_facts | default(none) }}'
+      args: '{{ optional_facts | default(ARGS_DEFAULT) }}'
       delegate_to: recipient
     - assert:
         that:
           - explicit_marker == 'applied'
           - deep[0][0].field is defined
           - direct[0].field is undefined
-"""
-    for strategy in ("linear", "ansiroll.core.ansiroll"):
-        result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
-                                    environment={"ANSIBLE_STRATEGY": strategy})
-        assert result.returncode == 0, result.stdout + result.stderr
+""".replace("ARGS_DEFAULT", args_default)
+    native, agent = (
+        _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+                           environment={"ANSIBLE_STRATEGY": strategy})
+        for strategy in ("linear", "ansiroll.core.ansiroll")
+    )
+    if args_default == "none" and native.returncode:
+        # Some legacy Core releases reject a non-mapping args expansion.
+        assert "invalid or malformed argument" in native.stdout
+        assert "invalid or malformed argument" in agent.stdout
+    else:
+        assert native.returncode == 0, native.stdout + native.stderr
+    assert agent.returncode == native.returncode, agent.stdout + agent.stderr
 
 
 @pytest.mark.parametrize("payload, expression", [("scalar", "'scalar'"), ("{inner: keep}", "{'inner': 'keep'}")])

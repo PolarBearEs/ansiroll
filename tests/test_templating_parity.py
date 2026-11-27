@@ -3568,6 +3568,25 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
 """ + key_type_check, use_strategy=use_strategy)
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy Core uses a string omit token")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_rejects_trusted_name_that_resolves_to_omit(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_args:
+      '{{ omit }}': invalid
+  tasks:
+    - block:
+        - set_fact: {}
+          args: '{{ fact_args }}'
+      rescue:
+        - debug: {msg: rejected-omitted-key}
+""", use_strategy=use_strategy)
+    assert messages == ["rejected-omitted-key"]
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
 @pytest.mark.parametrize("use_strategy", [False, True])
 @pytest.mark.parametrize("loop_source", ["'{{ entries }}'", "[{'{{ fact_name }}': hello}]"])
@@ -3640,6 +3659,26 @@ def test_set_fact_finalizes_selected_args_and_omits_nested_values(tmp_path, use_
           - "details == {'kept': 'ready', 'items': ['ready']}"
           - optional == 'ready'
           - literal == 'unset'
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="modern Core finalizes omit separately")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_uses_legacy_omit_token_with_task_vars(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        literal: unset
+        dropped: '{{ missing | default(omit) }}'
+      vars:
+        omit: unset
+    - assert:
+        quiet: true
+        that:
+          - literal == 'unset'
+          - dropped is undefined
 """, use_strategy=use_strategy)
 
 
