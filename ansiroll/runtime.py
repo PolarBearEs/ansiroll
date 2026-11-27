@@ -6491,6 +6491,8 @@ class Runtime:
                         included_vars_reference = res.pop("_ansiroll_included_vars_reference", None)
                         if payload is not None:
                             included_vars = json.loads(payload)
+            elif task.get("_custom_file_source_action"):
+                res = {"failed": True, "changed": False, "msg": task["fallback_reason"]}
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
