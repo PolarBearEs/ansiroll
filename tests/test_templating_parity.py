@@ -630,11 +630,14 @@ def test_block_aliases_and_containers_are_reused_in_a_render(tmp_path, use_strat
             msg: "{% for i in range(2) %}{% set unused = entries.append(i) if loop.first else none %}{{ entries | length }}{% endfor %}"
         - debug:
             msg: "{% set first = timestamp %}{% for i in range(2) %}{{ first == timestamp }}{% endfor %}"
+        - debug:
+            msg: "{% set first = details.timestamp %}cached={{ first == details.timestamp }}"
       vars:
         entries: []
         timestamp: "{{ now() }}"
+        details: {timestamp: "{{ now() }}"}
 """, use_strategy=use_strategy)
-    assert messages == ["11", "TrueTrue"]
+    assert messages == ["11", "TrueTrue", "cached=True"]
 
 
 @pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy vars iteration exposes raw template text")
@@ -653,6 +656,37 @@ def test_block_alias_source_is_preserved_during_legacy_vars_iteration(tmp_path, 
         alias: "prefix={{ x }}"
 """)
     assert messages == ["prefix=value / prefix={{ x }}"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy magic vars exposes play template sources")
+@pytest.mark.parametrize("native", ["False", "True"])
+def test_loop_magic_vars_preserves_the_legacy_play_alias_source(tmp_path, monkeypatch, native):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", native)
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {play_alias: "{{ 'play' }}"}
+  tasks:
+    - debug: {msg: "{{ vars.play_alias }} / {{ play_alias }} / {{ item }}"}
+      vars: {vars: {custom: x}}
+      loop: [alpha, beta]
+""")
+    assert messages == ["{{ 'play' }} / play / alpha", "{{ 'play' }} / play / beta"]
+
+
+@pytest.mark.parametrize("native", ["False", "True"])
+def test_non_loop_magic_vars_preserves_the_play_alias_source_on_legacy_core(tmp_path, monkeypatch, native):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", native)
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {play_alias: "{{ 'play' }}"}
+  tasks:
+    - debug: {msg: "value={{ vars.play_alias }}"}
+    - debug: {msg: "{{ 'equal' if vars.play_alias == 'play' else 'different' }}"}
+""")
+    assert messages == (["value=play", "equal"] if MODERN_TEMPLATING else ["value={{ 'play' }}", "different"])
+    assert recap[:4] == ("2", "0", "0", "0")
 
 
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
@@ -1447,6 +1481,35 @@ def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeyp
     output.unlink()
     assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
     assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy vars iteration exposes raw template text")
+def test_delegated_template_vars_iteration_keeps_legacy_block_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "False")
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+          vars:
+            scope_probe: "{{ vars.base_value }}"
+      vars:
+        base_value: ready
+        alias: "prefix={{ base_value }}"
+""", {"sample.j2": (
+        "{{ alias }} / {{ scope_probe }} / "
+        "{% for key, value in vars.items() if key == 'alias' %}{{ value }}{% endfor %}\n"
+    )})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    assert output.read_text() == "prefix=ready / ready / prefix={{ base_value }}\n"
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == "prefix=ready / ready / prefix={{ base_value }}\n"
 
 
 @pytest.mark.skipif(MODERN_TEMPLATING, reason="checks legacy non-native lookup location")

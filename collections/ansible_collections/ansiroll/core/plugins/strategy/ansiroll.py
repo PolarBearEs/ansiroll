@@ -1174,8 +1174,11 @@ class StrategyModule(StrategyBase):
 
                 if frame.get("defer_template_names"):
                     job_vars[_DEFER_LOOKUP_NAMES] = True
+                block_sources = set(frame.get("legacy_block_sources") or ())
                 for name in names:
-                    job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
+                    source = job_vars.get(name) if name in block_sources else None
+                    job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name),
+                                                             legacy_source=source)
             return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")),
                                        template_vars=template_vars if names else None)
         finally:
