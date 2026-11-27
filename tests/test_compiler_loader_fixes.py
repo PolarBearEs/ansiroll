@@ -1974,6 +1974,7 @@ def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt):
         "roles/payload/tasks/main.yml": """- copy:
     content: '{{ encrypted_fixture }}'
     dest: '{{ role_path }}/files/runtime.vault'
+    decrypt: false
     mode: '0640'
 - set_fact:
     source_name: runtime
@@ -2000,8 +2001,9 @@ def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt):
     assert any(record["scope"] == "play" and record["mode"] == ("linear-fallback" if decrypt else "native-agent")
                for record in records)
     installed = tmp_path / "installed"
+    assert (tmp_path / "roles/payload/files/runtime.vault").read_bytes() == encrypted
     assert installed.read_bytes() == (payload if decrypt else encrypted)
-    assert S_IMODE(installed.stat().st_mode) == 0o640
+    assert S_IMODE(installed.stat().st_mode) == (0o600 if decrypt else 0o640)
 
 
 def test_builtin_unarchive_normalizes_options_before_dispatch():
