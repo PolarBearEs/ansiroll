@@ -5652,7 +5652,7 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,"):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -5667,6 +5667,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
         env=env,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
 
 
@@ -5766,6 +5767,36 @@ def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, 
         environment={"ANSIROLL_TEST_FACT_SELECTED_ENV": "fact-selected"},
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("invalid", ["fifo", "vault"])
+def test_strategy_rejects_invalid_vars_file_selected_after_setup(tmp_path, invalid):
+    from textwrap import indent
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    path = tmp_path / ("settings-" + platform.system() + ".yml")
+    if invalid == "fifo":
+        os.mkfifo(path)
+        expected = "not a regular file"
+    else:
+        key = VaultSecret(b"synthetic-test-password")
+        encrypted = VaultLib([("default", key)]).encrypt(b"synthetic content", secret=key)
+        path.write_text("selected: !vault |\n" + indent(encrypted.decode(), "  "))
+        expected = "could not serialize selected vars file value"
+    (tmp_path / "settings-before.yml").write_text("{}\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files:
+    - ['settings-{{ ansible_facts.get(''system'', ''missing'') }}.yml', 'settings-before.yml']
+  tasks:
+    - debug: {msg: "{{ selected | default('value-was-dropped') }}"}
+""", "-e", "ansible_python_interpreter=" + sys.executable, timeout=45)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert expected in output, output
+    assert "value-was-dropped" not in output
 
 
 @pytest.mark.parametrize("fast", [False, True])

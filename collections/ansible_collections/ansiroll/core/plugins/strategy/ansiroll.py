@@ -1258,10 +1258,39 @@ class StrategyModule(StrategyBase):
             caller = sys._getframe(1)
             selected_file = (caller.f_code is reader and caller.f_locals.get("host") is host
                              and caller.f_locals.get("play") is self._cur_play)
-            data = load_from_file(path, *args, **kwargs)
-            if selected_file:
-                selected.append(data)
+            if not selected_file:
+                return load_from_file(path, *args, **kwargs)
+            original_reader = vars(loader).get("_get_file_contents")
+            loader._get_file_contents = read_selected
+            try:
+                data = load_from_file(path, *args, **kwargs)
+            finally:
+                if original_reader is None:
+                    del loader._get_file_contents
+                else:
+                    loader._get_file_contents = original_reader
+            selected.append(data)
             return data
+
+        def read_selected(path):
+            from ansible.errors import AnsibleFileNotFound, AnsibleParserError
+            from ansiroll.loader import _core_version
+
+            path = loader.path_dwim(path)
+            try:
+                with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
+                    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                        raise AnsibleParserError("selected vars file %r is not a regular file" % path)
+                    data = handle.read()
+            except FileNotFoundError as ex:
+                raise AnsibleFileNotFound("Unable to retrieve file contents.", file_name=path) from ex
+            except OSError as ex:
+                raise AnsibleParserError("could not read selected vars file %r" % path) from ex
+            if _core_version() < (2, 19):
+                return loader._decrypt_if_vault_data(data, os.fsencode(path))
+            from ansible._internal._datatag._tags import Origin
+
+            return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
 
         loader.load_from_file = capture
         try:
@@ -1289,13 +1318,17 @@ class StrategyModule(StrategyBase):
         keys = self._deferred_vars_file_keys | self._vars_file_keys(initial_files) | active_keys
         refreshed = {key: current_vars[key] for key in keys & current_vars.keys()}
         missing = sorted(keys - current_vars.keys(), key=str)
+        mapping_keys = []
+        try:
+            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys)
+        except AnsibleError as ex:
+            return {"error": str(ex)}
         if snapshot is not None:
             for key in missing:
                 snapshot.pop(key, None)
             snapshot.update(refreshed)
-        mapping_keys = []
         return {
-            "vars": _json_blob(refreshed, mapping_keys),
+            "vars": serialized,
             "names": sorted(set(self._cur_play.vars or {}) | active_keys, key=str),
             "missing": missing,
             "mapping_keys": mapping_keys,
@@ -2096,7 +2129,7 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values, mapping_keys=None):
+def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     from ansiroll.loader import _tag_untrusted
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
@@ -2124,12 +2157,14 @@ def _json_blob(values, mapping_keys=None):
             if mapping_keys is not None and _contains_typed_mapping_keys(v):
                 packed = _pack_delegated_value(v)
                 if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
-                    continue
+                    raise ValueError("mapping keys could not be serialized")
                 mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
                 v = packed["value"]
             else:
                 json.dumps(v, default=str)
-        except Exception:
+        except Exception as ex:
+            if k in strict_keys:
+                raise AnsibleError("could not serialize selected vars file value for %r" % k) from ex
             continue
         safe[k] = v
     return json.dumps(safe, default=str)
