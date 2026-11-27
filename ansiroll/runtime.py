@@ -903,8 +903,8 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             else:
                 items = dict.items(value)
             for key, item in items:
-                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views,
-                                          reject_vault=reject_vault)
+                marked_key = key if isinstance(key, _FactKeyTemplate) else _mark_unsafe(
+                    key, _seen, condition_text=condition_text, preserve_views=preserve_views, reject_vault=reject_vault)
                 out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
                                                preserve_lookup_hostvars, reject_vault)
             return out

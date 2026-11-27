@@ -3014,6 +3014,26 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
 """, use_strategy=use_strategy)
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_preserves_trusted_mapping_keys_in_loop_items(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_name: greeting
+    entries:
+      - '{{ fact_name }}': hello
+  tasks:
+    - set_fact: {}
+      args: '{{ item }}'
+      loop: '{{ entries }}'
+    - assert:
+        quiet: true
+        that: greeting == 'hello'
+""", use_strategy=use_strategy)
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern args and omit semantics")
 @pytest.mark.parametrize("use_strategy", [False, True])
 def test_set_fact_finalizes_selected_args_and_omits_nested_values(tmp_path, use_strategy):
