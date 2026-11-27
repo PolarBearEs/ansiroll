@@ -3087,22 +3087,34 @@ def _concat_keyword_segments(nodes):
              for part in nodes if preserve_none or part is not None]
     if len(parts) < 2:
         return parts[0] if parts else None
-    return "".join(str(_native_output_value(part)) for part in parts if part is not _KEYWORD_OMIT)
+    return "".join(map(str, _native_output_value(parts)))
 
 
-def _native_output_value(value):
+def _native_output_value(value, plain_strings=False, seen=None):
     """Materialize the members of a native template segment before stringification."""
+    if seen is None:
+        seen = {}
+    original = value
+    if id(original) in seen:
+        return seen[id(original)][1]
     value = _concretize(value)
     if isinstance(value, (KeysView, type({}.keys()))):
         value = list(value)
     if isinstance(value, (dict, _RawSnapshotMapping)):
-        return {_fail_on_undef(key): _native_output_value(member)
-                for key, member in value.items()
-                if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT}
-    if isinstance(value, (list, tuple, _RawSnapshotList)):
-        return [_native_output_value(member) for member in value
-                if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT]
-    return _fail_on_undef(value)
+        result = {
+            (str(key) if plain_strings and isinstance(key, str) else _fail_on_undef(key)):
+            _native_output_value(member, plain_strings, seen)
+            for key, member in value.items()
+            if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT
+        }
+    elif isinstance(value, (list, tuple, _RawSnapshotList)):
+        result = [_native_output_value(member, plain_strings, seen) for member in value
+                  if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT]
+    else:
+        return str(value) if plain_strings and isinstance(value, str) else _fail_on_undef(value)
+    # Lazy containers can create temporary wrappers while materializing members.
+    seen[id(original)] = (original, result)
+    return result
 
 
 def _finalize_text_segment(context, value):
@@ -3481,14 +3493,13 @@ def _concat_file_output(nodes):
     values = [value for value in nodes if preserve_none or value is not None]
     if len(values) < 2:
         return values[0] if values else None
-    return "".join("None" if value is None else _native_file_text(value)
-                   for value in values if not isinstance(value, _Omit))
+    return "".join(map(str, _native_output_value(values)))
 
 
 def _native_file_text(value):
     if value is None:
         return ""
-    return str(_native_output_value(value))
+    return str(_native_output_value(value, plain_strings=True))
 
 
 class _KeywordCodeGenerator(_AnsirollCodeGenerator, NativeCodeGenerator):

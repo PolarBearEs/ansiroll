@@ -1740,6 +1740,54 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     assert output.read_bytes() == expected
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="native file container output")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_materializes_shared_lazy_container_once(tmp_path, delegated):
+    marker = tmp_path / "lookups"
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    data:
+      stamp: "{{ lookup('pipe', 'printf x >> ' ~ ((playbook_dir ~ '/lookups') | quote) ~ '; printf ready') }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""),
+                  {"sample.j2": "{% set d = data %}{{ [d, d] }}"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert marker.read_text() == "x"
+    assert output.read_bytes() == b"[{'stamp': 'ready'}, {'stamp': 'ready'}]"
+    marker.unlink()
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == expected
+    assert marker.read_text() == "x"
+    assert output.read_bytes() == b"[{'stamp': 'ready'}, {'stamp': 'ready'}]"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="native file container output")
+def test_template_file_serializes_nested_markup_as_text(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    literal: !unsafe "{{ placeholder }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "{{ [literal | safe, '<x>' | escape] }}"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert output.read_bytes() == b"['{{ placeholder }}', '&lt;x&gt;']"
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"['{{ placeholder }}', '&lt;x&gt;']"
+
+
 @pytest.mark.parametrize(("task_options", "header"), [
     ("", 'trim_blocks: "False"'),
     ("", 'newline_sequence: "X"'),
@@ -1768,6 +1816,9 @@ def test_modern_template_rejects_invalid_delimiters_or_header_without_writing(tm
 
 
 def test_template_file_honors_block_closing_modifier(tmp_path):
+    from jinja2 import Environment, TemplateSyntaxError
+
+    source = "{% if true +%}\nline\n{% endif %}\nnext\n{% raw %}raw{% endraw +%}\nlast\n"
     path = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -1776,12 +1827,17 @@ def test_template_file_honors_block_closing_modifier(tmp_path):
         src: sample.j2
         dest: "{{ playbook_dir }}/rendered.txt"
         trim_blocks: true
-""", {"sample.j2": "{% if true +%}\nline\n{% endif %}\nnext\n{% raw %}raw{% endraw +%}\nlast\n"})
+""", {"sample.j2": source})
     output = tmp_path / "rendered.txt"
-    expected = _ansible(path, tmp_path)
+    actual = _ansiroll(path, tmp_path)
     assert output.read_bytes() == b"\nline\nnext\nraw\nlast\n"
+    try:
+        Environment(trim_blocks=True).parse(source)
+    except TemplateSyntaxError:
+        # Older controllers use a Jinja release without the bundled backport.
+        return
     output.unlink()
-    assert _ansiroll(path, tmp_path) == expected
+    assert _ansible(path, tmp_path) == actual
     assert output.read_bytes() == b"\nline\nnext\nraw\nlast\n"
 
 
