@@ -4901,13 +4901,15 @@ class Runtime:
             if "include_selector" not in node:
                 return node.get("file"), tasks, handlers
 
-            def inputs_match(inputs):
-                return all(_same_vars_input(_include_input_at(ctx, name, path),
+            def inputs_match(inputs, scope=ctx):
+                return all(_same_vars_input(_include_input_at(scope, name, path),
                                             value if present else _MISSING_VARS_FILE_INPUT)
                            for name, path, present, value in inputs)
 
             compile_inputs = node.get("include_compile_inputs")
-            if compile_inputs is not None and inputs_match(compile_inputs):
+            extra_inputs = node.get("include_compile_extra_inputs", ())
+            if (compile_inputs is not None and inputs_match(compile_inputs)
+                    and inputs_match(extra_inputs, self.extra_vars)):
                 key = node["compile_selection"]
             elif node.get("include_build_only"):
                 raise ValueError("include_tasks selector inputs changed and no alternate task file was bundled")

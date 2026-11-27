@@ -7034,10 +7034,10 @@ def test_vars_file_alternate_can_load_a_role_from_roles_path(tmp_path, monkeypat
     assert ("sibling-role-body" in json.dumps(frames)) == dependency
 
 
-def _run_vars_file_include_profile(plan, profile):
+def _run_vars_file_include_profile(plan, profile, **extra_vars):
     frames = []
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
-                      extra_vars={"profile": profile})
+                      extra_vars={"profile": profile, **extra_vars})
     runtime.run_play(plan)
     return runtime, [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
 
@@ -7107,7 +7107,8 @@ def test_vars_file_include_rejects_changed_inputs_for_build_only_body(tmp_path, 
     assert messages == ["include_tasks selector inputs changed and no alternate task file was bundled"]
 
 
-def test_vars_file_include_build_only_parent_ignores_shadowed_child_input(tmp_path):
+@pytest.mark.parametrize("child_action", ["include_tasks", "import_tasks"])
+def test_vars_file_include_build_only_parent_ignores_shadowed_child_input(tmp_path, child_action):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
@@ -7118,14 +7119,19 @@ def test_vars_file_include_build_only_parent_ignores_shadowed_child_input(tmp_pa
 """)
     for profile in ("normal", "alternate"):
         (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: entry.yml\nchild: {profile}.yml\n")
-    (tmp_path / "entry.yml").write_text("- include_tasks: '{{ child }}'\n  vars: {child: fixed.yml}\n")
+    (tmp_path / "entry.yml").write_text(f"- {child_action}: '{{{{ child }}}}'\n  vars: {{child: fixed.yml}}\n")
     (tmp_path / "fixed.yml").write_text("- debug: {msg: fixed-child}\n")
+    (tmp_path / "alternate.yml").write_text("- debug: {msg: alternate-child}\n")
 
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
     for profile in ("normal", "alternate"):
         runtime, messages = _run_vars_file_include_profile(plan, profile)
         assert not runtime.failed, messages
         assert messages == ["fixed-child"]
+
+    runtime, messages = _run_vars_file_include_profile(plan, "alternate", child="alternate.yml")
+    assert runtime.failed
+    assert messages == ["include_tasks selector inputs changed and no alternate task file was bundled"]
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["shared-entry", "different-children"])

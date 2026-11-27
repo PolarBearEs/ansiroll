@@ -1923,6 +1923,7 @@ class _IncludeVariables:
         self.vars_file_plan = None
         self.vars_file_scopes = None
         self.compile_selector_reads = set()
+        self.compile_selector_extra_reads = set()
         self.build_only_selector_names = set()
         # When candidate contents are unknown, any play var can change.
         self.incomplete = False
@@ -2142,6 +2143,21 @@ def _include_variant_branch(includes, base_scope, candidates):
     return branch
 
 
+def _record_build_only_selector_reads(includes, higher_layers, reads):
+    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+    from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
+
+    merge_hashes = DEFAULT_HASH_BEHAVIOUR == "merge"
+    replay_inputs = dict.fromkeys(includes.build_only_selector_names, frozenset())
+    for layer in higher_layers:
+        _clear_vars_file_blocks(replay_inputs, layer, merge_hashes)
+    includes.compile_selector_reads.update(read for read in reads if _vars_file_reads_blocked(replay_inputs, [read]))
+    # Launch extra vars can override even a binding shielded from replay by
+    # the child's own vars. With replace semantics a whole mapping can change.
+    includes.compile_selector_extra_reads.update((name, path if merge_hashes else ())
+                                                for name, path in reads if name not in _MAGIC_VAR_NAMES)
+
+
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand an include and any bodies selected by replayed vars files."""
     args = task.args or {}
@@ -2152,20 +2168,14 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
         return None
     if includes.build_only_selector_names and _is_templated(raw_fname):
-        from ansible.constants import DEFAULT_HASH_BEHAVIOUR
-        from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
-
         # This child is baked into a build-only parent body. Guard the
         # vars-file inputs it used even when the parent's filename is unchanged.
         variables, higher_layers = _include_template_variables(task, includes)
-        replay_inputs = dict.fromkeys(includes.build_only_selector_names, frozenset())
-        for layer in higher_layers:
-            _clear_vars_file_blocks(replay_inputs, layer, DEFAULT_HASH_BEHAVIOUR == "merge")
         reads, unknown_lookup = set(), set()
         if (_gather_timeout_dependencies(raw_fname, variables, selector=True, allow_controller=True,
                                          paths=reads, unknown_lookup=unknown_lookup) is None or unknown_lookup):
-            reads = {(name, ()) for name in includes.build_only_selector_names}
-        includes.compile_selector_reads.update(read for read in reads if _vars_file_reads_blocked(replay_inputs, [read]))
+            reads.update((name, ()) for name in includes.build_only_selector_names)
+        _record_build_only_selector_reads(includes, higher_layers, reads)
     parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
     if fname is None or (parents and includes.vars_file_scopes is not None):
         sources = (raw_fname, *parents)
@@ -2285,6 +2295,10 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     node["compile_selection"] = _include_variant_label(default_key)
     if build_only:
         node["include_build_only"] = True
+        extra_reads = variants[default_key].compile_selector_extra_reads
+        if extra_reads:
+            node["include_compile_extra_inputs"] = _include_input_snapshot(
+                task.get_variable_manager().extra_vars, sorted(extra_reads, key=repr))
     if default_inputs is not None and any(variant["include_variant"] == node["compile_selection"] for variant in bodies):
         node["include_compile_inputs"] = default_inputs
         node["include_selector_inputs"] = sorted(set(node["include_selector_inputs"]) |
@@ -2413,15 +2427,23 @@ def _include_import_scope(task, includes):
             from .runtime import _selector_template_sources
 
             templates = [source for value in sources for source, _, _ in _selector_template_sources(value)]
+            selector_reads = set()
             for source in templates:
                 reads, unknown_lookup = set(), set()
                 if _gather_timeout_dependencies(
                         source, variables, selector=True, allow_controller=True, computed=set(), paths=reads,
                         unknown_lookup=unknown_lookup if native_scope else None) and not unknown_lookup:
-                    includes.compile_selector_reads.update(reads)
+                    selector_reads.update(reads)
                 else:
                     names = includes.build_only_selector_names if native_scope else includes.vars_file_writes
-                    includes.compile_selector_reads.update((name, ()) for name in names)
+                    selector_reads.update((name, ()) for name in names)
+                    if native_scope:
+                        selector_reads.update(reads)
+            if native_scope:
+                _, higher_layers = _include_template_variables(current, includes)
+                _record_build_only_selector_reads(includes, higher_layers, selector_reads)
+            else:
+                includes.compile_selector_reads.update(selector_reads)
             if includes.compile_selected_vars is None:
                 variables = _portable_include_scope(templates, variables)
                 if variables is None:
