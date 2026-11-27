@@ -22,6 +22,7 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+from tests import ansible_playbook_command
 
 pytest.importorskip("ansible")
 
@@ -5700,7 +5701,8 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None,
+                       command=("ansible-playbook",)):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -5710,7 +5712,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
     env["ANSIBLE_NOCOLOR"] = "1"
     env.update(environment or {})
     return subprocess.run(
-        ["ansible-playbook", "-i", inventory, str(path), *args],
+        [*command, "-i", inventory, str(path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -7069,6 +7071,221 @@ def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, m
     runtime.run_play(_compiled_plays(source, tmp_path)[0])
     assert not runtime.failed
     assert recorded == [("first", False), ("second", False)]
+
+
+@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
+@pytest.mark.parametrize("no_log", ["false", "{{ false }}"])
+def test_expanded_include_loop_preserves_controls_and_register_scope(tmp_path, runner, no_log):
+    from ansiroll.loader import _core_version
+
+    version = _core_version(include_patch=True)
+    carries_register = version >= (2, 17, 4) or (2, 16, 11) <= version < (2, 17)
+    carries_include_filename = carries_register and version < (2, 21)
+    (tmp_path / "child.yml").write_text(
+        '- debug: {msg: "item={{ item }} idx={{ idx }} first={{ first_item }} label={{ resolved_label }}"}\n',
+    )
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars: {index_name: idx}
+  tasks:
+    - include_tasks: child.yml
+      loop: [1, 2, 3, 4]
+      loop_control:
+        index_var: "{{ index_name }}"
+        label: "label-{{ item }}"
+      when: >-
+        item == 1 or
+        (item == 2 and selected is defined and selected.include is defined and selected.include_args == {}
+        and selected.failed is undefined and selected.changed is undefined and selected._ansible_item_label == 'label-1') or
+        (item == 3 and selected is defined) or
+        (item == 4 and vars.selected is defined)
+      register: selected
+      no_log: NO_LOG
+      vars:
+        first_item: "{{ selected.results[0].item }}"
+        resolved_label: "{{ _ansible_item_label }}"
+    - assert:
+        that:
+          - selected.results[0].ansible_index_var == 'idx'
+          - selected.results[0]._ansible_item_label is undefined
+          - selected.results[1].idx == 1
+          - selected.results[3] is skipped
+""".replace("NO_LOG", json.dumps(no_log))
+    if runner == "standalone":
+        path = tmp_path / "play.yml"
+        path.write_text(playbook)
+        script = tmp_path / "compiled.py"
+        script.write_text(compile_playbook(str(path))[0])
+        proc = subprocess.run(
+            [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+        )
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(
+            tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy}, timeout=60,
+            command=ansible_playbook_command(),
+        )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "item=1 idx=0 first=1 label=label-1" in proc.stdout
+    assert ("item=2 idx=1 first=1 label=label-2" in proc.stdout) is carries_include_filename
+    assert ("item=3 idx=2 first=1 label=label-3" in proc.stdout) is carries_register
+    assert "item=4 idx=" not in proc.stdout
+    if runner == "standalone":
+        assert "item=label-1" in proc.stdout
+    if runner != "linear":
+        assert "item=label-4" in proc.stdout
+
+
+@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
+def test_expanded_include_loop_matches_undefined_label_behavior(tmp_path, runner):
+    from ansiroll.loader import _core_version
+
+    label_failure = _core_version() < (2, 21)
+    (tmp_path / "child.yml").write_text('- debug: {msg: "processed-{{ item }} as {{ _ansible_item_label }}"}\n')
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - include_tasks: child.yml
+      loop: [1, 2]
+      loop_control:
+        label: "{{ 'first' if item == 1 else missing }}"
+      register: selected
+      ignore_errors: true
+    - assert:
+        that:
+          - (selected is failed) == EXPECTED
+          - DIAGNOSTIC
+""".replace("EXPECTED", "true" if label_failure else "false").replace(
+        "DIAGNOSTIC", "selected.results[1].msg is search('Failed to template loop_control.label')"
+        if label_failure else "selected.results[1].warnings | length == 1")
+    if runner == "standalone":
+        path = tmp_path / "play.yml"
+        path.write_text(playbook)
+        script = tmp_path / "compiled.py"
+        script.write_text(compile_playbook(str(path))[0])
+        proc = subprocess.run(
+            [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+        )
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(
+            tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy}, timeout=60,
+            command=ansible_playbook_command(),
+        )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    if runner != "strategy":
+        assert "item=first" in proc.stdout
+    assert "processed-1 as first" in proc.stdout
+    assert ("processed-2 as 2" in proc.stdout) is not label_failure
+    if runner != "linear":
+        assert re.search(r"Failed to template loop_control[. ]label", proc.stdout + proc.stderr)
+
+
+@pytest.mark.parametrize("index_source", ['"{{ [\'idx\'] }}"', '!unsafe "{{ \'idx\' }}"'])
+def test_expanded_include_loop_rejects_invalid_templated_index_name(tmp_path, index_source):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("Core validates loop variable names from 2.21")
+    (tmp_path / "child.yml").write_text("- debug: {msg: escaped-index-validation}\n")
+    play = tmp_path / "play.yml"
+    play.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [1]
+      loop_control:
+        index_var: INDEX_SOURCE
+""".replace("INDEX_SOURCE", index_source))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(play))[0])
+    proc = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert proc.returncode != 0
+    assert "Invalid 'index_var'" in proc.stdout
+    assert "escaped-index-validation" not in proc.stdout
+
+
+def test_expanded_include_loop_keeps_untrusted_label_literal(tmp_path):
+    (tmp_path / "child.yml").write_text('- debug: {msg: "{{ _ansible_item_label }}"}\n')
+    play = tmp_path / "play.yml"
+    play.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [1]
+      loop_control:
+        label: !unsafe "literal {{ item }}"
+""")
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(play))[0])
+    proc = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '"msg": "literal {{ item }}"' in proc.stdout
+
+
+def test_expanded_include_loop_keeps_legacy_unsafe_index_name_literal(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 21):
+        pytest.skip("Core 2.21 rejects non-identifier loop variable names")
+    (tmp_path / "child.yml").write_text("- debug: {msg: child}\n")
+    play = tmp_path / "play.yml"
+    play.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_tasks: child.yml
+      loop: [1]
+      loop_control:
+        index_var: !unsafe "{{ 'idx' }}"
+        label: "{{ ansible_index_var }}"
+""")
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(play))[0])
+    proc = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "(item={{ 'idx' }})" in proc.stdout
+
+
+def test_expanded_include_loop_registers_native_role_arguments(tmp_path):
+    from ansiroll.loader import _core_version
+
+    version = _core_version(include_patch=True)
+    exposes_args = (2, 17, 4) <= version < (2, 21) or (2, 16, 11) <= version < (2, 17)
+    renders_args = (2, 19) <= version < (2, 21)
+    role_tasks = tmp_path / "roles" / "child" / "tasks"
+    role_tasks.mkdir(parents=True)
+    (role_tasks / "main.yml").write_text('- debug: {msg: "role-item-{{ item }}"}\n')
+    play = tmp_path / "play.yml"
+    play.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - include_role: {name: child APPLY_FLAGS}
+      loop: [1, 2, 3]
+      register: selected
+      when: >-
+        item == 1 or
+        (item == 2 and selected is defined and selected.include_args is defined and selected.include_args.name == 'child'
+        APPLIED_FLAG_CHECK) or
+        (item == 3 and selected is defined and selected.include is defined)
+""".replace("APPLY_FLAGS", ", apply: {check_mode: '{{ omit }}'}" if renders_args else "").replace(
+        "APPLIED_FLAG_CHECK", "and selected.include_args.apply.check_mode is undefined" if renders_args else ""))
+    script = tmp_path / "compiled.py"
+    script.write_text(compile_playbook(str(play))[0])
+    proc = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "role-item-1" in proc.stdout
+    assert ("role-item-2" in proc.stdout) is exposes_args
+    assert "role-item-3" not in proc.stdout
 
 
 @pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
