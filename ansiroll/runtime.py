@@ -1779,7 +1779,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
             if lstrip:
                 text = text.lstrip()
             if rstrip:
-                text = text.rstrip("\r\n")
+                text = text.rstrip()
             vals.append(text)
         return vals
     if name == "pipe":

@@ -1377,6 +1377,20 @@ def test_untrusted_data_is_not_templated_again(tmp_path):
     assert msgs[-1] == "BASE,BASE-2"
 
 
+def test_file_lookup_strips_trailing_whitespace_by_default(tmp_path):
+    contents = " \tpayload \t\nsecond line \t\n\n"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt') }}"
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt', rstrip=False) }}"
+""", {"data.txt": contents})
+    assert messages == [" \tpayload \t\nsecond line", contents]
+
+
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy):
     from ansible import constants as C
