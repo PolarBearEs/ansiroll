@@ -6531,6 +6531,133 @@ def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):
     assert "failed=0" in proc.stdout
 
 
+@pytest.mark.parametrize("strategy", ["linear", "ansiroll.core.ansiroll"])
+def test_delegated_set_fact_normalizes_arguments_on_invoking_host(tmp_path, strategy):
+    proc = _run_strategy_play(
+        tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    fact_name: rendered_fact
+    templated_facts: {incoming: arrived, rendered_fact: replaced}
+  tasks:
+    - set_fact:
+        "{{ fact_name }}": here
+        'on': quoted
+        ignored_fact: "{{ missing | default(omit) }}"
+        cacheable: "false"
+      args: "{{ templated_facts }}"
+      delegate_to: recipient
+      delegate_facts: false
+    - set_fact:
+        loop_value: "{{ ansible_facts.loop_value | default(0) | int + 1 }}"
+      delegate_to: recipient
+      loop: [first, second]
+    - assert:
+        that:
+          - loop_value | int == 1
+          - ansible_facts.loop_value is undefined
+          - rendered_fact == 'here'
+          - incoming == 'arrived'
+          - vars['on'] == 'quoted'
+          - ignored_fact is undefined
+          - ansible_facts.rendered_fact is undefined
+          - hostvars.recipient.rendered_fact is undefined
+""", inventory="origin,recipient,", environment={"ANSIBLE_STRATEGY": strategy},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_expanded_set_fact_args_prevent_conflicting_freeze(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    status: before
+    inputs: {status: after}
+  tasks:
+    - set_fact: {}
+      args: '{{ inputs }}'
+      delegate_to: localhost
+""")
+    with pytest.raises(ValueError, match="cannot freeze 'status'"):
+        compile_playbook(str(playbook), freeze_vars=["status"])
+
+
+def test_explicit_raw_params_fact_allows_unrelated_freeze(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    status: before
+    _raw_params: before
+    inputs: {status: after}
+  tasks:
+    - set_fact: {_raw_params: '{{ inputs }}'}
+""")
+    compile_playbook(str(playbook), freeze_vars=["status"])
+    with pytest.raises(ValueError, match="cannot freeze '_raw_params'"):
+        compile_playbook(str(playbook), freeze_vars=["_raw_params"])
+
+
+@pytest.mark.parametrize("args_default", ["{}", "none"], ids=["empty-mapping", "null"])
+def test_legacy_delegated_set_fact_preserves_explicit_and_nested_values(tmp_path, args_default):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 19):
+        pytest.skip("checks legacy argument and omit semantics")
+    playbook = """- hosts: origin
+  gather_facts: false
+  tasks:
+    - set_fact:
+        explicit_marker: applied
+        deep: [[{field: '{{ omit }}'}]]
+        direct: [{field: '{{ omit }}'}]
+      args: '{{ optional_facts | default(ARGS_DEFAULT) }}'
+      delegate_to: recipient
+    - assert:
+        that:
+          - explicit_marker == 'applied'
+          - deep[0][0].field is defined
+          - direct[0].field is undefined
+""".replace("ARGS_DEFAULT", args_default)
+    native, agent = (
+        _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+                           environment={"ANSIBLE_STRATEGY": strategy})
+        for strategy in ("linear", "ansiroll.core.ansiroll")
+    )
+    if args_default == "none" and native.returncode:
+        # Some legacy Core releases reject a non-mapping args expansion.
+        assert "invalid or malformed argument" in native.stdout
+        assert "invalid or malformed argument" in agent.stdout
+    else:
+        assert native.returncode == 0, native.stdout + native.stderr
+    assert agent.returncode == native.returncode, agent.stdout + agent.stderr
+
+
+@pytest.mark.parametrize("payload, expression", [("scalar", "'scalar'"), ("{inner: keep}", "{'inner': 'keep'}")])
+def test_delegated_set_fact_keeps_free_form_argument(tmp_path, payload, expression):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("checks free-form argument processing on Core 2.21")
+    playbook = """- hosts: origin
+  gather_facts: false
+  vars: {payload: %s, inner: untouched}
+  tasks:
+    - set_fact: '{{ payload }}'
+      delegate_to: recipient
+    - assert:
+        that:
+          - "vars['_raw_params'] == %s"
+          - inner == 'untouched'
+""" % (payload, expression)
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_strategy_routes_delegated_set_fact_to_the_target_host(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
@@ -7084,9 +7211,8 @@ def test_strategy_reports_controller_fallback_provenance(tmp_path):
   gather_facts: false
   connection: local
   tasks:
-    - name: delegated fact
-      set_fact:
-        delegated_value: present
+    - name: delegated command
+      command: 'true'
       delegate_to: localhost
 """,
         environment={"ANSIROLL_PROVENANCE": "1"},
