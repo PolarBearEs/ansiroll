@@ -323,6 +323,8 @@ class StrategyModule(StrategyBase):
             linear_reason = "Vault source selection requires core linear"
         elif any(item["kind"] == "file-source-arguments" for item in controller_reasons):
             linear_reason = "templated file source arguments require core linear"
+        elif any(item["kind"] == "apply-include" for item in controller_reasons):
+            linear_reason = "include_tasks with runtime apply variables requires core linear"
         elif not self._delegate_on_target and any(
                 _delegated_fact_flag(task.delegate_facts) is not False for task in delegated_fact_tasks):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
@@ -840,6 +842,11 @@ class StrategyModule(StrategyBase):
             concrete.loop_with = None
             concrete.register = None
             concrete.notify = []
+            for keyword in ("check_mode", "become", "no_log"):
+                if keyword in frame:
+                    setattr(concrete, keyword, frame[keyword])
+            if "diff_mode" in frame:
+                concrete.diff = frame["diff_mode"]
             # The agent applies the original retry policy around each controller call.
             concrete.retries = 0
             concrete.until = []
@@ -989,6 +996,27 @@ class StrategyModule(StrategyBase):
             container[path[-1]] = marker
         return _restore_delegated_mapping_keys(value, mapping_keys)
 
+    def _restore_private_result(self, packed, *, wrap_result=False):
+        from ansiroll.loader import _core_version
+
+        value = packed["value"]
+        if _core_version() < (2, 19):
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            if wrap_result:
+                value = wrap_var(value)
+            else:
+                for path in packed.get("unsafe_paths", ()):
+                    if not path:
+                        value = wrap_var(value)
+                        continue
+                    container = value
+                    for key in path[:-1]:
+                        container = container[key]
+                    container[path[-1]] = wrap_var(container[path[-1]])
+        return self._restore_play_fallback(value, packed["undefined"], packed.get("errors", ()),
+                                           packed.get("mapping_keys", ()))
+
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
         args = dict(frame.get("args") or {})
@@ -1011,11 +1039,13 @@ class StrategyModule(StrategyBase):
         except (OSError, AnsibleError) as ex:
             return {"failed": True, "changed": False, "msg": "template: %s" % ex}
         rt = self._local_runtime(become_pass)
-        previous = rt.check_mode, rt.become_user
+        previous = rt.check_mode, rt.diff_mode, rt.become_user
         try:
             rt.check_mode = bool(frame.get("check_mode"))
+            rt.diff_mode = bool(frame.get("diff_mode"))
             rt.become_user = str(frame.get("become_user") or "root")
             task = {
+                "no_log": bool(frame.get("no_log")),
                 "_baked": {src: raw},
                 "_baked_meta": {src: {
                     "fullpath": fullpath,
@@ -1075,7 +1105,7 @@ class StrategyModule(StrategyBase):
             return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")),
                                        template_vars=template_vars if names else None)
         finally:
-            rt.check_mode, rt.become_user = previous
+            rt.check_mode, rt.diff_mode, rt.become_user = previous
 
     def _run_include_vars(self, frame):
         """include_vars reads controller-side files; resolve and parse here."""
@@ -1588,25 +1618,25 @@ class StrategyModule(StrategyBase):
         try:
             registers = _register_names(task)
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
-            registered_result = result_data
+            state = result_data
+            if "private_result" in frame:
+                state = self._restore_private_result(frame["private_result"],
+                                                     wrap_result=action not in ("set_fact", "include_vars"))
+            registered_result = state
             if registers and not frame.get("is_item"):
                 if action in ("include_tasks", "include_role") and "include_register" in frame:
-                    private = frame["include_register"]
-                    registered_result = self._restore_play_fallback(
-                        private["value"], private["undefined"], private.get("errors", ()),
-                        private.get("mapping_keys", ()),
-                    )
+                    registered_result = self._restore_private_result(frame["include_register"])
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
-                    registered_result = _without_delegated_metadata(result_data)
+                    registered_result = _without_delegated_metadata(state)
                 if action == "include_vars" and included_vars:
                     registered_result = _restore_included_vars(
-                        result_data, included_vars, frame.get("included_vars_references"),
+                        state, included_vars, frame.get("included_vars_references"),
                     )
                 self._variable_manager.set_nonpersistent_facts(
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
-            facts = result_data.get("ansible_facts")
+            facts = state.get("ansible_facts")
             if task_key == "__gather_facts__" and status == "ok":
                 facts = frame.get("gathered_facts", facts)
                 if isinstance(facts, dict):
@@ -1617,7 +1647,7 @@ class StrategyModule(StrategyBase):
                 # The controller has already stored the original tagged values.
                 facts = None
             is_set_fact = action == "set_fact"
-            cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
+            cacheable = bool(state.get("_ansible_facts_cacheable", False))
             if isinstance(facts, dict):
                 # Match StrategyBase: cacheable set_fact results populate the
                 # persistent fact cache, while every set_fact result also gets
@@ -1657,6 +1687,11 @@ class StrategyModule(StrategyBase):
                             )
         except Exception:
             pass
+        if "no_log" in frame and task.no_log is not frame["no_log"]:
+            original = task
+            task = original.copy(exclude_parent=True)
+            task._parent = original._parent
+            task.no_log = frame["no_log"]
         tr = self._make_result(host, task, result_data)
         is_item = frame.get("is_item")
         ignored = frame.get("ignored")
@@ -1668,6 +1703,8 @@ class StrategyModule(StrategyBase):
         if status == "failed" and not is_item:
             self._tqm.send_callback(method, tr, ignore_errors=ignored)
             return not ignored
+        if status == "changed" and frame.get("diff_mode") and not frame.get("no_log") and result_data.get("diff"):
+            self._tqm.send_callback("v2_on_file_diff", tr)
         self._tqm.send_callback(method, tr)
         return False
 
@@ -1817,6 +1854,8 @@ def _controller_fallbacks(play_node):
                     kind = "file-source-arguments"
                 elif node.get("vars_file_include_fallback"):
                     kind = "vars-file-include"
+                elif node.get("_deferred_apply_include"):
+                    kind = "apply-include"
                 found.append({
                     "kind": kind,
                     "task": node.get("name") or node.get("action"),
