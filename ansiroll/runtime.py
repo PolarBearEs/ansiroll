@@ -5062,7 +5062,7 @@ class Runtime:
             for key, value in flags.items():
                 if isinstance(value, _Omit):
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
-                    flags[key] = self._execution_flag_value(inherited, ctx)
+                    flags[key] = self._bound_apply_flag(inherited, ctx)
             applied_vars = _setup_omit(self.template(authored_vars, ctx))
         except Exception as ex:
             return no_log or "no_log" in authored_flags, {}, {}, {
@@ -6011,9 +6011,13 @@ class Runtime:
         return default if value is None else _boolean(value, strict=True)
 
     def _execution_flag_value(self, value, ctx):
+        return _fail_on_undef(self.template(self._bound_apply_flag(value, ctx), ctx))
+
+    @staticmethod
+    def _bound_apply_flag(value, ctx):
         if isinstance(value, dict) and "__ansiroll_apply_flag__" in value:
             return ctx[_INCLUDE_APPLY_FLAGS][value["__ansiroll_apply_flag__"]]
-        return _fail_on_undef(self.template(value, ctx))
+        return value
 
     def _resolve_task_no_log(self, task, ctx):
         try:

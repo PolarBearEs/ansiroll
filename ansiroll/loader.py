@@ -1785,6 +1785,7 @@ _INCLUDE_STACK = {}
 # link for compile-time include paths and variables.
 _INCLUDE_ROLE_PARENTS = {}
 _INCLUDE_IDS = [0]
+_UNRESOLVED_INCLUDE_VALUE = object()
 
 
 def _is_templated(value):
@@ -1917,6 +1918,11 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if "{{" in fname or "{%" in fname:
         fname = _template_include_filename(task, fname, includes)
         if not isinstance(fname, str) or "{{" in fname or "{%" in fname:
+            if any(value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):
+                node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
+                node["_deferred_apply_include"] = True
+                node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
+                return node
             return None
     path = _include_tasks_path(task, fname, includes)
     if path is None or not os.path.exists(path):
@@ -1958,6 +1964,8 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 include._parent = task._parent
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
+                if render_apply and parent.vars:
+                    parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
             blocks = load_list_of_blocks(
                 data, play=_play_of(task), task_include=parent, role=task._role,
                 use_handlers=handler, variable_manager=task.get_variable_manager(),
@@ -2135,7 +2143,7 @@ def _include_scope(task):
         task = _include_parent(task)
     scope, params = {}, {}
     for parent in reversed(parents):
-        variables = parent.vars or {}
+        variables = getattr(parent, "_ansiroll_apply_filename_vars", parent.vars) or {}
         scope.update(variables)
         if isinstance(parent, TaskInclude):
             params.update(variables)
@@ -2209,6 +2217,30 @@ _MAGIC_VAR_NAMES = frozenset((
 
 def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
+    resolved = _template_include_value(task, value, includes)
+    if isinstance(resolved, str) and not _is_templated(resolved):
+        includes.resolved_template = True
+    return None if resolved is _UNRESOLVED_INCLUDE_VALUE else resolved
+
+
+def _compile_apply_filename_vars(task, variables, includes):
+    """Project non-looped apply bindings into the filename resolver's scope."""
+    compiled = {}
+    for name, value in variables.items():
+        if not _contains_dynamic_value(value):
+            compiled[name] = value
+            continue
+        # Templating a mapping lets Core drop an omitted value just as it does
+        # when finalizing the original apply arguments.
+        rendered = _template_include_value(task, {name: value}, includes)
+        if rendered is _UNRESOLVED_INCLUDE_VALUE:
+            compiled[name] = rendered
+        else:
+            compiled.update(rendered)
+    return compiled
+
+
+def _template_include_value(task, value, includes):
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
@@ -2274,7 +2306,7 @@ def _template_include_filename(task, value, includes):
         parent = _include_parent(parent)
 
     def is_runtime(name):
-        if name in loop_names:
+        if name in loop_names or variables.get(name) is _UNRESOLVED_INCLUDE_VALUE:
             return True
         if ((includes.incomplete or name in includes.vars_file_writes)
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
@@ -2289,7 +2321,7 @@ def _template_include_filename(task, value, includes):
         )
 
     if _depends_on_vars(value, variables, is_runtime):
-        return None
+        return _UNRESOLVED_INCLUDE_VALUE
     try:
         from ansible.template import Templar
         try:
@@ -2297,12 +2329,9 @@ def _template_include_filename(task, value, includes):
         except TypeError:
             templar = Templar(loader=task._loader)
             templar.available_variables = variables
-        resolved = templar.template(value, fail_on_undefined=True)
+        return templar.template(value, fail_on_undefined=True)
     except Exception:
-        return None
-    if isinstance(resolved, str) and not _is_templated(resolved):
-        includes.resolved_template = True
-    return resolved
+        return _UNRESOLVED_INCLUDE_VALUE
 
 
 def _is_literal_include_template(value):
@@ -4211,6 +4240,8 @@ def _execution_omit_fallback(value):
         return {"__ansiroll_apply_flag__": value.keyword}
     if value is Sentinel:
         return None
+    if _is_templated(value):
+        return _tag_untrusted(value)
     try:
         return boolean(value) if value is not None else False
     except TypeError:

@@ -5914,6 +5914,38 @@ def test_recursive_include_rebinds_templated_apply_flags(tmp_path, monkeypatch, 
     assert modes == [True, omit_once] + [True, False] * 19
 
 
+@pytest.mark.parametrize("child_check", [False, True])
+def test_expanded_include_omit_inherits_templated_block_mode_in_child_scope(tmp_path, child_check):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core drops omitted apply fields")
+    (tmp_path / "child.yml").write_text("""- file:
+    path: '{{ playbook_dir }}/marker'
+    state: touch
+  vars: {safe: CHILD_CHECK}
+""".replace("CHILD_CHECK", json.dumps(child_check)))
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: {safe: OUTER_CHECK}
+  tasks:
+    - block:
+        - include_tasks:
+            file: child.yml
+            apply: {check_mode: '{{ omit }}'}
+      check_mode: '{{ safe }}'
+""".replace("OUTER_CHECK", json.dumps(not child_check))
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        created = tmp_path / "marker"
+        assert created.exists() is (not child_check), result.stdout + result.stderr
+        if created.exists():
+            created.unlink()
+
+
 def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

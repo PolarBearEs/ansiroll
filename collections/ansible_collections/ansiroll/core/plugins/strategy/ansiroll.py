@@ -320,6 +320,8 @@ class StrategyModule(StrategyBase):
             linear_reason = "Vault source selection requires core linear"
         elif any(item["kind"] == "file-source-arguments" for item in controller_reasons):
             linear_reason = "templated file source arguments require core linear"
+        elif any(item["kind"] == "apply-include" for item in controller_reasons):
+            linear_reason = "include_tasks with runtime apply variables requires core linear"
         elif not self._delegate_on_target and any(
                 _delegated_fact_flag(task.delegate_facts) is not False for task in delegated_fact_tasks):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
@@ -1855,6 +1857,8 @@ def _controller_fallbacks(play_node):
                     kind = "vault-source"
                 elif node.get("_file_source_argument_layers"):
                     kind = "file-source-arguments"
+                elif node.get("_deferred_apply_include"):
+                    kind = "apply-include"
                 found.append({
                     "kind": kind,
                     "task": node.get("name") or node.get("action"),

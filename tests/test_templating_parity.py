@@ -3052,6 +3052,54 @@ def test_include_apply_vars_resolve_in_native_scope(tmp_path, use_strategy, loop
     assert messages == ["outer" if MODERN_TEMPLATING and not looped else "child"]
 
 
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("looped", [False, True])
+def test_include_apply_vars_select_nested_filename_in_native_scope(tmp_path, use_strategy, looped):
+    include = """
+- hosts: localhost
+  gather_facts: false
+  vars: {flavor: outer}
+  tasks:
+    - include_tasks:
+        file: entry.yml
+        apply:
+          vars: {flavor: applied, selected: '{{ flavor }}.yml'}
+"""
+    if looped:
+        include += "      loop: [one]\n"
+    messages, _ = _assert_parity(tmp_path, include, {
+        "entry.yml": "- include_tasks: '{{ selected }}'\n",
+        "outer.yml": "- debug: {msg: outer-filename}\n",
+        "applied.yml": "- debug: {msg: applied-filename}\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["outer-filename" if MODERN_TEMPLATING and not looped else "applied-filename"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Core prepares non-looped apply vars at inclusion")
+def test_include_apply_runtime_binding_defers_nested_filename_expansion(tmp_path):
+    playbook = """
+- hosts: localhost
+  gather_facts: false
+  vars: {flavor: outer}
+  tasks:
+    - set_fact: {flavor: selected}
+    - include_tasks:
+        file: entry.yml
+        apply:
+          vars: {flavor: applied, selected_file: '{{ flavor }}.yml'}
+"""
+    files = {
+        "entry.yml": "- include_tasks: '{{ selected_file }}'\n",
+        "applied.yml": "- debug: {msg: wrong-filename}\n",
+        "selected.yml": "- debug: {msg: selected-at-runtime}\n",
+    }
+    path = _write(tmp_path, playbook, files)
+    _, manifest = compile_playbook(str(path))
+    assert manifest["fallback_tasks"]
+    messages, _ = _assert_parity(tmp_path, playbook, files, use_strategy=True)
+    assert messages == ["selected-at-runtime"]
+
+
 @pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core uses unsafe string wrappers")
 def test_hidden_register_and_fact_keep_unsafe_values_in_next_strategy_play(tmp_path):
     _assert_parity(tmp_path, """
