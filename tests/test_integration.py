@@ -5877,7 +5877,8 @@ def test_strategy_validates_native_check_mode_buffers(tmp_path, expression, invo
 
 @pytest.mark.parametrize("access", ["lookup('vars', 'fallback')", "query('vars', 'fallback')[0]",
                                    "vars.fallback", "vars['fallback']", "vars.get('fallback')",
-                                   "mapping.values() | first", "(mapping.items() | first)[1]"])
+                                   "mapping.values() | first", "(mapping.items() | first)[1]",
+                                   "buffered", "mapping.buffered"])
 def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, access):
     from ansiroll.loader import _core_version
 
@@ -5894,7 +5895,10 @@ def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, acces
     - include_tasks: child.yml
       vars:
         fallback: '{{ omit }}'
-        mapping: {value: '{{ omit }}'}
+        buffered: '{% if true %}{{ omit }}{% endif %}'
+        mapping:
+          value: '{{ omit }}'
+          buffered: '{% if true %}{{ omit }}{% endif %}'
 """
     for strategy in ("linear", "ansiroll.core.ansiroll"):
         result = _run_strategy_play(tmp_path, playbook, "--check", "-c", "local",

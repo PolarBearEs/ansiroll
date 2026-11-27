@@ -5074,7 +5074,10 @@ class Runtime:
 
         scopes = []
         for ctx, loop_vars, result, item in selected:
-            params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
+            # Modern Core evaluates include variables in the child. Preserve
+            # their sources so keyword rendering sees native values like omit.
+            params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars,
+                                        defer=_core_at_least(2, 19))
             params.update(loop_vars)
             scope = _with_high_vars(overlay, params)
             # Handlers execute later, so retain the expressions as well as
