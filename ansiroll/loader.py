@@ -1517,12 +1517,15 @@ def _deferred_vars_files(play, basedir, entries):
                     candidates = set()
                     parent_paths = set()
                     for pattern in patterns:
+                        absolute_parent = os.path.isabs(pattern) and os.pardir in pattern.split(os.path.sep)
+                        # Core normalizes absolute candidates before looking for them.
+                        discovery = os.path.normpath(pattern) if absolute_parent else pattern
                         for root in first_found_roots:
-                            for path in glob.glob(os.path.join(glob.escape(root), pattern)):
+                            for path in glob.glob(os.path.join(glob.escape(root), discovery)):
                                 if not os.path.exists(path):
                                     continue
-                                if os.pardir in path.split(os.path.sep):
-                                    # Preserve which search root could reach this spelling.
+                                if absolute_parent or os.pardir in path.split(os.path.sep):
+                                    # Relative paths retain the spelling reached from their search root.
                                     parent_paths.add(path)
                                 path = os.path.normpath(path)
                                 candidates.add(path)

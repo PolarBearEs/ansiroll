@@ -485,7 +485,8 @@ def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp
     assert runtime.vars["selected"] == "production"
 
 
-@pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation", "parent-relative"])
+@pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation",
+                                      "parent-relative", "absolute-parent"])
 def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch, location):
     profiles = tmp_path / "profiles"
     play_dir = tmp_path
@@ -513,6 +514,9 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
         play_dir = tmp_path / "project"
         play_dir.mkdir()
         paths = "['../profiles']"
+    elif location == "absolute-parent":
+        filename = "playbook_dir ~ '/missing/../profiles/' ~ profile ~ '.yml'"
+        paths = "[]"
     else:
         paths = "[playbook_dir ~ '/profiles']"
     profiles.mkdir(parents=True, exist_ok=True)
@@ -525,7 +529,7 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
   tasks:
     - assert: {that: selected == 'production'}
 """.replace("PATHS", paths).replace("FILENAME", filename))
-    if location == "parent-relative":
+    if location in ("parent-relative", "absolute-parent"):
         from tests import ansible_playbook_command
 
         native = subprocess.run(

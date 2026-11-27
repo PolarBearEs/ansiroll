@@ -1696,7 +1696,8 @@ def _first_found_vars_file(args, kwargs, selector):
                 for root in roots:
                     candidate_path = os.path.join(root, candidate)
                     path = os.path.normpath(candidate_path)
-                    if path in bundled and (not parent_relative or candidate_path in parent_paths):
+                    checked_path = path if absolute else candidate_path
+                    if path in bundled and (not parent_relative or checked_path in parent_paths):
                         return [path]
                     if not covered:
                         # We cannot rule this root out before trying a later one.
