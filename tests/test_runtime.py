@@ -49,13 +49,25 @@ def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch
     offset_values = {"offset_%d" % index: values["stamp"].replace(tzinfo=datetime.timezone(offset))
                      for index, offset in enumerate(sub_minute_offsets)}
     values.update(offset_values)
-    packed = runtime._pack_include_value(values, preserve_scalars=True)
-    legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime)
+    extreme = datetime.timedelta(hours=23, minutes=59, seconds=30)
+    bounds = {
+        "near_min": datetime.datetime.min.replace(tzinfo=datetime.timezone(sub_minute_offsets[0])),
+        "near_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-sub_minute_offsets[0])),
+        "below_min": datetime.datetime.min.replace(tzinfo=datetime.timezone(extreme)),
+        "above_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-extreme)),
+    }
+    packed = runtime._pack_include_value({**values, **bounds}, preserve_scalars=True)
+    legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime,
+                                      min=datetime.datetime.min, max=datetime.datetime.max)
     monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime,
                                                        timedelta=datetime.timedelta, timezone=datetime.timezone))
     restored = runtime._restore_rescue_scalars(packed)
-    assert restored == values
+    assert {name: restored[name] for name in values} == values
     assert all(restored[name].tzinfo is datetime.timezone.utc for name in offset_values)
+    assert restored["near_min"].isoformat() == "0001-01-01T00:00:30+00:01"
+    assert restored["near_max"].isoformat() == "9999-12-31T23:59:29.999999-00:01"
+    assert restored["below_min"].isoformat() == "0001-01-01T00:00:00+23:59"
+    assert restored["above_max"].isoformat() == "9999-12-31T23:59:59.999999-23:59"
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():

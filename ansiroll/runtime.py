@@ -8341,10 +8341,30 @@ def _decode_delegated_key(key):
             sign, hours, minutes, seconds, micros = sub_minute.groups()
             offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
                                    microseconds=int(micros or 0))
-            value = value + offset if sign == "-" else value - offset
-            value = value.replace(tzinfo=_dt.timezone.utc)
+            if sign == "-":
+                offset = -offset
+            return _legacy_offset_datetime(value, offset)
         return value
     return key
+
+
+def _legacy_offset_datetime(value, offset):
+    try:
+        return (value - offset).replace(tzinfo=_dt.timezone.utc)
+    except OverflowError:
+        # Round away from zero so the local time moves back into range.
+        minute = _dt.timedelta(minutes=1)
+        aligned = min(abs(offset) // minute + 1, 1439) * minute
+        if offset.days < 0:
+            aligned = -aligned
+        adjustment = aligned - offset
+        try:
+            value += adjustment
+        except OverflowError:
+            # Offsets of 24 hours are invalid. Use the closest instant the
+            # legacy interpreter can represent when even 23:59 is too small.
+            value = _dt.datetime.min if adjustment.days < 0 else _dt.datetime.max
+        return value.replace(tzinfo=_dt.timezone(aligned))
 
 
 def _replace_delegated_values(value, replacements):
