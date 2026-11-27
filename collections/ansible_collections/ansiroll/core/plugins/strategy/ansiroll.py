@@ -397,7 +397,7 @@ class StrategyModule(StrategyBase):
 
     # ---- compilation -----------------------------------------------------
     def _compile(self, play, play_vars, gather_task):
-        from ansiroll.loader import _conditions, _controller_config_names, _controller_env_names, _convert_play
+        from ansiroll.loader import _conditions, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
 
@@ -432,12 +432,9 @@ class StrategyModule(StrategyBase):
             from ansiroll.compiler import _mark_unsupported
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
-        self._deferred_lookup_paths = {
-            os.path.abspath(path)
-            for entry in play_node.get("deferred_vars_files", ())
-            for path, data in entry["files"].items()
-            if _controller_env_names(data) or _controller_config_names(data)
-        }
+        self._deferred_vars_file_keys = (
+            set(play_node.get("vars") or {}) if play_node.get("deferred_vars_files") else None
+        )
 
         self._ansiballz = embedder.ansiballz_code or ""
         source = _render_source([play_node], modules, self._ansiballz)
@@ -514,7 +511,7 @@ class StrategyModule(StrategyBase):
         become_pass = self._resolve_become_password(hv, templar)
         agent_source = (
             self._agent_header(host, hv, become_pass)
-            + self._controller_lookup_header(selected_vars_files)
+            + self._controller_lookup_header(hv, selected_vars_files)
             + "_INJECTED_GATHER_FACTS = %r\n" % gather_facts
             + source
         )
@@ -534,6 +531,7 @@ class StrategyModule(StrategyBase):
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
                 host, chan, task_map, hv, templar, become_pass, play_context,
+                selected_vars_files=selected_vars_files,
                 gather_task=task_map.get("__gather_facts__") if gather_facts else None)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
@@ -579,7 +577,8 @@ class StrategyModule(StrategyBase):
             return {"options": {}, "error": str(ex)}
         return {"options": options, "error": None}
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *,
+              selected_vars_files=(), gather_task=None):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
@@ -653,6 +652,10 @@ class StrategyModule(StrategyBase):
                     "t": "source_result",
                     "source": source_result,
                 })
+            elif t == "vars_files":
+                state = self._resolved_vars_file_state(
+                    host, selected_vars_files, task=task_map.get("__gather_facts__"), snapshot=hv)
+                chan.send({"t": "vars_files_result", "result": state})
             elif t == "warning":
                 display.warning(frame["message"])
             elif t == "error":
@@ -1234,45 +1237,131 @@ class StrategyModule(StrategyBase):
                 + "_INJECTED_FAST_FACTS = %r\n"
                 % _truthy(os.environ.get("ANSIROLL_FAST_FACTS", "")))
 
-    def _host_vars_and_lookup_sources(self, host):
+    def _host_vars_and_lookup_sources(self, host, *, task=None):
         selected = []
-        if not self._deferred_lookup_paths:
-            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+        manager = self._variable_manager
+        if self._deferred_vars_file_keys is None:
+            return dict(manager.get_vars(host=host, play=self._cur_play, task=task)), selected
 
-        # Record the candidate mappings as Ansible selects them. The merged
-        # host vars alone lose inputs used by earlier selectors.
+        # Observe the vars_files reads made directly by this host's native
+        # variable manager. Inventory plugins can also use load_from_file.
         loader = self._loader
         load_from_file = loader.load_from_file
         original_override = vars(loader).get("load_from_file")
+        reader = manager.get_vars.__func__.__code__
 
         def capture(path, *args, **kwargs):
-            data = load_from_file(path, *args, **kwargs)
-            if path and os.path.abspath(os.fsdecode(path)) in self._deferred_lookup_paths:
-                selected.append(data)
+            caller = sys._getframe(1)
+            selected_file = (caller.f_code is reader and caller.f_locals.get("host") is host
+                             and caller.f_locals.get("play") is self._cur_play)
+            if not selected_file:
+                return load_from_file(path, *args, **kwargs)
+            original_reader = vars(loader).get("_get_file_contents")
+            loader._get_file_contents = read_selected
+            try:
+                data = load_from_file(path, *args, **kwargs)
+            finally:
+                if original_reader is None:
+                    del loader._get_file_contents
+                else:
+                    loader._get_file_contents = original_reader
+            selected.append(data)
             return data
+
+        def read_selected(path):
+            from ansible.errors import AnsibleFileNotFound, AnsibleParserError
+            from ansiroll.loader import _core_version
+
+            path = loader.path_dwim(path)
+            try:
+                with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
+                    opened = os.fstat(handle.fileno())
+                    if stat.S_ISREG(opened.st_mode):
+                        data = handle.read()
+                    elif stat.S_ISCHR(opened.st_mode) and os.path.samestat(opened, os.stat(os.devnull)):
+                        data = b""
+                    else:
+                        raise AnsibleParserError("selected vars file %r is not a regular file" % path)
+            except FileNotFoundError as ex:
+                raise AnsibleFileNotFound("Unable to retrieve file contents.", file_name=path) from ex
+            except OSError as ex:
+                raise AnsibleParserError("could not read selected vars file %r" % path) from ex
+            if _core_version() < (2, 19):
+                return loader._decrypt_if_vault_data(data, os.fsencode(path))
+            from ansible._internal._datatag._tags import Origin
+
+            return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
 
         loader.load_from_file = capture
         try:
-            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+            return dict(manager.get_vars(host=host, play=self._cur_play, task=task)), selected
         finally:
             if original_override is None:
                 del loader.load_from_file
             else:
                 loader.load_from_file = original_override
 
-    def _controller_lookup_header(self, selected_vars_files):
-        if not selected_vars_files:
-            return ""
+    def _resolved_vars_file_state(self, host, initial_files, *, task=None, snapshot=None):
+        if self._deferred_vars_file_keys is None:
+            return {"error": "unexpected request for vars_files"}
+        if task is None:
+            from ansible.playbook.block import Block
+            from ansible.playbook.task import Task
+
+            # Native vars_files validation uses a task context to distinguish
+            # an unresolved selector after cached setup from an early probe.
+            # The parent also supplies the playbook path for vars plugins.
+            task = Task(block=Block(play=self._cur_play))
+        try:
+            current_vars, files = self._host_vars_and_lookup_sources(host, task=task)
+        except AnsibleError as ex:
+            return {"error": str(ex)}
+        active_keys = self._vars_file_keys(files)
+        keys = self._deferred_vars_file_keys | self._vars_file_keys(initial_files) | active_keys
+        refreshed = {key: current_vars[key] for key in keys & current_vars.keys()}
+        missing = sorted(keys - current_vars.keys(), key=str)
+        mapping_keys = []
+        try:
+            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys)
+        except AnsibleError as ex:
+            return {"error": str(ex)}
+        if snapshot is not None:
+            for key in missing:
+                snapshot.pop(key, None)
+            snapshot.update(refreshed)
+        return {
+            "vars": serialized,
+            "names": sorted(set(self._cur_play.vars or {}) | active_keys, key=str),
+            "missing": missing,
+            "mapping_keys": mapping_keys,
+            "controller_lookups": self._controller_lookups(
+                {key: current_vars[key] for key in active_keys & current_vars.keys()}),
+        }
+
+    @staticmethod
+    def _vars_file_keys(files):
+        return {key for loaded in files
+                for mapping in (loaded if isinstance(loaded, list) else (loaded,))
+                if isinstance(mapping, dict) for key in mapping}
+
+    @staticmethod
+    def _controller_lookups(selected_vars_files):
         from ansiroll.loader import _controller_config_names, _controller_config_values, _controller_env_names
 
-        env_names = _controller_env_names(selected_vars_files)
-        config_names = _controller_config_names(selected_vars_files)
-        lookups = {
+        env_names = _controller_env_names(selected_vars_files, trusted_only=True)
+        config_names = _controller_config_names(selected_vars_files, trusted_only=True)
+        return {
             "controller_env": {name: os.environ[name] for name in sorted(env_names) if name in os.environ},
             "controller_config": _controller_config_values(config_names),
         }
+
+    def _controller_lookup_header(self, variables, selected_vars_files):
+        keys = self._vars_file_keys(selected_vars_files) & variables.keys()
+        if not keys:
+            return ""
+        sources = {key: variables[key] for key in keys}
         return "_INJECTED_CONTROLLER_LOOKUPS = __import__('json').loads(%r)\n" % json.dumps(
-            lookups, default=str)
+            self._controller_lookups(sources), default=str)
 
     # ---- channel transport ----------------------------------------------
     def _open_channel(self, host, play_context, hv, templar):
@@ -1515,6 +1604,12 @@ class StrategyModule(StrategyBase):
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = result_data.get("ansible_facts")
+            if task_key == "__gather_facts__" and status == "ok":
+                facts = frame.get("gathered_facts", facts)
+                if isinstance(facts, dict):
+                    # Accelerated setup does not emit the marker that
+                    # Ansible's variable manager checks in the fact cache.
+                    facts = dict(facts, module_setup=True)
             if action == "include_vars":
                 # The controller has already stored the original tagged values.
                 facts = None
@@ -2041,7 +2136,7 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values, mapping_keys=None):
+def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     from ansiroll.loader import _tag_untrusted
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
@@ -2070,12 +2165,14 @@ def _json_blob(values, mapping_keys=None):
             if mapping_keys is not None and _contains_typed_mapping_keys(v):
                 packed = _pack_delegated_value(v)
                 if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
-                    continue
+                    raise ValueError("mapping keys could not be serialized")
                 mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
                 v = packed["value"]
             else:
                 json.dumps(v, default=str)
-        except Exception:
+        except Exception as ex:
+            if k in strict_keys:
+                raise AnsibleError("could not serialize selected vars file value for %r" % k) from ex
             continue
         safe[k] = v
     return json.dumps(safe, default=str)

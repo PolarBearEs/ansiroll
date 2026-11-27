@@ -4277,6 +4277,7 @@ class Runtime:
         self.gather_setup_fn = None  # resolve implicit setup options using controller task scope
         self.delegate_on_target = False
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
+        self.controller_vars_files_fn = None
         self.on_task_start = None
         self._started_task_name = (None, None)
         self.on_warning = lambda message: sys.stderr.write("[WARNING]: %s\n" % message)
@@ -4631,6 +4632,9 @@ class Runtime:
         if item is not None:
             frame["item"] = item
         if self.on_result:
+            if (node.get("no_log") and status == "ok" and node.get("runtime_id") == "__gather_facts__"
+                    and self.controller_vars_files_fn is not None and isinstance(result.get("ansible_facts"), dict)):
+                frame["gathered_facts"] = result["ansible_facts"]
             if include_register is not None:
                 frame["include_register"] = include_register
             if (not is_item and not node.get("no_log") and node.get("register")
@@ -4830,11 +4834,21 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        play_vars = self._resolve_deferred_vars_files(
-            vars_file_play_vars, vars_files, early_files, vars_file_defaults,
-            merge_hashes=merge_vars_files, magic=vars_file_magic, ordered=ordered_files is not None,
-            deferred_entries=deferred_files)
-        self._play_var_names = set(play_vars)
+        if vars_files and self.controller_vars_files_fn is not None:
+            state = self.controller_vars_files_fn()
+            for key in state["missing"]:
+                self.vars.pop(key, None)
+            for key, values in state["controller_lookups"].items():
+                self.vars["__ansiroll_" + key].update(values)
+            play_vars = state["vars"]
+            active_play_vars = state["names"]
+        else:
+            play_vars = self._resolve_deferred_vars_files(
+                vars_file_play_vars, vars_files, early_files, vars_file_defaults,
+                merge_hashes=merge_vars_files, magic=vars_file_magic, ordered=ordered_files is not None,
+                deferred_entries=deferred_files)
+            active_play_vars = play_vars
+        self._play_var_names = set(active_play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
         # precedence than play vars and keep it for later plays in the run.
@@ -8649,6 +8663,20 @@ def agent_main():
             return {"data": data, "meta": source.get("meta") or {}}
         rt.controller_source_fn = _controller_source
 
+    def _controller_vars_files():
+        _chan_send(resp_fd, {"t": "vars_files"})
+        reply = _chan_recv()
+        if not reply or reply.get("t") != "vars_files_result":
+            raise VarsFilesError("controller did not return vars_files")
+        result = reply["result"]
+        if result.get("error"):
+            raise VarsFilesError(result["error"])
+        variables = json.loads(result["vars"])
+        _restore_delegated_mapping_keys(variables, result["mapping_keys"])
+        result["vars"] = variables
+        return result
+
+    rt.controller_vars_files_fn = _controller_vars_files
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
              "unreachable": 0, "rescued": 0, "ignored": 0}
@@ -8670,7 +8698,7 @@ def agent_main():
             if failed:
                 # A host that failed is removed from the rest of the playbook.
                 break
-    except MissingHandler as ex:
+    except (MissingHandler, VarsFilesError) as ex:
         _chan_send(resp_fd, {"t": "error", "message": str(ex)})
         return
     finally:
