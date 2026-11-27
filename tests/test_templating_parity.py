@@ -408,6 +408,28 @@ DEFINITIONS  module_defaults:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("merge", [False, True], ids=["replace", "merge"])
+def test_implicit_setup_does_not_capture_shadowed_vars_file_lookups(tmp_path, monkeypatch, merge):
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge" if merge else "replace")
+    path = _write(tmp_path, """
+- hosts: localhost
+  vars_files: ['optional-{{ profile }}.yml', earlier.yml, final.yml]
+  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ settings.fact_filter }}'
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"), {
+        "optional-production.yml": "settings: {other: present}\n",
+        "earlier.yml": "settings: {fact_filter: '{{ lookup(\"file\", \"unselected.txt\") }}'}\n",
+        "final.yml": "settings: {fact_filter: '{{ lookup(\"file\", \"selected.txt\") }}'}\n",
+        "files/unselected.txt": "uncaptured fixture contents\n",
+        "files/selected.txt": "ansible_distribution\n",
+    })
+    plays, _ = parse_playbook(str(path))
+    captured = plays[0]["gather_setup_scope"]["controller_lookups"]["file"]["file"]
+    assert set(captured) == {"selected.txt"}
+
+
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_setup_skips_an_undefined_environment_value(tmp_path, use_strategy):
     path = _write(tmp_path, """

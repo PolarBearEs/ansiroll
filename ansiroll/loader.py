@@ -327,7 +327,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     """Keep the play layers used by early vars-file and setup option expressions."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
-    from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
+    from .runtime import _GATHER_STRING_METHODS, _f_combine, _selector_template_sources, _vars_hash_mapping
 
     roles = list(_gather_public_roles(play))
     defaults = _gather_role_defaults(roles)
@@ -364,6 +364,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     file_aliases = {}
     file_names = set()
     file_values = {}
+    merge_hashes = C.DEFAULT_HASH_BEHAVIOUR == "merge"
     for entry in entries:
         for candidate in entry.get("controller_candidates", {}).values():
             selector_names.update(name for name, _ in candidate["paths"])
@@ -373,7 +374,8 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                 computed=computed_selector_names, retain_mutable=True)
             if dependencies is not None:
                 selector_names.update(dependencies[1])
-        files = [entry["static_vars"]] if "static_vars" in entry else entry["files"].values()
+        static = "static_vars" in entry
+        files = [entry["static_vars"]] if static else entry["files"].values()
         for contents in files:
             if not isinstance(contents, list):
                 continue
@@ -381,7 +383,15 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                 file_names.update(mapping)
                 for key, value in mapping.items():
                     if setup_sources and key not in export_replacements and key not in magic:
-                        file_values.setdefault(key, []).append(value)
+                        values = file_values.setdefault(key, [])
+                        if static:
+                            # A static vars file always overlays earlier candidates.
+                            if merge_hashes and _vars_hash_mapping(value):
+                                values[:] = [_f_combine(previous, value, recursive=True)
+                                             for previous in values if _vars_hash_mapping(previous)]
+                            else:
+                                values.clear()
+                        values.append(value)
                     for source, _, _ in _selector_template_sources(value):
                         file_aliases.setdefault(key, set()).add(source)
     if setup_sources:
