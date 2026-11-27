@@ -5721,6 +5721,61 @@ def test_strategy_excludes_failed_hosts_from_later_native_plays(tmp_path):
     assert not (tmp_path / "bad.txt").exists()
 
 
+@pytest.mark.parametrize(
+    ("remote_src", "use_remote_archive", "archive_exists"),
+    [("false", False, True), ('"{{ use_remote_archive }}"', False, False),
+     ('"{{ use_remote_archive }}"', True, True)],
+    ids=["baked", "templated-controller-missing", "templated-remote"],
+)
+def test_strategy_unarchive_creates(tmp_path, remote_src, use_remote_archive, archive_exists):
+    if archive_exists:
+        with zipfile.ZipFile(tmp_path / "payload.zip", "w") as archive:
+            archive.writestr("inside.txt", b"archive payload")
+    guarded = tmp_path / "guarded"
+    unguarded = tmp_path / "unguarded"
+    for destination in (guarded, unguarded):
+        destination.mkdir()
+        (destination / "sentinel").touch()
+    extracted = unguarded / "inside.txt"
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansiroll_native_only: true
+    use_remote_archive: %s
+  tasks:
+    - name: Extract with creates
+      ansible.builtin.unarchive:
+        src: "{{ playbook_dir }}/payload.zip"
+        dest: "{{ playbook_dir }}/guarded"
+        creates: "{{ playbook_dir }}/guarded/sentinel"
+        remote_src: %s
+    - name: Extract without creates
+      ansible.builtin.unarchive:
+        src: "{{ playbook_dir }}/payload.zip"
+        dest: "{{ playbook_dir }}/unguarded"
+        remote_src: %s
+""" % (str(use_remote_archive).lower(), remote_src, remote_src)
+
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(
+            tmp_path, playbook, "-v", "-e", json.dumps({"ansible_python_interpreter": sys.executable}),
+            environment={"ANSIBLE_STRATEGY": strategy},
+        )
+        output = result.stdout + result.stderr
+        assert "skipped, since %s exists" % (guarded / "sentinel") in output, output
+        assert not (guarded / "inside.txt").exists(), output
+        if archive_exists:
+            assert result.returncode == 0, output
+            assert extracted.read_bytes() == b"archive payload"
+            extracted.unlink()
+        else:
+            assert result.returncode != 0, output
+            diagnostic = "Could not find or access" if strategy == "linear" else "was not baked into the compiled file"
+            assert diagnostic in output, output
+            assert not extracted.exists(), output
+
+
 def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
