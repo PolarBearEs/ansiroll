@@ -5868,7 +5868,8 @@ def test_expanded_nested_include_honors_inherited_run_once(tmp_path):
         apply: {run_once: true}
 """
     for strategy in ("linear", "ansiroll.core.ansiroll"):
-        result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+        result = _run_strategy_play(tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+                                    inventory="origin,recipient,",
                                     environment={"ANSIBLE_STRATEGY": strategy})
         assert result.returncode == 0, result.stdout + result.stderr
         assert (tmp_path / "origin.txt").read_text() == "selected"
