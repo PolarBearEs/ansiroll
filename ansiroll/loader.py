@@ -68,7 +68,7 @@ def _vault_secrets(vault_password_file=None):
     if not paths[0]:
         try:
             from ansible import constants as C
-            paths = list(C.DEFAULT_VAULT_PASSWORD_FILES or [])
+            paths = [C.DEFAULT_VAULT_PASSWORD_FILE]
         except Exception:
             paths = []
     from ansible.parsing.vault import VaultSecret
@@ -835,6 +835,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.controller_execution = gather_facts is not None
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
     includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
@@ -1765,7 +1766,7 @@ def _convert_node(node, actions, basedir,
                                         skip_tags, includes)
             if inc is not None:
                 return inc
-        return _convert_task(node, actions, basedir)
+        return _convert_task(node, actions, basedir, controller_execution=includes.controller_execution)
     return None
 
 
@@ -2452,7 +2453,7 @@ def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
         return True
 
 
-def _convert_task(task, actions, basedir):
+def _convert_task(task, actions, basedir, *, controller_execution=False):
     action = task.action
 
     if action in ("meta", "ansible.builtin.meta"):
@@ -2514,6 +2515,7 @@ def _convert_task(task, actions, basedir):
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
         "check_mode": getattr(task, "check_mode", None),
+        "diff": getattr(task, "diff", None),
         "become": bool(task.become),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
@@ -2560,7 +2562,43 @@ def _convert_task(task, actions, basedir):
         node["delegate_facts"] = _boolean_or_template(node["delegate_facts"])
 
     if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
-        _bake_sources(node, task, basedir)
+        source_action = action.rsplit(".", 1)[-1]
+        unknown_defaults = False
+        argument_layers = []
+        if source_action in ("copy", "unarchive"):
+            explicit = set(node["args"])
+            if "_variable_params" in explicit:
+                argument_layers.append("_variable_params")
+            if _contains_dynamic_value(node["args"].get("_raw_params")):
+                argument_layers.append("_raw_params")
+            unknown_defaults = _apply_file_source_defaults(task, source_action, node)
+            if argument_layers:
+                node["_file_source_argument_layers"] = argument_layers
+                node["_file_source_inherited_args"] = sorted(node["args"].keys() - explicit)
+                node["fallback"] = True
+                node["fallback_reason"] = "templated file source arguments require controller selection"
+        _bake_sources(node, task, basedir, controller_execution=controller_execution,
+                      unknown_defaults=unknown_defaults or bool(argument_layers))
+        decrypt = node["args"].get("decrypt", True)
+        # With Vault secrets available, a live dynamic source may need decryption.
+        # Let Core select the source on the controller in that case.
+        live_copy = (controller_execution and source_action == "copy" and task._loader._vault.secrets
+                     and (node.get("_baked_tree") or node.get("_baked_absolute_tree")))
+        if (source_action in ("copy", "unarchive") and not node.get("_vault_plaintext")
+                and (unknown_defaults or argument_layers or _contains_dynamic_value(decrypt)
+                     or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
+                and (live_copy or any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
+                                      for value in (node.get("_baked") or {}).values()))):
+            node["_deferred_vault_source"] = True
+            node["_vault_source_inputs"] = [
+                key for key in ("src", "remote_src", "copy", "decrypt", "content")
+                if _contains_dynamic_value(args.get(key))
+            ]
+            if unknown_defaults:
+                node["_vault_source_inputs"].append("module_defaults")
+            node["_vault_source_inputs"].extend(argument_layers)
+            node["fallback"] = True
+            node["fallback_reason"] = "Vault source needs controller selection and decryption"
         if node["special"] is None:
             actions.add(action)
         else:
@@ -2568,7 +2606,7 @@ def _convert_task(task, actions, basedir):
             # official copy and file modules.
             actions.update(COPY_ACTION_MODULES)
             node.update(_copy_action_settings())
-            if node["special"] == "copy" and _remote_src(node["args"]) is not False:
+            if node["special"] == "copy" and (argument_layers or _remote_src(node["args"]) is not False):
                 # remote_src copies run the copy module on the target, like the
                 # copy action plugin's remote_src path.
                 actions.add(action)
@@ -2796,7 +2834,57 @@ def _special_of(action):
     return None
 
 
-def _bake_sources(node, task, basedir):
+def _apply_file_source_defaults(task, action, node):
+    """Lower source-affecting module defaults without running their templates."""
+    from ansible.plugins.loader import action_loader, module_loader
+
+    args = node["args"]
+    layers = task.module_defaults or ()
+    defaults = {}
+    for layer in (layers,) if isinstance(layers, dict) else layers:
+        defaults.update(layer)
+    if not defaults:
+        return False
+    if _core_version() < (2, 12):
+        # Legacy Core merges authored and redirected names in this order.
+        names = []
+        for name in getattr(task, "_ansible_internal_redirect_list", None) or (task.action,):
+            if name == task.action and name.startswith("ansible.legacy."):
+                names.append(name.rsplit(".", 1)[-1])
+            names.append(name)
+        entries = [defaults[name] for name in names if name in defaults]
+    else:
+        loaders = (action_loader, module_loader) if _core_version() >= (2, 19) else (module_loader, action_loader)
+        resolved = None
+        for loader in loaders:
+            result = loader.find_plugin_with_context(task.action, collection_list=task.collections)
+            if result.resolved:
+                resolved = result.resolved_fqcn
+                break
+        if not resolved:
+            # Without a known match, never bake plaintext based on a guessed alias.
+            return True
+        groups = (getattr(_play_of(task), "_action_groups", None) or {}).get(resolved, ())
+        entries = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
+        if resolved in defaults:
+            entries.append(defaults[resolved])
+    source_keys = {"decrypt", "remote_src", "src"}
+    if action == "unarchive":
+        source_keys.add("copy")
+    else:
+        source_keys.update(("content", "mode"))
+    missing = source_keys - args.keys()
+    if missing and any(not isinstance(entry, dict) for entry in entries):
+        node["_file_source_defaults"] = _tag_untrusted(entries)
+        node["_file_source_default_keys"] = sorted(missing)
+        return True
+    for entry in entries:
+        if isinstance(entry, dict):
+            args.update({key: entry[key] for key in missing & entry.keys()})
+    return False
+
+
+def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_defaults=False):
     """Bake controller-side src file(s) for template/copy/unarchive.
 
     Stores node['_baked'] = {rendered_src: text}. Resolves src using Ansible's
@@ -2811,14 +2899,24 @@ def _bake_sources(node, task, basedir):
     name = node.get("action", "").split(".")[-1]
     remote = _remote_src(args, unarchive=name == "unarchive") if name in ("copy", "unarchive") else False
     if remote is True:
-        return  # src lives on the target; the module reads it there
+        inherited = node.get("_file_source_inherited_args", ())
+        if not inherited or _remote_src(
+                {key: value for key, value in args.items() if key not in inherited},
+                unarchive=name == "unarchive") is True:
+            return  # src lives on the target; the module reads it there
+        remote = None  # templated arguments can override inherited source flags
 
     subdir = "templates" if name == "template" else "files"
     newline = ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
-    with_meta = name == "template" or (name == "copy" and (mode == "preserve" or _contains_dynamic_value(mode)))
+    with_meta = name == "template" or (name == "copy" and (
+        mode == "preserve" or _contains_dynamic_value(mode)
+        or "mode" in node.get("_file_source_default_keys", ())
+        or (node.get("_file_source_argument_layers") and (
+            "mode" not in args or "mode" in node["_file_source_inherited_args"]))
+    ))
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
     src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
@@ -2826,6 +2924,12 @@ def _bake_sources(node, task, basedir):
     if role_path:
         src = _ROLE_PATH_RE.sub(lambda _m: role_path, src)
 
+    decrypt = args.get("decrypt", True)
+    decrypt_selected = (
+        not unknown_defaults and name in ("copy", "unarchive") and remote is False and not _contains_dynamic_value(src)
+        and not _contains_dynamic_value(decrypt) and args.get("content") is None
+        and (_source_flag(decrypt) if name == "copy" else bool(decrypt))
+    )
     candidates = []
     if _JINJA_RE.search(src):
         loop = node.get("loop")
@@ -2860,15 +2964,34 @@ def _bake_sources(node, task, basedir):
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
-        with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
-            baked[rel] = fh.read()
+        source_is_plaintext = True
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if decrypt_selected and raw.startswith(b"$ANSIBLE_VAULT;"):
+            if controller_execution:
+                node["_deferred_vault_source"] = True
+                node["fallback"] = True
+                node["fallback_reason"] = "Vault source needs per-host controller decryption"
+                return
+            from ansible.errors import AnsibleError
+            try:
+                raw, source_is_plaintext = task._loader._decrypt_if_vault_data(raw)
+                if not source_is_plaintext:
+                    node["_vault_plaintext"] = True
+            except AnsibleError as ex:
+                # Match normal task gating for a source whose key is missing
+                # or incorrect. The failing payload needs no embedded bytes.
+                baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
+                continue
+        baked[rel] = raw.decode("utf-8", "surrogateescape")
         if not with_meta:
             continue
         try:
             st = os.stat(path)
             meta[rel] = {"fullpath": os.path.abspath(path),
                          "mtime": st.st_mtime, "uid": st.st_uid,
-                         "mode": stat.S_IMODE(st.st_mode)}
+                         # Vault's temporary plaintext source is owner-only.
+                         "mode": stat.S_IMODE(st.st_mode) if source_is_plaintext else 0o600}
         except OSError:
             pass
     node["_baked"] = baked
@@ -3001,6 +3124,7 @@ def _bake_absolute_tree(node, src, basedir, with_meta, *, newline=None):
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_absolute_tree"] = True
     if meta:
         node["_baked_meta"] = meta
     return True

@@ -196,6 +196,8 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
             "removed_modules": sorted(original_actions - surviving_actions),
         },
     }
+    if any(node.get("_vault_plaintext") for node in _walk_play_nodes(plays, include_disabled_handlers=True)):
+        manifest["contains_vault_plaintext"] = True
     return source, manifest
 
 
@@ -245,10 +247,10 @@ def _freeze_value(value, context):
     return resolved, True
 
 
-def _walk_play_nodes(plays):
+def _walk_play_nodes(plays, *, include_disabled_handlers=False):
     def walk(nodes):
         for node in nodes or []:
-            if node.get("tree_shaken_handler"):
+            if node.get("tree_shaken_handler") and not include_disabled_handlers:
                 continue
             yield node
             if node.get("type") == "block":

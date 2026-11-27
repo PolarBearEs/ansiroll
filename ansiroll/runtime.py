@@ -1202,6 +1202,11 @@ def _ansible_boolean(value):
         return False
 
 
+def _vault_source_recompile_note(task):
+    options = task.get("_vault_source_inputs") or ("src",)
+    return "Resolve %s at compile time." % ", ".join(options)
+
+
 def _to_bool(value):
     if isinstance(value, bool):
         return value
@@ -5931,16 +5936,55 @@ class Runtime:
                 res["exception"] = "(traceback unavailable)"
         return res
 
-    def _render_action_args(self, raw_args, ctx, args_cache):
+    def _render_action_args(self, raw_args, ctx, args_cache, *, source_task=None):
         if args_cache is None:
-            return self.template(raw_args, ctx)
+            args_cache = {}
         if "args" not in args_cache:
-            args_cache["args"] = self.template(raw_args, ctx)
+            argument_layers = (source_task or {}).get("_file_source_argument_layers")
+            if argument_layers:
+                raw_args = dict(raw_args)
+                sources = []
+                for layer in argument_layers:
+                    source = self.templater.render_string(raw_args.pop(layer), ctx)
+                    if not isinstance(source, dict):
+                        _fail_on_undef(source)
+                        if source == _OMIT or layer == "_variable_params" and _legacy_templating():
+                            continue
+                        raise ValueError("file source arguments must resolve to a dictionary")
+                    sources.append(source)
+                inherited = {key: raw_args.pop(key) for key in source_task["_file_source_inherited_args"]}
+                expanded = {}
+                for source in reversed(sources):
+                    expanded.update({key: source[key] for key in source if key not in raw_args and key not in expanded})
+                inherited = {key: value for key, value in inherited.items() if key not in expanded}
+                args = {**self.template(inherited, ctx), **expanded, **self.template(raw_args, ctx)}
+            else:
+                args = self.template(raw_args, ctx)
+            if source_task and source_task.get("_file_source_defaults"):
+                args = {**self._render_file_source_defaults(source_task, ctx, args.keys()), **args}
+            args_cache["args"] = args
         return args_cache["args"]
+
+    def _render_file_source_defaults(self, task, ctx, provided):
+        keys = set(task["_file_source_default_keys"]) - provided
+        if not keys:
+            return {}
+        selected = {}
+        for entry in task["_file_source_defaults"]:
+            templated = isinstance(entry, str)
+            layer = self.templater.render_string(entry, ctx) if templated else entry
+            if not isinstance(layer, dict) or set(layer) == {"__ansiroll_unsafe__"}:
+                _fail_on_undef(layer)
+                raise ValueError("file source module_defaults must resolve to a dictionary")
+            for key in keys & layer.keys():
+                selected[key] = layer, templated
+        return _strip_omit({key: layer[key] if templated else self.template(layer[key], ctx)
+                            for key, (layer, templated) in selected.items()})
 
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
+        inherited_diff_mode = self.diff_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
@@ -5952,6 +5996,9 @@ class Runtime:
                 if isinstance(check_override, str):
                     check_override = self.template(check_override, ctx)
                 self.check_mode = _boolean(check_override)
+            diff_override = task.get("diff")
+            if diff_override is not None:
+                self.diff_mode = _boolean(_fail_on_undef(self.template(diff_override, ctx)))
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -6006,7 +6053,7 @@ class Runtime:
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
-                    self._render_action_args(task.get("args") or {}, ctx, args_cache)))
+                    self._render_action_args(task.get("args") or {}, ctx, args_cache, source_task=task)))
                 if self._is_builtin_unarchive(task):
                     self._normalize_unarchive_options(args)
                 self._module_source_bytes = self._baked_module_source(task, args)
@@ -6040,6 +6087,7 @@ class Runtime:
             self._module_source_bytes = None
             self._module_env = None
             self.check_mode = inherited_check_mode
+            self.diff_mode = inherited_diff_mode
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
@@ -6194,14 +6242,20 @@ class Runtime:
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
-        if not self._is_builtin_unarchive(task) or _ansible_boolean(args.get("remote_src", False)):
+        if not self._is_builtin_unarchive(task):
+            return None
+        decrypt = args.pop("decrypt", True)
+        if _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         key = self._baked_source_key(task, src)
         marker = (task.get("_baked") or {}).get(key)
         if marker is None:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
-        return self._asset_bytes(marker)
+        data = self._asset_bytes(marker)
+        if not task.get("_vault_plaintext") and decrypt and data.startswith(b"$ANSIBLE_VAULT;"):
+            raise RuntimeError("Vault archive requires controller decryption. " + _vault_source_recompile_note(task))
+        return data
 
     def _task_environment(self, task, ctx):
         """Resolve the `environment:` keyword to a flat {name: value} dict."""
@@ -6305,7 +6359,7 @@ class Runtime:
         if name == "assert":
             # Its condition expressions are interpreted only by when().
             raw_args = {k: v for k, v in raw_args.items() if k != "that"}
-        args = self._render_action_args(raw_args, ctx, args_cache)
+        args = self._render_action_args(raw_args, ctx, args_cache, source_task=task)
         # Ansible accepts the complete module argument dictionary through a
         # single template, representing it internally as `_raw_params`.
         if (
@@ -6345,15 +6399,6 @@ class Runtime:
         args = _fail_on_undef(args)
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
-        if (name == "copy" and isinstance(args, dict)
-                and args.get("src") is not None and args.get("content") is None
-                and args.get("dest")
-                and _ansible_boolean(args.get("remote_src", False))):
-            # The copy action plugin (after its argument checks and the
-            # content branch) hands remote_src copies straight to the copy
-            # module, which reads src on the target.
-            return self.run_module(
-                task["action"], _fail_on_undef(_strip_omit(args)), become=become)
         if name in ("template", "copy"):
             return self._run_file_action(name, task, args, ctx, become)
         if name == "assert":
@@ -6733,8 +6778,14 @@ class Runtime:
                 failure = "can not use content with a dir as dest"
             if failure:
                 return {"failed": True, "changed": False, "msg": failure}
-            if content is None and _ansible_bool(args.get("remote_src", False)):
-                return self.run_module(_COPY_MODULE, args, become=become)
+            if content is None and _ansible_boolean(args.get("remote_src", False)):
+                action = task.get("action")
+                if action not in self.modules:
+                    action = _COPY_MODULE
+                builtin = self.modules.get(_COPY_MODULE, {}).get("module_fqn")
+                if action == _COPY_MODULE or (builtin and self.modules[action].get("module_fqn") == builtin):
+                    args.pop("decrypt", None)
+                return self.run_module(action, _fail_on_undef(args), become=become)
         else:
             content = None
 
@@ -6780,6 +6831,9 @@ class Runtime:
                         "msg": "%s: src %r was not baked into the compiled file" % (name, src)}
             try:
                 raw = self._asset_text(raw)
+                if (name == "copy" and not task.get("_vault_plaintext") and _ansible_boolean(args.get("decrypt", True))
+                        and raw.startswith("$ANSIBLE_VAULT;")):
+                    raise RuntimeError("Vault source requires controller decryption. " + _vault_source_recompile_note(task))
             except Exception as ex:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
