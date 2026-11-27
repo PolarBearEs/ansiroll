@@ -1083,9 +1083,9 @@ def _render_source_with_stats(plays, modules, ansiballz_code, group_vars=None,
     import_bundle, data_bundle, stats = _build_bundles(
         plays, modules, group_vars, specialized_vars, frozen_vars
     )
-    with open(_RUNTIME_PATH, "r") as fh:
+    with open(_RUNTIME_PATH, encoding="utf-8") as fh:
         runtime_src = fh.read()
-    with open(_WORKER_PATH, "r") as fh:
+    with open(_WORKER_PATH, encoding="utf-8") as fh:
         worker_src = fh.read()
     if runtime_src.count(_WORKER_CODE_MARKER) != 1:
         raise RuntimeError("Worker code marker missing or duplicated in runtime.py")
