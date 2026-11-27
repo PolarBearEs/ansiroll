@@ -813,16 +813,18 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                    and (scoped_options or _is_templated(play.gather_timeout)))
     ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup or include_replay) else None
     order_deferred = {}
+    verified_misses = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
-        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
-    deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
+        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope,
+        verified_misses=verified_misses if gather_facts is None else None)
+    deferred = _deferred_vars_files(play, basedir, unresolved_vars_files, verified_misses=verified_misses)
     for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
         deferred[index]["files"].update(selected)
         deferred[index].setdefault("checked_paths", {}).update(checked_paths)
         if controller_candidates:
             deferred[index]["controller_candidates"] = controller_candidates
-        if selected:
+        if selected or index in verified_misses:
             deferred[index]["has_compile_selection"] = True
     ordered_writes = None
     ordered_lookup_sources = []
@@ -910,6 +912,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
+        if all("legacy_missing_vars_file" in entry for entry in deferred):
+            # All files were checked at compile time. Fail before setup.
+            result["legacy_missing_vars_file"] = deferred[0]["legacy_missing_vars_file"]
     if gather:
         setup_options = {
             name: value
@@ -940,7 +945,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         **result,
         "tasks": _selected_include_lookup_nodes(result["tasks"]),
         "handlers": _selected_include_lookup_nodes(result["handlers"]),
-        "deferred_vars_files": [entry["names"] for entry in deferred],
+        "deferred_vars_files": [entry["names"] for entry in deferred if "legacy_missing_vars_file" not in entry],
         "ordered_vars_file_inputs": ordered_lookup_sources,
     }
     lookup_sources.pop("gather_setup_options", None)
@@ -948,6 +953,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     lookup_sources.pop("gather_setup_defaults", None)
     lookup_sources.pop("gather_action_defaults", None)
     lookup_sources.pop("_gather_setup_compile_vars", None)
+    lookup_sources.pop("legacy_missing_vars_file", None)
     names = _controller_env_names(lookup_sources)
     if "_gather_setup_scoped" in result:
         result["_gather_compile_env_names"] = sorted(names)
@@ -1179,7 +1185,8 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None,
+                        *, verified_misses=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -1190,7 +1197,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     from ansible.utils.vars import combine_vars
 
     out = dict(play.vars or {})
-    use_search_stack = _core_version() >= (2, 12)
+    core = _core_version()
+    use_search_stack = core >= (2, 12)
     compile_extra_vars = {}
     selector_magic = {}
     role_defaults = {}
@@ -1243,7 +1251,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             if required_plugins:
                                 controller_inputs["jinja_plugins"] = required_plugins
                     if unresolved and dependencies is not None:
-                        earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
+                        earlier = _deferred_vars_files(
+                            play, basedir, unresolved[scanned:],
+                            verified_misses={index - scanned: fixed for index, fixed in (verified_misses or {}).items()
+                                             if index >= scanned})
                         for index, previous in enumerate(earlier, start=scanned):
                             if order_deferred and index in order_deferred:
                                 previous["files"].update(order_deferred[index][0])
@@ -1275,7 +1286,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             ordered.append(len(unresolved))
                         unresolved.append(entry)
                     break
-            if ordered is not None:
+            if ordered is not None or (verified_misses is not None and core < (2, 15)):
                 checked_paths[filename] = None
                 if controller_inputs is not None:
                     controller_candidates[candidate_source] = dict(controller_inputs, name=filename)
@@ -1301,10 +1312,26 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             elif ordered is not None:
                 ordered.append(_tag_untrusted(mappings))
             break
+        else:
+            # Before 2.15, a name that resolves but has no existing candidate
+            # is a fatal vars-file miss when tasks obtain host variables.
+            # Keep it for the same runtime validation as a deferred selector.
+            if verified_misses is not None and core < (2, 15):
+                if not defer_for_order:
+                    extras = play.get_variable_manager().extra_vars
+                    scope = {**role_defaults, **out, "playbook_dir": basedir, **(all_vars or {}),
+                             **extras, **selector_magic}
+                    selector_names = _vars_file_miss_inputs(entry, scope)
+                    if selector_names is None:
+                        continue
+                    fixed = extras.keys() | selector_magic.keys() | {"playbook_dir"}
+                    verified_misses[len(unresolved)] = selector_names <= fixed
+                defer_for_order = True
         if defer_for_order:
             if order_deferred is not None:
                 order_deferred[len(unresolved)] = (selected, checked_paths, controller_candidates)
-            ordered.append(len(unresolved))
+            if ordered is not None:
+                ordered.append(len(unresolved))
             unresolved.append(entry)
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
@@ -1325,6 +1352,23 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             if key in all_vars:
                 out[key] = all_vars[key]
     return out
+
+
+def _vars_file_miss_inputs(entry, scope):
+    """A compile-time fallback can conceal inventory or setup dependencies."""
+    from .runtime import _GATHER_STRING_METHODS
+
+    names = set()
+    for source in _as_list(entry):
+        if _is_templated(source):
+            unknown = set()
+            dependencies = _gather_timeout_dependencies(
+                source, scope, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
+                unknown_lookup=unknown, retain_mutable=True)
+            if dependencies is None or unknown or dependencies[1] - scope.keys():
+                return None
+            names.update(dependencies[1])
+    return names
 
 
 @lru_cache(maxsize=1)
@@ -1418,7 +1462,7 @@ def _finite_vars_file_names(source):
         return None
 
 
-def _deferred_vars_files(play, basedir, entries):
+def _deferred_vars_files(play, basedir, entries, *, verified_misses=None):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -1436,10 +1480,16 @@ def _deferred_vars_files(play, basedir, entries):
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
     deferred = []
-    for entry in entries:
+    for index, entry in enumerate(entries):
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
         checked_paths = {}
+        if (verified_misses or {}).get(index):
+            # No candidate matched in this compile-resolved entry. Its
+            # failure does not depend on controller lookup files at launch.
+            deferred.append({"names": [], "files": {},
+                             "legacy_missing_vars_file": names[0] if len(names) == 1 else names})
+            continue
         unmodeled = []
         for position, name in enumerate(names):
             if _vars_file_has_dynamic_directory(name):

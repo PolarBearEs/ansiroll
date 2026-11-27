@@ -4892,6 +4892,8 @@ class Runtime:
 
     # ---- execution -------------------------------------------------------
     def run_play(self, play, defer_handlers=False, initial_notified=None):
+        if "legacy_missing_vars_file" in play:
+            raise VarsFilesError("vars file %s was not found" % (play["legacy_missing_vars_file"],))
         invocation_check_mode = self.check_mode
         self._playbook_dir = play.get("playbook_dir")
         self._pin_magic_vars(self.vars)
@@ -5487,9 +5489,16 @@ class Runtime:
                     selected = _f_combine(selected, mapping, recursive=merge_hashes)
                 selector_vars = _f_combine(selector_vars, mapping, recursive=merge_hashes)
 
+        legacy_missing = None
         for index, entry in enumerate(entries):
             if isinstance(entry, int):
                 entry = deferred_entries[entry]
+            if "legacy_missing_vars_file" in entry:
+                # Core first probes all readable files with missing files
+                # tolerated, so a parse error can precede a verified miss.
+                if legacy_missing is None:
+                    legacy_missing = entry["legacy_missing_vars_file"]
+                continue
             if "static_vars" in entry:
                 apply_files(entry["static_vars"])
                 continue
@@ -5608,10 +5617,14 @@ class Runtime:
                     continue
                 # Before 2.15, get_vars defaulted to include_delegate_to=True, which made a missing file fatal.
                 if not _core_at_least(2, 15):
-                    raise VarsFilesError("vars file %s was not found" % (item,))
+                    if legacy_missing is None:
+                        raise VarsFilesError("vars file %s was not found" % (item,))
+                    continue
                 # Ansible skips such an entry silently, but here the file may exist yet not have been bundled.
                 sys.stderr.write("[WARNING]: no file bundled at compile time matches vars_files item %r\n"
                                  % (item,))
+        if not before_setup and legacy_missing is not None:
+            raise VarsFilesError("vars file %s was not found" % (legacy_missing,))
         return selector_vars if before_setup else selected
 
     def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False,
