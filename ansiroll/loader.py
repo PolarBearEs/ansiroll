@@ -706,7 +706,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     blocks = play.compile()
     handler_blocks = _handler_blocks(play)
     include_replay = (any(_is_templated(filename) for entry in vars_file_entries for filename in _as_list(entry))
-                      and _has_task_include(blocks + handler_blocks))
+                      and _has_dynamic_include(blocks + handler_blocks))
     replay_order = any(_is_templated(filename)
                        for entry in vars_file_entries[:-1]
                        for filename in _as_list(entry))
@@ -1715,14 +1715,14 @@ def _can_write_var(writes, name):
     return name in writes or None in writes
 
 
-def _has_task_include(nodes):
+def _has_dynamic_include(nodes):
     from ansible.playbook.block import Block
 
     for node in nodes:
         if isinstance(node, Block):
-            if any(_has_task_include(group) for group in (node.block, node.rescue, node.always)):
+            if any(_has_dynamic_include(group) for group in (node.block, node.rescue, node.always)):
                 return True
-        elif str(getattr(node, "action", "")).rsplit(".", 1)[-1] == "include_tasks":
+        elif str(getattr(node, "action", "")).rsplit(".", 1)[-1] in ("include_tasks", "include_role"):
             return True
     return False
 
@@ -2025,8 +2025,11 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
 
 
 def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes):
-    if not variants and includes.unresolved_vars_file:
-        return None
+    if not variants and (includes.incomplete or includes.unresolved_vars_file):
+        node = _convert_task(task, actions, basedir)
+        node["vars_file_include_fallback"] = True
+        node["fallback_reason"] = "vars-file task selection requires core linear"
+        return node
     raw_fname = sources[0]
     default_key = None
     default_inputs = None

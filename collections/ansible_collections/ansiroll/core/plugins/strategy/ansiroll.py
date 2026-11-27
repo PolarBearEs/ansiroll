@@ -313,7 +313,10 @@ class StrategyModule(StrategyBase):
             and getattr(task, "delegate_to", None)
         ]
         linear_reason = None
-        if self._requires_linear_fallback:
+        if any(item["kind"] == "vars-file-include" for item in controller_reasons):
+            self._requires_linear_fallback = True
+            linear_reason = "vars-file task selection requires core linear"
+        elif self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
         elif not self._delegate_on_target and any(flag is not False for flag in fact_routes):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
@@ -1684,7 +1687,7 @@ def _controller_fallbacks(play_node):
                 walk(node.get("handlers"))
             if node.get("fallback"):
                 found.append({
-                    "kind": "controller-fallback",
+                    "kind": "vars-file-include" if node.get("vars_file_include_fallback") else "controller-fallback",
                     "task": node.get("name") or node.get("action"),
                     "reason": node.get("fallback_reason")
                               or "controller fallback",

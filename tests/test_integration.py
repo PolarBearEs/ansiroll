@@ -6476,6 +6476,44 @@ def _run_vars_file_include_profile(plan, profile):
     return runtime, [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
 
 
+def test_vars_file_include_uses_controller_fallback_for_host_selection(tmp_path):
+    (tmp_path / "profile-localhost.yml").write_text("task_file: selected.yml\n")
+    (tmp_path / "default.yml").write_text("- fail: {msg: compile-default-chosen}\n")
+    (tmp_path / "selected.yml").write_text("- debug: {msg: host-selected-include}\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars: {task_file: default.yml}
+  vars_files: ['profile-{{ inventory_hostname }}.yml']
+  tasks:
+    - include_tasks: '{{ task_file }}'
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "host-selected-include" in result.stdout
+
+
+def test_vars_file_include_replays_inside_a_literal_include_role(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: normal}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - include_role: {name: wrapper}
+""")
+    role_tasks = tmp_path / "roles" / "wrapper" / "tasks"
+    role_tasks.mkdir(parents=True)
+    (role_tasks / "main.yml").write_text("- include_tasks: '{{ task_file }}'\n")
+    for profile in ("normal", "alternate"):
+        (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {profile}.yml\n")
+        (role_tasks / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for profile in ("normal", "alternate"):
+        runtime, messages = _run_vars_file_include_profile(plan, profile)
+        assert not runtime.failed, messages
+        assert messages == [f"chosen-{profile}"]
+
+
 def test_vars_file_include_keeps_binding_when_optional_file_is_missing(tmp_path):
     from ansiroll.loader import _core_version
 
