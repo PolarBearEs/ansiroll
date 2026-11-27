@@ -1651,9 +1651,11 @@ def _first_found_vars_file(args, kwargs, selector):
             else:
                 raise ValueError("first_found filenames and paths must be strings")
 
+    modern = _core_at_least(2, 16)
+    if not _core_at_least(2, 12) or (modern and not _core_at_least(2, 17) and args):
+        kwargs = {}
     _fail_on_undef((args, dict(kwargs)))
     skip = _boolean(kwargs.get("skip", False), strict=True)
-    modern = _core_at_least(2, 16)
     paths = tuple(split_terms((_first_found_list_option(kwargs.get("paths", ())),), "[,:;]"))
     files = _first_found_list_option(kwargs.get("files", ()))
     if not modern and args and (paths or files):
@@ -1689,6 +1691,9 @@ def _first_found_vars_file(args, kwargs, selector):
                 if parent_relative and (not covered or parent_paths is None):
                     raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
                 absolute = os.path.isabs(candidate)
+                if absolute and re.search(r"\$(?:[a-zA-Z0-9_]+|\{[^}]*\})", candidate):
+                    raise ValueError("first_found absolute paths with environment references require selecting "
+                                     "the vars_files name at compile time")
                 if not absolute and not selector.get("search_path_matches", True):
                     raise ValueError("first_found ansible_search_path differs from the bundled search paths; "
                                      "recompile with the current search paths")

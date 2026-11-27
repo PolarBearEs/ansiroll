@@ -148,20 +148,22 @@ def test_standalone_vars_file_first_found_uses_launch_value_and_bundled_first_ma
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path):
+@pytest.mark.parametrize("keyword_files", [False, True], ids=["positional", "keyword"])
+def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path, keyword_files):
     from ansiroll.loader import _core_version
     from tests import ansible_playbook_command
 
-    if _core_version() < (2, 16):
+    core = _core_version()
+    if core < (2, 16):
         pytest.skip("this Core uses legacy first_found argument handling")
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
-    - "{{ lookup('first_found', [profile ~ '.yml', 'fallback.yml'], paths=search_dirs) }}"
+    - "{{ lookup('first_found', FILES[profile ~ '.yml', 'fallback.yml'], paths=search_dirs) }}"
   tasks:
     - assert: {that: selected == expected}
-""")
+""".replace("FILES", "files=" if keyword_files else ""))
     (tmp_path / "A").mkdir()
     (tmp_path / "B").mkdir()
     (tmp_path / "A" / "fallback.yml").write_text("selected: fallback\n")
@@ -170,7 +172,8 @@ def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path):
     source, _ = compile_playbook(str(playbook))
     artifact = tmp_path / "compiled.py"
     artifact.write_text(source)
-    for directories, expected in [(["A", "B"], "found"), ([], "default-root")]:
+    selected = "default-root" if core == (2, 16) and not keyword_files else "found"
+    for directories, expected in [(["A", "B"], selected), ([], "default-root")]:
         extra = json.dumps({"profile": "prod", "expected": expected, "search_dirs": directories})
         native = subprocess.run(
             ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", extra, str(playbook)],
@@ -435,6 +438,8 @@ def test_legacy_first_found_vars_files_evaluates_embedded_filename(tmp_path, key
 
     if _core_version() >= (2, 19):
         pytest.skip("legacy Core templates each candidate in the lookup plugin")
+    if keyword_files and _core_version() < (2, 12):
+        pytest.skip("Core before 2.12 ignores the files keyword")
     files = tmp_path / "files"
     files.mkdir()
     (files / "fallback.yml").write_text("selected: fallback\n")
@@ -489,6 +494,11 @@ def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp
 @pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation",
                                       "parent-relative", "absolute-parent"])
 def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch, location):
+    from ansiroll.loader import _core_version
+
+    core = _core_version()
+    if core < (2, 12) and location not in ("parent-relative", "absolute-parent"):
+        pytest.skip("Core before 2.12 ignores keyword search paths")
     profiles = tmp_path / "profiles"
     play_dir = tmp_path
     filename = "profile ~ '.yml'"
@@ -514,7 +524,8 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     elif location == "parent-relative":
         play_dir = tmp_path / "project"
         play_dir.mkdir()
-        paths = "['../profiles']"
+        filename = "'../profiles/' ~ profile ~ '.yml'"
+        paths = "[]"
     elif location == "absolute-parent":
         filename = "playbook_dir ~ '/missing/../profiles/' ~ profile ~ '.yml'"
         paths = "[]"
@@ -526,10 +537,11 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
-    - "{{ lookup('first_found', [FILENAME], files=[FILENAME], paths=PATHS) }}"
+    - "{{ lookup('first_found', TERMSfiles=[FILENAME], paths=PATHS) }}"
   tasks:
     - assert: {that: selected == 'production'}
-""".replace("PATHS", paths).replace("FILENAME", filename))
+""".replace("TERMS", "" if core == (2, 16) else "[FILENAME], ")
+                         .replace("PATHS", paths).replace("FILENAME", filename))
     if location in ("parent-relative", "absolute-parent"):
         from tests import ansible_playbook_command
 
@@ -543,6 +555,35 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     runtime.run_play(plan)
     assert not runtime.failed
     assert runtime.vars["selected"] == "production"
+
+
+def test_first_found_vars_files_rejects_unverified_absolute_environment_path(tmp_path, monkeypatch):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    directory = tmp_path / "controller-selected"
+    directory.mkdir()
+    (directory / "prod.yml").write_text("selected: requested\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    monkeypatch.setenv("ANSIROLL_TEST_FIRST_FOUND_DIR", directory.name)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', [playbook_dir ~ '/$ANSIROLL_TEST_FIRST_FOUND_DIR/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'requested'}
+""")
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "controller-selected" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    with pytest.raises(VarsFilesError, match="environment references require selecting"):
+        runtime.run_play(plan)
 
 
 def test_legacy_first_found_vars_files_bundles_positional_fallback(tmp_path):

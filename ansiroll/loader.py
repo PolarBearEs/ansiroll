@@ -1415,9 +1415,12 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
                 and not (call.dyn_args or call.dyn_kwargs)
                 and all(keyword.key in ("files", "paths", "skip") for keyword in call.kwargs)):
             return None
-        options = {keyword.key: keyword.value for keyword in call.kwargs}
         terms = call.args[1:]
-        modern = _core_version() >= (2, 16)
+        core = _core_version()
+        modern = core >= (2, 16)
+        # Before 2.12, keyword options are ignored. 2.16 reads them only without positional terms.
+        options = ({keyword.key: keyword.value for keyword in call.kwargs}
+                   if core >= (2, 12) and (core != (2, 16) or not terms) else {})
         files = options.get("files")
         has_files = files is not None and not (isinstance(files, (nodes.List, nodes.Tuple)) and not files.items)
         use_file_option = has_files and ((modern and not terms) or (not modern and terms))
