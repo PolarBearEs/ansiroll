@@ -362,14 +362,17 @@ Repository administrators should migrate the existing protection in this order.
    context with `Manual Full CI (merge candidate)` in one update. Select
    **GitHub Actions** as the expected source and keep **Require branches to be
    up to date before merging** and the other protection settings enabled as
-   configured. Read back the rule before resuming merges. Commit statuses are
-   tied to a SHA, so continue verifying the current test merge SHA before each
-   merge.
+   configured. Read back the rule and confirm the new source and context.
+4. After verifying the rule, set the repository Actions variable
+   `MANUAL_CI_LEGACY_STATUS_OPTIONAL` to `true` and resume merges. This lets
+   the workflow continue if a legacy status write fails. A status stays with
+   its SHA if that commit later appears as a PR head, so keep verifying the
+   run recorded against the current test merge SHA before each merge.
 
-Keep the legacy commit status until the cutover is verified. If a rollback is
-needed, pause merges and restore the legacy requirement with the same source
-and strict setting while both statuses are still available. Continue checking
-the exact merge candidate throughout the rollback.
+Keep the variable unset until the cutover is verified. If a rollback is needed,
+pause merges, unset the variable, and restore the legacy requirement with the
+same source and strict setting. Continue checking the exact merge candidate
+throughout the rollback.
 
 See `PLAN.md` for the full design and rationale.
 
