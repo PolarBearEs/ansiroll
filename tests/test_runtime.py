@@ -4598,6 +4598,38 @@ def test_explicit_until_retries_module_skip_and_sees_result_defaults(monkeypatch
     assert result["attempts"] == 1
 
 
+@pytest.mark.parametrize(("version", "skips"), [("2.10.17", False), ("2.20.11", True), ("2.21.1", True)])
+def test_unarchive_creates_action_skip_retry_behavior(tmp_path, monkeypatch, version, skips):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", version)
+    sentinel = tmp_path / "sentinel"
+    sentinel.touch()
+    rt = Runtime({}, "", {})
+    task = _task("unpack", "Extract", None, action="ansible.builtin.unarchive", register="unpacked",
+                 args={"src": "missing.zip", "dest": str(tmp_path), "creates": str(sentinel)},
+                 until=["unpacked.dest is defined"], retries=1, delay=0)
+
+    result = rt._exec_with_retries(task, {})
+
+    assert result["skipped"] is True
+    assert result.get("failed", False) is not skips
+    assert result.get("attempts") == (None if skips else 1)
+    assert "_ansiroll_action_skipped" not in result
+
+
+def test_unarchive_rejects_legacy_async_check_mode_before_creates(tmp_path):
+    sentinel = tmp_path / "sentinel"
+    sentinel.touch()
+    rt = Runtime({}, "", {}, check_mode=True)
+    task = _task("unpack", "Extract", None, action="ansible.builtin.unarchive",
+                 args={"src": "missing.zip", "dest": str(tmp_path), "creates": str(sentinel)},
+                 async_val=30, poll=0, async_options={"version": (2, 10, 17)})
+
+    result = rt._exec_with_retries(task, {})
+
+    assert result["failed"] is True
+    assert result["msg"] == "check mode and async cannot be used on same task."
+
+
 def test_async_acknowledgment_loss_stops_retries(monkeypatch):
     rt = Runtime({"test": {"module_fqn": "test"}}, "", {})
     calls = []

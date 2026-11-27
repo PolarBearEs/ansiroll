@@ -6254,6 +6254,7 @@ class Runtime:
         if attempts <= 1 and not (until and not _core_at_least(2, 16)):
             result = self._exec_one(task, ctx, become)
             result.pop("_ansiroll_unknown_outcome", None)
+            result.pop("_ansiroll_action_skipped", None)
             return result
 
         delay = float(self.template(task.get("delay"), ctx) or 0)
@@ -6263,7 +6264,8 @@ class Runtime:
         attempt_ctx = dict(ctx)
         for attempt in range(1, attempts + 1):
             res = self._exec_one(task, attempt_ctx, become, attempt=attempt, args_cache=args_cache)
-            if res.pop("_ansiroll_unknown_outcome", False) or res.get("unreachable") or attempts <= 1:
+            if (res.pop("_ansiroll_action_skipped", False) or res.pop("_ansiroll_unknown_outcome", False)
+                    or res.get("unreachable") or attempts <= 1):
                 return res
             if task.get("register"):
                 attempt_ctx[task["register"]] = _registered_result(task, res)
@@ -6498,8 +6500,11 @@ class Runtime:
                 self._executed_task_args = args
                 res = None
                 if self._is_builtin_unarchive(task):
-                    self._normalize_unarchive_options(args)
-                    res = self._unarchive_creates_skip(args, become)
+                    if task.get("async_val"):
+                        res = self._async_check_mode_error(task.get("async_options"))
+                    if res is None:
+                        self._normalize_unarchive_options(args)
+                        res = self._unarchive_creates_skip(args, become)
                 if res is None:
                     self._module_source_bytes = self._baked_module_source(task, args)
                     if task.get("async_val") and int(task.get("poll") or 0) == 0:
@@ -6535,6 +6540,9 @@ class Runtime:
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
+        if res.get("_ansiroll_action_skipped"):
+            # Core 2.19+ catches an action skip outside its attempt loop.
+            attempt = None
         if isinstance(included_vars, dict):
             # Only the include_vars controller reply carries authored definitions.
             res["ansible_facts"] = _IncludedVars(
@@ -6548,7 +6556,7 @@ class Runtime:
         if "rc" in res:
             res.setdefault("failed", res["rc"] not in (0, "0"))
         ectx = ctx
-        if (not (res.get("_ansiroll_unknown_outcome") or res.get("unreachable")) and
+        if (not (res.get("_ansiroll_action_skipped") or res.get("_ansiroll_unknown_outcome") or res.get("unreachable")) and
                 (attempt is not None or task.get("changed_when") is not None or task.get("failed_when") is not None)):
             res.setdefault("failed", False)
             res.setdefault("changed", False)
@@ -6699,7 +6707,10 @@ class Runtime:
         else:
             exists = os.path.exists(creates)
         if exists:
-            return {"skipped": True, "changed": False, "msg": "skipped, since %s exists" % creates}
+            result = {"skipped": True, "changed": False, "msg": "skipped, since %s exists" % creates}
+            if _core_at_least(2, 19):
+                result["_ansiroll_action_skipped"] = True
+            return result
         return None
 
     def _baked_module_source(self, task, args):
@@ -7171,6 +7182,12 @@ class Runtime:
                 results[convert] = bool(results[convert])
         return results
 
+    def _async_check_mode_error(self, options):
+        if self.check_mode and tuple((options or {}).get("version", (2, 21))) < (2, 17):
+            return {"failed": True, "changed": False,
+                    "msg": "check mode and async cannot be used on same task."}
+        return None
+
     def _run_async_module(self, action, args, become=False, async_val=0, ctx=None,
                           options=None):
         meta = self.modules.get(action)
@@ -7178,9 +7195,9 @@ class Runtime:
             return None
         options = options or {}
         version = tuple(options.get("version", (2, 21)))
-        if self.check_mode and version < (2, 17):
-            return {"failed": True, "changed": False,
-                    "msg": "check mode and async cannot be used on same task."}
+        error = self._async_check_mode_error(options)
+        if error is not None:
+            return error
         params = self._module_params(args)
         # The wrapper and its module receive the same task environment.
         env = dict(self._module_env or {})
