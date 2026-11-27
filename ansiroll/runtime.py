@@ -868,6 +868,10 @@ def _vars_file_glob_covers(pattern, name):
     )
 
 
+def _mark_unsafe_key(key, **options):
+    return key if isinstance(key, _FactKeyTemplate) else _mark_unsafe(key, **options)
+
+
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
                  preserve_views=False, preserve_lookup_hostvars=False, reject_vault=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
@@ -903,8 +907,8 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             else:
                 items = dict.items(value)
             for key, item in items:
-                marked_key = key if isinstance(key, _FactKeyTemplate) else _mark_unsafe(
-                    key, _seen, condition_text=condition_text, preserve_views=preserve_views, reject_vault=reject_vault)
+                marked_key = _mark_unsafe_key(
+                    key, _seen=_seen, condition_text=condition_text, preserve_views=preserve_views, reject_vault=reject_vault)
                 out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
                                                preserve_lookup_hostvars, reject_vault)
             return out
@@ -954,7 +958,7 @@ def _decode_frozen_value(value):
 
 
 def _trust_set_fact_value(value):
-    if isinstance(value, _NO_TEMPLATE):
+    if isinstance(value, (_FactKeyTemplate,) + _NO_TEMPLATE):
         return value
     if isinstance(value, str):
         return _TrustedAsTemplateValue(value)
@@ -4297,7 +4301,7 @@ class Runtime:
             if set(value.keys()) == {"__ansiroll_vault__"}:
                 return value
             # Ansible leaves mapping keys literal.
-            return {_mark_unsafe(k): self.template(v, ctx, _seen, strict)
+            return {_mark_unsafe_key(k): self.template(v, ctx, _seen, strict)
                     for k, v in value.items()}
         if isinstance(value, list):
             return [self.template(v, ctx, _seen, strict) for v in value]
@@ -6348,7 +6352,7 @@ class Runtime:
                 return _OMIT
             if isinstance(value, dict):
                 fields = ((key, finalize(member)) for key, member in value.items())
-                return {_mark_unsafe(key): member for key, member in fields if member is not _OMIT}
+                return {_mark_unsafe_key(key): member for key, member in fields if member is not _OMIT}
             if isinstance(value, (list, tuple)):
                 if modern:
                     members = [member for member in map(finalize, value) if member is not _OMIT]

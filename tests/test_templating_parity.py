@@ -3016,7 +3016,8 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
 @pytest.mark.parametrize("use_strategy", [False, True])
-def test_set_fact_preserves_trusted_mapping_keys_in_loop_items(tmp_path, use_strategy):
+@pytest.mark.parametrize("loop_source", ["'{{ entries }}'", "[{'{{ fact_name }}': hello}]"])
+def test_set_fact_preserves_trusted_mapping_keys_in_loop_items(tmp_path, use_strategy, loop_source):
     _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -3027,7 +3028,27 @@ def test_set_fact_preserves_trusted_mapping_keys_in_loop_items(tmp_path, use_str
   tasks:
     - set_fact: {}
       args: '{{ item }}'
-      loop: '{{ entries }}'
+      loop: LOOP_SOURCE
+    - assert:
+        quiet: true
+        that: greeting == 'hello'
+""".replace("LOOP_SOURCE", loop_source), use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_retains_trusted_keys_in_saved_mapping(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_name: greeting
+  tasks:
+    - set_fact:
+        saved:
+          '{{ fact_name }}': hello
+    - set_fact: {}
+      args: '{{ saved }}'
     - assert:
         quiet: true
         that: greeting == 'hello'
