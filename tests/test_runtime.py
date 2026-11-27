@@ -18,6 +18,16 @@ from ansiroll.runtime import (
 )
 
 
+@pytest.mark.parametrize(("version", "expected"), [("2.19.0", True), ("2.19.1", False)])
+def test_check_mode_buffer_null_semantics_follow_core_patch(monkeypatch, version, expected):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", version)
+    templater = Runtime({}, "", {}).templater
+    expression = "{% set x %}{{ none }}{{ none }}{% endset %}{{ x is not none }}"
+    assert templater.render_string(expression, {runtime._CHECK_MODE_TEMPLATE: True}) is expected
+
+
 @pytest.mark.parametrize("survivor", ["ordinary", {"{{ name }}": "untrusted"}])
 def test_bundled_fact_keys_keep_types_and_trust_across_json_collisions(survivor):
     from ansiroll.runtime import _FactKeyTemplate, _encode_bundle_mapping_keys, _restore_bundle_mapping_keys
