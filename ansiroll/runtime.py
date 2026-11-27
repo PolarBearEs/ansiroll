@@ -3087,7 +3087,22 @@ def _concat_keyword_segments(nodes):
              for part in nodes if preserve_none or part is not None]
     if len(parts) < 2:
         return parts[0] if parts else None
-    return "".join(str(_setup_omit(part)) for part in parts if part is not _KEYWORD_OMIT)
+    return "".join(str(_native_output_value(part)) for part in parts if part is not _KEYWORD_OMIT)
+
+
+def _native_output_value(value):
+    """Materialize the members of a native template segment before stringification."""
+    value = _concretize(value)
+    if isinstance(value, (KeysView, type({}.keys()))):
+        value = list(value)
+    if isinstance(value, (dict, _RawSnapshotMapping)):
+        return {_fail_on_undef(key): _native_output_value(member)
+                for key, member in value.items()
+                if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT}
+    if isinstance(value, (list, tuple, _RawSnapshotList)):
+        return [_native_output_value(member) for member in value
+                if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT]
+    return _fail_on_undef(value)
 
 
 def _finalize_text_segment(context, value):
@@ -3473,7 +3488,7 @@ def _concat_file_output(nodes):
 def _native_file_text(value):
     if value is None:
         return ""
-    return str(_fail_on_undef(_mark_unsafe(value)))
+    return str(_native_output_value(value))
 
 
 class _KeywordCodeGenerator(_AnsirollCodeGenerator, NativeCodeGenerator):
@@ -4238,11 +4253,13 @@ class _Templater:
                 prefix = prefix.replace("\n", env.newline_sequence)
                 suffix = suffix.replace("\n", env.newline_sequence)
                 legacy = _legacy_templating()
-                if prefix or suffix:
-                    value = "" if not legacy and isinstance(result, _Omit) else result
+                if (prefix or suffix) and not legacy:
+                    result = _concat_file_output(part for part in (prefix, result, suffix)
+                                                 if not isinstance(part, str) or part)
+                elif prefix or suffix:
                     if _core_at_least(2, 13):
-                        _fail_on_undef(value)
-                    result = prefix + str(_finalize_text_segment(ctx, value)) + suffix
+                        _fail_on_undef(result)
+                    result = prefix + str(_finalize_text_segment(ctx, result)) + suffix
                 elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
                     result = (str(_finalize_text_segment(ctx, result)) if result is None
                               else str(_as_text(result)))
@@ -8369,21 +8386,25 @@ def _template_file_options(source, args, warn):
 
     options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
                "lstrip_blocks": _boolean(args.get("lstrip_blocks", False))}
+    modern = _core_at_least(2, 19)
     for key in _template_task_only_args():
-        if key.endswith(("_start_string", "_end_string")) and args.get(key) is not None:
+        if key.endswith(("_start_string", "_end_string")) and key in args:
             value = args[key]
+            if value is None and not modern:
+                continue
             if not isinstance(value, (str, int, float, bool)):
                 raise ValueError("%s is expected to be a string" % key)
             options[key] = str(value)
-    if _core_at_least(2, 15) and not _core_at_least(2, 19):
+    if _core_at_least(2, 15):
         # Legacy Core validates task overrides when creating the Jinja overlay.
         # Inline headers are applied afterward and bypass that check.
         variable = options.get("variable_start_string", "{{")
-        if variable in (options.get("block_start_string", "{%"), options.get("comment_start_string", "{#")):
+        block = options.get("block_start_string", "{%")
+        comment = options.get("comment_start_string", "{#")
+        if variable in (block, comment) or modern and block == comment:
             raise ValueError("block, variable and comment start strings must be different")
     has_header = source.startswith("#jinja2:")
     if has_header:
-        modern = _core_at_least(2, 19)
         header, delimiter, source = source.partition("\n")
         if not delimiter:
             raise ValueError("missing newline after #jinja2 override")

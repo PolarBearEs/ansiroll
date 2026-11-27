@@ -6,9 +6,10 @@
 - MarkupSafe 1.1.1
 
 These are the final releases of this dependency pair that support Python 3.5.
-The archive also contains both upstream license files. Its comment lexer
-backports the `+` closing modifier so a comment can preserve the following
-newline when `trim_blocks` is enabled.
+The archive also contains both upstream license files. Its lexer backports
+Jinja 3.1's `+` closing modifiers for comments, statement blocks, and
+`endraw` so those tags can preserve the following newline when
+`trim_blocks` is enabled.
 
 Upstream artifacts used to build it:
 
@@ -18,7 +19,7 @@ Upstream artifacts used to build it:
   `29872e92839765e546828bb7754a68c418d927cd064fd4708fab9fe9c8bb116b`)
 
 The generated archive's SHA-256 is
-`eee4c15a201f75acc3d5a59c731674b05e38aa53939b69291878855b58600eae`.
+`d2367220e0d89d685c8685c88f57499568c2fc8652d367cdb83e28430674efc0`.
 
 `pyyaml-py35.zip` contains the pure-Python sources from PyYAML 5.3.1,
 stored under the private import name `ansiroll_yaml`. PyYAML 5.3.1 is the last
