@@ -1958,6 +1958,57 @@ def test_legacy_template_header_preserves_expression_formatting(tmp_path, expres
     assert output.read_bytes() == expected
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy Core uses a string omit token")
+@pytest.mark.parametrize(("source", "content"), [
+    ("{{ {omit: 'kept'} }}\n", b"{<<Omit>>: 'kept'}"),
+    (" {{ {omit: 'kept'} }}\n", b" {<<Omit>>: 'kept'}\n"),
+    ("prefix {{ [{omit_key: 'kept', '<<Omit>>': 'literal', '__omit_place_holder__ansiroll': 'text'}, omit_mapping] }}\n",
+     b"prefix [{<<Omit>>: 'kept', '<<Omit>>': 'literal', '__omit_place_holder__ansiroll': 'text'}, "
+     b"{'__omit_place_holder__ansiroll': 'text', <<Omit>>: 'aliased'}]\n"),
+])
+def test_template_file_preserves_omit_mapping_keys(tmp_path, source, content):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    omit_key: "{{ omit }}"
+    omit_mapping: "{{ {'__omit_place_holder__ansiroll': 'text', omit: 'aliased'} }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": source})
+    output = tmp_path / "rendered.txt"
+    native = _ansible(path, tmp_path)
+    assert output.read_bytes() == content
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == native
+    assert output.read_bytes() == content
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy Core uses a string omit token")
+@pytest.mark.parametrize("delegated,override", [(False, True), (True, False), (True, True)])
+def test_template_file_distinguishes_omit_override_from_magic_variable(tmp_path, delegated, override):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else "")
+        + ("      vars: {omit: '__omit_place_holder__ansiroll'}\n" if override else ""),
+        {"sample.j2": "prefix {{ {omit: 'value'} }}\n"})
+    output = tmp_path / "rendered.txt"
+    expected = b"prefix {'__omit_place_holder__ansiroll': 'value'}\n" if override else b"prefix {<<Omit>>: 'value'}\n"
+    native = _ansible(path, tmp_path)
+    assert output.read_bytes() == expected
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == native
+    assert output.read_bytes() == expected
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 
