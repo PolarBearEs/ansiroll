@@ -1493,7 +1493,7 @@ def _deferred_vars_files(play, basedir, entries):
     """
     import glob
     from ansible.errors import AnsibleFileNotFound
-    from .runtime import _vars_file_glob_covers
+    from .runtime import _FIRST_FOUND_ENV_REFERENCE, _vars_file_glob_covers
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
@@ -1537,10 +1537,12 @@ def _deferred_vars_files(play, basedir, entries):
                                 if absolute_parent or os.pardir in path.split(os.path.sep):
                                     # Relative paths retain the spelling reached from their search root.
                                     parent_paths.add(path)
-                                path = os.path.normpath(path)
-                                candidates.add(path)
-                                if path not in files:
-                                    files[path] = _bundled_vars_file(play, path)
+                                normalized = os.path.normpath(path)
+                                candidates.add(normalized)
+                                # Match the literal candidate for diagnostics without letting
+                                # path_dwim load data from an environment-expanded path.
+                                if normalized not in files and not _FIRST_FOUND_ENV_REFERENCE.search(path):
+                                    files[normalized] = _bundled_vars_file(play, normalized)
                     first_found[name] = {"plugin": plugin, "patterns": patterns,
                                          "roots": first_found_roots, "files": sorted(candidates),
                                          "parent_paths": sorted(parent_paths),
@@ -1612,7 +1614,8 @@ def _vars_first_found_search(play, basedir):
     if known:
         paths = [_PLAYBOOK_DIR_RE.sub(lambda _: basedir, path) for path in search_path]
         known = not any(_is_templated(path) for path in paths)
-    with_files = not (2, 19) <= _core_version() < (2, 21)
+    core = _core_version()
+    with_files = not (2, 19) <= core < (2, 21)
     roots = []
     for path in paths if known else ():
         resolved = unfrackpath(path, follow=False)
@@ -1621,7 +1624,7 @@ def _vars_first_found_search(play, basedir):
             if with_files:
                 roots.append(os.path.join(os.path.dirname(parent), "files"))
             roots.append(parent)
-            if _core_version() < (2, 21):
+            if core < (2, 16):
                 continue
         if with_files:
             roots.append(os.path.join(resolved, "files"))

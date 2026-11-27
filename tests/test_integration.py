@@ -187,11 +187,18 @@ def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path, key
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_first_found_vars_files_uses_authored_search_path_order(tmp_path):
+@pytest.mark.parametrize("nested_role", [False, True], ids=["ordinary", "role-under-tasks"])
+def test_first_found_vars_files_uses_authored_search_path_order(tmp_path, nested_role):
+    from ansiroll.loader import _core_version
     from ansiroll.runtime import VarsFilesError
     from tests import ansible_playbook_command
 
     roots = [tmp_path / name for name in ("preferred", "later")]
+    if nested_role:
+        roots[0] = tmp_path / "outer" / "tasks" / "preferred"
+        (roots[0] / "tasks").mkdir(parents=True)
+        (roots[0] / "tasks" / "main.yml").write_text("[]\n")
+    expected = "later" if nested_role and _core_version() < (2, 16) else "preferred"
     for directory, value in zip([*roots, tmp_path], ["preferred", "later", "fallback"]):
         directory.mkdir(exist_ok=True)
         (directory / "prod.yml").write_text(f"selected: {value}\n")
@@ -203,8 +210,8 @@ def test_first_found_vars_files_uses_authored_search_path_order(tmp_path):
   vars_files:
     - "{{ lookup('first_found', [profile ~ '.yml']) }}"
   tasks:
-    - assert: {that: selected == 'preferred'}
-""".replace("ROOTS", json.dumps([str(root) for root in roots])))
+    - assert: {that: selected == 'EXPECTED'}
+""".replace("ROOTS", json.dumps([str(root) for root in roots])).replace("EXPECTED", expected))
     args = ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)]
     native = subprocess.run(ansible_playbook_command() + args, cwd=tmp_path, capture_output=True,
                             text=True, timeout=30)
@@ -557,22 +564,25 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     assert runtime.vars["selected"] == "production"
 
 
-@pytest.mark.parametrize("absolute", [True, False], ids=["absolute", "matched-relative"])
-def test_first_found_vars_files_rejects_unverified_environment_path(tmp_path, monkeypatch, absolute):
+@pytest.mark.parametrize("spelling", ["absolute", "matched-relative", "tilde"])
+def test_first_found_vars_files_rejects_unverified_environment_path(tmp_path, monkeypatch, spelling):
     from ansiroll.runtime import VarsFilesError
     from tests import ansible_playbook_command
 
     directory = tmp_path / "controller-selected"
     directory.mkdir()
-    (directory / "prod.yml").write_text("selected: requested\n")
-    if not absolute:
+    (directory / "prod.yml").write_text("selected: requested\nprivate_value: expanded-file-fixture-marker\n")
+    if spelling == "matched-relative":
         literal = tmp_path / "$ANSIROLL_TEST_FIRST_FOUND_DIR"
         literal.mkdir()
         (literal / "prod.yml").write_text("selected: literal\n")
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
     monkeypatch.setenv("ANSIROLL_TEST_FIRST_FOUND_DIR", directory.name)
+    if spelling == "tilde":
+        monkeypatch.setenv("ANSIROLL_TEST_FIRST_FOUND_DIR", "")
+        monkeypatch.setenv("HOME", str(directory))
     playbook = tmp_path / "play.yml"
-    prefix = "playbook_dir ~ '/" if absolute else "'"
+    prefix = {"absolute": "playbook_dir ~ '/", "matched-relative": "'", "tilde": "'~"}[spelling]
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
@@ -586,7 +596,7 @@ def test_first_found_vars_files_rejects_unverified_environment_path(tmp_path, mo
     )
     assert native.returncode == 0, native.stdout + native.stderr
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
-    assert "controller-selected" not in json.dumps(plan)
+    assert "expanded-file-fixture-marker" not in json.dumps(plan)
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
     with pytest.raises(VarsFilesError, match="environment references require selecting"):
         runtime.run_play(plan)
