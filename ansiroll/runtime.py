@@ -72,6 +72,7 @@ def _legacy_non_native(ctx):
 
 _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
+_INCLUDE_APPLY_FLAGS = "__ansiroll_apply_flags"
 
 
 def _rendered_number(value, source, ctx):
@@ -89,7 +90,7 @@ def _vars_snapshot(ctx):
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
                 "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_vars_file_selector",
                 "__ansiroll_setup_controller_lookups",
-                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT}
+                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT, _INCLUDE_APPLY_FLAGS}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -4868,6 +4869,8 @@ class Runtime:
     def _include_steps(self, node, overlay, become):
         """Run a compile-time-expanded include_tasks or include_role, once per loop item if looped."""
         base_ctx = self._task_ctx(node, overlay)
+        if self._skips_run_once(node, base_ctx):
+            return
         name = self.emit_start(node)
         b = bool(node.get("become")) or become
         targets = self.__dict__.setdefault("_include_targets", {})
@@ -4879,6 +4882,7 @@ class Runtime:
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
         include_no_log = bool(node.get("no_log"))
+        apply_flags = {}
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
         metadata_flags = None
         if items:
@@ -4893,7 +4897,7 @@ class Runtime:
         if result is None and items is None:
             result, ignore = self._task_gate(node, base_ctx)
             if result is None:
-                include_no_log, result = self._resolve_task_no_log(node, base_ctx)
+                include_no_log, apply_flags, result = self._prepare_include(node, base_ctx)
         if result is not None:
             self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore, no_log=include_no_log)
@@ -5008,6 +5012,9 @@ class Runtime:
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
             params.update(loop_vars)
             scope = _with_high_vars(overlay, params)
+            if apply_flags:
+                include_id = node.get("include_id") or node["tasks_ref"]
+                scope[_INCLUDE_APPLY_FLAGS] = {**(overlay.get(_INCLUDE_APPLY_FLAGS) or {}), include_id: apply_flags}
             # Handlers execute later, so retain the expressions as well as
             # the loop values from this invocation.
             include_params = dict(overlay.get(_INCLUDE_PARAMS_KEY) or {})
@@ -5028,6 +5035,18 @@ class Runtime:
                 failure.pending_includes = (tasks, scopes, b)
             raise failure
         yield from self._included_body_steps(tasks, scopes, b)
+
+    def _prepare_include(self, node, ctx):
+        no_log, failure = self._resolve_task_no_log(node, ctx)
+        if failure is not None or not node.get("apply_flags"):
+            return no_log, {}, failure
+        try:
+            flags = _fail_on_undef(self.template(node["apply_flags"], ctx))
+        except Exception as ex:
+            return no_log or "no_log" in node["apply_flags"], {}, {
+                "failed": True, "changed": False, "msg": str(ex),
+            }
+        return no_log, flags, None
 
     def _included_body_steps(self, tasks, scopes, become):
         for scope in scopes:
@@ -5391,7 +5410,7 @@ class Runtime:
         inventory_order = tuple(current)
         host_task_bindings = {}
         for key, value in ctx.items():
-            if key in ("hostvars", "vars"):
+            if key in ("hostvars", "vars", _INCLUDE_APPLY_FLAGS):
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
@@ -5439,6 +5458,16 @@ class Runtime:
             total["total"] += elapsed
             total["max"] = max(total["max"], elapsed)
 
+    def _skips_run_once(self, task, ctx):
+        run_once = task.get("run_once")
+        if not self.skip_run_once or run_once is None:
+            return False
+        try:
+            return _boolean(self.template(run_once, ctx))
+        except Exception:
+            # Normal task execution will report invalid templating.
+            return False
+
     def _run_task(self, task, overlay, become=False):
         special = task.get("special")
         if special in ("meta_flush_handlers", "meta_clear_host_errors"):
@@ -5465,18 +5494,9 @@ class Runtime:
             return
         effective_become = bool(task.get("become")) or become
         base_ctx = self._task_ctx(task, overlay)
-        run_once = task.get("run_once")
-        if self.skip_run_once and run_once is not None:
-            try:
-                if isinstance(run_once, str):
-                    run_once = self.template(run_once, base_ctx)
-                if _boolean(run_once):
-                    # Ansible emits no skipped event for hosts which do not
-                    # execute a run_once task.
-                    return
-            except Exception:
-                # Normal task execution will report invalid templating.
-                pass
+        if self._skips_run_once(task, base_ctx):
+            # Linear emits no skipped event for hosts outside run_once.
+            return
         self.emit_start(task)
 
         notifications = []
@@ -5962,13 +5982,21 @@ class Runtime:
         return args_cache["args"]
 
     def _execution_flag(self, task, key, ctx, default):
-        value = task.get(key)
+        value = self._execution_flag_value(task.get(key), ctx)
         if value is None:
             return default
-        value = _fail_on_undef(self.template(value, ctx))
         if isinstance(value, _Omit):
-            value = task.get(key + "_on_omit", default)
+            value = self._execution_flag_value(task.get(key + "_on_omit", default), ctx)
         return default if value is None else _boolean(value, strict=True)
+
+    def _execution_flag_value(self, value, ctx):
+        while isinstance(value, dict) and "__ansiroll_apply_flag__" in value:
+            include_id, keyword, inherited = value["__ansiroll_apply_flag__"]
+            value = ctx[_INCLUDE_APPLY_FLAGS][include_id][keyword]
+            if not isinstance(value, _Omit):
+                return value
+            value = inherited
+        return _fail_on_undef(self.template(value, ctx))
 
     def _resolve_task_no_log(self, task, ctx):
         try:

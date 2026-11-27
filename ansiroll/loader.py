@@ -1893,6 +1893,10 @@ def _new_include_id():
     return "include-%d" % _INCLUDE_IDS[0]
 
 
+class _AppliedExecutionFlag(str):
+    """An inherited flag whose value is resolved by the include invocation."""
+
+
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand a compile-time-resolvable include_tasks.
 
@@ -1919,12 +1923,19 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         stable_template = raw_fname
     key = ("tasks", physical_path, _include_path_spelling(path),
            id(role) if role is not None else None, _is_handler(task),
-           _include_search_context(task, stable_template, fname), scope, repr(args.get("apply")))
+           _include_search_context(task, stable_template, fname), scope, repr(args.get("apply")),
+           bool(args.get("apply")) and task.loop is not None)
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
+    apply_flags = {}
+    # Core's looped include uses its original apply mapping for child tasks.
+    if _core_version() >= (2, 19) and task.loop is None:
+        applied = args.get("apply") or {}
+        apply_flags = {flag: _tag_untrusted(applied[flag]) for flag in ("check_mode", "diff", "no_log", "become")
+                       if _is_templated(applied.get(flag))}
     if ref is None:
         try:
             from ansible.playbook.helpers import load_list_of_blocks
@@ -1958,6 +1969,11 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             for nested in nested_includes:
                 nested._ansiroll_stable_include = True
         include_id = _new_include_id()
+        for flag in apply_flags:
+            value = _AppliedExecutionFlag(getattr(parent, flag))
+            inherited = parent._get_parent_attribute(flag, omit=True)
+            value.reference = [include_id, flag, _execution_omit_fallback(inherited)]
+            setattr(parent, flag, value)
         _INCLUDE_STACK[key] = include_id
         try:
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
@@ -1971,6 +1987,8 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", fname, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
+    if apply_flags:
+        node["apply_flags"] = apply_flags
     return node
 
 
@@ -1984,6 +2002,7 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
         **_execution_keyword(task, "no_log"),
+        "run_once": getattr(task, "run_once", None),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -4161,18 +4180,30 @@ def _execution_keyword(task, keyword, *, node_key=None):
     from ansible.playbook.base import Sentinel
 
     key = node_key or keyword
-    value = _tag_untrusted(getattr(task, keyword, None))
+    value = getattr(task, keyword, None)
+    if isinstance(value, _AppliedExecutionFlag):
+        return {key: {"__ansiroll_apply_flag__": value.reference}}
+    value = _tag_untrusted(value)
     result = {key: value}
     if _is_templated(value) and _core_version() >= (2, 19):
         inherited = task._get_parent_attribute(keyword, omit=True)
         if inherited is not Sentinel:
-            from ansible.module_utils.parsing.convert_bool import boolean
-
-            try:
-                result[key + "_on_omit"] = boolean(inherited) if inherited is not None else False
-            except TypeError:
-                result[key + "_on_omit"] = "invalid"
+            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
     return result
+
+
+def _execution_omit_fallback(value):
+    from ansible.module_utils.parsing.convert_bool import boolean
+    from ansible.playbook.base import Sentinel
+
+    if isinstance(value, _AppliedExecutionFlag):
+        return {"__ansiroll_apply_flag__": value.reference}
+    if value is Sentinel:
+        return None
+    try:
+        return boolean(value) if value is not None else False
+    except TypeError:
+        return "invalid"
 
 
 def _boolean_or_template(value):

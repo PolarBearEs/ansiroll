@@ -5766,6 +5766,78 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
         assert "+template diff" in proc.stdout
 
 
+@pytest.mark.parametrize("looped", [False, True], ids=["single", "looped"])
+def test_expanded_include_resolves_templated_apply_flags_in_native_scope(tmp_path, looped):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core resolves apply arguments at inclusion")
+    (tmp_path / "child.yml").write_text("""- name: Child write
+  vars: {safe: false}
+  copy:
+    content: child-content
+    dest: '{{ playbook_dir }}/{{ "dry" if item else "real" }}.txt'
+- debug:
+    msg: '{{ "hidden-apply-marker" if item else "visible-apply-marker" }}'
+  vars: {safe: false}
+- name: Explicit overrides
+  check_mode: false
+  no_log: false
+  copy:
+    content: override-content
+    dest: '{{ playbook_dir }}/override.txt'
+""")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars: {safe: true}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          check_mode: '{{ item and safe }}'
+          no_log: '{{ item and safe }}'
+      ITEM_SCOPE
+""".replace("ITEM_SCOPE", "loop: [true, false]" if looped else "vars: {item: true}")
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy})
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert (tmp_path / "dry.txt").exists() == looped, output
+        assert (tmp_path / "override.txt").read_text() == "override-content"
+        assert ("hidden-apply-marker" in output) == looped, output
+        if looped:
+            assert "visible-apply-marker" in output
+            assert (tmp_path / "real.txt").read_text() == "child-content"
+            (tmp_path / "dry.txt").unlink()
+            (tmp_path / "real.txt").unlink()
+        (tmp_path / "override.txt").unlink()
+
+
+def test_expanded_nested_include_honors_inherited_run_once(tmp_path):
+    (tmp_path / "outer.yml").write_text("- include_tasks: child.yml\n")
+    (tmp_path / "child.yml").write_text("""- copy:
+    content: selected
+    dest: '{{ playbook_dir }}/{{ inventory_hostname }}.txt'
+  run_once: false
+""")
+    playbook = """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - include_tasks:
+        file: outer.yml
+        apply: {run_once: true}
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, inventory="origin,recipient,",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (tmp_path / "origin.txt").read_text() == "selected"
+        assert not (tmp_path / "recipient.txt").exists(), result.stdout + result.stderr
+        (tmp_path / "origin.txt").unlink()
+
+
 def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
