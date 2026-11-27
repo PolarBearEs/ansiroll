@@ -7074,6 +7074,46 @@ def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, m
 
 
 @pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
+def test_expanded_include_matches_apply_var_scope_and_resolves_no_log_per_item(tmp_path, runner):
+    from ansiroll.loader import _core_version
+
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          vars:
+            chosen: "{{ flavor | default('fallback') }}"
+          no_log: "{{ false }}"
+"""
+    (tmp_path / "child.yml").write_text("""- debug:
+    msg: "{{ chosen }}-visible-applied-keyword"
+- debug:
+    msg: "{{ chosen }}-{{ 'visible-marker' if item == 'show' else 'private-marker' }}"
+  vars:
+    flavor: child
+  no_log: "{{ item == 'hide' }}"
+  loop: [show, hide]
+""")
+    if runner == "standalone":
+        path = tmp_path / "play.yml"
+        path.write_text(playbook)
+        artifact = tmp_path / "compiled.py"
+        artifact.write_text(compile_playbook(str(path))[0])
+        proc = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, text=True, capture_output=True)
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "fallback-visible-applied-keyword" in proc.stdout
+    prefix = "child" if _core_version() < (2, 19) else "fallback"
+    assert f"{prefix}-visible-marker" in proc.stdout
+    assert "private-marker" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
 @pytest.mark.parametrize("no_log", ["false", "{{ false }}"])
 def test_expanded_include_loop_preserves_controls_and_register_scope(tmp_path, runner, no_log):
     from ansiroll.loader import _core_version
@@ -7286,46 +7326,6 @@ def test_expanded_include_loop_registers_native_role_arguments(tmp_path):
     assert "role-item-1" in proc.stdout
     assert ("role-item-2" in proc.stdout) is exposes_args
     assert "role-item-3" not in proc.stdout
-
-
-@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
-def test_expanded_include_matches_apply_var_scope_and_resolves_no_log_per_item(tmp_path, runner):
-    from ansiroll.loader import _core_version
-
-    playbook = """- hosts: localhost
-  connection: local
-  gather_facts: false
-  tasks:
-    - include_tasks:
-        file: child.yml
-        apply:
-          vars:
-            chosen: "{{ flavor | default('fallback') }}"
-          no_log: "{{ false }}"
-"""
-    (tmp_path / "child.yml").write_text("""- debug:
-    msg: "{{ chosen }}-visible-applied-keyword"
-- debug:
-    msg: "{{ chosen }}-{{ 'visible-marker' if item == 'show' else 'private-marker' }}"
-  vars:
-    flavor: child
-  no_log: "{{ item == 'hide' }}"
-  loop: [show, hide]
-""")
-    if runner == "standalone":
-        path = tmp_path / "play.yml"
-        path.write_text(playbook)
-        artifact = tmp_path / "compiled.py"
-        artifact.write_text(compile_playbook(str(path))[0])
-        proc = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, text=True, capture_output=True)
-    else:
-        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
-        proc = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy})
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "fallback-visible-applied-keyword" in proc.stdout
-    prefix = "child" if _core_version() < (2, 19) else "fallback"
-    assert f"{prefix}-visible-marker" in proc.stdout
-    assert "private-marker" not in proc.stdout + proc.stderr
 
 
 def test_recursive_include_keeps_inherited_no_log(tmp_path):
