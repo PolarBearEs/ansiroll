@@ -758,13 +758,25 @@ def _literal_vars_input(value):
     if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
         text = value["__ansiroll_unsafe__"]
         if isinstance(text, str) and not _looks_templated(text):
-            return text
+            return str(text)
+    if isinstance(value, _NO_TEMPLATE) and not _looks_templated(value):
+        return str(value)
     return value
 
 
-def _vars_input_at(scope, name, path):
+def _raw_include_input(value):
+    if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)):
+        return str(value)
+    if isinstance(value, (_LazyTplDict, _LazyTplList)):
+        return value._raw
+    return value
+
+
+def _vars_input_at(scope, name, path, *, raw_containers=False):
     value = scope.get(name, _MISSING_VARS_FILE_INPUT)
     for member in path:
+        if raw_containers:
+            value = _raw_include_input(value)
         value = _literal_vars_input(value)
         if member is None:
             # None marks a branch choice rather than a member lookup.
@@ -801,6 +813,10 @@ def _same_vars_input(left, right):
     if isinstance(left, (list, tuple)):
         return len(left) == len(right) and all(_same_vars_input(a, b) for a, b in zip(left, right))
     return left == right
+
+
+def _include_input_at(scope, name, path):
+    return _raw_include_input(_vars_input_at(scope, name, path, raw_containers=True))
 
 
 def _clear_vars_file_blocks(blocked, mapping, merge_hashes):
@@ -4384,6 +4400,7 @@ class Runtime:
         self._inventory_defaults = inventory_defaults or {}
         self.vars = dict(host_vars or {})
         self._play_var_names = set()
+        self._replayed_play_vars = {}
         self._initial_host_vars = self._task_host_vars()
         self._legacy_omit_token = self._initial_host_vars.get("omit", _OMIT)
         self._vars_file_host_vars = self._initial_host_vars
@@ -5024,6 +5041,7 @@ class Runtime:
                 merge_hashes=merge_vars_files, magic=vars_file_magic, ordered=ordered_files is not None,
                 deferred_entries=deferred_files)
             active_play_vars = play_vars
+        self._replayed_play_vars = play_vars if merge_vars_files else {}
         self._play_var_names = set(active_play_vars)
         self.vars.update(self.template_vars(play_vars, self.ctx(), dynamic=True))
         # Host variables created by include_vars/set_fact/register have higher
@@ -5110,6 +5128,39 @@ class Runtime:
         if node.get("tasks_ref"):
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
+
+        def select_body(ctx):
+            if "include_selector" not in node:
+                return node.get("file"), tasks, handlers
+
+            def inputs_match(inputs, scope=ctx):
+                return all(_same_vars_input(_include_input_at(scope, name, path),
+                                            value if present else _MISSING_VARS_FILE_INPUT)
+                           for name, path, present, value in inputs)
+
+            compile_inputs = node.get("include_compile_inputs")
+            extra_inputs = node.get("include_compile_extra_inputs", ())
+            if (compile_inputs is not None and inputs_match(compile_inputs)
+                    and inputs_match(extra_inputs, self.extra_vars)):
+                key = node["compile_selection"]
+            elif node.get("include_build_only"):
+                raise ValueError("include_tasks selector inputs changed and no alternate task file was bundled")
+            else:
+                key = _fail_on_undef(self.template(node["include_selector"], ctx, strict=True))
+                if "include_parent_selectors" in node:
+                    key = [key, *(_fail_on_undef(self.template(source, ctx, strict=True))
+                                  for source in node["include_parent_selectors"])]
+            filename = key[0] if isinstance(key, list) else key
+            variant = next((entry for entry in tasks if entry["include_variant"] == key
+                            and inputs_match(entry.get("include_variant_inputs", ()))), None)
+            if variant is None:
+                raise ValueError("no bundled task file matches %r" % filename)
+            body = variant["block"]
+            if variant.get("include_id"):
+                targets[variant["include_id"]] = body, handlers
+            body, body_handlers = targets.get(variant.get("tasks_ref"), (body, handlers))
+            return filename, body, body_handlers
+
         include_no_log = bool(node.get("no_log"))
         apply_flags = {}
         apply_vars = {}
@@ -5128,6 +5179,11 @@ class Runtime:
             result, ignore = self._task_gate(node, base_ctx)
             if result is None:
                 include_no_log, apply_flags, apply_vars, result = self._prepare_include(node, base_ctx)
+                if result is None:
+                    try:
+                        filename, body, body_handlers = select_body(base_ctx)
+                    except Exception as error:
+                        result = {"changed": False, "failed": True, "msg": str(error)}
         if result is not None:
             self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore, no_log=include_no_log)
@@ -5148,10 +5204,9 @@ class Runtime:
         failed_items_ignored = True
         legacy_failure = None
         for i, item in enumerate(items if looped else [None]):
-            result = {"changed": False, "include": node.get("file")}
-            loop_vars = {}
             if not looped:
-                selected.append((base_ctx, loop_vars, result, item, include_no_log, apply_flags, apply_vars))
+                result = {"changed": False, "include": filename}
+                selected.append((base_ctx, {}, result, item, include_no_log, body, body_handlers, apply_flags, apply_vars))
                 break
             try:
                 loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
@@ -5165,11 +5220,17 @@ class Runtime:
             item_flags, item_vars = {}, {}
             if blocked is None:
                 item_no_log, item_flags, item_vars, blocked = self._prepare_include(node, ctx)
-            if blocked is not None:
-                if _result_failed(blocked) and not _core_at_least(2, 19):
-                    legacy_failure = (blocked, ignored)
-                    break
+            if blocked is None:
+                try:
+                    filename, body, body_handlers = select_body(ctx)
+                    result = {"changed": False, "include": filename}
+                except Exception as error:
+                    result = {"changed": False, "failed": True, "msg": str(error)}
+            else:
                 result = blocked
+            if _result_failed(result) and not _core_at_least(2, 19):
+                legacy_failure = (result, ignored)
+                break
             # Older executors added loop metadata directly to the result before
             # aggregating item status. Newer executors keep status separately.
             if not _core_at_least(2, 21):
@@ -5196,7 +5257,8 @@ class Runtime:
                 failed_items_ignored = failed_items_ignored and ignored
             reported = {**result, **loop_vars}
             if not _result_failed(result) and not result.get("skipped"):
-                selected.append((ctx, loop_vars, reported, item, item_no_log, item_flags, item_vars))
+                selected.append((ctx, loop_vars, reported, item, item_no_log, body, body_handlers,
+                                 item_flags, item_vars))
             results.append((item, result, reported, item_no_log))
             if stop:
                 break
@@ -5239,7 +5301,7 @@ class Runtime:
                 self._tally("skipped")
 
         scopes = []
-        for ctx, loop_vars, result, item, item_no_log, apply_flags, apply_vars in selected:
+        for ctx, loop_vars, result, item, item_no_log, body, body_handlers, apply_flags, apply_vars in selected:
             body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars,
                                         defer=_core_at_least(2, 19))
@@ -5258,15 +5320,15 @@ class Runtime:
                 self._store_register(node, result)
             if tally_ok:
                 self._tally("ok")
-            self._add_handlers(handlers, scope, b)
-            scopes.append(scope)
+            self._add_handlers(body_handlers, scope, b)
+            scopes.append((body, scope))
         if looped and status == "ok" and node.get("register"):
             self.emit(node, status, aggregate, ignored=ignored, name=name, no_log=aggregate_no_log)
         if failure is not None:
             if scopes:
-                failure.pending_includes = (tasks, scopes, b)
+                failure.pending_includes = (scopes, b)
             raise failure
-        yield from self._included_body_steps(tasks, scopes, b)
+        yield from self._included_body_steps(scopes, b)
 
     def _prepare_include(self, node, ctx):
         no_log, failure = self._resolve_task_no_log(node, ctx)
@@ -5290,8 +5352,8 @@ class Runtime:
             }
         return no_log, flags, applied_vars, None
 
-    def _included_body_steps(self, tasks, scopes, become):
-        for scope in scopes:
+    def _included_body_steps(self, scopes, become):
+        for tasks, scope in scopes:
             yield self._node_steps(tasks, scope, become)
 
     def _failed_include_steps(self, failure):
@@ -5653,6 +5715,21 @@ class Runtime:
                                       defer=looped or mixed_lookup or block_template
                                       or include_aliases or check_mode_aliases))
         ctx.update(higher_vars)
+        if "include_selector_inputs" in task and self.vars.get("__ansiroll_controller_config", {}).get(
+                "DEFAULT_HASH_BEHAVIOUR") == "merge":
+            inputs = set(task["include_selector_inputs"])
+            host = self._task_host_vars()
+            for key in inputs & (self._replayed_play_vars.keys() | self.extra_vars.keys()):
+                host.pop(key, None)
+                if key in self._vars_file_host_vars:
+                    host[key] = self._vars_file_host_vars[key]
+            layers = (role_defaults, host, self._replayed_play_vars, role_vars, overlay, task.get("vars") or {},
+                      self._include_vars_layer, self._set_fact_overrides, task.get("role_params") or {},
+                      overlay.get(_HIGH_VARS_KEY) or {}, self.extra_vars)
+            raw = [{key: mapping[key]._raw if isinstance(mapping[key], _LazyTplDict) else mapping[key]
+                    for key in inputs & mapping.keys()} for mapping in layers]
+            merged = _f_combine(*raw, recursive=True)
+            ctx.update(self.template_vars(merged, ctx, dynamic=True))
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]

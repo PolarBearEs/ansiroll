@@ -15,6 +15,7 @@ import re
 import stat
 import time
 from copy import copy
+from contextlib import contextmanager
 from functools import lru_cache
 
 from .compat import find_module, init_loader
@@ -489,7 +490,8 @@ def _capture_setup_files(play, terms_by_alias):
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None,
+                                 vars_lookup_allowed=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -525,6 +527,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             if not allow_controller and not (
                 isinstance(method, nodes.Getattr) and method.attr in scalar_methods
                 or selector and _is_literal_vars_lookup(call)
+                and (vars_lookup_allowed is None or vars_lookup_allowed(call.args[0].value))
             ):
                 return None
             if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
@@ -579,7 +582,7 @@ def _make_rewriting_loader(DataLoader):
 
     playbook_reader = Playbook._load_playbook_data.__code__
     role_reader = Role._load_role_yaml.__code__
-    task_readers = {load_list_of_tasks.__code__, _convert_include_tasks.__code__}
+    task_readers = {load_list_of_tasks.__code__, _expand_include_tasks.__code__}
 
     class RewritingDataLoader(DataLoader):
         def __init__(self):
@@ -790,6 +793,11 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         }
         setup_defaults = _prune_setup_defaults(setup_defaults, setup_overrides)
     vars_file_entries = _as_list(getattr(play, "vars_files", None))
+    _apply_force_handlers_default(play)
+    blocks = play.compile()
+    handler_blocks = _handler_blocks(play)
+    include_replay = (any(_is_templated(filename) for entry in vars_file_entries for filename in _as_list(entry))
+                      and _has_dynamic_include(blocks + handler_blocks))
     replay_order = any(_is_templated(filename)
                        for entry in vars_file_entries[:-1]
                        for filename in _as_list(entry))
@@ -803,7 +811,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     early_setup = (play.gather_facts is not False
                    and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
                    and (scoped_options or _is_templated(play.gather_timeout)))
-    ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup) else None
+    ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup or include_replay) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
@@ -824,9 +832,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     hosts = play.hosts
     if isinstance(hosts, list):
         hosts = ",".join(str(h) for h in hosts)
-    _apply_force_handlers_default(play)
-    blocks = play.compile()
-    handler_blocks = _handler_blocks(play)
     known_writes = set(runtime_writes or ())
     manager = play.get_variable_manager()
     # Strategy compilation has no host context. Values left by earlier plays
@@ -834,14 +839,20 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     for cache_name in ("_vars_cache", "_nonpersistent_fact_cache"):
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
-    includes = _IncludeVariables(play_vars, all_vars, known_writes)
-    includes.controller_execution = gather_facts is not None
+    includes = _IncludeVariables(play_vars, all_vars, known_writes, controller_execution=gather_facts is not None)
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
+    includes.unresolved_vars_file = include_replay and any(
+        not selected and not checked for selected, checked, _ in order_deferred.values())
     includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
         key for entry in deferred for data in entry["files"].values() if isinstance(data, list)
         for mapping in data for key in mapping
     }
+    if include_replay and ordered_vars_files and deferred:
+        includes.vars_file_plan = (play.vars or {}, [
+            deferred[entry] if isinstance(entry, int) else entry
+            for entry in ordered_vars_files
+        ])
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
@@ -849,6 +860,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         _INCLUDE_ROLE_PARENTS.clear()
         _INCLUDE_IDS[0] = 0
         initial_writes = includes.runtime_writes.copy()
+        includes.variant_writes.clear()
         includes.resolved_template = False
         play_actions = set()
         tasks = []
@@ -858,6 +870,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             if node:
                 tasks.append(node)
         handlers = _convert_handlers(handler_blocks, play_actions, basedir, includes)
+        includes.runtime_writes.update(includes.variant_writes)
         # Includes can expose additional writes, including writes that precede
         # another include on a later loop iteration. Revisit provisional paths
         # when the set grows, keeping only the final graph and task IDs.
@@ -865,7 +878,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             break
     actions.update(play_actions)
     if runtime_writes is not None:
-        runtime_writes.update(includes.runtime_writes)
+        runtime_writes.update(includes.runtime_writes | includes.variant_writes)
     _assign_runtime_ids(tasks, handlers)
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
@@ -925,6 +938,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     # definitions needed during ordered replay before later files shadow them.
     lookup_sources = {
         **result,
+        "tasks": _selected_include_lookup_nodes(result["tasks"]),
+        "handlers": _selected_include_lookup_nodes(result["handlers"]),
         "deferred_vars_files": [entry["names"] for entry in deferred],
         "ordered_vars_file_inputs": ordered_lookup_sources,
     }
@@ -1039,6 +1054,21 @@ def _ordered_vars_file_inputs(ordered, deferred, compile_selections):
                 if dependencies is not None:
                     selector_reads.update(dependencies[1])
     return mutable, sources
+
+
+def _selected_include_lookup_nodes(nodes):
+    """Controller values are captured for tasks selected at build time."""
+    selected = []
+    for node in nodes:
+        node = dict(node)
+        if "include_selector" in node:
+            node["tasks"] = [branch for branch in node["tasks"]
+                             if branch["include_build_selected"]]
+        for key in ("block", "rescue", "always", "tasks", "handlers"):
+            if node.get(key):
+                node[key] = _selected_include_lookup_nodes(node[key])
+        selected.append(node)
+    return selected
 
 
 def _apply_force_handlers_default(play):
@@ -1304,13 +1334,15 @@ def _vars_filename_template_environment():
     return _Templater().env
 
 
-def _vars_filename_controller_requirements(source, portable):
+def _vars_filename_controller_requirements(source, portable, *, paths=None, jinja_plugin_allowed=None):
     from jinja2 import nodes, TemplateSyntaxError
     from .runtime import _selector_template_sources
 
     env = _vars_filename_template_environment()
-    values = portable[0].values() if portable is not None else ()
-    sources = [source, *(alias for value in values for alias, _, _ in _selector_template_sources(value))]
+    values = portable[0] if portable is not None else {}
+    bindings = ((name, ()) for name in values) if paths is None else paths
+    sources = [source, *(alias for name, path in bindings
+                         for alias, _, _ in _selector_template_sources(values.get(name), path))]
     missing_filters = set()
     missing_tests = set()
     for candidate in sources:
@@ -1318,8 +1350,14 @@ def _vars_filename_controller_requirements(source, portable):
             parsed = env.parse(candidate)
         except TemplateSyntaxError:
             return True, {}
-        missing_filters.update(node.name for node in parsed.find_all(nodes.Filter) if node.name not in env.filters)
-        missing_tests.update(node.name for node in parsed.find_all(nodes.Test) if node.name not in env.tests)
+        for kind, node_type, supported, missing in (
+                ("filter", nodes.Filter, env.filters, missing_filters),
+                ("test", nodes.Test, env.tests, missing_tests)):
+            for node in parsed.find_all(node_type):
+                if jinja_plugin_allowed is not None and not jinja_plugin_allowed(kind, node.name):
+                    return True, {}
+                if node.name not in supported:
+                    missing.add(node.name)
         for call in parsed.find_all(nodes.Call):
             if (isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const)
@@ -1479,12 +1517,13 @@ class _UnbundledVaultFile(ValueError):
     pass
 
 
-def _load_plain_ansible_source(path):
+def _load_plain_ansible_source(path, *, opener=None):
     """Parse one validated snapshot of a source that must be unencrypted."""
     from ansible.module_utils.common.text.converters import to_text
     from ansible.parsing.dataloader import DataLoader
 
-    with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as fh:
+    source_opener = opener or _open_role_source
+    with open(path, "rb", opener=lambda name, _: source_opener(name)) as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
             raise ValueError("expected a regular file")
         data = to_text(fh.read(), errors="surrogate_or_strict")
@@ -1500,7 +1539,9 @@ def _load_plain_ansible_source(path):
 
 
 def _ansible_source_contains_vault(data):
-    if "$ANSIBLE_VAULT" in data:
+    from ansible.parsing.vault import is_encrypted
+
+    if is_encrypted(data):
         return True
     if data.lstrip().startswith(("{", "[")):
         import json
@@ -1839,6 +1880,18 @@ def _can_write_var(writes, name):
     return name in writes or None in writes
 
 
+def _has_dynamic_include(nodes):
+    from ansible.playbook.block import Block
+
+    for node in nodes:
+        if isinstance(node, Block):
+            if any(_has_dynamic_include(group) for group in (node.block, node.rescue, node.always)):
+                return True
+        elif str(getattr(node, "action", "")).rsplit(".", 1)[-1] in ("include_tasks", "include_role"):
+            return True
+    return False
+
+
 def _depends_on_vars(value, variables, matches):
     """Follow Jinja variable references through known values."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
@@ -1887,15 +1940,24 @@ def _depends_on_vars(value, variables, matches):
 
 
 class _IncludeVariables:
-    def __init__(self, play_vars, all_vars, runtime_writes):
+    def __init__(self, play_vars, all_vars, runtime_writes, *, controller_execution=False):
         self.play_vars = play_vars
+        self.compile_selected_vars = play_vars
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
+        self.controller_execution = controller_execution
+        self.variant_writes = set()
         self.resolved_template = False
         # Replay of a known vars file can only redefine keys found in its candidates.
         self.vars_file_writes = set()
+        self.vars_file_plan = None
+        self.vars_file_scopes = None
+        self.compile_selector_reads = set()
+        self.compile_selector_extra_reads = set()
+        self.build_only_selector_names = set()
         # When candidate contents are unknown, any play var can change.
         self.incomplete = False
+        self.unresolved_vars_file = False
 
     def record_writes(self, blocks):
         from ansible.playbook.block import Block
@@ -1957,28 +2019,528 @@ def _bind_include_apply_flags(parent, options):
         setattr(parent, key, value)
 
 
-def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
-    """Expand a compile-time-resolvable include_tasks.
 
-    Filenames depending on runtime values (such as a loop item or a registered
-    result) remain on the controller-coupled path.
-    """
-    args = task.args or {}
-    raw_fname = fname = args.get("_raw_params") or args.get("file")
-    if not isinstance(fname, str):
+def _vars_file_simple_field(source):
+    """Recognize a filename with one interpolated name and an optional default."""
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    try:
+        body = Environment().parse(os.path.expanduser(source)).body
+    except TemplateSyntaxError:
         return None
-    if "{{" in fname or "{%" in fname:
-        fname = _template_include_filename(task, fname, includes)
-        if not isinstance(fname, str) or "{{" in fname or "{%" in fname:
-            if any(value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):
-                node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
-                node["_deferred_apply_include"] = True
-                node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
-                return node
+    if len(body) != 1 or not isinstance(body[0], nodes.Output):
+        return None
+    pieces = []
+    field = None
+    fallback = None
+    for part in body[0].nodes:
+        if isinstance(part, nodes.TemplateData):
+            pieces.append(re.escape(part.data))
+            continue
+        if isinstance(part, nodes.Filter) and part.name in ("default", "d"):
+            if (part.kwargs or part.dyn_args or part.dyn_kwargs or len(part.args) > 2
+                    or any(not isinstance(arg, nodes.Const) for arg in part.args)):
+                return None
+            default = part.args[0].value if part.args else ""
+            fallback = ("" if default is None else str(default), bool(len(part.args) == 2 and part.args[1].value))
+            part = part.node
+        if field is not None or not isinstance(part, nodes.Name):
             return None
+        field = part.name
+        pieces.append(r"([^/]*)")
+    return (field, re.compile("".join(pieces)), fallback) if field is not None else None
+
+
+def _vars_file_variant_choices(entry, scope, constraints):
+    if not isinstance(entry, dict):
+        yield entry, constraints
+        return
+
+    fields = [(name, _vars_file_simple_field(name)) for name in entry["names"]]
+    can_skip = False
+    for name, field in fields:
+        if not _is_templated(name):
+            if entry.get("checked_paths", {}).get(name):
+                break
+        elif field is None or not (field[2] or field[0] in constraints or field[0] in scope):
+            can_skip = True
+    if can_skip:
+        yield [], constraints
+
+    directories = [folder for path in entry["dirs"] for folder in (
+        (os.path.join(path, entry["subdir"]), path) if entry.get("subdir") else (path,))]
+    matched = False
+    for path, data in entry["files"].items():
+        spellings = [path, *(os.path.relpath(path, directory) for directory in directories)]
+        matching = set()
+        default_matches = set()
+        for _, field in fields:
+            if field is not None:
+                name, pattern, fallback = field
+                for spelling in spellings:
+                    match = pattern.fullmatch(spelling)
+                    if match is not None:
+                        matching.add((name, match[1]))
+                        if fallback is not None and fallback[0] == match[1] and (
+                                name not in scope or fallback[1] and not scope[name]):
+                            default_matches.add((name, match[1]))
+        if not matching:
+            matched = True
+            if isinstance(data, list):
+                yield data, constraints
+        else:
+            for name, value in sorted(matching):
+                if name in constraints and constraints[name] is None:
+                    authored = scope.get(name)
+                    if ((name, value) in default_matches or not isinstance(authored, str)
+                            or _is_templated(authored) or authored == value):
+                        matched = True
+                        if isinstance(data, list):
+                            yield data, constraints
+                    continue
+                if constraints.get(name, value) != value:
+                    continue
+                matched = True
+                if not isinstance(data, list):
+                    continue
+                yield data, {**constraints, name: value}
+                if name not in constraints and (scope.get(name) == value or (name, value) in default_matches):
+                    # This file can be chosen without a launch override, so
+                    # a later assignment can supply the next filename's selector.
+                    yield data, {**constraints, name: None}
+    if not matched and not can_skip and all(field is not None for _, field in fields) and _core_version() >= (2, 15):
+        # Modern Core keeps the preceding vars when no templated candidate exists.
+        yield [], constraints
+
+
+def _include_variant_key(task, sources, includes, *, portable=False):
+    rendered = tuple(_template_include_filename(task, source, includes, runtime_portable=portable)
+                     if _is_templated(source) else source for source in sources)
+    if all(isinstance(name, str) and not _is_templated(name) for name in rendered):
+        return rendered[0] if len(rendered) == 1 else rendered
+    return None
+
+
+def _vars_file_include_variants(task, sources, includes):
+    """Render the filename with each distinct assignment to its file-backed inputs."""
+    from ansible.utils.vars import combine_vars
+    from .runtime import _GATHER_STRING_METHODS, _selector_template_sources, _vars_input_at
+
+    if not (includes.vars_file_plan or includes.vars_file_scopes) or not includes.vars_file_writes or includes.incomplete:
+        return {}, ()
+    paths = set()
+    for source in sources:
+        if _gather_timeout_dependencies(source, {}, _GATHER_STRING_METHODS, selector=True, paths=paths) is None:
+            return {}, ()
+    role_defaults, role_vars = _role_vars(task)
+    task_vars, params = _include_scope(task)
+    values = [role_defaults, role_vars, task_vars, params, _role_params(task),
+              task.get_variable_manager().extra_vars]
+    if includes.vars_file_scopes is None:
+        authored, entries = includes.vars_file_plan
+        values.append(authored)
+        values.extend(mapping for entry in entries
+                      for candidate in (entry["files"].values() if isinstance(entry, dict) else (entry,))
+                      if isinstance(candidate, list)
+                      for mapping in candidate)
+    else:
+        authored, entries = {}, ()
+        values.extend(includes.vars_file_scopes)
+    pending = list(paths)
+    while pending:
+        name, path = pending.pop()
+        for mapping in values:
+            for alias, _, _ in _selector_template_sources(mapping.get(name), path):
+                reads = set()
+                dependencies = _gather_timeout_dependencies(
+                    alias, {}, _GATHER_STRING_METHODS, selector=True, allow_controller=True, paths=reads)
+                if dependencies is None:
+                    continue
+                extra = reads - paths
+                paths.update(extra)
+                pending.extend(extra)
+    names = {name for name, _ in paths}
+    if not names & includes.vars_file_writes:
+        return {}, ()
+
+    scopes = includes.vars_file_scopes
+    if scopes is None:
+        states = [(authored, {})]
+        ordered_paths = sorted(paths, key=repr)
+        for entry in entries:
+            expanded = {}
+            projected = set()
+            for scope, constraints in states:
+                for candidate, binding in _vars_file_variant_choices(entry, scope, constraints):
+                    merged = scope
+                    for mapping in candidate:
+                        merged = combine_vars(merged, mapping)
+                    expanded.setdefault((repr(merged), tuple(sorted(binding.items()))), (merged, binding))
+                    if len(expanded) > 4096:
+                        raise ValueError("too many vars-file replay states for include_tasks; simplify the file selectors")
+                    projected.add(tuple(repr(_vars_input_at(merged, key, path)) for key, path in ordered_paths))
+                    if len(projected) > 256:
+                        return {}, ()
+            states = expanded.values()
+        scopes = [{**scope, **{name: value for name, value in binding.items() if value is not None}}
+                  for scope, binding in states]
+    variants = {}
+    for scope in scopes:
+        branch = _IncludeVariables(
+            _native_include_values(scope), includes.all_vars, includes.runtime_writes | includes.variant_writes)
+        key = _include_variant_key(task, sources, branch, portable=True)
+        if key is not None:
+            variants.setdefault(key, []).append(scope)
+    result = {}
+    for filename, candidates in variants.items():
+        result[filename] = _include_variant_branch(includes, candidates[0], candidates)
+    return result, sorted(names)
+
+
+def _include_variant_branch(includes, base_scope, candidates):
+    branch = _IncludeVariables(
+        _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes,
+        controller_execution=includes.controller_execution)
+    branch.vars_file_scopes = candidates
+    branch.vars_file_writes = {
+        key for scope in candidates for key in scope.keys() | base_scope.keys()
+        if key not in base_scope or key not in scope or scope[key] != base_scope[key]
+    }
+    return branch
+
+
+def _record_build_only_selector_reads(includes, higher_layers, reads):
+    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+    from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
+
+    merge_hashes = DEFAULT_HASH_BEHAVIOUR == "merge"
+    replay_inputs = dict.fromkeys(includes.build_only_selector_names, frozenset())
+    for layer in higher_layers:
+        _clear_vars_file_blocks(replay_inputs, layer, merge_hashes)
+    includes.compile_selector_reads.update(read for read in reads if _vars_file_reads_blocked(replay_inputs, [read]))
+    # Launch extra vars can override even a binding shielded from replay by
+    # the child's own vars. With replace semantics a whole mapping can change.
+    includes.compile_selector_extra_reads.update((name, path if merge_hashes else ())
+                                                for name, path in reads if name not in _MAGIC_VAR_NAMES)
+
+
+def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
+    """Expand an include and any bodies selected by replayed vars files."""
+    args = task.args or {}
+    raw_fname = args.get("_raw_params") or args.get("file")
+    if not isinstance(raw_fname, str):
+        return None
+    fname = _template_include_filename(task, raw_fname, includes) if _is_templated(raw_fname) else raw_fname
+    if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
+        return None
+    if includes.build_only_selector_names and _is_templated(raw_fname):
+        # This child is baked into a build-only parent body. Guard the
+        # vars-file inputs it used even when the parent's filename is unchanged.
+        variables, higher_layers = _include_template_variables(task, includes)
+        reads, unknown_lookup = set(), set()
+        if (_gather_timeout_dependencies(raw_fname, variables, selector=True, allow_controller=True,
+                                         paths=reads, unknown_lookup=unknown_lookup) is None or unknown_lookup):
+            reads.update((name, ()) for name in includes.build_only_selector_names)
+        _record_build_only_selector_reads(includes, higher_layers, reads)
+    parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
+    if fname is None or (parents and includes.vars_file_scopes is not None):
+        sources = (raw_fname, *parents)
+        variants, inputs = _vars_file_include_variants(task, sources, includes)
+        if fname is None and not variants and any(
+                value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):
+            node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
+            node["_deferred_apply_include"] = True
+            node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
+            return node
+        if variants or fname is None:
+            return _expand_include_variants(
+                task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes)
     path = _include_tasks_path(task, fname, includes)
+    return _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
+
+
+def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes):
+    if not variants and (includes.incomplete or includes.unresolved_vars_file):
+        node = _convert_task(task, actions, basedir)
+        node["vars_file_include_fallback"] = True
+        node["fallback_reason"] = "vars-file task selection requires core linear"
+        return node
+    raw_fname = sources[0]
+    build_only = not variants
+    default_key = None
+    default_inputs = None
+    if includes.compile_selected_vars is not None:
+        default = _IncludeVariables(
+            includes.compile_selected_vars, includes.all_vars, includes.runtime_writes | includes.variant_writes,
+            controller_execution=includes.controller_execution)
+        default_key = _include_variant_key(task, sources, default)
+        if default_key is not None and (default_key not in variants or
+                                        _include_variant_key(task, sources, default, portable=True) != default_key):
+            default_inputs = _compile_include_inputs(task, sources, default)
+            if build_only and default_inputs is None:
+                return None
+            if default_key in variants:
+                # The same parent filename does not imply the same bindings
+                # for its child includes and imports.
+                scopes = variants[default_key].vars_file_scopes
+                variants[default_key] = _include_variant_branch(includes, default.play_vars,
+                                                                [default.play_vars, *scopes])
+            else:
+                if build_only:
+                    default.build_only_selector_names = includes.vars_file_writes
+                variants[default_key] = default
+    bodies = []
+    apply_metadata = {}
+    writes = set()
+    role = getattr(task, "_role", None)
+    roots = {os.path.realpath(basedir)}
+    if role is not None:
+        roots.add(os.path.realpath(role._role_path))
+    pending = [(key, branch, key == default_key, ()) for key, branch in reversed(tuple(variants.items()))]
+    while pending:
+        key, branch, build_selected, known_reads = pending.pop()
+        fname = key if isinstance(key, str) else key[0]
+        branch.compile_selected_vars = includes.compile_selected_vars if build_selected else None
+        if build_selected:
+            branch.play_vars = includes.compile_selected_vars
+        variant_actions = set()
+        try:
+            path = _include_tasks_path(task, fname, branch)
+            if not path or (not build_selected and not any(
+                    os.path.commonpath((root, os.path.realpath(path))) == root for root in roots)):
+                continue
+            variant_task = task.copy(exclude_parent=True)
+            variant_task._parent = task._parent
+            if _core_version() >= (2, 19):
+                # Modern Core keeps the selected directory in the parent include.
+                variant_task._ansiroll_include_variant_filename = fname
+            expanded = _expand_include_tasks(variant_task, raw_fname, fname, path,
+                                             variant_actions, basedir, only_tags, skip_tags, branch)
+        except Exception:
+            if build_selected:
+                raise
+            continue
+        selector_names = (branch.build_only_selector_names if build_only
+                          else includes.vars_file_writes | branch.vars_file_writes)
+        reads = set(known_reads) | {
+            (name, path) for name, path in branch.compile_selector_reads if name in selector_names
+        }
+        variant_inputs = None
+        if build_only and reads:
+            variables, _ = _include_template_variables(task, branch)
+            reads.difference_update((name, path) for name, path, _, _ in default_inputs)
+            default_inputs.extend(_include_input_snapshot(variables, sorted(reads, key=repr)))
+        elif reads:
+            reads = sorted(reads, key=repr)
+            variant_inputs, selected, alternatives = _partition_include_import_scopes(task, branch, reads)
+            if alternatives:
+                if len(pending) + len(bodies) + len(alternatives) >= 256:
+                    raise ValueError("too many static import bindings for include_tasks")
+                # Re-expand each group in isolation so static imports resolve
+                # in its scope, even when they share an entry path.
+                groups = [(branch.play_vars, selected, build_selected)]
+                groups.extend((scopes[0], scopes, False) for scopes in alternatives)
+                pending.extend(
+                    (key, _include_variant_branch(includes, scope, scopes), selected_at_build, reads)
+                    for scope, scopes, selected_at_build in reversed(groups)
+                )
+                continue
+        if expanded is not None and expanded.get("type") == "include":
+            actions.update(variant_actions)
+            writes.update(branch.runtime_writes | branch.variant_writes)
+            body = {"type": "block", "block": expanded["tasks"], "include_variant": _include_variant_label(key),
+                    "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref"),
+                    "include_build_selected": build_selected}
+            if variant_inputs is not None:
+                body["include_variant_inputs"] = variant_inputs
+            bodies.append(body)
+            apply_metadata = {key: expanded[key] for key in ("apply_flags", "apply_omit_fallback", "apply_vars")
+                              if key in expanded}
+    if not bodies:
+        return None
+    includes.variant_writes.update(writes - includes.runtime_writes)
+    includes.resolved_template = True
+    role_defaults, role_vars = _role_vars(task)
+    node = _include_node(task, "include_tasks", raw_fname, basedir, role_defaults, role_vars, bodies, None, None)
+    node.update(apply_metadata)
+    node["include_selector"] = _tag_untrusted(raw_fname)
+    if len(sources) > 1:
+        node["include_parent_selectors"] = _tag_untrusted(list(sources[1:]))
+    node["include_selector_inputs"] = sorted(set(inputs) | {
+        name for body in bodies for name, _, _, _ in body.get("include_variant_inputs", ())
+    })
+    node["compile_selection"] = _include_variant_label(default_key)
+    if build_only:
+        node["include_build_only"] = True
+        extra_reads = variants[default_key].compile_selector_extra_reads
+        if extra_reads:
+            node["include_compile_extra_inputs"] = _include_input_snapshot(
+                task.get_variable_manager().extra_vars, sorted(extra_reads, key=repr))
+    if default_inputs is not None and any(variant["include_variant"] == node["compile_selection"] for variant in bodies):
+        node["include_compile_inputs"] = default_inputs
+        node["include_selector_inputs"] = sorted(set(node["include_selector_inputs"]) |
+                                                 {name for name, _, _, _ in default_inputs})
+    return node
+
+
+def _include_variant_label(key):
+    return list(key) if isinstance(key, tuple) else key
+
+
+def _partition_include_import_scopes(task, branch, reads):
+    variables, _ = _include_template_variables(task, branch)
+    selected_inputs = _include_input_snapshot(variables, reads)
+    partitions = {}
+    for scope in branch.vars_file_scopes or ():
+        sample = _IncludeVariables(_native_include_values(scope), branch.all_vars, set())
+        variables, _ = _include_template_variables(task, sample)
+        signature = repr(_include_input_snapshot(variables, reads))
+        partitions.setdefault(signature, []).append(scope)
+    selected_scopes = partitions.pop(repr(selected_inputs), [])
+    return selected_inputs, selected_scopes, list(partitions.values())
+
+
+def _compile_include_inputs(task, sources, includes):
+    variables, _ = _include_template_variables(task, includes)
+    paths = set()
+    for source in sources:
+        if _gather_timeout_dependencies(source, variables, selector=True, allow_controller=True, paths=paths) is None:
+            return None
+    return _include_input_snapshot(variables, sorted(paths, key=repr))
+
+
+def _include_input_snapshot(variables, paths):
+    from .runtime import _MISSING_VARS_FILE_INPUT, _vars_input_at
+
+    inputs = []
+    for name, path in paths:
+        value = _vars_input_at(variables, name, path)
+        if value is _MISSING_VARS_FILE_INPUT:
+            inputs.append((name, path, False, None))
+        else:
+            inputs.append((name, path, True, _tag_untrusted(value, template_syntax_only=True)))
+    return inputs
+@contextmanager
+def _include_source_loader(loader, plaintext_only, roots):
+    original = vars(loader).get("load_from_file")
+    if not plaintext_only:
+        yield
+        return
+    if getattr(original, "_ansiroll_plaintext_guard", False):
+        previous_roots = original._ansiroll_plaintext_roots
+        original._ansiroll_plaintext_roots = previous_roots | set(roots)
+        try:
+            yield
+        finally:
+            original._ansiroll_plaintext_roots = previous_roots
+        return
+
+    import sys
+    from ansible.playbook.role import Role
+
+    def read(path, *args, **kwargs):
+        resolved = loader.path_dwim(path)
+        physical = os.path.realpath(resolved)
+        permitted = read._ansiroll_plaintext_roots.copy()
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_code is Role._load_role_data.__code__:
+                # Core has already resolved this role, including metadata dependencies.
+                permitted.add(os.path.realpath(frame.f_locals["self"]._role_path))
+            frame = frame.f_back
+        if not any(os.path.commonpath((root, physical)) == root for root in permitted):
+            raise ValueError("runtime-only task source is outside the playbook and role directories")
+        return _rewrite_includes(_load_plain_ansible_source(physical, opener=_open_linked_role_source))
+
+    read._ansiroll_plaintext_guard = True
+    read._ansiroll_plaintext_roots = set(roots)
+    loader.load_from_file = read
+    try:
+        yield
+    finally:
+        if original is None:
+            del loader.load_from_file
+        else:
+            loader.load_from_file = original
+
+
+@contextmanager
+def _include_import_scope(task, includes):
+    """Give the native import parser the candidate's play bindings."""
+    from ansible import constants as C
+    from ansible.playbook.task_include import TaskInclude
+
+    native_scope = includes.vars_file_scopes is None and includes.compile_selected_vars is not None
+    if native_scope and not includes.build_only_selector_names:
+        yield
+        return
+
+    manager = task.get_variable_manager()
+    original = vars(manager).get("get_vars")
+    get_vars = manager.get_vars
+
+    def scoped_get_vars(*args, **kwargs):
+        current = kwargs.get("task")
+        if current is None:
+            return get_vars(*args, **kwargs)
+        play = kwargs.get("play")
+        if play is not None and not native_scope:
+            candidate_play = play.copy()
+            candidate_play.vars = includes.play_vars
+            candidate_play.vars_files = []
+            kwargs["play"] = candidate_play
+        variables = get_vars(*args, **kwargs)
+        if current.action in (*C._ACTION_IMPORT_TASKS, *C._ACTION_IMPORT_ROLE):
+            # The native parser templates the operand and its ancestry before
+            # opening a file. Validate both before it can run controller lookups.
+            sources = [current.args]
+            if current.action in C._ACTION_IMPORT_ROLE:
+                sources.extend((current._role_name, current._from_files, current.vars))
+            parent = _include_parent(current)
+            while parent is not None:
+                if isinstance(parent, TaskInclude):
+                    sources.append(parent.args.get("_raw_params"))
+                parent = _include_parent(parent)
+            from .runtime import _selector_template_sources
+
+            templates = [source for value in sources for source, _, _ in _selector_template_sources(value)]
+            selector_reads = set()
+            for source in templates:
+                reads, unknown_lookup = set(), set()
+                if _gather_timeout_dependencies(
+                        source, variables, selector=True, allow_controller=True, computed=set(), paths=reads,
+                        unknown_lookup=unknown_lookup if native_scope else None) and not unknown_lookup:
+                    selector_reads.update(reads)
+                else:
+                    names = includes.build_only_selector_names if native_scope else includes.vars_file_writes
+                    selector_reads.update((name, ()) for name in names)
+                    if native_scope:
+                        selector_reads.update(reads)
+            if native_scope:
+                _, higher_layers = _include_template_variables(current, includes)
+                _record_build_only_selector_reads(includes, higher_layers, selector_reads)
+            else:
+                includes.compile_selector_reads.update(selector_reads)
+            if includes.compile_selected_vars is None:
+                variables = _portable_include_scope(current, templates, variables)
+                if variables is None:
+                    raise ValueError("runtime-only import uses a controller-only template")
+        return variables
+
+    manager.get_vars = scoped_get_vars
+    try:
+        yield
+    finally:
+        if original is None:
+            del manager.get_vars
+        else:
+            manager.get_vars = original
+
+
+def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes):
     if path is None or not os.path.exists(path):
         return None
+    args = task.args or {}
     role = getattr(task, "_role", None)
     physical_path = os.path.realpath(path)
     scope = _include_scope_key(task)
@@ -2001,10 +2563,6 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if ref is None:
         try:
             from ansible.playbook.helpers import load_list_of_blocks
-            try:
-                data = task._loader.load_from_file(path, trusted_as_template=True)
-            except TypeError:  # older ansible-core without the trust kwarg
-                data = task._loader.load_from_file(path)
             handler = _is_handler(task)
             parent = task
             if args.get("apply"):
@@ -2014,10 +2572,18 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 parent = include.build_parent_block()
                 if render_apply and parent.vars:
                     parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
-            blocks = load_list_of_blocks(
-                data, play=_play_of(task), task_include=parent, role=task._role,
-                use_handlers=handler, variable_manager=task.get_variable_manager(),
-                loader=task._loader)
+            roots = [os.path.realpath(basedir)]
+            if role is not None:
+                roots.append(os.path.realpath(role._role_path))
+            with _include_source_loader(task._loader, includes.compile_selected_vars is None, roots), _include_import_scope(task, includes):
+                try:
+                    data = task._loader.load_from_file(path, trusted_as_template=True)
+                except TypeError:  # older ansible-core without the trust kwarg
+                    data = task._loader.load_from_file(path)
+                blocks = load_list_of_blocks(
+                    data, play=_play_of(task), task_include=parent, role=task._role,
+                    use_handlers=handler, variable_manager=task.get_variable_manager(),
+                    loader=task._loader)
         except Exception:
             return None
         includes.record_writes(blocks)
@@ -2036,9 +2602,10 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         _bind_include_apply_flags(parent, apply_options)
         _INCLUDE_STACK[key] = include_id
         try:
-            tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
-                                               skip_tags=skip_tags, includes=includes)
-                                 for b in blocks) if c]
+            with _include_source_loader(task._loader, includes.compile_selected_vars is None, roots):
+                tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
+                                                   skip_tags=skip_tags, includes=includes)
+                                     for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
         if parent is not task and parent.vars and tasks and not render_apply:
@@ -2117,7 +2684,8 @@ def _parent_include_paths(obj):
         if isinstance(obj, IncludeRole):
             yield getattr(obj, "_role_path", None) or "", False
         elif isinstance(obj, TaskInclude):
-            raw = (obj.args or {}).get("_raw_params") or (obj.args or {}).get("file")
+            raw = (getattr(obj, "_ansiroll_include_variant_filename", None)
+                   or (obj.args or {}).get("_raw_params") or (obj.args or {}).get("file"))
             if isinstance(raw, str) and ("{{" in raw or "{%" in raw):
                 yield raw, True
             else:
@@ -2259,9 +2827,9 @@ _MAGIC_VAR_NAMES = frozenset((
 ))
 
 
-def _template_include_filename(task, value, includes):
+def _template_include_filename(task, value, includes, *, runtime_portable=False):
     """Resolve an include filename using Ansible's own templar and precedence."""
-    resolved = _template_include_value(task, value, includes)
+    resolved = _template_include_value(task, value, includes, runtime_portable=runtime_portable)
     if isinstance(resolved, str) and not _is_templated(resolved):
         includes.resolved_template = True
     return None if resolved is _UNRESOLVED_INCLUDE_VALUE else resolved
@@ -2284,12 +2852,8 @@ def _compile_apply_filename_vars(task, variables, includes, *, portable=False):
     return compiled
 
 
-def _template_include_value(task, value, includes, *, portable=False):
-    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+def _include_template_variables(task, includes):
     from ansible.utils.vars import combine_vars
-
-    from ansible.vars.reserved import is_reserved_name
-    from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
 
     role_defaults, role_vars = _role_vars(task)
     extra_vars = task.get_variable_manager().extra_vars
@@ -2299,10 +2863,95 @@ def _template_include_value(task, value, includes, *, portable=False):
     for layer in (role_defaults, includes.play_vars, includes.all_vars or {}, role_vars,
                   task_vars, role_params, include_params, extra_vars):
         variables = combine_vars(variables, layer)
+    variables["playbook_dir"] = task._loader.get_basedir()
+    return variables, (role_vars, task_vars, role_params, include_params, extra_vars)
+
+
+def _portable_include_scope(task, sources, variables):
+    from ansible.errors import AnsibleError
+    from ansible.plugins.loader import filter_loader, lookup_loader, test_loader
+    from ansible.plugins.lookup import vars as builtin_vars
+
+    from .runtime import _GATHER_STRING_METHODS
+
+    roots = [*task.get_search_path(), task._loader.get_basedir()]
+
+    @lru_cache(maxsize=None)
+    def builtin_lookup(alias):
+        if alias != "ansible.builtin.vars" and any(
+                os.path.lexists(os.path.join(root, "lookup_plugins", "vars.py")) for root in roots):
+            return False
+        try:
+            resolved = lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
+        except (AnsibleError, ImportError):
+            return False
+        return bool(resolved and os.path.realpath(resolved) == os.path.realpath(builtin_vars.__file__))
+
+    @lru_cache(maxsize=None)
+    def builtin_jinja_path(kind):
+        # Core can import plugin modules just to discover which names they export.
+        loader = filter_loader if kind == "filter" else test_loader
+        directories = [entry.path for entry in loader._get_paths_with_context() if not entry.internal]
+        directories.extend(os.path.join(root, kind + "_plugins") for root in roots)
+        for directory in set(directories):
+            try:
+                with os.scandir(directory) as entries:
+                    if any(entry.name.endswith(".py") for entry in entries):
+                        return False
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return False
+        return True
+
+    def builtin_jinja_plugin(kind, name):
+        namespace, _, _ = name.rpartition(".")
+        return namespace in ("", "ansible.builtin", "ansible.legacy") and builtin_jinja_path(kind)
+
+    reads = {}
+    for source in sources:
+        paths = set()
+        dependencies = _gather_timeout_dependencies(
+            source, variables, _GATHER_STRING_METHODS, selector=True, paths=paths, vars_lookup_allowed=builtin_lookup)
+        if dependencies is None or _vars_filename_controller_requirements(
+                source, dependencies, paths=paths, jinja_plugin_allowed=builtin_jinja_plugin)[0]:
+            return None
+        for name, path in paths:
+            reads.setdefault(name, []).append(path)
+    if _core_version() >= (2, 19):
+        return variables
+    # Older Core eagerly renders every member of a referenced container.
+    # Preserve its shape while omitting values outside the selector's reads.
+    return {name: _project_include_input(variables[name], paths)
+            for name, paths in reads.items() if name in variables}
+
+
+def _project_include_input(value, paths):
+    if not paths:
+        return None
+    if () in paths:
+        return value
+    if isinstance(value, dict):
+        return {key: _project_include_input(item, [path[1:] for path in paths if path[0] == key])
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        result = [_project_include_input(item, [path[1:] for path in paths if path[0] in (i, i - len(value))])
+                  for i, item in enumerate(value)]
+        return tuple(result) if isinstance(value, tuple) else result
+    return value
+
+
+def _template_include_value(task, value, includes, *, runtime_portable=False, portable=False):
+    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+    from ansible.vars.reserved import is_reserved_name
+    from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
+
+    variables, higher_layers = _include_template_variables(task, includes)
+    extra_vars = higher_layers[-1]
     # Higher mappings can inherit keys from vars_files when hashes are merged.
-    higher_layers = role_vars, task_vars, role_params, include_params, extra_vars
     higher_names = set().union(*higher_layers)
-    replayed_names = higher_names if includes.incomplete else higher_names & includes.vars_file_writes
+    incomplete_scope = includes.incomplete or includes.unresolved_vars_file
+    replayed_names = higher_names if incomplete_scope else higher_names & includes.vars_file_writes
     vars_file_inputs = dict.fromkeys(replayed_names, frozenset())
     for layer in higher_layers:
         _clear_vars_file_blocks(vars_file_inputs, layer, DEFAULT_HASH_BEHAVIOUR == "merge")
@@ -2352,11 +3001,11 @@ def _template_include_value(task, value, includes, *, portable=False):
     def is_runtime(name):
         if name in loop_names or variables.get(name) is _UNRESOLVED_INCLUDE_VALUE:
             return True
-        if ((includes.incomplete or name in includes.vars_file_writes)
+        if ((incomplete_scope or name in includes.vars_file_writes)
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
                 and vars_file_can_change(name)):
             return True
-        if not _can_write_var(includes.runtime_writes, name):
+        if not (_can_write_var(includes.runtime_writes, name) or _can_write_var(includes.variant_writes, name)):
             return False
         # A scalar extra var replaces any runtime value. A mapping under
         # hash_behaviour=merge can still inherit keys from a runtime write.
@@ -2366,13 +3015,13 @@ def _template_include_value(task, value, includes, *, portable=False):
 
     if _depends_on_vars(value, variables, is_runtime):
         return _UNRESOLVED_INCLUDE_VALUE
-    if portable:
-        from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
+    if runtime_portable or includes.compile_selected_vars is None or portable:
+        from .runtime import _selector_template_sources
 
-        for source, _, _ in _selector_template_sources(_tag_untrusted(value)):
-            inputs = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS, selector=True)
-            if inputs is None or _vars_filename_controller_requirements(source, inputs)[0]:
-                return _UNRESOLVED_INCLUDE_VALUE
+        sources = [source for source, _, _ in _selector_template_sources(_tag_untrusted(value))]
+        variables = _portable_include_scope(task, sources, variables)
+        if variables is None:
+            return _UNRESOLVED_INCLUDE_VALUE
     try:
         from ansible.template import Templar
         try:
@@ -2383,6 +3032,20 @@ def _template_include_value(task, value, includes, *, portable=False):
         return templar.template(value, fail_on_undefined=True)
     except Exception:
         return _UNRESOLVED_INCLUDE_VALUE
+
+
+def _native_include_values(value):
+    if isinstance(value, dict):
+        if set(value) == {"__ansiroll_unsafe__"}:
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            return wrap_var(value["__ansiroll_unsafe__"])
+        return {key: _native_include_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_native_include_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_native_include_values(item) for item in value)
+    return value
 
 
 def _is_literal_include_template(value):
@@ -2437,8 +3100,12 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     handlers = []
     if ref is None:
         try:
-            role = Role.load(ri, play, parent_role=parent_role,
-                             from_files=from_files or None, from_include=True)
+            roots = [os.path.realpath(basedir)]
+            if task._role_path:
+                roots.append(os.path.realpath(task._role_path))
+            with _include_source_loader(task._loader, includes.compile_selected_vars is None, roots), _include_import_scope(task, includes):
+                role = Role.load(ri, play, parent_role=parent_role,
+                                 from_files=from_files or None, from_include=True)
             if _core_version() >= (2, 15):
                 dep_chain = role.get_dep_chain()
                 handler_dep_chain = dep_chain
