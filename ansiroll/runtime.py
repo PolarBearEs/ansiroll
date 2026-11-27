@@ -700,7 +700,9 @@ def _literal_vars_input(value):
     if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
         text = value["__ansiroll_unsafe__"]
         if isinstance(text, str) and not _looks_templated(text):
-            return text
+            return str(text)
+    if isinstance(value, _NO_TEMPLATE) and not _looks_templated(value):
+        return str(value)
     return value
 
 

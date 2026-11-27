@@ -6610,8 +6610,10 @@ def test_vars_file_alternate_static_import_uses_safe_candidate_scope(tmp_path, m
         assert messages == ["imported-alternate"]
 
 
-@pytest.mark.parametrize("alias", ["{{ child }}", "{{ child_alias }}", "{{ cfg.child }}"])
-def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, alias, monkeypatch):
+@pytest.mark.parametrize("alias, unsafe", [
+    ("{{ child }}", False), ("{{ child_alias }}", False), ("{{ cfg.child }}", False), ("{{ child }}", True),
+])
+def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, alias, unsafe, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
@@ -6622,8 +6624,9 @@ def test_vars_file_static_import_splits_shared_entry_by_child_binding(tmp_path, 
 """)
     for profile in ("normal", "alternate"):
         child = "{{ child }}" if profile == "alternate" else "normal.yml"
+        tag = "!unsafe " if unsafe and profile == "alternate" else ""
         (tmp_path / f"profile-{profile}.yml").write_text(
-            f"task_file: entry.yml\nchild: {profile}.yml\ncfg: {{child: '{child}'}}\n")
+            f"task_file: entry.yml\nchild: {tag}{profile}.yml\ncfg: {{child: '{child}'}}\n")
         (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: imported-{profile}}}\n")
     (tmp_path / "entry.yml").write_text(f"- import_tasks: '{alias}'\n")
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
