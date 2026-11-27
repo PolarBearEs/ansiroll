@@ -1958,7 +1958,8 @@ def test_copy_rejects_a_runtime_fetched_vault_source_before_writing(tmp_path):
 
 
 @pytest.mark.parametrize("decrypt", [False, True])
-def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt):
+@pytest.mark.parametrize("absolute", [False, True], ids=["role-relative", "absolute"])
+def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt, absolute):
     from stat import S_IMODE
 
     from ansible.parsing.vault import VaultLib, VaultSecret
@@ -1979,12 +1980,14 @@ def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt):
 - set_fact:
     source_name: runtime
 - copy:
-    src: '{{ source_name }}.vault'
+    src: 'SOURCE'
     dest: '{{ playbook_dir }}/installed'
     decrypt: DECRYPT
     mode: preserve
   diff: false
-""".replace("DECRYPT", json.dumps(decrypt)),
+""".replace("DECRYPT", json.dumps(decrypt))
+                   .replace("SOURCE", ("{{ playbook_dir }}/roles/payload/files/" if absolute else "")
+                            + "{{ source_name }}.vault"),
     })
     from tests import ansible_playbook_command
 
