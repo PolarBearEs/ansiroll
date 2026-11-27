@@ -1394,7 +1394,7 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
     import glob
 
     from jinja2 import Environment, TemplateSyntaxError, nodes
-    from .runtime import _first_found_list_option
+    from .runtime import _first_found_list_option, _selector_literal_member
 
     environment = Environment(keep_trailing_newline=True)
     named_homes = {}
@@ -1438,6 +1438,10 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
             return patterns
         if isinstance(term, nodes.Name):
             return [glob.escape(basedir) if term.name == "playbook_dir" else "*"]
+        if (core >= (2, 19) and isinstance(term, nodes.Getitem) and isinstance(term.node, nodes.Name)
+                and type(_selector_literal_member(term.arg)) is int):
+            # Modern Core reads just the selected member, which can change at launch.
+            return ["*"]
         if isinstance(term, (nodes.List, nodes.Tuple)):
             return [pattern for item in term.items for pattern in term_patterns(item, separators, keyword=keyword)]
         if isinstance(term, (nodes.Add, nodes.Concat)):

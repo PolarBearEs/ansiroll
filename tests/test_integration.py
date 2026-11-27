@@ -150,6 +150,58 @@ def test_standalone_vars_file_first_found_uses_launch_value_and_bundled_first_ma
 
 
 @pytest.mark.parametrize("keyword_files", [False, True], ids=["positional", "keyword"])
+def test_first_found_vars_files_replays_indexed_candidates(tmp_path, keyword_files):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires Core with lazy template list members")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    candidates:
+      - "{{ profile }}.yml"
+      - "{{ unrelated_filename }}"
+      - fallback.yml
+    directories:
+      - profiles
+      - "{{ unrelated_directory }}"
+  vars_files:
+    - "{{ lookup('first_found', FILES[candidates[0], candidates[-1]], paths=[directories[0]]) }}"
+  tasks:
+    - ansible.builtin.assert: {that: selected == expected}
+""".replace("FILES", "files=" if keyword_files else ""))
+    directory = tmp_path / "profiles"
+    directory.mkdir()
+    preferred = directory / "prod.yml"
+    fallback = directory / "fallback.yml"
+    preferred.write_text("selected: production\n")
+    fallback.write_text("selected: fallback\n")
+    choices = [("prod", "production"), ("missing", "fallback")]
+    for profile, expected in choices:
+        extra = json.dumps({"profile": profile, "expected": expected})
+        native = subprocess.run(
+            ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", extra, str(playbook)],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        )
+        assert native.returncode == 0, native.stdout + native.stderr
+
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    preferred.unlink()
+    fallback.unlink()
+    for profile, expected in choices:
+        extra = json.dumps({"profile": profile, "expected": expected})
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", str(artifact)], cwd=tmp_path,
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "ANSIROLL_EXTRA_VARS": extra},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("keyword_files", [False, True], ids=["positional", "keyword"])
 def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path, keyword_files):
     from ansiroll.loader import _core_version
     from tests import ansible_playbook_command
