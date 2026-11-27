@@ -1871,6 +1871,27 @@ def test_standalone_template_file_matches_comment_delimiter_handling(tmp_path, t
     assert output.read_bytes() == content
 
 
+@pytest.mark.skipif(Version(__version__) >= Version("2.11"), reason="requires Core 2.10 copy argument handling")
+def test_template_file_leaves_unsupported_comment_arguments_to_copy(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+        comment_start_string: "[["
+        comment_end_string: "]]"
+""", {"sample.j2": "a[[literal]]b\n"})
+    output = tmp_path / "rendered.txt"
+    output.write_bytes(b"existing\n")
+    expected = _ansible(path, tmp_path)
+    assert expected[1][3] == "1"
+    assert output.read_bytes() == b"existing\n"
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"existing\n"
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 

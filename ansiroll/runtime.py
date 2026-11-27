@@ -7287,7 +7287,7 @@ class Runtime:
                 # follow and dest on to copy and drops template-only options.
                 args["mode"] = lmode if lmode is not None else args.get("mode")
                 args["follow"] = _ansible_bool(args.get("follow", False))
-                for key in _TEMPLATE_ONLY_ARGS:
+                for key in _template_task_only_args():
                     args.pop(key, None)
             else:
                 data = raw.encode("utf-8", "surrogateescape")
@@ -8280,12 +8280,18 @@ _DEFAULT_REAL_FILE_ARGS = frozenset((
 ))
 
 
+def _template_task_only_args():
+    if _core_at_least(2, 11):
+        return _TEMPLATE_ONLY_ARGS
+    return tuple(key for key in _TEMPLATE_ONLY_ARGS if key not in ("comment_start_string", "comment_end_string"))
+
+
 def _template_file_options(source, args, warn):
     import ast
 
     options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
                "lstrip_blocks": _boolean(args.get("lstrip_blocks", False))}
-    for key in _TEMPLATE_ONLY_ARGS:
+    for key in _template_task_only_args():
         if key.endswith(("_start_string", "_end_string")) and args.get(key) is not None:
             value = args[key]
             if not isinstance(value, (str, int, float, bool)):
