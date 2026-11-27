@@ -6609,10 +6609,13 @@ class Runtime:
             if failure:
                 return {"failed": True, "changed": False, "msg": failure}
             if content is None and _ansible_boolean(args.get("remote_src", False)):
-                args.pop("decrypt", None)
                 action = task.get("action")
-                return self.run_module(action if action in self.modules else _COPY_MODULE,
-                                       _fail_on_undef(args), become=become)
+                if action not in self.modules:
+                    action = _COPY_MODULE
+                builtin = self.modules.get(_COPY_MODULE, {}).get("module_fqn")
+                if action == _COPY_MODULE or (builtin and self.modules[action].get("module_fqn") == builtin):
+                    args.pop("decrypt", None)
+                return self.run_module(action, _fail_on_undef(args), become=become)
         else:
             content = None
 
@@ -6643,8 +6646,12 @@ class Runtime:
                 lookup_task_id = task.get("runtime_id")
             if raw is None and self.controller_source_fn and (key is not None or lookup_task_id):
                 try:
-                    fetched = (self.controller_source_fn(src, lookup_task_id) if lookup_task_id
-                               else self.controller_source_fn(src))
+                    if lookup_task_id:
+                        fetch_options = {"decrypt": True} if name == "copy" and _ansible_boolean(
+                            args.get("decrypt", True)) else {}
+                        fetched = self.controller_source_fn(src, lookup_task_id, **fetch_options)
+                    else:
+                        fetched = self.controller_source_fn(src)
                     raw = fetched.get("data")
                     meta = fetched.get("meta") or {}
                     if isinstance(raw, bytes):
@@ -6658,7 +6665,8 @@ class Runtime:
                         "msg": "%s: src %r was not baked into the compiled file" % (name, src)}
             try:
                 raw = self._asset_text(raw)
-                if (name == "copy" and not task.get("_vault_plaintext") and _ansible_boolean(args.get("decrypt", True))
+                if (name == "copy" and not (task.get("_vault_plaintext") or meta.get("vault_decrypted"))
+                        and _ansible_boolean(args.get("decrypt", True))
                         and raw.startswith("$ANSIBLE_VAULT;")):
                     raise RuntimeError("Vault source requires controller decryption. " + _vault_source_recompile_note(task))
             except Exception as ex:
@@ -8368,8 +8376,8 @@ def agent_main():
             return reply.get("result", {})
         rt.delegate_fn = _delegate
 
-        def _controller_source(path, lookup_task_id=None):
-            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id})
+        def _controller_source(path, lookup_task_id=None, *, decrypt=False):
+            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id, "decrypt": decrypt})
             reply = _chan_recv()
             if not reply or reply.get("t") != "source_result":
                 raise RuntimeError("controller did not return a source result")

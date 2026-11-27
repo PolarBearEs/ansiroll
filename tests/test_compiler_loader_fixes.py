@@ -1957,6 +1957,42 @@ def test_copy_rejects_a_runtime_fetched_vault_source_before_writing(tmp_path):
     assert not dest.exists()
 
 
+@pytest.mark.parametrize("decrypt", [False, True])
+def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt):
+    from stat import S_IMODE
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    secret = VaultSecret(b"synthetic-test-password")
+    password = tmp_path / "vault-password"
+    password.write_bytes(secret.bytes)
+    payload = b"selected synthetic vault data\n"
+    encrypted = VaultLib([("default", secret)]).encrypt(payload, secret=secret)
+    _write(tmp_path, {
+        "pb.yml": "- hosts: localhost\n  gather_facts: false\n  roles: [payload]\n",
+        "roles/payload/files/seed.vault": "plaintext candidate\n",
+        "roles/payload/tasks/main.yml": """- copy:
+    content: '{{ encrypted_fixture }}'
+    dest: '{{ role_path }}/files/runtime.vault'
+    mode: '0640'
+- set_fact:
+    source_name: runtime
+- copy:
+    src: '{{ source_name }}.vault'
+    dest: '{{ playbook_dir }}/installed'
+    decrypt: '{{ decrypt_source }}'
+    mode: preserve
+  diff: false
+""",
+    })
+    _ansible(tmp_path / "pb.yml", "--vault-password-file", str(password),
+             "-e", json.dumps({"encrypted_fixture": encrypted.decode(), "decrypt_source": decrypt}),
+             strategy="ansiroll.core.ansiroll", returncode=0)
+    installed = tmp_path / "installed"
+    assert installed.read_bytes() == (payload if decrypt else encrypted)
+    assert S_IMODE(installed.stat().st_mode) == (0o600 if decrypt else 0o640)
+
+
 def test_builtin_unarchive_normalizes_options_before_dispatch():
     from ansiroll.runtime import Runtime
 

@@ -3676,13 +3676,19 @@ def test_copy_without_embedded_modules_fails_clearly(tmp_path):
     assert not dest.exists()
 
 
-@pytest.mark.parametrize("module", ["copy", "ansible.builtin.copy"])
-def test_remote_copy_prefers_the_embedded_task_module(monkeypatch, module):
-    rt = Runtime({module: {}}, "", {"inventory_hostname": "h"})
-    monkeypatch.setattr(rt, "run_module", lambda action, args, become: {"action": action})
+@pytest.mark.parametrize("modules, module, receives_decrypt", [
+    ({"copy": {"module_fqn": "custom.copy"}}, "copy", True),
+    ({"copy": {"module_fqn": "ansible.modules.copy"}}, "copy", False),
+    ({}, "ansible.builtin.copy", False),
+])
+def test_remote_copy_prefers_the_embedded_task_module(monkeypatch, modules, module, receives_decrypt):
+    modules = {"ansible.builtin.copy": {"module_fqn": "ansible.modules.copy"}, **modules}
+    rt = Runtime(modules, "", {"inventory_hostname": "h"})
+    monkeypatch.setattr(rt, "run_module", lambda action, args, become: {"action": action, "args": args})
     result = rt._run_file_action("copy", {"action": "copy"},
-                                 {"src": "/source", "dest": "/output", "remote_src": True}, {})
-    assert result == {"action": module}
+                                 {"src": "/source", "dest": "/output", "remote_src": True, "decrypt": False}, {})
+    assert result["action"] == module
+    assert ("decrypt" in result["args"]) is receives_decrypt
 
 
 def test_copy_fetches_runtime_created_controller_source(tmp_path):
