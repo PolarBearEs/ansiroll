@@ -3742,18 +3742,24 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
             read_path = task._loader.path_dwim(path) if role_path else path
             source_path = read_path
             opener = None
+            lookup_realpath_differs = False
             if read_path != path:
                 source_path = os.path.realpath(read_path)
-                if source_path != os.path.realpath(path):
+                lookup_realpath_differs = source_path != os.path.realpath(path)
+                if lookup_realpath_differs:
                     roots = _role_source_roots(task, basedir)
                     if not (any(_visible_below(read_path, root) for root in roots)
                             and any(_visible_below(source_path, os.path.realpath(root)) for root in roots)):
                         raise OSError("normalized source is outside the visible role and playbook roots")
                 opener = partial(_open_role_source, opener=_open_linked_role_source)
             with _checked_role_source(source_path, opener=opener) as (fh, st):
+                if name == "template" and lookup_realpath_differs:
+                    # Native templates use the lookup metadata when
+                    # normalization selects a different file.
+                    lookup_stat = os.stat(path)
+                    if not os.path.samestat(st, lookup_stat):
+                        st = lookup_stat
                 raw = fh.read()
-            if name == "template" and read_path != path:
-                st = os.stat(path)
         except (OSError, _RoleSourceLeaseError) as ex:
             baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
             continue

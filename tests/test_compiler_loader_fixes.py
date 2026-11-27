@@ -586,6 +586,48 @@ def test_baked_source_checks_descriptor_type_before_reading(tmp_path, monkeypatc
     assert "_baked_meta" not in node
 
 
+@pytest.mark.parametrize("src, loop", [
+    pytest.param("app.j2", "", id="explicit"),
+    pytest.param("{{ item }}.j2", "  loop: [app]\n", id="literal-loop"),
+    pytest.param("nested/../app.j2", "", id="normalized-path"),
+    pytest.param("${ANSIROLL_TEST_TEMPLATE_NAME}.j2", "", id="normalized-hardlink"),
+])
+def test_static_template_preserves_mode_from_payload_descriptor(tmp_path, monkeypatch, src, loop):
+    _write(tmp_path, {
+        "pb.yml": "- hosts: localhost\n  gather_facts: false\n  roles: [r]\n",
+        "roles/r/tasks/main.yml": (
+            f"- template: {{src: '{src}', dest: rendered.txt, mode: preserve}}\n" + loop
+        ),
+        "roles/r/templates/app.j2": "template payload\n",
+    })
+    source = tmp_path / "roles/r/templates/app.j2"
+    (source.parent / "nested").mkdir()
+    monkeypatch.setenv("ANSIROLL_TEST_TEMPLATE_NAME", "app")
+    os.link(source, source.with_name("${ANSIROLL_TEST_TEMPLATE_NAME}.j2"))
+    source.chmod(0o644)
+    pathname_stat = source.stat()
+    original_fstat = os.fstat
+
+    def descriptor_stat(fd):
+        info = original_fstat(fd)
+        if not os.path.samestat(info, pathname_stat):
+            return info
+        fields = list(info)
+        fields[stat.ST_MODE] = stat.S_IFREG | 0o640
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "fstat", descriptor_stat)
+    compiled, _ = compile_playbook(str(tmp_path / "pb.yml"))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compiled)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, env=_env(),
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rendered = tmp_path / "rendered.txt"
+    assert rendered.read_text() == "template payload\n"
+    assert stat.S_IMODE(rendered.stat().st_mode) == 0o640
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires a POSIX FIFO")
 def test_compile_dynamic_role_source_prefix_keeps_blocker_from_earlier_root(tmp_path):
     _write(tmp_path, {"pb.yml": """
