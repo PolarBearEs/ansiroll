@@ -3436,6 +3436,46 @@ class _ConditionalCodeGenerator(_AnsirollCodeGenerator):
             self.write(")")
 
 
+class _FileCodeGenerator(_AnsirollCodeGenerator):
+    def write_commons(self):
+        super().write_commons()
+        # Jinja 2.11 uses its string-only global concat unless we bind the
+        # file environment's concatenator in the root and block functions.
+        self.writeline("concat = environment.concat")
+
+    def _output_child_to_const(self, node, frame, finalize):
+        if not isinstance(node, jinja2.nodes.TemplateData):
+            raise jinja2.nodes.Impossible()
+        return super()._output_child_to_const(node, frame, finalize)
+
+    def _output_child_pre(self, node, frame, finalize):
+        if finalize.src is not None:
+            self.write(finalize.src)
+
+    def _output_child_post(self, node, frame, finalize):
+        if finalize.src is not None:
+            self.write(")")
+
+
+class _ConditionalFileCodeGenerator(_ConditionalCodeGenerator, _FileCodeGenerator):
+    pass
+
+
+def _concat_file_output(nodes):
+    preserve_none = not _core_at_least(2, 19, 1)
+    values = [value for value in nodes if preserve_none or value is not None]
+    if len(values) < 2:
+        return values[0] if values else None
+    return "".join("None" if value is None else _native_file_text(value)
+                   for value in values if not isinstance(value, _Omit))
+
+
+def _native_file_text(value):
+    if value is None:
+        return ""
+    return str(_fail_on_undef(_mark_unsafe(value)))
+
+
 class _KeywordCodeGenerator(_AnsirollCodeGenerator, NativeCodeGenerator):
     def write_commons(self):
         super().write_commons()
@@ -3537,12 +3577,12 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message, missing=missing)
 
 
-def _bare_template_expression(text, *, lex=None):
+def _bare_template_expression(text, *, lex=None, verify=False):
     stripped = text.strip()
     if not (stripped.startswith("{{") and stripped.endswith("}}")):
         return None
     inner = stripped[2:-2]
-    if not ("{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
+    if not (verify or "{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
             or inner.endswith(("-", "}"))):
         return inner.strip()
     try:
@@ -3855,10 +3895,22 @@ class _Templater:
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
-    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None):
+    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None, file_options=(), file_header=False):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
-        if not _looks_templated(text) and not (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text):
+        if file_newline is None:
+            templated = _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text)
+        else:
+            settings = dict(file_options)
+            starts = [
+                settings.get(kind + "_start_string", getattr(self.env, kind + "_start_string"))
+                for kind in ("variable", "block", "comment")
+            ]
+            if (any(not isinstance(start, str) or not start for start in starts)
+                    or _core_at_least(2, 19) and len(set(starts)) != len(starts)):
+                raise ValueError("template opening delimiters must be distinct non-empty strings")
+            templated = file_header or any(start in text for start in starts)
+        if not templated:
             if file_newline is not None and _legacy_templating():
                 return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", file_newline)
             return text
@@ -3874,7 +3926,8 @@ class _Templater:
             # A Python plugin can read an alias that starts a nested template.
             # Its Jinja expressions still need lazy hostvars entries.
             with self._plugin_arg_scope(None):
-                result = self._render_string(text, ctx, strict, file_newline=file_newline)
+                result = self._render_string(
+                    text, ctx, strict, file_newline=file_newline, file_options=file_options, file_header=file_header)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -4090,22 +4143,17 @@ class _Templater:
                     pending.extend(value)
         return False
 
-    def _render_string(self, text, ctx, strict=False, *, file_newline=None):
+    def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=(), file_header=False):
         stripped = text.strip()
-        check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE)
+        check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
         native_keyword = check_mode_template is True
-        expr = None
-        if check_mode_template is None or stripped == text:
-            expr = _bare_template_expression(stripped, lex=self.env.lex)
-        if expr is None:
-            # Full templates keep their existing rendering and newline behavior.
-            file_newline = None
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
+        native_file = file_newline is not None and not _legacy_templating()
         if native_keyword:
             if env not in self._keyword_environments:
                 keyword_env = env.overlay()
@@ -4121,18 +4169,29 @@ class _Templater:
                 self._keyword_environments[env] = keyword_env
             env = self._keyword_environments[env]
         if file_newline is not None:
-            key = (env, file_newline)
+            key = (env, file_newline, file_options, native_file)
             if key not in self._file_environments:
+                settings = {"newline_sequence": file_newline, "keep_trailing_newline": False, **dict(file_options)}
                 file_env = env.overlay()
-                file_env.keep_trailing_newline = False
-                file_env.newline_sequence = file_newline
+                for option, value in settings.items():
+                    setattr(file_env, option, value)
+                if native_file:
+                    file_env.code_generator_class = _ConditionalFileCodeGenerator if lazy_names else _FileCodeGenerator
+                    file_env.concat = _concat_file_output
+                    file_env.finalize = _concretize
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
-        template_key = (text, strict, lazy_names, file_newline, native_keyword)
+        expr = None
+        legacy_header = file_header and not native_file
+        if (not legacy_header and (check_mode_template is None or text == stripped)
+                and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
+            expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
+        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
+        template_key = (text, *template_options)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
         if expr is not None:
-            expr_key = (expr, strict, lazy_names, file_newline, native_keyword)
+            expr_key = (expr, *template_options)
             try:
                 if tracking and ("[" in expr or "(" in expr or "+" in expr or "{" in expr):
                     sequence = self._conditional_list(text.strip(), env, ctx, strict)
@@ -4152,7 +4211,11 @@ class _Templater:
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-                if native_keyword:
+                if native_file:
+                    # Bundled Jinja uses the global text concatenator in
+                    # Template.render, even when the overlay has a native one.
+                    result = _concat_file_output(tmpl.root_render_func(tmpl.new_context(ctx)))
+                elif native_keyword:
                     result = _concat_keyword_segments(tmpl.generate(**ctx))
                 else:
                     result = tmpl.render(**ctx)
@@ -4172,8 +4235,8 @@ class _Templater:
                 tokens = list(env.lex(text))
                 prefix = tokens[0][2] if tokens[0][1] == "data" else ""
                 suffix = tokens[-1][2] if tokens[-1][1] == "data" else ""
-                prefix = prefix.replace("\n", file_newline)
-                suffix = suffix.replace("\n", file_newline)
+                prefix = prefix.replace("\n", env.newline_sequence)
+                suffix = suffix.replace("\n", env.newline_sequence)
                 legacy = _legacy_templating()
                 if prefix or suffix:
                     value = "" if not legacy and isinstance(result, _Omit) else result
@@ -4185,8 +4248,13 @@ class _Templater:
                               else str(_as_text(result)))
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
+                if file_header and source_newlines == len(text):
+                    # Removing the header also consumed a trailing LF.
+                    source_newlines += 1
                 result_newlines = len(result) - len(result.rstrip("\n"))
-                result += file_newline * (source_newlines - result_newlines)
+                # Core 2.14–2.18 restore using the overlay's newline sequence.
+                restored_newline = env.newline_sequence if not native_file and _core_at_least(2, 14) else file_newline
+                result += restored_newline * (source_newlines - result_newlines)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
                 # when a later assertion member reads a cached alias.
@@ -7277,11 +7345,13 @@ class Runtime:
                 except Exception:
                     pass
                 try:
-                    rendered = self.templater.render_string(raw, tctx, file_newline=newline_sequence)
+                    raw, options, header = _template_file_options(raw, args, self.on_warning)
+                    rendered = self.templater.render_string(
+                        raw, tctx, file_newline=newline_sequence, file_options=options, file_header=header)
                     if _core_at_least(2, 19) and isinstance(rendered, _Omit):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
-                    rendered = _as_text(rendered)
+                    rendered = _native_file_text(rendered) if _core_at_least(2, 19) else _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
@@ -7295,7 +7365,7 @@ class Runtime:
                 # follow and dest on to copy and drops template-only options.
                 args["mode"] = lmode if lmode is not None else args.get("mode")
                 args["follow"] = _ansible_bool(args.get("follow", False))
-                for key in _TEMPLATE_ONLY_ARGS:
+                for key in _template_task_only_args():
                     args.pop(key, None)
             else:
                 data = raw.encode("utf-8", "surrogateescape")
@@ -8286,6 +8356,58 @@ _DEFAULT_REAL_FILE_ARGS = frozenset((
     "attributes", "unsafe_writes", "state", "path", "_original_basename",
     "recurse", "force", "_diff_peek", "src",
 ))
+
+
+def _template_task_only_args():
+    if _core_at_least(2, 11):
+        return _TEMPLATE_ONLY_ARGS
+    return tuple(key for key in _TEMPLATE_ONLY_ARGS if key not in ("comment_start_string", "comment_end_string"))
+
+
+def _template_file_options(source, args, warn):
+    import ast
+
+    options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
+               "lstrip_blocks": _boolean(args.get("lstrip_blocks", False))}
+    for key in _template_task_only_args():
+        if key.endswith(("_start_string", "_end_string")) and args.get(key) is not None:
+            value = args[key]
+            if not isinstance(value, (str, int, float, bool)):
+                raise ValueError("%s is expected to be a string" % key)
+            options[key] = str(value)
+    if _core_at_least(2, 15) and not _core_at_least(2, 19):
+        # Legacy Core validates task overrides when creating the Jinja overlay.
+        # Inline headers are applied afterward and bypass that check.
+        variable = options.get("variable_start_string", "{{")
+        if variable in (options.get("block_start_string", "{%"), options.get("comment_start_string", "{#")):
+            raise ValueError("block, variable and comment start strings must be different")
+    has_header = source.startswith("#jinja2:")
+    if has_header:
+        modern = _core_at_least(2, 19)
+        header, delimiter, source = source.partition("\n")
+        if not delimiter:
+            raise ValueError("missing newline after #jinja2 override")
+        overrides = {}
+        nullable = ("line_statement_prefix", "line_comment_prefix")
+        booleans = ("trim_blocks", "lstrip_blocks", "keep_trailing_newline")
+        for entry in header[len("#jinja2:"):].split(","):
+            key, value = entry.split(":", 1)
+            key = key.strip()
+            if key not in _TEMPLATE_ONLY_ARGS[:-3] + booleans + nullable:
+                if modern:
+                    raise ValueError("invalid #jinja2 override %r" % key)
+                warn("Could not find Jinja2 environment setting to override: %r" % key)
+                continue
+            overrides[key] = ast.literal_eval(value.strip())
+        if modern:
+            for key, value in overrides.items():
+                expected = bool if key in booleans else str
+                if value is None and key in nullable:
+                    continue
+                if not isinstance(value, expected) or (key == "newline_sequence" and value not in ("\n", "\r", "\r\n")):
+                    raise ValueError("invalid value for #jinja2 override %r: %r" % (key, value))
+        options.update(overrides)
+    return source, tuple(sorted(options.items())), has_header
 
 
 class _CopyActionError(Exception):
