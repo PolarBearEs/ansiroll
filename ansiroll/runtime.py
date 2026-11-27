@@ -1657,15 +1657,19 @@ def _first_found_vars_file(args, kwargs, selector):
                         candidate = os.path.join(directory, relative) if relative else directory
                 if ".." in candidate.split(os.path.sep):
                     raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
-                if not os.path.isabs(candidate) and not selector.get("search_path_matches", True):
+                absolute = os.path.isabs(candidate)
+                if not absolute and not selector.get("search_path_matches", True):
                     raise ValueError("first_found ansible_search_path differs from the bundled search paths; "
                                      "recompile with the current search paths")
-                for root in selector["roots"]:
+                roots = ("",) if absolute else selector["roots"]
+                covered = any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"])
+                for root in roots:
                     path = os.path.normpath(os.path.join(root, candidate))
                     if path in bundled:
                         return [path]
-                if not any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"]):
-                    raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
+                    if not covered:
+                        # We cannot rule this root out before trying a later one.
+                        raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
     if skip and (modern or args):
         return []
     raise ValueError("No file was found when using first_found.")

@@ -253,6 +253,44 @@ def test_first_found_vars_files_uses_absolute_candidate_before_search_path(tmp_p
         runtime.run_play(plan)
 
 
+def test_first_found_vars_files_rejects_unverified_earlier_root(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    earlier = tmp_path / "preferred"
+    (earlier / "nested").mkdir(parents=True)
+    (earlier / "nested" / "prod.yml").write_text("selected: earlier\n")
+    (tmp_path / "nested").mkdir()
+    later = tmp_path / "nested" / "prod.yml"
+    later.write_text("selected: later\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_search_path: ROOTS
+  vars_files:
+    - >-
+      {{ lookup('first_found', [profile ~ '.yml', ABSOLUTE]) }}
+  tasks:
+    - assert: {that: selected == expected}
+""".replace("ROOTS", json.dumps([str(earlier)])).replace("ABSOLUTE", json.dumps(str(later))))
+    extra = {"profile": "nested/prod", "expected": "earlier"}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(extra), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    with pytest.raises(VarsFilesError, match="outside the vars_files bundle"):
+        runtime.run_play(plan)
+
+    extra = {"profile": "missing", "expected": "later"}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
 def test_first_found_vars_files_normalizes_string_options(tmp_path):
     from ansiroll.loader import _core_version
     from tests import ansible_playbook_command
