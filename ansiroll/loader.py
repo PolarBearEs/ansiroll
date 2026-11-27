@@ -3701,22 +3701,32 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
         and not _contains_dynamic_value(decrypt) and args.get("content") is None
         and (_source_flag(decrypt) if name == "copy" else bool(decrypt))
     )
-    if (controller_execution and name == "unarchive" and _contains_dynamic_value(src)
-            and task._loader._vault.secrets
-            and (unknown_defaults or _contains_dynamic_value(decrypt) or bool(decrypt))):
+    loop = node.get("loop")
+    item_sources = ([_ITEM_RE.sub(lambda _match: str(item), src) for item in loop]
+                    if _JINJA_RE.search(src) and isinstance(loop, list) and _only_item(src) else None)
+    live_archive = (controller_execution and name == "unarchive" and _contains_dynamic_value(src)
+                    and "\0" not in src and task._loader._vault.secrets
+                    and (unknown_defaults or _contains_dynamic_value(decrypt) or bool(decrypt)))
+    archive_patterns = []
+    if live_archive:
+        if item_sources is not None and not _contains_dynamic_value(loop):
+            archive_patterns = [_linked_role_source_pattern(path) for path in item_sources
+                                if "\0" not in path and ".." not in path.split(os.sep)]
+        else:
+            parsed = _linked_role_source_patterns(src, allow_absolute=True)
+            archive_patterns = [pattern for _, pattern in parsed[1]] if parsed else []
+    live_archive = bool(archive_patterns)
+    if live_archive:
         # A prior task can create an archive after baking has finished.
-        # Let the controller select and decrypt the live source.
-        node["_deferred_vault_source"] = True
-        node["fallback"] = True
-        node["fallback_reason"] = "Vault source needs controller selection and decryption"
-        return
+        node["_live_archive_source"] = True
+        node["_live_archive_source_patterns"] = archive_patterns
+        if not _JINJA_RE.search(src):
+            return  # A Jinja statement must select the complete path at runtime.
 
     candidates = []
     if _JINJA_RE.search(src):
-        loop = node.get("loop")
-        if isinstance(loop, list) and _only_item(src):
-            for it in loop:
-                candidates.append(_ITEM_RE.sub(str(it), src))
+        if item_sources is not None:
+            candidates = item_sources
         elif _bake_absolute_tree(node, src, basedir, with_meta, newline=newline):
             return
         # Baked search trees are keyed relative to a search dir, so they can never match a src that renders to an
@@ -3726,8 +3736,8 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
             # src is dynamic (e.g. "services/{{ item.name }}.service.j2") and the loop is a runtime var; bake every
             # file it could resolve to.
             return
-        elif remote is None:
-            return  # remote_src decided at runtime; src may be a target path
+        elif remote is None or live_archive:
+            return  # The source location will be resolved when the task runs.
         else:
             node["fallback"] = True
             node["fallback_reason"] = "dynamic baked src not resolvable at compile time: %s" % src
@@ -3740,8 +3750,8 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     for rel in candidates:
         path = _find_needle(task, subdir, rel)
         if path is None:
-            if remote is None:
-                continue  # may be a target path if remote_src renders true
+            if remote is None or live_archive:
+                continue  # The path may be on the target or created later on the controller.
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
@@ -4405,7 +4415,7 @@ def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
     return dirs if tagged else [d for d, _ in dirs]
 
 
-def _linked_role_source_patterns(src):
+def _linked_role_source_patterns(src, *, allow_absolute=False):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     try:
@@ -4505,7 +4515,7 @@ def _linked_role_source_patterns(src):
         return None
     patterns = []
     for candidate in dict.fromkeys(path for path, _ in candidates):
-        if not candidate or os.path.isabs(candidate) or ".." in candidate.split(os.sep):
+        if not candidate or (not allow_absolute and os.path.isabs(candidate)) or ".." in candidate.split(os.sep):
             continue
         # These spellings require a directory, even after the variables render.
         if candidate.endswith((os.sep, os.sep + ".")):

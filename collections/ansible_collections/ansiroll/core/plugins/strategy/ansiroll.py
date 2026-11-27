@@ -422,7 +422,7 @@ class StrategyModule(StrategyBase):
     def _compile(self, play, play_vars, gather_task):
         from ansiroll.loader import _conditions, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
-        from ansiroll.compiler import _render_source
+        from ansiroll.compiler import _render_source, _walk_play_nodes
 
         actions = set()
         only_tags = set(context.CLIARGS.get("tags") or [])
@@ -460,6 +460,11 @@ class StrategyModule(StrategyBase):
         )
 
         self._ansiballz = embedder.ansiballz_code or ""
+        self._live_archive_sources = {
+            node["runtime_id"]: node.pop("_live_archive_source_patterns")
+            for node in _walk_play_nodes([play_node])
+            if node.get("_live_archive_source") and node.get("runtime_id")
+        }
         source = _render_source([play_node], modules, self._ansiballz)
         task_map = self._build_task_map(play, play_node)
         if gather_task is not None:
@@ -672,11 +677,17 @@ class StrategyModule(StrategyBase):
                                  frame.get("name") or frame.get("action")))
             elif t == "source":
                 lookup_task_id = frame.get("lookup_task_id")
-                role_task = task_map.get(lookup_task_id) if lookup_task_id else None
-                if lookup_task_id and role_task is None:
+                role_task = task_map.get(lookup_task_id) if isinstance(lookup_task_id, str) else None
+                archive_decrypt = frame.get("archive_decrypt")
+                archive_patterns = self._live_archive_sources.get(lookup_task_id, ()) if role_task is not None else ()
+                if "archive_decrypt" in frame and (type(archive_decrypt) is not bool or not archive_patterns):
+                    source_result = {"error": "controller archive read was not scheduled for this task"}
+                elif lookup_task_id and role_task is None:
                     source_result = {"error": "could not identify the role source's task"}
                 else:
-                    source_result = self._read_controller_source(frame.get("path"), role_task=role_task)
+                    source_result = self._read_controller_source(
+                        frame.get("path"), role_task=role_task, archive_decrypt=archive_decrypt,
+                        archive_patterns=archive_patterns)
                 chan.send({
                     "t": "source_result",
                     "source": source_result,
@@ -753,10 +764,16 @@ class StrategyModule(StrategyBase):
         tracked.update({key: stored[key] for key in private_names})
 
     @staticmethod
-    def _read_controller_source(path, *, role_task=None):
+    def _read_controller_source(path, *, role_task=None, archive_decrypt=None, archive_patterns=()):
         """Read a runtime-created controller file for in-memory target transfer."""
         if not path or (role_task is None and not os.path.isfile(path)):
             return {"error": "controller source %r is not a regular file" % path}
+        if archive_decrypt is not None:
+            from ansiroll.loader import _linked_role_source_matches
+
+            if role_task is None or not isinstance(path, str) or ".." in path.split(os.sep) or not any(
+                    _linked_role_source_matches(pattern, os.path.normpath(path)) for pattern in archive_patterns):
+                return {"error": "controller archive %r does not match the task's src" % path}
         fd = None
         try:
             if role_task is None:
@@ -770,9 +787,14 @@ class StrategyModule(StrategyBase):
                 fullpath = loader.path_dwim_relative_stack(role_task.get_search_path(), subdir, path)
                 realpath = os.path.realpath(fullpath)
                 absolute = os.path.abspath(fullpath)
-                if realpath != absolute:
+                if realpath != absolute or archive_decrypt is not None:
                     roots = {os.path.abspath(root): os.path.realpath(root)
                              for root in _role_source_roots(role_task, loader.get_basedir())}
+                if archive_decrypt is not None and not any(
+                        _visible_below(absolute, root) and _visible_below(realpath, real_root)
+                        for root, real_root in roots.items()):
+                    return {"error": "controller archive %r is outside its task's source directories" % path}
+                if realpath != absolute:
                     # Declared roots may themselves be reached through links.
                     ordinary = any(
                         os.path.commonpath((absolute, root)) == root
@@ -789,6 +811,8 @@ class StrategyModule(StrategyBase):
                 if not stat.S_ISREG(st.st_mode):
                     return {"error": "controller source %r is not a regular file" % path}
                 data = fh.read()
+            if archive_decrypt:
+                data, _ = _decrypt_controller_file(loader, fullpath, data)
             return {
                 "data": base64.b64encode(data).decode("ascii"),
                 "meta": {
@@ -1378,7 +1402,6 @@ class StrategyModule(StrategyBase):
 
         def read_selected(path):
             from ansible.errors import AnsibleFileNotFound, AnsibleParserError
-            from ansiroll.loader import _core_version
 
             path = loader.path_dwim(path)
             try:
@@ -1394,11 +1417,7 @@ class StrategyModule(StrategyBase):
                 raise AnsibleFileNotFound("Unable to retrieve file contents.", file_name=path) from ex
             except OSError as ex:
                 raise AnsibleParserError("could not read selected vars file %r" % path) from ex
-            if _core_version() < (2, 19):
-                return loader._decrypt_if_vault_data(data, os.fsencode(path))
-            from ansible._internal._datatag._tags import Origin
-
-            return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
+            return _decrypt_controller_file(loader, path, data)
 
         loader.load_from_file = capture
         try:
@@ -1919,6 +1938,16 @@ def _register_names(task):
     if isinstance(value, dict):
         return [str(name) for name in value]
     return [str(value)] if value else []
+
+
+def _decrypt_controller_file(loader, path, data):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        return loader._decrypt_if_vault_data(data, os.fsencode(path))
+    from ansible._internal._datatag._tags import Origin
+
+    return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
 
 
 def _controller_fallbacks(play_node):

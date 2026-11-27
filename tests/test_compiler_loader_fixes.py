@@ -1578,7 +1578,10 @@ def test_selected_vault_source_honors_decrypt_option(tmp_path, action, decrypt, 
         assert S_IMODE(installed.stat().st_mode) == (0o600 if decrypt else 0o644)
 
 
-@pytest.mark.parametrize("source_kind", ["vault-with-seed", "vault-without-seed", "vault-block", "remote"])
+@pytest.mark.parametrize("source_kind", [
+    "vault-with-seed", "vault-without-seed", "vault-block", "vault-literal-loop",
+    "plaintext", "remote", "templated-remote",
+])
 def test_unarchive_strategy_selects_live_archive_with_vault_credentials(tmp_path, source_kind):
     from ansible.parsing.vault import VaultLib, VaultSecret
     from tests import ansible_playbook_command
@@ -1597,28 +1600,36 @@ def test_unarchive_strategy_selects_live_archive_with_vault_credentials(tmp_path
     destination.mkdir()
     if source_kind == "vault-with-seed":
         (files / "seed.zip").write_bytes(data)
-    remote = source_kind == "remote"
+    remote = source_kind in ("remote", "templated-remote")
+    vault_source = source_kind.startswith("vault-")
     live = files / "live.zip"
-    if remote:
+    if not vault_source:
         live.write_bytes(data)
     ciphertext = VaultLib([("default", secret)]).encrypt(data, secret=secret)
     playbook = tmp_path / "pb.yml"
     write_archive = """    - copy:
         content: "{{ ciphertext }}"
         dest: "{{ playbook_dir }}/files/live.zip"
+        decrypt: false
       no_log: true
 """
     selector = ("{% if source_name == 'live' %}live{% else %}seed{% endif %}" if source_kind == "vault-block"
                 else "{{ source_name }}")
+    source = "{{ playbook_dir }}/files/" + selector + ".zip"
+    loop = ""
+    if source_kind == "vault-literal-loop":
+        source = "{{ item }}"
+        loop = "\n      loop: " + json.dumps([str(live)])
+    remote_option = '"{{ use_remote }}"' if source_kind == "templated-remote" else str(remote).lower()
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   tasks:
-%s    - set_fact: {source_name: live}
+%s    - set_fact: {source_name: live, use_remote: %s}
     - unarchive:
-        src: "{{ playbook_dir }}/files/%s.zip"
+        src: "%s"
         dest: "{{ playbook_dir }}/extracted"
-        remote_src: %s
-""" % ("" if remote else write_archive, selector, str(remote).lower()))
+        remote_src: %s%s
+""" % (write_archive if vault_source else "", str(remote).lower(), source, remote_option, loop))
     cmd = ansible_playbook_command() + [
         "-i", "localhost,", "-c", "local", "--vault-password-file", str(password_file),
         "-e", json.dumps({"ciphertext": ciphertext.decode("ascii"), "ansible_python_interpreter": sys.executable}),
@@ -1627,13 +1638,15 @@ def test_unarchive_strategy_selects_live_archive_with_vault_credentials(tmp_path
     installed = destination / "content.txt"
     env = {**_env(), "ANSIBLE_COLLECTIONS_PATH": os.path.join(ROOT, "collections")}
     for strategy in ("linear", "ansiroll.core.ansiroll"):
-        if not remote and live.exists():
+        if vault_source and live.exists():
             live.unlink()
         run = subprocess.run(cmd, cwd=tmp_path, env={**env, "ANSIBLE_STRATEGY": strategy,
-                             "ANSIROLL_NATIVE_ONLY": "1" if remote else "0"},
-                             capture_output=True, text=True, timeout=60)
+                             "ANSIROLL_NATIVE_ONLY": "0" if vault_source else "1"},
+                             capture_output=True, text=True, timeout=90)
         assert run.returncode == 0, run.stdout + run.stderr
         assert installed.read_bytes() == payload
+        if vault_source:
+            assert live.read_bytes() == ciphertext
         installed.unlink()
 
 
