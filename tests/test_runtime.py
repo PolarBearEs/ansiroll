@@ -4,6 +4,7 @@ These use only the runtime "special" actions (debug/set_fact/fail/assert) and
 template/copy-with-content, so no Ansible or embedded modules are required.
 """
 
+import datetime
 import io
 import json
 import os
@@ -15,6 +16,33 @@ import pytest
 from ansiroll.runtime import (
     _OMIT, ConditionalError, Runtime, UntrustedConditional, _parse_output,
 )
+
+
+@pytest.mark.parametrize(("version", "expected"), [("2.19.0", True), ("2.19.1", False)])
+def test_check_mode_buffer_null_semantics_follow_core_patch(monkeypatch, version, expected):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", version)
+    templater = Runtime({}, "", {}).templater
+    expression = "{% set x %}{{ none }}{{ none }}{% endset %}{{ x is not none }}"
+    assert templater.render_string(expression, {runtime._CHECK_MODE_TEMPLATE: True}) is expected
+
+
+@pytest.mark.parametrize("survivor", ["ordinary", {"{{ name }}": "untrusted"}])
+def test_bundled_fact_keys_keep_types_and_trust_across_json_collisions(survivor):
+    from ansiroll.runtime import _FactKeyTemplate, _encode_bundle_mapping_keys, _restore_bundle_mapping_keys
+
+    source = {True: {_FactKeyTemplate("{{ name }}"): "typed"}, "true": survivor,
+              "kept": {_FactKeyTemplate("{{ name }}"): "trusted"}}
+    encoded, paths = _encode_bundle_mapping_keys(source)
+    decoded = json.loads(json.dumps(encoded))
+    restored = _restore_bundle_mapping_keys(decoded, json.loads(json.dumps(paths)))
+    assert restored[True] == {"{{ name }}": "typed"}
+    assert isinstance(next(iter(restored[True])), _FactKeyTemplate)
+    assert restored["true"] == survivor
+    if isinstance(survivor, dict):
+        assert type(next(iter(restored["true"]))) is str
+    assert isinstance(next(iter(restored["kept"])), _FactKeyTemplate)
 
 
 def _task(uuid, name, special, **kw):
@@ -35,6 +63,57 @@ def run(tasks, host_vars=None, handlers=None, gather=False):
 
 def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
+
+
+def test_rescued_datetime_keys_preserve_fractional_offsets():
+    from ansiroll import runtime
+
+    stamp = datetime.datetime(2025, 3, 1)
+    offsets = (100000, 200000, -100000)
+    keys = [stamp.replace(tzinfo=datetime.timezone(datetime.timedelta(microseconds=offset))) for offset in offsets]
+    original = dict(zip(keys, offsets))
+    packed = runtime._pack_include_value(original)
+    restored = runtime._restore_delegated_mapping_keys(packed["value"], packed["mapping_keys"])
+    assert restored == original
+    assert [key.isoformat() for key in restored] == [key.isoformat() for key in keys]
+
+
+def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch):
+    from ansiroll import runtime
+
+    values = {"day": datetime.date(2025, 3, 1), "stamp": datetime.datetime(2025, 3, 1, 8, 30),
+              "aware": datetime.datetime(2025, 3, 1, 8, 30, 1, 123,
+                                         tzinfo=datetime.timezone(datetime.timedelta(hours=-3, minutes=-30)))}
+    sub_minute_offsets = (datetime.timedelta(seconds=30),
+                          -datetime.timedelta(hours=2, seconds=15, microseconds=321))
+    offset_values = {"offset_%d" % index: values["stamp"].replace(tzinfo=datetime.timezone(offset))
+                     for index, offset in enumerate(sub_minute_offsets)}
+    values.update(offset_values)
+    extreme = datetime.timedelta(hours=23, minutes=59, seconds=30)
+    bounds = {
+        "near_min": datetime.datetime.min.replace(tzinfo=datetime.timezone(sub_minute_offsets[0])),
+        "near_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-sub_minute_offsets[0])),
+        "below_min": datetime.datetime.min.replace(tzinfo=datetime.timezone(extreme)),
+        "above_max": datetime.datetime.max.replace(tzinfo=datetime.timezone(-extreme)),
+    }
+    packed = runtime._pack_include_value({**values, **bounds}, preserve_scalars=True)
+    first_key = bounds["below_min"]
+    second_key = datetime.datetime.min.replace(tzinfo=datetime.timezone(extreme - datetime.timedelta(seconds=15)))
+    packed_keys = runtime._pack_include_value({first_key: "first", second_key: "second", first_key.isoformat(): "text"})
+    legacy_datetime = SimpleNamespace(strptime=datetime.datetime.strptime,
+                                      min=datetime.datetime.min, max=datetime.datetime.max)
+    monkeypatch.setattr(runtime, "_dt", SimpleNamespace(date=datetime.date, datetime=legacy_datetime,
+                                                       timedelta=datetime.timedelta, timezone=datetime.timezone))
+    restored = runtime._restore_rescue_scalars(packed)
+    assert {name: restored[name] for name in values} == values
+    assert all(restored[name].tzinfo is datetime.timezone.utc for name in offset_values)
+    assert restored["near_min"].isoformat() == "0001-01-01T00:00:30+00:01"
+    assert restored["near_max"].isoformat() == "9999-12-31T23:59:29.999999-00:01"
+    assert restored["below_min"].isoformat() == "0001-01-01T00:00:00+23:59"
+    assert restored["above_max"].isoformat() == "9999-12-31T23:59:59.999999-23:59"
+    restored_keys = runtime._restore_delegated_mapping_keys(packed_keys["value"], packed_keys["mapping_keys"])
+    assert list(restored_keys.values()) == ["first", "second", "text"]
+    assert runtime._pack_include_value(restored_keys)["mapping_keys"] == packed_keys["mapping_keys"]
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():
@@ -2667,6 +2746,19 @@ def test_set_fact_string_results_are_trusted_as_templates():
     assert not rt.failed
 
 
+def test_set_fact_expanded_args_leave_generated_mapping_values_literal(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.21.1")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    task = _task("1", "set fact", "set_fact", args={
+        "_variable_params": "{{ {'generated': {'text': '{' ~ '{ sentinel }}'}} }}",
+    })
+    result = runtime._run_set_fact(task, {"sentinel": "rendered"}, None)
+    ctx = {"sentinel": "rendered", "hostvars": {"localhost": result["ansible_facts"]}}
+    assert runtime.template("{{ hostvars.localhost.generated.text }}", ctx) == "{{ sentinel }}"
+
+
 def test_special_action_accepts_entire_templated_argument_dictionary():
     tasks = [
         _task(
@@ -3676,6 +3768,21 @@ def test_copy_without_embedded_modules_fails_clearly(tmp_path):
     assert not dest.exists()
 
 
+@pytest.mark.parametrize("modules, module, receives_decrypt", [
+    ({"copy": {"module_fqn": "custom.copy"}}, "copy", True),
+    ({"copy": {"module_fqn": "ansible.modules.copy"}}, "copy", False),
+    ({}, "ansible.builtin.copy", False),
+])
+def test_remote_copy_prefers_the_embedded_task_module(monkeypatch, modules, module, receives_decrypt):
+    modules = {"ansible.builtin.copy": {"module_fqn": "ansible.modules.copy"}, **modules}
+    rt = Runtime(modules, "", {"inventory_hostname": "h"})
+    monkeypatch.setattr(rt, "run_module", lambda action, args, become: {"action": action, "args": args})
+    result = rt._run_file_action("copy", {"action": "copy"},
+                                 {"src": "/source", "dest": "/output", "remote_src": True, "decrypt": False}, {})
+    assert result["action"] == module
+    assert ("decrypt" in result["args"]) is receives_decrypt
+
+
 def test_copy_fetches_runtime_created_controller_source(tmp_path):
     src = tmp_path / "checkout" / "docker-compose.yml"
     src.parent.mkdir()
@@ -4539,3 +4646,96 @@ def test_conditions_keep_namespaced_facts_and_controller_precedence(monkeypatch,
     assert _override_ctx({"action": "debug"}, result, ctx) == ctx
     delegated = {"action": "setup", "delegate_to": "other", "delegate_facts": "{{ route_facts }}"}
     assert _override_ctx(delegated, result, ctx, rt.template) == (ctx if modern else effective)
+
+
+
+
+def _target_side_sources():
+    from ansiroll import compiler, runtime as runtime_module
+
+    package = os.path.dirname(compiler.__file__)
+    paths = [os.path.join(package, "worker.py")]
+    modules = os.path.join(package, "accelerated_modules")
+    paths += sorted(os.path.join(modules, name) for name in os.listdir(modules) if name.endswith(".py"))
+    for path in paths:
+        with open(path, "rb") as source:
+            yield os.path.relpath(path, package), source.read()
+    yield "runtime.AGENT_BOOTSTRAP", runtime_module.AGENT_BOOTSTRAP
+
+
+def _assembled_agent():
+    from ansiroll import compiler
+
+    # The two controller lookups need Ansible, which the target never has
+    patches = {"_controller_core_version": lambda: "2.10.17", "_controller_inventory_address_patterns": lambda: []}
+    originals = {name: getattr(compiler, name) for name in patches}
+    try:
+        for name, replacement in patches.items():
+            setattr(compiler, name, replacement)
+        return compiler._render_source([], {}, "")
+    finally:
+        for name, original in originals.items():
+            setattr(compiler, name, original)
+
+
+_TARGET_SIDE_SOURCES = list(_target_side_sources()) + [("assembled agent", None)]
+
+
+@pytest.mark.parametrize("name, source", _TARGET_SIDE_SOURCES, ids=[name for name, _ in _TARGET_SIDE_SOURCES])
+def test_target_side_code_parses_on_python_35(name, source):
+    # Gateways still run Python 3.5 (stretch) and 3.7 (buster); one walrus broke every deploy to them. Best-effort, not
+    # exhaustive: the 3.5 grammar of older parsers still takes some 3.6+ forms, and 3.6+ APIs get through.
+    import ast
+
+    if source is None:
+        source = _assembled_agent()
+    tree = ast.parse(source, feature_version=(3, 5))
+    too_new = tuple(
+        getattr(ast, node, ())
+        for node in ("NamedExpr", "JoinedStr", "AnnAssign", "Match", "TryStar", "TypeAlias")
+    )
+    offenders = []
+    for node in ast.walk(tree):
+        arguments = getattr(node, "args", None)
+        if (
+            isinstance(node, too_new)
+            or (isinstance(arguments, ast.arguments) and arguments.posonlyargs)
+            or getattr(node, "type_params", None)
+            or (isinstance(node, ast.comprehension) and node.is_async)
+            or (isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names))
+        ):
+            offenders.append("{}:{} {}".format(name, getattr(node, "lineno", "?"), type(node).__name__))
+    assert offenders == []
+
+
+def test_legacy_bare_name_rendering_reads_regex_groups_without_subscripts(monkeypatch):
+    # Python 3.5's match objects have no __getitem__, so `match[1]` broke legacy templating on stretch gateways
+    import re
+    import ansiroll.runtime as runtime_mod
+
+    class Python35Match:
+        def __init__(self, match):
+            self._match = match
+
+        def __getattr__(self, name):
+            return getattr(self._match, name)
+
+    def without_subscripts(find):
+        def wrapped(*args, **kwargs):
+            found = find(*args, **kwargs)
+            return Python35Match(found) if found else found
+        return wrapped
+
+    python35_re = SimpleNamespace(**{name: getattr(re, name) for name in dir(re) if not name.startswith("__")})
+    python35_re.match = without_subscripts(re.match)
+    python35_re.fullmatch = without_subscripts(re.fullmatch)
+    monkeypatch.setattr(runtime_mod, "re", python35_re)
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    legacy = {"__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": False}}
+
+    assert runtime_mod._rendered_number(5, "{{ count }}", dict(legacy, count=5)) == 5
+    assert runtime_mod._rendered_number(5, "{{ count }}", dict(legacy, count="5")) == "5"
+    runtime = Runtime({}, "", {}, extra_vars={"override_timeout": None})
+    template = {"source": "{{ override_timeout }}", "vars": {}, "names": ["override_timeout"]}
+    assert runtime._gather_timeout_for_run(23, template, legacy) is None

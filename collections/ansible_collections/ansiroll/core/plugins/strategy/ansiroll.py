@@ -31,8 +31,9 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import MappingView
+from collections.abc import Mapping, MappingView, Set
 
 DOCUMENTATION = """
     name: ansiroll
@@ -98,6 +99,24 @@ class _DelegatedMemberError(StrictUndefined):
 
     def __repr__(self):
         self._fail_with_undefined_error()
+
+
+def _wrap_legacy_rescue_value(value):
+    from ansible.utils.unsafe_proxy import wrap_var
+
+    def wrap(member):
+        # Legacy wrap_var rebuilds ranges from a generator, which range does not accept.
+        if isinstance(member, range):
+            return member
+        if isinstance(member, Mapping):
+            return {wrap(key): wrap(item) for key, item in member.items()}
+        if isinstance(member, (list, tuple)):
+            return type(member)(wrap(item) for item in member)
+        if isinstance(member, Set):
+            return {wrap(item) for item in member}
+        return wrap_var(member)
+
+    return wrap(value)
 
 
 def _legacy_environment_validator(validate, aliases):
@@ -306,16 +325,23 @@ class StrategyModule(StrategyBase):
                 item for item in controller_reasons
                 if item.get("kind") != "delegate"
             ]
-        fact_routes = [
-            _delegated_fact_flag(getattr(task, "delegate_facts", None))
+        delegated_fact_tasks = [
+            task
             for task in task_map.values()
             if str(getattr(task, "action", "") or "").rsplit(".", 1)[-1] == "set_fact"
-            and getattr(task, "delegate_to", None)
+            and _has_delegated_fact_flag(task)
         ]
         linear_reason = None
         if self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
-        elif not self._delegate_on_target and any(flag is not False for flag in fact_routes):
+        elif any(item["kind"] == "vault-source" for item in controller_reasons):
+            linear_reason = "Vault source selection requires core linear"
+        elif any(item["kind"] == "file-source-arguments" for item in controller_reasons):
+            linear_reason = "templated file source arguments require core linear"
+        elif any(item["kind"] == "apply-include" for item in controller_reasons):
+            linear_reason = "include_tasks with runtime apply variables requires core linear"
+        elif not self._delegate_on_target and any(
+                _delegated_fact_flag(task.delegate_facts) is not False for task in delegated_fact_tasks):
             linear_reason = "delegated set_fact requires task-lockstep scheduling"
         elif len(hosts) > 1 and self._controller_only_play:
             linear_reason = (
@@ -352,7 +378,10 @@ class StrategyModule(StrategyBase):
             # constructor, which this deliberately reused instance never runs.
             if not hasattr(self, "_in_handlers"):
                 self._in_handlers = False
-            self.__class__ = _SetFactLinearStrategy if any(flag is not False for flag in fact_routes) else _LinearStrategy
+            # Linear still needs the raw flag to identify quoted false values.
+            # Dynamic roles can introduce delegated set_fact after compilation.
+            routed_facts = self._requires_linear_fallback or bool(delegated_fact_tasks)
+            self.__class__ = _SetFactLinearStrategy if routed_facts else _LinearStrategy
             return self.run(iterator, play_context)
         self._emit_provenance({
             "scope": "play",
@@ -388,7 +417,7 @@ class StrategyModule(StrategyBase):
 
     # ---- compilation -----------------------------------------------------
     def _compile(self, play, play_vars, gather_task):
-        from ansiroll.loader import _conditions, _controller_config_names, _controller_env_names, _convert_play
+        from ansiroll.loader import _conditions, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
         from ansiroll.compiler import _render_source
 
@@ -423,12 +452,9 @@ class StrategyModule(StrategyBase):
             from ansiroll.compiler import _mark_unsupported
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
-        self._deferred_lookup_paths = {
-            os.path.abspath(path)
-            for entry in play_node.get("deferred_vars_files", ())
-            for path, data in entry["files"].items()
-            if _controller_env_names(data) or _controller_config_names(data)
-        }
+        self._deferred_vars_file_keys = (
+            set(play_node.get("vars") or {}) if play_node.get("deferred_vars_files") else None
+        )
 
         self._ansiballz = embedder.ansiballz_code or ""
         source = _render_source([play_node], modules, self._ansiballz)
@@ -505,7 +531,7 @@ class StrategyModule(StrategyBase):
         become_pass = self._resolve_become_password(hv, templar)
         agent_source = (
             self._agent_header(host, hv, become_pass)
-            + self._controller_lookup_header(selected_vars_files)
+            + self._controller_lookup_header(hv, selected_vars_files)
             + "_INJECTED_GATHER_FACTS = %r\n" % gather_facts
             + source
         )
@@ -525,6 +551,7 @@ class StrategyModule(StrategyBase):
             self._profile("%s agent send %.3fs" % (host.name, time.monotonic() - send_started))
             failed = self._pump(
                 host, chan, task_map, hv, templar, become_pass, play_context,
+                selected_vars_files=selected_vars_files,
                 gather_task=task_map.get("__gather_facts__") if gather_facts else None)
             self._profile("%s total %.3fs" % (host.name, time.monotonic() - started))
             return failed
@@ -534,32 +561,54 @@ class StrategyModule(StrategyBase):
     def _gather_setup_options(self, host, gather_task):
         from ansiroll.loader import _core_version
 
-        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
-                   if key in gather_task.args}
-        if options.get("gather_subset") == ["all"] and "gather_subset" not in (self._cur_play.get_ds() or {}):
-            del options["gather_subset"]
-        error = None
-        if options:
-            try:
-                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
-                values["ansible_search_path"] = gather_task.get_search_path()
-                options = self._mk_templar(values).template(options)
-                if _core_version() < (2, 19) and (omit := values.get("omit")):
-                    from ansible.executor.task_executor import remove_omit
+        try:
+            values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+            values["ansible_search_path"] = gather_task.get_search_path()
+            templar = self._mk_templar(values)
+            task = gather_task.copy()
+            task.args = dict(gather_task.args)
+            if _core_version() >= (2, 19):
+                from ansible.executor.module_common import _apply_action_arg_defaults
 
-                    options = remove_omit(options, omit)
-            except AnsibleError as ex:
-                error = str(ex)
-        return {"options": options if error is None else {}, "error": error}
+                args = task.post_validate_attribute("args", templar=templar._engine)
+                options = {key: value for key, value in args.items() if key != "parallel" and value is not None}
+                options = _apply_action_arg_defaults("ansible.builtin.setup", task, options, templar)
+            else:
+                from ansible.executor.module_common import get_action_args_with_defaults
+                from ansible.executor.task_executor import remove_omit
 
-    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
+                validate_args = getattr(task, "_post_validate_args", None)
+                if validate_args is not None:
+                    task.args = validate_args(task.fattributes["args"], task.args, templar)
+                else:
+                    task.args = templar.template(task.args)
+                legacy = _core_version() < (2, 12)
+                groups = {} if legacy else {"action_groups": getattr(self._cur_play, "_action_groups", {})}
+                setup_action = "ansible.legacy.setup" if legacy else "ansible.builtin.setup"
+                args = get_action_args_with_defaults(
+                    task.action if legacy else "ansible.builtin.gather_facts",
+                    task.args, task.module_defaults, templar, **groups)
+                if omit := values.get("omit"):
+                    args = remove_omit(args, omit)
+                args = {key: value for key, value in args.items() if key != "parallel" and value is not None}
+                options = get_action_args_with_defaults(
+                    setup_action, args, task.module_defaults, templar, **groups)
+        except (AnsibleError, ValueError, TypeError) as ex:
+            return {"options": {}, "error": str(ex)}
+        return {"options": options, "error": None}
+
+    def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *,
+              selected_vars_files=(), gather_task=None):
         host_failed = False
         seen = set()
         included_vars_by_task = {}
         last_frame = time.monotonic()
 
-        def resolve_play_var(name=None, *, member=None):
-            chan.send({"t": "delegate_play_var", "name": name, "member": member})
+        def resolve_play_var(name=None, *, member=None, template_vars=None):
+            request = {"t": "delegate_play_var", "name": name, "member": member}
+            if template_vars:
+                request["template_vars"] = template_vars
+            chan.send(request)
             reply = chan.recv()
             if not reply or reply.get("t") != "delegate_play_var_result":
                 raise RuntimeError("ansiroll: agent did not return a delegated play variable")
@@ -597,6 +646,12 @@ class StrategyModule(StrategyBase):
                 self._emit_frame(host, result_frame, task_map, seen, templar, definitions)
             elif t == "task_start":
                 self._emit_task_start(frame.get("frame", {}), task_map, seen)
+            elif t == "rescue":
+                task = task_map.get(frame.get("task"))
+                if task is not None:
+                    self._mirror_rescued_failure(host, task, frame["result"], frame.get("args"), frame.get("name"))
+            elif t == "rescue_overrides":
+                self._mirror_rescue_overrides(host.name, frame["writes"])
             elif t == "gather_setup":
                 data = (self._gather_setup_options(host, gather_task) if gather_task is not None
                         else {"error": "implicit setup was not scheduled"})
@@ -623,6 +678,10 @@ class StrategyModule(StrategyBase):
                     "t": "source_result",
                     "source": source_result,
                 })
+            elif t == "vars_files":
+                state = self._resolved_vars_file_state(
+                    host, selected_vars_files, task=task_map.get("__gather_facts__"), snapshot=hv)
+                chan.send({"t": "vars_files_result", "result": state})
             elif t == "warning":
                 display.warning(frame["message"])
             elif t == "error":
@@ -638,6 +697,57 @@ class StrategyModule(StrategyBase):
                 break
             last_frame = now
         return host_failed
+
+    def _restore_rescue_value(self, packed):
+        from ansiroll.runtime import _restore_rescue_scalars
+
+        value = _restore_rescue_scalars(packed)
+        if _UnifiedTaskResult is None:
+            value = _wrap_legacy_rescue_value(value)
+        return self._restore_play_fallback(
+            value, packed["undefined"], packed.get("errors", ()), packed.get("mapping_keys", ()))
+
+    def _mirror_rescued_failure(self, host, task, result, args=None, name=None):
+        # This is variable state for later plays. Display has already received
+        # the ordinary result frame with any no_log censoring applied.
+        failed_task = task.dump_attrs() if hasattr(task, "dump_attrs") else task.serialize()
+        if name is not None:
+            failed_task["name"] = name
+        if args is not None:
+            failed_task["args"] = self._restore_rescue_value(args)
+        if _UnifiedTaskResult is None:
+            failed_task = _wrap_legacy_rescue_value(failed_task)
+        facts = {
+            "ansible_failed_task": failed_task,
+            "ansible_failed_result": self._restore_rescue_value(result),
+        }
+        self._save_rescue_facts(host.name, facts, facts.keys())
+
+    def _mirror_rescue_overrides(self, host_name, writes):
+        manager = self._variable_manager
+        previously_private = set(_private_rescue_facts(manager, host_name))
+        # Apply accepted writes in item order. A public item must not stop a
+        # later censored item updating a fact that was private before the loop.
+        for packed, no_log, cacheable in writes:
+            facts = self._restore_rescue_value(packed)
+            if no_log:
+                accepted = {name: value for name, value in facts.items() if name in previously_private}
+                if accepted:
+                    self._save_rescue_facts(host_name, accepted, accepted.keys())
+            else:
+                if cacheable:
+                    manager.set_host_facts(host_name, dict(facts))
+                self._save_rescue_facts(host_name, facts, ())
+
+    def _save_rescue_facts(self, host_name, facts, private_names):
+        manager = self._variable_manager
+        manager.set_nonpersistent_facts(host_name, facts)
+        private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
+        tracked = private.setdefault(host_name, {})
+        for key in facts:
+            tracked.pop(key, None)
+        stored = manager._nonpersistent_fact_cache[host_name]
+        tracked.update({key: stored[key] for key in private_names})
 
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
@@ -748,14 +858,6 @@ class StrategyModule(StrategyBase):
                     for key, value in facts.items():
                         self._variable_manager.set_host_variable(target.name, key, value)
             return result
-        if action == "set_fact":
-            args = dict(frame.get("args") or {})
-            cacheable = bool(args.pop("cacheable", False))
-            return {
-                "changed": False,
-                "ansible_facts": args,
-                "_ansible_facts_cacheable": cacheable,
-            }
         if action == "synchronize":
             return self._run_native_controller_task(
                 frame, host, hv, task_map or {}, play_context, resolve_play_var)
@@ -812,6 +914,11 @@ class StrategyModule(StrategyBase):
             concrete.loop_with = None
             concrete.register = None
             concrete.notify = []
+            for keyword in ("check_mode", "become", "no_log"):
+                if keyword in frame:
+                    setattr(concrete, keyword, frame[keyword])
+            if "diff_mode" in frame:
+                concrete.diff = frame["diff_mode"]
             # The agent applies the original retry policy around each controller call.
             concrete.retries = 0
             concrete.until = []
@@ -921,7 +1028,7 @@ class StrategyModule(StrategyBase):
 
     @staticmethod
     def _restore_play_fallback(value, undefined, errors=(), mapping_keys=(), *, runtime_marker=None):
-        from ansiroll.runtime import _restore_delegated_mapping_keys
+        from ansiroll.runtime import _replace_delegated_values, _restore_delegated_mapping_keys
 
         if not undefined and not errors and not mapping_keys:
             return value
@@ -948,18 +1055,37 @@ class StrategyModule(StrategyBase):
                 missing = UndefinedMarker(hint=message, _no_template_source=True)
 
                 def error_marker(message):
-                    return CapturedExceptionMarker(AnsibleError(message))
+                    from ansible._internal._templating._utils import TemplateContext
+
+                    # A received marker has no local source template.
+                    with TemplateContext(template_value=None, templar=None, options=None):
+                        return CapturedExceptionMarker(AnsibleError(message))
 
         markers = [(path, missing) for path in undefined]
         markers.extend((path, error_marker(message)) for path, message in errors)
-        for path, marker in markers:
-            if not path:
-                return marker
-            container = value
-            for key in path[:-1]:
-                container = container[key]
-            container[path[-1]] = marker
+        value = _replace_delegated_values(value, markers)
         return _restore_delegated_mapping_keys(value, mapping_keys)
+
+    def _restore_private_result(self, packed, *, wrap_result=False):
+        from ansiroll.loader import _core_version
+
+        value = packed["value"]
+        if _core_version() < (2, 19):
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            if wrap_result:
+                value = wrap_var(value)
+            else:
+                for path in packed.get("unsafe_paths", ()):
+                    if not path:
+                        value = wrap_var(value)
+                        continue
+                    container = value
+                    for key in path[:-1]:
+                        container = container[key]
+                    container[path[-1]] = wrap_var(container[path[-1]])
+        return self._restore_play_fallback(value, packed["undefined"], packed.get("errors", ()),
+                                           packed.get("mapping_keys", ()))
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
@@ -983,11 +1109,14 @@ class StrategyModule(StrategyBase):
         except (OSError, AnsibleError) as ex:
             return {"failed": True, "changed": False, "msg": "template: %s" % ex}
         rt = self._local_runtime(become_pass)
-        previous = rt.check_mode, rt.become_user
+        previous = rt.check_mode, rt.diff_mode, rt.become_user, rt._copy_transfer_check_mode
         try:
             rt.check_mode = bool(frame.get("check_mode"))
+            rt.diff_mode = bool(frame.get("diff_mode"))
             rt.become_user = str(frame.get("become_user") or "root")
+            rt._copy_transfer_check_mode = frame.get("copy_transfer_check_mode")
             task = {
+                "no_log": bool(frame.get("no_log")),
                 "_baked": {src: raw},
                 "_baked_meta": {src: {
                     "fullpath": fullpath,
@@ -997,6 +1126,7 @@ class StrategyModule(StrategyBase):
                 }},
             }
             job_vars = dict(frame.get("vars") or {})
+            template_vars = {}
             if names := frame.get("lazy_template_vars"):
                 from ansiroll.runtime import (
                     _DEFER_LOOKUP_NAMES,
@@ -1012,7 +1142,13 @@ class StrategyModule(StrategyBase):
                     return _AnsirollUndefined(hint=message) if missing else _captured(message)
 
                 def load_template_var(name=None, *, member=None):
-                    resolved = resolve_play_var(name, member=member) if resolve_play_var else None
+                    action_vars = dict(template_vars)
+                    for key in ("template_mtime", "template_run_date"):
+                        if action_vars.get(key) is not None:
+                            action_vars[key] = action_vars[key].isoformat()
+                    template_vars.clear()
+                    resolved = (resolve_play_var(name, member=member, template_vars=action_vars)
+                                if resolve_play_var else None)
                     if resolved is None:
                         return _captured("unable to resolve delegated template value")
                     if "error" in resolved:
@@ -1033,12 +1169,14 @@ class StrategyModule(StrategyBase):
                         return _HostVarView(items, rt, job_vars)
                     return _lazy_container(items, rt, job_vars, delegated=True)
 
-                job_vars[_DEFER_LOOKUP_NAMES] = True
+                if frame.get("defer_template_names"):
+                    job_vars[_DEFER_LOOKUP_NAMES] = True
                 for name in names:
                     job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
-            return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
+            return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")),
+                                       template_vars=template_vars if names else None)
         finally:
-            rt.check_mode, rt.become_user = previous
+            rt.check_mode, rt.diff_mode, rt.become_user, rt._copy_transfer_check_mode = previous
 
     def _run_include_vars(self, frame):
         """include_vars reads controller-side files; resolve and parse here."""
@@ -1194,6 +1332,7 @@ class StrategyModule(StrategyBase):
                 + "_INJECTED_SKIP_RUN_ONCE = %r\n"
                 % (host.name != getattr(self, "_first_host_name", host.name))
                 + "_INJECTED_CHECK_MODE = %r\n" % bool(self._check_mode)
+                + "_INJECTED_INVOCATION_CHECK_MODE = %r\n" % bool(context.CLIARGS.get("check"))
                 + "_INJECTED_DIFF_MODE = %r\n" % bool(self._diff_mode)
                 + "_INJECTED_PROFILE = %r\n" % bool(getattr(self, "_profile_enabled", False))
                 + "_INJECTED_NATIVE_ONLY = %r\n"
@@ -1203,45 +1342,131 @@ class StrategyModule(StrategyBase):
                 + "_INJECTED_FAST_FACTS = %r\n"
                 % _truthy(os.environ.get("ANSIROLL_FAST_FACTS", "")))
 
-    def _host_vars_and_lookup_sources(self, host):
+    def _host_vars_and_lookup_sources(self, host, *, task=None):
         selected = []
-        if not self._deferred_lookup_paths:
-            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+        manager = self._variable_manager
+        if self._deferred_vars_file_keys is None:
+            return dict(manager.get_vars(host=host, play=self._cur_play, task=task)), selected
 
-        # Record the candidate mappings as Ansible selects them. The merged
-        # host vars alone lose inputs used by earlier selectors.
+        # Observe the vars_files reads made directly by this host's native
+        # variable manager. Inventory plugins can also use load_from_file.
         loader = self._loader
         load_from_file = loader.load_from_file
         original_override = vars(loader).get("load_from_file")
+        reader = manager.get_vars.__func__.__code__
 
         def capture(path, *args, **kwargs):
-            data = load_from_file(path, *args, **kwargs)
-            if path and os.path.abspath(os.fsdecode(path)) in self._deferred_lookup_paths:
-                selected.append(data)
+            caller = sys._getframe(1)
+            selected_file = (caller.f_code is reader and caller.f_locals.get("host") is host
+                             and caller.f_locals.get("play") is self._cur_play)
+            if not selected_file:
+                return load_from_file(path, *args, **kwargs)
+            original_reader = vars(loader).get("_get_file_contents")
+            loader._get_file_contents = read_selected
+            try:
+                data = load_from_file(path, *args, **kwargs)
+            finally:
+                if original_reader is None:
+                    del loader._get_file_contents
+                else:
+                    loader._get_file_contents = original_reader
+            selected.append(data)
             return data
+
+        def read_selected(path):
+            from ansible.errors import AnsibleFileNotFound, AnsibleParserError
+            from ansiroll.loader import _core_version
+
+            path = loader.path_dwim(path)
+            try:
+                with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
+                    opened = os.fstat(handle.fileno())
+                    if stat.S_ISREG(opened.st_mode):
+                        data = handle.read()
+                    elif stat.S_ISCHR(opened.st_mode) and os.path.samestat(opened, os.stat(os.devnull)):
+                        data = b""
+                    else:
+                        raise AnsibleParserError("selected vars file %r is not a regular file" % path)
+            except FileNotFoundError as ex:
+                raise AnsibleFileNotFound("Unable to retrieve file contents.", file_name=path) from ex
+            except OSError as ex:
+                raise AnsibleParserError("could not read selected vars file %r" % path) from ex
+            if _core_version() < (2, 19):
+                return loader._decrypt_if_vault_data(data, os.fsencode(path))
+            from ansible._internal._datatag._tags import Origin
+
+            return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
 
         loader.load_from_file = capture
         try:
-            return dict(self._variable_manager.get_vars(host=host, play=self._cur_play)), selected
+            return dict(manager.get_vars(host=host, play=self._cur_play, task=task)), selected
         finally:
             if original_override is None:
                 del loader.load_from_file
             else:
                 loader.load_from_file = original_override
 
-    def _controller_lookup_header(self, selected_vars_files):
-        if not selected_vars_files:
-            return ""
+    def _resolved_vars_file_state(self, host, initial_files, *, task=None, snapshot=None):
+        if self._deferred_vars_file_keys is None:
+            return {"error": "unexpected request for vars_files"}
+        if task is None:
+            from ansible.playbook.block import Block
+            from ansible.playbook.task import Task
+
+            # Native vars_files validation uses a task context to distinguish
+            # an unresolved selector after cached setup from an early probe.
+            # The parent also supplies the playbook path for vars plugins.
+            task = Task(block=Block(play=self._cur_play))
+        try:
+            current_vars, files = self._host_vars_and_lookup_sources(host, task=task)
+        except AnsibleError as ex:
+            return {"error": str(ex)}
+        active_keys = self._vars_file_keys(files)
+        keys = self._deferred_vars_file_keys | self._vars_file_keys(initial_files) | active_keys
+        refreshed = {key: current_vars[key] for key in keys & current_vars.keys()}
+        missing = sorted(keys - current_vars.keys(), key=str)
+        mapping_keys = []
+        try:
+            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys)
+        except AnsibleError as ex:
+            return {"error": str(ex)}
+        if snapshot is not None:
+            for key in missing:
+                snapshot.pop(key, None)
+            snapshot.update(refreshed)
+        return {
+            "vars": serialized,
+            "names": sorted(set(self._cur_play.vars or {}) | active_keys, key=str),
+            "missing": missing,
+            "mapping_keys": mapping_keys,
+            "controller_lookups": self._controller_lookups(
+                {key: current_vars[key] for key in active_keys & current_vars.keys()}),
+        }
+
+    @staticmethod
+    def _vars_file_keys(files):
+        return {key for loaded in files
+                for mapping in (loaded if isinstance(loaded, list) else (loaded,))
+                if isinstance(mapping, dict) for key in mapping}
+
+    @staticmethod
+    def _controller_lookups(selected_vars_files):
         from ansiroll.loader import _controller_config_names, _controller_config_values, _controller_env_names
 
-        env_names = _controller_env_names(selected_vars_files)
-        config_names = _controller_config_names(selected_vars_files)
-        lookups = {
+        env_names = _controller_env_names(selected_vars_files, trusted_only=True)
+        config_names = _controller_config_names(selected_vars_files, trusted_only=True)
+        return {
             "controller_env": {name: os.environ[name] for name in sorted(env_names) if name in os.environ},
             "controller_config": _controller_config_values(config_names),
         }
+
+    def _controller_lookup_header(self, variables, selected_vars_files):
+        keys = self._vars_file_keys(selected_vars_files) & variables.keys()
+        if not keys:
+            return ""
+        sources = {key: variables[key] for key in keys}
         return "_INJECTED_CONTROLLER_LOOKUPS = __import__('json').loads(%r)\n" % json.dumps(
-            lookups, default=str)
+            self._controller_lookups(sources), default=str)
 
     # ---- channel transport ----------------------------------------------
     def _open_channel(self, host, play_context, hv, templar):
@@ -1274,21 +1499,27 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
-        mapping_keys = {"host": [], "overrides": []}
+        from ansiroll.runtime import _pack_include_value
+
+        mapping_keys = {"host": [], "extra": [], "overrides": []}
         blob = _json_blob(hv, mapping_keys["host"])
-        extra_blob = _json_blob(_extra_vars(self._variable_manager))
+        extra_blob = _json_blob(_extra_vars(self._variable_manager), mapping_keys["extra"])
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
-        override_blob = _json_blob(nonpersistent, mapping_keys["overrides"])
+        rescue = _private_rescue_facts(self._variable_manager, host.name)
+        override_blob = _json_blob(
+            {key: value for key, value in nonpersistent.items() if key not in rescue}, mapping_keys["overrides"])
+        rescue_blob = json.dumps(_pack_include_value(rescue, preserve_scalars=True)) if rescue else "null"
         return (
             "_INJECTED_HOST = %r\n"
             "_INJECTED_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_EXTRA_VARS = __import__('json').loads(%r)\n"
             "_INJECTED_HOST_VAR_OVERRIDES = __import__('json').loads(%r)\n"
+            "_INJECTED_RESCUE_FACTS = __import__('json').loads(%r)\n"
             "_INJECTED_VAR_MAPPING_KEYS = __import__('json').loads(%r)\n"
             "_INJECTED_BECOME_PASS = %r\n"
-            % (host.name, blob, extra_blob, override_blob, json.dumps(mapping_keys), become_pass)
+            % (host.name, blob, extra_blob, override_blob, rescue_blob, json.dumps(mapping_keys), become_pass)
         )
 
     def _connect(self, host, play_context, hv, templar=None):
@@ -1465,30 +1696,43 @@ class StrategyModule(StrategyBase):
         try:
             registers = _register_names(task)
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
-            registered_result = result_data
+            state = result_data
+            if "private_result" in frame:
+                state = self._restore_private_result(frame["private_result"],
+                                                     wrap_result=action not in ("set_fact", "include_vars"))
+            registered_result = state
             if registers and not frame.get("is_item"):
                 if action in ("include_tasks", "include_role") and "include_register" in frame:
-                    private = frame["include_register"]
-                    registered_result = self._restore_play_fallback(
-                        private["value"], private["undefined"], private.get("errors", ()),
-                        private.get("mapping_keys", ()),
-                    )
+                    registered_result = self._restore_private_result(frame["include_register"])
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
-                    registered_result = _without_delegated_metadata(result_data)
+                    registered_result = _without_delegated_metadata(state)
                 if action == "include_vars" and included_vars:
                     registered_result = _restore_included_vars(
-                        result_data, included_vars, frame.get("included_vars_references"),
+                        state, included_vars, frame.get("included_vars_references"),
                     )
                 self._variable_manager.set_nonpersistent_facts(
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
-            facts = result_data.get("ansible_facts")
+            facts = state.get("ansible_facts")
+            if (action == "set_fact" and isinstance(facts, dict)
+                    and ("private_result" in frame or frame.get("is_item"))):
+                # Commit rescue-name writes in item order after the task,
+                # with censored writes allowed only on success.
+                from ansiroll.runtime import _RESCUE_FACT_NAMES
+
+                facts = {name: value for name, value in facts.items() if name not in _RESCUE_FACT_NAMES}
+            if task_key == "__gather_facts__" and status == "ok":
+                facts = frame.get("gathered_facts", facts)
+                if isinstance(facts, dict):
+                    # Accelerated setup does not emit the marker that
+                    # Ansible's variable manager checks in the fact cache.
+                    facts = dict(facts, module_setup=True)
             if action == "include_vars":
                 # The controller has already stored the original tagged values.
                 facts = None
             is_set_fact = action == "set_fact"
-            cacheable = bool(result_data.get("_ansible_facts_cacheable", False))
+            cacheable = bool(state.get("_ansible_facts_cacheable", False))
             if isinstance(facts, dict):
                 # Match StrategyBase: cacheable set_fact results populate the
                 # persistent fact cache, while every set_fact result also gets
@@ -1528,6 +1772,11 @@ class StrategyModule(StrategyBase):
                             )
         except Exception:
             pass
+        if "no_log" in frame and task.no_log is not frame["no_log"]:
+            original = task
+            task = original.copy(exclude_parent=True)
+            task._parent = original._parent
+            task.no_log = frame["no_log"]
         tr = self._make_result(host, task, result_data)
         is_item = frame.get("is_item")
         ignored = frame.get("ignored")
@@ -1539,6 +1788,8 @@ class StrategyModule(StrategyBase):
         if status == "failed" and not is_item:
             self._tqm.send_callback(method, tr, ignore_errors=ignored)
             return not ignored
+        if status == "changed" and frame.get("diff_mode") and not frame.get("no_log") and result_data.get("diff"):
+            self._tqm.send_callback("v2_on_file_diff", tr)
         self._tqm.send_callback(method, tr)
         return False
 
@@ -1681,8 +1932,15 @@ def _controller_fallbacks(play_node):
                 walk(node.get("tasks"))
                 walk(node.get("handlers"))
             if node.get("fallback"):
+                kind = "controller-fallback"
+                if node.get("_deferred_vault_source"):
+                    kind = "vault-source"
+                elif node.get("_file_source_argument_layers"):
+                    kind = "file-source-arguments"
+                elif node.get("_deferred_apply_include"):
+                    kind = "apply-include"
                 found.append({
-                    "kind": "controller-fallback",
+                    "kind": kind,
                     "task": node.get("name") or node.get("action"),
                     "reason": node.get("fallback_reason")
                               or "controller fallback",
@@ -1786,26 +2044,42 @@ class _LegacyFactResultQueue(collections.deque):
         return result
 
 
+_UNROUTED_FACT_RESULT = object()
+
+
 class _SetFactLinearStrategy(_LinearStrategy):
     """Use the worker's resolved delegation flags when linear publishes facts."""
 
     def run(self, iterator, play_context):
+        from ansiroll.runtime import _looks_templated
+
         self._fact_iterator = iterator
         self._fact_routes = {}
         self._legacy_fact_items = {}
         self._run_once_fact_results = {}
         send_callback = self._tqm.send_callback
         original = vars(self._tqm).get("send_callback")
+        threaded_callbacks = (_UnifiedTaskResult is not None
+                              or hasattr(_LinearStrategy, "_convert_wire_task_result_to_raw"))
 
         def capture_item(method, *args, **kwargs):
             if method in ("v2_runner_item_on_ok", "v2_runner_item_on_skipped", "v2_runner_item_on_failed"):
+                if threaded_callbacks and threading.current_thread() is not self._results_thread:
+                    # Linear may emit deferred callbacks after consuming the aggregate.
+                    return send_callback(method, *args, **kwargs)
                 result = args[0]
                 host, task = ((result.host, result.task) if _UnifiedTaskResult is not None else
                               (result._host, result._task))
                 key = (host.name, task._uuid)
-                if self._routed_fact_task(key):
-                    target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
-                    self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
+                original = self._queued_task_cache.get(key, {}).get("task")
+                if _has_delegated_fact_flag(original):
+                    if task.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT:
+                        target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
+                        self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
+                    elif _looks_templated(original.action):
+                        # Keep the place of items that don't resolve to set_fact,
+                        # including skipped items that never resolve the action.
+                        self._fact_routes.setdefault(key, []).append(_UNROUTED_FACT_RESULT)
             return send_callback(method, *args, **kwargs)
 
         # Core 2.10 consumes raw queues inline without a conversion hook.
@@ -1831,10 +2105,10 @@ class _SetFactLinearStrategy(_LinearStrategy):
             else:
                 self._tqm.send_callback = original
 
-    def _routed_fact_task(self, key):
+    def _routed_fact_task(self, key, resolved):
         original = self._queued_task_cache.get(key, {}).get("task")
-        return (original is not None and original.action in C._ACTION_SET_FACT and original.delegate_to
-                and _delegated_fact_flag(original.delegate_facts) is not False)
+        return (_has_delegated_fact_flag(original)
+                and (resolved.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT))
 
     def _fact_recipient(self, name):
         if not isinstance(name, str):
@@ -1865,15 +2139,19 @@ class _SetFactLinearStrategy(_LinearStrategy):
         if host is None:
             return
         routes = self._fact_routes.pop((host.name, task_uuid), ())
-        items = data.get("results", ())
-        if routes and len(routes) == len(items) and not result.is_failed() and not result.is_unreachable():
-            self._legacy_fact_items.update((id(item), (host, target)) for item, target in zip(items, routes)
-                                           if "ansible_facts" in item)
+        items = data.get("results")
+        if (routes and isinstance(items, list) and len(routes) == len(items)
+                and getattr(task, "action", None) not in C._ACTION_DEBUG
+                and not (result.is_failed() or result.is_unreachable() or result.is_skipped())):
+            # Hold the item itself so its identity cannot be reused before
+            # linear consumes the route or finishes the aggregate.
+            self._legacy_fact_items.update((id(item), (item, host, target)) for item, target in zip(items, routes)
+                                           if target is not _UNROUTED_FACT_RESULT and "ansible_facts" in item)
 
     def get_delegated_hosts(self, result, task):
         route = self._legacy_fact_items.pop(id(result), None)
         if route is not None:
-            host, target = route
+            _, host, target = route
             if target is None:
                 return self.get_task_hosts(self._fact_iterator, host, task)
             return [self._fact_recipient(target)]
@@ -1887,7 +2165,7 @@ class _SetFactLinearStrategy(_LinearStrategy):
             return result
         key = (host.name, task._uuid)
         routes = self._fact_routes.pop(key, ())
-        if not self._routed_fact_task(key):
+        if not routes and not self._routed_fact_task(key, task):
             return result
         if data.loop_results is None:
             if data.delegated_host:
@@ -1895,16 +2173,33 @@ class _SetFactLinearStrategy(_LinearStrategy):
             return result
         if len(routes) == len(data.loop_results):
             for item, target in zip(data.loop_results, routes):
-                item.delegated_host = self._fact_recipient(target) if target else host.name
+                if target is not _UNROUTED_FACT_RESULT:
+                    item.delegated_host = self._fact_recipient(target) if target else host.name
             if task.run_once and None in routes:
-                self._run_once_fact_results[id(result)] = routes
+                # Older 2.21 patches may retain a write's dictionary in the
+                # cache, where later writes can mutate it in place.
+                writes = [
+                    (target, item.delegated_host, {
+                        layer: dict(values) for layer, values in item.pending_changes.register_host_variables.items()
+                    })
+                    for item, target in zip(data.loop_results, routes)
+                ]
+                self._run_once_fact_results[id(result)] = (writes, dict(data.registered_values or {}))
         return result
 
     def _process_pending_results(self, iterator, *args, **kwargs):
         results = super()._process_pending_results(iterator, *args, **kwargs)
+        if _UnifiedTaskResult is None:
+            for result in results:
+                data = result._result if hasattr(result, "_result") else result._return_data
+                items = data.get("results")
+                if isinstance(items, list):
+                    for item in items:
+                        self._legacy_fact_items.pop(id(item), None)
+            return results
         for result in results:
-            routes = self._run_once_fact_results.pop(id(result), ())
-            if not routes or result.utr.failed or result.utr.unreachable or result.utr.skipped:
+            replay = self._run_once_fact_results.pop(id(result), None)
+            if replay is None or result.utr.failed or result.utr.unreachable or result.utr.skipped:
                 continue
             from ansible._internal._task import VariableLayer
 
@@ -1912,19 +2207,38 @@ class _SetFactLinearStrategy(_LinearStrategy):
             # run_once fact belongs to the entire batch. Replay in item order
             # so a later delegated assignment wins for its own recipient.
             cache = self._variable_manager
-            original_hosts = self.get_task_hosts(iterator, result.host, result.task)
-            for item, target in zip(result.utr.loop_results, routes):
-                recipients = [item.delegated_host] if target else original_hosts
-                changes = item.pending_changes.register_host_variables
-                for host in recipients:
-                    if VariableLayer.CACHEABLE_FACT in changes:
-                        cache.set_host_facts(host, changes[VariableLayer.CACHEABLE_FACT])
-                    if VariableLayer.EPHEMERAL_FACT in changes:
-                        cache.set_nonpersistent_facts(host, changes[VariableLayer.EPHEMERAL_FACT])
-            if result.utr.registered_values:
+            writes, registered = replay
+            task = result.task
+            original_hosts = self.get_task_hosts(iterator, result.host, task)
+            for target, delegated_host, changes in writes:
+                if target is _UNROUTED_FACT_RESULT:
+                    recipients = ([delegated_host or task.delegate_to]
+                                  if task.delegate_to and task.delegate_facts else original_hosts)
+                else:
+                    recipients = [delegated_host] if target else original_hosts
+                for layer, values in sorted(changes.items()):
+                    if layer == VariableLayer.REGISTER_VARS:
+                        for host in original_hosts:
+                            cache.set_nonpersistent_facts(host, dict(values))
+                    elif layer == VariableLayer.CACHEABLE_FACT:
+                        for host in recipients:
+                            cache.set_host_facts(host, dict(values))
+                    elif layer == VariableLayer.EPHEMERAL_FACT:
+                        for host in recipients:
+                            cache.set_nonpersistent_facts(host, dict(values))
+                    elif layer == VariableLayer.INCLUDE_VARS:
+                        for host in recipients:
+                            for name, value in values.items():
+                                cache.set_host_variable(host, name, value)
+            if registered:
                 for host in original_hosts:
-                    cache.set_nonpersistent_facts(host, result.utr.registered_values)
+                    cache.set_nonpersistent_facts(host, dict(registered))
         return results
+
+
+def _has_delegated_fact_flag(task):
+    return (task is not None and task.delegate_to
+            and task.delegate_facts is not None and task.delegate_facts is not False)
 
 
 def _delegated_fact_flag(value):
@@ -1949,7 +2263,7 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values, mapping_keys=None):
+def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     from ansiroll.loader import _tag_untrusted
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
@@ -1966,8 +2280,9 @@ def _json_blob(values, mapping_keys=None):
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        if mapping_keys is None or not _contains_typed_mapping_keys(values):
-            return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
+        tagged = _tag_untrusted(values, template_syntax_only=True)
+        if mapping_keys is None or not _contains_typed_mapping_keys(tagged):
+            return json.dumps(tagged, default=str)
     except Exception:
         pass
     safe = {}
@@ -1977,18 +2292,35 @@ def _json_blob(values, mapping_keys=None):
             if mapping_keys is not None and _contains_typed_mapping_keys(v):
                 packed = _pack_delegated_value(v)
                 if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
-                    continue
+                    raise ValueError("mapping keys could not be serialized")
                 mapping_keys.extend(([k, *path], keys) for path, keys in packed["mapping_keys"])
                 v = packed["value"]
             else:
                 json.dumps(v, default=str)
-        except Exception:
+        except Exception as ex:
+            if k in strict_keys:
+                raise AnsibleError("could not serialize selected vars file value for %r" % k) from ex
             continue
         safe[k] = v
     return json.dumps(safe, default=str)
 
 
+def _private_rescue_facts(manager, host_name):
+    private = getattr(manager, "_ansiroll_private_rescue_facts", {})
+    tracked = private.get(host_name, {})
+    if not tracked:
+        return {}
+    current = manager._nonpersistent_fact_cache.get(host_name, {})
+    active = {key: value for key, value in tracked.items() if key in current and current[key] is value}
+    if active:
+        private[host_name] = active
+    else:
+        private.pop(host_name, None)
+    return active
+
+
 def _hostvars_snapshot(hostvars, *, preserve_keys=False):
+    from ansiroll.loader import _core_version
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     if hostvars is None:
@@ -2001,12 +2333,35 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
             names.extend(alias for alias in C.LOCALHOST if alias not in names)
     except Exception:
         return out
-    raw_get = getattr(hostvars, "raw_get", None) if preserve_keys else None
+    raw_get = getattr(hostvars, "raw_get", None)
+    manager = getattr(hostvars, "_variable_manager", None)
+    inventory = getattr(hostvars, "_inventory", None)
     for name in names:
         try:
-            source = hostvars[name]
+            host = inventory.get_host(name) if inventory is not None else None
+            private_names = _private_rescue_facts(manager, host.name if host else name)
+            if private_names:
+                from ansible.vars.hostvars import HostVarsVars
+
+                if host is None:
+                    continue
+                # Remove only the private fact layer before precedence is
+                # applied. This also keeps aliases from resolving it.
+                public_manager = object.__new__(type(manager))
+                vars(public_manager).update(vars(manager))
+                cache = manager._nonpersistent_fact_cache.copy()
+                cache[host.name] = {key: value for key, value in cache[host.name].items() if key not in private_names}
+                public_manager._nonpersistent_fact_cache = cache
+                raw = public_manager.get_vars(host=host, include_hostvars=False)
+                raw = {key: value for key, value in raw.items()
+                       if key not in ("vars", "hostvars")}
+                raw["vars"] = dict(raw)
+                host_kw = {"host": name} if _core_version() >= (2, 19) else {}
+                source = HostVarsVars(raw, loader=hostvars._loader, **host_kw)
+            else:
+                raw = raw_get(name) if raw_get is not None and preserve_keys else {}
+                source = hostvars[name]
             keys = list(source)
-            raw = raw_get(name) if raw_get is not None else {}
         except Exception:
             continue
         safe = {}

@@ -68,7 +68,7 @@ def _vault_secrets(vault_password_file=None):
     if not paths[0]:
         try:
             from ansible import constants as C
-            paths = list(C.DEFAULT_VAULT_PASSWORD_FILES or [])
+            paths = [C.DEFAULT_VAULT_PASSWORD_FILE]
         except Exception:
             paths = []
     from ansible.parsing.vault import VaultSecret
@@ -170,9 +170,11 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                 })
             node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
             if scoped_options:
-                setup_layers["gather_setup_scope"]["controller_lookups"] = {
+                setup_scope = setup_layers["gather_setup_scope"]
+                setup_scope["controller_lookups"] = {
                     "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
                     "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
+                    "file": _capture_setup_files(play, lookups.get("file", {})),
                 }
             node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
@@ -325,7 +327,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     """Keep the play layers used by early vars-file and setup option expressions."""
     from ansible import constants as C
     from ansible.utils.vars import combine_vars
-    from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
+    from .runtime import _GATHER_STRING_METHODS, _f_combine, _selector_template_sources, _vars_hash_mapping
 
     roles = list(_gather_public_roles(play))
     defaults = _gather_role_defaults(roles)
@@ -346,10 +348,11 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     setup_names = set()
     computed = set()
     setup_lookups = {"env": set(), "config": set()}
+    setup_sources = [source for source, _, _ in _selector_template_sources(scoped_options or {})]
     lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
     for layer in (*exports, play.get_variable_manager().extra_vars, magic):
         lookup_scope = combine_vars(lookup_scope, layer)
-    for source, _, _ in _selector_template_sources(scoped_options or {}):
+    for source in setup_sources:
         dependencies = _gather_timeout_dependencies(
             source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
             computed=computed, retain_mutable=True)
@@ -360,6 +363,8 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
             computed=computed, lookups=setup_lookups)
     file_aliases = {}
     file_names = set()
+    file_values = {}
+    merge_hashes = C.DEFAULT_HASH_BEHAVIOUR == "merge"
     for entry in entries:
         for candidate in entry.get("controller_candidates", {}).values():
             selector_names.update(name for name, _ in candidate["paths"])
@@ -369,15 +374,35 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                 computed=computed_selector_names, retain_mutable=True)
             if dependencies is not None:
                 selector_names.update(dependencies[1])
-        files = [entry["static_vars"]] if "static_vars" in entry else entry["files"].values()
+        static = "static_vars" in entry
+        files = [entry["static_vars"]] if static else entry["files"].values()
         for contents in files:
             if not isinstance(contents, list):
                 continue
             for mapping in contents:
                 file_names.update(mapping)
                 for key, value in mapping.items():
+                    if setup_sources and key not in export_replacements and key not in magic:
+                        values = file_values.setdefault(key, [])
+                        if static:
+                            # A static vars file always overlays earlier candidates.
+                            if merge_hashes and _vars_hash_mapping(value):
+                                values[:] = [_f_combine(previous, value, recursive=True)
+                                             for previous in values if _vars_hash_mapping(previous)]
+                            else:
+                                values.clear()
+                        values.append(value)
                     for source, _, _ in _selector_template_sources(value):
                         file_aliases.setdefault(key, set()).add(source)
+    if setup_sources:
+        # File lookups can refer to explicitly authored assets in any reachable
+        # branch. Environment and config capture still follows the build scope.
+        file_lookups = {"file": {}}
+        for source in setup_sources:
+            _gather_timeout_dependencies(
+                source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
+                computed=computed, retain_mutable=True, lookups=file_lookups, alternate_values=file_values)
+        setup_lookups.update(file_lookups)
     if computed_selector_names:
         selector_names.update(defaults)
     for names, scope, shadowed in (
@@ -424,18 +449,52 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
                 for export in exports
             ],
             "magic": {key: value for key, value in magic.items() if computed or key in setup_names},
-            "task_search_path": play.get_search_path(),
+            "task_search_path": (play.get_search_path() if hasattr(play, "get_search_path")
+                                 else [play._loader.get_basedir()]),
         })
     return result
 
+
+def _capture_setup_files(play, terms_by_alias):
+    """Resolve literal early setup file lookups using the controller search path."""
+    from ansible.errors import AnsibleError
+    from ansible.plugins import loader as plugin_loader
+    from ansible.plugins.lookup import file as builtin_file
+
+    if not terms_by_alias:
+        return {}
+    loader = play._loader
+    plugin = plugin_loader.lookup_loader.get("ansible.builtin.file", loader=loader)
+    search_path = play.get_search_path() if hasattr(play, "get_search_path") else [loader.get_basedir()]
+    variables = {"ansible_search_path": search_path}
+    plugin_dirs = [loader.get_basedir(), *(role._role_path for role in (play.roles or ())
+                                          if role._role_path and not role._role_collection)]
+    overrides_file = any(os.path.isfile(os.path.join(root, "lookup_plugins", "file.py")) for root in plugin_dirs)
+    builtin_path = os.path.realpath(builtin_file.__file__)
+    captured = {}
+    for alias, names in sorted(terms_by_alias.items()):
+        if alias != "ansible.builtin.file":
+            resolved = plugin_loader.lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
+            if overrides_file or not resolved or os.path.realpath(resolved) != builtin_path:
+                continue
+        files = captured[alias] = {}
+        for name in sorted(names):
+            try:
+                files[name], = plugin.run([name], variables=variables, lstrip=False, rstrip=False)
+            except (AnsibleError, OSError):
+                # Missing terms fail only if the runner actually selects them.
+                continue
+    return captured
+
+
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False, lookups=None):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
     from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
-                          _selector_template_sources)
+                          _selector_template_sources, _setup_builtin_lookup)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
@@ -470,10 +529,12 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 return None
             if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
-                plugin = call.args[0].value.rsplit(".", 1)[-1]
+                alias = call.args[0].value
+                plugin = _setup_builtin_lookup(alias)
                 if plugin in lookups:
-                    lookups[plugin].update(arg.value for arg in call.args[1:]
-                                           if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
+                    terms = lookups[plugin].setdefault(alias, set()) if plugin == "file" else lookups[plugin]
+                    terms.update(arg.value for arg in call.args[1:]
+                                 if isinstance(arg, nodes.Const) and isinstance(arg.value, str))
         for name, path in _selector_input_paths(expression, remaining, key_scope, computed, unknown_lookup,
                                                 resolve_aliases=resolve_aliases, analysis=analysis,
                                                 retain_mutable=retain_mutable):
@@ -483,6 +544,9 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 paths.add((name, path))
             seen.add((name, path))
             names.add(name)
+            for value in (alternate_values or {}).get(name, ()):
+                pending.extend((alias, suffix, (name, location), ancestors)
+                               for alias, suffix, location in _selector_template_sources(value, path))
             if name not in variables:
                 continue
             value = variables[name]
@@ -700,6 +764,31 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         except Exception:
             basedir = os.getcwd()
     unresolved_vars_files = []
+    gather = gather_facts
+    if gather is None:
+        gather = play.gather_facts
+        if gather is None:
+            gather = C.DEFAULT_GATHERING != "explicit"
+    setup_defaults = _setup_module_defaults(play, "ansible.builtin.setup") if gather else []
+    gather_defaults = _setup_module_defaults(play, "ansible.builtin.gather_facts") if gather else []
+    if (setup_defaults or gather_defaults) and _core_version() >= (2, 19):
+        explicit = {
+            key for key in ("fact_path", "gather_subset", "gather_timeout")
+            if key in (play.get_ds() or {}) and _known_setup_arg(getattr(play, key, None))
+        }
+        gather_defaults = _prune_setup_defaults(gather_defaults, explicit)
+        # A gather_facts argument overrides the setup default when Core
+        # forwards it. Templated mappings can replace any earlier value.
+        known_gather_args = {}
+        for layer in gather_defaults:
+            if isinstance(layer, dict):
+                known_gather_args.update(layer)
+            else:
+                known_gather_args.clear()
+        setup_overrides = explicit | {
+            key for key, value in known_gather_args.items() if key != "parallel" and _known_setup_arg(value)
+        }
+        setup_defaults = _prune_setup_defaults(setup_defaults, setup_overrides)
     vars_file_entries = _as_list(getattr(play, "vars_files", None))
     replay_order = any(_is_templated(filename)
                        for entry in vars_file_entries[:-1]
@@ -708,6 +797,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         key: value for key in ("fact_path", "gather_subset")
         if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
     }
+    default_sources = _tag_untrusted(setup_defaults + gather_defaults)
+    if any(_selector_template_sources(default_sources)):
+        scoped_options["module_defaults"] = default_sources
     early_setup = (play.gather_facts is not False
                    and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
                    and (scoped_options or _is_templated(play.gather_timeout)))
@@ -743,6 +835,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
+    includes.controller_execution = gather_facts is not None
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
     includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
@@ -774,13 +867,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     if runtime_writes is not None:
         runtime_writes.update(includes.runtime_writes)
     _assign_runtime_ids(tasks, handlers)
-    # The strategy supplies the iterator's filtered setup decision. Standalone
-    # uses the play keyword and the controller's default gathering policy.
-    gather = gather_facts
-    if gather is None:
-        gather = play.gather_facts
-        if gather is None:
-            gather = C.DEFAULT_GATHERING != "explicit"
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
     core_version = _core_version()
@@ -819,8 +905,17 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         }
         # Older cores expose their default subset on the loaded Play. Leave
         # the equivalent setup default implicit when the play did not set it.
-        if setup_options.get("gather_subset") == ["all"] and "gather_subset" not in (play.get_ds() or {}):
+        play_data = play.get_ds() or {}
+        if (not (setup_defaults or gather_defaults) and setup_options.get("gather_subset") == ["all"]
+                and "gather_subset" not in play_data):
             del setup_options["gather_subset"]
+        if setup_defaults:
+            result["gather_setup_defaults"] = _tag_untrusted(setup_defaults)
+        if gather_defaults:
+            result["gather_action_defaults"] = _tag_untrusted(gather_defaults)
+        if setup_defaults or gather_defaults:
+            if "gather_timeout" not in play_data and play.gather_timeout is not None:
+                result["gather_timeout"] = play.gather_timeout
         if setup_options:
             result["gather_setup_options"] = _tag_untrusted(setup_options)
         if gather_facts is None and scoped_options:
@@ -835,6 +930,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     lookup_sources.pop("gather_setup_options", None)
     lookup_sources.pop("_gather_setup_scoped", None)
+    lookup_sources.pop("gather_setup_defaults", None)
+    lookup_sources.pop("gather_action_defaults", None)
     lookup_sources.pop("_gather_setup_compile_vars", None)
     names = _controller_env_names(lookup_sources)
     if "_gather_setup_scoped" in result:
@@ -848,6 +945,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     config_names = _controller_config_names(lookup_sources)
     config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE",
                          "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
+    if setup_defaults or gather_defaults:
+        config_names.add("DEFAULT_GATHER_SUBSET")
     if core_version >= (2, 19):
         config_names.add("DISPLAY_TRACEBACK")
     controller_config = _controller_config_values(config_names)
@@ -960,23 +1059,60 @@ def _apply_force_handlers_default(play):
         pass
 
 
-def _controller_env_names(value):
+def _known_setup_arg(value):
+    from .runtime import _selector_template_sources
+
+    return value is not None and not any(_selector_template_sources(_tag_untrusted(value)))
+
+
+def _prune_setup_defaults(layers, overrides):
+    return [{key: value for key, value in layer.items() if key not in overrides}
+            if isinstance(layer, dict) else layer for layer in layers]
+
+
+def _setup_module_defaults(play, action):
+    defaults = {}
+    layers = play.module_defaults or ()
+    if isinstance(layers, dict):
+        layers = (layers,)
+    for layer in layers:
+        defaults.update(layer)
+    groups = (getattr(play, "_action_groups", None) or {}).get(action, ())
+    inherited = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
+    if _core_version() < (2, 12):
+        short = action.rsplit(".", 1)[-1]
+        inherited.append(defaults.get(short))
+        if short == "setup":
+            inherited.append(defaults.get("ansible.legacy.setup"))
+    else:
+        inherited.append(defaults.get(action))
+    return [entry for entry in inherited if entry]
+
+
+def _controller_env_names(value, *, trusted_only=False):
     """Find literal controller-side env lookups that the target must reproduce."""
-    return _controller_lookup_names(value, _ENV_LOOKUP_RE)
+    return _controller_lookup_names(value, _ENV_LOOKUP_RE, trusted_only=trusted_only)
 
 
-def _controller_config_names(value):
+def _controller_config_names(value, *, trusted_only=False):
     """Find literal config lookups whose controller values must be preserved."""
-    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE)
+    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE, trusted_only=trusted_only)
 
 
-def _controller_lookup_names(value, pattern):
+def _controller_lookup_names(value, pattern, *, trusted_only=False):
+    if trusted_only:
+        try:
+            from ansible.template import is_trusted_as_template
+        except ImportError:
+            def is_trusted_as_template(value):
+                return not getattr(value, "__UNSAFE__", False)
+
     names = set()
     seen = set()
     pending = [value]
     while pending:
         item = pending.pop()
-        if isinstance(item, str):
+        if isinstance(item, str) and (not trusted_only or is_trusted_as_template(item)):
             names.update(pattern.findall(item))
         elif isinstance(item, (dict, list, tuple)) and id(item) not in seen:
             seen.add(id(item))
@@ -1430,6 +1566,8 @@ def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
 
 def _tag_untrusted(value, template_syntax_only=False):
     """Mark strings that are explicitly not trusted (for example `!unsafe`)."""
+    from .runtime import _FactKeyTemplate
+
     try:
         from ansible._internal._datatag._tags import TrustedAsTemplate
     except ImportError:
@@ -1444,7 +1582,8 @@ def _tag_untrusted(value, template_syntax_only=False):
             if not template_syntax_only or "{{" in v or "{%" in v:
                 return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
-            return {k: walk(x) for k, x in v.items()}
+            return {_FactKeyTemplate(k) if isinstance(k, str) and ("{{" in k or "{%" in k)
+                    and not untrusted(k) else k: walk(x) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
         if isinstance(v, tuple):
@@ -1634,7 +1773,7 @@ def _convert_node(node, actions, basedir,
                                         skip_tags, includes)
             if inc is not None:
                 return inc
-        return _convert_task(node, actions, basedir)
+        return _convert_task(node, actions, basedir, controller_execution=includes.controller_execution)
     return None
 
 
@@ -1649,6 +1788,7 @@ _INCLUDE_STACK = {}
 # link for compile-time include paths and variables.
 _INCLUDE_ROLE_PARENTS = {}
 _INCLUDE_IDS = [0]
+_UNRESOLVED_INCLUDE_VALUE = object()
 
 
 def _is_templated(value):
@@ -1664,13 +1804,31 @@ def _loop_binding_names(loop_var, index_var, extended):
     return names
 
 
-def _runtime_write_names(action, args, register):
+def _set_fact_raw_params_is_fact(task):
+    from ansible.parsing.splitter import split_args
+
+    # Delegated free-form arguments retain the same key as native Core.
+    if getattr(task, "delegate_to", None):
+        return True
+    source = task.get_ds() or {}
+    forms = (source.get("args"), source.get(task.action), source.get("action"), source.get("local_action"))
+    return any(
+        (isinstance(form, dict) and "_raw_params" in form)
+        or (isinstance(form, str) and any(token.startswith("_raw_params=") for token in split_args(form)))
+        for form in forms
+    )
+
+
+def _runtime_write_names(action, args, register, *, raw_params_is_fact=False):
     """Return variable writes, using None for a write with unknown names."""
     names = set(register if isinstance(register, dict) else [register]) if register else set()
     action = str(action or "").rsplit(".", 1)[-1]
     if action == "set_fact":
         names.update(None if _is_templated(key) else key
-                     for key in args if key != "cacheable")
+                     for key in args if key not in ("cacheable", "_variable_params"))
+        if "_variable_params" in args or (
+                not raw_params_is_fact and set(args) == {"_raw_params"} and _is_templated(args["_raw_params"])):
+            names.add(None)
     elif action == "include_vars":
         name = args.get("name")
         names.add(name if isinstance(name, str) and name and not _is_templated(name) else None)
@@ -1749,8 +1907,11 @@ class _IncludeVariables:
                 self.record_writes(node.rescue)
                 self.record_writes(node.always)
             elif isinstance(node, Task):
+                args = node.args or {}
+                raw_params_is_fact = ("_raw_params" in args and node.action.rsplit(".", 1)[-1] == "set_fact"
+                                      and _set_fact_raw_params_is_fact(node))
                 self.runtime_writes.update(
-                    _runtime_write_names(node.action, node.args or {}, node.register)
+                    _runtime_write_names(node.action, args, node.register, raw_params_is_fact=raw_params_is_fact)
                 )
 
 
@@ -1762,6 +1923,38 @@ def _include_ref(key):
 def _new_include_id():
     _INCLUDE_IDS[0] += 1
     return "include-%d" % _INCLUDE_IDS[0]
+
+
+class _AppliedExecutionFlag(str):
+    """An inherited flag whose value is resolved by the include invocation."""
+
+
+def _include_apply_flags(task, keywords, *, role=False):
+    # Looped include_tasks keeps the original apply mapping; include_role
+    # finalizes it separately for each item before expanding the role.
+    if _core_version() < (2, 19) or (task.loop is not None and not role):
+        return {}
+    applied = (task.args or {}).get("apply")
+    if not isinstance(applied, dict):
+        return {}
+    flags = {key: _tag_untrusted(applied[key]) for key in keywords if _is_templated(applied.get(key))}
+    if not flags:
+        return {}
+    fallbacks = {}
+    for key in flags:
+        inherited = task._get_parent_attribute(key, omit=True)
+        fallback = _execution_omit_fallback(inherited, keyword=key)
+        if key == "check_mode" and _is_templated(inherited) and not isinstance(inherited, _AppliedExecutionFlag):
+            fallback = {"__ansiroll_raw_apply_check_mode__": fallback}
+        fallbacks[key] = fallback
+    return {"apply_flags": flags, "apply_omit_fallback": fallbacks}
+
+
+def _bind_include_apply_flags(parent, options):
+    for key in options.get("apply_flags", ()):
+        value = _AppliedExecutionFlag(getattr(parent, key))
+        value.keyword = key
+        setattr(parent, key, value)
 
 
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
@@ -1777,6 +1970,11 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     if "{{" in fname or "{%" in fname:
         fname = _template_include_filename(task, fname, includes)
         if not isinstance(fname, str) or "{{" in fname or "{%" in fname:
+            if any(value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):
+                node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
+                node["_deferred_apply_include"] = True
+                node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
+                return node
             return None
     path = _include_tasks_path(task, fname, includes)
     if path is None or not os.path.exists(path):
@@ -1790,12 +1988,16 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         stable_template = raw_fname
     key = ("tasks", physical_path, _include_path_spelling(path),
            id(role) if role is not None else None, _is_handler(task),
-           _include_search_context(task, stable_template, fname), scope)
+           _include_search_context(task, stable_template, fname), scope, repr(args.get("apply")),
+           bool(args.get("apply")) and task.loop is not None)
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
+    apply_options = _include_apply_flags(task, ("check_mode", "diff", "no_log", "become"))
+    applied = args.get("apply") or {}
+    render_apply = _core_version() >= (2, 19) and task.loop is None
     if ref is None:
         try:
             from ansible.playbook.helpers import load_list_of_blocks
@@ -1805,17 +2007,17 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 data = task._loader.load_from_file(path)
             handler = _is_handler(task)
             parent = task
-            if handler and args.get("apply"):
-                include = task.copy()
+            if args.get("apply"):
+                include = task.copy(exclude_parent=True)
+                include._parent = task._parent
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
+                if render_apply and parent.vars:
+                    parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
             blocks = load_list_of_blocks(
                 data, play=_play_of(task), task_include=parent, role=task._role,
                 use_handlers=handler, variable_manager=task.get_variable_manager(),
                 loader=task._loader)
-            if parent is not task:
-                for block in blocks:
-                    block.vars = dict(parent.vars, **(block.vars or {}))
         except Exception:
             return None
         includes.record_writes(blocks)
@@ -1831,6 +2033,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             for nested in nested_includes:
                 nested._ansiroll_stable_include = True
         include_id = _new_include_id()
+        _bind_include_apply_flags(parent, apply_options)
         _INCLUDE_STACK[key] = include_id
         try:
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
@@ -1838,9 +2041,14 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
+        if parent is not task and parent.vars and tasks and not render_apply:
+            tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", fname, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
+    if render_apply and applied.get("vars"):
+        node["apply_vars"] = _tag_untrusted(applied["vars"])
+    node.update(apply_options)
     return node
 
 
@@ -1853,7 +2061,8 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "action": action,
         "register": _register_of(task),
         **_ignore_errors_keywords(task),
-        "no_log": bool(getattr(task, "no_log", False)),
+        **_execution_keyword(task, "no_log"),
+        "run_once": getattr(task, "run_once", None),
         "file": fname,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
@@ -1975,7 +2184,7 @@ def _include_scope(task):
         task = _include_parent(task)
     scope, params = {}, {}
     for parent in reversed(parents):
-        variables = parent.vars or {}
+        variables = getattr(parent, "_ansiroll_apply_filename_vars", parent.vars) or {}
         scope.update(variables)
         if isinstance(parent, TaskInclude):
             params.update(variables)
@@ -1983,7 +2192,15 @@ def _include_scope(task):
 
 
 def _include_scope_key(task):
-    return tuple(repr(sorted(scope.items())) for scope in _include_scope(task))
+    keywords = ("become_user", "ignore_errors", "ignore_unreachable", "environment", "tags", "run_once")
+    return (
+        *(repr(sorted(scope.items())) for scope in _include_scope(task)),
+        tuple(repr(getattr(task, key, None)) for key in keywords),
+        tuple(repr(_execution_keyword(task, key)) for key in ("check_mode", "diff", "no_log", "become")),
+        # A null parent and no parent both look unset on the include
+        # itself, but a child task that returns omit distinguishes them.
+        repr(task._get_parent_attribute("check_mode")),
+    )
 
 
 def _too_many_include_contexts(key):
@@ -2044,6 +2261,30 @@ _MAGIC_VAR_NAMES = frozenset((
 
 def _template_include_filename(task, value, includes):
     """Resolve an include filename using Ansible's own templar and precedence."""
+    resolved = _template_include_value(task, value, includes)
+    if isinstance(resolved, str) and not _is_templated(resolved):
+        includes.resolved_template = True
+    return None if resolved is _UNRESOLVED_INCLUDE_VALUE else resolved
+
+
+def _compile_apply_filename_vars(task, variables, includes, *, portable=False):
+    """Project non-looped apply bindings into the filename resolver's scope."""
+    compiled = {}
+    for name, value in variables.items():
+        if not _contains_dynamic_value(value):
+            compiled[name] = value
+            continue
+        # Templating a mapping lets Core drop an omitted value just as it does
+        # when finalizing the original apply arguments.
+        rendered = _template_include_value(task, {name: value}, includes, portable=portable)
+        if rendered is _UNRESOLVED_INCLUDE_VALUE:
+            compiled[name] = rendered
+        else:
+            compiled.update(rendered)
+    return compiled
+
+
+def _template_include_value(task, value, includes, *, portable=False):
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
@@ -2109,7 +2350,7 @@ def _template_include_filename(task, value, includes):
         parent = _include_parent(parent)
 
     def is_runtime(name):
-        if name in loop_names:
+        if name in loop_names or variables.get(name) is _UNRESOLVED_INCLUDE_VALUE:
             return True
         if ((includes.incomplete or name in includes.vars_file_writes)
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
@@ -2124,7 +2365,14 @@ def _template_include_filename(task, value, includes):
         )
 
     if _depends_on_vars(value, variables, is_runtime):
-        return None
+        return _UNRESOLVED_INCLUDE_VALUE
+    if portable:
+        from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
+
+        for source, _, _ in _selector_template_sources(_tag_untrusted(value)):
+            inputs = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS, selector=True)
+            if inputs is None or _vars_filename_controller_requirements(source, inputs)[0]:
+                return _UNRESOLVED_INCLUDE_VALUE
     try:
         from ansible.template import Templar
         try:
@@ -2132,12 +2380,9 @@ def _template_include_filename(task, value, includes):
         except TypeError:
             templar = Templar(loader=task._loader)
             templar.available_variables = variables
-        resolved = templar.template(value, fail_on_undefined=True)
+        return templar.template(value, fail_on_undefined=True)
     except Exception:
-        return None
-    if isinstance(resolved, str) and not _is_templated(resolved):
-        includes.resolved_template = True
-    return resolved
+        return _UNRESOLVED_INCLUDE_VALUE
 
 
 def _is_literal_include_template(value):
@@ -2178,8 +2423,12 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     except Exception:
         return None
     task._role_path = getattr(ri, "_role_path", None)
+    apply_options = _include_apply_flags(task, ("check_mode",), role=True)
+    applied = args.get("apply") or {}
+    render_apply = _core_version() >= (2, 19)
     key = ("role", task._role_path or name, tuple(sorted(from_files.items())),
-           _is_handler(task), _include_search_context(task), _include_scope_key(task))
+           _is_handler(task), _include_search_context(task), _include_scope_key(task), repr(args.get("apply")),
+           bool(apply_options))
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
@@ -2199,22 +2448,23 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 handler_dep_chain = None
             blocks = role.compile(play, dep_chain=dep_chain)
             handler_blocks = role.get_handler_blocks(play, dep_chain=handler_dep_chain) or []
-            if handler_blocks and args.get("apply"):
+            parent = task
+            if args.get("apply"):
                 include = task.copy()
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
-                for block in handler_blocks:
-                    block._parent = parent
+            for block in blocks + handler_blocks:
+                block._parent = parent
+            _bind_include_apply_flags(parent, apply_options)
         except Exception:
             return None
         includes.record_writes(blocks + handler_blocks)
-        _register_included(blocks)
-        _register_included(handler_blocks)
+        nested_includes = _register_included(blocks + handler_blocks)
+        if parent is not task and render_apply and parent.vars:
+            parent._ansiroll_apply_filename_vars = (
+                _compile_apply_filename_vars(task, parent.vars, includes, portable=True) if nested_includes else {})
         task._role_path = role._role_path
-        role_roots = [id(block) for block in blocks + handler_blocks
-                      if getattr(block, "_parent", None) is None]
-        if handler_blocks and args.get("apply"):
-            role_roots.append(id(parent))
+        role_roots = (id(parent),) if parent is not task else ()
         _INCLUDE_ROLE_PARENTS.update(dict.fromkeys(role_roots, task))
         include_id = _new_include_id()
         # Keep the guard while converting the role's tasks: that is where a
@@ -2224,7 +2474,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             # Executing include_role appends the role's handlers to the play's
             # handlers (ansible/playbook/role_include.py IncludeRole.get_block_list).
             handlers = _convert_handlers(handler_blocks, actions, basedir, includes)
-            if handlers and args.get("apply") and parent.vars:
+            if handlers and parent is not task and parent.vars and not render_apply:
                 applied_vars = _tag_untrusted(dict(parent.vars))
                 for handler in handlers:
                     handler["handler_block_vars"] = applied_vars
@@ -2242,13 +2492,19 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                                skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]
+            if parent is not task and parent.vars and tasks and not render_apply:
+                tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
         finally:
             _INCLUDE_STACK.pop(key, None)
             for root in role_roots:
                 del _INCLUDE_ROLE_PARENTS[root]
     role_defaults, role_vars = _role_vars(task)
-    return _include_node(task, "include_role", name, basedir,
+    node = _include_node(task, "include_role", name, basedir,
                          role_defaults, role_vars, tasks, include_id, ref, handlers)
+    if render_apply and isinstance(applied, dict) and applied.get("vars"):
+        node["apply_vars"] = _tag_untrusted(applied["vars"])
+    node.update(apply_options)
+    return node
 
 
 def _play_of(task):
@@ -2300,7 +2556,7 @@ def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
         return True
 
 
-def _convert_task(task, actions, basedir):
+def _convert_task(task, actions, basedir, *, controller_execution=False):
     action = task.action
 
     if action in ("meta", "ansible.builtin.meta"):
@@ -2354,15 +2610,17 @@ def _convert_task(task, actions, basedir):
         "search_dirs": _search_dirs(task, basedir, "files"),
         "search_path": _raw_search_path(task, basedir),
         **_ignore_errors_keywords(task),
-        "no_log": bool(getattr(task, "no_log", False)),
+        **_execution_keyword(task, "no_log"),
         "ignore_unreachable": _boolean_or_template(getattr(task, "ignore_unreachable", False)),
         "async_val": int(getattr(task, "async_val", 0) or 0),
         "poll": int(getattr(task, "poll", 0) or 0),
         "run_once": getattr(task, "run_once", None),
         # None inherits the invocation's --check setting; explicit values
         # (including templates) override it for this task.
-        "check_mode": getattr(task, "check_mode", None),
+        **_execution_keyword(task, "check_mode"),
+        **_execution_keyword(task, "diff"),
         "become": bool(task.become),
+        **_execution_keyword(task, "become", node_key="become_override"),
         "become_user": getattr(task, "become_user", None),
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),  # lowest precedence (below play vars)
@@ -2408,7 +2666,43 @@ def _convert_task(task, actions, basedir):
         node["delegate_facts"] = _boolean_or_template(node["delegate_facts"])
 
     if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
-        _bake_sources(node, task, basedir)
+        source_action = action.rsplit(".", 1)[-1]
+        unknown_defaults = False
+        argument_layers = []
+        if source_action in ("copy", "unarchive"):
+            explicit = set(node["args"])
+            if "_variable_params" in explicit:
+                argument_layers.append("_variable_params")
+            if _contains_dynamic_value(node["args"].get("_raw_params")):
+                argument_layers.append("_raw_params")
+            unknown_defaults = _apply_file_source_defaults(task, source_action, node)
+            if argument_layers:
+                node["_file_source_argument_layers"] = argument_layers
+                node["_file_source_inherited_args"] = sorted(node["args"].keys() - explicit)
+                node["fallback"] = True
+                node["fallback_reason"] = "templated file source arguments require controller selection"
+        _bake_sources(node, task, basedir, controller_execution=controller_execution,
+                      unknown_defaults=unknown_defaults or bool(argument_layers))
+        decrypt = node["args"].get("decrypt", True)
+        # With Vault secrets available, a live dynamic source may need decryption.
+        # Let Core select the source on the controller in that case.
+        live_copy = (controller_execution and source_action == "copy" and task._loader._vault.secrets
+                     and (node.get("_baked_tree") or node.get("_baked_absolute_tree")))
+        if (source_action in ("copy", "unarchive") and not node.get("_vault_plaintext")
+                and (unknown_defaults or argument_layers or _contains_dynamic_value(decrypt)
+                     or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
+                and (live_copy or any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
+                                      for value in (node.get("_baked") or {}).values()))):
+            node["_deferred_vault_source"] = True
+            node["_vault_source_inputs"] = [
+                key for key in ("src", "remote_src", "copy", "decrypt", "content")
+                if _contains_dynamic_value(args.get(key))
+            ]
+            if unknown_defaults:
+                node["_vault_source_inputs"].append("module_defaults")
+            node["_vault_source_inputs"].extend(argument_layers)
+            node["fallback"] = True
+            node["fallback_reason"] = "Vault source needs controller selection and decryption"
         if node["special"] is None:
             actions.add(action)
         else:
@@ -2416,7 +2710,7 @@ def _convert_task(task, actions, basedir):
             # official copy and file modules.
             actions.update(COPY_ACTION_MODULES)
             node.update(_copy_action_settings())
-            if node["special"] == "copy" and _remote_src(node["args"]) is not False:
+            if node["special"] == "copy" and (argument_layers or _remote_src(node["args"]) is not False):
                 # remote_src copies run the copy module on the target, like the
                 # copy action plugin's remote_src path.
                 actions.add(action)
@@ -2433,6 +2727,8 @@ def _convert_task(task, actions, basedir):
         trusted_keys = [k for k in _tag_untrusted(keys) if isinstance(k, str)]
         if trusted_keys:
             node["set_fact_key_templates"] = trusted_keys
+        if "_raw_params" in args:
+            node["set_fact_raw_params_is_fact"] = _set_fact_raw_params_is_fact(task)
     if action.split(".")[-1] == "assert":
         node["args"] = {k: v if k == "that" else _tag_untrusted(v)
                         for k, v in node["args"].items()}
@@ -2642,7 +2938,57 @@ def _special_of(action):
     return None
 
 
-def _bake_sources(node, task, basedir):
+def _apply_file_source_defaults(task, action, node):
+    """Lower source-affecting module defaults without running their templates."""
+    from ansible.plugins.loader import action_loader, module_loader
+
+    args = node["args"]
+    layers = task.module_defaults or ()
+    defaults = {}
+    for layer in (layers,) if isinstance(layers, dict) else layers:
+        defaults.update(layer)
+    if not defaults:
+        return False
+    if _core_version() < (2, 12):
+        # Legacy Core merges authored and redirected names in this order.
+        names = []
+        for name in getattr(task, "_ansible_internal_redirect_list", None) or (task.action,):
+            if name == task.action and name.startswith("ansible.legacy."):
+                names.append(name.rsplit(".", 1)[-1])
+            names.append(name)
+        entries = [defaults[name] for name in names if name in defaults]
+    else:
+        loaders = (action_loader, module_loader) if _core_version() >= (2, 19) else (module_loader, action_loader)
+        resolved = None
+        for loader in loaders:
+            result = loader.find_plugin_with_context(task.action, collection_list=task.collections)
+            if result.resolved:
+                resolved = result.resolved_fqcn
+                break
+        if not resolved:
+            # Without a known match, never bake plaintext based on a guessed alias.
+            return True
+        groups = (getattr(_play_of(task), "_action_groups", None) or {}).get(resolved, ())
+        entries = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
+        if resolved in defaults:
+            entries.append(defaults[resolved])
+    source_keys = {"decrypt", "remote_src", "src"}
+    if action == "unarchive":
+        source_keys.add("copy")
+    else:
+        source_keys.update(("content", "mode"))
+    missing = source_keys - args.keys()
+    if missing and any(not isinstance(entry, dict) for entry in entries):
+        node["_file_source_defaults"] = _tag_untrusted(entries)
+        node["_file_source_default_keys"] = sorted(missing)
+        return True
+    for entry in entries:
+        if isinstance(entry, dict):
+            args.update({key: entry[key] for key in missing & entry.keys()})
+    return False
+
+
+def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_defaults=False):
     """Bake controller-side src file(s) for template/copy/unarchive.
 
     Stores node['_baked'] = {rendered_src: text}. Resolves src using Ansible's
@@ -2657,14 +3003,24 @@ def _bake_sources(node, task, basedir):
     name = node.get("action", "").split(".")[-1]
     remote = _remote_src(args, unarchive=name == "unarchive") if name in ("copy", "unarchive") else False
     if remote is True:
-        return  # src lives on the target; the module reads it there
+        inherited = node.get("_file_source_inherited_args", ())
+        if not inherited or _remote_src(
+                {key: value for key, value in args.items() if key not in inherited},
+                unarchive=name == "unarchive") is True:
+            return  # src lives on the target; the module reads it there
+        remote = None  # templated arguments can override inherited source flags
 
     subdir = "templates" if name == "template" else "files"
     newline = ""
     # Template exposes source metadata (template_fullpath, template_mtime, template_uid) and copy reads the source
     # mode for mode=preserve; otherwise it is left out, since mtimes would make compiles differ across checkouts.
     mode = args.get("mode")
-    with_meta = name == "template" or (name == "copy" and (mode == "preserve" or _contains_dynamic_value(mode)))
+    with_meta = name == "template" or (name == "copy" and (
+        mode == "preserve" or _contains_dynamic_value(mode)
+        or "mode" in node.get("_file_source_default_keys", ())
+        or (node.get("_file_source_argument_layers") and (
+            "mode" not in args or "mode" in node["_file_source_inherited_args"]))
+    ))
     # playbook_dir is the controller's playbook directory, so it is known now. The runtime renders it to the
     # same path, which then matches the baked key.
     src = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, src)
@@ -2672,6 +3028,12 @@ def _bake_sources(node, task, basedir):
     if role_path:
         src = _ROLE_PATH_RE.sub(lambda _m: role_path, src)
 
+    decrypt = args.get("decrypt", True)
+    decrypt_selected = (
+        not unknown_defaults and name in ("copy", "unarchive") and remote is False and not _contains_dynamic_value(src)
+        and not _contains_dynamic_value(decrypt) and args.get("content") is None
+        and (_source_flag(decrypt) if name == "copy" else bool(decrypt))
+    )
     candidates = []
     if _JINJA_RE.search(src):
         loop = node.get("loop")
@@ -2706,15 +3068,34 @@ def _bake_sources(node, task, basedir):
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
-        with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
-            baked[rel] = fh.read()
+        source_is_plaintext = True
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if decrypt_selected and raw.startswith(b"$ANSIBLE_VAULT;"):
+            if controller_execution:
+                node["_deferred_vault_source"] = True
+                node["fallback"] = True
+                node["fallback_reason"] = "Vault source needs per-host controller decryption"
+                return
+            from ansible.errors import AnsibleError
+            try:
+                raw, source_is_plaintext = task._loader._decrypt_if_vault_data(raw)
+                if not source_is_plaintext:
+                    node["_vault_plaintext"] = True
+            except AnsibleError as ex:
+                # Match normal task gating for a source whose key is missing
+                # or incorrect. The failing payload needs no embedded bytes.
+                baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
+                continue
+        baked[rel] = raw.decode("utf-8", "surrogateescape")
         if not with_meta:
             continue
         try:
             st = os.stat(path)
             meta[rel] = {"fullpath": os.path.abspath(path),
                          "mtime": st.st_mtime, "uid": st.st_uid,
-                         "mode": stat.S_IMODE(st.st_mode)}
+                         # Vault's temporary plaintext source is owner-only.
+                         "mode": stat.S_IMODE(st.st_mode) if source_is_plaintext else 0o600}
         except OSError:
             pass
     node["_baked"] = baked
@@ -2847,6 +3228,7 @@ def _bake_absolute_tree(node, src, basedir, with_meta, *, newline=None):
     if not baked:
         return False
     node["_baked"] = baked
+    node["_baked_absolute_tree"] = True
     if meta:
         node["_baked_meta"] = meta
     return True
@@ -3896,6 +4278,57 @@ def _ignore_errors_keywords(task):
         if inherited is not Sentinel and inherited is not None:
             result["ignore_errors_on_omit"] = _boolean_or_template(inherited)
     return result
+
+
+def _execution_keyword(task, keyword, *, node_key=None):
+    from ansible.playbook.base import Sentinel
+
+    key = node_key or keyword
+    value = getattr(task, keyword, None)
+    if isinstance(value, _AppliedExecutionFlag):
+        return {key: {"__ansiroll_apply_flag__": value.keyword}}
+    value = _tag_untrusted(value)
+    result = {key: value}
+    if keyword == "check_mode" and isinstance(value, str):
+        try:
+            inherited = task._get_parent_attribute(keyword, omit=True)
+        except TypeError:
+            inherited = Sentinel
+        if inherited is Sentinel:
+            result[key + "_on_omit"] = "invocation"
+        elif isinstance(inherited, _AppliedExecutionFlag):
+            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
+        elif _core_version() < (2, 19):
+            result[key + "_on_omit"] = bool(inherited)
+        else:
+            from ansible.module_utils.parsing.convert_bool import boolean
+
+            # Core validates the restored task keyword without rendering it.
+            try:
+                result[key + "_on_omit"] = boolean(inherited) if inherited is not None else False
+            except TypeError:
+                result[key + "_on_omit"] = "invalid"
+    elif _is_templated(value) and _core_version() >= (2, 19):
+        inherited = task._get_parent_attribute(keyword, omit=True)
+        if inherited is not Sentinel:
+            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
+    return result
+
+
+def _execution_omit_fallback(value, *, keyword=None):
+    from ansible.module_utils.parsing.convert_bool import boolean
+    from ansible.playbook.base import Sentinel
+
+    if isinstance(value, _AppliedExecutionFlag):
+        return {"__ansiroll_apply_flag__": value.keyword}
+    if value is Sentinel:
+        return {"__ansiroll_invocation_check_mode__": True} if keyword == "check_mode" else None
+    if _is_templated(value):
+        return _tag_untrusted(value)
+    try:
+        return boolean(value) if value is not None else False
+    except TypeError:
+        return "invalid"
 
 
 def _boolean_or_template(value):
