@@ -1629,8 +1629,9 @@ def _first_found_list_option(value):
     if not isinstance(value, str):
         return value
     members = [part.strip() for part in value.split(",")]
-    return [part[1:-1] if len(part) > 1 and part[0] in ("'", '"') and part[-1] == part[0] else part
-            for part in members]
+    members = [part[1:-1] if len(part) > 1 and part[0] in ("'", '"') and part[-1] == part[0] else part
+               for part in members]
+    return [type(value)(part) for part in members] if isinstance(value, _NO_TEMPLATE) else members
 
 
 def _first_found_vars_file(args, kwargs, selector):
@@ -1639,7 +1640,8 @@ def _first_found_vars_file(args, kwargs, selector):
             if isinstance(value, (list, tuple)):
                 yield from split_terms(value, separators)
             elif isinstance(value, str):
-                yield from re.split(separators, value) if separators else (value,)
+                parts = re.split(separators, value) if separators else (value,)
+                yield from (type(value)(part) for part in parts) if isinstance(value, _NO_TEMPLATE) else parts
             else:
                 raise ValueError("first_found filenames and paths must be strings")
 
@@ -1654,12 +1656,20 @@ def _first_found_vars_file(args, kwargs, selector):
         terms = args
         if modern and not terms:
             terms = (files,)
-        filenames = [tuple(re.split("[,;]", term)) if modern else (term,) for term in split_terms(terms)]
+        filenames = [tuple(split_terms((term,), "[,;]")) if modern else (term,) for term in split_terms(terms)]
     bundled = selector["files"]
+    render_candidate = selector.get("render_candidate")
     for group in filenames:
         for folder in paths or ("",):
             for filename in group:
                 candidate = os.path.join(folder, filename) if folder else filename
+                if render_candidate is not None and not any(isinstance(part, _NO_TEMPLATE) for part in (folder, filename)):
+                    try:
+                        candidate = _fail_on_undef(render_candidate(candidate))
+                    except jinja2.UndefinedError as ex:
+                        if isinstance(ex, _CapturedTemplateError):
+                            raise
+                        continue
                 if candidate.startswith("~"):
                     home, _, relative = candidate.partition("/")
                     directory = selector.get("named_homes", {}).get(home)
@@ -3605,11 +3615,19 @@ class _Templater:
 
     def _g_lookup(self, name, *a, **k):
         try:
-            a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: self._template_lookup_arg(value) for key, value in k.items()}
+            ctx = self._current_ctx
+            selector = (ctx or {}).get("__ansiroll_first_found")
+            if selector and name == selector["plugin"] and not _core_at_least(2, 19):
+                # Legacy Core templates each joined filename inside first_found.
+                lookup_ctx = dict(ctx, __ansiroll_first_found=dict(
+                    selector, render_candidate=lambda candidate: self.render_string(candidate, ctx)))
+            else:
+                a = tuple(self._template_lookup_term(v) for v in a)
+                k = {key: self._template_lookup_arg(value) for key, value in k.items()}
+                lookup_ctx = self._lookup_ctx(name, a)
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
-                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k), preserve_lookup_hostvars=True)
+                _lookup(name, *a, _ansiroll_ctx=lookup_ctx, **k), preserve_lookup_hostvars=True)
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):

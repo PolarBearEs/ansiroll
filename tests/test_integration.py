@@ -425,6 +425,36 @@ def test_first_found_vars_files_does_not_use_blocked_search_path_before_setup(tm
     assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
 
 
+def test_legacy_first_found_vars_files_skips_undefined_embedded_filename(tmp_path):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    if _core_version() >= (2, 19):
+        pytest.skip("legacy Core templates each candidate in the lookup plugin")
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    positional = "profile, " if _core_version() < (2, 16) else ""
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', TERMSfiles=['{{ missing }}.yml', profile ~ '.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'fallback'}
+""".replace("TERMS", positional))
+    extra = {"profile": "fallback"}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(extra), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
 def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
