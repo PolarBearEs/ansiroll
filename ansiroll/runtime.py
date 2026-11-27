@@ -470,6 +470,16 @@ def _is_literal_vars_lookup(call):
     )
 
 
+def _selector_literal_member(node):
+    nodes = jinja2.nodes
+    if isinstance(node, nodes.Const) and isinstance(node.value, (str, int)):
+        return node.value
+    if (isinstance(node, (nodes.Neg, nodes.Pos)) and isinstance(node.node, nodes.Const)
+            and type(node.node.value) is int):
+        return -node.node.value if isinstance(node, nodes.Neg) else node.node.value
+    return None
+
+
 def _selector_input_paths(expression, remaining=(), variables=None, computed=None, unknown_lookup=None,
                           *, resolve_aliases=False, analysis=None, retain_mutable=False):
     """Yield variable names and literal member paths read by a selector."""
@@ -564,10 +574,9 @@ def _selector_input_paths(expression, remaining=(), variables=None, computed=Non
         root = node
         path = []
         while isinstance(root, (nodes.Getattr, nodes.Getitem)):
-            if isinstance(root, nodes.Getattr):
-                path.append(root.attr)
-            elif isinstance(root.arg, nodes.Const) and isinstance(root.arg.value, (str, int)):
-                path.append(root.arg.value)
+            member = root.attr if isinstance(root, nodes.Getattr) else _selector_literal_member(root.arg)
+            if member is not None:
+                path.append(member)
             else:
                 vars_access = isinstance(root.node, nodes.Name) and root.node.name == "vars"
                 if vars_access and computed is not None:
