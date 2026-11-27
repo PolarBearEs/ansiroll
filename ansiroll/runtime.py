@@ -5445,8 +5445,14 @@ class Runtime:
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
         block_template = (task.get("delegate_to") and task.get("special") == "template"
                           and any(_is_deferred_block_var(value) for value in ctx.values()))
+        # Keep child aliases lazy when an include parameter still needs the
+        # complete child context, including the native check-mode omit value.
+        include_aliases = task_vars and any(
+            isinstance(value, _TaskVarTemplate) or isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic
+            for value in (higher_vars.get(name) for name in overlay.get(_INCLUDE_PARAMS_KEY, ()))
+        )
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
-                                      defer=looped or mixed_lookup or block_template))
+                                      defer=looped or mixed_lookup or block_template or include_aliases))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):

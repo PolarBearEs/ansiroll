@@ -5878,7 +5878,8 @@ def test_strategy_validates_native_check_mode_buffers(tmp_path, expression, invo
 @pytest.mark.parametrize("access", ["lookup('vars', 'fallback')", "query('vars', 'fallback')[0]",
                                    "vars.fallback", "vars['fallback']", "vars.get('fallback')",
                                    "mapping.values() | first", "(mapping.items() | first)[1]",
-                                   "buffered", "mapping.buffered"])
+                                   "buffered", "mapping.buffered", "copy_of_fallback",
+                                   "vars.copy_of_fallback", "lookup('vars', 'copy_of_buffered')"])
 def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, access):
     from ansiroll.loader import _core_version
 
@@ -5888,6 +5889,9 @@ def test_strategy_check_mode_keeps_include_omit_alias_consistent(tmp_path, acces
     path: '{{ playbook_dir }}/result'
     state: touch
   check_mode: CHECK_MODE
+  vars:
+    copy_of_fallback: '{{ fallback }}'
+    copy_of_buffered: '{{ buffered }}'
 """.replace("CHECK_MODE", json.dumps("{{ fallback == " + access + " }}")))
     playbook = """- hosts: localhost
   gather_facts: false
