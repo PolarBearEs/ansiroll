@@ -3734,6 +3734,9 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
                 continue  # may be a target path if remote_src renders true
             node["fallback"] = True
             node["fallback_reason"] = "baked src not found: %s" % rel
+            if controller_execution and name == "unarchive" and not _is_templated(src):
+                # Core checks the target's creates guard before finding the archive.
+                node["_missing_literal_unarchive_source"] = True
             return
         source_is_plaintext = True
         with open(path, "rb") as fh:

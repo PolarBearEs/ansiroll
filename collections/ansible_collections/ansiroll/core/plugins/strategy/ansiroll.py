@@ -341,6 +341,8 @@ class StrategyModule(StrategyBase):
             linear_reason = "Vault source selection requires core linear"
         elif any(item["kind"] == "file-source-arguments" for item in controller_reasons):
             linear_reason = "templated file source arguments require core linear"
+        elif any(item["kind"] == "missing-unarchive-source" for item in controller_reasons):
+            linear_reason = "missing literal unarchive source requires core linear"
         elif any(item["kind"] == "apply-include" for item in controller_reasons):
             linear_reason = "include_tasks with runtime apply variables requires core linear"
         elif not self._delegate_on_target and any(
@@ -1940,6 +1942,8 @@ def _controller_fallbacks(play_node):
                     kind = "vault-source"
                 elif node.get("_file_source_argument_layers"):
                     kind = "file-source-arguments"
+                elif node.get("_missing_literal_unarchive_source"):
+                    kind = "missing-unarchive-source"
                 elif node.get("vars_file_include_fallback"):
                     kind = "vars-file-include"
                 elif node.get("_deferred_apply_include"):
