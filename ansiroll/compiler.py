@@ -21,6 +21,7 @@ import json
 import os
 import zipfile
 
+from .compat import scoped_compile_module_paths
 from .embed import ModuleEmbedder
 from .loader import (
     COPY_ACTION_MODULES,
@@ -105,6 +106,7 @@ if __name__ == "__main__":
 '''
 
 
+@scoped_compile_module_paths()
 def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
                      vault_password_file=None, *, extra_vars=None,
                      tree_shake=False, freeze_playbook_vars=False,
@@ -709,6 +711,7 @@ def _actions_in_plays(plays):
     }
     if any(node.get("special") in ("template", "copy") for node in _walk_play_nodes(plays)):
         actions.update(COPY_ACTION_MODULES)
+    actions.update(node["_copy_module"] for node in _walk_play_nodes(plays) if "_copy_module" in node)
     if any(play.get("gather_facts") for play in plays):
         actions.add("ansible.builtin.setup")
     return actions
@@ -777,9 +780,10 @@ def _mark_required_accelerators(plays, actions):
 
 def _mark_unsupported(plays, unsupported_actions):
     for node in _walk_play_nodes(plays):
-        if node.get("action") in unsupported_actions and not node.get("fallback"):
+        action = node.get("_copy_module") or node.get("action")
+        if action in unsupported_actions and not node.get("fallback"):
             node["fallback"] = True
-            node["fallback_reason"] = "module %s could not be embedded" % node["action"]
+            node["fallback_reason"] = "module %s could not be embedded" % action
 
 
 def _collect_fallbacks(plays):

@@ -2071,6 +2071,118 @@ def test_copy_content_wins_over_remote_src(tmp_path):
     assert _ansiroll(tmp_path / "pb.yml", tmp_path) == expected
 
 
+def test_stock_copy_action_routes_to_local_copy_module(tmp_path):
+    from tests import ansible_playbook_command
+
+    _write(tmp_path, {
+        "library/copy.py": """#!/usr/bin/python
+from pathlib import Path
+
+from ansible.module_utils.basic import AnsibleModule
+
+module = AnsibleModule(argument_spec={
+    "src": {"type": "path"}, "dest": {"type": "path"}, "follow": {"type": "bool"},
+    "checksum": {"type": "str"}, "_original_basename": {"type": "str"},
+    "remote_src": {"type": "bool"}, "decrypt": {"type": "bool"},
+})
+module.exit_json(
+    changed=False, local_copy=Path(module.params["src"]).read_text(),
+    basename=module.params["_original_basename"], decrypt=module.params["decrypt"],
+)
+""",
+        "files/source.txt": "controller content",
+        "remote.txt": "target content",
+        "play.yml": """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - copy: {src: source.txt, dest: "{{ playbook_dir }}/output"}
+      register: short_copy
+    - ansible.builtin.copy: {src: source.txt, dest: "{{ playbook_dir }}/output"}
+      register: builtin_copy
+    - ansible.builtin.copy:
+        src: "{{ playbook_dir }}/remote.txt"
+        dest: "{{ playbook_dir }}/output"
+        remote_src: true
+        decrypt: false
+      register: remote_copy
+    - assert:
+        that:
+          - short_copy.local_copy == 'controller content'
+          - short_copy.basename == 'source.txt'
+          - builtin_copy.local_copy == 'controller content'
+          - builtin_copy.basename == 'source.txt'
+          - remote_copy.local_copy == 'target content'
+          - remote_copy.basename == None
+          - remote_copy.decrypt == false
+""",
+    })
+    playbook = tmp_path / "play.yml"
+    command = ansible_playbook_command() + [
+        "-i", "localhost,", "-c", "local", "-e", "ansible_python_interpreter=" + sys.executable,
+        str(playbook),
+    ]
+    env = _env()
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = subprocess.run(command, cwd=tmp_path,
+                                env={**env, "ANSIBLE_STRATEGY": strategy, "ANSIROLL_NATIVE_ONLY": "1"},
+                                capture_output=True, text=True, timeout=120)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    artifact = tmp_path / "compiled.py"
+    source, manifest = compile_playbook(str(playbook), tree_shake=True)
+    assert manifest["fallback_tasks"] == []
+    assert "ansible.legacy.copy" in manifest["modules"]
+    artifact.write_text(source)
+    (tmp_path / "files/source.txt").unlink()
+    (tmp_path / "library/copy.py").unlink()
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("old_cache_clearing", [False, True])
+def test_compilations_keep_local_copy_modules_separate(tmp_path, monkeypatch, old_cache_clearing):
+    from ansible import constants as C
+
+    monkeypatch.setattr(C, "OLD_PLUGIN_CACHE_CLEARING", old_cache_clearing)
+    play = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.builtin.copy:
+        content: hello
+        dest: "{{ playbook_dir }}/output"
+      register: copied
+"""
+    _write(tmp_path, {"plain/play.yml": play})
+    plain = str(tmp_path / "plain/play.yml")
+    assert "ansible.legacy.copy" not in compile_playbook(plain)[1]["modules"]
+    for marker in ("first", "second"):
+        base = tmp_path / marker
+        _write(base, {
+            "play.yml": play + """    - assert:
+        that: copied.marker == '%s'
+""" % marker,
+            "library/copy.py": """#!/usr/bin/python
+from ansible.module_utils.basic import AnsibleModule
+
+module = AnsibleModule(argument_spec=dict.fromkeys(
+    ("src", "dest", "checksum", "follow", "_original_basename"), {}
+))
+module.exit_json(changed=False, marker=%r)
+""" % marker,
+        })
+        source, manifest = compile_playbook(str(base / "play.yml"))
+        assert "ansible.legacy.copy" in manifest["modules"]
+        artifact = base / "compiled.py"
+        artifact.write_text(source)
+        result = subprocess.run([sys.executable, str(artifact)], cwd=base, env=_env(),
+                                capture_output=True, text=True, timeout=90)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    assert "ansible.legacy.copy" not in compile_playbook(plain)[1]["modules"]
+
+
 def test_included_file_lookups_do_not_depend_on_cwd(tmp_path):
     dest = tmp_path / "pb" / "dest.txt"
     _write(tmp_path / "pb", {"pb.yml": """
