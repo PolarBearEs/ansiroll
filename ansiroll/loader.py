@@ -836,17 +836,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes)
     includes.controller_execution = gather_facts is not None
-    for index, entry in enumerate(deferred):
-        if index not in order_deferred or entry.get("unmodeled"):
-            includes.incomplete = True
-        for data in entry["files"].values():
-            if not isinstance(data, list):
-                includes.incomplete = True
-                continue
-            for mapping in data:
-                includes.vars_file_writes.update(mapping)
-    if ordered_writes is not None:
-        includes.vars_file_writes = ordered_writes
+    includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
+                              for index, entry in enumerate(deferred))
+    includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
+        key for entry in deferred for data in entry["files"].values() if isinstance(data, list)
+        for mapping in data for key in mapping
+    }
     includes.record_writes(blocks + handler_blocks)
     while True:
         INCLUDED_TASKS.clear()
