@@ -5804,7 +5804,7 @@ def test_strategy_restores_resolved_include_apply_check_mode(tmp_path, include, 
     assert observed == [not writes]
 
 
-@pytest.mark.parametrize("case", ["looped", "buffered", "vars", "raw-parent"])
+@pytest.mark.parametrize("case", ["looped", "buffered", "vars", "vars-native", "raw-parent", "tasks-raw-parent"])
 def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatch, case):
     from ansiroll.loader import _core_version
 
@@ -5814,8 +5814,9 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
     (role / "tasks").mkdir(parents=True)
     (role / "vars").mkdir()
     (role / "vars" / "main.yml").write_text("toggle: false\n")
-    child_mode = "mode" if case == "vars" else "omit"
-    (role / "tasks" / "main.yml").write_text("""- file:
+    child_mode = {"vars": "mode", "vars-native": "mode is boolean"}.get(case, "omit")
+    task_file = tmp_path / "child.yml" if case == "tasks-raw-parent" else role / "tasks" / "main.yml"
+    task_file.write_text("""- file:
     path: "{{ playbook_dir }}/result-{{ item | default('only') }}"
     state: touch
   check_mode: "{{ CHILD_MODE }}"
@@ -5824,12 +5825,17 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
         "looped": "check_mode: '{{ item }}'",
         "buffered": "check_mode: '{% if simulate %}{{ true }}{% else %}{{ omit }}{% endif %}'",
         "vars": "vars: {mode: '{{ toggle }}'}",
+        "vars-native": "vars: {mode: '{% if true %}{{ true }}{% endif %}'}",
         "raw-parent": "check_mode: '{{ omit }}'",
+        "tasks-raw-parent": "check_mode: '{% if true %}{{ omit }}{% endif %}'",
     }[case]
     task = "- include_role:\n    name: child\n    apply:\n      " + apply + "\n"
+    if case == "tasks-raw-parent":
+        task = task.replace("include_role:", "include_tasks:").replace("name: child", "file: child.yml")
     if case == "looped":
         task += "  loop: [true, false]\n"
-    if case == "raw-parent":
+    rejects_parent = case in ("raw-parent", "tasks-raw-parent")
+    if rejects_parent:
         task = "- block:\n" + textwrap.indent(task, "    ") + "  check_mode: '{{ simulate }}'\n"
     play = """- hosts: localhost
   connection: local
@@ -5839,8 +5845,8 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
 """ + textwrap.indent(task, "    ")
     native = _run_strategy_play(tmp_path, play, "--check", "-e", "ansible_python_interpreter=" + sys.executable,
                                 environment={"ANSIBLE_STRATEGY": "linear"})
-    expected = [True, False] if case == "looped" else [] if case == "raw-parent" else [True]
-    assert (native.returncode == 0) is (case != "raw-parent"), native.stdout + native.stderr
+    expected = [True, False] if case == "looped" else [] if rejects_parent else [True]
+    assert (native.returncode == 0) is not rejects_parent, native.stdout + native.stderr
     assert len(list(tmp_path.glob("result-*"))) == expected.count(False), native.stdout + native.stderr
 
     source, _ = compile_playbook(str(tmp_path / "play.yml"))
@@ -5850,8 +5856,38 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
     monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: observed.append(runtime.check_mode)
                         or {"changed": False})
     runtime.run_play(_compiled_plays(source, tmp_path)[0])
-    assert runtime.failed is (case == "raw-parent")
+    assert runtime.failed is rejects_parent
     assert observed == expected
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_compile_skips_role_apply_lookups(tmp_path, monkeypatch, nested):
+    from ansible.plugins.loader import lookup_loader
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native role apply rendering")
+    calls = []
+    lookup_type = type(lookup_loader.get("env"))
+    monkeypatch.setattr(lookup_type, "run", lambda *args, **kwargs: calls.append(True) or ["child.yml"])
+    tasks = tmp_path / "roles" / "child" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("- include_tasks: '{{ source_file }}'\n" if nested else "- debug: {msg: child}\n")
+    (tasks / "child.yml").write_text("- debug: {msg: nested}\n")
+    play = tmp_path / "play.yml"
+    play.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    file_alias: "{{ lookup('env', 'ANSIROLL_ROLE_APPLY_FILENAME') }}"
+  tasks:
+    - include_role:
+        name: child
+        apply:
+          vars: {source_file: '{{ file_alias }}'}
+      when: false
+""")
+    compile_playbook(str(play))
+    assert not calls
 
 
 @pytest.mark.parametrize(("action", "invocation_check", "delegated"), [
@@ -6019,6 +6055,7 @@ def test_strategy_preserves_rendered_false_check_mode(tmp_path, expression):
 
 @pytest.mark.parametrize("expression", [
     "{% if true %}{{ omit }}{% endif %}",
+    "{% if true %}\n{{ omit }}{% endif %}",
     " {{ omit }} ",
     " {{- omit -}} ",
     "{{ omit }}\n",

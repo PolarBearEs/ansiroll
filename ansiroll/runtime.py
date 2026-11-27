@@ -1081,9 +1081,9 @@ def _setup_omit(args):
     if not _core_at_least(2, 19):
         return _fail_on_undef(_strip_omit(args))
     if isinstance(args, dict):
-        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT}
+        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT and value is not _KEYWORD_OMIT}
     if isinstance(args, (list, tuple)):
-        return [_setup_omit(value) for value in args if value != _OMIT]
+        return [_setup_omit(value) for value in args if value != _OMIT and value is not _KEYWORD_OMIT]
     return _fail_on_undef(args)
 
 
@@ -4097,6 +4097,7 @@ class _Templater:
                 keyword_env.getattr = partial(self._keyword_member, env.getattr)
                 keyword_env.getitem = partial(self._keyword_member, env.getitem)
                 keyword_env.keep_trailing_newline = False
+                keyword_env.trim_blocks = True
                 keyword_env.concat = _concat_keyword_segments
                 keyword_env.finalize = _concretize
                 keyword_env.code_generator_class = (
@@ -5215,7 +5216,7 @@ class Runtime:
                 if isinstance(value, _Omit) or value is _KEYWORD_OMIT:
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
                     flags[key] = self._bound_apply_flag(inherited, ctx)
-            applied_vars = _setup_omit(self.template(authored_vars, ctx))
+            applied_vars = _setup_omit(self.template(authored_vars, self._check_mode_template_context(ctx)))
         except Exception as ex:
             return no_log or "no_log" in authored_flags, {}, {}, {
                 "failed": True, "changed": False, "msg": str(ex),
@@ -6216,18 +6217,23 @@ class Runtime:
             if isinstance(value, dict):
                 if value == {"__ansiroll_invocation_check_mode__": True}:
                     return self._invocation_check_mode
-                if "__ansiroll_raw_role_check_mode__" in value:
+                if "__ansiroll_raw_apply_check_mode__" in value:
                     # A child's omit restores and validates the original
                     # inherited keyword without evaluating it again.
                     if on_omit:
                         raise ValueError("invalid inherited check_mode value")
-                    value = value["__ansiroll_raw_role_check_mode__"]
+                    value = value["__ansiroll_raw_apply_check_mode__"]
             if isinstance(value, str):
-                native_keyword = _core_at_least(2, 19)
-                ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
-                if native_keyword and ctx.get("omit") is _OMIT:
-                    ctx["omit"] = _KEYWORD_OMIT
+                ctx = self._check_mode_template_context(ctx)
         return _fail_on_undef(self.template(value, ctx))
+
+    @staticmethod
+    def _check_mode_template_context(ctx):
+        native_keyword = _core_at_least(2, 19)
+        ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
+        if native_keyword and ctx.get("omit") is _OMIT:
+            ctx["omit"] = _KEYWORD_OMIT
+        return ctx
 
     @staticmethod
     def _bound_apply_flag(value, ctx):

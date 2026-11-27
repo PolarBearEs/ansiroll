@@ -1944,8 +1944,8 @@ def _include_apply_flags(task, keywords, *, role=False):
     for key in flags:
         inherited = task._get_parent_attribute(key, omit=True)
         fallback = _execution_omit_fallback(inherited, keyword=key)
-        if role and key == "check_mode" and _is_templated(inherited) and not isinstance(inherited, _AppliedExecutionFlag):
-            fallback = {"__ansiroll_raw_role_check_mode__": fallback}
+        if key == "check_mode" and _is_templated(inherited) and not isinstance(inherited, _AppliedExecutionFlag):
+            fallback = {"__ansiroll_raw_apply_check_mode__": fallback}
         fallbacks[key] = fallback
     return {"apply_flags": flags, "apply_omit_fallback": fallbacks}
 
@@ -2267,7 +2267,7 @@ def _template_include_filename(task, value, includes):
     return None if resolved is _UNRESOLVED_INCLUDE_VALUE else resolved
 
 
-def _compile_apply_filename_vars(task, variables, includes):
+def _compile_apply_filename_vars(task, variables, includes, *, portable=False):
     """Project non-looped apply bindings into the filename resolver's scope."""
     compiled = {}
     for name, value in variables.items():
@@ -2276,7 +2276,7 @@ def _compile_apply_filename_vars(task, variables, includes):
             continue
         # Templating a mapping lets Core drop an omitted value just as it does
         # when finalizing the original apply arguments.
-        rendered = _template_include_value(task, {name: value}, includes)
+        rendered = _template_include_value(task, {name: value}, includes, portable=portable)
         if rendered is _UNRESOLVED_INCLUDE_VALUE:
             compiled[name] = rendered
         else:
@@ -2284,7 +2284,7 @@ def _compile_apply_filename_vars(task, variables, includes):
     return compiled
 
 
-def _template_include_value(task, value, includes):
+def _template_include_value(task, value, includes, *, portable=False):
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.utils.vars import combine_vars
 
@@ -2366,6 +2366,13 @@ def _template_include_value(task, value, includes):
 
     if _depends_on_vars(value, variables, is_runtime):
         return _UNRESOLVED_INCLUDE_VALUE
+    if portable:
+        from .runtime import _GATHER_STRING_METHODS, _selector_template_sources
+
+        for source, _, _ in _selector_template_sources(_tag_untrusted(value)):
+            inputs = _gather_timeout_dependencies(source, variables, _GATHER_STRING_METHODS, selector=True)
+            if inputs is None or _vars_filename_controller_requirements(source, inputs)[0]:
+                return _UNRESOLVED_INCLUDE_VALUE
     try:
         from ansible.template import Templar
         try:
@@ -2448,14 +2455,14 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 parent = include.build_parent_block()
             for block in blocks + handler_blocks:
                 block._parent = parent
-            if parent is not task and render_apply and parent.vars:
-                parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
             _bind_include_apply_flags(parent, apply_options)
         except Exception:
             return None
         includes.record_writes(blocks + handler_blocks)
-        _register_included(blocks)
-        _register_included(handler_blocks)
+        nested_includes = _register_included(blocks + handler_blocks)
+        if parent is not task and render_apply and parent.vars:
+            parent._ansiroll_apply_filename_vars = (
+                _compile_apply_filename_vars(task, parent.vars, includes, portable=True) if nested_includes else {})
         task._role_path = role._role_path
         role_roots = (id(parent),) if parent is not task else ()
         _INCLUDE_ROLE_PARENTS.update(dict.fromkeys(role_roots, task))
