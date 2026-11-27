@@ -5132,7 +5132,12 @@ class Runtime:
 
         def select_body(ctx):
             if "include_selector" not in node:
-                return node.get("file"), tasks, handlers
+                filename = node.get("file")
+                if "include_checked_selector" in node:
+                    selected = _fail_on_undef(self.template(node["include_checked_selector"], ctx, strict=True))
+                    if selected != filename:
+                        raise ValueError("no bundled task file matches %r" % selected)
+                return filename, tasks, handlers
 
             def inputs_match(inputs, scope=ctx):
                 return all(_same_vars_input(_include_input_at(scope, name, path),

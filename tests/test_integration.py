@@ -9203,6 +9203,137 @@ def test_vars_file_variant_writes_invalidate_an_earlier_include_path(tmp_path):
     assert any(task["name"] == "earlier include" for task in manifest["fallback_tasks"])
 
 
+@pytest.mark.parametrize("case", [
+    "included-body", "later-task", "role-bridge", "omitted-binding", "own-register", "skipped-include",
+    "preceding-include", "loop-body", "recursive-body", "lookup", "public-role", "gathered-fact",
+    "skipped-public-role", "public-role-default",
+])
+def test_nested_apply_filename_uses_values_at_outer_include(tmp_path, monkeypatch, case):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native include apply rendering")
+
+    invocation = """- include_tasks:
+    file: outer.yml
+    apply:
+      vars:
+        source_file: '{{ basename }}.yml'
+"""
+    write = "- set_fact: {basename: updated}\n"
+    outer = "- name: select child\n  include_tasks: '{{ source_file }}'\n"
+    lookup_calls = []
+    gather = "  gather_facts: false\n"
+    if case == "included-body":
+        outer = write + outer
+    elif case == "later-task":
+        invocation += write
+        (tmp_path / "bridge.yml").write_text(outer.replace("source_file", "child_file"))
+        outer = """- include_tasks:
+    file: bridge.yml
+    apply:
+      vars:
+        child_file: '{{ source_file }}'
+"""
+    elif case == "role-bridge":
+        invocation += write
+        role_tasks = tmp_path / "roles" / "bridge" / "tasks"
+        role_tasks.mkdir(parents=True)
+        (role_tasks / "main.yml").write_text(outer.replace("source_file", "child_file"))
+        outer = """- include_role:
+    name: bridge
+    apply:
+      vars:
+        child_file: '{{ source_file }}'
+"""
+    elif case == "omitted-binding":
+        invocation = invocation.replace("'{{ basename }}.yml'", json.dumps(
+            "{{ omit if basename == 'initial' else basename ~ '.yml' }}")) + write
+        outer = outer.replace("'{{ source_file }}'", json.dumps("{{ source_file | default('initial.yml') }}"))
+    elif case == "own-register":
+        invocation += "  register: basename\n"
+    elif case == "skipped-include":
+        invocation = "- name: skipped include\n  include_tasks: missing.yml\n  when: false\n" + invocation + write
+    elif case == "preceding-include":
+        (tmp_path / "write.yml").write_text(write)
+        invocation = "- include_tasks: write.yml\n" + invocation
+    elif case == "loop-body":
+        (tmp_path / "repeated.yml").write_text(invocation + write)
+        invocation = "- include_tasks: repeated.yml\n  loop: [1, 2]\n"
+    elif case == "recursive-body":
+        (tmp_path / "repeated.yml").write_text(invocation + write + """- set_fact:
+    depth: '{{ (depth | default(0)) + 1 }}'
+- include_tasks: repeated.yml
+  when: depth < 2
+""")
+        invocation = "- include_tasks: repeated.yml\n"
+    elif case == "lookup":
+        from ansible.plugins.loader import lookup_loader
+
+        monkeypatch.setenv("ANSIROLL_APPLY_SELECTOR_SUFFIX", "")
+        lookup_type = type(lookup_loader.get("env"))
+        monkeypatch.setattr(lookup_type, "run", lambda *args, **kwargs: lookup_calls.append(True) or [""])
+        invocation = invocation.replace(
+            "'{{ basename }}.yml'", '"{{ basename ~ lookup(\'env\', \'ANSIROLL_APPLY_SELECTOR_SUFFIX\') }}.yml"')
+        invocation += write
+    elif case in ("public-role", "skipped-public-role", "public-role-default"):
+        role = tmp_path / "roles" / "publish"
+        (role / "tasks").mkdir(parents=True)
+        role_values = role / ("defaults" if case == "public-role-default" else "vars")
+        role_values.mkdir()
+        (role / "tasks" / "main.yml").write_text("[]\n")
+        (role_values / "main.yml").write_text("basename: updated\n")
+        role_include = "- include_role: {name: publish, public: true}\n"
+        if case == "skipped-public-role":
+            role_include += "  when: false\n"
+        invocation = role_include + invocation + write
+    elif case == "gathered-fact":
+        gather = "  gather_facts: true\n  gather_subset: ['!all', '!min', system]\n"
+        invocation = invocation.replace("'{{ basename }}.yml'",
+                                        '"{{ \'updated\' if ansible_facts.system is defined else \'initial\' }}.yml"')
+        invocation += "- set_fact: {ansible_facts: {system: changed_later}}\n"
+    (tmp_path / "outer.yml").write_text(outer)
+    for name in ("initial", "updated"):
+        (tmp_path / f"{name}.yml").write_text(f"- debug: {{msg: selected-{name}}}\n")
+    playbook = ("- hosts: localhost\n  connection: local\n" + gather + "  vars: {basename: initial}\n  tasks:\n"
+                + textwrap.indent(invocation, "    "))
+    native = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": "linear"}, timeout=30)
+    assert native.returncode == 0, native.stdout + native.stderr
+    requires_fallback = case in (
+        "preceding-include", "loop-body", "recursive-body", "lookup", "public-role", "gathered-fact",
+    )
+    expected = ["initial"]
+    if case in ("preceding-include", "public-role", "gathered-fact"):
+        expected = ["updated"]
+    elif case in ("loop-body", "recursive-body"):
+        expected.append("updated")
+    assert re.findall(r"selected-(initial|updated)", native.stdout) == expected
+
+    source, manifest = compile_playbook(str(tmp_path / "play.yml"))
+    assert not lookup_calls
+    if not requires_fallback:
+        assert [task["name"] for task in manifest["fallback_tasks"]] == (
+            ["skipped include"] if case == "skipped-include" else [])
+        script = tmp_path / "compiled.py"
+        script.write_text(source)
+        result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    else:
+        assert [(task["name"], task["reason"]) for task in manifest["fallback_tasks"]] == [
+            ("select child", "include_tasks with runtime apply variables requires core linear"),
+        ]
+        result = _run_strategy_play(tmp_path, playbook, environment={"ANSIROLL_PROVENANCE": "1"}, timeout=30)
+        assert '"mode": "linear-fallback"' in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert re.findall(r"selected-(initial|updated)", result.stdout) == expected
+    if case in ("included-body", "later-task", "role-bridge", "omitted-binding"):
+        env = {**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"basename": "updated"})}
+        override = subprocess.run([sys.executable, str(script)], cwd=tmp_path, env=env,
+                                  capture_output=True, text=True, timeout=30)
+        assert override.returncode != 0
+        assert "no bundled task file matches 'updated.yml'" in override.stdout
+        assert not re.findall(r"selected-(initial|updated)", override.stdout)
+
+
 def test_skipped_include_with_non_string_filename_compiles(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
