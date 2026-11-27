@@ -3701,6 +3701,16 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
         and not _contains_dynamic_value(decrypt) and args.get("content") is None
         and (_source_flag(decrypt) if name == "copy" else bool(decrypt))
     )
+    if (controller_execution and name == "unarchive" and _contains_dynamic_value(src)
+            and task._loader._vault.secrets
+            and (unknown_defaults or _contains_dynamic_value(decrypt) or bool(decrypt))):
+        # A prior task can create an archive after baking has finished.
+        # Let the controller select and decrypt the live source.
+        node["_deferred_vault_source"] = True
+        node["fallback"] = True
+        node["fallback_reason"] = "Vault source needs controller selection and decryption"
+        return
+
     candidates = []
     if _JINJA_RE.search(src):
         loop = node.get("loop")

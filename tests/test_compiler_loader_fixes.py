@@ -1578,6 +1578,65 @@ def test_selected_vault_source_honors_decrypt_option(tmp_path, action, decrypt, 
         assert S_IMODE(installed.stat().st_mode) == (0o600 if decrypt else 0o644)
 
 
+@pytest.mark.parametrize("source_kind", ["vault-with-seed", "vault-without-seed", "vault-block", "remote"])
+def test_unarchive_strategy_selects_live_archive_with_vault_credentials(tmp_path, source_kind):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from tests import ansible_playbook_command
+
+    secret = VaultSecret(b"synthetic-test-password")
+    password_file = tmp_path / "vault-password"
+    password_file.write_bytes(secret.bytes)
+    payload = b"runtime archive payload\x00"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("content.txt", payload)
+    data = buffer.getvalue()
+    files = tmp_path / "files"
+    files.mkdir()
+    destination = tmp_path / "extracted"
+    destination.mkdir()
+    if source_kind == "vault-with-seed":
+        (files / "seed.zip").write_bytes(data)
+    remote = source_kind == "remote"
+    live = files / "live.zip"
+    if remote:
+        live.write_bytes(data)
+    ciphertext = VaultLib([("default", secret)]).encrypt(data, secret=secret)
+    playbook = tmp_path / "pb.yml"
+    write_archive = """    - copy:
+        content: "{{ ciphertext }}"
+        dest: "{{ playbook_dir }}/files/live.zip"
+      no_log: true
+"""
+    selector = ("{% if source_name == 'live' %}live{% else %}seed{% endif %}" if source_kind == "vault-block"
+                else "{{ source_name }}")
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+%s    - set_fact: {source_name: live}
+    - unarchive:
+        src: "{{ playbook_dir }}/files/%s.zip"
+        dest: "{{ playbook_dir }}/extracted"
+        remote_src: %s
+""" % ("" if remote else write_archive, selector, str(remote).lower()))
+    cmd = ansible_playbook_command() + [
+        "-i", "localhost,", "-c", "local", "--vault-password-file", str(password_file),
+        "-e", json.dumps({"ciphertext": ciphertext.decode("ascii"), "ansible_python_interpreter": sys.executable}),
+        str(playbook),
+    ]
+    installed = destination / "content.txt"
+    env = {**_env(), "ANSIBLE_COLLECTIONS_PATH": os.path.join(ROOT, "collections")}
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        if not remote and live.exists():
+            live.unlink()
+        run = subprocess.run(cmd, cwd=tmp_path, env={**env, "ANSIBLE_STRATEGY": strategy,
+                             "ANSIROLL_NATIVE_ONLY": "1" if remote else "0"},
+                             capture_output=True, text=True, timeout=60)
+        assert run.returncode == 0, run.stdout + run.stderr
+        assert installed.read_bytes() == payload
+        installed.unlink()
+
+
 def test_vault_strategy_keeps_literal_source_controller_side(tmp_path):
     from ansible.parsing.vault import VaultLib, VaultSecret
     from tests import ansible_playbook_command
