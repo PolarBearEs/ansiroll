@@ -1685,7 +1685,11 @@ def test_delegated_template_redacts_registered_diff(tmp_path, strategy):
     ("alpha\r\nbeta\r\n", None, "\n", b"alpha\r\nbeta\r\n" if MODERN_TEMPLATING else b"alpha\nbeta\n"),
     pytest.param("{% set value = 42 %}{{ value -}}\n", None, "\n", b"42",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native full-template scalar")),
-    pytest.param("answer={{ none }}\n", None, "\n", b"answer=\n",
+    pytest.param("answer={{ none }}\n", None, "\n",
+                 b"answer=None\n" if Version(__version__) < Version("2.19.1") else b"answer=\n",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern None output segments")),
+    pytest.param("{{ 42 }}{{ none }}\n", None, "\n",
+                 b"42None\n" if Version(__version__) < Version("2.19.1") else b"42",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern None output segments")),
     ("{% if true %}{{ true }}{% endif %}", None, "\n", b"True"),
     ("{% if true %}{{ [true, 'ready'] }}{% endif %}", None, "\n", b"[True, 'ready']"),
@@ -1857,7 +1861,7 @@ def test_standalone_template_file_matches_comment_delimiter_handling(tmp_path, t
     output = tmp_path / "rendered.txt"
     output.write_bytes(b"existing\n")
     expected = _ansible(path, tmp_path)
-    if expected_text is None and not MODERN_TEMPLATING:
+    if expected_text is None and not MODERN_TEMPLATING and (not options or Version(__version__) < Version("2.15")):
         expected_text = output.read_bytes()
     assert expected[1][3] == ("1" if expected_text is None else "0")
     content = b"existing\n" if expected_text is None else expected_text

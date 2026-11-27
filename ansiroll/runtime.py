@@ -3446,10 +3446,12 @@ class _ConditionalFileCodeGenerator(_ConditionalCodeGenerator, _FileCodeGenerato
 
 
 def _concat_file_output(nodes):
-    values = [value for value in nodes if value is not None]
+    preserve_none = not _core_at_least(2, 19, 1)
+    values = [value for value in nodes if preserve_none or value is not None]
     if len(values) < 2:
         return values[0] if values else None
-    return "".join(_native_file_text(value) for value in values if not isinstance(value, _Omit))
+    return "".join("None" if value is None else _native_file_text(value)
+                   for value in values if not isinstance(value, _Omit))
 
 
 def _native_file_text(value):
@@ -8289,6 +8291,12 @@ def _template_file_options(source, args, warn):
             if not isinstance(value, (str, int, float, bool)):
                 raise ValueError("%s is expected to be a string" % key)
             options[key] = str(value)
+    if _core_at_least(2, 15) and not _core_at_least(2, 19):
+        # Legacy Core validates task overrides when creating the Jinja overlay.
+        # Inline headers are applied afterward and bypass that check.
+        variable = options.get("variable_start_string", "{{")
+        if variable in (options.get("block_start_string", "{%"), options.get("comment_start_string", "{#")):
+            raise ValueError("block, variable and comment start strings must be different")
     has_header = source.startswith("#jinja2:")
     if has_header:
         modern = _core_at_least(2, 19)
