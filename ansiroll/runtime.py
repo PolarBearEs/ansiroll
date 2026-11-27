@@ -6597,7 +6597,12 @@ class Runtime:
             if part == "..":
                 if not prefix:
                     return None
-                prefix.pop()
+                if prefix[-1] == "..":
+                    prefix.append("..")
+                    if "/".join(prefix) not in directories:
+                        return None
+                else:
+                    prefix.pop()
             else:
                 prefix.append(part)
                 directory = "/".join(prefix)
@@ -6607,6 +6612,41 @@ class Runtime:
                 elif directory not in directories:
                     return None
         return "/".join(prefix + [parts[-1]])
+
+    @staticmethod
+    def _baked_role_traversal(task, src):
+        normalized = os.path.normpath(src)
+        parts = src.split("/")
+        action = (task.get("action") or "").rsplit(".", 1)[-1]
+        for base, directories, aliases, blocked, files, metadata, conditional in task["_baked_tree_traversal"]:
+            if conditional and parts[0] == task["_baked_tree"]:
+                continue
+            directories = set(directories)
+            traversed = Runtime._baked_role_path(parts, directories, aliases)
+            if traversed not in blocked and traversed not in files:
+                continue
+            # Copy checks the raw pathname for recursive directory handling.
+            if action == "copy" and blocked.get(traversed):
+                return None, {}
+            selected = Runtime._baked_role_path(normalized.split("/"), directories, aliases)
+            if selected in blocked:
+                return None, {}
+            # The selected root may acquire its normalized file after
+            # compilation. Fetch it with the original role search order.
+            key = files.get(selected) or "\0live"
+            meta = (task.get("_baked_meta") or {}).get(key) or {}
+            if action == "template" and key is not None:
+                raw_meta = metadata.get(traversed, meta) if traversed != selected else meta
+                meta = dict(raw_meta, fullpath=os.path.join(base, src))
+            return key, meta
+        return src, {}
+
+    @staticmethod
+    def _uses_baked_role_traversal(task, src):
+        if "_baked_tree_traversal" not in task or not isinstance(src, str) or src.startswith(("/", "~")):
+            return False
+        parts = src.split("/")
+        return ".." in parts and parts[-1] not in ("", ".", "..")
 
     @staticmethod
     def _baked_source_key(task, src):
@@ -6625,6 +6665,8 @@ class Runtime:
             return src
         normalized = os.path.normpath(src)
         if ".." in parts:
+            if Runtime._uses_baked_role_traversal(task, src):
+                return Runtime._baked_role_traversal(task, src)[0]
             # Relative Ansible source paths traverse the controller's actual
             # directories. A missing or unbaked component can't be canceled.
             shadowed = (task.get("_baked_tree_shadowed") or {}).get(normalized)
@@ -6656,11 +6698,14 @@ class Runtime:
         if direct_key is not None:
             return direct_key
         if normalized in (task.get("_baked_tree_shadowed") or {}):
-            for _, _, blocked, files in task["_baked_tree_roots"]:
+            roots = task.get("_baked_tree_traversal")
+            candidates = ((root[3], root[4]) for root in roots) if roots is not None else (
+                (root[2], root[3]) for root in task["_baked_tree_roots"])
+            for blocked, files in candidates:
                 if normalized in blocked:
                     break
                 if normalized in files:
-                    return direct.get(lookup, files[normalized] or src)
+                    return direct.get(lookup, files[normalized] or "\0live")
             return "\0blocked"
         return direct.get(lookup, normalized)
 
@@ -7270,15 +7315,16 @@ class Runtime:
         else:
             if src is None:
                 return {"failed": True, "changed": False, "msg": "%s: src is required" % name}
-            key = self._baked_source_key(task, src)
+            if self._uses_baked_role_traversal(task, src):
+                key, meta = self._baked_role_traversal(task, src)
+            else:
+                key = self._baked_source_key(task, src)
+                meta = (task.get("_baked_meta") or {}).get(key) or {}
             raw = baked.get(key)
-            meta = (task.get("_baked_meta") or {}).get(key) or {}
-            lookup_task_id = None
-            direct_role_src = (task.get("_baked_tree") and isinstance(src, str)
-                               and not os.path.isabs(src) and ".." not in src.split("/"))
-            if direct_role_src:
-                lookup_task_id = task.get("runtime_id")
-            if raw is None and self.controller_source_fn and (key is not None or lookup_task_id):
+            relative_role_src = task.get("_baked_tree") and isinstance(src, str) and not os.path.isabs(src)
+            direct_role_src = relative_role_src and ".." not in src.split("/")
+            lookup_task_id = task.get("runtime_id") if relative_role_src else None
+            if raw is None and key is not None and self.controller_source_fn and (not relative_role_src or lookup_task_id):
                 try:
                     fetched = (self.controller_source_fn(src, lookup_task_id) if lookup_task_id
                                else self.controller_source_fn(src))
