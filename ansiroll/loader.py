@@ -22,6 +22,9 @@ from .compat import find_module, init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
 from .accelerated_modules import can_accelerate
 
+_TASK_INCLUDES = ("include_tasks", "ansible.builtin.include_tasks")
+_ROLE_INCLUDES = ("include_role", "ansible.builtin.include_role")
+
 # Actions that are coupled to the controller and cannot run inside the single file.
 CONTROLLER_COUPLED = {
     "fetch", "ansible.builtin.fetch",
@@ -839,7 +842,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     for cache_name in ("_vars_cache", "_nonpersistent_fact_cache"):
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
-    includes = _IncludeVariables(play_vars, all_vars, known_writes, controller_execution=gather_facts is not None)
+    core_version = _core_version()
+    includes = _IncludeVariables(play_vars, all_vars, known_writes.copy(),
+                                 controller_execution=gather_facts is not None, ordered_apply=core_version >= (2, 19))
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
     includes.unresolved_vars_file = include_replay and any(
@@ -860,6 +865,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         _INCLUDE_ROLE_PARENTS.clear()
         _INCLUDE_IDS[0] = 0
         initial_writes = includes.runtime_writes.copy()
+        initial_handler_writes = includes.handler_writes.copy()
+        includes.prior_writes = known_writes.copy()
         includes.variant_writes.clear()
         includes.resolved_template = False
         play_actions = set()
@@ -871,10 +878,16 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                 tasks.append(node)
         handlers = _convert_handlers(handler_blocks, play_actions, basedir, includes)
         includes.runtime_writes.update(includes.variant_writes)
+        if includes.ordered_apply and includes.recursive and includes.resolved_template:
+            # A reused body can run again with writes that follow its first
+            # invocation. Keep the recursive graph and use the broad scope.
+            includes.ordered_apply = False
+            continue
         # Includes can expose additional writes, including writes that precede
         # another include on a later loop iteration. Revisit provisional paths
         # when the set grows, keeping only the final graph and task IDs.
-        if not includes.resolved_template or initial_writes == includes.runtime_writes:
+        if not includes.resolved_template or (initial_writes == includes.runtime_writes
+                                              and initial_handler_writes == includes.handler_writes):
             break
     actions.update(play_actions)
     if runtime_writes is not None:
@@ -882,7 +895,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     _assign_runtime_ids(tasks, handlers)
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
-    core_version = _core_version()
     result = {
         "name": play.name or "",
         "hosts": hosts,
@@ -1752,16 +1764,21 @@ def _assign_stable_uuids(tasks, handlers, mapping=None):
 def _convert_handlers(blocks, actions, basedir, includes):
     seen = set()
     handlers = []
-    for block_index, block in enumerate(blocks):
-        for handler in block.block or []:
-            # Ignore tag selection for handlers, which run when notified.
-            node = _convert_node(handler, actions, basedir, includes=includes)
-            if node and node.get("uuid") not in seen:
-                seen.add(node.get("uuid"))
-                node["handler_block"] = block_index
-                if node.get("type") == "include":
-                    node.update(_handler_match(handler))
-                handlers.append(node)
+    prior_writes = includes.prior_writes
+    includes.prior_writes = None
+    try:
+        for block_index, block in enumerate(blocks):
+            for handler in block.block or []:
+                # Ignore tag selection for handlers, which run when notified.
+                node = _convert_node(handler, actions, basedir, includes=includes)
+                if node and node.get("uuid") not in seen:
+                    seen.add(node.get("uuid"))
+                    node["handler_block"] = block_index
+                    if node.get("type") == "include":
+                        node.update(_handler_match(handler))
+                    handlers.append(node)
+    finally:
+        includes.prior_writes = prior_writes
     return handlers
 
 
@@ -1804,16 +1821,24 @@ def _convert_node(node, actions, basedir,
     if isinstance(node, Task):
         if not _matches_tags(node, only_tags, skip_tags, includes.all_vars):
             return None
-        if node.action in ("include_tasks", "ansible.builtin.include_tasks"):
+        if node.action not in _TASK_INCLUDES:
+            includes.record_prior_task(node)
+        inc = None
+        if node.action in _TASK_INCLUDES:
             inc = _convert_include_tasks(node, actions, basedir, only_tags,
                                          skip_tags, includes)
-            if inc is not None:
-                return inc
-        if node.action in ("include_role", "ansible.builtin.include_role"):
+        elif node.action in _ROLE_INCLUDES:
             inc = _convert_include_role(node, actions, basedir, only_tags,
                                         skip_tags, includes)
-            if inc is not None:
-                return inc
+        if inc is not None and inc.get("type") == "include":
+            return inc
+        if node.action in _TASK_INCLUDES:
+            includes.record_prior_task(node)
+        if node.action in (*_TASK_INCLUDES, *_ROLE_INCLUDES) and not _statically_skipped_include(node):
+            # Keep the broad analysis after a body that Core may load at runtime.
+            includes.record_prior_writes({None})
+        if inc is not None:
+            return inc
         return _convert_task(node, actions, basedir, controller_execution=includes.controller_execution)
     return None
 
@@ -1880,6 +1905,13 @@ def _can_write_var(writes, name):
     return name in writes or None in writes
 
 
+def _task_runtime_writes(task):
+    args = task.args or {}
+    raw_params_is_fact = ("_raw_params" in args and task.action.rsplit(".", 1)[-1] == "set_fact"
+                          and _set_fact_raw_params_is_fact(task))
+    return _runtime_write_names(task.action, args, task.register, raw_params_is_fact=raw_params_is_fact)
+
+
 def _has_dynamic_include(nodes):
     from ansible.playbook.block import Block
 
@@ -1890,6 +1922,10 @@ def _has_dynamic_include(nodes):
         elif str(getattr(node, "action", "")).rsplit(".", 1)[-1] in ("include_tasks", "include_role"):
             return True
     return False
+
+
+def _statically_skipped_include(task):
+    return any(condition is False for condition in task.when or ())
 
 
 def _depends_on_vars(value, variables, matches):
@@ -1940,11 +1976,17 @@ def _depends_on_vars(value, variables, matches):
 
 
 class _IncludeVariables:
-    def __init__(self, play_vars, all_vars, runtime_writes, *, controller_execution=False):
+    def __init__(self, play_vars, all_vars, runtime_writes, *, controller_execution=False, ordered_apply=False):
         self.play_vars = play_vars
         self.compile_selected_vars = play_vars
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
+        # Only apply-time expressions use ordered writes. Handler ordering is
+        # driven by notifications and flushes, so keep their writes separate.
+        self.prior_writes = runtime_writes.copy()
+        self.handler_writes = set()
+        self.ordered_apply = ordered_apply
+        self.recursive = False
         self.controller_execution = controller_execution
         self.variant_writes = set()
         self.resolved_template = False
@@ -1969,12 +2011,26 @@ class _IncludeVariables:
                 self.record_writes(node.rescue)
                 self.record_writes(node.always)
             elif isinstance(node, Task):
-                args = node.args or {}
-                raw_params_is_fact = ("_raw_params" in args and node.action.rsplit(".", 1)[-1] == "set_fact"
-                                      and _set_fact_raw_params_is_fact(node))
-                self.runtime_writes.update(
-                    _runtime_write_names(node.action, args, node.register, raw_params_is_fact=raw_params_is_fact)
-                )
+                self.runtime_writes.update(_task_runtime_writes(node))
+
+    def record_prior_writes(self, writes):
+        if not self.ordered_apply:
+            return
+        if self.prior_writes is None:
+            self.handler_writes.update(writes)
+        else:
+            self.prior_writes.update(writes)
+
+    def record_prior_task(self, task):
+        if self.ordered_apply:
+            self.record_prior_writes(_task_runtime_writes(task))
+
+    def variant(self, play_vars):
+        branch = _IncludeVariables(play_vars, self.all_vars, self.runtime_writes | self.variant_writes,
+                                   controller_execution=self.controller_execution, ordered_apply=self.ordered_apply)
+        branch.prior_writes = self.prior_writes.copy() if self.prior_writes is not None else None
+        branch.handler_writes = self.handler_writes
+        return branch
 
 
 def _include_ref(key):
@@ -2198,9 +2254,7 @@ def _vars_file_include_variants(task, sources, includes):
 
 
 def _include_variant_branch(includes, base_scope, candidates):
-    branch = _IncludeVariables(
-        _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes,
-        controller_execution=includes.controller_execution)
+    branch = includes.variant(_native_include_values(base_scope))
     branch.vars_file_scopes = candidates
     branch.vars_file_writes = {
         key for scope in candidates for key in scope.keys() | base_scope.keys()
@@ -2230,7 +2284,9 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     raw_fname = args.get("_raw_params") or args.get("file")
     if not isinstance(raw_fname, str):
         return None
-    fname = _template_include_filename(task, raw_fname, includes) if _is_templated(raw_fname) else raw_fname
+    checked_selector = _is_templated(raw_fname) and _uses_ordered_apply(task, raw_fname, includes)
+    fname = (_template_include_filename(task, raw_fname, includes, runtime_portable=checked_selector)
+             if _is_templated(raw_fname) else raw_fname)
     if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
         return None
     if includes.build_only_selector_names and _is_templated(raw_fname):
@@ -2242,21 +2298,33 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                                          paths=reads, unknown_lookup=unknown_lookup) is None or unknown_lookup):
             reads.update((name, ()) for name in includes.build_only_selector_names)
         _record_build_only_selector_reads(includes, higher_layers, reads)
+    if fname is None and checked_selector:
+        return _deferred_apply_include_task(task, actions, basedir, includes)
     parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
     if fname is None or (parents and includes.vars_file_scopes is not None):
         sources = (raw_fname, *parents)
         variants, inputs = _vars_file_include_variants(task, sources, includes)
         if fname is None and not variants and any(
                 value is _UNRESOLVED_INCLUDE_VALUE for value in _include_scope(task)[0].values()):
-            node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
-            node["_deferred_apply_include"] = True
-            node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
-            return node
+            return _deferred_apply_include_task(task, actions, basedir, includes)
         if variants or fname is None:
             return _expand_include_variants(
                 task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes)
     path = _include_tasks_path(task, fname, includes)
-    return _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
+    node = _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
+    if checked_selector:
+        if node is None:
+            return _deferred_apply_include_task(task, actions, basedir, includes)
+        if node.get("type") == "include":
+            node["include_checked_selector"] = _tag_untrusted(raw_fname)
+    return node
+
+
+def _deferred_apply_include_task(task, actions, basedir, includes):
+    node = _convert_task(task, actions, basedir, controller_execution=includes.controller_execution)
+    node["_deferred_apply_include"] = True
+    node["fallback_reason"] = "include_tasks with runtime apply variables requires core linear"
+    return node
 
 
 def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes):
@@ -2270,9 +2338,7 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     default_key = None
     default_inputs = None
     if includes.compile_selected_vars is not None:
-        default = _IncludeVariables(
-            includes.compile_selected_vars, includes.all_vars, includes.runtime_writes | includes.variant_writes,
-            controller_execution=includes.controller_execution)
+        default = includes.variant(includes.compile_selected_vars)
         default_key = _include_variant_key(task, sources, default)
         if default_key is not None and (default_key not in variants or
                                         _include_variant_key(task, sources, default, portable=True) != default_key):
@@ -2292,6 +2358,7 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     bodies = []
     apply_metadata = {}
     writes = set()
+    prior_writes = set()
     role = getattr(task, "_role", None)
     roots = {os.path.realpath(basedir)}
     if role is not None:
@@ -2348,6 +2415,8 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
         if expanded is not None and expanded.get("type") == "include":
             actions.update(variant_actions)
             writes.update(branch.runtime_writes | branch.variant_writes)
+            includes.recursive |= branch.recursive
+            prior_writes.update(branch.prior_writes or ())
             body = {"type": "block", "block": expanded["tasks"], "include_variant": _include_variant_label(key),
                     "include_id": expanded.get("include_id"), "tasks_ref": expanded.get("tasks_ref"),
                     "include_build_selected": build_selected}
@@ -2359,6 +2428,7 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     if not bodies:
         return None
     includes.variant_writes.update(writes - includes.runtime_writes)
+    includes.record_prior_writes(prior_writes)
     includes.resolved_template = True
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", raw_fname, basedir, role_defaults, role_vars, bodies, None, None)
@@ -2586,8 +2656,13 @@ def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_t
             return None
         nested_includes = _register_included(blocks)
         if parent is not task and render_apply and parent.vars:
+            parent._ansiroll_ordered_apply_vars = set()
             parent._ansiroll_apply_filename_vars = (
-                _compile_apply_filename_vars(task, parent.vars, includes, portable=True) if nested_includes else {})
+                _compile_apply_filename_vars(task, parent.vars, includes, portable=True,
+                                             ordered_vars=parent._ansiroll_ordered_apply_vars) if nested_includes else {})
+        # Core finalizes apply before storing the include result. The register
+        # can influence later selectors inside the body and after it returns.
+        includes.record_prior_task(task)
         includes.record_writes(blocks)
         if raw_fname != fname and all(
             ((nested.args or {}).get("_raw_params") or (nested.args or {}).get("file")) == raw_fname
@@ -2611,6 +2686,9 @@ def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_t
             _INCLUDE_STACK.pop(key, None)
         if parent is not task and parent.vars and tasks and not render_apply:
             tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
+    else:
+        includes.recursive = True
+        includes.record_prior_task(task)
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", fname, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
@@ -2744,7 +2822,7 @@ def _include_search_context(task, stable_template=None, fname=None):
     return tuple(relative), tuple(remaining)
 
 
-def _include_scope(task):
+def _include_scope(task, ordered_vars=None):
     from ansible.playbook.task_include import TaskInclude
 
     parents = []
@@ -2755,9 +2833,31 @@ def _include_scope(task):
     for parent in reversed(parents):
         variables = getattr(parent, "_ansiroll_apply_filename_vars", parent.vars) or {}
         scope.update(variables)
+        if ordered_vars is not None:
+            ordered_vars.difference_update(variables)
+            ordered_vars.update(getattr(parent, "_ansiroll_ordered_apply_vars", ()))
         if isinstance(parent, TaskInclude):
             params.update(variables)
     return scope, params
+
+
+def _ordered_apply_inputs(task, higher_layers):
+    from ansible.constants import DEFAULT_HASH_BEHAVIOUR
+
+    ordered_vars = set()
+    _include_scope(task, ordered_vars)
+    for layer in higher_layers[2:]:
+        ordered_vars.difference_update(name for name, value in layer.items()
+                                       if DEFAULT_HASH_BEHAVIOUR != "merge" or not isinstance(value, dict))
+    return ordered_vars
+
+
+def _uses_ordered_apply(task, selector, includes):
+    if not includes.ordered_apply:
+        return False
+    variables, higher_layers = _include_template_variables(task, includes)
+    ordered_vars = _ordered_apply_inputs(task, higher_layers)
+    return bool(ordered_vars) and _depends_on_vars(selector, variables, ordered_vars.__contains__)
 
 
 def _include_scope_key(task):
@@ -2836,7 +2936,7 @@ def _template_include_filename(task, value, includes, *, runtime_portable=False)
     return None if resolved is _UNRESOLVED_INCLUDE_VALUE else resolved
 
 
-def _compile_apply_filename_vars(task, variables, includes, *, portable=False):
+def _compile_apply_filename_vars(task, variables, includes, *, portable=False, ordered_vars=None):
     """Project non-looped apply bindings into the filename resolver's scope."""
     compiled = {}
     for name, value in variables.items():
@@ -2845,11 +2945,17 @@ def _compile_apply_filename_vars(task, variables, includes, *, portable=False):
             continue
         # Templating a mapping lets Core drop an omitted value just as it does
         # when finalizing the original apply arguments.
-        rendered = _template_include_value(task, {name: value}, includes, portable=portable)
+        ordered_reads = set() if ordered_vars is not None else None
+        rendered = _template_include_value(task, {name: value}, includes, portable=portable,
+                                           ordered_reads=ordered_reads)
         if rendered is _UNRESOLVED_INCLUDE_VALUE:
             compiled[name] = rendered
         else:
             compiled.update(rendered)
+            if ordered_reads:
+                # An omitted binding may become present with different inputs.
+                ordered_vars.add(name)
+                ordered_vars.update(rendered)
     return compiled
 
 
@@ -2942,7 +3048,7 @@ def _project_include_input(value, paths):
     return value
 
 
-def _template_include_value(task, value, includes, *, runtime_portable=False, portable=False):
+def _template_include_value(task, value, includes, *, runtime_portable=False, portable=False, ordered_reads=None):
     from ansible.constants import DEFAULT_HASH_BEHAVIOUR
     from ansible.vars.reserved import is_reserved_name
     from .runtime import _clear_vars_file_blocks, _vars_file_reads_blocked
@@ -2999,6 +3105,17 @@ def _template_include_value(task, value, includes, *, runtime_portable=False, po
             ))
         parent = _include_parent(parent)
 
+    # Modern non-looped include_tasks finalizes apply.vars before entering its
+    # body. Within a loop, an earlier iteration could already have run it.
+    all_writes = includes.runtime_writes | includes.variant_writes
+    runtime_writes = all_writes
+    ordered_inputs = (_ordered_apply_inputs(task, higher_layers)
+                      if ordered_reads is not None and includes.ordered_apply else set())
+    if (ordered_reads is not None and includes.ordered_apply and task.action in _TASK_INCLUDES
+            and not loop_names and includes.prior_writes is not None):
+        prior_writes = includes.prior_writes | includes.handler_writes
+        runtime_writes = all_writes | (prior_writes - {None}) if None in prior_writes else prior_writes
+
     def is_runtime(name):
         if name in loop_names or variables.get(name) is _UNRESOLVED_INCLUDE_VALUE:
             return True
@@ -3006,7 +3123,14 @@ def _template_include_value(task, value, includes, *, runtime_portable=False, po
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)
                 and vars_file_can_change(name)):
             return True
-        if not (_can_write_var(includes.runtime_writes, name) or _can_write_var(includes.variant_writes, name)):
+        # Facts, absent names, and merged mappings can have inputs invisible
+        # to the invocation's compile-time bindings.
+        runtime_input = (name not in variables or name.startswith("ansible_") or name in _MAGIC_VAR_NAMES
+                         or is_reserved_name(name) or DEFAULT_HASH_BEHAVIOUR == "merge"
+                         and isinstance(variables.get(name), dict))
+        if not (_can_write_var(runtime_writes, name) or runtime_input and _can_write_var(all_writes, name)):
+            if ordered_reads is not None and (name in ordered_inputs or _can_write_var(all_writes, name)):
+                ordered_reads.add(name)
             return False
         # A scalar extra var replaces any runtime value. A mapping under
         # hash_behaviour=merge can still inherit keys from a runtime write.
@@ -3116,6 +3240,15 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 handler_dep_chain = None
             blocks = role.compile(play, dep_chain=dep_chain)
             handler_blocks = role.get_handler_blocks(play, dep_chain=handler_dep_chain) or []
+            if includes.ordered_apply and not _statically_skipped_include(task):
+                from ansible import constants as C
+
+                public = task.public
+                if public is None:
+                    private, origin = C.config.get_config_value_and_origin("DEFAULT_PRIVATE_ROLE_VARS")
+                    public = origin != "default" and not private
+                if public:
+                    includes.record_prior_writes(role.get_vars(include_params=False, only_exports=True).keys())
             parent = task
             if args.get("apply"):
                 include = task.copy()
@@ -3129,8 +3262,10 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
         includes.record_writes(blocks + handler_blocks)
         nested_includes = _register_included(blocks + handler_blocks)
         if parent is not task and render_apply and parent.vars:
+            parent._ansiroll_ordered_apply_vars = set()
             parent._ansiroll_apply_filename_vars = (
-                _compile_apply_filename_vars(task, parent.vars, includes, portable=True) if nested_includes else {})
+                _compile_apply_filename_vars(task, parent.vars, includes, portable=True,
+                                             ordered_vars=parent._ansiroll_ordered_apply_vars) if nested_includes else {})
         task._role_path = role._role_path
         role_roots = (id(parent),) if parent is not task else ()
         _INCLUDE_ROLE_PARENTS.update(dict.fromkeys(role_roots, task))
@@ -3166,6 +3301,8 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             _INCLUDE_STACK.pop(key, None)
             for root in role_roots:
                 del _INCLUDE_ROLE_PARENTS[root]
+    else:
+        includes.recursive = True
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_role", name, basedir,
                          role_defaults, role_vars, tasks, include_id, ref, handlers)
