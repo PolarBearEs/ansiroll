@@ -7,6 +7,7 @@ standalone script; debug messages and the recap must match.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -24,6 +25,7 @@ from ansiroll.compiler import compile_playbook  # noqa: E402
 from ansiroll.loader import parse_playbook  # noqa: E402
 
 MODERN_TEMPLATING = Version(__version__) >= Version("2.19")
+LEGACY_SETUP = Version(__version__) < Version("2.12")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RECAP_RE = re.compile(
@@ -49,13 +51,13 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
         ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
-         "-e", json.dumps({"ansible_python_interpreter": sys.executable}), str(playbook)],
+         "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
     return _summary(proc.stdout, proc.stderr)
@@ -110,6 +112,356 @@ def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypat
         "facts/ansiroll_setup_probe.fact": '{"value":"custom"}\n',
     }, use_strategy=use_strategy)
     assert messages == ["subset/custom" if custom_path else "subset/missing"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_applies_templated_module_defaults(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  vars:
+    setup_defaults:
+      filter: DISTRIBUTION_FILTER
+  module_defaults:
+    SETUP_ACTION: "{{ setup_defaults }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
+        "DISTRIBUTION_FILTER", "ansible_distribution" if LEGACY_SETUP else "[ansible_distribution]"),
+        use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores set an implicit gather_subset override")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_arguments_override_module_defaults(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.setup:
+      gather_subset: ['!all', '!min']
+  tasks:
+    - debug:
+        msg: "{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"
+
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  module_defaults:
+    ansible.builtin.setup:
+      gather_subset: "{{ intentionally_undefined_and_overridden }}"
+  tasks:
+    - debug:
+        msg: "{{ 'full' if ansible_facts.distribution is defined else 'subset' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["subset", "full"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores eagerly render module default mappings")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_copies_only_live_default_mapping_members(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  vars:
+    setup_defaults:
+      gather_subset: "{{ missing_and_overridden }}"
+      filter: [ansible_distribution, "{{ extra_filter | default(omit) }}"]
+  module_defaults:
+    ansible.builtin.setup: "{{ setup_defaults }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older cores eagerly render module default mappings")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_gather_action_defaults_take_precedence_over_setup_defaults(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.gather_facts:
+      filter: [ansible_distribution]
+    ansible.builtin.setup:
+      filter: "{{ missing_and_overridden }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.skipif(LEGACY_SETUP, reason="uses the modern setup action name")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    ansible.builtin.gather_facts:
+      parallel: false
+      filter: null
+    ansible.builtin.setup:
+      filter: [ansible_distribution]
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("value", ["none", "omit"])
+def test_implicit_setup_applies_setup_default_after_explicit_empty_value(tmp_path, monkeypatch, use_strategy, value):
+    if not MODERN_TEMPLATING:
+        if LEGACY_SETUP or not use_strategy or value != "none":
+            pytest.skip("only modern Core has the same omit and null semantics in both launch modes")
+        monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "true")
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ EMPTY_VALUE }}"
+  module_defaults:
+    ansible.builtin.gather_facts:
+      fact_path: "{{ playbook_dir }}/gather"
+    ansible.builtin.setup:
+      fact_path: "{{ playbook_dir }}/setup"
+  tasks:
+    - debug:
+        msg: "{{ ansible_local.probe.value }}"
+""".replace("EMPTY_VALUE", value),
+        {"setup/probe.fact": '{"value":"setup"}', "gather/probe.fact": '{"value":"gather"}'},
+        use_strategy=use_strategy)
+    assert messages == ["setup"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="modern Core does not eagerly render overridden defaults")
+def test_implicit_setup_eagerly_renders_legacy_defaults(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [all]
+  module_defaults:
+    SETUP_ACTION:
+      gather_subset: "{{ undefined_setup_default }}"
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"))
+    _, expected = _ansible(path, tmp_path)
+    _, result = _ansiroll(path, tmp_path)
+    assert expected[3] == "1"
+    assert result == expected
+
+
+@pytest.mark.skipif(Version(__version__) >= Version("2.12"), reason="only older cores use legacy setup")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_honors_legacy_module_default_names(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    setup:
+      filter: ansible_distribution
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""", use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_defaults_read_public_role_vars(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  roles: [settings]
+  module_defaults:
+    SETUP_ACTION:
+      filter: "{{ fact_filter }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"), {
+        "roles/settings/defaults/main.yml": (
+            "fact_filter: ansible_distribution\n" if LEGACY_SETUP else "fact_filter: [ansible_distribution]\n"),
+        "roles/settings/tasks/main.yml": "[]\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+def test_strategy_setup_defaults_use_the_host_selected_vars_file(tmp_path):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  vars:
+    fact_filter: [ansible_hostname]
+  vars_files: ['site-{{ inventory_hostname }}.yml']
+  module_defaults:
+    SETUP_ACTION:
+      filter: "{{ fact_filter }}"
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"), {
+        "site-localhost.yml": (
+            "fact_filter: ansible_distribution\n" if LEGACY_SETUP else "fact_filter: [ansible_distribution]\n"),
+    }, use_strategy=True)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("plugin", ["file", "ansible.builtin.file"])
+def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strategy, plugin):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    SETUP_ACTION:
+      filter: 'FILTER_EXPRESSION'
+  tasks:
+    - debug:
+        msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
+        "FILTER_EXPRESSION", ('{{ lookup("PLUGIN", "fact-filter.txt") }}' if LEGACY_SETUP
+                              else '{{ [lookup("PLUGIN", "fact-filter.txt")] }}').replace("PLUGIN", plugin)),
+        {"files/fact-filter.txt": "ansible_distribution\n"}, use_strategy=use_strategy)
+    assert messages == ["filtered"]
+
+
+@pytest.mark.parametrize("plugin", ["example.custom.file", "file"])
+def test_implicit_setup_does_not_capture_files_requested_by_custom_lookups(tmp_path, plugin):
+    files = {"files/private.txt": "synthetic private contents\n"}
+    if plugin == "file":
+        files["lookup_plugins/file.py"] = """from ansible.plugins.lookup import LookupBase
+
+class LookupModule(LookupBase):
+    def run(self, terms, variables=None, **kwargs):
+        return ['ansible_distribution']
+"""
+    path = _write(tmp_path, """
+- hosts: localhost
+  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ lookup("PLUGIN", "private.txt") }}'
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace("PLUGIN", plugin), files)
+    # Ansible registers playbook-local plugin directories process-wide.
+    result = subprocess.run(
+        [sys.executable, "-c", "import json, sys; from ansiroll.loader import parse_playbook; "
+         "print(json.dumps(parse_playbook(sys.argv[1])[0], default=str))", str(path)],
+        env=_env(), cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "synthetic private contents" not in result.stdout
+
+
+@pytest.mark.parametrize("source", ["play-vars", "vars-files"])
+def test_implicit_setup_replays_file_lookups_reachable_at_launch(tmp_path, source):
+    def lookup(filename):
+        return f'lookup("file", "{filename}.txt")'
+
+    def expression(value):
+        return "{{ " + (value if LEGACY_SETUP else f"[{value}]") + " }}"
+
+    selected = lookup("production")
+    dead = lookup("unreachable")
+    alternate = f"({dead} if false else {selected})"
+    initial = lookup("default")
+    files = {
+        "files/default.txt": "ansible_hostname\n",
+        "files/production.txt": "ansible_distribution\n",
+        "files/unreachable.txt": "never capture this file\n",
+    }
+    if source == "vars-files":
+        definitions = "  vars_files: ['config-{{ profile }}.yml']\n"
+        files["config-dev.yml"] = "fact_filter: " + json.dumps(expression(initial))
+        files["config-prod.yml"] = "fact_filter: " + json.dumps(expression(alternate))
+    else:
+        definitions = "    fact_filter: " + json.dumps(expression(f"{initial} if profile == 'dev' else {alternate}")) + "\n"
+    path = _write(tmp_path, """
+- hosts: localhost
+  vars:
+    profile: dev
+DEFINITIONS  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ fact_filter }}'
+  tasks:
+    - assert:
+        that:
+          - ansible_facts.distribution is defined
+          - ansible_facts.hostname is undefined
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup")
+                  .replace("DEFINITIONS", definitions), files)
+    plays, _ = parse_playbook(str(path))
+    captured = plays[0]["gather_setup_scope"]["controller_lookups"]["file"]["file"]
+    assert set(captured) == {"default.txt", "production.txt"}
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(path))[0])
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path,
+                            env={**_env(), "ANSIROLL_EXTRA_VARS": '{"profile":"prod"}'},
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("merge", [False, True], ids=["replace", "merge"])
+def test_implicit_setup_does_not_capture_shadowed_vars_file_lookups(tmp_path, monkeypatch, merge):
+    monkeypatch.setattr(C, "DEFAULT_HASH_BEHAVIOUR", "merge" if merge else "replace")
+    path = _write(tmp_path, """
+- hosts: localhost
+  vars_files: ['optional-{{ profile }}.yml', earlier.yml, final.yml]
+  module_defaults:
+    SETUP_ACTION:
+      filter: '{{ settings.fact_filter }}'
+  tasks: []
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup"), {
+        "optional-production.yml": "settings: {other: present}\n",
+        "earlier.yml": "settings: {fact_filter: '{{ lookup(\"file\", \"unselected.txt\") }}'}\n",
+        "final.yml": "settings: {fact_filter: '{{ lookup(\"file\", \"selected.txt\") }}'}\n",
+        "files/unselected.txt": "uncaptured fixture contents\n",
+        "files/selected.txt": "ansible_distribution\n",
+    })
+    plays, _ = parse_playbook(str(path))
+    captured = plays[0]["gather_setup_scope"]["controller_lookups"]["file"]["file"]
+    assert set(captured) == {"selected.txt"}
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_skips_an_undefined_environment_value(tmp_path, use_strategy):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  fact_path: "{{ playbook_dir }}/facts"
+  gather_subset: ['!all', '!min', local]
+  environment:
+    ANSIROLL_GATHER_PROBE: "{{ unavailable_during_setup }}"
+  tasks: []
+""", {"facts/probe.fact": '{"value":"setup"}\n'})
+    _, recap = (_ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+                if use_strategy else _ansiroll(path, tmp_path))
+    assert recap[0] == "1"
+    assert recap[3] == "0"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy setup evaluates path defaults differently")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_implicit_setup_uses_default_fact_path_when_explicit_value_is_null(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  fact_path: "{{ none }}"
+  module_defaults:
+    ansible.builtin.setup:
+      fact_path: "{{ playbook_dir }}/facts"
+  tasks:
+    - debug: {msg: "{{ ansible_local.probe.value }}"}
+""", {"facts/probe.fact": '{"value":"default path"}\n'}, use_strategy=use_strategy)
+    assert messages == ["default path"]
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
@@ -215,6 +567,92 @@ def test_standalone_implicit_fact_path_uses_vars_file_selected_by_cached_facts(t
         "facts/probe.fact": '{"value":"cached"}\n',
     })
     assert messages == ["cached"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_follow_child_task_precedence(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact: {value: first}
+    - block:
+        - debug:
+            msg: "{{ value }} / {{ alias }} / {{ nested.leaf }}"
+        - set_fact: {value: second}
+        - debug:
+            msg: "{{ value }} / {{ alias }} / {{ nested.leaf }}"
+        - debug:
+            msg: "{{ other }} / {{ other_alias }}"
+          vars:
+            other: task
+      vars:
+        value: block
+        alias: "{{ value }}"
+        nested: {leaf: "{{ value }}"}
+        other: block
+        other_alias: "{{ other }}"
+""", use_strategy=use_strategy)
+    assert messages == ["first / first / first", "second / second / second", "task / task"]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.20"), reason="modern task vars snapshot behavior")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_preserve_the_preexecution_vars_snapshot(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug:
+            msg: "{{ item }} / {{ from_snapshot }}"
+          loop: [current]
+        - debug:
+            msg: register-snapshot
+          register: out
+          failed_when: saw_register
+      vars:
+        from_snapshot: "{{ vars.item | default('snapshot') }}"
+        saw_register: "{{ vars.out is defined }}"
+""", use_strategy=use_strategy)
+    assert messages == ["current / snapshot", "register-snapshot"]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.20"), reason="modern templating cache behavior")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_block_aliases_and_containers_are_reused_in_a_render(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug:
+            msg: "{% for i in range(2) %}{% set unused = entries.append(i) if loop.first else none %}{{ entries | length }}{% endfor %}"
+        - debug:
+            msg: "{% set first = timestamp %}{% for i in range(2) %}{{ first == timestamp }}{% endfor %}"
+      vars:
+        entries: []
+        timestamp: "{{ now() }}"
+""", use_strategy=use_strategy)
+    assert messages == ["11", "TrueTrue"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy vars iteration exposes raw template text")
+def test_block_alias_source_is_preserved_during_legacy_vars_iteration(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "False")
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - debug: {msg: "{{ alias }} / {{ observed }}"}
+          vars:
+            observed: "{% for key, value in vars.items() if key == 'alias' %}{{ value }}{% endfor %}"
+      vars:
+        x: value
+        alias: "prefix={{ x }}"
+""")
+    assert messages == ["prefix=value / prefix={{ x }}"]
 
 
 def test_reference_bootstrap_ignores_tests_module_in_playbook_directory(tmp_path):
@@ -958,6 +1396,116 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
     assert messages == ["first/second", "first/" + null_suffix]
 
 
+def test_delegated_template_does_not_run_unused_block_lookups(tmp_path):
+    marker = tmp_path / "lookup-marker"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/one.txt"
+          delegate_to: localhost
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/two.txt"
+          delegate_to: localhost
+      vars:
+        unused: "{{ lookup('pipe', 'printf x >> MARKER_PATH') }}"
+""".replace("MARKER_PATH", str(marker)), {"sample.j2": "plain template\n"})
+    expected = _ansible(playbook, tmp_path)
+    assert not marker.exists()
+    (tmp_path / "one.txt").unlink()
+    (tmp_path / "two.txt").unlink()
+    actual = _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll")
+    assert actual == expected
+    assert not marker.exists()
+
+
+def test_delegated_template_resolves_block_alias_in_file_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    year = "vars.details.year" if MODERN_TEMPLATING else "details.year"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        details:
+          path: "{{ template_destpath }}"
+          year: "{{ template_run_date.year }}"
+""", {"sample.j2": "{{ details.path }}|{{ " + year + " }}\n"})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    expected_text = output.read_text()
+    assert expected_text.startswith(str(output) + "|")
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="checks legacy non-native lookup location")
+def test_delegated_template_resolves_legacy_block_lookup_on_controller(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "false")
+    monkeypatch.setenv("ANSIROLL_TEST_LOOKUP_HOST", "controller")
+    interpreter = tmp_path / "agent-python"
+    interpreter.write_text(
+        "#!/bin/sh\nexport ANSIROLL_TEST_LOOKUP_HOST=agent\n"
+        + "exec " + shlex.quote(sys.executable) + ' "$@"\n')
+    interpreter.chmod(0o755)
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        location: "{{ lookup('pipe', 'echo $ANSIROLL_TEST_LOOKUP_HOST') }}"
+""", {"sample.j2": "location={{ location }}\n"})
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path, interpreter=str(interpreter))
+    assert output.read_text() == "location=controller\n"
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll",
+                    interpreter=str(interpreter)) == expected
+    assert output.read_text() == "location=controller\n"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="checks native template name resolution")
+def test_delegated_template_resolves_referenced_block_lookup(tmp_path):
+    playbook = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - template:
+            src: sample.j2
+            dest: "{{ playbook_dir }}/output.txt"
+          delegate_to: localhost
+      vars:
+        referenced: >-
+          {{ lookup('pipe', 'printf used >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}
+        unused: >-
+          {{ lookup('pipe', 'printf unused >> ' ~ ((playbook_dir ~ '/lookups') | quote)) }}
+""", {"sample.j2": "{{ 'untouched' if true else referenced }}\n"})
+    marker = tmp_path / "lookups"
+    output = tmp_path / "output.txt"
+    expected = _ansible(playbook, tmp_path)
+    assert marker.read_text() == "used"
+    marker.unlink()
+    output.unlink()
+    assert _ansible(playbook, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert marker.read_text() == "used"
+
+
 def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     from ansiroll.loader import _core_version
 
@@ -978,7 +1526,8 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     output = tmp_path / "rendered.txt"
     expected = _ansible(path, tmp_path)
     expected_text = output.read_text()
-    suffix = "None" if (2, 13) <= _core_version() < (2, 19) else ""
+    version = _core_version()
+    suffix = "None" if version < (2, 12) or (2, 13) <= version < (2, 19) else ""
     assert expected_text == "prefix=controller/" + suffix + "\n"
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
@@ -2255,6 +2804,8 @@ def test_dynamic_include_when_uses_loop_item(tmp_path, action):
     assert messages == ["allowed", "second"]
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
+                    reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_include_loop_registers_results_and_tallies_ignored_failures(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
@@ -2458,6 +3009,8 @@ def test_include_loop_censors_no_log_item_values(tmp_path):
     assert "synthetic-private-item" not in result.stdout + result.stderr
 
 
+@pytest.mark.skipif(Version(__version__) < Version("2.11"),
+                    reason="Ansible 2.10 omits the aggregate skipped flag for include loops")
 def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_path):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
