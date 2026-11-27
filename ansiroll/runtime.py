@@ -1907,7 +1907,11 @@ def _read_lazy_member(container, value):
             ctx.active_task_bindings.pop()
     if binding is not None and isinstance(resolved, (_LazyTplDict, _LazyTplList)):
         resolved._task_binding = binding
-    return _keyword_omit_value(resolved, container._rt.templater._current_ctx)
+    if isinstance(resolved, _Omit):
+        templater = getattr(container._rt, "templater", None)
+        if templater is not None:
+            return _keyword_omit_value(resolved, templater._current_ctx)
+    return resolved
 
 
 class _LazyTplDict(dict):
