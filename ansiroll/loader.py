@@ -837,8 +837,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     for cache_name in ("_vars_cache", "_nonpersistent_fact_cache"):
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
-    includes = _IncludeVariables(play_vars, all_vars, known_writes)
-    includes.controller_execution = gather_facts is not None
+    includes = _IncludeVariables(play_vars, all_vars, known_writes, controller_execution=gather_facts is not None)
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
     includes.unresolved_vars_file = include_replay and any(
@@ -1904,11 +1903,12 @@ def _depends_on_vars(value, variables, matches):
 
 
 class _IncludeVariables:
-    def __init__(self, play_vars, all_vars, runtime_writes):
+    def __init__(self, play_vars, all_vars, runtime_writes, *, controller_execution=False):
         self.play_vars = play_vars
         self.compile_selected_vars = play_vars
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
+        self.controller_execution = controller_execution
         self.variant_writes = set()
         self.resolved_template = False
         # Replay of a known vars file can only redefine keys found in its candidates.
@@ -2125,7 +2125,8 @@ def _vars_file_include_variants(task, sources, includes):
 
 def _include_variant_branch(includes, base_scope, candidates):
     branch = _IncludeVariables(
-        _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes)
+        _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes,
+        controller_execution=includes.controller_execution)
     branch.vars_file_scopes = candidates
     branch.vars_file_writes = {
         key for scope in candidates for key in scope.keys() | base_scope.keys()
@@ -2166,7 +2167,8 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
     default_inputs = None
     if includes.compile_selected_vars is not None:
         default = _IncludeVariables(
-            includes.compile_selected_vars, includes.all_vars, includes.runtime_writes | includes.variant_writes)
+            includes.compile_selected_vars, includes.all_vars, includes.runtime_writes | includes.variant_writes,
+            controller_execution=includes.controller_execution)
         default_key = _include_variant_key(task, sources, default)
         if default_key is not None and default_key not in variants:
             default_inputs = _compile_include_inputs(task, sources, default)
