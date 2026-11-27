@@ -17,6 +17,23 @@ from ansiroll.runtime import (
 )
 
 
+@pytest.mark.parametrize("survivor", ["ordinary", {"{{ name }}": "untrusted"}])
+def test_bundled_fact_keys_keep_types_and_trust_across_json_collisions(survivor):
+    from ansiroll.runtime import _FactKeyTemplate, _encode_bundle_mapping_keys, _restore_bundle_mapping_keys
+
+    source = {True: {_FactKeyTemplate("{{ name }}"): "typed"}, "true": survivor,
+              "kept": {_FactKeyTemplate("{{ name }}"): "trusted"}}
+    encoded, paths = _encode_bundle_mapping_keys(source)
+    decoded = json.loads(json.dumps(encoded))
+    restored = _restore_bundle_mapping_keys(decoded, json.loads(json.dumps(paths)))
+    assert restored[True] == {"{{ name }}": "typed"}
+    assert isinstance(next(iter(restored[True])), _FactKeyTemplate)
+    assert restored["true"] == survivor
+    if isinstance(survivor, dict):
+        assert type(next(iter(restored["true"]))) is str
+    assert isinstance(next(iter(restored["kept"])), _FactKeyTemplate)
+
+
 def _task(uuid, name, special, **kw):
     node = {"type": "task", "uuid": uuid, "name": name, "action": special,
             "special": special, "args": {}, "when": [], "loop": None,
@@ -2665,6 +2682,19 @@ def test_set_fact_string_results_are_trusted_as_templates():
     rt, frames = run(tasks)
     assert by_name(frames, "verify trusted result")[0]["status"] == "ok"
     assert not rt.failed
+
+
+def test_set_fact_expanded_args_leave_generated_mapping_values_literal(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.21.1")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    task = _task("1", "set fact", "set_fact", args={
+        "_variable_params": "{{ {'generated': {'text': '{' ~ '{ sentinel }}'}} }}",
+    })
+    result = runtime._run_set_fact(task, {"sentinel": "rendered"}, None)
+    ctx = {"sentinel": "rendered", "hostvars": {"localhost": result["ansible_facts"]}}
+    assert runtime.template("{{ hostvars.localhost.generated.text }}", ctx) == "{{ sentinel }}"
 
 
 def test_special_action_accepts_entire_templated_argument_dictionary():

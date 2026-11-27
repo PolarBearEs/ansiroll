@@ -48,7 +48,7 @@ _ANSIROLL_INVENTORY_ADDRESS_PATTERNS = ()
 _GATHER_STRING_METHODS = {"split", "rsplit", "strip", "lstrip", "rstrip"}
 
 
-def _core_at_least(major, minor):
+def _core_at_least(major, minor, patch=0):
     """Feature gate on the compiling controller's ansible-core version."""
     version = _ANSIROLL_CORE_VERSION
     if not version:
@@ -57,8 +57,8 @@ def _core_at_least(major, minor):
             from ansible.release import __version__ as version
         except Exception:
             return False
-    match = re.match(r"^(\d+)\.(\d+)", str(version))
-    return bool(match) and tuple(map(int, match.groups())) >= (major, minor)
+    match = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", str(version))
+    return bool(match) and tuple(int(part or 0) for part in match.groups()) >= (major, minor, patch)
 
 
 def _legacy_templating():
@@ -171,6 +171,61 @@ class _Omit(str):
 
 
 _OMIT = _Omit("__omit_place_holder__ansiroll")
+
+
+class _FactKeyTemplate(str):
+    """An authored mapping key that set_fact may evaluate."""
+
+
+def _encode_bundle_mapping_keys(value):
+    """Make JSON object keys while retaining scalar key types and fact-name trust."""
+    paths = []
+
+    def encode(current, path):
+        if isinstance(current, dict):
+            names = {str(key) for key in current if isinstance(key, str)}
+            encoded, typed, templates = {}, {}, []
+            for key, item in current.items():
+                if isinstance(key, str):
+                    name = str(key)
+                    if isinstance(key, _FactKeyTemplate):
+                        templates.append(name)
+                else:
+                    if key is not None and not isinstance(key, (int, float)):
+                        raise TypeError("Unsupported bundle mapping key type %s" % type(key).__name__)
+                    name = json.dumps(key)
+                    while name in names:
+                        name += "_"
+                    names.add(name)
+                    typed[name] = key
+                encoded[name] = encode(item, (*path, name))
+            if templates or typed:
+                paths.append((path, templates, typed))
+            return encoded
+        if isinstance(current, (list, tuple)):
+            return [encode(item, (*path, index)) for index, item in enumerate(current)]
+        return current
+
+    return encode(value, ()), paths
+
+
+def _restore_bundle_mapping_keys(value, paths):
+    # Restore inner mappings before changing the keys used to reach them.
+    for path, keys, typed in paths:
+        mapping = value
+        for member in path:
+            mapping = mapping[member]
+        keys = set(keys)
+        entries = {}
+        for key, item in mapping.items():
+            if key in typed:
+                key = typed[key]
+            elif key in keys:
+                key = _FactKeyTemplate(key)
+            entries[key] = item
+        mapping.clear()
+        mapping.update(entries)
+    return value
 _LOCALHOST_NAMES = ("localhost", "127.0.0.1", "::1")
 _NO_CONDITIONAL_LIST = object()
 _MISSING_VARS_FILE_INPUT = object()
@@ -834,6 +889,10 @@ def _vars_file_glob_covers(pattern, name):
     )
 
 
+def _mark_unsafe_key(key, **options):
+    return key if isinstance(key, _FactKeyTemplate) else _mark_unsafe(key, **options)
+
+
 def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text=False,
                  preserve_views=False, preserve_lookup_hostvars=False, reject_vault=False):
     """Deep-copy `value`, marking template-looking strings as never-templated."""
@@ -869,8 +928,8 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
             else:
                 items = dict.items(value)
             for key, item in items:
-                marked_key = _mark_unsafe(key, _seen, condition_text=condition_text, preserve_views=preserve_views,
-                                          reject_vault=reject_vault)
+                marked_key = _mark_unsafe_key(
+                    key, _seen=_seen, condition_text=condition_text, preserve_views=preserve_views, reject_vault=reject_vault)
                 out[marked_key] = _mark_unsafe(item, _seen, preserve_included_vars, condition_text, preserve_views,
                                                preserve_lookup_hostvars, reject_vault)
             return out
@@ -920,7 +979,7 @@ def _decode_frozen_value(value):
 
 
 def _trust_set_fact_value(value):
-    if isinstance(value, _NO_TEMPLATE):
+    if isinstance(value, (_FactKeyTemplate,) + _NO_TEMPLATE):
         return value
     if isinstance(value, str):
         return _TrustedAsTemplateValue(value)
@@ -2961,7 +3020,7 @@ def _type_name(value):
                            (_DeferredVarItems, "ItemsView"), (_DeferredVarValues, "ValuesView")):
         if isinstance(value, internal):
             return name
-    if type(value) in (_UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
+    if type(value) in (_FactKeyTemplate, _UnsafeText, _UnsafeTemplate, _UntrustedConditionValue,
                        _TrustedAsTemplateValue):
         return "str"
     return type(value).__name__
@@ -4176,6 +4235,7 @@ class Runtime:
         self.vars = dict(host_vars or {})
         self._play_var_names = set()
         self._initial_host_vars = self._task_host_vars()
+        self._legacy_omit_token = self._initial_host_vars.get("omit", _OMIT)
         self._vars_file_host_vars = self._initial_host_vars
         self.python = python or sys.executable
         self.check_mode = check_mode
@@ -4311,7 +4371,7 @@ class Runtime:
             if set(value.keys()) == {"__ansiroll_vault__"}:
                 return value
             # Ansible leaves mapping keys literal.
-            return {_mark_unsafe(k): self.template(v, ctx, _seen, strict)
+            return {_mark_unsafe_key(k): self.template(v, ctx, _seen, strict)
                     for k, v in value.items()}
         if isinstance(value, list):
             return [self.template(v, ctx, _seen, strict) for v in value]
@@ -5402,6 +5462,9 @@ class Runtime:
             higher_vars.update(self.extra_vars)
         higher_vars.update(task.get("role_magic") or {})
         self._pin_magic_vars(higher_vars)
+        if task.get("special") == "set_fact" and _legacy_templating():
+            # Legacy Core adds the omit token after merging task variables.
+            higher_vars["omit"] = self._legacy_omit_token
         ctx.pop(_HIGH_VARS_KEY, None)
         ctx.pop(_INCLUDE_PARAMS_KEY, None)
         task_vars = {key: value for key, value in (task.get("vars") or {}).items()
@@ -5694,10 +5757,12 @@ class Runtime:
                         action = (task.get("action") or "").rsplit(".", 1)[-1]
                         base_ctx.update(facts if action == "set_fact" else self._visible_module_facts(facts))
                         if commits_delegated_facts and action == "set_fact":
-                            cached = base_ctx.get("ansible_facts")
-                            base_ctx["ansible_facts"] = {
-                                **(cached if isinstance(cached, dict) else {}), **_normalized_facts(facts),
-                            }
+                            cached = base_ctx.setdefault("ansible_facts", {})
+                            if res.get("_ansible_facts_cacheable"):
+                                base_ctx["ansible_facts"] = {
+                                    **(cached if isinstance(cached, dict) else {}),
+                                    **_normalized_facts(facts, preserve_local=True),
+                                }
                 aggregate_no_log = aggregate_no_log or no_log
                 res["item"] = it
                 if task.get("loop_label") is not None:
@@ -6079,7 +6144,7 @@ class Runtime:
             else:
                 self._module_env = self._task_environment(task, ctx)
             special = task.get("special")
-            if special and (special == "debug"
+            if special and (special in ("debug", "set_fact")
                             or not (self.delegate_fn and task.get("delegate_to"))):
                 res = self._run_special(special, task, ctx, become, args_cache)
             elif delegated:
@@ -6422,6 +6487,8 @@ class Runtime:
 
     def _run_special(self, special, task, ctx, become=False, args_cache=None):
         name = special.split(".")[-1]
+        if name == "set_fact":
+            return self._run_set_fact(task, ctx, args_cache)
         raw_args = task.get("args") or {}
         if name == "assert":
             # Its condition expressions are interpreted only by when().
@@ -6464,30 +6531,6 @@ class Runtime:
                 "_ansible_verbose_always": True,
             }
         args = _fail_on_undef(args)
-        if name == "set_fact":
-            import keyword
-            facts = {}
-            key_templates = set(task.get("set_fact_key_templates", ()))
-            cacheable = _boolean(args.get("cacheable", False))
-            reserved = ("true", "false", "yes", "no", "on", "off", "none", "null")
-            for k, value in args.items():
-                if k == "cacheable":
-                    continue
-                if k in key_templates:
-                    k = _fail_on_undef(self.template(str(k), ctx))
-                if not isinstance(k, str):
-                    return {"failed": True, "changed": False,
-                            "msg": "Invalid variable name '%s' of type '%s'"
-                                   % (k, type(k).__name__)}
-                if not k.isidentifier() or keyword.iskeyword(k) or k.lower() in reserved:
-                    return {"failed": True, "changed": False,
-                            "msg": "Invalid variable name '%s'" % k}
-                facts[_trust_set_fact_value(k)] = _trust_set_fact_value(value)
-            return {
-                "changed": False,
-                "ansible_facts": facts,
-                "_ansible_facts_cacheable": cacheable,
-            }
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
         if name in ("template", "copy"):
@@ -6507,6 +6550,102 @@ class Runtime:
             return {"failed": True, "changed": False,
                     "msg": args.get("fail_msg", args.get("msg", "Assertion failed"))}
         return {"failed": True, "changed": False, "msg": "Unsupported special action: %s" % name}
+
+    def _run_set_fact(self, task, ctx, args_cache):
+        import keyword
+
+        if args_cache is None:
+            args_cache = {}
+        if "args" not in args_cache:
+            args_cache["args"] = self._set_fact_args(task, ctx)
+        args = args_cache["args"]
+        cacheable = _boolean(args.get("cacheable", False), strict=True)
+        modern = _core_at_least(2, 19)
+        reserved = {"true", "false", "none", "True", "False", "None", "not"}
+        facts = {}
+        keys = sorted(args) if modern and all(isinstance(key, str) for key in args) else args
+        for key in keys:
+            if key == "cacheable":
+                continue
+            value = args[key]
+            if isinstance(key, _FactKeyTemplate):
+                key = _fail_on_undef(self.template(str(key), ctx))
+                if modern and isinstance(key, _Omit):
+                    return {"failed": True, "changed": False,
+                            "msg": "Invalid variable name: fact key resolved to omit"}
+            if not isinstance(key, str):
+                return {"failed": True, "changed": False,
+                        "msg": "Invalid variable name '%s' of type '%s'" % (key, type(key).__name__)}
+            is_reserved = key in reserved if modern else keyword.iskeyword(key)
+            if is_reserved or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", key):
+                return {"failed": True, "changed": False, "msg": "Invalid variable name '%s'" % key}
+            facts[_trust_set_fact_value(key)] = _trust_set_fact_value(value)
+        return {"changed": False, "ansible_facts": facts, "_ansible_facts_cacheable": cacheable}
+
+    def _set_fact_args(self, task, ctx):
+        raw = dict(task.get("args") or {})
+        modern = _core_at_least(2, 19)
+        legacy_omit = self._legacy_omit_token if not modern else None
+
+        def omitted(value):
+            return isinstance(value, _Omit) or (
+                legacy_omit is not None and isinstance(value, str) and value == legacy_omit)
+
+        def finalize(value):
+            if omitted(value):
+                return _OMIT
+            if isinstance(value, dict):
+                fields = ((key, finalize(member)) for key, member in value.items())
+                return {_mark_unsafe_key(key): member for key, member in fields if member is not _OMIT}
+            if isinstance(value, (list, tuple)):
+                if modern:
+                    members = [member for member in map(finalize, value) if member is not _OMIT]
+                else:
+                    # Legacy remove_omit visits mappings directly in lists.
+                    members = [finalize(member) if isinstance(member, dict) else _fail_on_undef(member)
+                               for member in value]
+                return tuple(members) if isinstance(value, tuple) else members
+            return _fail_on_undef(value)
+
+        source = raw.pop("_variable_params", None)
+        free_form = (source is None and set(raw) == {"_raw_params"}
+                     and not task.get("set_fact_raw_params_is_fact") and isinstance(raw["_raw_params"], str))
+        if free_form:
+            source = raw["_raw_params"]
+        params = {}
+        if source is not None:
+            params = self.templater.render_string(source, ctx)
+            if _is_undef(params):
+                _fail_on_undef(params)
+            if not isinstance(params, dict) or set(params) == {"__ansiroll_unsafe__"}:
+                if free_form:
+                    raw["_raw_params"] = params
+                elif modern:
+                    if not omitted(params):
+                        raise ValueError("set_fact args must resolve to a dictionary")
+                elif _core_at_least(2, 14, 3) or (_core_at_least(2, 13, 8) and not _core_at_least(2, 14)):
+                    raise ValueError("invalid or malformed argument: '%s'" % _as_text(params))
+                params = {}
+            elif free_form:
+                raw.pop("_raw_params")
+        explicit_templates = set(task.get("set_fact_key_templates", ()))
+        if modern:
+            # Core sorts the combined keys before evaluating any values, including omit.
+            sorted(set(params) | raw.keys())
+        # Modern Core checks only the surviving value for a key. Keeping a
+        # lazy mapping here avoids evaluating shadowed aliases and lookups.
+        args = {}
+        for key in params:
+            if key not in raw or not modern:
+                value = finalize(params[key])
+                if value is not _OMIT:
+                    args[key] = value
+        for key, value in raw.items():
+            normalized = finalize(value if free_form else self.template(value, ctx))
+            args.pop(key, None)
+            if normalized is not _OMIT:
+                args[_FactKeyTemplate(key) if key in explicit_templates else key] = normalized
+        return _mark_unsafe(args)
 
     def _run_accelerated_action(self, task, args, become=False):
         name = str(task.get("action") or "").split(".")[-1]
@@ -7152,6 +7291,9 @@ class Runtime:
             if short_action == "set_fact":
                 self.vars.update(facts)
                 self._set_fact_overrides.update(facts)
+                if not res.get("_ansible_facts_cacheable"):
+                    self.vars.setdefault("ansible_facts", {})
+                    return
             elif short_action == "include_vars":
                 self.vars.update(facts)
                 self._include_vars_layer.update(facts)
@@ -7164,7 +7306,7 @@ class Runtime:
             # The `ansible_facts` magic var holds facts without the ansible_
             # prefix ('fqdn' in ansible_facts), unlike the injected top-level
             # ansible_* vars.
-            existing.update(_normalized_facts(facts))
+            existing.update(_normalized_facts(facts, preserve_local=short_action == "set_fact"))
 
     def _notification_names(self, task, ctx):
         with self._strict_vars():
@@ -8296,12 +8438,13 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), un
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
-        if all(isinstance(key, str) for key in keys):
+        if all(isinstance(key, str) and not isinstance(key, _FactKeyTemplate) for key in keys):
             wire_keys = keys
         else:
             # Index this mapping on the wire so 8080 and '8080' never collide.
             wire_keys = [str(index) for index in range(len(keys))]
-            mapping_keys.append((path, keys))
+            mapping_keys.append((path, [{"fact_template": str(key)} if isinstance(key, _FactKeyTemplate)
+                                        else key for key in keys]))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys,
                                                     (*path, wire_key), unsafe_paths)
                 for wire_key, key in zip(wire_keys, keys)}
@@ -8351,7 +8494,7 @@ def _contains_typed_mapping_keys(value):
         if isinstance(member, (dict, list, tuple)) and id(member) not in seen:
             seen.add(id(member))
             if isinstance(member, dict):
-                if any(not isinstance(key, str) for key in member):
+                if any(not isinstance(key, str) or isinstance(key, _FactKeyTemplate) for key in member):
                     return True
                 pending.extend(member.values())
             else:
@@ -8375,6 +8518,8 @@ def _restore_delegated_mapping_keys(value, mapping_keys):
         if isinstance(key, dict):
             from datetime import date, datetime
 
+            if "fact_template" in key:
+                return _FactKeyTemplate(key["fact_template"])
             if "bytes" in key:
                 return base64.b64decode(key["bytes"], validate=True)
             if "date" in key:
@@ -8494,6 +8639,7 @@ def agent_main():
     _restore_delegated_mapping_keys(host_var_overrides, mapping_keys.get("overrides", ()))
     host_vars.update(injected_vars)
     extra_vars = dict(g.get("_INJECTED_EXTRA_VARS") or {})
+    _restore_delegated_mapping_keys(extra_vars, mapping_keys.get("extra", ()))
     specialized_vars = dict(g.get("_SPECIALIZED_VARS") or {})
     specialized_vars.update(g.get("_FROZEN_VARS") or {})
     conflicts = sorted(k for k, value in specialized_vars.items()
