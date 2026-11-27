@@ -845,6 +845,11 @@ class StrategyModule(StrategyBase):
             concrete.loop_with = None
             concrete.register = None
             concrete.notify = []
+            for keyword in ("check_mode", "become", "no_log"):
+                if keyword in frame:
+                    setattr(concrete, keyword, frame[keyword])
+            if "diff_mode" in frame:
+                concrete.diff = frame["diff_mode"]
             # The agent applies the original retry policy around each controller call.
             concrete.retries = 0
             concrete.until = []
@@ -993,6 +998,27 @@ class StrategyModule(StrategyBase):
                 container = container[key]
             container[path[-1]] = marker
         return _restore_delegated_mapping_keys(value, mapping_keys)
+
+    def _restore_private_result(self, packed, *, wrap_result=False):
+        from ansiroll.loader import _core_version
+
+        value = packed["value"]
+        if _core_version() < (2, 19):
+            from ansible.utils.unsafe_proxy import wrap_var
+
+            if wrap_result:
+                value = wrap_var(value)
+            else:
+                for path in packed.get("unsafe_paths", ()):
+                    if not path:
+                        value = wrap_var(value)
+                        continue
+                    container = value
+                    for key in path[:-1]:
+                        container = container[key]
+                    container[path[-1]] = wrap_var(container[path[-1]])
+        return self._restore_play_fallback(value, packed["undefined"], packed.get("errors", ()),
+                                           packed.get("mapping_keys", ()))
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
@@ -1597,19 +1623,12 @@ class StrategyModule(StrategyBase):
             action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
             state = result_data
             if "private_result" in frame:
-                private = frame["private_result"]
-                state = self._restore_play_fallback(
-                    private["value"], private["undefined"], private.get("errors", ()),
-                    private.get("mapping_keys", ()),
-                )
+                state = self._restore_private_result(frame["private_result"],
+                                                     wrap_result=action not in ("set_fact", "include_vars"))
             registered_result = state
             if registers and not frame.get("is_item"):
                 if action in ("include_tasks", "include_role") and "include_register" in frame:
-                    private = frame["include_register"]
-                    registered_result = self._restore_play_fallback(
-                        private["value"], private["undefined"], private.get("errors", ()),
-                        private.get("mapping_keys", ()),
-                    )
+                    registered_result = self._restore_private_result(frame["include_register"])
                 if action == "synchronize":
                     from ansiroll.runtime import _without_delegated_metadata
                     registered_result = _without_delegated_metadata(state)

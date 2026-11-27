@@ -2271,6 +2271,29 @@ class ActionModule(ActionBase):
     assert "synthetic-fixture-password" not in result.stdout + result.stderr
 
 
+def test_controller_synchronize_uses_check_mode_from_include_apply(tmp_path):
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        return {"changed": False, "checked": self._task.check_mode}
+""")
+    (tmp_path / "child.yml").write_text("- synchronize: {}\n  register: synced\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: {dry_run: true}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply: {check_mode: '{{ dry_run }}'}
+    - assert: {that: synced.checked == true}
+""")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("looped", [False, True], ids=["single", "loop"])
 @pytest.mark.parametrize("ignore", [False, True], ids=["fatal", "ignored"])
 def test_controller_synchronize_tallies_unreachable(tmp_path, looped, ignore):
@@ -5768,7 +5791,9 @@ def test_expanded_include_applies_task_keywords(tmp_path, runner):
                               text=True, capture_output=True)
     else:
         strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
-        proc = _run_strategy_play(tmp_path, playbook, "--diff", environment={"ANSIBLE_STRATEGY": strategy})
+        proc = _run_strategy_play(tmp_path, playbook, "--diff", "-e",
+                                  "ansible_python_interpreter=" + sys.executable,
+                                  environment={"ANSIBLE_STRATEGY": strategy})
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not (tmp_path / "dry.txt").exists()

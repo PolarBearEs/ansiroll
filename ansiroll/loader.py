@@ -1939,8 +1939,9 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     tasks = []
     apply_flags = {}
     # Core's looped include uses its original apply mapping for child tasks.
-    if _core_version() >= (2, 19) and task.loop is None:
-        applied = args.get("apply") or {}
+    applied = args.get("apply") or {}
+    render_apply = _core_version() >= (2, 19) and task.loop is None
+    if render_apply:
         apply_flags = {flag: _tag_untrusted(applied[flag]) for flag in ("check_mode", "diff", "no_log", "become")
                        if _is_templated(applied.get(flag))}
     if ref is None:
@@ -1987,12 +1988,13 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
-        if parent is not task and parent.vars and tasks:
-            tasks = [{"type": "block", "include_apply_scope": True,
-                      "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
+        if parent is not task and parent.vars and tasks and not render_apply:
+            tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", fname, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
+    if render_apply and applied.get("vars"):
+        node["apply_vars"] = _tag_untrusted(applied["vars"])
     if apply_flags:
         node["apply_flags"] = apply_flags
         node["apply_omit_fallback"] = {

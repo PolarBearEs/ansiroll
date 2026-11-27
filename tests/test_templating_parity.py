@@ -3031,6 +3031,52 @@ def test_no_log_include_register_remains_available_in_next_strategy_play(tmp_pat
     assert messages == []
 
 
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("looped", [False, True])
+def test_include_apply_vars_resolve_in_native_scope(tmp_path, use_strategy, looped):
+    include = """
+- hosts: localhost
+  gather_facts: false
+  vars: {flavor: outer}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          vars: {flavor: applied, chosen: '{{ flavor }}'}
+"""
+    if looped:
+        include += "      loop: [one]\n"
+    messages, _ = _assert_parity(tmp_path, include, {
+        "child.yml": "- debug: {msg: '{{ chosen }}'}\n  vars: {flavor: child}\n",
+    }, use_strategy=use_strategy)
+    assert messages == ["outer" if MODERN_TEMPLATING and not looped else "child"]
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core uses unsafe string wrappers")
+def test_hidden_register_and_fact_keep_unsafe_values_in_next_strategy_play(tmp_path):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: !unsafe '{{ 6 * 7 }}'}
+      register: hidden
+      no_log: true
+    - set_fact:
+        hidden_fact: {value: !unsafe '{{ 6 * 7 }}'}
+      no_log: true
+- hosts: localhost
+  gather_facts: false
+  vars:
+    literal: !unsafe '{{ 6 * 7 }}'
+  tasks:
+    - assert:
+        quiet: true
+        that:
+          - hidden.msg == literal
+          - hidden_fact.value == literal
+""", use_strategy=True)
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern native tuple keys")
 @pytest.mark.parametrize("no_log", [False, True])
 @pytest.mark.parametrize(("item", "condition"), [

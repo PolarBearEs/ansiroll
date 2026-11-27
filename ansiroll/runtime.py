@@ -4554,16 +4554,16 @@ class Runtime:
                 item = "(censored due to no_log)"
                 emitted_result["_ansible_item_label"] = item
             if send_register:
-                include_register = _pack_include_value(result)
+                include_register = _pack_include_value(result, preserve_unsafe=True)
             if getattr(self, "_controller_result_transport", False) and not include:
                 if node.get("register") and not is_item:
-                    private_result = _pack_include_value(result)
+                    private_result = _pack_include_value(result, preserve_unsafe=True)
                 elif isinstance(result.get("ansible_facts"), dict):
                     state = {key: result[key] for key in ("ansible_facts", "_ansible_facts_cacheable") if key in result}
-                    private_result = _pack_include_value(state)
+                    private_result = _pack_include_value(state, preserve_unsafe=True)
         elif include and _contains_typed_mapping_keys((result, item)):
             # Leave presentation JSON-safe and keep the original keys for register.
-            packed = _pack_include_value(result)
+            packed = _pack_include_value(result, preserve_unsafe=bool(send_register))
             emitted_result = packed["value"]
             item = _pack_include_value(item)["value"] if item is not None else None
             if send_register:
@@ -4897,6 +4897,7 @@ class Runtime:
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
         include_no_log = bool(node.get("no_log"))
         apply_flags = {}
+        apply_vars = {}
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
         metadata_flags = None
         if items:
@@ -4911,7 +4912,7 @@ class Runtime:
         if result is None and items is None:
             result, ignore = self._task_gate(node, base_ctx)
             if result is None:
-                include_no_log, apply_flags, result = self._prepare_include(node, base_ctx)
+                include_no_log, apply_flags, apply_vars, result = self._prepare_include(node, base_ctx)
         if result is not None:
             self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore, no_log=include_no_log)
@@ -5022,10 +5023,11 @@ class Runtime:
                 self._tally("skipped")
 
         scopes = []
+        body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
         for ctx, loop_vars, result, item, item_no_log in selected:
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars)
             params.update(loop_vars)
-            scope = _with_high_vars(overlay, params)
+            scope = _with_high_vars(body_overlay, params)
             if apply_flags:
                 scope[_INCLUDE_APPLY_FLAGS] = {**(overlay.get(_INCLUDE_APPLY_FLAGS) or {}), **apply_flags}
             # Handlers execute later, so retain the expressions as well as
@@ -5051,19 +5053,22 @@ class Runtime:
 
     def _prepare_include(self, node, ctx):
         no_log, failure = self._resolve_task_no_log(node, ctx)
-        if failure is not None or not node.get("apply_flags"):
-            return no_log, {}, failure
+        authored_flags = node.get("apply_flags") or {}
+        authored_vars = node.get("apply_vars") or {}
+        if failure is not None or not (authored_flags or authored_vars):
+            return no_log, {}, {}, failure
         try:
-            flags = _fail_on_undef(self.template(node["apply_flags"], ctx))
+            flags = _fail_on_undef(self.template(authored_flags, ctx))
             for key, value in flags.items():
                 if isinstance(value, _Omit):
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
                     flags[key] = self._execution_flag_value(inherited, ctx)
+            applied_vars = _setup_omit(self.template(authored_vars, ctx))
         except Exception as ex:
-            return no_log or "no_log" in node["apply_flags"], {}, {
+            return no_log or "no_log" in authored_flags, {}, {}, {
                 "failed": True, "changed": False, "msg": str(ex),
             }
-        return no_log, flags, None
+        return no_log, flags, applied_vars, None
 
     def _included_body_steps(self, tasks, scopes, become):
         for scope in scopes:
@@ -5077,8 +5082,7 @@ class Runtime:
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
-        # Authored block aliases see the child task's scope. Include apply
-        # aliases resolve in the surrounding scope before the child runs.
+        # Keep the older compiled block marker readable.
         defer = not block.get("include_apply_scope")
         scope.update(self.template_vars(
             block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay), defer=defer, block_vars=defer))
@@ -8272,9 +8276,9 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path):
+def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, unsafe_paths):
     try:
-        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path)
+        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path, unsafe_paths)
     except _CapturedTemplateError as error:
         errors.append((path, str(error)))
     except jinja2.UndefinedError:
@@ -8284,7 +8288,7 @@ def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path)
     return None
 
 
-def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
+def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), unsafe_paths=None):
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
@@ -8294,12 +8298,17 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=()):
             # Index this mapping on the wire so 8080 and '8080' never collide.
             wire_keys = [str(index) for index in range(len(keys))]
             mapping_keys.append((path, keys))
-        return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys, (*path, wire_key))
+        return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys,
+                                                    (*path, wire_key), unsafe_paths)
                 for wire_key, key in zip(wire_keys, keys)}
     if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
-        return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys, (*path, index))
+        return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys,
+                                          (*path, index), unsafe_paths)
                 for index in range(len(value))]
-    return _fail_on_undef(value)
+    value = _fail_on_undef(value)
+    if unsafe_paths is not None and isinstance(value, _NO_TEMPLATE) and _looks_templated(value):
+        unsafe_paths.append(path)
+    return value
 
 
 def _encode_delegated_key(key):
@@ -8316,14 +8325,17 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
-def _pack_delegated_value(value):
+def _pack_delegated_value(value, *, preserve_unsafe=False):
     undefined, errors, mapping_keys = [], [], []
-    value = _delegate_fallback_value(value, undefined, errors, mapping_keys)
+    unsafe_paths = [] if preserve_unsafe else None
+    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, unsafe_paths=unsafe_paths)
     result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
     if errors:
         result["errors"] = errors
     if mapping_keys:
         result["mapping_keys"] = json.loads(json.dumps(mapping_keys, default=_encode_delegated_key))
+    if unsafe_paths:
+        result["unsafe_paths"] = unsafe_paths
     return result
 
 
@@ -8343,9 +8355,9 @@ def _contains_typed_mapping_keys(value):
     return False
 
 
-def _pack_include_value(value):
+def _pack_include_value(value, *, preserve_unsafe=False):
     try:
-        return _pack_delegated_value(value)
+        return _pack_delegated_value(value, preserve_unsafe=preserve_unsafe)
     except (TypeError, ValueError):
         # A plugin can return arbitrary hashable objects. Such keys cannot
         # cross the wire, but should not abort callbacks for an include.
