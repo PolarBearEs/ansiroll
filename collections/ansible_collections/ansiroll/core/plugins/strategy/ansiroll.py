@@ -2037,7 +2037,7 @@ def _truthy(value):
 
 
 class _LegacyFactResultQueue(collections.deque):
-    """Inspect 2.10 results at dequeue time, before linear publishes facts."""
+    """Inspect legacy results at dequeue time, before linear publishes facts."""
 
     def __init__(self, results, record):
         super().__init__(results)
@@ -2077,26 +2077,31 @@ class _SetFactLinearStrategy(_LinearStrategy):
                               (result._host, result._task))
                 key = (host.name, task._uuid)
                 original = self._queued_task_cache.get(key, {}).get("task")
-                if _has_delegated_fact_flag(original):
+                tracks_delegation = _has_delegated_fact_flag(original)
+                templated_action = original is not None and _looks_templated(original.action)
+                if tracks_delegation or (_UnifiedTaskResult is None and templated_action):
                     if task.action in C._ACTION_SET_FACT or original.action in C._ACTION_SET_FACT:
-                        target = task.delegate_to if _delegated_fact_flag(task.delegate_facts) is True else None
+                        target = None
+                        if tracks_delegation and _delegated_fact_flag(task.delegate_facts) is True:
+                            target = task.delegate_to
                         self._fact_routes.setdefault(key, []).append(target if isinstance(target, str) else None)
-                    elif _looks_templated(original.action):
+                    elif templated_action:
                         # Keep the place of items that don't resolve to set_fact,
                         # including skipped items that never resolve the action.
                         self._fact_routes.setdefault(key, []).append(_UNROUTED_FACT_RESULT)
             return send_callback(method, *args, **kwargs)
 
         # Core 2.10 consumes raw queues inline without a conversion hook.
-        raw_queues = ("_results", "_handler_results") if not (
-            hasattr(_LinearStrategy, "normalize_task_result")
-            or hasattr(_LinearStrategy, "_convert_wire_task_result_to_raw")
-            or _UnifiedTaskResult is not None
-        ) else ()
+        raw_queues = {}
+        if _UnifiedTaskResult is None:
+            if hasattr(_LinearStrategy, "_convert_wire_task_result_to_raw"):
+                raw_queues["_results"] = self._publish_legacy_debug_loop_facts
+            elif not hasattr(_LinearStrategy, "normalize_task_result"):
+                raw_queues = dict.fromkeys(("_results", "_handler_results"), self._record_legacy_routes)
         if raw_queues:
             with self._results_lock:
-                for name in raw_queues:
-                    setattr(self, name, _LegacyFactResultQueue(getattr(self, name), self._record_legacy_routes))
+                for name, on_dequeue in raw_queues.items():
+                    setattr(self, name, _LegacyFactResultQueue(getattr(self, name), on_dequeue))
         self._tqm.send_callback = capture_item
         try:
             return super().run(iterator, play_context)
@@ -2146,12 +2151,31 @@ class _SetFactLinearStrategy(_LinearStrategy):
         routes = self._fact_routes.pop((host.name, task_uuid), ())
         items = data.get("results")
         if (routes and isinstance(items, list) and len(routes) == len(items)
-                and getattr(task, "action", None) not in C._ACTION_DEBUG
                 and not (result.is_failed() or result.is_unreachable() or result.is_skipped())):
             # Hold the item itself so its identity cannot be reused before
             # linear consumes the route or finishes the aggregate.
             self._legacy_fact_items.update((id(item), (item, host, target)) for item, target in zip(items, routes)
                                            if target is not _UNROUTED_FACT_RESULT and "ansible_facts" in item)
+
+    def _publish_legacy_debug_loop_facts(self, result):
+        # Core uses the final item action for the whole successful aggregate.
+        # A final debug skips all facts, so publish the earlier set_fact items
+        # before Core applies the task register.
+        task = result.task
+        if task.action not in C._ACTION_DEBUG:
+            return
+        for item in result._loop_results:
+            route = self._legacy_fact_items.pop(id(item), None)
+            if route is None:
+                continue
+            _, host, target = route
+            recipients = (self.get_task_hosts(self._fact_iterator, host, task) if target is None
+                          else [self._fact_recipient(target)])
+            facts = item["ansible_facts"]
+            for recipient in recipients:
+                if item.get("_ansible_facts_cacheable"):
+                    self._variable_manager.set_host_facts(recipient, dict(facts))
+                self._variable_manager.set_nonpersistent_facts(recipient, dict(facts))
 
     def get_delegated_hosts(self, result, task):
         route = self._legacy_fact_items.pop(id(result), None)

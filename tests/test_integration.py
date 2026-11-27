@@ -7915,6 +7915,48 @@ def test_strategy_ignores_deferred_group_callbacks_in_later_handler_fact_routing
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("delegated", [False, True])
+def test_strategy_keeps_set_fact_writes_before_a_final_debug_item(tmp_path, delegated):
+    from ansiroll.loader import _core_version
+
+    if not (2, 19) <= _core_version() < (2, 21):
+        pytest.skip("requires Core's legacy publication of templated loop actions")
+    playbook = """- hosts: origin
+  connection: local
+  gather_facts: false
+  vars:
+    # Core 2.20 consults the action before entering the worker loop.
+    operation: {action: set_fact}
+  tasks:
+    - name: Write facts, then report
+      action: "{{ operation.action }}"
+      args: "{{ operation.args }}"
+      loop_control: {loop_var: operation}
+      loop:
+        - {action: set_fact, args: {local_marker: earlier, loop_result: shadowed}, route: false}
+        - {action: set_fact, args: {routed_marker: later, cacheable: true}, route: true}
+        - {action: debug, args: {msg: last}, route: true}
+      register: loop_result
+DELEGATION
+    - assert:
+        that:
+          - local_marker == 'earlier'
+          - loop_result.results[-1].msg == 'last'
+          - ROUTED_CHECK
+"""
+    if delegated:
+        delegation = '      delegate_to: recipient\n      delegate_facts: "{{ operation.route }}"\n'
+        routed_check = ("routed_marker is undefined and hostvars.recipient.local_marker is undefined and "
+                        "hostvars.recipient.routed_marker == 'later' and "
+                        "hostvars.recipient.ansible_facts.routed_marker == 'later'")
+    else:
+        delegation = ""
+        routed_check = "routed_marker == 'later' and ansible_facts.routed_marker == 'later'"
+    proc = _run_strategy_play(tmp_path, playbook.replace("DELEGATION", delegation).replace(
+        "ROUTED_CHECK", routed_check), inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 @pytest.mark.parametrize(("action", "looped"), [("debug", True), ("set_fact", True), ("debug", False)])
 def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action, looped):
     from types import SimpleNamespace
@@ -7932,7 +7974,7 @@ def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action, l
     monkeypatch.setattr(module._LinearStrategy, "_process_pending_results", lambda *_: [result])
 
     strategy._record_legacy_routes(result)
-    assert (id(item) in strategy._legacy_fact_items) == (action == "set_fact")
+    assert (id(item) in strategy._legacy_fact_items) is looped
     assert not strategy._fact_routes
     assert strategy._process_pending_results(None) == [result]
     assert not strategy._legacy_fact_items
