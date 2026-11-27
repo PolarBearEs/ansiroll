@@ -8002,7 +8002,7 @@ def test_strategy_warns_for_each_unnamed_play_in_linear_fallback(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     warnings = " ".join(proc.stderr.split())
     assert warnings.count("ansiroll_delegate_on_target has no effect during core linear fallback") == 2
-    locations = set(re.findall(r"play\.yml:\s*(\d+)", warnings))
+    locations = set(re.findall(r"play\.yml:(\d+),", "".join(proc.stderr.split())))
     assert {"1", str(len(play.splitlines()) + 1)} <= locations
 
 
@@ -8021,7 +8021,7 @@ def test_strategy_warns_for_each_import_of_a_play_in_linear_fallback(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     warnings = " ".join(proc.stderr.split())
     assert warnings.count("ansiroll_delegate_on_target has no effect during core linear fallback") == 2
-    assert len(re.findall(r"imported\.yml:\s*1\b", warnings)) == 2
+    assert "".join(proc.stderr.split()).count("imported.yml:1,") == 2
 
 
 def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
