@@ -3546,6 +3546,8 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
       args: '{{ unsafe_args }}'
       ignore_errors: true
 """ if MODERN_TEMPLATING else ""
+    # Legacy loaders can report their YAML string subclass here.
+    key_type_check = "          - fact_args.keys() | list | first | type_debug == 'str'\n" if MODERN_TEMPLATING else ""
     _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -3563,8 +3565,7 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
         quiet: true
         that:
           - greeting == 'hello'
-          - fact_args.keys() | list | first | type_debug == 'str'
-""", use_strategy=use_strategy)
+""" + key_type_check, use_strategy=use_strategy)
 
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
