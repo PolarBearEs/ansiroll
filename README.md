@@ -68,6 +68,11 @@ python3 -m ansiroll.cli compile playbook.yml -o - | python3 -
 Keep stdout and stderr separate. Send stdout to a pipe or file because a terminal
 can transform the generated source.
 
+A standalone artifact can contain plaintext from a Vault-encrypted source
+selected at compile time. For named output, the compiler creates a fresh
+owner-only file with mode `0700`. To redirect stdout to a file, use a new path
+and set `umask 077` before redirecting. The shell controls access to that file.
+
 Configure any Python startup hooks, such as `sitecustomize`, to send their
 messages to stderr so they cannot add text to the pipeline before Ansiroll runs.
 When Ansiroll and Ansible are installed in the interpreter's environment, use
@@ -304,6 +309,17 @@ before execution if it would use core `linear`, controller execution, or
 delegation fallback. `ANSIROLL_PROVENANCE=1` emits one JSON record per play and
 task with `native-agent`, `real-ansiballz`, `controller-fallback`, or
 `linear-fallback`; CI asserts the native-only lane contains no fallback records.
+
+Before merging a PR into `master`, run **Manual Full PR CI** from GitHub
+Actions using the PR number and its current full commit SHA. The workflow tests
+GitHub's proposed merge and requires all 20 CI jobs, including the Ansible 2.10
+jobs, to pass. Refresh the PR branch and run CI again if `master` advances.
+
+```bash
+pr=123
+head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+gh workflow run reviewed-ci.yml --ref master -f pr_number="$pr" -f head_sha="$head"
+```
 
 See `PLAN.md` for the full design and rationale.
 
