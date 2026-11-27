@@ -7080,8 +7080,9 @@ def test_vars_file_include_replays_inside_a_literal_include_role(tmp_path):
         assert messages == [f"chosen-{profile}"]
 
 
-@pytest.mark.parametrize("shared_entry", [False, True])
-def test_vars_file_include_rejects_changed_inputs_for_build_only_body(tmp_path, shared_entry):
+@pytest.mark.parametrize("child_action", [None, "import_tasks", "include_tasks"],
+                         ids=["changed-entry", "nested-import", "nested-include"])
+def test_vars_file_include_rejects_changed_inputs_for_build_only_body(tmp_path, child_action):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
@@ -7091,11 +7092,11 @@ def test_vars_file_include_rejects_changed_inputs_for_build_only_body(tmp_path, 
     - include_tasks: '{{ [task_file] | path_join }}'
 """)
     for profile in ("normal", "alternate"):
-        entry = "entry.yml" if shared_entry else f"{profile}.yml"
+        entry = "entry.yml" if child_action else f"{profile}.yml"
         (tmp_path / f"profile-{profile}.yml").write_text(f"task_file: {entry}\nchild: {profile}.yml\n")
         (tmp_path / f"{profile}.yml").write_text(f"- debug: {{msg: chosen-{profile}}}\n")
-    if shared_entry:
-        (tmp_path / "entry.yml").write_text("- import_tasks: '{{ child }}'\n")
+    if child_action:
+        (tmp_path / "entry.yml").write_text(f"- {child_action}: '{{{{ child }}}}'\n")
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
     runtime, messages = _run_vars_file_include_profile(plan, "normal")
     assert not runtime.failed, messages

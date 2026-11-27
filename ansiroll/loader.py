@@ -1922,8 +1922,8 @@ class _IncludeVariables:
         self.vars_file_writes = set()
         self.vars_file_plan = None
         self.vars_file_scopes = None
-        self.static_import_reads = set()
-        self.build_only_import_names = set()
+        self.compile_selector_reads = set()
+        self.build_only_selector_names = set()
         # When candidate contents are unknown, any play var can change.
         self.incomplete = False
         self.unresolved_vars_file = False
@@ -2151,6 +2151,15 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     fname = _template_include_filename(task, raw_fname, includes) if _is_templated(raw_fname) else raw_fname
     if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
         return None
+    if includes.build_only_selector_names and _is_templated(raw_fname):
+        # This child is baked into a build-only parent body. Guard the
+        # vars-file inputs it used even when the parent's filename is unchanged.
+        variables, _ = _include_template_variables(task, includes)
+        reads, unknown_lookup = set(), set()
+        if (_gather_timeout_dependencies(raw_fname, variables, selector=True, allow_controller=True,
+                                         paths=reads, unknown_lookup=unknown_lookup) is None or unknown_lookup):
+            reads = {(name, ()) for name in includes.build_only_selector_names}
+        includes.compile_selector_reads.update(reads)
     parents = tuple(path for path, dynamic in _parent_include_paths(_include_parent(task)) if dynamic)
     if fname is None or (parents and includes.vars_file_scopes is not None):
         sources = (raw_fname, *parents)
@@ -2182,7 +2191,7 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             if build_only and default_inputs is None:
                 return None
             if build_only:
-                default.build_only_import_names = includes.vars_file_writes
+                default.build_only_selector_names = includes.vars_file_writes
             variants[default_key] = default
     bodies = []
     writes = set()
@@ -2214,9 +2223,9 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
             if build_selected:
                 raise
             continue
-        import_names = branch.build_only_import_names if build_only else branch.vars_file_writes
+        selector_names = branch.build_only_selector_names if build_only else branch.vars_file_writes
         reads = set(known_reads) | {
-            (name, path) for name, path in branch.static_import_reads if name in import_names
+            (name, path) for name, path in branch.compile_selector_reads if name in selector_names
         }
         variant_inputs = None
         if build_only and reads:
@@ -2357,7 +2366,7 @@ def _include_import_scope(task, includes):
     from ansible.playbook.task_include import TaskInclude
 
     native_scope = includes.vars_file_scopes is None and includes.compile_selected_vars is not None
-    if native_scope and not includes.build_only_import_names:
+    if native_scope and not includes.build_only_selector_names:
         yield
         return
 
@@ -2395,10 +2404,10 @@ def _include_import_scope(task, includes):
                 if _gather_timeout_dependencies(
                         source, variables, selector=True, allow_controller=True, computed=set(), paths=reads,
                         unknown_lookup=unknown_lookup if native_scope else None) and not unknown_lookup:
-                    includes.static_import_reads.update(reads)
+                    includes.compile_selector_reads.update(reads)
                 else:
-                    names = includes.build_only_import_names if native_scope else includes.vars_file_writes
-                    includes.static_import_reads.update((name, ()) for name in names)
+                    names = includes.build_only_selector_names if native_scope else includes.vars_file_writes
+                    includes.compile_selector_reads.update((name, ()) for name in names)
             if includes.compile_selected_vars is None:
                 variables = _portable_include_scope(templates, variables)
                 if variables is None:
