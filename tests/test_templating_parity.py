@@ -200,19 +200,22 @@ def test_implicit_gather_action_defaults_take_precedence_over_setup_defaults(tmp
 @pytest.mark.skipif(LEGACY_SETUP, reason="uses the modern setup action name")
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 def test_implicit_gather_action_consumes_parallel_and_drops_null_options(tmp_path, use_strategy):
+    # Core 2.12–2.15 used true for synchronous dispatch, even with just one fact module.
+    parallel = Version(__version__) < Version("2.16")
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: true
+  gather_subset: ['!all', '!min', distribution, platform]
   module_defaults:
     ansible.builtin.gather_facts:
-      parallel: false
+      parallel: PARALLEL
       filter: null
     ansible.builtin.setup:
       filter: [ansible_distribution]
   tasks:
     - debug:
         msg: "{{ 'filtered' if ansible_facts.distribution is defined and ansible_facts.hostname is undefined else 'unfiltered' }}"
-""", use_strategy=use_strategy)
+""".replace("PARALLEL", json.dumps(parallel)), use_strategy=use_strategy)
     assert messages == ["filtered"]
 
 
