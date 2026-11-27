@@ -5083,7 +5083,7 @@ class Runtime:
             result = {"changed": False, "include": node.get("file")}
             loop_vars = {}
             if not looped:
-                selected.append((base_ctx, loop_vars, result, item, include_no_log))
+                selected.append((base_ctx, loop_vars, result, item, include_no_log, apply_flags, apply_vars))
                 break
             try:
                 loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
@@ -5094,8 +5094,9 @@ class Runtime:
             ctx = {**base_ctx, **loop_vars}
             blocked, ignored = self._task_gate(node, ctx)
             item_no_log = include_no_log
+            item_flags, item_vars = {}, {}
             if blocked is None:
-                item_no_log, blocked = self._resolve_task_no_log(node, ctx)
+                item_no_log, item_flags, item_vars, blocked = self._prepare_include(node, ctx)
             if blocked is not None:
                 if _result_failed(blocked) and not _core_at_least(2, 19):
                     legacy_failure = (blocked, ignored)
@@ -5127,7 +5128,7 @@ class Runtime:
                 failed_items_ignored = failed_items_ignored and ignored
             reported = {**result, **loop_vars}
             if not _result_failed(result) and not result.get("skipped"):
-                selected.append((ctx, loop_vars, reported, item, item_no_log))
+                selected.append((ctx, loop_vars, reported, item, item_no_log, item_flags, item_vars))
             results.append((item, result, reported, item_no_log))
             if stop:
                 break
@@ -5170,8 +5171,8 @@ class Runtime:
                 self._tally("skipped")
 
         scopes = []
-        body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
-        for ctx, loop_vars, result, item, item_no_log in selected:
+        for ctx, loop_vars, result, item, item_no_log, apply_flags, apply_vars in selected:
+            body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars,
                                         defer=_core_at_least(2, 19))
             params.update(loop_vars)
@@ -5206,9 +5207,12 @@ class Runtime:
         if failure is not None or not (authored_flags or authored_vars):
             return no_log, {}, {}, failure
         try:
-            flags = _fail_on_undef(self.template(authored_flags, ctx))
+            flags = {
+                key: self._execution_flag_value(value, ctx, check_mode=key == "check_mode")
+                for key, value in authored_flags.items()
+            }
             for key, value in flags.items():
-                if isinstance(value, _Omit):
+                if isinstance(value, _Omit) or value is _KEYWORD_OMIT:
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
                     flags[key] = self._bound_apply_flag(inherited, ctx)
             applied_vars = _setup_omit(self.template(authored_vars, ctx))
@@ -6191,12 +6195,7 @@ class Runtime:
         authored = task.get(key)
         check_mode = key == "check_mode"
         omit_token = ctx.get("omit")
-        if check_mode and isinstance(authored, str):
-            native_keyword = _core_at_least(2, 19)
-            ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
-            if native_keyword and omit_token is _OMIT:
-                ctx["omit"] = _KEYWORD_OMIT
-        value = self._execution_flag_value(authored, ctx)
+        value = self._execution_flag_value(authored, ctx, check_mode=check_mode)
         legacy_omit = (check_mode and _legacy_templating() and isinstance(omit_token, str)
                        and omit_token.startswith("__omit_place_holder__") and value == omit_token)
         omitted = isinstance(value, _Omit) or value is _KEYWORD_OMIT or legacy_omit
@@ -6206,15 +6205,28 @@ class Runtime:
                 return self._invocation_check_mode, omitted
             if check_mode and fallback == "invalid":
                 raise ValueError("invalid inherited check_mode value")
-            value = self._execution_flag_value(fallback, ctx)
+            value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
         if value is None:
             return (False if check_mode and authored is not None else default), omitted
         return _boolean(value, strict=True), omitted
 
-    def _execution_flag_value(self, value, ctx):
+    def _execution_flag_value(self, value, ctx, *, check_mode=False, on_omit=False):
         value = self._bound_apply_flag(value, ctx)
-        if isinstance(value, dict) and value == {"__ansiroll_invocation_check_mode__": True}:
-            return self._invocation_check_mode
+        if check_mode:
+            if isinstance(value, dict):
+                if value == {"__ansiroll_invocation_check_mode__": True}:
+                    return self._invocation_check_mode
+                if "__ansiroll_raw_role_check_mode__" in value:
+                    # A child's omit restores and validates the original
+                    # inherited keyword without evaluating it again.
+                    if on_omit:
+                        raise ValueError("invalid inherited check_mode value")
+                    value = value["__ansiroll_raw_role_check_mode__"]
+            if isinstance(value, str):
+                native_keyword = _core_at_least(2, 19)
+                ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
+                if native_keyword and ctx.get("omit") is _OMIT:
+                    ctx["omit"] = _KEYWORD_OMIT
         return _fail_on_undef(self.template(value, ctx))
 
     @staticmethod

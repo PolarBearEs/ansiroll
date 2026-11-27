@@ -5804,6 +5804,56 @@ def test_strategy_restores_resolved_include_apply_check_mode(tmp_path, include, 
     assert observed == [not writes]
 
 
+@pytest.mark.parametrize("case", ["looped", "buffered", "vars", "raw-parent"])
+def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatch, case):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native role apply rendering")
+    role = tmp_path / "roles" / "child"
+    (role / "tasks").mkdir(parents=True)
+    (role / "vars").mkdir()
+    (role / "vars" / "main.yml").write_text("toggle: false\n")
+    child_mode = "mode" if case == "vars" else "omit"
+    (role / "tasks" / "main.yml").write_text("""- file:
+    path: "{{ playbook_dir }}/result-{{ item | default('only') }}"
+    state: touch
+  check_mode: "{{ CHILD_MODE }}"
+""".replace("CHILD_MODE", child_mode))
+    apply = {
+        "looped": "check_mode: '{{ item }}'",
+        "buffered": "check_mode: '{% if simulate %}{{ true }}{% else %}{{ omit }}{% endif %}'",
+        "vars": "vars: {mode: '{{ toggle }}'}",
+        "raw-parent": "check_mode: '{{ omit }}'",
+    }[case]
+    task = "- include_role:\n    name: child\n    apply:\n      " + apply + "\n"
+    if case == "looped":
+        task += "  loop: [true, false]\n"
+    if case == "raw-parent":
+        task = "- block:\n" + textwrap.indent(task, "    ") + "  check_mode: '{{ simulate }}'\n"
+    play = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: {mode: true, toggle: true, simulate: false}
+  tasks:
+""" + textwrap.indent(task, "    ")
+    native = _run_strategy_play(tmp_path, play, "--check", "-e", "ansible_python_interpreter=" + sys.executable,
+                                environment={"ANSIBLE_STRATEGY": "linear"})
+    expected = [True, False] if case == "looped" else [] if case == "raw-parent" else [True]
+    assert (native.returncode == 0) is (case != "raw-parent"), native.stdout + native.stderr
+    assert len(list(tmp_path.glob("result-*"))) == expected.count(False), native.stdout + native.stderr
+
+    source, _ = compile_playbook(str(tmp_path / "play.yml"))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, check_mode=True)
+    observed = []
+    monkeypatch.setattr(runtime, "_run_accelerated_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: observed.append(runtime.check_mode)
+                        or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert runtime.failed is (case == "raw-parent")
+    assert observed == expected
+
+
 @pytest.mark.parametrize(("action", "invocation_check", "delegated"), [
     ("copy", True, False),
     ("template", True, False),

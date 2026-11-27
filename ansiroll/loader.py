@@ -1929,9 +1929,10 @@ class _AppliedExecutionFlag(str):
     """An inherited flag whose value is resolved by the include invocation."""
 
 
-def _include_apply_flags(task, keywords):
-    # Core's looped include uses its original apply mapping for child tasks.
-    if _core_version() < (2, 19) or task.loop is not None:
+def _include_apply_flags(task, keywords, *, role=False):
+    # Looped include_tasks keeps the original apply mapping; include_role
+    # finalizes it separately for each item before expanding the role.
+    if _core_version() < (2, 19) or (task.loop is not None and not role):
         return {}
     applied = (task.args or {}).get("apply")
     if not isinstance(applied, dict):
@@ -1939,9 +1940,13 @@ def _include_apply_flags(task, keywords):
     flags = {key: _tag_untrusted(applied[key]) for key in keywords if _is_templated(applied.get(key))}
     if not flags:
         return {}
-    fallbacks = {
-        key: _execution_omit_fallback(task._get_parent_attribute(key, omit=True), keyword=key) for key in flags
-    }
+    fallbacks = {}
+    for key in flags:
+        inherited = task._get_parent_attribute(key, omit=True)
+        fallback = _execution_omit_fallback(inherited, keyword=key)
+        if role and key == "check_mode" and _is_templated(inherited) and not isinstance(inherited, _AppliedExecutionFlag):
+            fallback = {"__ansiroll_raw_role_check_mode__": fallback}
+        fallbacks[key] = fallback
     return {"apply_flags": flags, "apply_omit_fallback": fallbacks}
 
 
@@ -2411,7 +2416,9 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     except Exception:
         return None
     task._role_path = getattr(ri, "_role_path", None)
-    apply_options = _include_apply_flags(task, ("check_mode",))
+    apply_options = _include_apply_flags(task, ("check_mode",), role=True)
+    applied = args.get("apply") or {}
+    render_apply = _core_version() >= (2, 19)
     key = ("role", task._role_path or name, tuple(sorted(from_files.items())),
            _is_handler(task), _include_search_context(task), _include_scope_key(task), repr(args.get("apply")),
            bool(apply_options))
@@ -2441,6 +2448,8 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 parent = include.build_parent_block()
             for block in blocks + handler_blocks:
                 block._parent = parent
+            if parent is not task and render_apply and parent.vars:
+                parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
             _bind_include_apply_flags(parent, apply_options)
         except Exception:
             return None
@@ -2458,7 +2467,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             # Executing include_role appends the role's handlers to the play's
             # handlers (ansible/playbook/role_include.py IncludeRole.get_block_list).
             handlers = _convert_handlers(handler_blocks, actions, basedir, includes)
-            if handlers and args.get("apply") and parent.vars:
+            if handlers and parent is not task and parent.vars and not render_apply:
                 applied_vars = _tag_untrusted(dict(parent.vars))
                 for handler in handlers:
                     handler["handler_block_vars"] = applied_vars
@@ -2476,7 +2485,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
                                                skip_tags=skip_tags, includes=includes)
                                  for b in blocks) if c]
-            if parent is not task and parent.vars and tasks:
+            if parent is not task and parent.vars and tasks and not render_apply:
                 tasks = [{"type": "block", "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
         finally:
             _INCLUDE_STACK.pop(key, None)
@@ -2485,6 +2494,8 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_role", name, basedir,
                          role_defaults, role_vars, tasks, include_id, ref, handlers)
+    if render_apply and isinstance(applied, dict) and applied.get("vars"):
+        node["apply_vars"] = _tag_untrusted(applied["vars"])
     node.update(apply_options)
     return node
 
