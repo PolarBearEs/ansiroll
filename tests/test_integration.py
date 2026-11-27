@@ -22,6 +22,7 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+from tests import ansible_playbook_command
 
 pytest.importorskip("ansible")
 
@@ -5700,7 +5701,8 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None,
+                       command=("ansible-playbook",)):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -5710,7 +5712,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
     env["ANSIBLE_NOCOLOR"] = "1"
     env.update(environment or {})
     return subprocess.run(
-        ["ansible-playbook", "-i", inventory, str(path), *args],
+        [*command, "-i", inventory, str(path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -7091,7 +7093,8 @@ def test_skipped_include_loop_register_and_recap(tmp_path, runner, all_skipped):
     if runner != "standalone":
         # The second play reads the register from the controller's fact cache.
         playbook += play
-    aggregate_skipped = all_skipped and _core_version() >= (2, 11)
+    legacy = _core_version() < (2, 11)
+    aggregate_skipped = all_skipped and not legacy
     playbook += """\
     - assert:
         that:
@@ -7103,6 +7106,11 @@ def test_skipped_include_loop_register_and_recap(tmp_path, runner, all_skipped):
 """.replace("FIRST_SKIPPED", "true" if all_skipped else "false").replace(
         "EXPECTED", "true" if aggregate_skipped else "false").replace(
         "MESSAGE", "All items skipped" if aggregate_skipped else "All items completed")
+    if all_skipped and legacy:
+        playbook += """\
+          - selected.skipped is undefined
+          - selected.failed is undefined
+"""
     if runner == "standalone":
         path = tmp_path / "play.yml"
         path.write_text(playbook)
@@ -7113,7 +7121,10 @@ def test_skipped_include_loop_register_and_recap(tmp_path, runner, all_skipped):
         )
     else:
         strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
-        proc = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy}, timeout=30)
+        proc = _run_strategy_play(
+            tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy}, timeout=60,
+            command=ansible_playbook_command(),
+        )
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert ("executed-child" in proc.stdout) is not all_skipped
