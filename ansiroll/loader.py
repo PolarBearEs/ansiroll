@@ -490,7 +490,8 @@ def _capture_setup_files(play, terms_by_alias):
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
-                                 unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None):
+                                 unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None,
+                                 vars_lookup_allowed=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -526,6 +527,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             if not allow_controller and not (
                 isinstance(method, nodes.Getattr) and method.attr in scalar_methods
                 or selector and _is_literal_vars_lookup(call)
+                and (vars_lookup_allowed is None or vars_lookup_allowed(call.args[0].value))
             ):
                 return None
             if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
@@ -2514,7 +2516,7 @@ def _include_import_scope(task, includes):
             else:
                 includes.compile_selector_reads.update(selector_reads)
             if includes.compile_selected_vars is None:
-                variables = _portable_include_scope(templates, variables)
+                variables = _portable_include_scope(current, templates, variables)
                 if variables is None:
                     raise ValueError("runtime-only import uses a controller-only template")
         return variables
@@ -2859,14 +2861,30 @@ def _include_template_variables(task, includes):
     return variables, (role_vars, task_vars, role_params, include_params, extra_vars)
 
 
-def _portable_include_scope(sources, variables):
+def _portable_include_scope(task, sources, variables):
+    from ansible.errors import AnsibleError
+    from ansible.plugins.loader import lookup_loader
+    from ansible.plugins.lookup import vars as builtin_vars
+
     from .runtime import _GATHER_STRING_METHODS
+
+    @lru_cache(maxsize=None)
+    def builtin_lookup(alias):
+        if alias != "ansible.builtin.vars":
+            roots = [*task.get_search_path(), task._loader.get_basedir()]
+            if any(os.path.lexists(os.path.join(root, "lookup_plugins", "vars.py")) for root in roots):
+                return False
+        try:
+            resolved = lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
+        except (AnsibleError, ImportError):
+            return False
+        return bool(resolved and os.path.realpath(resolved) == os.path.realpath(builtin_vars.__file__))
 
     reads = {}
     for source in sources:
         paths = set()
         dependencies = _gather_timeout_dependencies(
-            source, variables, _GATHER_STRING_METHODS, selector=True, paths=paths)
+            source, variables, _GATHER_STRING_METHODS, selector=True, paths=paths, vars_lookup_allowed=builtin_lookup)
         if dependencies is None or _vars_filename_controller_requirements(source, dependencies, paths=paths)[0]:
             return None
         for name, path in paths:
@@ -2972,7 +2990,7 @@ def _template_include_value(task, value, includes, *, runtime_portable=False, po
         from .runtime import _selector_template_sources
 
         sources = [source for source, _, _ in _selector_template_sources(_tag_untrusted(value))]
-        variables = _portable_include_scope(sources, variables)
+        variables = _portable_include_scope(task, sources, variables)
         if variables is None:
             return _UNRESOLVED_INCLUDE_VALUE
     try:

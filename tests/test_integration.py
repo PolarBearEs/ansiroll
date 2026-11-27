@@ -8865,6 +8865,37 @@ def test_vars_file_include_excludes_unreachable_bodies(tmp_path, first_found):
     assert messages == ["chosen-alternate"]
 
 
+@pytest.mark.parametrize("alias", ["vars", "ansible.legacy.vars", "ansible.builtin.vars"])
+def test_vars_file_alternate_selector_rejects_shadowed_vars_lookup(tmp_path, monkeypatch, alias):
+    from types import SimpleNamespace
+
+    from ansible.plugins.loader import lookup_loader
+    from ansible.plugins.lookup import vars as builtin_vars
+    from ansiroll.loader import _core_version, _portable_include_scope
+
+    plugin = tmp_path / "vars.py"
+    resolved = SimpleNamespace(plugin_resolved_path=str(plugin))
+    monkeypatch.setattr(lookup_loader, "find_plugin_with_context", lambda name: resolved)
+    task = SimpleNamespace(get_search_path=lambda: [str(tmp_path)],
+                           _loader=SimpleNamespace(get_basedir=lambda: str(tmp_path)))
+    source = ["{{ filename }}"]
+    filename = "{{ lookup('" + alias + "', 'child') }}"
+    if _core_version() >= (2, 19):
+        from ansible.template import trust_as_template
+
+        filename = trust_as_template(filename)
+    variables = {"filename": filename, "child": "child.yml"}
+    assert _portable_include_scope(task, source, variables) is None
+
+    resolved.plugin_resolved_path = builtin_vars.__file__
+    assert _portable_include_scope(task, source, variables) == variables
+    directory = tmp_path / "lookup_plugins"
+    directory.mkdir()
+    (directory / "vars.py").touch()
+    result = _portable_include_scope(task, source, variables)
+    assert (result is not None) is (alias == "ansible.builtin.vars")
+
+
 @pytest.mark.parametrize("controller_lookup", [False, True])
 def test_vars_file_alternate_static_import_uses_safe_candidate_scope(tmp_path, monkeypatch, controller_lookup):
     for profile in ("normal", "alternate"):
