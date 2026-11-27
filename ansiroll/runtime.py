@@ -177,26 +177,30 @@ class _FactKeyTemplate(str):
 
 
 def _encode_bundle_mapping_keys(value):
-    """Make JSON object keys while retaining null types and fact-name trust."""
+    """Make JSON object keys while retaining scalar key types and fact-name trust."""
     paths = []
 
     def encode(current, path):
         if isinstance(current, dict):
-            null_key = None
-            if None in current:
-                null_key = "null"
-                while null_key in current:
-                    null_key += "_"
-            # JSON object keys are strings. Keep only the last entry for a
-            # spelling, just as json.loads does, before recording trust.
-            surviving = {}
+            names = {str(key) for key in current if isinstance(key, str)}
+            encoded, typed, templates = {}, {}, []
             for key, item in current.items():
-                name = str(key) if isinstance(key, str) else json.dumps(key)
-                surviving[null_key if key is None else name] = key, item
-            keys = [name for name, (key, _) in surviving.items() if isinstance(key, _FactKeyTemplate)]
-            if keys or null_key is not None:
-                paths.append((path, keys, null_key))
-            return {name: encode(item, (*path, name)) for name, (_, item) in surviving.items()}
+                if isinstance(key, str):
+                    name = str(key)
+                    if isinstance(key, _FactKeyTemplate):
+                        templates.append(name)
+                else:
+                    if key is not None and not isinstance(key, (int, float)):
+                        raise TypeError("Unsupported bundle mapping key type %s" % type(key).__name__)
+                    name = json.dumps(key)
+                    while name in names:
+                        name += "_"
+                    names.add(name)
+                    typed[name] = key
+                encoded[name] = encode(item, (*path, name))
+            if templates or typed:
+                paths.append((path, templates, typed))
+            return encoded
         if isinstance(current, (list, tuple)):
             return [encode(item, (*path, index)) for index, item in enumerate(current)]
         return current
@@ -205,15 +209,16 @@ def _encode_bundle_mapping_keys(value):
 
 
 def _restore_bundle_mapping_keys(value, paths):
-    for path, keys, null_key in reversed(paths):
+    # Restore inner mappings before changing the keys used to reach them.
+    for path, keys, typed in paths:
         mapping = value
         for member in path:
             mapping = mapping[member]
         keys = set(keys)
         entries = {}
         for key, item in mapping.items():
-            if key == null_key:
-                key = None
+            if key in typed:
+                key = typed[key]
             elif key in keys:
                 key = _FactKeyTemplate(key)
             entries[key] = item

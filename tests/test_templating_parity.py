@@ -3686,17 +3686,18 @@ def test_set_fact_distinguishes_null_and_string_keys(tmp_path, use_strategy, exp
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Core sorts keys before dropping omitted values")
 @pytest.mark.parametrize("use_strategy", [False, True])
-def test_set_fact_rejects_mixed_key_types_before_omit(tmp_path, use_strategy):
+@pytest.mark.parametrize("key", ["null", "42"])
+def test_set_fact_rejects_mixed_key_types_before_omit(tmp_path, use_strategy, key):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
   tasks:
     - block:
-        - set_fact: {null: '{{ omit }}', good: written}
+        - set_fact: {KEY: '{{ omit }}', good: written}
       rescue:
         - debug: {msg: rejected-mixed-keys}
     - assert: {that: good is undefined, quiet: true}
-""", use_strategy=use_strategy)
+""".replace("KEY", key), use_strategy=use_strategy)
     assert messages == ["rejected-mixed-keys"]
 
 
