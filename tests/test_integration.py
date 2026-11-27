@@ -6410,6 +6410,94 @@ def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+def test_strategy_agent_receives_only_its_selected_vars_file(tmp_path, monkeypatch):
+    from ansible.inventory.manager import InventoryManager
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
+    from ansible.vars.manager import VariableManager
+
+    names = ("alpha", "beta")
+    monkeypatch.setenv("ANSIROLL_TEST_PROFILE_SHADOWED", "lookup-value-shadowed")
+    monkeypatch.setenv("ANSIROLL_TEST_PROFILE_DEFAULT", "lookup-value-default")
+    for name in (*names, "fallback"):
+        key = f"ANSIROLL_TEST_PROFILE_{name.upper()}"
+        monkeypatch.setenv(key, f"lookup-value-{name}")
+        (tmp_path / f"profile-{name}.yml").write_text(
+            f'profile_value: "file-value-{name}"\nprofile_lookup: "{{{{ lookup(\'env\', \'{key}\') }}}}"\n')
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    profile_lookup: "{{ lookup('env', 'ANSIROLL_TEST_PROFILE_SHADOWED') }}"
+    default_lookup: "{{ lookup('env', 'ANSIROLL_TEST_PROFILE_DEFAULT') }}"
+  vars_files: ['profile-{{ inventory_hostname | default("fallback") }}.yml']
+  tasks:
+    - command: /bin/true
+""")
+    loader = DataLoader()
+    loader.set_basedir(str(tmp_path))
+    inventory = InventoryManager(loader=loader, sources="alpha,beta,")
+    manager = VariableManager(loader=loader, inventory=inventory)
+    play = Playbook.load(str(playbook), variable_manager=manager, loader=loader).get_plays()[0]
+    strategy_type = _load_strategy_module().StrategyModule
+    strategy = strategy_type.__new__(strategy_type)
+    strategy._cur_play = play
+    strategy._loader = loader
+    strategy._variable_manager = manager
+    strategy._delegate_on_target = strategy._check_mode = strategy._diff_mode = False
+    source, _, task_map = strategy._compile(play, manager.get_vars(play=play), None)
+    monkeypatch.setattr(strategy, "_resolve_become_password", lambda *args: None)
+    monkeypatch.setattr(strategy, "_pump", lambda *args, **kwargs: False)
+    for name in names:
+        payloads = []
+        monkeypatch.setattr(strategy, "_open_channel", lambda *args: SimpleNamespace(
+            send_blob=payloads.append, close=lambda: None))
+        assert not strategy._run_host(inventory.get_host(name), source, task_map, None, False)
+        payload, = payloads
+        plan, = _compiled_plays(payload, tmp_path)
+        combined = payload + json.dumps(plan)
+        assert "lookup-value-shadowed" not in combined
+        assert "lookup-value-default" in combined
+        for candidate in (*names, "fallback"):
+            assert (f"file-value-{candidate}" in combined) == (candidate == name)
+            assert (f"lookup-value-{candidate}" in combined) == (candidate == name)
+
+
+def test_strategy_vars_file_handler_names_use_controller_scope(tmp_path):
+    (tmp_path / "profile-default.yml").write_text("handler_name: native-handler\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars_files: ['profile-{{ profile | default("default") }}.yml']
+  tasks:
+    - command: /bin/true
+      notify: native-handler
+  handlers:
+    - name: "{{ handler_name }}"
+      debug: {msg: handled}
+""", environment={"ANSIROLL_PROVENANCE": "1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "handled" in result.stdout
+    assert "templated handler names with dynamic vars files require core linear" in result.stdout + result.stderr
+
+
+def test_strategy_vars_file_nested_import_uses_controller_scope(tmp_path):
+    (tmp_path / "profile-localhost.yml").write_text("task_source: selected.yml\n")
+    (tmp_path / "wrapper.yml").write_text("- import_tasks: '{{ task_source }}'\n")
+    (tmp_path / "selected.yml").write_text("- debug: {msg: imported-from-profile}\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars_files: ['profile-{{ inventory_hostname | default("localhost") }}.yml']
+  tasks:
+    - include_tasks: wrapper.yml
+""", environment={"ANSIROLL_PROVENANCE": "1"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "imported-from-profile" in result.stdout
+    assert "vars-file task selection requires core linear" in result.stdout + result.stderr
+
+
 def test_strategy_honors_play_level_local_connection(tmp_path):
     proc = _run_strategy_play(
         tmp_path,
@@ -7251,28 +7339,36 @@ def test_strategy_selects_vars_file_using_inventory_before_set_fact(tmp_path):
 
 
 @pytest.mark.parametrize("no_log", [False, True])
-@pytest.mark.parametrize("alias", [False, True], ids=["devnull", "devnull-symlink"])
+@pytest.mark.parametrize("alias", [None, False, True], ids=["single-selector", "devnull", "devnull-symlink"])
 def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, no_log, alias):
     empty_file = os.devnull
     if alias:
         empty_file = tmp_path / "empty.yml"
         empty_file.symlink_to(os.devnull)
-    (tmp_path / "settings-before.yml").write_text("before_gathering: old\n")
+    (tmp_path / "settings-before.yml").write_text("before_gathering: old\nsetup_probe: selected\n")
     (tmp_path / ("settings-" + platform.system() + ".yml")).write_text(
         'after_gathering: "{{ lookup(\'env\', \'ANSIROLL_TEST_FACT_SELECTED_ENV\') }}"\n')
     playbook = """- hosts: localhost
   gather_facts: true
   no_log: NO_LOG
   connection: local
+  vars:
+    setup_probe: authored
+  environment:
+    ANSIROLL_SETUP_PROBE: "{{ setup_probe }}"
   vars_files:
-    - DEVNULL
-    - ['settings-{{ ansible_facts.get(''system'', ''missing'') }}.yml', 'settings-before.yml']
+DEVNULL
+    - SELECTOR
   tasks:
     - assert:
         that:
           - before_gathering is undefined
           - after_gathering == 'fact-selected'
-""".replace("NO_LOG", str(no_log).lower()).replace("DEVNULL", json.dumps(str(empty_file)))
+          - ansible_facts.env.ANSIROLL_SETUP_PROBE == 'selected'
+""".replace("NO_LOG", str(no_log).lower()).replace(
+        "DEVNULL\n", "" if alias is None else "    - " + json.dumps(str(empty_file)) + "\n").replace(
+        "SELECTOR", """'settings-{{ ansible_facts.system | default("before") }}.yml'""" if alias is None
+        else """['settings-{{ ansible_facts.get("system", "missing") }}.yml', 'settings-before.yml']""")
     proc = _run_strategy_play(
         tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
         environment={"ANSIROLL_TEST_FACT_SELECTED_ENV": "fact-selected"},

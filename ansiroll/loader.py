@@ -814,8 +814,18 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup or include_replay) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
+    controller_vars_files = gather_facts is not None and _has_templated_vars_files(play)
+    tag_vars = all_vars
+    if controller_vars_files:
+        # A hostless compile can select a different file than any given host.
+        # Compile the common task graph without those file contents.
+        scope = play.copy()
+        scope.vars_files = []
+        all_vars = scope.get_variable_manager().get_vars(play=scope)
+    else:
+        scope = play
     play_vars = _resolved_play_vars(
-        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
+        scope, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
     deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
     for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
         deferred[index]["files"].update(selected)
@@ -840,8 +850,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes, controller_execution=gather_facts is not None)
-    includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
-                              for index, entry in enumerate(deferred))
+    includes.tag_vars = tag_vars
+    includes.incomplete = controller_vars_files or any(
+        index not in order_deferred or entry.get("unmodeled") for index, entry in enumerate(deferred))
     includes.unresolved_vars_file = include_replay and any(
         not selected and not checked for selected, checked, _ in order_deferred.values())
     includes.vars_file_writes = ordered_writes if ordered_writes is not None else {
@@ -903,13 +914,15 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         "become_user": getattr(play, "become_user", None),
         "force_handlers": bool(getattr(play, "force_handlers", False)),
         "ignore_errors": getattr(play, "ignore_errors", None),
-        "vars": _tag_untrusted(play_vars),
+        "vars": {} if controller_vars_files else _tag_untrusted(play_vars),
         "playbook_dir": basedir,
         "tasks": tasks,
         "handlers": handlers,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
+    if controller_vars_files:
+        result["controller_vars_files"] = True
     if gather:
         setup_options = {
             name: value
@@ -1760,7 +1773,7 @@ def _convert_handlers(blocks, actions, basedir, includes):
                 seen.add(node.get("uuid"))
                 node["handler_block"] = block_index
                 if node.get("type") == "include":
-                    node.update(_handler_match(handler))
+                    node.update(_handler_match(handler, controller_execution=includes.controller_execution))
                 handlers.append(node)
     return handlers
 
@@ -1802,7 +1815,7 @@ def _convert_node(node, actions, basedir,
         return block_node
 
     if isinstance(node, Task):
-        if not _matches_tags(node, only_tags, skip_tags, includes.all_vars):
+        if not _matches_tags(node, only_tags, skip_tags, includes.tag_vars):
             return None
         if node.action in ("include_tasks", "ansible.builtin.include_tasks"):
             inc = _convert_include_tasks(node, actions, basedir, only_tags,
@@ -1834,6 +1847,12 @@ _UNRESOLVED_INCLUDE_VALUE = object()
 
 def _is_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
+
+
+def _has_templated_vars_files(play):
+    return any(_is_templated(filename)
+               for entry in _as_list(getattr(play, "vars_files", None))
+               for filename in _as_list(entry))
 
 
 def _loop_binding_names(loop_var, index_var, extended):
@@ -1944,6 +1963,7 @@ class _IncludeVariables:
         self.play_vars = play_vars
         self.compile_selected_vars = play_vars
         self.all_vars = all_vars
+        self.tag_vars = all_vars
         self.runtime_writes = runtime_writes
         self.controller_execution = controller_execution
         self.variant_writes = set()
@@ -2256,7 +2276,10 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             return _expand_include_variants(
                 task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes)
     path = _include_tasks_path(task, fname, includes)
-    return _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
+    expanded = _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
+    if expanded is None and includes.controller_execution and _has_templated_vars_files(_play_of(task)):
+        return _expand_include_variants(task, (raw_fname,), {}, None, actions, basedir, only_tags, skip_tags, includes)
+    return expanded
 
 
 def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes):
@@ -2470,7 +2493,9 @@ def _include_import_scope(task, includes):
     from ansible import constants as C
     from ansible.playbook.task_include import TaskInclude
 
-    native_scope = includes.vars_file_scopes is None and includes.compile_selected_vars is not None
+    controller_scope = includes.controller_execution and _has_templated_vars_files(_play_of(task))
+    native_scope = (not controller_scope and includes.vars_file_scopes is None
+                    and includes.compile_selected_vars is not None)
     if native_scope and not includes.build_only_selector_names:
         yield
         return
@@ -2481,16 +2506,14 @@ def _include_import_scope(task, includes):
 
     def scoped_get_vars(*args, **kwargs):
         current = kwargs.get("task")
-        if current is None:
-            return get_vars(*args, **kwargs)
         play = kwargs.get("play")
-        if play is not None and not native_scope:
+        if play is not None and not native_scope and (current is not None or controller_scope):
             candidate_play = play.copy()
             candidate_play.vars = includes.play_vars
             candidate_play.vars_files = []
             kwargs["play"] = candidate_play
         variables = get_vars(*args, **kwargs)
-        if current.action in (*C._ACTION_IMPORT_TASKS, *C._ACTION_IMPORT_ROLE):
+        if current is not None and current.action in (*C._ACTION_IMPORT_TASKS, *C._ACTION_IMPORT_ROLE):
             # The native parser templates the operand and its ancestry before
             # opening a file. Validate both before it can run controller lookups.
             sources = [current.args]
@@ -2504,6 +2527,8 @@ def _include_import_scope(task, includes):
             from .runtime import _selector_template_sources
 
             templates = [source for value in sources for source, _, _ in _selector_template_sources(value)]
+            if templates and controller_scope:
+                raise ValueError("templated imports with dynamic vars files require core linear")
             selector_reads = set()
             for source in templates:
                 reads, unknown_lookup = set(), set()
@@ -3298,7 +3323,7 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
         "special": _special_of(action),
     }
     if _is_handler(task):
-        node.update(_handler_match(task))
+        node.update(_handler_match(task, controller_execution=controller_execution))
     if unarchive:
         node["_builtin_unarchive"] = builtin_unarchive
     if node["async_val"] or action in ("async_status", "ansible.builtin.async_status",
@@ -3420,7 +3445,7 @@ def _role_names(task):
     return names
 
 
-def _handler_match(task):
+def _handler_match(task, *, controller_execution=False):
     """Names and ``listen`` topics a notification can match a handler by.
 
     Mirrors StrategyBase.search_handlers_by_notification: a handler matches
@@ -3439,9 +3464,15 @@ def _handler_match(task):
         if isinstance(_tag_untrusted(task.name, template_syntax_only=True), dict):
             match["handler_name_trusted"] = False
             return match
+        play = _play_of(task)
+        if controller_execution and _has_templated_vars_files(play):
+            # Core resolves handler names in a hostless scope. That scope can
+            # select a vars file whose values must stay on the controller.
+            match["controller_handler_name"] = True
+            return match
         # StrategyBase resolves handler names with play/task vars and no host.
         variables = task.get_variable_manager().get_vars(
-            play=_play_of(task), task=task, include_hostvars=False)
+            play=play, task=task, include_hostvars=False)
         variables.pop("vars", None)  # rebuilt after applying invocation vars
         variables.pop("omit", None)  # use the stable runtime omit token
         match["handler_name_vars"] = _tag_untrusted(variables)

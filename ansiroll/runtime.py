@@ -4931,7 +4931,9 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         timeout_template = play.get("gather_timeout_template") or {}
-        play_vars = dict(play.get("vars") or {})
+        controller_files = play.get("controller_vars_files") and self.controller_vars_files_fn is not None
+        # The controller snapshot already applies vars-file precedence for setup.
+        play_vars = {} if controller_files else dict(play.get("vars") or {})
         deferred_files = play.get("deferred_vars_files") or ()
         ordered_files = play.get("ordered_vars_files", timeout_template.get("vars_files"))
         vars_files = ordered_files if ordered_files is not None else deferred_files
@@ -5028,7 +5030,7 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        if vars_files and self.controller_vars_files_fn is not None:
+        if controller_files or (vars_files and self.controller_vars_files_fn is not None):
             state = self.controller_vars_files_fn()
             for key in state["missing"]:
                 self.vars.pop(key, None)
