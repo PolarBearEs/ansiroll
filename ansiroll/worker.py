@@ -721,6 +721,8 @@ def main():
             finally:
                 if source_fd is not None:
                     os.close(source_fd)
+        elif op == "path_exists":
+            _send({"exists": os.path.exists(req["args"]["path"])})
         elif op in _COPY_OPS:
             try:
                 args = req.get("args") or {}

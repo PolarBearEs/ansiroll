@@ -6495,32 +6495,33 @@ class Runtime:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
                     self._render_action_args(task.get("args") or {}, ctx, args_cache, source_task=task)))
+                self._executed_task_args = args
+                res = None
                 if self._is_builtin_unarchive(task):
                     self._normalize_unarchive_options(args)
-                self._executed_task_args = args
-                self._module_source_bytes = self._baked_module_source(task, args)
-                if task.get("async_val") and int(task.get("poll") or 0) == 0:
-                    res = self._run_async_module(
-                        task["action"], args, become=become,
-                        async_val=int(task.get("async_val") or 0), ctx=ctx,
-                        options=task.get("async_options"))
-                elif task.get("action") in ("async_status", "ansible.builtin.async_status",
-                                            "ansible.legacy.async_status"):
-                    res = self._run_async_status(task["action"], args, become, ctx,
-                                                 task.get("async_options"))
-                elif task.get("accelerator") and (
-                        self.accelerated_modules
-                        or task.get("accelerator") == "required"):
-                    res = self._run_accelerated_action(task, args, become)
-                    if res is not None:
-                        provenance = {
-                            "mode": "native-agent",
-                            "reason": "accelerated action",
-                        }
-                else:
-                    res = None
+                    res = self._unarchive_creates_skip(args, become)
                 if res is None:
-                    res = self.run_module(task["action"], args, become=become)
+                    self._module_source_bytes = self._baked_module_source(task, args)
+                    if task.get("async_val") and int(task.get("poll") or 0) == 0:
+                        res = self._run_async_module(
+                            task["action"], args, become=become,
+                            async_val=int(task.get("async_val") or 0), ctx=ctx,
+                            options=task.get("async_options"))
+                    elif task.get("action") in ("async_status", "ansible.builtin.async_status",
+                                                "ansible.legacy.async_status"):
+                        res = self._run_async_status(task["action"], args, become, ctx,
+                                                     task.get("async_options"))
+                    elif task.get("accelerator") and (
+                            self.accelerated_modules
+                            or task.get("accelerator") == "required"):
+                        res = self._run_accelerated_action(task, args, become)
+                        if res is not None:
+                            provenance = {
+                                "mode": "native-agent",
+                                "reason": "accelerated action",
+                            }
+                    if res is None:
+                        res = self.run_module(task["action"], args, become=become)
         except Exception as ex:
             res = {"failed": True, "changed": False,
                    "msg": "ansiroll: task raised %s: %s" % (type(ex).__name__, ex)}
@@ -6682,6 +6683,24 @@ class Runtime:
             if "remote_src" in args:
                 raise ValueError("parameters are mutually exclusive: ('copy', 'remote_src')")
             args["remote_src"] = not _ansible_boolean(args.pop("copy"))
+
+    def _unarchive_creates_skip(self, args, become):
+        creates = args.get("creates")
+        if not creates:
+            return None
+        if args.get("src") is None or args.get("dest") is None:
+            return {"failed": True, "changed": False, "msg": "src (or content) and dest are required"}
+        creates = self._remote_expand_user(creates, become)
+        if self._needs_become(become):
+            result = self._run_worker_operation("path_exists", {"path": creates}, become=become)
+            if result is None:
+                raise RuntimeError("worker unavailable to check unarchive creates")
+            exists = result["exists"]
+        else:
+            exists = os.path.exists(creates)
+        if exists:
+            return {"skipped": True, "changed": False, "msg": "skipped, since %s exists" % creates}
+        return None
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""

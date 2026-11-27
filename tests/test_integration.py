@@ -5380,6 +5380,45 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path, l
     assert manifest["bundles"]["asset_count"] == 1
 
 
+@pytest.mark.parametrize(("remote_src", "module_defaults"), [(False, False), (True, False), (False, True)])
+def test_compiled_unarchive_checks_creates_before_extracting(tmp_path, remote_src, module_defaults):
+    archive = tmp_path / "payload.zip"
+    with zipfile.ZipFile(str(archive), "w") as zipped:
+        zipped.writestr("inside.txt", b"archive payload")
+    destination = tmp_path / "extracted"
+    destination.mkdir()
+    sentinel = destination / "sentinel"
+    sentinel.touch()
+    play = tmp_path / "unarchive.yml"
+    creates = 'creates: "{{ playbook_dir }}/extracted/sentinel"'
+    defaults = "\n  module_defaults:\n    ansible.builtin.unarchive:\n      " + creates if module_defaults else ""
+    task_creates = "" if module_defaults else "\n        " + creates
+    play.write_text("""
+- hosts: localhost
+  gather_facts: false%s
+  tasks:
+    - ansible.builtin.unarchive:
+        src: %s
+        dest: "{{ playbook_dir }}/extracted"%s
+        remote_src: %s
+""" % (defaults, archive, task_creates, str(remote_src).lower()))
+    src, _ = compile_playbook(str(play))
+    generated = tmp_path / "compiled.py"
+    generated.write_text(src)
+    if not remote_src:
+        archive.unlink()
+
+    proc = subprocess.run([sys.executable, str(generated)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "skipped=1" in proc.stdout
+    assert not (destination / "inside.txt").exists()
+
+    sentinel.unlink()
+    proc = subprocess.run([sys.executable, str(generated)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (destination / "inside.txt").read_bytes() == b"archive payload"
+
+
 def test_async_unarchive_keeps_memory_source_alive_until_extraction(tmp_path):
     archive = tmp_path / "async-payload.zip"
     with zipfile.ZipFile(str(archive), "w") as zipped:
