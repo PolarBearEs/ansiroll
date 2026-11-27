@@ -13,9 +13,11 @@ HEAD = "a" * 40
 BASE = "b" * 40
 OLD_BASE = "c" * 40
 MERGE = "d" * 40
+OLD_MERGE = "e" * 40
 MERGE_CONTEXT = "Manual Full CI (merge candidate)"
 LEGACY_CONTEXT = "Manual Full CI"
 CURRENT_PR = {
+    "number": 12,
     "state": "open",
     "head": {"sha": HEAD},
     "base": {"sha": BASE, "ref": "master"},
@@ -59,7 +61,11 @@ if "POST" in args and "context=" + os.environ.get("MOCK_FAIL_STATUS_CONTEXT", ""
 routes = json.loads((directory / "routes").read_text())
 for endpoint in routes:
     if endpoint in args:
-        print(routes[endpoint])
+        response = routes[endpoint]
+        if isinstance(response, list):
+            call_index = sum(endpoint in json.loads(line) for line in (directory / "calls").read_text().splitlines())
+            response = response[call_index - 1]
+        print(response)
         break
 else:
     sys.exit("Unexpected gh call: " + repr(args))
@@ -87,13 +93,13 @@ else:
     return run
 
 
-def report(check_id, owner, base, conclusion="success"):
+def report(check_id, owner, base, conclusion="success", *, merge=MERGE):
     return {
         "id": check_id,
         "app": {"slug": "github-actions"},
         "external_id": owner,
         "conclusion": conclusion,
-        "output": {"summary": f"Merge commit: {MERGE}\nBase commit: {base}"},
+        "output": {"summary": f"Merge commit: {merge}\nBase commit: {base}"},
     }
 
 
@@ -113,7 +119,7 @@ def test_reconcile_checks_for_the_current_pr_only(run_step, branch, cancelled):
         "invalidate-head-checks",
         {
             "pulls?state=open&per_page=100": f"12\t{HEAD}\t{BASE}\t{branch}",
-            "pulls/12": f"12\t{HEAD}\t{BASE}\t{branch}",
+            "pulls/12": json.dumps(dict(CURRENT_PR, base={"sha": BASE, "ref": branch}, mergeable=None)),
             f"commits/{HEAD}/check-runs": "\n".join(
                 json.dumps({"check_runs": page}) for page in (checks, [report(7, owner, OLD_BASE)])
             ),
@@ -132,12 +138,36 @@ def test_base_push_skips_a_pr_that_moved_since_listing(run_step):
         "invalidate-head-checks",
         {
             "pulls?state=open&per_page=100&base=master": f"12\t{HEAD}\t{BASE}\tmaster",
-            "pulls/12": f"12\t{HEAD}\t{'e' * 40}\tmaster",
+            "pulls/12": json.dumps(dict(CURRENT_PR, base={"sha": OLD_BASE, "ref": "master"})),
             f"commits/{HEAD}/check-runs": json.dumps({"check_runs": [report(1, "manual-full-ci:pr:12", OLD_BASE)]}),
         },
         GITHUB_EVENT_NAME="push",
     )
     assert not any("PATCH" in args for args in calls)
+
+
+@pytest.mark.parametrize(("metadata", "cancelled"), [
+    ("verified", {1, 3}),
+    ("pending", {3}),
+    ("wrong_parents", {3}),
+    ("replaced", set()),
+])
+def test_reconcile_returning_head_against_verified_candidate(run_step, metadata, cancelled):
+    owner = "manual-full-ci:pr:12"
+    checks = [report(1, owner, BASE, merge=OLD_MERGE), report(2, owner, BASE), report(3, owner, OLD_BASE)]
+    current = dict(CURRENT_PR, mergeable=None) if metadata == "pending" else CURRENT_PR
+    routes = {
+        "pulls?state=open&per_page=100": f"12\t{HEAD}\t{BASE}\tmaster",
+        "pulls/12": json.dumps(current),
+        f"commits/{HEAD}/check-runs": json.dumps({"check_runs": checks}),
+    }
+    if metadata != "pending":
+        parent_base = OLD_BASE if metadata == "wrong_parents" else BASE
+        routes[f"git/commits/{MERGE}"] = json.dumps({"parents": [{"sha": parent_base}, {"sha": HEAD}]})
+    if metadata == "replaced":
+        routes["pulls/12"] = [json.dumps(current), json.dumps(dict(current, merge_commit_sha=OLD_MERGE))]
+    calls = run_step("invalidate-head-checks", routes, GITHUB_EVENT_NAME="schedule")
+    assert {int(args[args.index("PATCH") + 1].rsplit("/", 1)[1]) for args in calls if "PATCH" in args} == cancelled
 
 
 def test_schedule_only_reconciles_head_checks(workflow, reconciliation_workflow):
@@ -149,7 +179,7 @@ def test_schedule_only_reconciles_head_checks(workflow, reconciliation_workflow)
     assert "github.ref == 'refs/heads/master'" in reconcile["if"]
     assert "github.event_name == 'workflow_dispatch'" in workflow["jobs"]["reviewed-head"]["if"]
     assert workflow["jobs"]["tests"]["needs"] == "reviewed-head"
-    assert reconcile["permissions"] == {"checks": "write", "pull-requests": "read"}
+    assert reconcile["permissions"] == {"checks": "write", "contents": "read", "pull-requests": "read"}
     assert len(reconcile["steps"]) == 1
     assert "uses" not in reconcile["steps"][0]
 
