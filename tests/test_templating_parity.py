@@ -3540,6 +3540,207 @@ def test_set_fact_templates_authored_fact_names(tmp_path, use_strategy):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
+    unsafe_task = """
+    - set_fact: {}
+      args: '{{ unsafe_args }}'
+      ignore_errors: true
+""" if MODERN_TEMPLATING else ""
+    # Legacy loaders can report their YAML string subclass here.
+    key_type_check = "          - fact_args.keys() | list | first | type_debug == 'str'\n" if MODERN_TEMPLATING else ""
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_name: greeting
+    fact_args:
+      '{{ fact_name }}': hello
+    unsafe_args:
+      !unsafe '{{ fact_name }}': overwritten
+  tasks:
+    - set_fact: {}
+      args: '{{ fact_args }}'
+""" + unsafe_task + """
+    - assert:
+        quiet: true
+        that:
+          - greeting == 'hello'
+""" + key_type_check, use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy Core uses a string omit token")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_rejects_trusted_name_that_resolves_to_omit(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_args:
+      '{{ omit }}': invalid
+  tasks:
+    - block:
+        - set_fact: {}
+          args: '{{ fact_args }}'
+      rescue:
+        - debug: {msg: rejected-omitted-key}
+""", use_strategy=use_strategy)
+    assert messages == ["rejected-omitted-key"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("loop_source", ["'{{ entries }}'", "[{'{{ fact_name }}': hello}]"])
+def test_set_fact_preserves_trusted_mapping_keys_in_loop_items(tmp_path, use_strategy, loop_source):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_name: greeting
+    entries:
+      - '{{ fact_name }}': hello
+  tasks:
+    - set_fact: {}
+      args: '{{ item }}'
+      loop: LOOP_SOURCE
+    - assert:
+        quiet: true
+        that: greeting == 'hello'
+""".replace("LOOP_SOURCE", loop_source), use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern mapping key trust")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_retains_trusted_keys_in_saved_mapping(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_name: greeting
+  tasks:
+    - set_fact:
+        saved:
+          '{{ fact_name }}': hello
+    - set_fact: {}
+      args: '{{ saved }}'
+    - assert:
+        quiet: true
+        that: greeting == 'hello'
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="uses modern args and omit semantics")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_finalizes_selected_args_and_omits_nested_values(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    fact_args:
+      status: '{{ never_defined }}'
+      details:
+        kept: ready
+        missing: '{{ never_defined | default(omit) }}'
+        items: [ready, '{{ never_defined | default(omit) }}']
+  tasks:
+    - set_fact:
+        status: ready
+      args: '{{ fact_args }}'
+    - set_fact:
+        optional: ready
+      args: '{{ optional_facts | default(omit) }}'
+    - set_fact:
+        literal: unset
+      vars:
+        omit: unset
+    - assert:
+        quiet: true
+        that:
+          - status == 'ready'
+          - "details == {'kept': 'ready', 'items': ['ready']}"
+          - optional == 'ready'
+          - literal == 'unset'
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="modern Core finalizes omit separately")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_uses_legacy_omit_token_with_task_vars(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        literal: unset
+        dropped: '{{ missing | default(omit) }}'
+      vars:
+        omit: unset
+    - assert:
+        quiet: true
+        that:
+          - literal == 'unset'
+          - dropped is undefined
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="older parsers consume raw_params as an internal argument")
+@pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_preserves_an_explicit_raw_params_fact(tmp_path, use_strategy):
+    _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    payload: {inner: keep}
+  tasks:
+    - set_fact:
+        _raw_params: "{{ payload }}"
+      delegate_to: localhost
+    - assert:
+        quiet: true
+        that:
+          - _raw_params.inner == 'keep'
+          - inner is undefined
+""", use_strategy=use_strategy)
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("expanded", [False, True], ids=["direct", "expanded"])
+def test_set_fact_distinguishes_null_and_string_keys(tmp_path, use_strategy, expanded):
+    assignment = ("set_fact: {}\n          args: '{{ payload }}'" if expanded
+                  else "set_fact: {null: invalid}")
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    payload: {null: invalid, 'null': also-invalid}
+  tasks:
+    - block:
+        - ASSIGNMENT
+      rescue:
+        - debug: {msg: rejected-null-key}
+    - set_fact: {'null': valid}
+    - debug: {msg: "{{ vars['null'] }}"}
+""".replace("ASSIGNMENT", assignment), use_strategy=use_strategy)
+    assert messages == ["rejected-null-key", "valid"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Core sorts keys before dropping omitted values")
+@pytest.mark.parametrize("use_strategy", [False, True])
+@pytest.mark.parametrize("key", ["null", "42"])
+def test_set_fact_rejects_mixed_key_types_before_omit(tmp_path, use_strategy, key):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - set_fact: {KEY: '{{ omit }}', good: written}
+      rescue:
+        - debug: {msg: rejected-mixed-keys}
+    - assert: {that: good is undefined, quiet: true}
+""".replace("KEY", key), use_strategy=use_strategy)
+    assert messages == ["rejected-mixed-keys"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
 def test_loop_preserves_distinct_registered_results(tmp_path, use_strategy):
     _, recap = _assert_parity(tmp_path, """
 - hosts: localhost

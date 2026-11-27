@@ -843,14 +843,6 @@ class StrategyModule(StrategyBase):
                     for key, value in facts.items():
                         self._variable_manager.set_host_variable(target.name, key, value)
             return result
-        if action == "set_fact":
-            args = dict(frame.get("args") or {})
-            cacheable = bool(args.pop("cacheable", False))
-            return {
-                "changed": False,
-                "ansible_facts": args,
-                "_ansible_facts_cacheable": cacheable,
-            }
         if action == "synchronize":
             return self._run_native_controller_task(
                 frame, host, hv, task_map or {}, play_context, resolve_play_var)
@@ -1464,9 +1456,9 @@ class StrategyModule(StrategyBase):
         resolved become password into the streamed run (stdin only -- never on disk)."""
         from ansiroll.runtime import _pack_include_value
 
-        mapping_keys = {"host": [], "overrides": []}
+        mapping_keys = {"host": [], "extra": [], "overrides": []}
         blob = _json_blob(hv, mapping_keys["host"])
-        extra_blob = _json_blob(_extra_vars(self._variable_manager))
+        extra_blob = _json_blob(_extra_vars(self._variable_manager), mapping_keys["extra"])
         nonpersistent = getattr(
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
@@ -2227,8 +2219,9 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        if mapping_keys is None or not _contains_typed_mapping_keys(values):
-            return json.dumps(_tag_untrusted(values, template_syntax_only=True), default=str)
+        tagged = _tag_untrusted(values, template_syntax_only=True)
+        if mapping_keys is None or not _contains_typed_mapping_keys(tagged):
+            return json.dumps(tagged, default=str)
     except Exception:
         pass
     safe = {}
