@@ -332,6 +332,54 @@ def test_first_found_vars_files_normalizes_string_options(tmp_path):
     assert runtime.vars["selected"] == "production"
 
 
+@pytest.mark.parametrize(("arguments", "minimum", "matches"), [
+    ("['files/' ~ profile ~ '.yml']", (2, 21), True),
+    ("['{{ profile | default(other, true) }}.yml']", (2, 10), True),
+    ("""["{{ profile | default('}}fallback', true) }}.yml"]""", (2, 10), True),
+    ("files=['{{ profile | default(other, true) }}.yml']", (2, 19), False),
+], ids=["files-prefix", "embedded-positional", "quoted-delimiter", "embedded-keyword"])
+def test_first_found_vars_files_preserves_rendered_candidate_bounds(tmp_path, arguments, minimum, matches):
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    core = _core_version()
+    if core < minimum:
+        pytest.skip("the lookup needs the compiling Core's search or option behavior")
+    root = tmp_path if (2, 19) <= core < (2, 21) else tmp_path / "files"
+    root.mkdir(exist_ok=True)
+    (root / "prod.yml").write_text("selected: direct\n")
+    if minimum == (2, 21):
+        duplicate = root / "files"
+        duplicate.mkdir()
+        (duplicate / "prod.yml").write_text("selected: duplicate\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - >-
+      {{ lookup('first_found', ARGUMENTS) }}
+  tasks:
+    - assert: {that: selected == 'direct'}
+""".replace("ARGUMENTS", arguments))
+    extra = {"profile": "prod", "other": "fallback"}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(extra), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert (native.returncode == 0) == matches, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    if not matches:
+        with pytest.raises(VarsFilesError, match="No file was found"):
+            runtime.run_play(plan)
+        assert "No file was found" in native.stdout + native.stderr
+        return
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "direct"
+
+
 def test_legacy_first_found_paths_without_files_have_no_candidates(monkeypatch):
     import ansiroll.runtime as runtime
 

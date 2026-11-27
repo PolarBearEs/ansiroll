@@ -1396,6 +1396,7 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
     from jinja2 import Environment, TemplateSyntaxError, nodes
     from .runtime import _first_found_list_option
 
+    environment = Environment(keep_trailing_newline=True)
     named_homes = {}
 
     def expand_home(pattern):
@@ -1416,17 +1417,32 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
             return all(option_can_be_empty(item) for item in term.nodes)
         return not isinstance(term, nodes.Const) or term.value == ""
 
-    def term_patterns(term, separators="[;,]"):
+    def term_patterns(term, separators="[;,]", *, keyword=False):
         if isinstance(term, nodes.Const) and isinstance(term.value, str):
-            values = re.split(separators, term.value) if separators else [term.value]
-            return [_vars_file_glob_pattern(name) for name in values]
+            value = term.value
+            if keyword or not _is_templated(value):
+                names = re.split(separators, value) if separators else [value]
+                pattern = _vars_file_glob_pattern if keyword and core < (2, 19) else glob.escape
+                return [pattern(name) for name in names]
+            # Core renders positional terms before lookup delimiter handling.
+            # The lexer distinguishes delimiters in quoted Jinja expressions
+            # from separators in the surrounding filename.
+            patterns = [""]
+            for _, token, text in environment.lex(value):
+                if token == "data":
+                    first, *others = re.split(separators, text) if separators else [text]
+                    patterns[-1] += glob.escape(first)
+                    patterns.extend(map(glob.escape, others))
+                elif token in ("variable_begin", "block_begin"):
+                    patterns[-1] += "*"
+            return patterns
         if isinstance(term, nodes.Name):
             return [glob.escape(basedir) if term.name == "playbook_dir" else "*"]
         if isinstance(term, (nodes.List, nodes.Tuple)):
-            return [pattern for item in term.items for pattern in term_patterns(item, separators)]
+            return [pattern for item in term.items for pattern in term_patterns(item, separators, keyword=keyword)]
         if isinstance(term, (nodes.Add, nodes.Concat)):
             terms = (term.left, term.right) if isinstance(term, nodes.Add) else term.nodes
-            segments = [term_patterns(segment, separators) for segment in terms]
+            segments = [term_patterns(segment, separators, keyword=keyword) for segment in terms]
             if all(len(part) == 1 for part in segments):
                 return ["".join(part[0] for part in segments)]
         raise ValueError("unmodeled first_found filename")
@@ -1434,11 +1450,11 @@ def _vars_first_found_patterns(source, basedir, allow_short_name):
     def option_patterns(term, separators):
         if isinstance(term, nodes.Const) and isinstance(term.value, str):
             return [pattern for value in _first_found_list_option(term.value)
-                    for pattern in term_patterns(nodes.Const(value), separators)]
-        return term_patterns(term, separators)
+                    for pattern in term_patterns(nodes.Const(value), separators, keyword=True)]
+        return term_patterns(term, separators, keyword=True)
 
     try:
-        parsed = Environment().parse(source).body
+        parsed = environment.parse(source).body
         if len(parsed) != 1 or not isinstance(parsed[0], nodes.Output):
             return None
         expressions = [node for node in parsed[0].nodes
@@ -1572,8 +1588,12 @@ def _deferred_vars_files(play, basedir, entries):
                         # Core normalizes absolute candidates. For relative ones,
                         # collapse repeated separators but preserve dot components.
                         discovery = os.path.normpath(pattern) if absolute else re.sub(r"/{2,}", "/", pattern)
-                        for root in first_found_roots:
+                        for root, implicit_files in first_found_roots:
                             for path in glob.glob(os.path.join(glob.escape(root), discovery)):
+                                if implicit_files and not absolute:
+                                    relative = path[len(os.path.join(root, "")):]
+                                    if relative.split(os.path.sep, 1)[0] == "files":
+                                        continue
                                 if not os.path.exists(path):
                                     continue
                                 normalized = os.path.normpath(path)
@@ -1586,7 +1606,10 @@ def _deferred_vars_files(play, basedir, entries):
                                 if normalized not in files and not _FIRST_FOUND_ENV_REFERENCE.search(path):
                                     files[normalized] = _bundled_vars_file(play, normalized)
                     first_found[name] = {"plugin": plugin, "patterns": patterns,
-                                         "roots": first_found_roots, "files": sorted(candidates),
+                                         "roots": [path for path, _ in first_found_roots],
+                                         "implicit_files": [index for index, (_, implicit) in enumerate(first_found_roots)
+                                                            if implicit],
+                                         "files": sorted(candidates),
                                          "matched_spellings": sorted(matched_spellings),
                                          "home": os.path.expanduser("~"), "named_homes": named_homes,
                                          "search_path": search_path, "search_path_known": known_search_path}
@@ -1664,16 +1687,16 @@ def _vars_first_found_search(play, basedir):
         parent = os.path.dirname(resolved)
         if parent.endswith("/tasks") and play._loader._is_role(path):
             if with_files:
-                roots.append(os.path.join(os.path.dirname(parent), "files"))
-            roots.append(parent)
+                roots.append((os.path.join(os.path.dirname(parent), "files"), False))
+            roots.append((parent, False))
             if core < (2, 16):
                 continue
         if with_files:
-            roots.append(os.path.join(resolved, "files"))
-        roots.append(resolved)
+            roots.append((os.path.join(resolved, "files"), core >= (2, 21)))
+        roots.append((resolved, False))
     if with_files:
-        roots.append(os.path.join(basedir, "files"))
-    roots.append(basedir)
+        roots.append((os.path.join(basedir, "files"), core >= (2, 21)))
+    roots.append((basedir, False))
     return list(dict.fromkeys(roots)), _tag_untrusted(search_path) if known else None, known
 
 

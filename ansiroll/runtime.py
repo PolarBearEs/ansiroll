@@ -1751,6 +1751,7 @@ def _first_found_vars_file(args, kwargs, selector):
             terms = (files,)
         filenames = [tuple(split_terms((term,), "[,;]")) if modern else (term,) for term in split_terms(terms)]
     bundled = selector["files"]
+    implicit_files = frozenset(selector.get("implicit_files", ()))
     matched_spellings = selector.get("matched_spellings", selector.get("parent_paths"))
     render_candidate = selector.get("render_candidate")
     environment_path_error = ("first_found paths with environment references require selecting "
@@ -1787,7 +1788,10 @@ def _first_found_vars_file(args, kwargs, selector):
                                      "recompile with the current search paths")
                 roots = ("",) if absolute else selector["roots"]
                 relative_spelling = re.sub(r"/{2,}", "/", candidate) if not absolute else None
-                for root in roots:
+                for index, root in enumerate(roots):
+                    if (not absolute and index in implicit_files
+                            and candidate.split(os.path.sep, 1)[0] == "files"):
+                        continue
                     candidate_path = os.path.join(root, candidate)
                     path = os.path.normpath(candidate_path)
                     checked_path = path if absolute else os.path.join(root, relative_spelling)
@@ -3822,9 +3826,10 @@ class _Templater:
         try:
             ctx = self._current_ctx
             selector = (ctx or {}).get("__ansiroll_first_found")
-            legacy_first_found = selector and name == selector["plugin"] and not _core_at_least(2, 19)
+            modeled_first_found = selector and name == selector["plugin"]
+            legacy_first_found = modeled_first_found and not _core_at_least(2, 19)
             a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: value if legacy_first_found and key in ("files", "paths") else self._template_lookup_arg(value)
+            k = {key: value if modeled_first_found and key in ("files", "paths") else self._template_lookup_arg(value)
                  for key, value in k.items()}
             if legacy_first_found:
                 # Core renders positional terms before entering the plugin.
