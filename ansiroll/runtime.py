@@ -29,7 +29,7 @@ import time
 import hashlib
 import re
 import shlex
-from collections.abc import Generator, ItemsView, KeysView, MutableMapping, MutableSequence, ValuesView
+from collections.abc import Generator, ItemsView, KeysView, MappingView, MutableMapping, MutableSequence, ValuesView
 from contextlib import contextmanager
 from functools import partial, wraps
 from itertools import groupby
@@ -3098,7 +3098,7 @@ def _native_output_value(value, plain_strings=False, seen=None):
     if id(original) in seen:
         return seen[id(original)][1]
     value = _concretize(value)
-    if isinstance(value, (KeysView, type({}.keys()))):
+    if isinstance(value, MappingView):
         value = list(value)
     if isinstance(value, (dict, _RawSnapshotMapping)):
         result = {
@@ -3493,7 +3493,11 @@ def _concat_file_output(nodes):
     values = [value for value in nodes if preserve_none or value is not None]
     if len(values) < 2:
         return values[0] if values else None
-    return "".join(map(str, _native_output_value(values)))
+    try:
+        return "".join(map(str, _native_output_value(values)))
+    except jinja2.UndefinedError as error:
+        # Jinja also concatenates intermediate buffers that may never be used.
+        return _AnsirollUndefined(hint=str(error), exc=type(error))
 
 
 def _native_file_text(value):
@@ -3560,6 +3564,23 @@ class _AnsirollContext(jinja2.runtime.Context):
 class _KeywordContext(_AnsirollContext):
     def call(__self, __obj, *args, **kwargs):
         return _keyword_omit_value(super().call(__obj, *args, **kwargs), __self.parent)
+
+
+class _FileContext(_AnsirollContext):
+    def call(__self, __obj, *args, **kwargs):
+        if _is_undef(__obj):
+            return __obj
+        if __obj is _jinja_dict:
+            # Core propagates an undefined argument before calling dict().
+            for arg in (*args, *kwargs.values()):
+                if _is_undef(arg):
+                    return _AnsirollUndefined(hint=arg._undefined_message, exc=arg._undefined_exception)
+        try:
+            result = super().call(__obj, *args, **kwargs)
+            # Snapshot the view on return, while leaving its members for output finalization.
+            return list(result) if isinstance(result, MappingView) else result
+        except jinja2.UndefinedError as error:
+            return _AnsirollUndefined(hint=str(error), exc=type(error))
 
 
 class _PluginDict(dict):
@@ -4202,6 +4223,7 @@ class _Templater:
                 for option, value in settings.items():
                     setattr(file_env, option, value)
                 if native_file:
+                    file_env.context_class = _FileContext
                     file_env.code_generator_class = _ConditionalFileCodeGenerator if lazy_names else _FileCodeGenerator
                     file_env.concat = _concat_file_output
                     file_env.finalize = _concretize

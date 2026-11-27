@@ -1788,6 +1788,77 @@ def test_template_file_serializes_nested_markup_as_text(tmp_path):
     assert output.read_bytes() == b"['{{ placeholder }}', '&lt;x&gt;']"
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern mapping-view finalization")
+def test_modern_template_file_mapping_views(tmp_path):
+    successful = {
+        "keys": ("{{ data.keys() }}", b"['mode']"),
+        "items": ("{{ dict(mode='ready').items() }}", b"[['mode', 'ready']]"),
+        "mixed_values": ("prefix {{ dict(mode='ready').values() }}\n", b"prefix ['ready']\n"),
+        "nested_items": ("{{ [dict(mode='ready').items()] }}", b"[[['mode', 'ready']]]"),
+        "items_alias": ("{{ good_alias }}", b"[['mode', 'ready']]"),
+        "omit": ("{{ [dict(mode=omit).items(), dict(mode=omit).values()] }}", b"[[['mode']], []]"),
+        "snapshot": (
+            "{% set data = dict(mode='ready') %}{% set view = data.items() %}"
+            "{% set _ = data.update(extra='later') %}{{ view }}", b"[['mode', 'ready']]",
+        ),
+        "unused_member": ("{% set view = {'mode': missing_member}.items() %}{{ view | length }}", b"1"),
+        "unused_buffer": (
+            "{% set unused %}prefix {{ {'mode': missing_member}.items() }}{% endset %}"
+            "{% macro buffered() %}prefix {{ {'mode': missing_member}.values() }}{% endmacro %}"
+            "{{ buffered().missing_attr | default('macro') }} "
+            "{{ dict(mode=missing_member).keys() | default('default') }}", b"macro default",
+        ),
+        "undefined_default": (
+            "{% set unused = dict(mode=undef(123)).keys() %}"
+            "{{ dict(mode=undef()).items() | default('ready') }}", b"ready",
+        ),
+    }
+    rejected = {
+        "undefined_call": "{{ dict(mode=missing_member).keys() }}",
+        "undefined_dict_items": "{{ dict(mode=missing_member).items() }}",
+        "hard_error": "{{ dict(mode=undef(123)).keys() | default('ready') }}",
+        "undefined_item": "{{ {'mode': missing_member}.items() }}",
+        "undefined_value": "{{ {'mode': missing_member}.values() }}",
+        "undefined_nested_item": "{{ [{'mode': missing_member}.items()] }}",
+        "undefined_mixed_value": "prefix {{ {'mode': [missing_member]}.values() }}\n",
+        "undefined_alias": "{{ bad_alias }}",
+        "undefined_buffer": "{% set captured %}prefix {{ {'mode': missing_member}.items() }}{% endset %}{{ captured }}",
+    }
+    sources = {name: source for name, (source, _) in successful.items()}
+    sources.update(rejected)
+    play = {
+        "hosts": "localhost",
+        "gather_facts": False,
+        "vars": {
+            "data": {"mode": "{{ missing_member }}"},
+            "good_alias": "{{ dict(mode='ready').items() }}",
+            "bad_alias": "{{ {'mode': missing_member}.items() }}",
+        },
+        "tasks": [
+            {"name": name, "template": {"src": name + ".j2", "dest": str(tmp_path / name)},
+             "ignore_errors": name in rejected}
+            for name in sources
+        ],
+    }
+    path = _write(tmp_path, json.dumps([play]), {name + ".j2": source for name, source in sources.items()})
+    for name in rejected:
+        (tmp_path / name).write_bytes(b"existing content\n")
+
+    def render_and_check(render):
+        summary = render(path, tmp_path)
+        assert summary[1][6] == str(len(rejected))
+        for name, (_, expected) in successful.items():
+            output = tmp_path / name
+            assert output.read_bytes() == expected, name
+            output.unlink()
+        for name in rejected:
+            assert (tmp_path / name).read_bytes() == b"existing content\n", name
+        return summary
+
+    native = render_and_check(_ansible)
+    assert render_and_check(_ansiroll) == native
+
+
 @pytest.mark.parametrize(("task_options", "header"), [
     ("", 'trim_blocks: "False"'),
     ("", 'newline_sequence: "X"'),
