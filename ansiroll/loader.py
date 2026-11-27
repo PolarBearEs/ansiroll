@@ -1943,9 +1943,6 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                 data, play=_play_of(task), task_include=parent, role=task._role,
                 use_handlers=handler, variable_manager=task.get_variable_manager(),
                 loader=task._loader)
-            if parent is not task:
-                for block in blocks:
-                    block.vars = dict(parent.vars, **(block.vars or {}))
         except Exception:
             return None
         includes.record_writes(blocks)
@@ -1968,6 +1965,9 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                                  for b in blocks) if c]
         finally:
             _INCLUDE_STACK.pop(key, None)
+        if parent is not task and parent.vars and tasks:
+            tasks = [{"type": "block", "include_apply_scope": True,
+                      "vars": _tag_untrusted(dict(parent.vars)), "block": tasks}]
     role_defaults, role_vars = _role_vars(task)
     node = _include_node(task, "include_tasks", fname, basedir,
                          role_defaults, role_vars, tasks, include_id, ref)
