@@ -22,6 +22,7 @@ permissions: {}
 
 env:
   MERGE_STATUS_CONTEXT: Manual Full CI (merge candidate)
+  LEGACY_MERGE_STATUS_OPTIONAL: ${{ vars.MANUAL_CI_LEGACY_STATUS_OPTIONAL }}
 
 concurrency:
   group: >-
@@ -104,7 +105,12 @@ jobs:
           for context in "$MERGE_STATUS_CONTEXT" 'Manual Full CI'; do
             gh api --method POST "$api/statuses/$merge" \
               -f context="$context" -f state=pending -f description="Testing merge $merge" \
-              -f target_url="$runs$GITHUB_RUN_ID"
+              -f target_url="$runs$GITHUB_RUN_ID" && continue
+            status_error=$?
+            if [[ "$context" == "$MERGE_STATUS_CONTEXT" || "$LEGACY_MERGE_STATUS_OPTIONAL" != true ]]; then
+              exit "$status_error"
+            fi
+            echo '::warning::Could not publish the legacy merge status.'
           done
           printf 'merge=%s\n' "$merge" >> "$GITHUB_OUTPUT"
 
@@ -184,12 +190,17 @@ jobs:
               success) description="Tests passed on merge $MERGE" ;;
               failure) description="CI failed on merge $MERGE" ;;
             esac
-            # Publish the required merge-candidate result only after the legacy
-            # status has been published for the transition.
+            # Require both writes until the protection cutover is verified.
             for context in 'Manual Full CI' "$MERGE_STATUS_CONTEXT"; do
               gh api --method POST "$api/statuses/$MERGE" \
                 -f context="$context" -f state="$state" -f description="$description" \
-                -f target_url="$run_url" || { report_error=$?; break; }
+                -f target_url="$run_url" && continue
+              status_error=$?
+              if [[ "$context" == "$MERGE_STATUS_CONTEXT" || "$LEGACY_MERGE_STATUS_OPTIONAL" != true ]]; then
+                report_error=$status_error
+                break
+              fi
+              echo '::warning::Could not publish the legacy merge status.'
             done
           else
             report_error=$?

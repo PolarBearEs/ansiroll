@@ -38,6 +38,7 @@ def run_step(tmp_path, monkeypatch, workflow):
     gh.write_text(
         """#!/usr/bin/env python3
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -47,6 +48,8 @@ with (directory / "calls").open("a") as log:
     log.write(json.dumps(args) + "\\n")
 if "--method" in args and args[args.index("--method") + 1] == "PATCH":
     sys.exit(0)
+if "POST" in args and "context=" + os.environ.get("MOCK_FAIL_STATUS_CONTEXT", "") in args:
+    sys.exit(42)
 routes = json.loads((directory / "routes").read_text())
 for endpoint in routes:
     if endpoint in args:
@@ -136,7 +139,16 @@ def test_synchronize_only_reconciles_head_checks(workflow):
     assert "uses" not in workflow["jobs"]["invalidate-head-checks"]["steps"][0]
 
 
-def test_dispatch_marks_both_merge_statuses_pending(run_step, tmp_path):
+@pytest.mark.parametrize(
+    ("optional", "failed_context", "expected_contexts", "exit_code"),
+    [
+        pytest.param("", "", [MERGE_CONTEXT, LEGACY_CONTEXT], 0, id="publish-both"),
+        pytest.param("", LEGACY_CONTEXT, [MERGE_CONTEXT, LEGACY_CONTEXT], 42, id="legacy-required"),
+        pytest.param("true", LEGACY_CONTEXT, [MERGE_CONTEXT, LEGACY_CONTEXT], 0, id="legacy-optional"),
+        pytest.param("true", MERGE_CONTEXT, [MERGE_CONTEXT], 42, id="candidate-required"),
+    ],
+)
+def test_dispatch_marks_merge_statuses_pending(run_step, tmp_path, optional, failed_context, expected_contexts, exit_code):
     output = tmp_path / "outputs"
     calls = run_step(
         "reviewed-head",
@@ -145,19 +157,32 @@ def test_dispatch_marks_both_merge_statuses_pending(run_step, tmp_path):
             f"git/commits/{MERGE}": json.dumps({"parents": [{"sha": BASE}, {"sha": HEAD}]}),
             f"statuses/{MERGE}": "{}",
         },
+        expected_exit=exit_code,
         PR="12", EXPECTED_HEAD=HEAD, GITHUB_SHA=BASE, GITHUB_OUTPUT=str(output),
+        LEGACY_MERGE_STATUS_OPTIONAL=optional, MOCK_FAIL_STATUS_CONTEXT=failed_context,
     )
     writes = [args for args in calls if "POST" in args]
-    assert len(writes) == 2
-    for args, context in zip(writes, [MERGE_CONTEXT, LEGACY_CONTEXT]):
+    assert len(writes) == len(expected_contexts)
+    for args, context in zip(writes, expected_contexts):
         assert f"repos/example/ansiroll/statuses/{MERGE}" in args
         assert f"context={context}" in args
         assert "state=pending" in args
-    assert f"merge={MERGE}" in output.read_text().splitlines()
+    assert (f"merge={MERGE}" in output.read_text().splitlines()) == (exit_code == 0)
 
 
-@pytest.mark.parametrize(("tests_result", "exit_code"), [("success", 0), ("failure", 1)])
-def test_report_publishes_merge_statuses_and_pr_head_check(run_step, tests_result, exit_code):
+@pytest.mark.parametrize(
+    ("tests_result", "optional", "failed_context", "writes_count", "head_result", "exit_code"),
+    [
+        pytest.param("success", "", "", 2, "success", 0, id="passing-ci"),
+        pytest.param("failure", "", "", 2, "failure", 1, id="failing-ci"),
+        pytest.param("success", "", LEGACY_CONTEXT, 1, "action_required", 42, id="legacy-required"),
+        pytest.param("success", "true", LEGACY_CONTEXT, 2, "success", 0, id="legacy-optional"),
+        pytest.param("success", "true", MERGE_CONTEXT, 2, "action_required", 42, id="candidate-required"),
+    ],
+)
+def test_report_publishes_merge_statuses_and_pr_head_check(
+    run_step, tests_result, optional, failed_context, writes_count, head_result, exit_code,
+):
     calls = run_step(
         "report-pr-ci",
         {
@@ -180,9 +205,10 @@ def test_report_publishes_merge_statuses_and_pr_head_check(run_step, tests_resul
         },
         expected_exit=exit_code,
         PR="12", HEAD=HEAD, BASE=BASE, MERGE=MERGE, MERGE_ATTEMPT="1", TESTS_RESULT=tests_result,
+        LEGACY_MERGE_STATUS_OPTIONAL=optional, MOCK_FAIL_STATUS_CONTEXT=failed_context,
     )
     writes = [args for args in calls if "POST" in args and f"repos/example/ansiroll/statuses/{MERGE}" in args]
-    assert len(writes) == 2
+    assert len(writes) == writes_count
     for args, context in zip(writes, [LEGACY_CONTEXT, MERGE_CONTEXT]):
         assert f"context={context}" in args
         assert f"state={tests_result}" in args
@@ -190,7 +216,7 @@ def test_report_publishes_merge_statuses_and_pr_head_check(run_step, tests_resul
     assert "external_id=manual-full-ci:pr:12" in creation
     assert f"head_sha={HEAD}" in creation
     assert f"name={LEGACY_CONTEXT}" in creation
-    assert f"conclusion={tests_result}" in creation
+    assert f"conclusion={head_result}" in creation
     assert f"output[summary]=Merge commit: {MERGE}\nBase commit: {BASE}" in creation
 
 
