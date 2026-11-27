@@ -5892,17 +5892,23 @@ def test_role_apply_check_mode_matches_native_include_scope(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("nested", [False, True])
-def test_compile_skips_role_apply_lookups(tmp_path, monkeypatch, nested):
+@pytest.mark.parametrize("include", ["include_tasks", "include_role"])
+def test_compile_skips_include_apply_lookups(tmp_path, monkeypatch, nested, include):
     from ansible.plugins.loader import lookup_loader
     from ansiroll.loader import _core_version
 
     if _core_version() < (2, 19):
-        pytest.skip("requires native role apply rendering")
+        pytest.skip("requires native include apply rendering")
     calls = []
     lookup_type = type(lookup_loader.get("env"))
     monkeypatch.setattr(lookup_type, "run", lambda *args, **kwargs: calls.append(True) or ["child.yml"])
-    tasks = tmp_path / "roles" / "child" / "tasks"
-    tasks.mkdir(parents=True)
+    if include == "include_role":
+        tasks = tmp_path / "roles" / "child" / "tasks"
+        tasks.mkdir(parents=True)
+        target = "name: child"
+    else:
+        tasks = tmp_path
+        target = "file: main.yml"
     (tasks / "main.yml").write_text("- include_tasks: '{{ source_file }}'\n" if nested else "- debug: {msg: child}\n")
     (tasks / "child.yml").write_text("- debug: {msg: nested}\n")
     play = tmp_path / "play.yml"
@@ -5911,14 +5917,99 @@ def test_compile_skips_role_apply_lookups(tmp_path, monkeypatch, nested):
   vars:
     file_alias: "{{ lookup('env', 'ANSIROLL_ROLE_APPLY_FILENAME') }}"
   tasks:
-    - include_role:
-        name: child
+    - INCLUDE:
+        TARGET
         apply:
           vars: {source_file: '{{ file_alias }}'}
       when: false
-""")
-    compile_playbook(str(play))
+""".replace("INCLUDE", include).replace("TARGET", target))
+    source, _ = compile_playbook(str(play))
     assert not calls
+    script = tmp_path / "compiled.py"
+    script.write_text(source)
+    proc = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "skipped=1" in proc.stdout
+
+
+def test_compile_expands_nested_filename_from_portable_apply_var(tmp_path, monkeypatch):
+    from ansible.plugins.loader import lookup_loader
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native include apply rendering")
+    calls = []
+    lookup_type = type(lookup_loader.get("env"))
+    monkeypatch.setattr(lookup_type, "run", lambda *args, **kwargs: calls.append(True) or ["build"])
+    monkeypatch.setenv("ANSIROLL_TASK_APPLY_VALUE", "runtime")
+    (tmp_path / "main.yml").write_text("- include_tasks: bridge.yml\n")
+    (tmp_path / "bridge.yml").write_text("- include_tasks: '{{ source_file }}'\n")
+    (tmp_path / "chosen.yml").write_text("- debug: {msg: 'nested-{{ value }}'}\n")
+    play = tmp_path / "play.yml"
+    play.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {basename: chosen}
+  tasks:
+    - include_tasks:
+        file: main.yml
+        apply:
+          vars:
+            source_file: '{{ basename }}.yml'
+            value: "{{ lookup('env', 'ANSIROLL_TASK_APPLY_VALUE') }}"
+""")
+    source, manifest = compile_playbook(str(play))
+    assert not calls
+    assert not manifest["fallback_tasks"]
+    script = tmp_path / "compiled.py"
+    script.write_text(source)
+    proc = subprocess.run(
+        [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "nested-runtime" in proc.stdout
+
+
+@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
+def test_include_role_applies_handler_alias_in_native_scope(tmp_path, runner):
+    from ansiroll.loader import _core_version
+
+    role = tmp_path / "roles" / "child"
+    (role / "tasks").mkdir(parents=True)
+    (role / "handlers").mkdir()
+    (role / "tasks" / "main.yml").write_text("""- debug: {msg: changed}
+  changed_when: true
+  notify: print alias
+""")
+    (role / "handlers" / "main.yml").write_text("""- name: print alias
+  vars: {source: handler}
+  debug: {msg: "{{ source }} / {{ alias }}"}
+""")
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: {source: play}
+  tasks:
+    - include_role:
+        name: child
+        apply:
+          vars: {source: block, alias: "{{ source }}"}
+"""
+    if runner == "standalone":
+        play = tmp_path / "play.yml"
+        play.write_text(playbook)
+        script = tmp_path / "compiled.py"
+        script.write_text(compile_playbook(str(play))[0])
+        proc = subprocess.run(
+            [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+        )
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy}, timeout=30)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    alias = "play" if _core_version() >= (2, 19) else "handler"
+    assert "handler / " + alias in proc.stdout
 
 
 @pytest.mark.parametrize(("action", "invocation_check", "delegated"), [

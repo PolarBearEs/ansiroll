@@ -2570,8 +2570,6 @@ def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_t
                 include._parent = task._parent
                 include.args = dict(args, apply=dict(args["apply"]))
                 parent = include.build_parent_block()
-                if render_apply and parent.vars:
-                    parent._ansiroll_apply_filename_vars = _compile_apply_filename_vars(task, parent.vars, includes)
             roots = [os.path.realpath(basedir)]
             if role is not None:
                 roots.append(os.path.realpath(role._role_path))
@@ -2586,8 +2584,11 @@ def _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_t
                     loader=task._loader)
         except Exception:
             return None
-        includes.record_writes(blocks)
         nested_includes = _register_included(blocks)
+        if parent is not task and render_apply and parent.vars:
+            parent._ansiroll_apply_filename_vars = (
+                _compile_apply_filename_vars(task, parent.vars, includes, portable=True) if nested_includes else {})
+        includes.record_writes(blocks)
         if raw_fname != fname and all(
             ((nested.args or {}).get("_raw_params") or (nested.args or {}).get("file")) == raw_fname
             and _include_scope_key(nested) == scope
