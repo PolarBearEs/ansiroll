@@ -1279,9 +1279,13 @@ class StrategyModule(StrategyBase):
             path = loader.path_dwim(path)
             try:
                 with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
-                    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    mode = os.fstat(handle.fileno()).st_mode
+                    if stat.S_ISREG(mode):
+                        data = handle.read()
+                    elif path == os.devnull and stat.S_ISCHR(mode):
+                        data = b""
+                    else:
                         raise AnsibleParserError("selected vars file %r is not a regular file" % path)
-                    data = handle.read()
             except FileNotFoundError as ex:
                 raise AnsibleFileNotFound("Unable to retrieve file contents.", file_name=path) from ex
             except OSError as ex:

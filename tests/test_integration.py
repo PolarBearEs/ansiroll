@@ -5755,13 +5755,14 @@ def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, 
   no_log: NO_LOG
   connection: local
   vars_files:
+    - DEVNULL
     - ['settings-{{ ansible_facts.get(''system'', ''missing'') }}.yml', 'settings-before.yml']
   tasks:
     - assert:
         that:
           - before_gathering is undefined
           - after_gathering == 'fact-selected'
-""".replace("NO_LOG", str(no_log).lower())
+""".replace("NO_LOG", str(no_log).lower()).replace("DEVNULL", json.dumps(os.devnull))
     proc = _run_strategy_play(
         tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
         environment={"ANSIROLL_TEST_FACT_SELECTED_ENV": "fact-selected"},
