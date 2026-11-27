@@ -309,16 +309,28 @@ delegation fallback. `ANSIROLL_PROVENANCE=1` emits one JSON record per play and
 task with `native-agent`, `real-ansiballz`, `controller-fallback`, or
 `linear-fallback`; CI asserts the native-only lane contains no fallback records.
 
-Before merging a PR into `master`, run **Manual Full PR CI** from GitHub
-Actions using the PR number and its current full commit SHA. The workflow tests
-GitHub's proposed merge and requires all 20 CI jobs, including the Ansible 2.10
-jobs, to pass. Refresh the PR branch and run CI again if `master` advances.
+Before dispatching **Manual Full PR CI**, a maintainer must confirm that review
+covers the PR's current full head SHA. Address findings introduced by the PR
+before dispatch. If a maintainer confirms a finding is present on the base and
+already tracked, link its issue in the PR and treat that finding as resolved
+for this dispatch.
+
+Manually run **Manual Full PR CI** from `master` with the PR number and that
+reviewed SHA. All 20 CI jobs, including the Ansible 2.10 jobs, must pass on
+GitHub's exact proposed merge commit. Verify the tested head and merge commit
+before merging. If the PR head changes, confirm review again. If the head or
+merge candidate changes, run CI again. Older head checks without a recorded PR
+owner can remain visible. Use a fresh manual run for the current candidate.
 
 ```bash
 pr=123
-head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+head='<full SHA confirmed in review>'
 gh workflow run reviewed-ci.yml --ref master -f pr_number="$pr" -f head_sha="$head"
 ```
+
+GitHub Actions event policy must allow `pull_request_target` for automatic
+head-check invalidation on PR updates. The invalidation job uses GitHub's API
+and runs without a checkout or test jobs.
 
 See `PLAN.md` for the full design and rationale.
 

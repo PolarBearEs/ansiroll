@@ -16,7 +16,7 @@ on:
   push:
     branches: [master]
   pull_request_target:
-    types: [edited, reopened]
+    types: [edited, reopened, synchronize]
 
 permissions: {}
 
@@ -224,6 +224,7 @@ jobs:
               # GitHub also expects the protected check on the PR head.
               if check=$(gh api --method POST "$api/check-runs" --jq '.id' \
                 -f name="Manual Full CI" -f head_sha="$HEAD" -f details_url="$details_url" \
+                -f external_id="manual-full-ci:pr:$PR" \
                 -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" \
                 -f "output[summary]=$(printf 'Merge commit: %s\nBase commit: %s' "$MERGE" "$BASE")"); then
                 revision_status=0
@@ -259,7 +260,8 @@ jobs:
   invalidate-head-checks:
     if: github.event_name == 'push' ||
       (github.event_name == 'pull_request_target' &&
-        (github.event.action == 'reopened' || github.event.changes.base.ref.from != ''))
+        (github.event.action == 'reopened' || github.event.action == 'synchronize' ||
+          github.event.changes.base.ref.from != ''))
     runs-on: ubuntu-latest
     permissions:
       checks: write
@@ -290,9 +292,14 @@ jobs:
           failed=0
           while IFS=$'\t' read -r pr head base branch; do
             [[ -n "$pr" ]] || continue
-            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Manual Full CI") ||
-               ! stale=$(jq -r --arg base "$base" --arg branch "$branch" '
-              .check_runs[] | select(.app.slug == "github-actions" and .conclusion != "cancelled" and
+            # Check runs are attached to commits. Include older reports so a
+            # newer check for another PR with the same head can't hide ours.
+            # Legacy reports have no reliable owner and are left alone.
+            if ! checks=$(retry_api --method GET --paginate "$api/commits/$head/check-runs" \
+              -f check_name="Manual Full CI" -f filter=all -F per_page=100) ||
+               ! stale=$(jq -r --arg owner "manual-full-ci:pr:$pr" --arg base "$base" --arg branch "$branch" '
+              .check_runs[] | select(.app.slug == "github-actions" and .external_id == $owner and
+                .conclusion != "cancelled" and
                 ($branch != "master" or (.output.summary // "" | endswith("Base commit: " + $base) | not))) | .id
             ' <<< "$checks"); then
               echo "::warning::Could not inspect CI checks for PR #$pr."
