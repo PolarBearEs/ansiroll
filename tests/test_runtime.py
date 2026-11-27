@@ -3686,6 +3686,21 @@ def test_copy_without_embedded_modules_fails_clearly(tmp_path):
     assert not dest.exists()
 
 
+@pytest.mark.parametrize("modules, module, receives_decrypt", [
+    ({"copy": {"module_fqn": "custom.copy"}}, "copy", True),
+    ({"copy": {"module_fqn": "ansible.modules.copy"}}, "copy", False),
+    ({}, "ansible.builtin.copy", False),
+])
+def test_remote_copy_prefers_the_embedded_task_module(monkeypatch, modules, module, receives_decrypt):
+    modules = {"ansible.builtin.copy": {"module_fqn": "ansible.modules.copy"}, **modules}
+    rt = Runtime(modules, "", {"inventory_hostname": "h"})
+    monkeypatch.setattr(rt, "run_module", lambda action, args, become: {"action": action, "args": args})
+    result = rt._run_file_action("copy", {"action": "copy"},
+                                 {"src": "/source", "dest": "/output", "remote_src": True, "decrypt": False}, {})
+    assert result["action"] == module
+    assert ("decrypt" in result["args"]) is receives_decrypt
+
+
 def test_copy_fetches_runtime_created_controller_source(tmp_path):
     src = tmp_path / "checkout" / "docker-compose.yml"
     src.parent.mkdir()
@@ -4549,3 +4564,96 @@ def test_conditions_keep_namespaced_facts_and_controller_precedence(monkeypatch,
     assert _override_ctx({"action": "debug"}, result, ctx) == ctx
     delegated = {"action": "setup", "delegate_to": "other", "delegate_facts": "{{ route_facts }}"}
     assert _override_ctx(delegated, result, ctx, rt.template) == (ctx if modern else effective)
+
+
+
+
+def _target_side_sources():
+    from ansiroll import compiler, runtime as runtime_module
+
+    package = os.path.dirname(compiler.__file__)
+    paths = [os.path.join(package, "worker.py")]
+    modules = os.path.join(package, "accelerated_modules")
+    paths += sorted(os.path.join(modules, name) for name in os.listdir(modules) if name.endswith(".py"))
+    for path in paths:
+        with open(path, "rb") as source:
+            yield os.path.relpath(path, package), source.read()
+    yield "runtime.AGENT_BOOTSTRAP", runtime_module.AGENT_BOOTSTRAP
+
+
+def _assembled_agent():
+    from ansiroll import compiler
+
+    # The two controller lookups need Ansible, which the target never has
+    patches = {"_controller_core_version": lambda: "2.10.17", "_controller_inventory_address_patterns": lambda: []}
+    originals = {name: getattr(compiler, name) for name in patches}
+    try:
+        for name, replacement in patches.items():
+            setattr(compiler, name, replacement)
+        return compiler._render_source([], {}, "")
+    finally:
+        for name, original in originals.items():
+            setattr(compiler, name, original)
+
+
+_TARGET_SIDE_SOURCES = list(_target_side_sources()) + [("assembled agent", None)]
+
+
+@pytest.mark.parametrize("name, source", _TARGET_SIDE_SOURCES, ids=[name for name, _ in _TARGET_SIDE_SOURCES])
+def test_target_side_code_parses_on_python_35(name, source):
+    # Gateways still run Python 3.5 (stretch) and 3.7 (buster); one walrus broke every deploy to them. Best-effort, not
+    # exhaustive: the 3.5 grammar of older parsers still takes some 3.6+ forms, and 3.6+ APIs get through.
+    import ast
+
+    if source is None:
+        source = _assembled_agent()
+    tree = ast.parse(source, feature_version=(3, 5))
+    too_new = tuple(
+        getattr(ast, node, ())
+        for node in ("NamedExpr", "JoinedStr", "AnnAssign", "Match", "TryStar", "TypeAlias")
+    )
+    offenders = []
+    for node in ast.walk(tree):
+        arguments = getattr(node, "args", None)
+        if (
+            isinstance(node, too_new)
+            or (isinstance(arguments, ast.arguments) and arguments.posonlyargs)
+            or getattr(node, "type_params", None)
+            or (isinstance(node, ast.comprehension) and node.is_async)
+            or (isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                and any(alias.name == "annotations" for alias in node.names))
+        ):
+            offenders.append("{}:{} {}".format(name, getattr(node, "lineno", "?"), type(node).__name__))
+    assert offenders == []
+
+
+def test_legacy_bare_name_rendering_reads_regex_groups_without_subscripts(monkeypatch):
+    # Python 3.5's match objects have no __getitem__, so `match[1]` broke legacy templating on stretch gateways
+    import re
+    import ansiroll.runtime as runtime_mod
+
+    class Python35Match:
+        def __init__(self, match):
+            self._match = match
+
+        def __getattr__(self, name):
+            return getattr(self._match, name)
+
+    def without_subscripts(find):
+        def wrapped(*args, **kwargs):
+            found = find(*args, **kwargs)
+            return Python35Match(found) if found else found
+        return wrapped
+
+    python35_re = SimpleNamespace(**{name: getattr(re, name) for name in dir(re) if not name.startswith("__")})
+    python35_re.match = without_subscripts(re.match)
+    python35_re.fullmatch = without_subscripts(re.fullmatch)
+    monkeypatch.setattr(runtime_mod, "re", python35_re)
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.12.10")
+    legacy = {"__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": False}}
+
+    assert runtime_mod._rendered_number(5, "{{ count }}", dict(legacy, count=5)) == 5
+    assert runtime_mod._rendered_number(5, "{{ count }}", dict(legacy, count="5")) == "5"
+    runtime = Runtime({}, "", {}, extra_vars={"override_timeout": None})
+    template = {"source": "{{ override_timeout }}", "vars": {}, "names": ["override_timeout"]}
+    assert runtime._gather_timeout_for_run(23, template, legacy) is None

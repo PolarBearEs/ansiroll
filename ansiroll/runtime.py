@@ -79,7 +79,7 @@ def _rendered_number(value, source, ctx):
     if isinstance(value, Number) and not isinstance(value, bool) and _legacy_non_native(ctx):
         # A bare name preserves the type only when its original value is numeric.
         bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source)
-        if bare is None or not isinstance(dict.get(ctx, bare[1]), Number):
+        if bare is None or not isinstance(dict.get(ctx, bare.group(1)), Number):
             return str(value)
     return value
 
@@ -786,7 +786,7 @@ def _selector_projection_cycle(origin, path, ancestors):
     return False
 
 
-def _selector_template_sources(value, path=()):
+def _selector_template_sources(value, path=(), *, include_members=True):
     """Yield each required template with its remaining path and its location in the input."""
     for index, key in enumerate(path):
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
@@ -807,6 +807,8 @@ def _selector_template_sources(value, path=()):
     while pending:
         value, location = pending.pop()
         if isinstance(value, (dict, list, tuple)):
+            if not include_members:
+                continue
             if id(value) in seen:
                 continue
             seen.add(id(value))
@@ -1014,6 +1016,16 @@ def _strip_omit(args):
     return args
 
 
+def _setup_omit(args):
+    if not _core_at_least(2, 19):
+        return _fail_on_undef(_strip_omit(args))
+    if isinstance(args, dict):
+        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT}
+    if isinstance(args, (list, tuple)):
+        return [_setup_omit(value) for value in args if value != _OMIT]
+    return _fail_on_undef(args)
+
+
 def _fail_on_undef(value):
     """Raise the captured error of any Undefined nested in a value."""
     if isinstance(value, dict):
@@ -1149,6 +1161,11 @@ def _ansible_boolean(value):
         return normalized in ("y", "yes", "on", "1", "true", "t", 1, 1.0)
     except TypeError:
         return False
+
+
+def _vault_source_recompile_note(task):
+    options = task.get("_vault_source_inputs") or ("src",)
+    return "Resolve %s at compile time." % ", ".join(options)
 
 
 def _to_bool(value):
@@ -1606,11 +1623,21 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _setup_builtin_lookup(name):
+    namespace, _, short = name.rpartition(".")
+    if namespace in ("", "ansible.builtin", "ansible.legacy") and short in ("env", "config", "file"):
+        return short
+    return None
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
-    name = str(name).rsplit(".", 1)[-1]
+    qualified_name = str(name)
+    name = qualified_name.rsplit(".", 1)[-1]
     if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
         raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
     setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    if setup_lookups is not None and name in ("env", "config", "file") and not _setup_builtin_lookup(qualified_name):
+        raise _UnsupportedLookup(qualified_name)
     if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
         known = setup_lookups.get(name, ())
         if any(str(term) not in known for term in args):
@@ -1648,6 +1675,16 @@ def _lookup_values(name, args, kwargs, ctx=None):
         vals = []
         lstrip = kwargs.get("lstrip", False)
         rstrip = kwargs.get("rstrip", True)
+        if setup_lookups is not None:
+            files = setup_lookups.get("file", {}).get(qualified_name, {})
+            for term in map(str, args):
+                if term not in files:
+                    raise ValueError("setup requires an uncaptured controller file %r" % term)
+                value = files[term]
+                if lstrip:
+                    value = value.lstrip()
+                vals.append(value.rstrip() if rstrip else value)
+            return vals
         dirs = (ctx or {}).get("__ansiroll_search_dirs") or []
         for a in args:
             path = os.path.expanduser(str(a))
@@ -2137,6 +2174,15 @@ class _TaskVarTemplate(str):
     """Source of a task variable that may need a loop binding."""
 
 
+class _BlockVarTemplate(_TaskVarTemplate):
+    """Inherited block alias resolved in the child task's context."""
+
+
+def _is_deferred_block_var(value):
+    return isinstance(value, _BlockVarTemplate) or (
+        isinstance(value, (_LazyTplDict, _LazyTplList)) and vars(value).get("_block_vars", False))
+
+
 class _DelegatedTemplateValue:
     """Read an agent variable or container member once, on demand."""
 
@@ -2176,7 +2222,7 @@ class _PlayVarScope(dict):
         self.task_containers = {}
         self.active_task_bindings = []
         self.resolved_snapshot = {}
-        if ctx.get(_DEFER_LOOKUP_NAMES):
+        if ctx.get(_DEFER_LOOKUP_NAMES) or any(isinstance(value, _DelegatedTemplateValue) for value in ctx.values()):
             view = _DeferredPlayVarView
         else:
             view = _ModernPlayVarView if _core_at_least(2, 19) else _PlayVarView
@@ -2617,7 +2663,7 @@ class _DeferredPlayVarView(_ModernPlayVarView):
             source = source.source
         # Legacy iteration still exposes play template source, while accessed
         # containers retain their mutations in the snapshot.
-        if isinstance(source, _PlayVarTemplate):
+        if isinstance(source, (_PlayVarTemplate, _BlockVarTemplate)):
             return str(source)
         if isinstance(source, (_TaskVarTemplate, _DelegatedTemplateValue)) or (
                 isinstance(source, (_LazyTplDict, _LazyTplList)) and source._task_vars):
@@ -2960,9 +3006,10 @@ def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
         native = _legacy_templating() and config.get("DEFAULT_JINJA2_NATIVE") is True
-        # Ansible 2.13–2.18 reuse the native finalizer when switching the
-        # template action to a text environment. Earlier cores replace it.
-        if not native or (context.get(_TEMPLATE_FILE_TEXT) and not _core_at_least(2, 13)):
+        # Ansible 2.12 replaces the native finalizer for template files.
+        # Other legacy versions preserve native None stringification here.
+        text_finalizer = context.get(_TEMPLATE_FILE_TEXT) and _core_at_least(2, 12) and not _core_at_least(2, 13)
+        if not native or text_finalizer:
             return ""
     return _concretize(value)
 
@@ -3653,7 +3700,7 @@ class _Templater:
         if isinstance(value, _DelegatedTemplateValue):
             return value.resolve()
         self._observe_untrusted(value)
-        if type(value) in (str, _TaskVarTemplate, _PlayVarTemplate) and _looks_templated(value):
+        if type(value) in (str, _TaskVarTemplate, _BlockVarTemplate, _PlayVarTemplate) and _looks_templated(value):
             cache = None
             if isinstance(ctx, _PlayVarScope) and isinstance(value, _TaskVarTemplate):
                 cache = ctx.resolved_task
@@ -3709,7 +3756,8 @@ class _Templater:
         if isinstance(ctx, _PlayVarScope):
             return ctx
         if (ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
-                or any(isinstance(value, _PlayVarTemplate) for value in ctx.values())):
+                or any(isinstance(value, (_PlayVarTemplate, _DelegatedTemplateValue)) or _is_deferred_block_var(value)
+                       for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
@@ -3931,7 +3979,7 @@ class _Templater:
             value = pending.pop()
             if isinstance(value, (_LazyTplDict, _LazyTplList)):
                 value = value._raw
-            if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate):
+            if type(value) in (str, _PlayVarTemplate, _TaskVarTemplate, _BlockVarTemplate):
                 stripped = value.strip()
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
@@ -4339,7 +4387,7 @@ class Runtime:
             return out
         return value
 
-    def template_vars(self, d, ctx, dynamic=False, higher_vars=None, defer=False):
+    def template_vars(self, d, ctx, dynamic=False, higher_vars=None, defer=False, block_vars=False):
         """Prepare variables with lazy containers and optional deferred templates.
 
         Legacy non-native templating also keeps scalar sources so its raw
@@ -4357,13 +4405,15 @@ class Runtime:
             if isinstance(v, str) and dynamic and ("{{" in v or "{%" in v):
                 out[k] = _PlayVarTemplate(v)
             elif defer and type(v) is str and _looks_templated(v):
-                out[k] = _TaskVarTemplate(v)
+                out[k] = _BlockVarTemplate(v) if block_vars else _TaskVarTemplate(v)
             elif isinstance(v, str) and not (legacy or defer):
                 out[k] = self.templater.render_string(v, base)
             elif isinstance(v, dict) and set(v.keys()) == {"__ansiroll_unsafe__"}:
                 out[k] = _UntrustedConditionValue(v["__ansiroll_unsafe__"])
             else:
                 out[k] = _lazy_container(v, self, base, dynamic or defer, task_vars=defer)
+                if block_vars and isinstance(out[k], (_LazyTplDict, _LazyTplList)):
+                    out[k]._block_vars = True
         return out
 
     @contextmanager
@@ -4778,6 +4828,8 @@ class Runtime:
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
                 setup_options=play.get("gather_setup_options"),
+                setup_defaults=play.get("gather_setup_defaults"),
+                gather_defaults=play.get("gather_action_defaults"),
                 option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
@@ -5029,8 +5081,10 @@ class Runtime:
 
     def _block_steps(self, block, overlay, become):
         scope = dict(overlay)
+        # Resolve aliases when a child consumes them so its task vars and
+        # facts written during the block participate in normal precedence.
         scope.update(self.template_vars(
-            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay)))
+            block.get("vars"), self._layered_ctx(self.ctx(overlay), overlay), defer=True, block_vars=True))
         # Frames run strictly nested, so the block's conditions stay in force while its children are on the stack.
         inherited = self._inherited_when
         self._inherited_when = self._when_of(block)
@@ -5271,7 +5325,8 @@ class Runtime:
                                  % (item,))
         return selector_vars if before_setup else selected
 
-    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False,
+                                   mapping_shape=False):
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -5285,6 +5340,13 @@ class Runtime:
             except jinja2.TemplateSyntaxError:
                 return None
             analysis = _selector_scope(expression, ctx)
+            # A direct reference only needs the mapping itself at this
+            # stage. Keys that survive the defaults merge are checked later.
+            nodes = jinja2.nodes
+            body = expression.body
+            direct_mapping = (mapping_shape and len(body) == 1 and isinstance(body[0], nodes.Output)
+                              and len(body[0].nodes) == 1
+                              and isinstance(body[0].nodes[0], (nodes.Name, nodes.Getattr, nodes.Getitem)))
             for call in analysis[2]:
                 method = call.node
                 if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
@@ -5294,7 +5356,7 @@ class Runtime:
                 if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
                                               for arg in call.args)
-                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
+                        and _setup_builtin_lookup(call.args[0].value)
                         and not (call.dyn_args or call.dyn_kwargs)):
                     continue
                 return None
@@ -5318,7 +5380,8 @@ class Runtime:
                     return None
                 inputs[name] = value
                 pending.extend((alias, suffix, (name, location), ancestors)
-                               for alias, suffix, location in _selector_template_sources(value, path))
+                               for alias, suffix, location in _selector_template_sources(
+                                   value, path, include_members=not direct_mapping))
         return inputs
 
     def _task_ctx(self, task, overlay):
@@ -5348,7 +5411,10 @@ class Runtime:
         # Inherited lookups can be reached through aliases in task vars.
         mixed_lookup = self.templater._contains_mixed_lookup(
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
-        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars, defer=looped or mixed_lookup))
+        block_template = (task.get("delegate_to") and task.get("special") == "template"
+                          and any(_is_deferred_block_var(value) for value in ctx.values()))
+        ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
+                                      defer=looped or mixed_lookup or block_template))
         ctx.update(higher_vars)
         ctx.setdefault("omit", _OMIT)
         if task.get("search_dirs"):
@@ -5368,7 +5434,7 @@ class Runtime:
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
-                if mixed_lookup and key in task_vars:
+                if (mixed_lookup or block_template) and key in task_vars:
                     host_task_bindings[key] = value
                 # An alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
@@ -5385,9 +5451,10 @@ class Runtime:
             ctx[_DEFER_LOOKUP_NAMES] = True
         loop_snapshot = looped and bool(task_vars)
         play_magic = loop_snapshot and any(isinstance(value, _PlayVarTemplate) for value in ctx.values())
-        if "vars" not in ctx or play_magic:
+        block_snapshot = any(_is_deferred_block_var(value) for value in ctx.values())
+        if "vars" not in ctx or play_magic or block_snapshot:
             snapshot = _vars_snapshot(ctx)
-            ctx["vars"] = _LoopVarsSnapshot(snapshot) if loop_snapshot else snapshot
+            ctx["vars"] = _LoopVarsSnapshot(snapshot) if (loop_snapshot or block_snapshot) else snapshot
         return ctx
 
     def run_task(self, task, overlay, become=False):
@@ -5889,17 +5956,56 @@ class Runtime:
                 res["exception"] = "(traceback unavailable)"
         return res
 
-    def _render_action_args(self, raw_args, ctx, args_cache):
+    def _render_action_args(self, raw_args, ctx, args_cache, *, source_task=None):
         if args_cache is None:
-            return self.template(raw_args, ctx)
+            args_cache = {}
         if "args" not in args_cache:
-            args_cache["args"] = self.template(raw_args, ctx)
+            argument_layers = (source_task or {}).get("_file_source_argument_layers")
+            if argument_layers:
+                raw_args = dict(raw_args)
+                sources = []
+                for layer in argument_layers:
+                    source = self.templater.render_string(raw_args.pop(layer), ctx)
+                    if not isinstance(source, dict):
+                        _fail_on_undef(source)
+                        if source == _OMIT or layer == "_variable_params" and _legacy_templating():
+                            continue
+                        raise ValueError("file source arguments must resolve to a dictionary")
+                    sources.append(source)
+                inherited = {key: raw_args.pop(key) for key in source_task["_file_source_inherited_args"]}
+                expanded = {}
+                for source in reversed(sources):
+                    expanded.update({key: source[key] for key in source if key not in raw_args and key not in expanded})
+                inherited = {key: value for key, value in inherited.items() if key not in expanded}
+                args = {**self.template(inherited, ctx), **expanded, **self.template(raw_args, ctx)}
+            else:
+                args = self.template(raw_args, ctx)
+            if source_task and source_task.get("_file_source_defaults"):
+                args = {**self._render_file_source_defaults(source_task, ctx, args.keys()), **args}
+            args_cache["args"] = args
         return args_cache["args"]
+
+    def _render_file_source_defaults(self, task, ctx, provided):
+        keys = set(task["_file_source_default_keys"]) - provided
+        if not keys:
+            return {}
+        selected = {}
+        for entry in task["_file_source_defaults"]:
+            templated = isinstance(entry, str)
+            layer = self.templater.render_string(entry, ctx) if templated else entry
+            if not isinstance(layer, dict) or set(layer) == {"__ansiroll_unsafe__"}:
+                _fail_on_undef(layer)
+                raise ValueError("file source module_defaults must resolve to a dictionary")
+            for key in keys & layer.keys():
+                selected[key] = layer, templated
+        return _strip_omit({key: layer[key] if templated else self.template(layer[key], ctx)
+                            for key, (layer, templated) in selected.items()})
 
     def _exec_one(self, task, ctx, become=False, attempt=None, args_cache=None):
         task_started = time.monotonic()
         inherited_check_mode = self.check_mode
         inherited_transfer_check_mode = self._copy_transfer_check_mode
+        inherited_diff_mode = self.diff_mode
         inherited_become_user = self.become_user
         provenance = {"mode": "native-agent"}
         refreshed_vars = None
@@ -5928,6 +6034,9 @@ class Runtime:
                     elif check_override == "invalid":
                         raise ValueError("invalid inherited check_mode value")
                 self.check_mode = _boolean(check_override, strict=check_override is not None)
+            diff_override = task.get("diff")
+            if diff_override is not None:
+                self.diff_mode = _boolean(_fail_on_undef(self.template(diff_override, ctx)))
             become_user = task.get("become_user")
             if become_user:
                 if isinstance(become_user, str):
@@ -5982,7 +6091,7 @@ class Runtime:
             else:
                 provenance = {"mode": "real-ansiballz"}
                 args = _fail_on_undef(_strip_omit(
-                    self._render_action_args(task.get("args") or {}, ctx, args_cache)))
+                    self._render_action_args(task.get("args") or {}, ctx, args_cache, source_task=task)))
                 if self._is_builtin_unarchive(task):
                     self._normalize_unarchive_options(args)
                 self._module_source_bytes = self._baked_module_source(task, args)
@@ -6017,6 +6126,7 @@ class Runtime:
             self._module_env = None
             self.check_mode = inherited_check_mode
             self._copy_transfer_check_mode = inherited_transfer_check_mode
+            self.diff_mode = inherited_diff_mode
             self.become_user = inherited_become_user
         # Module output is data, never a template (Ansible marks it unsafe).
         res = _mark_unsafe(res)
@@ -6171,14 +6281,20 @@ class Runtime:
 
     def _baked_module_source(self, task, args):
         """Return baked controller-side input for worker-local memory transport."""
-        if not self._is_builtin_unarchive(task) or _ansible_boolean(args.get("remote_src", False)):
+        if not self._is_builtin_unarchive(task):
+            return None
+        decrypt = args.pop("decrypt", True)
+        if _ansible_boolean(args.get("remote_src", False)):
             return None
         src = args.get("src")
         key = self._baked_source_key(task, src)
         marker = (task.get("_baked") or {}).get(key)
         if marker is None:
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
-        return self._asset_bytes(marker)
+        data = self._asset_bytes(marker)
+        if not task.get("_vault_plaintext") and decrypt and data.startswith(b"$ANSIBLE_VAULT;"):
+            raise RuntimeError("Vault archive requires controller decryption. " + _vault_source_recompile_note(task))
+        return data
 
     def _task_environment(self, task, ctx):
         """Resolve the `environment:` keyword to a flat {name: value} dict."""
@@ -6280,7 +6396,7 @@ class Runtime:
         if name == "assert":
             # Its condition expressions are interpreted only by when().
             raw_args = {k: v for k, v in raw_args.items() if k != "that"}
-        args = self._render_action_args(raw_args, ctx, args_cache)
+        args = self._render_action_args(raw_args, ctx, args_cache, source_task=task)
         # Ansible accepts the complete module argument dictionary through a
         # single template, representing it internally as `_raw_params`.
         if (
@@ -6344,15 +6460,6 @@ class Runtime:
             }
         if name == "fail":
             return {"failed": True, "changed": False, "msg": args.get("msg", "Failed as requested from task")}
-        if (name == "copy" and isinstance(args, dict)
-                and args.get("src") is not None and args.get("content") is None
-                and args.get("dest")
-                and _ansible_boolean(args.get("remote_src", False))):
-            # The copy action plugin (after its argument checks and the
-            # content branch) hands remote_src copies straight to the copy
-            # module, which reads src on the target.
-            return self.run_module(
-                task["action"], _fail_on_undef(_strip_omit(args)), become=become)
         if name in ("template", "copy"):
             return self._run_file_action(name, task, args, ctx, become)
         if name == "assert":
@@ -6589,7 +6696,7 @@ class Runtime:
             ack["changed"] = True
         return ack
 
-    def _run_file_action(self, name, task, args, ctx, become=False):
+    def _run_file_action(self, name, task, args, ctx, become=False, *, template_vars=None):
         """Run template/copy like their action plugins, with src baked at
         compile time.
 
@@ -6645,8 +6752,14 @@ class Runtime:
                 failure = "can not use content with a dir as dest"
             if failure:
                 return {"failed": True, "changed": False, "msg": failure}
-            if content is None and _ansible_bool(args.get("remote_src", False)):
-                return self.run_module(_COPY_MODULE, args, become=become)
+            if content is None and _ansible_boolean(args.get("remote_src", False)):
+                action = task.get("action")
+                if action not in self.modules:
+                    action = _COPY_MODULE
+                builtin = self.modules.get(_COPY_MODULE, {}).get("module_fqn")
+                if action == _COPY_MODULE or (builtin and self.modules[action].get("module_fqn") == builtin):
+                    args.pop("decrypt", None)
+                return self.run_module(action, _fail_on_undef(args), become=become)
         else:
             content = None
 
@@ -6692,6 +6805,9 @@ class Runtime:
                         "msg": "%s: src %r was not baked into the compiled file" % (name, src)}
             try:
                 raw = self._asset_text(raw)
+                if (name == "copy" and not task.get("_vault_plaintext") and _ansible_boolean(args.get("decrypt", True))
+                        and raw.startswith("$ANSIBLE_VAULT;")):
+                    raise RuntimeError("Vault source requires controller decryption. " + _vault_source_recompile_note(task))
             except Exception as ex:
                 return {"failed": True, "changed": False,
                         "msg": "%s: cannot load embedded src %r: %s" % (name, src, ex)}
@@ -6721,16 +6837,21 @@ class Runtime:
                         uid = pwd.getpwuid(uid).pw_name if uid is not None else uid
                     except Exception:
                         pass
-                    tctx.setdefault("template_host", platform.node())
-                    tctx.setdefault("template_path", src)
-                    tctx.setdefault("template_fullpath", fullpath)
-                    tctx.setdefault("template_destpath", dest)
-                    tctx.setdefault("template_mtime",
-                                    _dt.datetime.fromtimestamp(meta["mtime"])
-                                    if meta.get("mtime") is not None else None)
-                    tctx.setdefault("template_uid", uid)
-                    tctx.setdefault("template_run_date", _dt.datetime.now())
-                    tctx.setdefault("ansible_managed", "Ansible managed")
+                    action_vars = {
+                        "template_host": platform.node(),
+                        "template_path": src,
+                        "template_fullpath": fullpath,
+                        "template_destpath": dest,
+                        "template_mtime": (_dt.datetime.fromtimestamp(meta["mtime"])
+                                           if meta.get("mtime") is not None else None),
+                        "template_uid": uid,
+                        "template_run_date": _dt.datetime.now(),
+                        "ansible_managed": "Ansible managed",
+                    }
+                    action_vars = {key: value for key, value in action_vars.items() if key not in tctx}
+                    tctx.update(action_vars)
+                    if template_vars is not None:
+                        template_vars.update(action_vars)
                 except Exception:
                     pass
                 try:
@@ -7230,7 +7351,7 @@ class Runtime:
             # Legacy Ansible returns a bare null variable directly. Other
             # expressions that yield null render as an empty, invalid timeout.
             bare = re.fullmatch(r"\{\{\s*(\w+)\s*\}\}", template["source"])
-            if not (bare and bare[1] in scope and scope[bare[1]] is None):
+            if not (bare and bare.group(1) in scope and scope[bare.group(1)] is None):
                 raise ValueError("gather_timeout must be an integer")
             value = template.get("null_representation")
             if value is None:
@@ -7241,10 +7362,44 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
+    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False):
+        def check_dependencies(value, *, mapping_shape=False):
+            if not blocked:
+                return
+            for source, _, _ in _selector_template_sources(value):
+                paths = set()
+                inputs = self._pre_setup_template_inputs(
+                    source, ctx, selector=True, paths=paths, setup_lookups=True, mapping_shape=mapping_shape)
+                if inputs is None or _vars_file_reads_blocked(blocked, paths):
+                    raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
+
+        defaults = {}
+        modern = _core_at_least(2, 19)
+        for entry in layers or ():
+            if isinstance(entry, str):
+                check_dependencies(entry, mapping_shape=modern)
+                entry = self.templater.render_string(entry, ctx, strict=True)
+                if isinstance(entry, _LazyTplDict):
+                    entry = entry._raw
+            if _is_undef(entry):
+                _fail_on_undef(entry)
+            if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
+                raise ValueError("setup module defaults must resolve to a dictionary")
+            if not modern:
+                check_dependencies(entry)
+                entry = _fail_on_undef(self.template(entry, ctx, strict=True))
+            defaults.update(entry)
+        inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
+        if modern:
+            check_dependencies(inherited)
+            return _setup_omit(self.template(inherited, ctx, strict=True))
+        # Legacy Core removes omit before the setup action applies its own defaults.
+        return inherited if final_setup else _setup_omit(inherited)
+
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None, option_contexts=None):
+                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -7270,11 +7425,18 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            if self.gather_setup_fn is not None and setup_options:
+            if self.gather_setup_fn is not None and (setup_options or setup_defaults or gather_defaults):
                 controller_setup = self.gather_setup_fn()
                 if controller_setup["error"] is not None:
                     raise ValueError(controller_setup["error"])
-                resolved_options = controller_setup["options"]
+                setup_args = controller_setup["options"]
+                # Older gather tasks carry setup's default values even when
+                # the only authored argument resolves to omit.
+                if (not _core_at_least(2, 13) and gather_timeout is None and not timeout_template
+                        and "gather_subset" not in (setup_options or {}) and not (setup_defaults or gather_defaults)
+                        and setup_args in ({"gather_subset": ["all"]},
+                                           {"gather_subset": ["all"], "gather_timeout": 10})):
+                    setup_args = {}
             else:
                 authored_options = dict(setup_options or {})
                 if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
@@ -7290,22 +7452,30 @@ class Runtime:
                             if inputs is None or _vars_file_reads_blocked(blocks, paths):
                                 raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
                     resolved_options[key] = self.template(value, scope, strict=True)
-                resolved_options = _fail_on_undef(_strip_omit(resolved_options))
-                if _core_at_least(2, 19) and isinstance(resolved_options.get("gather_subset"), list):
-                    resolved_options["gather_subset"] = [item for item in resolved_options["gather_subset"]
-                                                         if item != _OMIT]
-                if "gather_subset" in resolved_options and resolved_options["gather_subset"] is not None:
-                    subset = resolved_options["gather_subset"]
+                if not _core_at_least(2, 18) and resolved_options.get("gather_subset") == _OMIT:
+                    config = ctx.get("__ansiroll_controller_config", {})
+                    resolved_options["gather_subset"] = config.get("DEFAULT_GATHER_SUBSET", ["all"])
+                setup_args = _setup_omit(resolved_options)
+                subset = setup_args.get("gather_subset")
+                if subset is not None:
                     if not isinstance(subset, list):
                         subset = [subset]
                     if not all(isinstance(item, str) for item in subset):
                         raise ValueError("gather_subset items must be strings")
-                    resolved_options["gather_subset"] = subset
-            setup_args = {key: value for key, value in resolved_options.items() if value is not None}
-            gather_timeout = self._gather_timeout_for_run(
-                gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
-            if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
-                setup_args["gather_timeout"] = gather_timeout
+                    setup_args["gather_subset"] = subset
+                gather_timeout = self._gather_timeout_for_run(
+                    gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
+                if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
+                    setup_args["gather_timeout"] = gather_timeout
+                if gather_defaults or setup_defaults:
+                    defaults_ctx, defaults_blocks = (option_contexts or {}).get("fact_path", (ctx, ()))
+                    gather_args = {**setup_args, **{key: value for key, value in resolved_options.items() if value == _OMIT}}
+                    setup_args.update(self._render_setup_defaults(gather_defaults, gather_args, defaults_ctx, defaults_blocks))
+                    setup_args.pop("parallel", None)
+                setup_args = {key: value for key, value in setup_args.items() if value is not None}
+                if setup_defaults:
+                    setup_args.update(self._render_setup_defaults(
+                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
@@ -8354,7 +8524,9 @@ def agent_main():
                 ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
-            defer_template = action == "template" and ctx.get(_DEFER_LOOKUP_NAMES)
+            defer_template = action == "template" and (
+                ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
+            )
             if defer_template:
                 resolve_keys = {"omit"}
             deferred = {} if resolve_keys is not None else None
@@ -8384,9 +8556,17 @@ def agent_main():
             members = [] if defer_template else None
             if defer_template:
                 requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+                if _legacy_non_native(ctx) and not ctx.get(_DEFER_LOOKUP_NAMES):
+                    # Legacy scalar block aliases were sent as template source.
+                    # Let the controller evaluate that source when the file uses it.
+                    requested_names.difference_update(
+                        name for name, value in ctx.items() if isinstance(value, _BlockVarTemplate)
+                    )
                 if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
                     requested_names.add("hostvars")
                 frame["lazy_template_vars"] = sorted(requested_names)
+                # Transport can be lazy while Jinja resolves each referenced name.
+                frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES))
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
@@ -8394,6 +8574,12 @@ def agent_main():
                 member = reply.get("member")
                 fallback = None
                 if member is None and isinstance(name, str) and name in requested_names:
+                    template_vars = reply.get("template_vars") if defer_template else None
+                    if template_vars:
+                        for key in ("template_mtime", "template_run_date"):
+                            if template_vars.get(key) is not None:
+                                template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
+                        scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
                     fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
                 elif members is not None and type(member) is int and 0 <= member < len(members):
                     fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)
@@ -8427,7 +8613,8 @@ def agent_main():
         for play in plays:
             if not g.get("_INJECTED_GATHER_FACTS", True):
                 play = dict(play, gather_facts=False)
-            if controller_lookups := g.get("_INJECTED_CONTROLLER_LOOKUPS"):
+            controller_lookups = g.get("_INJECTED_CONTROLLER_LOOKUPS")
+            if controller_lookups:
                 play = {**play, **{
                     key: {**(play.get(key) or {}), **values}
                     for key, values in controller_lookups.items()

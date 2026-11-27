@@ -6,9 +6,13 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: GitHub's merge commit for the reviewed PR
+        description: GitHub's test merge commit for the PR
         type: string
         required: true
+      require_all:
+        description: Require the legacy matrix jobs to pass as well
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -85,7 +89,7 @@ jobs:
           - { python: "3.13", ansible: "ansible-core==2.20.*", experimental: false }
           # Oldest supported target; harder to install on modern CI, so allow failure.
           - { python: "3.9", ansible: "ansible-base==2.10.17", experimental: true }
-    continue-on-error: ${{ matrix.experimental }}
+    continue-on-error: ${{ matrix.experimental && !inputs.require_all }}
     name: "ansible ${{ matrix.ansible }} (py${{ matrix.python }})"
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +131,7 @@ jobs:
           - { series: "2.19", host_profile: "portable", docker_profile: "smoke", experimental: false }
           - { series: "2.20", docker_profile: "full", experimental: false }
           - { series: "2.21", host_profile: "portable", docker_profile: "smoke", experimental: false }
-    continue-on-error: ${{ matrix.experimental }}
+    continue-on-error: ${{ matrix.experimental && !inputs.require_all }}
     name: "Ansible parity ${{ matrix.series }}"
     steps:
       - uses: actions/checkout@v4
