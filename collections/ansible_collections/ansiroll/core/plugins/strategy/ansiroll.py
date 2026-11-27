@@ -1283,10 +1283,10 @@ class StrategyModule(StrategyBase):
             path = loader.path_dwim(path)
             try:
                 with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
-                    mode = os.fstat(handle.fileno()).st_mode
-                    if stat.S_ISREG(mode):
+                    opened = os.fstat(handle.fileno())
+                    if stat.S_ISREG(opened.st_mode):
                         data = handle.read()
-                    elif path == os.devnull and stat.S_ISCHR(mode):
+                    elif stat.S_ISCHR(opened.st_mode) and os.path.samestat(opened, os.stat(os.devnull)):
                         data = b""
                     else:
                         raise AnsibleParserError("selected vars file %r is not a regular file" % path)
@@ -1313,11 +1313,13 @@ class StrategyModule(StrategyBase):
         if self._deferred_vars_file_keys is None:
             return {"error": "unexpected request for vars_files"}
         if task is None:
+            from ansible.playbook.block import Block
             from ansible.playbook.task import Task
 
             # Native vars_files validation uses a task context to distinguish
             # an unresolved selector after cached setup from an early probe.
-            task = Task()
+            # The parent also supplies the playbook path for vars plugins.
+            task = Task(block=Block(play=self._cur_play))
         try:
             current_vars, files = self._host_vars_and_lookup_sources(host, task=task)
         except AnsibleError as ex:

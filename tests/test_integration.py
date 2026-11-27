@@ -5746,7 +5746,12 @@ def test_strategy_selects_vars_file_using_inventory_before_set_fact(tmp_path):
 
 
 @pytest.mark.parametrize("no_log", [False, True])
-def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, no_log):
+@pytest.mark.parametrize("alias", [False, True], ids=["devnull", "devnull-symlink"])
+def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, no_log, alias):
+    empty_file = os.devnull
+    if alias:
+        empty_file = tmp_path / "empty.yml"
+        empty_file.symlink_to(os.devnull)
     (tmp_path / "settings-before.yml").write_text("before_gathering: old\n")
     (tmp_path / ("settings-" + platform.system() + ".yml")).write_text(
         'after_gathering: "{{ lookup(\'env\', \'ANSIROLL_TEST_FACT_SELECTED_ENV\') }}"\n')
@@ -5762,12 +5767,39 @@ def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, 
         that:
           - before_gathering is undefined
           - after_gathering == 'fact-selected'
-""".replace("NO_LOG", str(no_log).lower()).replace("DEVNULL", json.dumps(os.devnull))
+""".replace("NO_LOG", str(no_log).lower()).replace("DEVNULL", json.dumps(str(empty_file)))
     proc = _run_strategy_play(
         tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
         environment={"ANSIROLL_TEST_FACT_SELECTED_ENV": "fact-selected"},
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_refreshes_cached_vars_file_with_playbook_relative_inventory_vars(tmp_path):
+    nested = tmp_path / "nested"
+    group_vars = nested / "group_vars"
+    group_vars.mkdir(parents=True)
+    (group_vars / "all.yml").write_text("profile: nested\n")
+    (nested / f"settings-nested-{platform.system()}.yml").write_text("selected: nested\n")
+    (nested / "play.yml").write_text("""- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars_files: ['settings-{{ profile }}-{{ ansible_facts.system }}.yml']
+  tasks:
+    - assert: {that: selected == 'nested'}
+""")
+    playbook = """- hosts: localhost
+  gather_facts: true
+  connection: local
+  tasks: []
+- import_playbook: nested/play.yml
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(
+            tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+            environment={"ANSIBLE_STRATEGY": strategy, "ANSIBLE_PLAYBOOK_VARS_ROOT": "bottom"}, timeout=45,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("invalid", ["fifo", "vault"])
