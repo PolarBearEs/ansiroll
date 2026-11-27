@@ -539,23 +539,41 @@ class StrategyModule(StrategyBase):
     def _gather_setup_options(self, host, gather_task):
         from ansiroll.loader import _core_version
 
-        options = {key: gather_task.args[key] for key in ("gather_subset", "fact_path")
-                   if key in gather_task.args}
-        if options.get("gather_subset") == ["all"] and "gather_subset" not in (self._cur_play.get_ds() or {}):
-            del options["gather_subset"]
-        error = None
-        if options:
-            try:
-                values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
-                values["ansible_search_path"] = gather_task.get_search_path()
-                options = self._mk_templar(values).template(options)
-                if _core_version() < (2, 19) and (omit := values.get("omit")):
-                    from ansible.executor.task_executor import remove_omit
+        try:
+            values = self._variable_manager.get_vars(play=self._cur_play, host=host, task=gather_task)
+            values["ansible_search_path"] = gather_task.get_search_path()
+            templar = self._mk_templar(values)
+            task = gather_task.copy()
+            task.args = dict(gather_task.args)
+            if _core_version() >= (2, 19):
+                from ansible.executor.module_common import _apply_action_arg_defaults
 
-                    options = remove_omit(options, omit)
-            except AnsibleError as ex:
-                error = str(ex)
-        return {"options": options if error is None else {}, "error": error}
+                args = task.post_validate_attribute("args", templar=templar._engine)
+                options = {key: value for key, value in args.items() if key != "parallel" and value is not None}
+                options = _apply_action_arg_defaults("ansible.builtin.setup", task, options, templar)
+            else:
+                from ansible.executor.module_common import get_action_args_with_defaults
+                from ansible.executor.task_executor import remove_omit
+
+                validate_args = getattr(task, "_post_validate_args", None)
+                if validate_args is not None:
+                    task.args = validate_args(task.fattributes["args"], task.args, templar)
+                else:
+                    task.args = templar.template(task.args)
+                legacy = _core_version() < (2, 12)
+                groups = {} if legacy else {"action_groups": getattr(self._cur_play, "_action_groups", {})}
+                setup_action = "ansible.legacy.setup" if legacy else "ansible.builtin.setup"
+                args = get_action_args_with_defaults(
+                    task.action if legacy else "ansible.builtin.gather_facts",
+                    task.args, task.module_defaults, templar, **groups)
+                if omit := values.get("omit"):
+                    args = remove_omit(args, omit)
+                args = {key: value for key, value in args.items() if key != "parallel" and value is not None}
+                options = get_action_args_with_defaults(
+                    setup_action, args, task.module_defaults, templar, **groups)
+        except (AnsibleError, ValueError, TypeError) as ex:
+            return {"options": {}, "error": str(ex)}
+        return {"options": options, "error": None}
 
     def _pump(self, host, chan, task_map, hv, templar, become_pass, play_context, *, gather_task=None):
         host_failed = False

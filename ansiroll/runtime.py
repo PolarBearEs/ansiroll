@@ -784,7 +784,7 @@ def _selector_projection_cycle(origin, path, ancestors):
     return False
 
 
-def _selector_template_sources(value, path=()):
+def _selector_template_sources(value, path=(), *, include_members=True):
     """Yield each required template with its remaining path and its location in the input."""
     for index, key in enumerate(path):
         if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
@@ -805,6 +805,8 @@ def _selector_template_sources(value, path=()):
     while pending:
         value, location = pending.pop()
         if isinstance(value, (dict, list, tuple)):
+            if not include_members:
+                continue
             if id(value) in seen:
                 continue
             seen.add(id(value))
@@ -1010,6 +1012,16 @@ def _strip_omit(args):
     if isinstance(args, dict):
         return {k: v for k, v in args.items() if v != _OMIT}
     return args
+
+
+def _setup_omit(args):
+    if not _core_at_least(2, 19):
+        return _fail_on_undef(_strip_omit(args))
+    if isinstance(args, dict):
+        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT}
+    if isinstance(args, (list, tuple)):
+        return [_setup_omit(value) for value in args if value != _OMIT]
+    return _fail_on_undef(args)
 
 
 def _fail_on_undef(value):
@@ -1604,11 +1616,21 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _setup_builtin_lookup(name):
+    namespace, _, short = name.rpartition(".")
+    if namespace in ("", "ansible.builtin", "ansible.legacy") and short in ("env", "config", "file"):
+        return short
+    return None
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
-    name = str(name).rsplit(".", 1)[-1]
+    qualified_name = str(name)
+    name = qualified_name.rsplit(".", 1)[-1]
     if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
         raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
     setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    if setup_lookups is not None and name in ("env", "config", "file") and not _setup_builtin_lookup(qualified_name):
+        raise _UnsupportedLookup(qualified_name)
     if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
         known = setup_lookups.get(name, ())
         if any(str(term) not in known for term in args):
@@ -1646,6 +1668,16 @@ def _lookup_values(name, args, kwargs, ctx=None):
         vals = []
         lstrip = kwargs.get("lstrip", False)
         rstrip = kwargs.get("rstrip", True)
+        if setup_lookups is not None:
+            files = setup_lookups.get("file", {}).get(qualified_name, {})
+            for term in map(str, args):
+                if term not in files:
+                    raise ValueError("setup requires an uncaptured controller file %r" % term)
+                value = files[term]
+                if lstrip:
+                    value = value.lstrip()
+                vals.append(value.rstrip() if rstrip else value)
+            return vals
         dirs = (ctx or {}).get("__ansiroll_search_dirs") or []
         for a in args:
             path = os.path.expanduser(str(a))
@@ -4728,6 +4760,8 @@ class Runtime:
                 ctx=setup_ctx, when=play.get("gather_when"), no_log=play.get("gather_no_log"),
                 gather_timeout=play.get("gather_timeout"),
                 setup_options=play.get("gather_setup_options"),
+                setup_defaults=play.get("gather_setup_defaults"),
+                gather_defaults=play.get("gather_action_defaults"),
                 option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
@@ -5223,7 +5257,8 @@ class Runtime:
                                  % (item,))
         return selector_vars if before_setup else selected
 
-    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False):
+    def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False,
+                                   mapping_shape=False):
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -5237,6 +5272,13 @@ class Runtime:
             except jinja2.TemplateSyntaxError:
                 return None
             analysis = _selector_scope(expression, ctx)
+            # A direct reference only needs the mapping itself at this
+            # stage. Keys that survive the defaults merge are checked later.
+            nodes = jinja2.nodes
+            body = expression.body
+            direct_mapping = (mapping_shape and len(body) == 1 and isinstance(body[0], nodes.Output)
+                              and len(body[0].nodes) == 1
+                              and isinstance(body[0].nodes[0], (nodes.Name, nodes.Getattr, nodes.Getitem)))
             for call in analysis[2]:
                 method = call.node
                 if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
@@ -5246,7 +5288,7 @@ class Runtime:
                 if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
                                               for arg in call.args)
-                        and call.args[0].value.rsplit(".", 1)[-1] in ("env", "config")
+                        and _setup_builtin_lookup(call.args[0].value)
                         and not (call.dyn_args or call.dyn_kwargs)):
                     continue
                 return None
@@ -5270,7 +5312,8 @@ class Runtime:
                     return None
                 inputs[name] = value
                 pending.extend((alias, suffix, (name, location), ancestors)
-                               for alias, suffix, location in _selector_template_sources(value, path))
+                               for alias, suffix, location in _selector_template_sources(
+                                   value, path, include_members=not direct_mapping))
         return inputs
 
     def _task_ctx(self, task, overlay):
@@ -7180,10 +7223,44 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
+    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False):
+        def check_dependencies(value, *, mapping_shape=False):
+            if not blocked:
+                return
+            for source, _, _ in _selector_template_sources(value):
+                paths = set()
+                inputs = self._pre_setup_template_inputs(
+                    source, ctx, selector=True, paths=paths, setup_lookups=True, mapping_shape=mapping_shape)
+                if inputs is None or _vars_file_reads_blocked(blocked, paths):
+                    raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
+
+        defaults = {}
+        modern = _core_at_least(2, 19)
+        for entry in layers or ():
+            if isinstance(entry, str):
+                check_dependencies(entry, mapping_shape=modern)
+                entry = self.templater.render_string(entry, ctx, strict=True)
+                if isinstance(entry, _LazyTplDict):
+                    entry = entry._raw
+            if _is_undef(entry):
+                _fail_on_undef(entry)
+            if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
+                raise ValueError("setup module defaults must resolve to a dictionary")
+            if not modern:
+                check_dependencies(entry)
+                entry = _fail_on_undef(self.template(entry, ctx, strict=True))
+            defaults.update(entry)
+        inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
+        if modern:
+            check_dependencies(inherited)
+            return _setup_omit(self.template(inherited, ctx, strict=True))
+        # Legacy Core removes omit before the setup action applies its own defaults.
+        return inherited if final_setup else _setup_omit(inherited)
+
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None, option_contexts=None):
+                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -7209,11 +7286,18 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            if self.gather_setup_fn is not None and setup_options:
+            if self.gather_setup_fn is not None and (setup_options or setup_defaults or gather_defaults):
                 controller_setup = self.gather_setup_fn()
                 if controller_setup["error"] is not None:
                     raise ValueError(controller_setup["error"])
-                resolved_options = controller_setup["options"]
+                setup_args = controller_setup["options"]
+                # Older gather tasks carry setup's default values even when
+                # the only authored argument resolves to omit.
+                if (not _core_at_least(2, 13) and gather_timeout is None and not timeout_template
+                        and "gather_subset" not in (setup_options or {}) and not (setup_defaults or gather_defaults)
+                        and setup_args in ({"gather_subset": ["all"]},
+                                           {"gather_subset": ["all"], "gather_timeout": 10})):
+                    setup_args = {}
             else:
                 authored_options = dict(setup_options or {})
                 if not _core_at_least(2, 13) and not authored_options.get("fact_path"):
@@ -7229,22 +7313,30 @@ class Runtime:
                             if inputs is None or _vars_file_reads_blocked(blocks, paths):
                                 raise ValueError("%s requires a vars file that cannot be selected before setup" % key)
                     resolved_options[key] = self.template(value, scope, strict=True)
-                resolved_options = _fail_on_undef(_strip_omit(resolved_options))
-                if _core_at_least(2, 19) and isinstance(resolved_options.get("gather_subset"), list):
-                    resolved_options["gather_subset"] = [item for item in resolved_options["gather_subset"]
-                                                         if item != _OMIT]
-                if "gather_subset" in resolved_options and resolved_options["gather_subset"] is not None:
-                    subset = resolved_options["gather_subset"]
+                if not _core_at_least(2, 18) and resolved_options.get("gather_subset") == _OMIT:
+                    config = ctx.get("__ansiroll_controller_config", {})
+                    resolved_options["gather_subset"] = config.get("DEFAULT_GATHER_SUBSET", ["all"])
+                setup_args = _setup_omit(resolved_options)
+                subset = setup_args.get("gather_subset")
+                if subset is not None:
                     if not isinstance(subset, list):
                         subset = [subset]
                     if not all(isinstance(item, str) for item in subset):
                         raise ValueError("gather_subset items must be strings")
-                    resolved_options["gather_subset"] = subset
-            setup_args = {key: value for key, value in resolved_options.items() if value is not None}
-            gather_timeout = self._gather_timeout_for_run(
-                gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
-            if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
-                setup_args["gather_timeout"] = gather_timeout
+                    setup_args["gather_subset"] = subset
+                gather_timeout = self._gather_timeout_for_run(
+                    gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
+                if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
+                    setup_args["gather_timeout"] = gather_timeout
+                if gather_defaults or setup_defaults:
+                    defaults_ctx, defaults_blocks = (option_contexts or {}).get("fact_path", (ctx, ()))
+                    gather_args = {**setup_args, **{key: value for key, value in resolved_options.items() if value == _OMIT}}
+                    setup_args.update(self._render_setup_defaults(gather_defaults, gather_args, defaults_ctx, defaults_blocks))
+                    setup_args.pop("parallel", None)
+                setup_args = {key: value for key, value in setup_args.items() if value is not None}
+                if setup_defaults:
+                    setup_args.update(self._render_setup_defaults(
+                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
