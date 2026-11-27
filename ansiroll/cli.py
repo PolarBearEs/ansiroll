@@ -6,10 +6,12 @@ import argparse
 import errno
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 
 from .compiler import compile_playbook
@@ -19,8 +21,32 @@ def entrypoint():
     return main(_standalone=True)
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    compile_parser = None
+    compile_operands = None
+    parsed = None
+
+    def parse_known_args(self, args=None, namespace=None):
+        if namespace is None:
+            namespace = argparse.Namespace()
+        self.parsed = namespace
+        return super().parse_known_args(args, namespace)
+
+    def error(self, message):
+        compile_parser = self.compile_parser
+        if compile_parser is not None:
+            playbook = getattr(compile_parser.parsed, "playbook", None)
+            # An option error can occur before argparse reaches the positional.
+            # Treat the remaining tokens as possible inputs in that case.
+            candidates = [playbook] if playbook is not None else compile_parser.compile_operands
+            if any(_stderr_may_be_playbook(path) for path in candidates):
+                self.exit(2)
+        super().error(message)
+
+
 def main(argv=None, *, _standalone=False):
-    parser = argparse.ArgumentParser(prog="ansiroll", description=__doc__)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    parser = _ArgumentParser(prog="ansiroll", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     pc = sub.add_parser("compile", help="Compile a playbook to a single .py file")
@@ -50,6 +76,9 @@ def main(argv=None, *, _standalone=False):
                     help="vault password file for decrypting baked group_vars "
                          "(default: $ANSIBLE_VAULT_PASSWORD_FILE or ansible.cfg)")
 
+    if argv[:1] == ["compile"]:
+        parser.compile_parser = pc.compile_parser = pc
+        pc.compile_operands = argv[1:]
     args = parser.parse_args(argv)
 
     if args.command == "compile":
@@ -59,6 +88,9 @@ def main(argv=None, *, _standalone=False):
             return 2
         if args.output == "-":
             parser.error("use the ansiroll command for -o -, or compile_playbook() from Python")
+        if _diagnostics_may_be_playbook(args.playbook, 1, sys.stdout):
+            sys.stderr.write("ansiroll: stdout points to input playbook: %s\n" % args.playbook)
+            return 2
         return _cmd_compile(args)
     if args.command == "run":
         return _cmd_run(args)
@@ -176,13 +208,20 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
         return destination_controlled and stream_controlled
 
 
-def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None):
-    for stream, fd in (("stdout", stdout_fd), ("stderr", 2)):
-        if _same_manifest_stream(path, info, fd, destination_fd):
-            if _discard_stream(info):
-                return os.devnull
-            raise ValueError("manifest path points to %s: %s" % (stream, path))
-    return path
+def _validate_stdout_manifest(path, info, stdout_fd, destination_fd=None, *, closed_stdout=None):
+    if closed_stdout is None:
+        same_stdout = _same_manifest_stream(path, info, stdout_fd, destination_fd)
+    else:
+        same_stdout = _same_stream(info, closed_stdout)
+    if same_stdout:
+        stream = "stdout"
+    elif _same_manifest_stream(path, info, 2, destination_fd):
+        stream = "stderr"
+    else:
+        return path
+    if _discard_stream(info):
+        return os.devnull
+    raise ValueError("manifest path points to %s: %s" % (stream, path))
 
 
 class _TruncatingReopenError(OSError):
@@ -226,8 +265,34 @@ def _open_truncated_destination(path, reference, original_error, validate, prepa
 _TRUNCATING_RETRY_ERRORS = (errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP)
 
 
+def _open_manifest_fd(path, flags, validate, before_fifo):
+    # A blocking open could wait on a replacement FIFO before validation
+    # gets the chance to discover that it is the Python output.
+    while True:
+        try:
+            return os.open(path, flags | os.O_NONBLOCK, 0o666)
+        except OSError as ex:
+            if ex.errno != errno.ENXIO:
+                raise
+            info = _try_stat(path)
+            if info is None or not stat.S_ISFIFO(info.st_mode):
+                raise
+            validate(info, None)
+            if before_fifo is not None:
+                before_fifo()
+            time.sleep(0.01)
+
+
 @contextmanager
-def _open_compile_destination(path, validate, *, release_output=None, prepare=None):
+def _open_compile_destination(path, validate, *, release_output=None, prepare=None,
+                              manifest=False, before_fifo=None):
+    nonblocking_open = manifest and hasattr(os, "O_NONBLOCK")
+
+    def open_destination(flags):
+        if nonblocking_open:
+            return _open_manifest_fd(path, flags, validate, before_fifo)
+        return os.open(path, flags, 0o666)
+
     with ExitStack() as stack, ExitStack() as initial_pin:
         # A failed create-open gives us no fd. Capture the existing inode
         # before trying it so a retry cannot truncate a replacement file.
@@ -247,13 +312,13 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
             try:
                 if reference is None:
                     try:
-                        fd = os.open(path, flags | os.O_EXCL, 0o666)
+                        fd = open_destination(flags | os.O_EXCL)
                     except FileExistsError:
-                        fd = os.open(path, flags, 0o666)
+                        fd = open_destination(flags)
                     else:
                         created = True
                 else:
-                    fd = os.open(path, flags, 0o666)
+                    fd = open_destination(flags)
             except OSError as ex:
                 if ex.errno != errno.EMFILE or (reference is None and release_output is None):
                     raise
@@ -267,7 +332,7 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
                         validate(os.fstat(reference), None)
                     release_output()
                 released_for_emfile = reference is None
-                fd = os.open(path, flags, 0o666)
+                fd = open_destination(flags)
         except OSError as ex:
             # Preserve EACCES, including the kernel's protected_regular
             # check on the initial O_CREAT open in a sticky directory.
@@ -299,6 +364,11 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
             writer = stack.enter_context(os.fdopen(fd, "w"))
             info = os.fstat(fd)
             validate(info, fd)
+            if nonblocking_open:
+                os.set_blocking(fd, True)
+            if before_fifo is not None and stat.S_ISFIFO(info.st_mode):
+                before_fifo()
+                validate(info, fd)
             if prepare is not None:
                 reference = prepare(info, fd)
                 prepare = None
@@ -327,24 +397,40 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
                     stack.callback(os.close, reference)
                 writer.close()
             else:
+                validate(os.fstat(fd), fd)
                 yield writer
                 return
 
         # Reopen the validated inode even if its pathname has since changed.
         fd = _open_truncated_destination(path, reference, original_error, validate, prepare, initial_pin)
         with os.fdopen(fd, "w") as writer:
+            validate(os.fstat(fd), fd)
             yield writer
 
 
-def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None):
+def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None, write_stdout=None):
     path = _manifest_for_stdout(path, stdout_fd)
+    closed_stdout = None
+    wrote_stdout = False
 
     def validate(info, fd):
-        _validate_stdout_manifest(path, info, stdout_fd, fd)
+        _validate_stdout_manifest(path, info, stdout_fd, fd, closed_stdout=closed_stdout)
         if validate_input is not None:
             validate_input(info, "manifest path", path)
 
-    with _open_compile_destination(path, validate) as fh:
+    def before_fifo():
+        nonlocal closed_stdout, wrote_stdout
+        if not wrote_stdout:
+            info = os.fstat(stdout_fd)
+            # Keep a character device open for terminal alias validation.
+            close_stdout = not stat.S_ISCHR(info.st_mode)
+            write_stdout(close_stdout)
+            if close_stdout:
+                closed_stdout = info
+            wrote_stdout = True
+
+    with _open_compile_destination(path, validate, manifest=True,
+                                   before_fifo=before_fifo if write_stdout is not None else None) as fh:
         json.dump(manifest, fh, indent=2)
 
 
@@ -557,7 +643,7 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
         _check_file_destinations(output_path, manifest_path)
         release_output = output_reference.close if reference is not None else None
         with _open_compile_destination(
-            manifest_path, validate_manifest, release_output=release_output,
+            manifest_path, validate_manifest, release_output=release_output, manifest=True,
         ) as manifest_file:
             json.dump(manifest, manifest_file, indent=2)
 
@@ -571,7 +657,7 @@ def _diagnostic_stream_may_be_playbook(stream, playbook):
         # Ansible can emit diagnostics during import. Keep them off this
         # stream until the input's identity is known.
         try:
-            with open(os.devnull, "w") as sink, redirect_stderr(sink):
+            with open(os.devnull, "w") as sink, redirect_stderr(sink), redirect_stdout(sink):
                 from ansible.parsing.quoting import unquote
                 from ansible.utils.path import unfrackpath
 
@@ -606,24 +692,101 @@ def _fd_is_read_only(fd):
     return (fcntl(fd, F_GETFL) & os.O_ACCMODE) == os.O_RDONLY
 
 
-def _stderr_may_be_playbook(playbook):
-    descriptors = {2}
+def _stream_fd(stream):
     try:
-        descriptors.add(sys.stderr.fileno())
+        return stream.fileno()
     except (AttributeError, OSError, ValueError):
         pass  # In-memory streams and closed streams have no descriptor.
-    for fd in descriptors:
+
+
+def _writable_stream_stat(fd):
+    if fd is not None:
         try:
-            if _fd_is_read_only(fd):
-                continue
-            info = os.fstat(fd)
+            if not _fd_is_read_only(fd):
+                return os.fstat(fd)
         except OSError as ex:
             if ex.errno != errno.EBADF:
                 raise
-            continue
-        if _diagnostic_stream_may_be_playbook(info, playbook):
+
+
+def _diagnostics_may_be_playbook(playbook, fd, stream):
+    for descriptor in {fd, _stream_fd(stream)}:
+        info = _writable_stream_stat(descriptor)
+        if info is not None and _diagnostic_stream_may_be_playbook(info, playbook):
             return True
     return False
+
+
+def _stderr_may_be_playbook(playbook):
+    return _diagnostics_may_be_playbook(playbook, 2, sys.stderr)
+
+
+def _reserve_closed_standard_fds(stack):
+    # Keep saved diagnostic handles and spools out of stdin/stdout/stderr.
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError as ex:
+            if ex.errno != errno.EBADF:
+                raise
+            sink = os.open(os.devnull, os.O_RDWR)
+            if sink != fd:
+                try:
+                    os.dup2(sink, fd, inheritable=False)
+                finally:
+                    os.close(sink)
+            stack.callback(os.close, fd)
+
+
+@contextmanager
+def _hold_compile_diagnostics(input_alias):
+    # Ansible may emit warnings before it opens even the first playbook.
+    # Delay file and pipe diagnostics until their destination can be compared
+    # with every input opened during compilation.
+    streams = (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__)
+    descriptors = {1, 2, *map(_stream_fd, streams)}
+    redirected = set()
+    pending = []
+    original_streams = {}
+    destinations = {}
+    for fd in sorted(descriptors - {None}):
+        info = _writable_stream_stat(fd)
+        if info is not None and (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
+            destinations[fd] = info
+    with ExitStack() as buffers, ExitStack() as redirects:
+        if destinations:
+            _reserve_closed_standard_fds(buffers)
+        for fd, info in destinations.items():
+            saved = os.dup(fd)
+            buffers.callback(os.close, saved)
+            spool = buffers.enter_context(tempfile.TemporaryFile())
+            pending.append((info, spool, saved))
+            spool_info = os.fstat(spool.fileno())
+            original_streams[(spool_info.st_dev, spool_info.st_ino)] = info
+            inheritable = os.get_inheritable(fd)
+            os.dup2(spool.fileno(), fd, inheritable=inheritable)
+            redirects.callback(os.dup2, saved, fd, inheritable=inheritable)
+            redirected.add(fd)
+        try:
+            yield original_streams
+        finally:
+            try:
+                if redirected:
+                    for stream in streams:
+                        if _stream_fd(stream) in redirected:
+                            stream.flush()
+                    if os.name == "posix":
+                        # Native plugins may also buffer writes to stdout.
+                        import ctypes
+
+                        ctypes.CDLL(None).fflush(None)
+            finally:
+                redirects.close()
+            for info, spool, saved in pending:
+                if spool.seek(0, os.SEEK_END) and not input_alias(info):
+                    spool.seek(0)
+                    with open(saved, "wb", closefd=False) as output:
+                        shutil.copyfileobj(spool, output)
 
 
 def _cmd_compile_stdout(args):
@@ -682,25 +845,43 @@ def _cmd_compile(args, stdout=None):
     input_paths = {}
     input_inodes = set()
 
+    def input_alias(info, *, check_paths=True):
+        if (info.st_dev, info.st_ino) in input_inodes:
+            return True
+        if not check_paths:
+            return False
+        # Recheck the entry playbook last, immediately before writing.
+        for input_path in reversed(input_paths):
+            try:
+                current_input = os.stat(input_path)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except (OSError, UnicodeError) as ex:
+                raise ValueError("cannot check current input playbook: %s" % ex) from ex
+            if os.path.samestat(info, current_input):
+                return True
+        return False
+
+    def suppress_diagnostics(info):
+        if info is None or not (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
+            return False
+        try:
+            if input_paths:
+                return input_alias(info)
+            return _diagnostic_stream_may_be_playbook(info, args.playbook)
+        except ValueError:
+            return True
+
+    def stderr_is_input():
+        return suppress_diagnostics(_writable_stream_stat(_stream_fd(sys.stderr)))
+
+    def report(message):
+        if not stderr_is_input():
+            sys.stderr.write(message)
+
     def validate_input(info, name, path, *, check_paths=True):
-        if info is None:
-            return
-        if (info.st_dev, info.st_ino) not in input_inodes:
-            if not check_paths:
-                return
-            # Recheck the entry playbook last, immediately before writing.
-            for input_path in reversed(input_paths):
-                try:
-                    current_input = os.stat(input_path)
-                except (FileNotFoundError, NotADirectoryError):
-                    continue
-                except (OSError, UnicodeError) as ex:
-                    raise ValueError("cannot check current input playbook: %s" % ex) from ex
-                if os.path.samestat(info, current_input):
-                    break
-            else:
-                return
-        raise ValueError("%s points to input playbook: %s" % (name, path))
+        if info is not None and input_alias(info, check_paths=check_paths):
+            raise ValueError("%s points to input playbook: %s" % (name, path))
 
     def check_input_destinations(*, check_paths=True):
         if stdout is None:
@@ -712,51 +893,85 @@ def _cmd_compile(args, stdout=None):
 
     def on_playbook_open(path, info):
         input_paths[path] = None
+        # A descriptor path can reach a redirected diagnostic buffer.
+        # Protect the original destination and refuse to parse that buffer.
+        diagnostic = original_streams.get((info.st_dev, info.st_ino))
+        if diagnostic is not None:
+            info = diagnostic
         input_inodes.add((info.st_dev, info.st_ino))
+        # A saved diagnostic writer also keeps a matching FIFO from reaching EOF.
+        if diagnostic is not None or (
+            stat.S_ISFIFO(info.st_mode) and any(os.path.samestat(info, stream) for stream in original_streams.values())
+        ):
+            raise ValueError("input playbook points to a diagnostic stream: %s" % os.fsdecode(path))
         check_input_destinations(check_paths=False)
 
     try:
         if stdout is None and args.manifest:
             _check_file_destinations(args.output, args.manifest)
     except ValueError as ex:
-        sys.stderr.write("ansiroll: %s\n" % ex)
+        report("ansiroll: %s\n" % ex)
         return 2
     try:
-        extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
-    except Exception as ex:
-        sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
-        return 2
-    try:
-        source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
-                                            vault_password_file=args.vault_password_file,
-                                            extra_vars=extra_vars,
-                                            tree_shake=args.tree_shake,
-                                            freeze_playbook_vars=args.freeze_playbook_vars,
-                                            freeze_vars=args.freeze_var,
-                                            on_playbook_open=on_playbook_open)
-    except Exception as ex:
-        if not isinstance(ex, (ValueError,) + _ansible_errors()):
-            raise
-        message = str(ex)
-        if not message.startswith("ansiroll: "):
-            message = "ansiroll: " + message
-        sys.stderr.write(message + "\n")
-        return 2
+        with _hold_compile_diagnostics(suppress_diagnostics) as original_streams:
+            try:
+                extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
+            except Exception as ex:
+                sys.stderr.write("ansiroll: invalid extra vars: %s\n" % ex)
+                return 2
+            try:
+                source, manifest = compile_playbook(args.playbook, python_interpreter=args.interpreter,
+                                                    vault_password_file=args.vault_password_file,
+                                                    extra_vars=extra_vars,
+                                                    tree_shake=args.tree_shake,
+                                                    freeze_playbook_vars=args.freeze_playbook_vars,
+                                                    freeze_vars=args.freeze_var,
+                                                    on_playbook_open=on_playbook_open)
+            except Exception as ex:
+                if not isinstance(ex, (ValueError,) + _ansible_errors()):
+                    raise
+                message = str(ex)
+                if not message.startswith("ansiroll: "):
+                    message = "ansiroll: " + message
+                sys.stderr.write(message + "\n")
+                return 2
+    except SystemExit as ex:
+        if ex.code is not None and not isinstance(ex.code, int) and stderr_is_input():
+            raise SystemExit(1) from None
+        raise
+    except (Exception, KeyboardInterrupt) as ex:
+        if stderr_is_input():
+            return 130 if isinstance(ex, KeyboardInterrupt) else 2
+        raise
     try:
         check_input_destinations()
         if stdout is None:
             _write_compile_files(args.output, args.manifest, source, manifest, validate_input)
         else:
-            if args.manifest:
-                _write_stdout_manifest(args.manifest, manifest, stdout.fileno(), validate_input=validate_input)
             encoded = source.encode("utf-8")
-            validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
-            stdout.write(encoded)
-            stdout.flush()
-    except (ValueError, _TruncatingReopenError) as ex:
-        sys.stderr.write("ansiroll: %s\n" % ex)
-        return 2
-    sys.stderr.write(
+            wrote_stdout = False
+
+            def write_stdout(close=False):
+                nonlocal wrote_stdout
+                validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
+                stdout.write(encoded)
+                stdout.flush()
+                if close:
+                    stdout.close()
+                wrote_stdout = True
+
+            if args.manifest:
+                _write_stdout_manifest(args.manifest, manifest, stdout.fileno(),
+                                       validate_input=validate_input, write_stdout=write_stdout)
+            if not wrote_stdout:
+                write_stdout()
+    except (Exception, KeyboardInterrupt) as ex:
+        if isinstance(ex, (ValueError, _TruncatingReopenError)):
+            report("ansiroll: %s\n" % ex)
+        elif not stderr_is_input():
+            raise
+        return 130 if isinstance(ex, KeyboardInterrupt) else 2
+    report(
         "ansiroll: compiled %s -> %s (%d modules embedded, %d fallback tasks)\n"
         % (args.playbook, "stdout" if stdout is not None else args.output, len(manifest["modules"]),
            len(manifest["fallback_tasks"]))

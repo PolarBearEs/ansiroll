@@ -630,11 +630,15 @@ def _make_rewriting_loader(DataLoader):
                 if observe:
                     path = self.path_dwim(file_name)
                     # Only reuse parsed data whose input inode was observed.
-                    if self._FILE_CACHE.get(path) is not self._observed_playbook_cache.get(path):
+                    if (path not in self._observed_playbook_cache
+                            or self._FILE_CACHE.get(path) is not self._observed_playbook_cache[path]):
                         self._FILE_CACHE.pop(path, None)
                 data = super().load_from_file(file_name, *args, **kwargs)
                 if observe:
-                    self._observed_playbook_cache[path] = self._FILE_CACHE.get(path)
+                    if path in self._FILE_CACHE:
+                        self._observed_playbook_cache[path] = self._FILE_CACHE[path]
+                    else:
+                        self._observed_playbook_cache.pop(path, None)
             finally:
                 self._opening_playbook = opening_playbook
             if not (playbook or role_tasks or reader in task_readers):
