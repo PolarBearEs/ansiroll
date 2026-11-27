@@ -6395,7 +6395,7 @@ class Runtime:
             args.pop(key, None)
             if normalized is not _OMIT:
                 args[_FactKeyTemplate(key) if key in explicit_templates else key] = normalized
-        return args
+        return _mark_unsafe(args)
 
     def _run_accelerated_action(self, task, args, become=False):
         name = str(task.get("action") or "").split(".")[-1]

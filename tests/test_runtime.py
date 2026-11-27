@@ -2682,6 +2682,19 @@ def test_set_fact_string_results_are_trusted_as_templates():
     assert not rt.failed
 
 
+def test_set_fact_expanded_args_leave_generated_mapping_values_literal(monkeypatch):
+    import ansiroll.runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.21.1")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    task = _task("1", "set fact", "set_fact", args={
+        "_variable_params": "{{ {'generated': {'text': '{' ~ '{ sentinel }}'}} }}",
+    })
+    result = runtime._run_set_fact(task, {"sentinel": "rendered"}, None)
+    ctx = {"sentinel": "rendered", "hostvars": {"localhost": result["ansible_facts"]}}
+    assert runtime.template("{{ hostvars.localhost.generated.text }}", ctx) == "{{ sentinel }}"
+
+
 def test_special_action_accepts_entire_templated_argument_dictionary():
     tasks = [
         _task(
