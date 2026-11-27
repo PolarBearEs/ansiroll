@@ -1117,23 +1117,30 @@ def _setup_module_defaults(play, action):
     return [entry for entry in inherited if entry]
 
 
-def _controller_env_names(value):
+def _controller_env_names(value, *, trusted_only=False):
     """Find literal controller-side env lookups that the target must reproduce."""
-    return _controller_lookup_names(value, _ENV_LOOKUP_RE)
+    return _controller_lookup_names(value, _ENV_LOOKUP_RE, trusted_only=trusted_only)
 
 
-def _controller_config_names(value):
+def _controller_config_names(value, *, trusted_only=False):
     """Find literal config lookups whose controller values must be preserved."""
-    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE)
+    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE, trusted_only=trusted_only)
 
 
-def _controller_lookup_names(value, pattern):
+def _controller_lookup_names(value, pattern, *, trusted_only=False):
+    if trusted_only:
+        try:
+            from ansible.template import is_trusted_as_template
+        except ImportError:
+            def is_trusted_as_template(value):
+                return not getattr(value, "__UNSAFE__", False)
+
     names = set()
     seen = set()
     pending = [value]
     while pending:
         item = pending.pop()
-        if isinstance(item, str):
+        if isinstance(item, str) and (not trusted_only or is_trusted_as_template(item)):
             names.update(pattern.findall(item))
         elif isinstance(item, (dict, list, tuple)) and id(item) not in seen:
             seen.add(id(item))
