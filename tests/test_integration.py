@@ -9,6 +9,7 @@ import getpass
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -2399,6 +2400,19 @@ def test_synchronize_round_trips_the_rendered_loop_environment(tmp_path, monkeyp
     play, = Playbook.load(str(playbook), loader=loader).get_plays()
     original, = play.tasks[0].block
     original_environment = original.environment
+    file_vars = {
+        "file_options": {
+            "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
+            "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
+        },
+        "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
+        "file_list": ["{{ 'mixed' | upper }}"],
+        "optional_agent_alias": alias_value,
+        "typed_agent_alias": "{{ {8080: 'number', '8080': 'text', 3: {3: 'nested'}, 4: missing} }}",
+        "dated_agent_alias": "{{ '{2026-01-01: dated, ? !!binary YQ== : binary, plain: regular}' | from_yaml }}",
+        "item_options": {"bad": "{{ 'value' | unknown_filter }}", "ok": "valid"},
+        "unused_agent_alias": "{{ missing_value }}",
+    }
     agent = """
 import json
 import sys
@@ -2406,15 +2420,7 @@ from ansiroll import runtime
 runtime._INJECTED_VARS = json.loads(sys.argv[3])
 runtime.PLAYS = [{"vars": json.loads(sys.argv[3]), "deferred_vars_files": [{
     "names": ["/vars/{{ inventory_hostname }}.yml"],
-    "files": {"/vars/localhost.yml": [{"file_options": {
-        "label": "{{ 'release' | upper }}", "optional": "{{ missing }}",
-        "labels": ["{{ 'release' | upper }}", "{{ missing }}", "tail"],
-    }, "file_env": {"SYNC_FILE_WHOLE": "{{ 'mixed' | upper }}"},
-        "file_list": ["{{ 'mixed' | upper }}"], "optional_agent_alias": json.loads(sys.argv[4]),
-        "typed_agent_alias": "{{ {8080: 'number', '8080': 'text', 3: {3: 'nested'}, 4: missing} }}",
-        "dated_agent_alias": "{{ '{2026-01-01: dated, ? !!binary YQ== : binary, plain: regular}' | from_yaml }}",
-        "item_options": {"bad": "{{ 'value' | unknown_filter }}", "ok": "valid"},
-        "unused_agent_alias": "{{ missing_value }}"}]},
+    "files": {"/vars/localhost.yml": [json.loads(sys.argv[4])]},
 }], "tasks": [{
     "type": "task", "name": "Register a literal", "action": "ansible.builtin.debug",
     "special": "debug", "register": "prior", "args": {"msg": "{{ '{' ~ '{ item }' ~ '}' }}"},
@@ -2437,12 +2443,18 @@ runtime.agent_main()
     messages.append({"t": "delegate_result", "result": {"changed": False}})
     encoded = [json.dumps(message).encode() for message in messages]
     replies = b"".join(len(message).to_bytes(4, "big") + message for message in encoded)
+    selected_vars = {**_tag_untrusted(play.vars), **file_vars}
+    selected = json.dumps({"t": "vars_files_result", "result": {
+        "vars": json.dumps(selected_vars), "names": list(selected_vars), "missing": [], "mapping_keys": [],
+        "controller_lookups": {},
+    }}).encode()
+    replies = len(selected).to_bytes(4, "big") + selected + replies * 2
     serialized_environment = json.dumps(_tag_untrusted(original_environment, template_syntax_only=True))
     serialized_vars = json.dumps(_tag_untrusted(original.get_vars()))
     serialized_play_vars = json.dumps(_tag_untrusted(play.vars))
     result = subprocess.run([sys.executable, "-c", agent, serialized_environment,
-                             serialized_vars, serialized_play_vars, json.dumps(alias_value)],
-                            input=replies * 2,
+                             serialized_vars, serialized_play_vars, json.dumps(file_vars)],
+                            input=replies,
                             capture_output=True, timeout=15, check=True)
     stream = io.BytesIO(result.stdout)
     frames = []
@@ -5640,7 +5652,7 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,"):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -5655,6 +5667,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
         env=env,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
 
 
@@ -5838,6 +5851,44 @@ def test_expanded_nested_include_honors_inherited_run_once(tmp_path):
         (tmp_path / "origin.txt").unlink()
 
 
+@pytest.mark.parametrize("omit_once", [False, True])
+def test_recursive_include_rebinds_templated_apply_flags(tmp_path, monkeypatch, omit_once):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core resolves apply arguments at inclusion")
+    applied = "{{ omit if (depth | default(0)) == 1 else safe }}" if omit_once else "{{ safe }}"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {safe: true}
+  tasks:
+    - include_tasks:
+        file: recursive.yml
+        apply: {check_mode: APPLIED}
+    - assert: {that: depth == 40}
+""".replace("APPLIED", json.dumps(applied)))
+    (tmp_path / "recursive.yml").write_text("""- command: step
+- set_fact:
+    depth: '{{ (depth | default(0) | int) + 1 }}'
+    safe: '{{ not safe }}'
+- include_tasks:
+    file: recursive.yml
+    apply: {check_mode: APPLIED}
+  when: depth < 40
+""".replace("APPLIED", json.dumps(applied)))
+    source, manifest = compile_playbook(str(playbook))
+    assert not manifest["fallback_tasks"]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    modes = []
+    monkeypatch.setattr(runtime, "_run_accelerated_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: modes.append(runtime.check_mode)
+                        or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert modes == [True, omit_once] + [True, False] * 19
+
+
 def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
@@ -6012,6 +6063,181 @@ module.exit_json(changed=True, diff={"before": "", "after": "unconditional-diff-
     result = _run_strategy_play(tmp_path, play, "-e", "ansible_python_interpreter=" + sys.executable)
     assert result.returncode == 0, result.stdout + result.stderr
     assert ("+unconditional-diff-marker" in result.stdout) == diff
+
+
+def test_strategy_selects_vars_file_using_inventory_before_set_fact(tmp_path):
+    group_vars = tmp_path / "group_vars"
+    group_vars.mkdir()
+    (group_vars / "all.yml").write_text("setup_profile: inventory\n")
+    (tmp_path / "settings-inventory.yml").write_text("chosen: inventory\n")
+    (tmp_path / "settings-host-fact.yml").write_text("chosen: host-fact\n")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        setup_profile: host-fact
+
+- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files: ['settings-{{ setup_profile }}.yml']
+  tasks:
+    - assert:
+        that:
+          - chosen == 'inventory'
+          - setup_profile == 'host-fact'
+"""
+
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("no_log", [False, True])
+@pytest.mark.parametrize("alias", [False, True], ids=["devnull", "devnull-symlink"])
+def test_strategy_refreshes_vars_file_selection_after_gathering_facts(tmp_path, no_log, alias):
+    empty_file = os.devnull
+    if alias:
+        empty_file = tmp_path / "empty.yml"
+        empty_file.symlink_to(os.devnull)
+    (tmp_path / "settings-before.yml").write_text("before_gathering: old\n")
+    (tmp_path / ("settings-" + platform.system() + ".yml")).write_text(
+        'after_gathering: "{{ lookup(\'env\', \'ANSIROLL_TEST_FACT_SELECTED_ENV\') }}"\n')
+    playbook = """- hosts: localhost
+  gather_facts: true
+  no_log: NO_LOG
+  connection: local
+  vars_files:
+    - DEVNULL
+    - ['settings-{{ ansible_facts.get(''system'', ''missing'') }}.yml', 'settings-before.yml']
+  tasks:
+    - assert:
+        that:
+          - before_gathering is undefined
+          - after_gathering == 'fact-selected'
+""".replace("NO_LOG", str(no_log).lower()).replace("DEVNULL", json.dumps(str(empty_file)))
+    proc = _run_strategy_play(
+        tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+        environment={"ANSIROLL_TEST_FACT_SELECTED_ENV": "fact-selected"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_refreshes_cached_vars_file_with_playbook_relative_inventory_vars(tmp_path):
+    nested = tmp_path / "nested"
+    group_vars = nested / "group_vars"
+    group_vars.mkdir(parents=True)
+    (group_vars / "all.yml").write_text("profile: nested\n")
+    (nested / f"settings-nested-{platform.system()}.yml").write_text("selected: nested\n")
+    (nested / "play.yml").write_text("""- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars_files: ['settings-{{ profile }}-{{ ansible_facts.system }}.yml']
+  tasks:
+    - assert: {that: selected == 'nested'}
+""")
+    playbook = """- hosts: localhost
+  gather_facts: true
+  connection: local
+  tasks: []
+- import_playbook: nested/play.yml
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(
+            tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+            environment={"ANSIBLE_STRATEGY": strategy, "ANSIBLE_PLAYBOOK_VARS_ROOT": "bottom"}, timeout=45,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("invalid", ["fifo", "vault"])
+def test_strategy_rejects_invalid_vars_file_selected_after_setup(tmp_path, invalid):
+    from textwrap import indent
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    path = tmp_path / ("settings-" + platform.system() + ".yml")
+    if invalid == "fifo":
+        os.mkfifo(path)
+        expected = "not a regular file"
+    else:
+        key = VaultSecret(b"synthetic-test-password")
+        encrypted = VaultLib([("default", key)]).encrypt(b"synthetic content", secret=key)
+        path.write_text("selected: !vault |\n" + indent(encrypted.decode(), "  "))
+        expected = "could not serialize selected vars file value"
+    (tmp_path / "settings-before.yml").write_text("{}\n")
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files:
+    - ['settings-{{ ansible_facts.get(''system'', ''missing'') }}.yml', 'settings-before.yml']
+  tasks:
+    - debug: {msg: "{{ selected | default('value-was-dropped') }}"}
+""", "-e", "ansible_python_interpreter=" + sys.executable, timeout=45)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert expected in output, output
+    assert "value-was-dropped" not in output
+
+
+@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("cached", [False, True])
+def test_strategy_rejects_undefined_vars_file_after_successful_setup(tmp_path, fast, cached):
+    gather = """- hosts: localhost
+  gather_facts: true
+  connection: local
+  tasks:
+    - debug: {msg: gathered}
+"""
+    verify = """- hosts: localhost
+  gather_facts: GATHER
+  connection: local
+  vars_files: ['settings-{{ missing_file_selector }}.yml']
+  tasks:
+    - debug: {msg: should-not-run}
+""".replace("GATHER", str(not cached).lower())
+    playbook = (gather if cached else "") + verify
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        proc = _run_strategy_play(
+            tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+            environment={"ANSIBLE_STRATEGY": strategy, "ANSIROLL_FAST_FACTS": str(int(fast))},
+        )
+        output = proc.stdout + proc.stderr
+        assert proc.returncode != 0, output
+        assert "an undefined variable was found" in output, output
+        assert "should-not-run" not in output
+
+
+def test_strategy_does_not_capture_lookup_source_from_untrusted_fact(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires Ansible template trust tags")
+    (tmp_path / "settings-localhost.yml").write_text("replacement: safe\n")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        replacement: !unsafe "{{ lookup('env', 'ANSIROLL_UNTRUSTED_FACT_LOOKUP') }}"
+
+- hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files: ['settings-{{ inventory_hostname }}.yml']
+  tasks:
+    - assert:
+        that:
+          - "'ANSIROLL_UNTRUSTED_FACT_LOOKUP' in replacement"
+          - "'ANSIROLL_UNTRUSTED_FACT_LOOKUP' not in __ansiroll_controller_env"
+"""
+    proc = _run_strategy_play(
+        tmp_path, playbook, "-e", "ansible_python_interpreter=" + sys.executable,
+        environment={"ANSIROLL_UNTRUSTED_FACT_LOOKUP": "controller-only test value"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def test_strategy_preserves_set_fact_precedence_across_plays(tmp_path):

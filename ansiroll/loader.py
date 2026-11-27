@@ -1089,23 +1089,30 @@ def _setup_module_defaults(play, action):
     return [entry for entry in inherited if entry]
 
 
-def _controller_env_names(value):
+def _controller_env_names(value, *, trusted_only=False):
     """Find literal controller-side env lookups that the target must reproduce."""
-    return _controller_lookup_names(value, _ENV_LOOKUP_RE)
+    return _controller_lookup_names(value, _ENV_LOOKUP_RE, trusted_only=trusted_only)
 
 
-def _controller_config_names(value):
+def _controller_config_names(value, *, trusted_only=False):
     """Find literal config lookups whose controller values must be preserved."""
-    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE)
+    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE, trusted_only=trusted_only)
 
 
-def _controller_lookup_names(value, pattern):
+def _controller_lookup_names(value, pattern, *, trusted_only=False):
+    if trusted_only:
+        try:
+            from ansible.template import is_trusted_as_template
+        except ImportError:
+            def is_trusted_as_template(value):
+                return not getattr(value, "__UNSAFE__", False)
+
     names = set()
     seen = set()
     pending = [value]
     while pending:
         item = pending.pop()
-        if isinstance(item, str):
+        if isinstance(item, str) and (not trusted_only or is_trusted_as_template(item)):
             names.update(pattern.findall(item))
         elif isinstance(item, (dict, list, tuple)) and id(item) not in seen:
             seen.add(id(item))
@@ -1971,8 +1978,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         include_id = _new_include_id()
         for flag in apply_flags:
             value = _AppliedExecutionFlag(getattr(parent, flag))
-            inherited = parent._get_parent_attribute(flag, omit=True)
-            value.reference = [include_id, flag, _execution_omit_fallback(inherited)]
+            value.keyword = flag
             setattr(parent, flag, value)
         _INCLUDE_STACK[key] = include_id
         try:
@@ -1989,6 +1995,9 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                          role_defaults, role_vars, tasks, include_id, ref)
     if apply_flags:
         node["apply_flags"] = apply_flags
+        node["apply_omit_fallback"] = {
+            flag: _execution_omit_fallback(task._get_parent_attribute(flag, omit=True)) for flag in apply_flags
+        }
     return node
 
 
@@ -2132,7 +2141,7 @@ def _include_scope(task):
 
 
 def _include_scope_key(task):
-    keywords = ("become_user", "ignore_errors", "ignore_unreachable", "environment", "tags")
+    keywords = ("become_user", "ignore_errors", "ignore_unreachable", "environment", "tags", "run_once")
     return (
         *(repr(sorted(scope.items())) for scope in _include_scope(task)),
         tuple(repr(getattr(task, key, None)) for key in keywords),
@@ -4182,7 +4191,7 @@ def _execution_keyword(task, keyword, *, node_key=None):
     key = node_key or keyword
     value = getattr(task, keyword, None)
     if isinstance(value, _AppliedExecutionFlag):
-        return {key: {"__ansiroll_apply_flag__": value.reference}}
+        return {key: {"__ansiroll_apply_flag__": value.keyword}}
     value = _tag_untrusted(value)
     result = {key: value}
     if _is_templated(value) and _core_version() >= (2, 19):
@@ -4197,7 +4206,7 @@ def _execution_omit_fallback(value):
     from ansible.playbook.base import Sentinel
 
     if isinstance(value, _AppliedExecutionFlag):
-        return {"__ansiroll_apply_flag__": value.reference}
+        return {"__ansiroll_apply_flag__": value.keyword}
     if value is Sentinel:
         return None
     try:
