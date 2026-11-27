@@ -70,6 +70,12 @@ def _legacy_non_native(ctx):
     return config.get("DEFAULT_JINJA2_NATIVE") is False and _legacy_templating()
 
 
+def _bare_null_variable(source, ctx):
+    # Legacy Templar's anchored match also accepts a single final LF.
+    bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source) if isinstance(source, str) else None
+    return bare is not None and bare.group(1) in ctx and ctx[bare.group(1)] is None
+
+
 _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 _CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
@@ -5345,6 +5351,8 @@ class Runtime:
             for key, value in flags.items():
                 if isinstance(value, _Omit) or value is _KEYWORD_OMIT:
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
+                    if key == "diff" and inherited is None:
+                        inherited = self.diff_mode
                     flags[key] = self._bound_apply_flag(inherited, ctx)
             applied_vars = _setup_omit(self.template(authored_vars, self._check_mode_template_context(ctx)))
         except Exception as ex:
@@ -6349,9 +6357,17 @@ class Runtime:
             fallback = task.get(key + "_on_omit", default)
             if check_mode and fallback == "invocation":
                 return self._invocation_check_mode, omitted
-            if check_mode and fallback == "invalid":
-                raise ValueError("invalid inherited check_mode value")
+            if (check_mode or key == "diff") and fallback == "invalid":
+                raise ValueError("invalid inherited %s value" % key)
             value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
+        if value is None and key == "diff" and authored is not None:
+            if _legacy_templating() and _bare_null_variable(authored, ctx):
+                config = ctx.get("__ansiroll_controller_config") or {}
+                value = config.get("DEFAULT_NULL_REPRESENTATION")
+            elif _legacy_non_native(ctx):
+                raise TypeError("Invalid boolean value for 'diff'")
+            if value is None:
+                return False, omitted
         if value is None:
             return (False if check_mode and authored is not None else default), omitted
         return _boolean(value, strict=True), omitted

@@ -964,6 +964,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         config_names.add("DEFAULT_GATHER_SUBSET")
     if core_version >= (2, 19):
         config_names.add("DISPLAY_TRACEBACK")
+    else:
+        config_names.add("DEFAULT_NULL_REPRESENTATION")
     controller_config = _controller_config_values(config_names)
     from ansible.plugins.loader import connection_loader
 
@@ -4952,6 +4954,11 @@ def _execution_keyword(task, keyword, *, node_key=None):
 
     key = node_key or keyword
     value = getattr(task, keyword, None)
+    if (keyword == "diff" and value is None and _core_version() >= (2, 17)
+            and task._get_parent_attribute(keyword) is None):
+        # Copy uses the task's diff flag directly starting in 2.17.
+        # An unset flag can also resolve to None when compiling outside the CLI.
+        value = False
     if isinstance(value, _AppliedExecutionFlag):
         return {key: {"__ansiroll_apply_flag__": value.keyword}}
     value = _tag_untrusted(value)
@@ -4978,7 +4985,11 @@ def _execution_keyword(task, keyword, *, node_key=None):
     elif _is_templated(value) and _core_version() >= (2, 19):
         inherited = task._get_parent_attribute(keyword, omit=True)
         if inherited is not Sentinel:
-            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
+            if keyword == "diff" and _is_templated(inherited) and not isinstance(inherited, _AppliedExecutionFlag):
+                # Core validates a restored diff flag without templating it.
+                result[key + "_on_omit"] = "invalid"
+            else:
+                result[key + "_on_omit"] = _execution_omit_fallback(inherited)
     return result
 
 
