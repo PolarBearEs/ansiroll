@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, MappingView, Set
+from dataclasses import asdict
 
 DOCUMENTATION = """
     name: ansiroll
@@ -57,12 +58,11 @@ from jinja2 import StrictUndefined
 _UnifiedTaskResult = None
 try:  # 2.18-2.20: callbacks accept the private raw result wrapper
     from ansible.executor.task_result import _RawTaskResult as _ResultClass
-except Exception:  # 2.21+ uses UnifiedTaskResult; older cores use TaskResult
-    from ansible.executor.task_result import TaskResult as _ResultClass
+except ImportError:  # 2.21+ uses HostTaskResult; older cores use TaskResult
     try:
-        from ansible._internal._task import UnifiedTaskResult as _UnifiedTaskResult
-    except Exception:  # pragma: no cover - older ansible-core
-        pass
+        from ansible._internal._task import HostTaskResult as _ResultClass, UnifiedTaskResult as _UnifiedTaskResult
+    except ImportError:
+        from ansible.executor.task_result import TaskResult as _ResultClass
 
 display = Display()
 
@@ -1020,7 +1020,7 @@ class StrategyModule(StrategyBase):
                 safe_keys = ("ansible_delegated_host", "ansible_host", "ansible_port",
                              "ansible_user", "ansible_connection")
                 result["_ansible_delegated_vars"] = {key: delegated[key] for key in safe_keys if key in delegated}
-            return result
+            return _encode_controller_diagnostics(result)
         except Exception as ex:
             return {
                 "failed": True,
@@ -1797,66 +1797,10 @@ class StrategyModule(StrategyBase):
         return False
 
     def _make_result(self, host, task, result_data):
-        result_data = dict(result_data)
-        # 2.19+ callbacks expect a structured error summary. Reconstruct one
-        # from the agent's plain result so native-style diagnostics (including
-        # task source context) are retained.
-        if result_data.get("failed") and not _is_structured_error(
-                result_data.get("exception")):
-            summary = _failure_summary(task, result_data.get("msg"))
-            if summary is not None:
-                result_data["exception"] = summary
-            else:
-                result_data.pop("exception", None)
-        elif isinstance(result_data.get("exception"), str):
-            result_data.pop("exception")
-        # Same for deprecations: the agent forwards plain dicts, which the
-        # 2.19+ default callback cannot render; degrade them to warnings.
-        def summary_message(value):
-            if not isinstance(value, dict):
-                return str(value)
-            if value.get("msg"):
-                return str(value["msg"])
-            event = value.get("event")
-            if isinstance(event, dict) and event.get("msg"):
-                return str(event["msg"])
-            return str(value)
-
-        # Serialized module warnings/deprecations are plain dictionaries by
-        # the time they cross the agent channel.  New callbacks expect typed
-        # summary objects and otherwise abort before printing the normal ok
-        # line; older callbacks receive the string fallback below.
-        raw_warnings = result_data.pop("warnings", []) or []
-        raw_deprecations = result_data.pop("deprecations", []) or []
-        try:
-            from ansible.module_utils._internal._messages import (
-                DeprecationSummary, Event, WarningSummary,
-            )
-            if raw_warnings:
-                result_data["warnings"] = [
-                    WarningSummary(event=Event(msg=summary_message(w)))
-                    for w in raw_warnings
-                ]
-            if raw_deprecations:
-                result_data["deprecations"] = [
-                    DeprecationSummary(
-                        event=Event(msg=summary_message(dep)),
-                        date=dep.get("date") if isinstance(dep, dict) else None,
-                        version=dep.get("version") if isinstance(dep, dict) else None,
-                    )
-                    for dep in raw_deprecations
-                ]
-        except Exception:  # older ansible-core uses strings/dicts here
-            warnings = [summary_message(w) for w in raw_warnings]
-            warnings.extend(
-                "[DEPRECATION WARNING]: %s" % summary_message(dep)
-                for dep in raw_deprecations
-            )
-            if warnings:
-                result_data["warnings"] = warnings
+        result_data = _restore_callback_diagnostics(task, result_data)
         if _UnifiedTaskResult is not None:
             unified = _UnifiedTaskResult.from_action_result_dict(dict(result_data))
-            return _ResultClass(host, task, unified)
+            return _ResultClass(host=host, task=task, utr=unified)
         try:
             return _ResultClass(host, task, dict(result_data), task.dump_attrs())
         except TypeError:
@@ -1962,8 +1906,108 @@ def _controller_fallbacks(play_node):
     return found
 
 
-def _is_structured_error(value):
-    return value is not None and not isinstance(value, (str, dict))
+def _encode_controller_diagnostics(result):
+    """Keep native diagnostic details when a controller result crosses the agent channel."""
+    try:
+        from ansible.module_utils._internal._messages import SummaryBase
+    except ImportError:
+        return result
+
+    def encode(summary):
+        if not isinstance(summary, SummaryBase):
+            return summary
+        data = asdict(summary)
+        plugin = data.get("deprecator")
+        if plugin is not None and plugin.get("type") is not None:
+            plugin["type"] = plugin["type"].name
+        return data
+
+    if "exception" in result:
+        result["exception"] = encode(result["exception"])
+    for key in ("warnings", "deprecations"):
+        if result.get(key):
+            result[key] = [encode(summary) for summary in result[key]]
+    return result
+
+
+def _diagnostic_message(value):
+    if isinstance(value, dict):
+        if value.get("msg"):
+            return str(value["msg"])
+        event = value.get("event")
+        if isinstance(event, dict) and event.get("msg"):
+            return str(event["msg"])
+    return str(value)
+
+
+def _restore_callback_diagnostics(task, result):
+    result = dict(result)
+    if getattr(task, "loop", None) is not None and isinstance(result.get("results"), list):
+        result["results"] = [_restore_callback_diagnostics(task, item) if isinstance(item, dict) else item
+                             for item in result["results"]]
+    raw_warnings = result.pop("warnings", None) or ()
+    raw_deprecations = result.pop("deprecations", None) or ()
+    exception = result.pop("exception", None)
+    try:
+        from ansible.module_utils._internal._messages import (
+            DeprecationSummary, ErrorSummary, Event, EventChain, PluginInfo, PluginType, WarningSummary,
+        )
+    except ImportError:
+        warnings = [_diagnostic_message(w) for w in raw_warnings]
+        warnings.extend("[DEPRECATION WARNING]: %s" % _diagnostic_message(dep) for dep in raw_deprecations)
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def restore_event(event):
+        fields = dict(event)
+        if chain := fields.get("chain"):
+            fields["chain"] = EventChain(**{**chain, "event": restore_event(chain["event"])})
+        if isinstance(fields.get("events"), (list, tuple)):
+            fields["events"] = tuple(restore_event(event) for event in fields["events"])
+        return Event(**fields)
+
+    def decode(value, summary_class):
+        if isinstance(value, summary_class):
+            return value
+        if not isinstance(value, dict) or not isinstance(value.get("event"), dict):
+            return None
+        try:
+            fields = dict(value, event=restore_event(value["event"]))
+            if plugin := fields.get("deprecator"):
+                if not isinstance(plugin, dict):
+                    return None
+                plugin_type = PluginType[plugin["type"]] if plugin.get("type") is not None else None
+                fields["deprecator"] = PluginInfo(resolved_name=plugin.get("resolved_name"), type=plugin_type)
+            if summary_class is ErrorSummary and "error_context" in fields:
+                from ansible._internal._errors._captured import CapturedErrorSummary
+
+                return CapturedErrorSummary(**fields)
+            return summary_class(**fields)
+        except (ImportError, KeyError, RecursionError, TypeError, ValueError):
+            # Module results can contain arbitrary JSON under these keys.
+            return None
+
+    summary = decode(exception, ErrorSummary)
+    if summary is None and result.get("failed"):
+        summary = _failure_summary(task, result.get("msg"))
+    if summary is not None:
+        result["exception"] = summary
+    if raw_warnings:
+        result["warnings"] = [decode(warning, WarningSummary)
+                              or WarningSummary(event=Event(msg=_diagnostic_message(warning)))
+                              for warning in raw_warnings]
+    if raw_deprecations:
+        deprecations = []
+        for raw in raw_deprecations:
+            summary = decode(raw, DeprecationSummary)
+            if summary is None:
+                options = {name: raw[name] for name in ("date", "version")
+                           if isinstance(raw, dict) and isinstance(raw.get(name), str)}
+                summary = DeprecationSummary(event=Event(msg=_diagnostic_message(raw)), **options)
+            deprecations.append(summary)
+        result["deprecations"] = deprecations
+    return result
 
 
 def _failure_summary(task, message):

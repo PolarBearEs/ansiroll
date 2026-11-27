@@ -4598,6 +4598,22 @@ def test_explicit_until_retries_module_skip_and_sees_result_defaults(monkeypatch
     assert result["attempts"] == 1
 
 
+@pytest.mark.parametrize("version", ["2.20.11", "2.21.1"])
+def test_retry_exhaustion_preserves_controller_error_summary(monkeypatch, version):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", version)
+    rt = Runtime({}, "", {})
+    exception = {"event": {"msg": "controller failure", "formatted_source_context": "Origin: play.yml:5:7"}}
+    rt.delegate_fn = lambda *args: {"failed": True, "exception": exception}
+    task = _task("sync", "Synchronize", None, action="synchronize", fallback=True,
+                 retries=1, delay=0)
+
+    result = rt._exec_with_retries(task, {})
+
+    assert result["failed"] is True
+    assert result["attempts"] == 1
+    assert result["exception"] == exception
+
+
 def test_async_acknowledgment_loss_stops_retries(monkeypatch):
     rt = Runtime({"test": {"module_fqn": "test"}}, "", {})
     calls = []

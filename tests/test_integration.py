@@ -2272,6 +2272,86 @@ class ActionModule(ActionBase):
     assert "synthetic-fixture-password" not in result.stdout + result.stderr
 
 
+def test_controller_synchronize_replays_native_diagnostics(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 20):
+        pytest.skip("native controller diagnostics in this test require Core 2.20")
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "synchronize.py").write_text("""from ansible.errors import AnsibleError
+from ansible.plugins.action import ActionBase
+from ansible.utils.display import Display
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        if self._task.args.get("fail"):
+            try:
+                raise ValueError("controller diagnostic inner failure")
+            except ValueError as ex:
+                raise AnsibleError("controller diagnostic outer failure") from ex
+        display = Display()
+        display.warning("controller diagnostic warning", obj=self._task.get_ds(),
+                        help_text="controller diagnostic warning help")
+        display.deprecated("controller diagnostic deprecation", collection_name="sample.fixture",
+                           version="9.0", obj=self._task.get_ds())
+        return {"changed": False}
+""")
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - synchronize: {}
+    - synchronize: {fail: true}
+"""
+    env = {"ANSIBLE_DEPRECATION_WARNINGS": "1", "ANSIBLE_DISPLAY_TRACEBACK": "never"}
+    linear = _run_strategy_play(tmp_path, playbook, environment={**env, "ANSIBLE_STRATEGY": "linear"}, timeout=90)
+    compiled = _run_strategy_play(tmp_path, playbook, environment=env, timeout=90)
+    assert linear.returncode == compiled.returncode == 2, compiled.stdout + compiled.stderr
+
+    def diagnostic(output, prefix):
+        return re.search(r"(?m)^" + re.escape(prefix) + r".*\nOrigin: [^\n]+", output).group()
+
+    assert diagnostic(compiled.stderr, "[WARNING]: controller diagnostic warning") == diagnostic(
+        linear.stderr, "[WARNING]: controller diagnostic warning")
+    assert "controller diagnostic warning help\n" in compiled.stderr
+    assert diagnostic(compiled.stderr, "[DEPRECATION WARNING]: controller diagnostic deprecation") == diagnostic(
+        linear.stderr, "[DEPRECATION WARNING]: controller diagnostic deprecation")
+    prefix = "[ERROR]: Task failed: controller diagnostic outer failure: controller diagnostic inner failure"
+    assert diagnostic(compiled.stdout, prefix) == diagnostic(linear.stdout, prefix)
+
+
+def test_controller_diagnostic_round_trip_preserves_linked_and_grouped_events():
+    messages = pytest.importorskip("ansible.module_utils._internal._messages")
+    strategy = _load_strategy_module()
+    event = messages.Event(
+        msg="outer",
+        chain=messages.EventChain(msg_reason="cause", traceback_reason="previous", event=messages.Event(msg="inner")),
+        events=(messages.Event(msg="grouped"),),
+    )
+    deprecator = messages.PluginInfo(resolved_name="sample.fixture.action", type=messages.PluginType.ACTION)
+    result = {"failed": True, "exception": messages.ErrorSummary(event=event),
+              "warnings": [messages.WarningSummary(event=event)],
+              "deprecations": [messages.DeprecationSummary(event=event, deprecator=deprecator, version="9.0")]}
+    encoded = strategy._encode_controller_diagnostics(dict(result))
+    wire = json.loads(json.dumps(encoded))
+
+    assert strategy._restore_callback_diagnostics(SimpleNamespace(), wire) == result
+
+
+def test_controller_diagnostic_replay_tolerates_malformed_module_deprecation_metadata():
+    pytest.importorskip("ansible.module_utils._internal._messages")
+    strategy = _load_strategy_module()
+    result = {"deprecations": [
+        {"msg": "legacy warning", "version": 2.3},
+        {"event": {"msg": "malformed metadata"}, "deprecator": "broken"},
+    ]}
+
+    restored = strategy._restore_callback_diagnostics(SimpleNamespace(), result)
+
+    assert [item.event.msg for item in restored["deprecations"]] == ["legacy warning", "malformed metadata"]
+
+
 def test_controller_synchronize_uses_check_mode_from_include_apply(tmp_path):
     plugins = tmp_path / "action_plugins"
     plugins.mkdir()

@@ -6296,7 +6296,9 @@ class Runtime:
             res["failed"] = fw_result
         else:
             res["failed"] = True
-        if _core_at_least(2, 19) and (not modern_result or action_failed):
+        exception = res.get("exception")
+        has_error_summary = isinstance(exception, dict) and isinstance(exception.get("event"), dict)
+        if _core_at_least(2, 19) and (not modern_result or action_failed) and not has_error_summary:
             # Core projects the captured task error as a traceback string.
             # From 2.21 exhaustion alone no longer creates a captured error.
             config = ctx.get("__ansiroll_controller_config") or {}
