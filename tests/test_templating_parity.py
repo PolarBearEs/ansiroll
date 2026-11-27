@@ -360,6 +360,31 @@ class LookupModule(LookupBase):
     assert "synthetic private contents" not in result.stdout
 
 
+@pytest.mark.parametrize(("options", "expected"), [
+    ("", " \tpayload"),
+    (', lstrip="false"', "payload" if LEGACY_SETUP else " \tpayload"),
+    (', rstrip=" OFF "', " \tpayload" if LEGACY_SETUP else " \tpayload \t\n"),
+    (', lstrip=" Y ", rstrip="t"', "payload"),
+], ids=["defaults", "false-lstrip", "false-rstrip", "true-options"])
+def test_implicit_setup_replays_file_lookup_strip_options(tmp_path, options, expected):
+    value = f'lookup("file", "strip-check.txt"{options})'
+    selected = f'"ansible_distribution" if {value} | length == {len(expected)} else "ansible_hostname"'
+    expression = "{{ " + (selected if LEGACY_SETUP else f"[{selected}]") + " }}"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    SETUP_ACTION:
+      filter: 'FILTER_EXPRESSION'
+  tasks:
+    - debug:
+        msg: "{{ 'distribution' if ansible_facts.distribution is defined else 'hostname' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup")
+                  .replace("FILTER_EXPRESSION", expression),
+        {"files/strip-check.txt": " \tpayload \t\n"})
+    assert messages == ["distribution"]
+
+
 @pytest.mark.parametrize("source", ["play-vars", "vars-files"])
 def test_implicit_setup_replays_file_lookups_reachable_at_launch(tmp_path, source):
     def lookup(filename):

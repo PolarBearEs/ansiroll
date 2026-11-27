@@ -1755,6 +1755,10 @@ def _lookup_values(name, args, kwargs, ctx=None):
         vals = []
         lstrip = kwargs.get("lstrip", False)
         rstrip = kwargs.get("rstrip", True)
+        # Core 2.12 began treating these as typed lookup options.
+        if _core_at_least(2, 12):
+            lstrip = _boolean(lstrip)
+            rstrip = _boolean(rstrip)
         if setup_lookups is not None:
             files = setup_lookups.get("file", {}).get(qualified_name, {})
             for term in map(str, args):
