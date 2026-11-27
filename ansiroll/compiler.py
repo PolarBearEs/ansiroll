@@ -54,7 +54,7 @@ _FOOTER = '''
 if __name__ == "__main__":
     import sys as _sys
     _host = globals().get("_INJECTED_HOST") or os.environ.get("ANSIROLL_HOST", _ANSIROLL_HOST)
-    _host_vars = {"inventory_hostname": _host}
+    _host_vars = {"inventory_hostname": _mark_unsafe(_host)}
     _host_vars.update(_BAKED_GROUP_VARS)
     # ANSIROLL_VARS_FILE follows `ansible-playbook -e` semantics: extra vars,
     # highest precedence (play vars must not override them).
@@ -79,6 +79,8 @@ if __name__ == "__main__":
             _sys.exit(2)
     if "_INJECTED_VARS" in globals():
         _host_vars.update(_INJECTED_VARS)
+        if "inventory_hostname" in _INJECTED_VARS:
+            _host_vars["inventory_hostname"] = _mark_unsafe(_host_vars["inventory_hostname"])
     _become_pass = globals().get("_INJECTED_BECOME_PASS") or os.environ.get("ANSIROLL_BECOME_PASS")
     # Direct runs are for humans: Ansible-like output by default. Controllers use
     # agent mode and never come through here; ANSIROLL_RAW=1 restores the framed
@@ -101,7 +103,7 @@ if __name__ == "__main__":
                    pretty=_pretty, profile=_profile, native_only=_native_only,
                    module_bundle=_ansiroll_import_bytes,
                    resource_reader=_ansiroll_resource_read,
-                   engine_bootstrap=_ANSIROLL_BOOTSTRAP_SECONDS))
+                   engine_bootstrap=_ANSIROLL_BOOTSTRAP_SECONDS, launcher_host=_host))
 '''
 
 

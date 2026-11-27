@@ -81,6 +81,108 @@ def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
     }
 
 
+def test_standalone_rebuilds_each_play_scope_and_retains_host_state(tmp_path):
+    from ansiroll import compile_playbook
+
+    (tmp_path / "play-vars.yml").write_text("only_in_first_play: first\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: true
+  vars:
+    group_names: [play]
+    temporary: first
+    changing: before
+    ansible_facts:
+      alias: "{{ changing }}"
+    hostvars:
+      other: {scope: play}
+  vars_files: [play-vars.yml]
+  tasks:
+    - assert: {that: "group_names == ['play']"}
+    - set_fact:
+        my_cached_fact: cached
+        cacheable: true
+    - set_fact: {changing: after}
+    - assert: {that: ansible_facts.alias == 'after'}
+    - set_fact: {delegated_fact: delegated}
+      delegate_to: localhost
+      delegate_facts: true
+    - assert: {that: "hostvars.other.scope == 'play'"}
+    - debug: {msg: saved}
+      register: saved_result
+- hosts: all
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - group_names == ['inventory']
+          - temporary is undefined
+          - only_in_first_play is undefined
+          - saved_result.msg == 'saved'
+          - hostvars.localhost.delegated_fact == 'delegated'
+          - hostvars.other is undefined
+          - my_cached_fact == 'cached'
+          - ansible_facts.my_cached_fact == 'cached'
+          - ansible_facts.system is defined
+          - ansible_facts.alias is undefined
+""")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    runner = ("import runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__', "
+              "init_globals={'_INJECTED_VARS': {'group_names': ['inventory']}})")
+    result = subprocess.run([sys.executable, "-c", runner, str(compiled)], capture_output=True,
+                            env=dict(os.environ, ANSIROLL_HOST="worker"), text=True, timeout=45)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_standalone_renders_baked_hostname_alias(tmp_path):
+    from ansiroll import compile_playbook
+
+    group_vars = tmp_path / "group_vars"
+    group_vars.mkdir()
+    (group_vars / "all.yml").write_text("inventory_hostname: '{{ configured_name }}'\nconfigured_name: configured\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    configured_name: play-local-name
+  tasks:
+    - set_fact: {configured_name: written-name}
+- hosts: all
+  gather_facts: false
+  tasks:
+    - assert:
+        that:
+          - inventory_hostname == 'configured'
+          - inventory_hostname_short == 'configured'
+          - inventory_hostname in hostvars
+          - configured_name == 'written-name'
+""")
+    compiled = tmp_path / "compiled.py"
+    compiled.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run([sys.executable, str(compiled)], env=dict(os.environ, ANSIROLL_HOST="launcher.example"),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_standalone_uses_previous_host_fact_to_resolve_become_password(monkeypatch):
+    from ansiroll.runtime import Runtime, main
+
+    passwords = []
+    facts = []
+
+    def run_play(runtime, play, **kwargs):
+        passwords.append(runtime.become_password)
+        facts.append(runtime.vars.get("ansible_facts"))
+        if play.get("set_password"):
+            runtime._absorb_facts({"action": "set_fact"}, {"ansible_facts": {"ansible_become_pass": "synthetic"}})
+
+    monkeypatch.setattr(Runtime, "run_play", run_play)
+    assert main([{"set_password": True}, {}], {}, "", pretty=True) == 0
+    assert passwords == [None, "synthetic"]
+    assert facts == [None, {}]
+
+
 @pytest.mark.parametrize(("host", "selector", "short_override"), [
     ("node.example.test", "inventory_hostname_short | default(profile)", None),
     ("node.example.test", "inventory_hostname_short | default(profile)", "override"),

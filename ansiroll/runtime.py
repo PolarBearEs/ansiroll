@@ -4394,7 +4394,7 @@ class Runtime:
                  check_mode=False, diff_mode=False, on_result=None, become_password=None, profile=False,
                  extra_vars=None, skip_run_once=False, pretty=False,
                  module_bundle=None, resource_reader=None,
-                 host_var_overrides=None, native_only=False, inventory_defaults=None):
+                 host_var_overrides=None, native_only=False, inventory_defaults=None, inventory_host=None):
         self.modules = modules
         # Standalone defaults are available to tasks without entering the host
         # state that deferred vars-file selectors read and later plays inherit.
@@ -4435,6 +4435,7 @@ class Runtime:
         # include_vars results: above task vars, below set_fact/register.
         self._include_vars_layer = {}
         self._module_fact_layer = {}
+        self._standalone_host_state = None
         self._facts_gathered = False
         self.native_only = bool(native_only)
         self._task_provenance = {}
@@ -4477,7 +4478,7 @@ class Runtime:
         self._strict_var_resolution = False
         self.stats = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
                       "unreachable": 0, "rescued": 0, "ignored": 0}
-        self.host = self._initial_host_vars.get("inventory_hostname") or _hostname()
+        self.host = inventory_host or self._initial_host_vars.get("inventory_hostname") or _hostname()
         self.failed = False
         self.unreachable = False
         if self.become_password is None:
@@ -4898,7 +4899,7 @@ class Runtime:
         play_check_mode = play.get("check_mode")
         if play_check_mode is not None:
             if isinstance(play_check_mode, str):
-                play_check_mode = self.template(play_check_mode, self.ctx())
+                play_check_mode = self.template(play_check_mode, self.ctx(self.extra_vars))
             self.check_mode = _boolean(play_check_mode)
         if play.get("jinja_plugins"):
             plugins = []
@@ -4925,6 +4926,25 @@ class Runtime:
         self.vars["__ansiroll_controller_config"] = (
             play.get("controller_config") or {}
         )
+        if self._standalone_host_state is not None:
+            configured_host = self._standalone_host_state.get("inventory_hostname")
+            if _looks_templated(configured_host) and not isinstance(configured_host, _NO_TEMPLATE):
+                inventory_ctx = self.ctx(self.extra_vars, base={
+                    **self._vars_file_host_vars,
+                    "__ansiroll_controller_env": self.vars["__ansiroll_controller_env"],
+                    "__ansiroll_controller_config": self.vars["__ansiroll_controller_config"],
+                })
+                alias = self.template(configured_host, inventory_ctx)
+                if isinstance(alias, str) and alias:
+                    self.host = alias
+                    # Resolve the inventory identity before applying play-local
+                    # variables so both the hostname and its hostvars key agree.
+                    if self.vars.get("inventory_hostname") == configured_host:
+                        self.vars["inventory_hostname"] = alias
+                    self._inventory_defaults = {
+                        **self._inventory_defaults,
+                        "inventory_hostname_short": _mark_unsafe(_inventory_hostname_short(alias)),
+                    }
         self._play_var_names.clear()
         self.vars.update(self._visible_module_facts(self._module_fact_layer))
         saved_facts = self.vars.get("ansible_facts")
@@ -7576,6 +7596,25 @@ class Runtime:
             return self.host
         return next((name for name in hostvars if name in _LOCALHOST_NAMES), target)
 
+    def _with_delegated_facts(self, hostvars, fact_host, facts, exposed, cacheable):
+        hostvars = dict(hostvars or {})
+        previous = hostvars.get(fact_host)
+        target = dict(previous or {})
+        target.update(exposed)
+        if (cacheable and fact_host not in self._delegated_ansible_facts_overrides
+                and "ansible_facts" not in self.extra_vars):
+            cached = target.get("ansible_facts")
+            target["ansible_facts"] = {
+                **(cached if isinstance(cached, dict) else {}),
+                **_normalized_facts(facts, preserve_local=True),
+            }
+        hostvars[fact_host] = target
+        if fact_host in _LOCALHOST_NAMES:
+            for alias in _LOCALHOST_NAMES:
+                if alias != self.host and (alias not in hostvars or hostvars[alias] is previous):
+                    hostvars[alias] = target
+        return hostvars
+
     def _absorb_facts(self, task, res, fact_host=None, *, rescue_overrides=None, no_log=False):
         refreshed_vars = res.pop("_ansiroll_vars", None)
         if isinstance(refreshed_vars, dict):
@@ -7591,28 +7630,17 @@ class Runtime:
             facts = _mark_unsafe(facts)
             short_action = str(task.get("action") or "").rsplit(".", 1)[-1]
             if fact_host is not None and fact_host != self.host:
-                hostvars = dict(self.vars.get("hostvars") or {})
+                hostvars = self.vars.get("hostvars") or {}
                 if fact_host not in hostvars and fact_host not in _LOCALHOST_NAMES:
                     return
-                previous = hostvars.get(fact_host)
-                target = dict(previous or {})
                 exposed = {key: value for key, value in facts.items() if key not in self.extra_vars}
-                target.update(exposed)
                 if "ansible_facts" in exposed:
                     self._delegated_ansible_facts_overrides.add(fact_host)
-                if (res.get("_ansible_facts_cacheable") and fact_host not in self._delegated_ansible_facts_overrides
-                        and "ansible_facts" not in self.extra_vars):
-                    cached = target.get("ansible_facts")
-                    target["ansible_facts"] = {
-                        **(cached if isinstance(cached, dict) else {}),
-                        **_normalized_facts(facts, preserve_local=True),
-                    }
-                hostvars[fact_host] = target
-                if fact_host in _LOCALHOST_NAMES:
-                    for alias in _LOCALHOST_NAMES:
-                        if alias != self.host and (alias not in hostvars or hostvars[alias] is previous):
-                            hostvars[alias] = target
-                self.vars["hostvars"] = hostvars
+                cacheable = res.get("_ansible_facts_cacheable")
+                self.vars["hostvars"] = self._with_delegated_facts(hostvars, fact_host, facts, exposed, cacheable)
+                if self._standalone_host_state is not None:
+                    self._standalone_host_state["hostvars"] = self._with_delegated_facts(
+                        self._standalone_host_state.get("hostvars"), fact_host, facts, exposed, cacheable)
                 return
             if short_action == "set_fact":
                 self.vars.update(facts)
@@ -7623,6 +7651,8 @@ class Runtime:
                         rescue_overrides.append((writes, no_log, bool(res.get("_ansible_facts_cacheable"))))
                 if not res.get("_ansible_facts_cacheable"):
                     self.vars.setdefault("ansible_facts", {})
+                    if self._standalone_host_state is not None:
+                        self._standalone_host_state.setdefault("ansible_facts", {})
                     return
             elif short_action == "include_vars":
                 self.vars.update(facts)
@@ -7630,13 +7660,19 @@ class Runtime:
             else:
                 self._module_fact_layer.update(facts)
                 self.vars.update(self._visible_module_facts(facts))
-            existing = self.vars.get("ansible_facts")
-            if not isinstance(existing, dict):
-                existing = self.vars["ansible_facts"] = {}
             # The `ansible_facts` magic var holds facts without the ansible_
             # prefix ('fqdn' in ansible_facts), unlike the injected top-level
             # ansible_* vars.
-            existing.update(_normalized_facts(facts, preserve_local=short_action == "set_fact"))
+            normalized = _normalized_facts(facts, preserve_local=short_action == "set_fact")
+            existing = self.vars.get("ansible_facts")
+            if not isinstance(existing, dict):
+                existing = self.vars["ansible_facts"] = {}
+            existing.update(normalized)
+            if self._standalone_host_state is not None:
+                saved = self._standalone_host_state.get("ansible_facts")
+                self._standalone_host_state["ansible_facts"] = {
+                    **(saved if isinstance(saved, dict) else {}), **normalized,
+                }
 
     def _notification_names(self, task, ctx):
         with self._strict_vars():
@@ -8515,17 +8551,21 @@ def _state_json_default(value):
 def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_mode=False,
          become_password=None, defer_handlers=False, initial_notified=None,
          extra_vars=None, pretty=False, profile=False, module_bundle=None,
-         resource_reader=None, engine_bootstrap=None, native_only=False):
+         resource_reader=None, engine_bootstrap=None, native_only=False, launcher_host=None):
     runtime_started = time.monotonic()
     host_vars = dict(host_vars or {})
-    host = host_vars.get("inventory_hostname") or _hostname()
+    configured_host = host_vars.get("inventory_hostname")
+    if launcher_host is None and configured_host:
+        # Direct Runtime API callers provide their inventory hostname as data.
+        host_vars["inventory_hostname"] = configured_host = _mark_unsafe(configured_host)
+    host = _decode_included_var(configured_host)
+    if not isinstance(host, str) or not host or (_looks_templated(host) and not isinstance(host, _NO_TEMPLATE)):
+        host = launcher_host or _hostname()
     inventory_defaults = {
         "inventory_hostname_short": _mark_unsafe(_inventory_hostname_short(host)),
         "group_names": ["ungrouped"],
     }
-    if host_vars.get("inventory_hostname"):
-        host_vars["inventory_hostname"] = _mark_unsafe(host)
-    else:
+    if not configured_host:
         inventory_defaults["inventory_hostname"] = _mark_unsafe(host)
     failed = False
     total = {"ok": 0, "changed": 0, "failures": 0, "skipped": 0,
@@ -8547,6 +8587,8 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
     }
     rt = None
     vars_file_host_vars = {**inventory_defaults, **host_vars}
+    # Keep inventory and host writes separate from each play's merged scope.
+    host_state = dict(host_vars)
     host_var_overrides = {}
     delegated_ansible_facts_overrides = set()
     include_vars_layer = {}
@@ -8559,15 +8601,20 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
             banner = "PLAY [%s] " % (play.get("name") or play.get("hosts") or "")
             sys.stdout.write("\n" + banner + "*" * max(3, 79 - len(banner)) + "\n")
         init_started = time.monotonic()
-        rt = Runtime(modules, ansiballz_code, host_vars, check_mode=check_mode,
+        play_host_vars = {**host_state, **module_fact_layer, **include_vars_layer, **host_var_overrides}
+        if isinstance(play_host_vars.get("ansible_facts"), dict):
+            # The live namespace is updated in place to preserve lazy play bindings.
+            play_host_vars["ansible_facts"] = play_host_vars["ansible_facts"].copy()
+        rt = Runtime(modules, ansiballz_code, play_host_vars, check_mode=check_mode,
                      diff_mode=diff_mode,
                      become_password=become_password, extra_vars=extra_vars,
                      pretty=pretty, profile=profile, module_bundle=module_bundle,
                      resource_reader=resource_reader,
                      host_var_overrides=host_var_overrides,
-                     native_only=native_only, inventory_defaults=inventory_defaults)
+                     native_only=native_only, inventory_defaults=inventory_defaults, inventory_host=host)
         rt._include_vars_layer = dict(include_vars_layer)
         rt._module_fact_layer = dict(module_fact_layer)
+        rt._standalone_host_state = host_state
         rt._vars_file_host_vars = vars_file_host_vars
         rt._delegated_ansible_facts_overrides = delegated_ansible_facts_overrides
         engine_profile["runtime_init"] += time.monotonic() - init_started
@@ -8585,11 +8632,9 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
             cleanup_started = time.monotonic()
             rt.cleanup()  # shut the worker down
             engine_profile["worker_cleanup"] += time.monotonic() - cleanup_started
-        host_vars = rt.vars  # carry facts/registers across plays for the same host
         host_var_overrides = rt._set_fact_overrides
         include_vars_layer = rt._include_vars_layer
         module_fact_layer = rt._module_fact_layer
-        host = rt.host
         failed = failed or rt.failed
         for k in total:
             total[k] += rt.stats.get(k, 0)
@@ -8637,6 +8682,8 @@ def main(plays, modules, ansiballz_code, host_vars=None, check_mode=False, diff_
         for identity, count in rt.engine_profile.get("worker_identities", {}).items():
             identities = engine_profile["worker_identities"]
             identities[identity] = identities.get(identity, 0) + count
+    if rt is not None:
+        host = rt.host
     if not pretty:
         # Emit the accumulated var state + pending handler notifications so a controller
         # can carry them into the next segment (segment-driven delegation).
