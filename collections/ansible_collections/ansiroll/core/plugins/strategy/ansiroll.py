@@ -563,8 +563,11 @@ class StrategyModule(StrategyBase):
         included_vars_by_task = {}
         last_frame = time.monotonic()
 
-        def resolve_play_var(name=None, *, member=None):
-            chan.send({"t": "delegate_play_var", "name": name, "member": member})
+        def resolve_play_var(name=None, *, member=None, template_vars=None):
+            request = {"t": "delegate_play_var", "name": name, "member": member}
+            if template_vars:
+                request["template_vars"] = template_vars
+            chan.send(request)
             reply = chan.recv()
             if not reply or reply.get("t") != "delegate_play_var_result":
                 raise RuntimeError("ansiroll: agent did not return a delegated play variable")
@@ -1002,6 +1005,7 @@ class StrategyModule(StrategyBase):
                 }},
             }
             job_vars = dict(frame.get("vars") or {})
+            template_vars = {}
             if names := frame.get("lazy_template_vars"):
                 from ansiroll.runtime import (
                     _DEFER_LOOKUP_NAMES,
@@ -1017,7 +1021,13 @@ class StrategyModule(StrategyBase):
                     return _AnsirollUndefined(hint=message) if missing else _captured(message)
 
                 def load_template_var(name=None, *, member=None):
-                    resolved = resolve_play_var(name, member=member) if resolve_play_var else None
+                    action_vars = dict(template_vars)
+                    for key in ("template_mtime", "template_run_date"):
+                        if action_vars.get(key) is not None:
+                            action_vars[key] = action_vars[key].isoformat()
+                    template_vars.clear()
+                    resolved = (resolve_play_var(name, member=member, template_vars=action_vars)
+                                if resolve_play_var else None)
                     if resolved is None:
                         return _captured("unable to resolve delegated template value")
                     if "error" in resolved:
@@ -1038,10 +1048,12 @@ class StrategyModule(StrategyBase):
                         return _HostVarView(items, rt, job_vars)
                     return _lazy_container(items, rt, job_vars, delegated=True)
 
-                job_vars[_DEFER_LOOKUP_NAMES] = True
+                if frame.get("defer_template_names"):
+                    job_vars[_DEFER_LOOKUP_NAMES] = True
                 for name in names:
                     job_vars[name] = _DelegatedTemplateValue(lambda name=name: load_template_var(name))
-            return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")))
+            return rt._run_file_action("template", task, args, job_vars, become=bool(frame.get("become")),
+                                       template_vars=template_vars if names else None)
         finally:
             rt.check_mode, rt.become_user = previous
 
