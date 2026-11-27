@@ -828,6 +828,7 @@ def _vars_file_glob_covers(pattern, name):
     patterns = pattern.split(os.path.sep)
     return len(parts) == len(patterns) and all(
         (part or not segment) and (not part.startswith(".") or segment.startswith("."))
+        and (part != os.pardir or segment == os.pardir)
         and fnmatchcase(part, segment)
         for part, segment in zip(parts, patterns)
     )
@@ -1663,6 +1664,7 @@ def _first_found_vars_file(args, kwargs, selector):
             terms = (files,)
         filenames = [tuple(split_terms((term,), "[,;]")) if modern else (term,) for term in split_terms(terms)]
     bundled = selector["files"]
+    parent_paths = selector.get("parent_paths")
     render_candidate = selector.get("render_candidate")
     for group in filenames:
         for folder in paths or ("",):
@@ -1682,17 +1684,19 @@ def _first_found_vars_file(args, kwargs, selector):
                         directory = selector["home"]
                     if directory is not None:
                         candidate = os.path.join(directory, relative) if relative else directory
-                if ".." in candidate.split(os.path.sep):
+                covered = any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"])
+                parent_relative = os.pardir in candidate.split(os.path.sep)
+                if parent_relative and (not covered or parent_paths is None):
                     raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
                 absolute = os.path.isabs(candidate)
                 if not absolute and not selector.get("search_path_matches", True):
                     raise ValueError("first_found ansible_search_path differs from the bundled search paths; "
                                      "recompile with the current search paths")
                 roots = ("",) if absolute else selector["roots"]
-                covered = any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"])
                 for root in roots:
-                    path = os.path.normpath(os.path.join(root, candidate))
-                    if path in bundled:
+                    candidate_path = os.path.join(root, candidate)
+                    path = os.path.normpath(candidate_path)
+                    if path in bundled and (not parent_relative or candidate_path in parent_paths):
                         return [path]
                     if not covered:
                         # We cannot rule this root out before trying a later one.

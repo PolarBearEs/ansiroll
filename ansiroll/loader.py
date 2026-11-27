@@ -1515,17 +1515,22 @@ def _deferred_vars_files(play, basedir, entries):
                     first_found_roots, search_path, known_search_path = first_found_search
                     plugin, patterns, named_homes = modeled
                     candidates = set()
+                    parent_paths = set()
                     for pattern in patterns:
                         for root in first_found_roots:
                             for path in glob.glob(os.path.join(glob.escape(root), pattern)):
                                 if not os.path.exists(path):
                                     continue
+                                if os.pardir in path.split(os.path.sep):
+                                    # Preserve which search root could reach this spelling.
+                                    parent_paths.add(path)
                                 path = os.path.normpath(path)
                                 candidates.add(path)
                                 if path not in files:
                                     files[path] = _bundled_vars_file(play, path)
                     first_found[name] = {"plugin": plugin, "patterns": patterns,
                                          "roots": first_found_roots, "files": sorted(candidates),
+                                         "parent_paths": sorted(parent_paths),
                                          "home": os.path.expanduser("~"), "named_homes": named_homes,
                                          "search_path": search_path, "search_path_known": known_search_path}
                     continue

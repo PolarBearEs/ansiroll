@@ -331,7 +331,7 @@ def test_legacy_first_found_paths_without_files_have_no_candidates(monkeypatch):
         )
 
 
-@pytest.mark.parametrize("case", ["out-of-bounds", "directory", "missing", "skip"])
+@pytest.mark.parametrize("case", ["out-of-bounds", "launch-parent", "directory", "missing", "skip"])
 def test_first_found_vars_files_never_falls_back_after_unverified_candidate(tmp_path, case):
     from ansiroll.loader import _core_version
 
@@ -345,7 +345,8 @@ def test_first_found_vars_files_never_falls_back_after_unverified_candidate(tmp_
         (tmp_path / "nested" / "prod.yml").write_text("selected: nested\n")
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
     playbook = tmp_path / "play.yml"
-    terms = "[profile ~ '.yml', 'fallback.yml']" if case in ("out-of-bounds", "directory") else "[profile ~ '.yml']"
+    terms = ("[profile ~ '.yml', 'fallback.yml']" if case in ("out-of-bounds", "launch-parent", "directory")
+             else "[profile ~ '.yml']")
     skip = ", skip=True" if case == "skip" else ""
     playbook.write_text("""- hosts: localhost
   gather_facts: false
@@ -357,13 +358,14 @@ def test_first_found_vars_files_never_falls_back_after_unverified_candidate(tmp_
     source, _ = compile_playbook(str(playbook))
     artifact = tmp_path / "compiled.py"
     artifact.write_text(source)
-    profile = "nested/prod" if case == "out-of-bounds" else "prod"
+    profile = {"out-of-bounds": "nested/prod", "launch-parent": "nested/../fallback"}.get(case, "prod")
     result = subprocess.run(
         [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
         env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
     )
     assert result.returncode != 0
-    expected = {"out-of-bounds": "outside the vars_files bundle", "directory": "expected a regular file",
+    expected = {"out-of-bounds": "outside the vars_files bundle", "launch-parent": "outside the vars_files bundle",
+                "directory": "expected a regular file",
                 "missing": "No file was found", "skip": "must resolve to a string"}
     assert expected[case] in result.stdout + result.stderr
 
@@ -483,9 +485,10 @@ def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp
     assert runtime.vars["selected"] == "production"
 
 
-@pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation"])
+@pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation", "parent-relative"])
 def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch, location):
     profiles = tmp_path / "profiles"
+    play_dir = tmp_path
     filename = "profile ~ '.yml'"
     if location in ("named-home", "joined-home"):
         expanduser = os.path.expanduser
@@ -506,17 +509,30 @@ def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch
     elif location == "empty-concatenation":
         profiles = tmp_path
         paths = "[prefix ~ '']"
+    elif location == "parent-relative":
+        play_dir = tmp_path / "project"
+        play_dir.mkdir()
+        paths = "['../profiles']"
     else:
         paths = "[playbook_dir ~ '/profiles']"
     profiles.mkdir(parents=True, exist_ok=True)
     (profiles / "prod.yml").write_text("selected: production\n")
-    playbook = tmp_path / "play.yml"
+    playbook = play_dir / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
   vars_files:
     - "{{ lookup('first_found', [FILENAME], files=[FILENAME], paths=PATHS) }}"
-  tasks: []
+  tasks:
+    - assert: {that: selected == 'production'}
 """.replace("PATHS", paths).replace("FILENAME", filename))
+    if location == "parent-relative":
+        from tests import ansible_playbook_command
+
+        native = subprocess.run(
+            ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+            cwd=play_dir, capture_output=True, text=True, timeout=30,
+        )
+        assert native.returncode == 0, native.stdout + native.stderr
     plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
     runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod", "prefix": ""})
     runtime.run_play(plan)
