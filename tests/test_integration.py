@@ -8896,6 +8896,32 @@ def test_vars_file_alternate_selector_rejects_shadowed_vars_lookup(tmp_path, mon
     assert (result is not None) is (alias == "ansible.builtin.vars")
 
 
+@pytest.mark.parametrize(("kind", "expression"), [("filter", "child | lower"), ("test", "child is string")])
+@pytest.mark.parametrize("location", ["playbook", "configured"])
+def test_vars_file_alternate_selector_rejects_controller_jinja_plugins(tmp_path, monkeypatch, kind, expression, location):
+    from types import SimpleNamespace
+
+    from ansible.plugins.loader import filter_loader, test_loader
+    from ansiroll.loader import _core_version, _portable_include_scope
+
+    loader = filter_loader if kind == "filter" else test_loader
+    plugin_dir = tmp_path / (kind + "_plugins" if location == "playbook" else "configured")
+    paths = [SimpleNamespace(path=str(plugin_dir), internal=False)] if location == "configured" else []
+    monkeypatch.setattr(loader, "_get_paths_with_context", lambda: paths)
+    task = SimpleNamespace(get_search_path=lambda: [str(tmp_path)],
+                           _loader=SimpleNamespace(get_basedir=lambda: str(tmp_path)))
+    filename = "{{ " + expression + " }}"
+    if _core_version() >= (2, 19):
+        from ansible.template import trust_as_template
+
+        filename = trust_as_template(filename)
+    variables = {"filename": filename, "child": "child.yml"}
+    assert _portable_include_scope(task, ["{{ filename }}"], variables) == variables
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.py").touch()
+    assert _portable_include_scope(task, ["{{ filename }}"], variables) is None
+
+
 @pytest.mark.parametrize("controller_lookup", [False, True])
 def test_vars_file_alternate_static_import_uses_safe_candidate_scope(tmp_path, monkeypatch, controller_lookup):
     for profile in ("normal", "alternate"):

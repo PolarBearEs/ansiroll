@@ -1334,7 +1334,7 @@ def _vars_filename_template_environment():
     return _Templater().env
 
 
-def _vars_filename_controller_requirements(source, portable, *, paths=None):
+def _vars_filename_controller_requirements(source, portable, *, paths=None, jinja_plugin_allowed=None):
     from jinja2 import nodes, TemplateSyntaxError
     from .runtime import _selector_template_sources
 
@@ -1350,8 +1350,14 @@ def _vars_filename_controller_requirements(source, portable, *, paths=None):
             parsed = env.parse(candidate)
         except TemplateSyntaxError:
             return True, {}
-        missing_filters.update(node.name for node in parsed.find_all(nodes.Filter) if node.name not in env.filters)
-        missing_tests.update(node.name for node in parsed.find_all(nodes.Test) if node.name not in env.tests)
+        for kind, node_type, supported, missing in (
+                ("filter", nodes.Filter, env.filters, missing_filters),
+                ("test", nodes.Test, env.tests, missing_tests)):
+            for node in parsed.find_all(node_type):
+                if jinja_plugin_allowed is not None and not jinja_plugin_allowed(kind, node.name):
+                    return True, {}
+                if node.name not in supported:
+                    missing.add(node.name)
         for call in parsed.find_all(nodes.Call):
             if (isinstance(call.node, nodes.Name) and call.node.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const)
@@ -2863,29 +2869,52 @@ def _include_template_variables(task, includes):
 
 def _portable_include_scope(task, sources, variables):
     from ansible.errors import AnsibleError
-    from ansible.plugins.loader import lookup_loader
+    from ansible.plugins.loader import filter_loader, lookup_loader, test_loader
     from ansible.plugins.lookup import vars as builtin_vars
 
     from .runtime import _GATHER_STRING_METHODS
 
+    roots = [*task.get_search_path(), task._loader.get_basedir()]
+
     @lru_cache(maxsize=None)
     def builtin_lookup(alias):
-        if alias != "ansible.builtin.vars":
-            roots = [*task.get_search_path(), task._loader.get_basedir()]
-            if any(os.path.lexists(os.path.join(root, "lookup_plugins", "vars.py")) for root in roots):
-                return False
+        if alias != "ansible.builtin.vars" and any(
+                os.path.lexists(os.path.join(root, "lookup_plugins", "vars.py")) for root in roots):
+            return False
         try:
             resolved = lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
         except (AnsibleError, ImportError):
             return False
         return bool(resolved and os.path.realpath(resolved) == os.path.realpath(builtin_vars.__file__))
 
+    @lru_cache(maxsize=None)
+    def builtin_jinja_path(kind):
+        # Core can import plugin modules just to discover which names they export.
+        loader = filter_loader if kind == "filter" else test_loader
+        directories = [entry.path for entry in loader._get_paths_with_context() if not entry.internal]
+        directories.extend(os.path.join(root, kind + "_plugins") for root in roots)
+        for directory in set(directories):
+            try:
+                with os.scandir(directory) as entries:
+                    if any(entry.name.endswith(".py") for entry in entries):
+                        return False
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                return False
+        return True
+
+    def builtin_jinja_plugin(kind, name):
+        namespace, _, _ = name.rpartition(".")
+        return namespace in ("", "ansible.builtin", "ansible.legacy") and builtin_jinja_path(kind)
+
     reads = {}
     for source in sources:
         paths = set()
         dependencies = _gather_timeout_dependencies(
             source, variables, _GATHER_STRING_METHODS, selector=True, paths=paths, vars_lookup_allowed=builtin_lookup)
-        if dependencies is None or _vars_filename_controller_requirements(source, dependencies, paths=paths)[0]:
+        if dependencies is None or _vars_filename_controller_requirements(
+                source, dependencies, paths=paths, jinja_plugin_allowed=builtin_jinja_plugin)[0]:
             return None
         for name, path in paths:
             reads.setdefault(name, []).append(path)
