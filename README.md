@@ -304,6 +304,17 @@ delegation fallback. `ANSIROLL_PROVENANCE=1` emits one JSON record per play and
 task with `native-agent`, `real-ansiballz`, `controller-fallback`, or
 `linear-fallback`; CI asserts the native-only lane contains no fallback records.
 
+Before merging a PR into `master`, run **Manual Full PR CI** from GitHub
+Actions using the PR number and its current full commit SHA. The workflow tests
+GitHub's proposed merge and requires all 20 CI jobs, including the Ansible 2.10
+jobs, to pass. Refresh the PR branch and run CI again if `master` advances.
+
+```bash
+pr=123
+head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+gh workflow run reviewed-ci.yml --ref master -f pr_number="$pr" -f head_sha="$head"
+```
+
 See `PLAN.md` for the full design and rationale.
 
 ## License and generated artifacts

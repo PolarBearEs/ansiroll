@@ -3001,6 +3001,32 @@ def test_implicit_setup_passes_play_gather_timeout(tmp_path, monkeypatch, timeou
         assert calls == [("ansible.builtin.setup", expected)]
 
 
+@pytest.mark.parametrize("authored_timeout", [None, 10])
+def test_legacy_controller_setup_keeps_fast_facts_for_implicit_options(monkeypatch, authored_timeout):
+    import ansiroll.runtime as runtime_module
+    from ansiroll.accelerated_modules import facts
+
+    monkeypatch.setattr(runtime_module, "_core_at_least", lambda major, minor: (2, 12) >= (major, minor))
+    monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    options = {"gather_subset": ["all"], "gather_timeout": 10}
+    runtime.gather_setup_fn = lambda: {"options": options, "error": None}
+    calls = []
+
+    def collect_facts(**kwargs):
+        calls.append("fast")
+        return {"ansible_facts": {}}
+
+    def run_setup(action, args, **kwargs):
+        calls.append((action, args))
+        return {"ansible_facts": {}}
+
+    monkeypatch.setattr(facts, "run", collect_facts)
+    monkeypatch.setattr(runtime, "run_module", run_setup)
+    assert runtime.gather_facts(setup_options={"fact_path": "{{ omit }}"}, gather_timeout=authored_timeout)
+    assert calls == (["fast"] if authored_timeout is None else [("ansible.builtin.setup", options)])
+
+
 def test_standalone_gather_options_resolve_selected_vars_file_before_setup(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
@@ -3070,6 +3096,63 @@ def test_standalone_gather_fact_path_captures_only_reachable_role_lookup_inputs(
                         lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
     runtime.run_play(plan)
     assert called == [("ansible.builtin.setup", {"fact_path": "/controller-facts"})]
+
+
+def test_standalone_setup_defaults_use_launch_selected_vars_and_final_vars_scope(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    legacy = Version(__version__) < Version("2.12")
+    action = "setup" if legacy else "ansible.builtin.setup"
+    fact_filter = "ansible_distribution" if legacy else ["ansible_distribution"]
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars_files: ['vars-{{ profile }}.yml']
+  module_defaults:
+    SETUP_ACTION:
+      filter: "{{ vars.fact_filter }}"
+  tasks: []
+""".replace("SETUP_ACTION", action))
+    (tmp_path / "vars-active.yml").write_text("fact_filter: " + json.dumps(fact_filter) + "\n")
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "active"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called[0][0] == "ansible.builtin.setup"
+    assert called[0][1]["filter"] == fact_filter
+
+
+def test_standalone_setup_reads_captured_controller_file_after_source_removal(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    legacy = Version(__version__) < Version("2.12")
+    action = "setup" if legacy else "ansible.builtin.setup"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"""- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    {action}:
+      filter: '{{{{ lookup("file", "fact-filter.txt", lstrip=true) }}}}'
+  tasks: []
+""")
+    directory = tmp_path / "files"
+    directory.mkdir()
+    filter_file = directory / "fact-filter.txt"
+    filter_file.write_text("  ansible_distribution  \n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    filter_file.unlink()
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    calls = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert calls[0]["filter"] == "ansible_distribution"
 
 
 def test_standalone_setup_captures_only_the_active_query_from_selected_vars(tmp_path, monkeypatch):
@@ -3167,6 +3250,121 @@ def test_implicit_fact_path_lookup_can_run_before_unrelated_vars_file(tmp_path, 
     runtime.run_play(_compiled_plays(source, tmp_path)[0])
     assert called == [("ansible.builtin.setup", {"fact_path": "/independent"})]
     assert runtime.vars["unrelated"] == "value"
+
+
+@pytest.mark.parametrize("option", ["gather_subset", "gather_timeout", "filter"])
+def test_setup_defaults_do_not_capture_an_overridden_controller_lookup(tmp_path, monkeypatch, option):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    if Version(__version__) < Version("2.19"):
+        pytest.skip("older cores eagerly render module defaults")
+    playbook = tmp_path / "play.yml"
+    override = {
+        "gather_subset": "  gather_subset: [all]\n",
+        "gather_timeout": "  gather_timeout: 15\n",
+        "filter": "",
+    }[option]
+    gather_default = ("    ansible.builtin.gather_facts:\n      filter: [ansible_distribution]\n"
+                      if option == "filter" else "")
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+""" + override + """  module_defaults:
+""" + gather_default + f"""    ansible.builtin.setup:
+      {option}: "{{{{ lookup('env', 'ANSIROLL_SHADOWED_SETUP_DEFAULT') }}}}"
+  tasks: []
+""")
+    monkeypatch.setenv("ANSIROLL_SHADOWED_SETUP_DEFAULT", "synthetic-private-setup-subset")
+    source, _ = compile_playbook(str(playbook))
+    assert "synthetic-private-setup-subset" not in json.dumps(_compiled_plays(source, tmp_path))
+
+
+def test_setup_defaults_check_vars_file_dependencies_before_gathering(tmp_path, monkeypatch):
+    from ansible.release import __version__
+    from packaging.version import Version
+
+    if Version(__version__) < Version("2.19"):
+        pytest.skip("uses modern setup arguments")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  vars:
+    fact_filter: [ansible_hostname]
+  vars_files: ["vars-{{ lookup('vars', selector_name) }}.yml"]
+  module_defaults:
+    ansible.builtin.setup:
+      filter: "{{ fact_filter }}"
+  tasks: []
+""")
+    (tmp_path / "vars-late.yml").write_text("fact_filter: [ansible_distribution]\n")
+    source, _ = compile_playbook(str(playbook))
+    frames, called = [], []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"selector_name": "profile", "profile": "late"},
+                      on_result=frames.append)
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append(args) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert runtime.failed
+    assert "setup module defaults require a vars file" in frames[0]["result"]["msg"]
+    assert not called
+
+
+def test_setup_defaults_keep_legacy_omit_in_the_final_setup_arguments(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import _OMIT
+
+    version = _core_version()
+    action = "setup" if version < (2, 12) else "ansible.builtin.setup"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    SETUP_ACTION:
+      fact_path: "{{ omit }}"
+  tasks: []
+""".replace("SETUP_ACTION", action))
+    source, _ = compile_playbook(str(playbook))
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert len(calls) == 1
+    if version < (2, 19):
+        assert calls[0]["fact_path"] == _OMIT
+    else:
+        assert "fact_path" not in calls[0]
+
+
+def test_setup_defaults_ignore_blocked_overridden_mapping_member(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core defers overridden module default members")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  fact_path: /explicit
+  vars:
+    directory: /old
+    my_defaults:
+      fact_path: "{{ directory }}"
+      filter: [ansible_distribution]
+  vars_files: ["vars-{{ lookup('vars', selector_name) }}.yml"]
+  module_defaults:
+    ansible.builtin.setup: "{{ my_defaults }}"
+  tasks: []
+""")
+    (tmp_path / "vars-late.yml").write_text("directory: /late\n")
+    source, _ = compile_playbook(str(playbook))
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"selector_name": "profile", "profile": "late"})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: calls.append(args) or {"ansible_facts": {}})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert calls == [{"fact_path": "/explicit", "filter": ["ansible_distribution"]}]
 
 
 def test_implicit_fact_path_sees_empty_local_facts_when_injection_is_disabled(tmp_path, monkeypatch):
@@ -4471,11 +4669,16 @@ def test_timeout_hash_merge_tracks_definite_nested_members(tmp_path, monkeypatch
     ("lookup('vars', 'TIMEOUT_SECONDS' | lower)", "{timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('vars', 'timeout_value' | replace('value', 'seconds'))", "{timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
+    ("lookup('vars', key)", "{key: timeout_seconds, timeout_seconds: 23}", {"timeout_seconds": 45}, 23),
     ("lookup('ansible.builtin.vars', key)", "{key: timeout_seconds, timeout_seconds: 23}",
      {"timeout_seconds": 45}, 23),
 ])
 def test_controller_timeout_detects_type_and_vars_lookup_dependencies(
         tmp_path, monkeypatch, expression, play_vars, override, expected):
+    from ansiroll.loader import _core_version
+
+    if _core_version(include_patch=True) < (2, 11, 12) and expression.startswith("lookup('ansible.builtin.vars'"):
+        pytest.skip("Ansible 2.10 and early 2.11 do not load the fully qualified vars lookup's options")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_1", "abc")
     monkeypatch.setenv("ANSIROLL_TIMEOUT_a", "abc")
     playbook = tmp_path / "play.yml"
@@ -5527,7 +5730,8 @@ def test_compiled_copy_reads_content_addressed_binary_asset(tmp_path):
     assert manifest["bundles"]["asset_count"] == 1
 
 
-def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
+@pytest.mark.parametrize("legacy_copy", [False, True])
+def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path, legacy_copy):
     archive = tmp_path / "payload.zip"
     with zipfile.ZipFile(str(archive), "w") as zipped:
         zipped.writestr("inside.txt", b"embedded archive payload\x00")
@@ -5540,10 +5744,11 @@ def test_compiled_unarchive_uses_baked_controller_source_from_memory(tmp_path):
   tasks:
     - ansible.builtin.unarchive:
         src: payload.zip
-        dest: %s
-""" % destination)
+        dest: %s%s
+""" % (destination, "\n        copy: true" if legacy_copy else ""))
 
     src, manifest = compile_playbook(str(play))
+    archive.unlink()
     # copy/template stage their data in a temp dir like the action plugin;
     # unarchive must keep using the in-memory source.
     assert "ansiroll-unarchive-" not in src
@@ -6046,7 +6251,7 @@ def test_strategy_routes_cross_host_facts_at_the_actual_task_boundary(tmp_path):
     - assert:
         that: seeded == 'during_task'
       when: inventory_hostname == 'beta'
-""", inventory="alpha,beta,",
+""", "-e", json.dumps({"ansible_python_interpreter": sys.executable}), inventory="alpha,beta,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -6097,6 +6302,127 @@ RETRY_OPTIONS    - assert:
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
+@pytest.mark.parametrize("templated_action", [False, True])
+def test_strategy_routes_delegated_facts_in_a_dynamically_selected_role(tmp_path, templated_action):
+    from ansiroll.loader import _core_version
+
+    if templated_action and _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""ACTION:
+    "{{ item.key }}": "{{ item.value }}"
+  delegate_to: recipient
+  delegate_facts: "{{ item.route }}"
+  loop:
+    - {key: local_marker, value: local, route: false}
+    - {key: remote_marker, value: remote, route: true}
+  register: fact_results
+  retries: 2
+  delay: 0
+  until: item.route is false or fact_results.attempts >= 2
+""".replace("ACTION", '- action: "{{ fact_action }}"\n  args' if templated_action else "- set_fact"))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+    fact_action: set_fact
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - fact_results.results[1].attempts == 2
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_routes_literal_false_delegation_in_dynamic_roles(tmp_path, flag):
+    tasks = tmp_path / "roles" / "route_sample" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "main.yml").write_text("""- set_fact:
+    local_marker: "{{ item }}"
+  delegate_to: recipient
+  delegate_facts: FLAG
+  loop: [first, second]
+""".replace("FLAG", flag))
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    selected_role: route_sample
+  tasks:
+    - include_role:
+        name: "{{ selected_role }}"
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("flag", ['"false"', '"{{ false }}"'])
+def test_strategy_keeps_false_string_fact_on_origin_in_multihost_fallback(tmp_path, flag):
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact:
+        local_marker: "{{ item }}"
+      delegate_to: recipient
+      delegate_facts: FLAG
+      loop: [first, second]
+      when: inventory_hostname == 'origin'
+    - assert:
+        that:
+          - local_marker == 'second'
+          - hostvars.recipient.local_marker is undefined
+      when: inventory_hostname == 'origin'
+""".replace("FLAG", flag), inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_routes_templated_set_fact_after_a_skipped_item(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("modern Core supports templated task actions")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  vars:
+    fact_action: set_fact
+  tasks:
+    - action: "{{ fact_action }}"
+      args:
+        "{{ item.key }}": "{{ item.value }}"
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+      loop:
+        - {key: skipped_marker, value: skipped, route: true, run: false}
+        - {key: local_marker, value: local, route: false, run: true}
+        - {key: remote_marker, value: remote, route: true, run: true}
+      when: item.run
+      register: fact_results
+    - assert:
+        that:
+          - fact_results.results[0].skipped
+          - local_marker == 'local'
+          - remote_marker is undefined
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'remote'
+          - hostvars.recipient.skipped_marker is undefined
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: all
@@ -6115,6 +6441,126 @@ def test_strategy_keeps_delegated_run_once_fact_writes_in_loop_order(tmp_path):
 """, inventory="origin,recipient,",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_keeps_mixed_run_once_fact_writes_in_loop_order(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("checks the unified fact layers used by Ansible 2.21")
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - action: "{{ item.action }}"
+      args: "{{ item.args }}"
+      loop:
+        - action: set_fact
+          args: {ansible_distribution: batch_value, cacheable: true}
+          route: false
+        - action: setup
+          args: {gather_subset: [min], filter: [ansible_distribution]}
+          route: true
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+    - assert:
+        that: (ansible_facts.distribution == 'batch_value') == (inventory_hostname == 'origin')
+""", "-e", json.dumps({"ansible_python_interpreter": sys.executable}), inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_keeps_registered_variables_in_mixed_run_once_loop_order(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("requires the unified register variable layer")
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    (plugins / "write_registered_value.py").write_text("""
+from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        self.register_host_variables({"marker": "registered"})
+        return {"changed": False}
+""")
+    proc = _run_strategy_play(tmp_path, """- hosts: all
+  gather_facts: false
+  connection: local
+  tasks:
+    - action: "{{ item.action }}"
+      args: "{{ item.args }}"
+      loop:
+        - {action: set_fact, args: {marker: earlier}}
+        - {action: write_registered_value, args: {}}
+      run_once: true
+      delegate_to: recipient
+      delegate_facts: "{{ inventory_hostname == 'recipient' }}"
+    - assert:
+        that: marker == 'registered'
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_strategy_ignores_deferred_group_callbacks_in_later_handler_fact_routing(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if not (2, 19) <= _core_version() < (2, 21):
+        pytest.skip("checks legacy result publication for templated actions")
+    proc = _run_strategy_play(tmp_path, """- hosts: origin
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {scheduled_action: group_by}
+    - debug: {msg: first}
+      changed_when: true
+      notify: route
+    - meta: flush_handlers
+    - set_fact: {scheduled_action: set_fact}
+    - debug: {msg: second}
+      changed_when: true
+      notify: route
+    - meta: flush_handlers
+    - assert:
+        that:
+          - local_marker == 'first'
+          - hostvars.recipient.local_marker is undefined
+          - hostvars.recipient.remote_marker == 'second'
+  handlers:
+    - name: route
+      action: "{{ scheduled_action }}"
+      args: "{{ item[scheduled_action] }}"
+      loop:
+        - {group_by: {key: first}, set_fact: {local_marker: first}, route: false}
+        - {group_by: {key: second}, set_fact: {remote_marker: second}, route: true}
+      delegate_to: recipient
+      delegate_facts: "{{ item.route }}"
+""", inventory="origin,recipient,")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize(("action", "looped"), [("debug", True), ("set_fact", True), ("debug", False)])
+def test_strategy_discards_unpublished_legacy_fact_routes(monkeypatch, action, looped):
+    from types import SimpleNamespace
+
+    module = _load_strategy_module()
+    strategy = object.__new__(module._SetFactLinearStrategy)
+    host = SimpleNamespace(name="origin")
+    task = SimpleNamespace(_uuid="loop", action=action)
+    item = {"ansible_facts": {"marker": "value"}}
+    result = SimpleNamespace(_result={"results": [item] if looped else None}, _host=host, _task=task,
+                             is_failed=lambda: False, is_unreachable=lambda: False, is_skipped=lambda: False)
+    strategy._fact_routes = {("origin", "loop"): ["recipient"]} if looped else {}
+    strategy._legacy_fact_items = {}
+    monkeypatch.setattr(module, "_UnifiedTaskResult", None)
+    monkeypatch.setattr(module._LinearStrategy, "_process_pending_results", lambda *_: [result])
+
+    strategy._record_legacy_routes(result)
+    assert (id(item) in strategy._legacy_fact_items) == (action == "set_fact")
+    assert not strategy._fact_routes
+    assert strategy._process_pending_results(None) == [result]
+    assert not strategy._legacy_fact_items
 
 
 def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
