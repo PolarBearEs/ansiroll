@@ -757,38 +757,36 @@ class StrategyModule(StrategyBase):
         """Read a runtime-created controller file for in-memory target transfer."""
         if not path or (role_task is None and not os.path.isfile(path)):
             return {"error": "controller source %r is not a regular file" % path}
-        fd = None
         try:
             if role_task is None:
-                source = open(path, "rb")
                 fullpath = os.path.abspath(path)
+                with open(path, "rb") as fh:
+                    st = os.fstat(fh.fileno())
+                    if not stat.S_ISREG(st.st_mode):
+                        return {"error": "controller source %r is not a regular file" % path}
+                    data = fh.read()
             else:
-                from ansiroll.loader import _open_linked_role_source, _role_source_roots, _visible_below
+                from ansiroll.loader import _checked_role_source, _open_linked_role_source
+                from ansiroll.loader import _role_source_path_allowed, _role_source_roots
 
                 loader = role_task._loader
-                subdir = "templates" if role_task.action.rsplit(".", 1)[-1] == "template" else "files"
+                is_template = role_task.action.rsplit(".", 1)[-1] == "template"
+                subdir = "templates" if is_template else "files"
                 fullpath = loader.path_dwim_relative_stack(role_task.get_search_path(), subdir, path)
-                realpath = os.path.realpath(fullpath)
-                absolute = os.path.abspath(fullpath)
-                if realpath != absolute:
-                    roots = {os.path.abspath(root): os.path.realpath(root)
-                             for root in _role_source_roots(role_task, loader.get_basedir())}
-                    # Declared roots may themselves be reached through links.
-                    ordinary = any(
-                        os.path.commonpath((absolute, root)) == root
-                        and os.path.join(real_root, os.path.relpath(absolute, root)) == realpath
-                        for root, real_root in roots.items()
-                    )
-                    if not ordinary and (not any(_visible_below(fullpath, root) for root in roots)
-                                         or not any(_visible_below(realpath, root) for root in roots.values())):
-                        return {"error": "controller role source %r is excluded" % path}
-                fd = _open_linked_role_source(realpath)
-                source = os.fdopen(fd, "rb", closefd=False)
-            with source as fh:
-                st = os.fstat(fh.fileno())
-                if not stat.S_ISREG(st.st_mode):
-                    return {"error": "controller source %r is not a regular file" % path}
-                data = fh.read()
+                absolute = loader.path_dwim(fullpath)
+                realpath = os.path.realpath(absolute)
+                traversed = os.path.realpath(fullpath)
+                roots = {os.path.abspath(root): os.path.realpath(root)
+                         for root in _role_source_roots(role_task, loader.get_basedir())}
+                if not all(_role_source_path_allowed(absolute, target, roots) for target in {traversed, realpath}):
+                    return {"error": "controller role source %r is excluded" % path}
+                raw_info = os.stat(traversed) if traversed != realpath else None
+                if raw_info is not None and not is_template and stat.S_ISDIR(raw_info.st_mode):
+                    return {"error": "controller role source %r is a directory" % path}
+                with _checked_role_source(realpath, opener=_open_linked_role_source) as (fh, st):
+                    data = fh.read()
+                if is_template and raw_info is not None:
+                    st = raw_info
             return {
                 "data": base64.b64encode(data).decode("ascii"),
                 "meta": {
@@ -800,9 +798,6 @@ class StrategyModule(StrategyBase):
             }
         except (OSError, AnsibleError) as ex:
             return {"error": "could not read controller source %r: %s" % (path, ex)}
-        finally:
-            if fd is not None:
-                os.close(fd)
 
     def _profile(self, msg):
         if getattr(self, "_profile_enabled", False):

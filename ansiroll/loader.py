@@ -3736,8 +3736,12 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
         source_is_plaintext = True
-        with open(path, "rb") as fh:
-            raw = fh.read()
+        try:
+            with _checked_role_source(path) as (fh, st):
+                raw = fh.read()
+        except (OSError, _RoleSourceLeaseError) as ex:
+            baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
+            continue
         if decrypt_selected and raw.startswith(b"$ANSIBLE_VAULT;"):
             if controller_execution:
                 node["_deferred_vault_source"] = True
@@ -3757,14 +3761,10 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
         baked[rel] = raw.decode("utf-8", "surrogateescape")
         if not with_meta:
             continue
-        try:
-            st = os.stat(path)
-            meta[rel] = {"fullpath": os.path.abspath(path),
-                         "mtime": st.st_mtime, "uid": st.st_uid,
-                         # Vault's temporary plaintext source is owner-only.
-                         "mode": stat.S_IMODE(st.st_mode) if source_is_plaintext else 0o600}
-        except OSError:
-            pass
+        meta[rel] = {"fullpath": os.path.abspath(path),
+                     "mtime": st.st_mtime, "uid": st.st_uid,
+                     # Vault's temporary plaintext source is owner-only.
+                     "mode": stat.S_IMODE(st.st_mode) if source_is_plaintext else 0o600}
     node["_baked"] = baked
     if meta:
         node["_baked_meta"] = meta
@@ -3845,6 +3845,34 @@ def _open_role_source(path):
             time.sleep(0.05)
 
 
+class _NonregularRoleSource(OSError):
+    def __init__(self, path, mode):
+        super().__init__("source %r is not a regular file" % path)
+        self.mode = mode
+
+
+@contextmanager
+def _checked_role_source(path, *, opener=None):
+    """Read only a regular file and take metadata from the same descriptor."""
+    try:
+        fd = (opener or _open_role_source)(path)
+    except OSError as ex:
+        # Some special files fail open before the descriptor can be checked.
+        if ex.errno in (errno.ENXIO, errno.EACCES):
+            mode = os.stat(path).st_mode
+            if not stat.S_ISREG(mode):
+                raise _NonregularRoleSource(path, mode) from ex
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise _NonregularRoleSource(path, info.st_mode)
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            yield source, info
+    finally:
+        os.close(fd)
+
+
 def _bake_absolute_tree(node, src, basedir, with_meta, *, newline=None):
     """Bake the playbook-dir files an absolute dynamic src can name, keyed by their absolute paths with repeated
     separators collapsed (as the runtime looks them up). Each {{ ... }} matches any run of characters, "/" included,
@@ -3878,17 +3906,25 @@ def _bake_absolute_tree(node, src, basedir, with_meta, *, newline=None):
             path = os.path.join(walk_root, fn)
             if fn.startswith(".") or not pattern.match(path) or not os.path.isfile(path):
                 continue
-            if not _visible_below(os.path.realpath(path), root):
+            resolved = os.path.realpath(path)
+            if not _visible_below(resolved, root):
                 continue
             try:
-                st = os.stat(path)
-                size += st.st_size
-                if size > _ABSOLUTE_TREE_LIMIT:
-                    return False
-                with open(path, "r", encoding="utf-8", errors="surrogateescape", newline=newline) as fh:
-                    baked[path] = fh.read()
-            except OSError:
+                with _checked_role_source(resolved, opener=_open_linked_role_source) as (fh, st):
+                    remaining = _ABSOLUTE_TREE_LIMIT - size
+                    if st.st_size > remaining:
+                        return False
+                    raw = fh.read(remaining + 1)
+            except (FileNotFoundError, NotADirectoryError):
                 continue
+            except (OSError, _RoleSourceLeaseError) as ex:
+                baked[path] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (path, ex)}
+                continue
+            size += len(raw)
+            if size > _ABSOLUTE_TREE_LIMIT:
+                return False
+            payload = raw.decode("utf-8", "surrogateescape")
+            baked[path] = payload.replace("\r\n", "\n").replace("\r", "\n") if newline is None else payload
             if with_meta:
                 meta[path] = {"fullpath": os.path.abspath(path), "mtime": st.st_mtime, "uid": st.st_uid,
                               "mode": stat.S_IMODE(st.st_mode)}
@@ -3947,6 +3983,9 @@ def _role_source_layout(base, walk):
         directory = os.path.relpath(root, base)
         while directory not in directories:
             directories.add(directory)
+            path = os.path.join(base, directory)
+            if directory != "." and os.path.islink(path):
+                aliases[directory] = os.path.relpath(os.path.realpath(path), real_base)
             directory = os.path.dirname(directory) or "."
         for name in dirs:
             path = os.path.join(root, name)
@@ -3955,11 +3994,87 @@ def _role_source_layout(base, walk):
     return directories, aliases
 
 
+def _role_prefix_parent_walk(base, prefix, literal_tail):
+    """List the fixed suffix at literal-prefix ancestors it can reach."""
+    prefix = os.path.normpath(prefix)
+    if prefix == ".":
+        return
+    suffix = os.path.normpath(os.path.join(*literal_tail)).split(os.sep) if literal_tail else []
+    parents = 0
+    while parents < len(suffix) and suffix[parents] == "..":
+        parents += 1
+    if parents == len(suffix):
+        return
+    for _ in range(parents):
+        if not prefix:
+            break
+        prefix = os.path.dirname(prefix)
+        directory, name = os.path.split(os.path.join(base, prefix, *suffix[parents:]))
+        if os.path.isdir(directory):
+            yield directory, [], [name]
+
+
 def _role_source_mode(path):
     try:
         return os.stat(path).st_mode
     except OSError:
         return None
+
+
+def _role_linked_traversal_walk(base, directories, aliases, visible_roots, walked):
+    """Add physical directories reached by visible links under declared roots."""
+    real_base = os.path.realpath(base)
+
+    def targets(entries):
+        return {target for path, target in entries.items()
+                if any(_visible_below(os.path.join(real_base, path), root) for root in visible_roots)}
+
+    visited = set(walked)
+    pending = sorted(targets(aliases) - visited)
+    for target in pending:
+        if target in visited:
+            continue
+        start = os.path.join(base, target)
+        real_start = os.path.realpath(start)
+        if not any(_visible_below(real_start, root) for root in visible_roots):
+            continue
+        walk = []
+        for root, names, files in os.walk(start):
+            names[:] = sorted(name for name in names if not name.startswith("."))
+            walk.append((root, names, [name for name in files if not name.startswith(".")]))
+        found_dirs, found_aliases = _role_source_layout(base, walk)
+        visited.update(os.path.relpath(directory, base) for directory, _, _ in walk)
+        visited.add(target)
+        pending.extend(sorted(targets(found_aliases) - visited))
+        directories.update(found_dirs)
+        aliases.update(found_aliases)
+        yield from walk
+
+
+def _collect_role_traversal_entries(base, directory, names, blocked, files):
+    for name in sorted(names):
+        path = os.path.join(directory, name)
+        rel = os.path.relpath(path, base)
+        mode = _role_source_mode(path)
+        if mode is None:
+            continue
+        if stat.S_ISREG(mode):
+            files.setdefault(rel, None)
+        else:
+            blocked[rel] = stat.S_ISDIR(mode)
+
+
+def _role_traversal_template_metadata(base, names, blocked, files):
+    metadata = {}
+    for rel in sorted(blocked.keys() | files.keys()):
+        if os.path.basename(rel) not in names:
+            continue
+        try:
+            info = os.stat(os.path.join(base, rel))
+        except OSError:
+            continue
+        metadata[rel] = {"mtime": info.st_mtime, "uid": info.st_uid, "mode": stat.S_IMODE(info.st_mode)}
+    return metadata
 
 
 def _role_traversal_duplicates(claimed, special_paths, directories, aliases, literal_tail):
@@ -4088,7 +4203,6 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     baked."""
     if getattr(task, "_role", None) is None:
         return False
-    newline = ""
     prefix = _literal_head(src).rpartition("/")[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
@@ -4115,12 +4229,16 @@ def _bake_search_tree(node, task, basedir, subdir, src):
             suffix = os.sep.join(literal_tail[start:])
             fixed_path = os.sep + os.path.normpath(suffix).lstrip(os.sep)
     trees = []
-    directories = set()
-    aliases = {}
     # Before 2.21 Ansible compared the byte path component to a text dirname.
-    explicit_subdir = _literal_head(src).startswith(subdir + "/") and _core_version() >= (2, 21)
-    for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True, explicit_subdir=explicit_subdir):
+    skip_repeated_subdir = _core_version() >= (2, 21)
+    explicit_subdir = _literal_head(src).startswith(subdir + "/") and skip_repeated_subdir
+    search_dirs = _search_dirs(task, basedir, subdir, tagged=True, explicit_subdir=explicit_subdir,
+                               track_conditional=True)
+    visible_roots = tuple(os.path.realpath(root) for root in _role_source_roots(task, basedir))
+    linked_walk_dirs = set()
+    for base, is_subdir, *conditional in dict.fromkeys(search_dirs):
         walk = []
+        walked = set()
         requires_basename_head = False
         if prefix or is_subdir:
             start = os.path.join(base, prefix)
@@ -4133,12 +4251,19 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 if fixed_path:
                     files = [basename] if basename in files else []
                 walk.append((root, dirs, files))
+                walked.add(os.path.relpath(root, base))
+            parent_walk = list(_role_prefix_parent_walk(base, prefix, literal_tail))
+            linked_walk_dirs.update((base, entry[0]) for entry in parent_walk)
+            walk.extend(parent_walk)
         root_dirs, root_aliases = _role_source_layout(base, walk)
-        trees.append((base, is_subdir, walk, root_dirs, root_aliases, requires_basename_head))
-        directories.update(root_dirs)
-        for relative, target in root_aliases.items():
-            aliases.setdefault(relative, target)
-    aliases = {path: target for path, target in aliases.items() if target in directories}
+        # A directory link can leave the scanned prefix while remaining under
+        # the same search root. Keep its physical route for parent traversal.
+        if walk:
+            linked_walk = list(_role_linked_traversal_walk(base, root_dirs, root_aliases, visible_roots, walked))
+            linked_walk_dirs.update((base, entry[0]) for entry in linked_walk)
+            walk.extend(linked_walk)
+        trees.append((base, is_subdir, walk, root_dirs, root_aliases, requires_basename_head,
+                      bool(conditional and conditional[0] and skip_repeated_subdir)))
     suffix = fixed_path[1:].split(os.sep) if os.sep in fixed_path[1:] else ()
 
     def matches_source(relative, filename, alias_candidates):
@@ -4155,32 +4280,30 @@ def _bake_search_tree(node, task, basedir, subdir, src):
 
     def bake_source(full, rel, root_index, alternate):
         _, _, root_blocks, root_files = source_roots[root_index]
+        base = trees[root_index][0]
         claimed.add(rel)
         key = "\0%d\0%s" % (root_index, rel) if alternate else rel
         root_files[rel] = key
         if rel in blockers:
             shadowed.setdefault(rel, set()).add(root_index)
         try:
-            # The path may have become a FIFO after the file check.
-            try:
-                fd = _open_role_source(full)
-            except OSError as ex:
-                # A replacement special file can fail open before fstat.
-                if ex.errno not in (errno.ENXIO, errno.EACCES):
-                    raise
-                mode = os.stat(full).st_mode
-                if stat.S_ISREG(mode):
-                    raise
-            else:
-                try:
-                    st = os.fstat(fd)
-                    mode = st.st_mode
-                    if stat.S_ISREG(mode):
-                        with os.fdopen(fd, "r", encoding="utf-8", errors="surrogateescape",
-                                       newline=newline, closefd=False) as fh:
-                            baked[key] = fh.read()
-                finally:
-                    os.close(fd)
+            path, opener = full, None
+            if (base, os.path.dirname(full)) in linked_walk_dirs:
+                path = os.path.realpath(full)
+                if not any(_visible_below(path, root) for root in visible_roots):
+                    raise OSError("linked role source is excluded")
+                opener = _open_linked_role_source
+            with _checked_role_source(path, opener=opener) as (fh, st):
+                baked[key] = fh.read().decode("utf-8", "surrogateescape")
+        except _NonregularRoleSource as ex:
+            if not alternate:
+                claimed.remove(rel)
+            del root_files[rel]
+            root_blocks[rel] = stat.S_ISDIR(ex.mode)
+            blockers.setdefault(rel, set()).add(root_index)
+            if rel in shadowed:
+                shadowed[rel].discard(root_index)
+            return
         except _RoleSourceLeaseError as ex:
             baked[key] = {"__ansiroll_source_error__": str(ex)}
             shadowed.setdefault(rel, set()).add(root_index)
@@ -4197,15 +4320,6 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                 shadowed[rel].discard(root_index)
             del root_files[rel]
             return
-        if not stat.S_ISREG(mode):
-            if not alternate:
-                claimed.remove(rel)
-            del root_files[rel]
-            root_blocks[rel] = stat.S_ISDIR(mode)
-            blockers.setdefault(rel, set()).add(root_index)
-            if rel in shadowed:
-                shadowed[rel].discard(root_index)
-            return
         if alternate:
             alternate_meta[key] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime,
                                    "uid": st.st_uid, "mode": stat.S_IMODE(st.st_mode)}
@@ -4213,7 +4327,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
         meta[rel] = {"fullpath": os.path.abspath(full), "mtime": st.st_mtime, "uid": st.st_uid,
                      "mode": stat.S_IMODE(st.st_mode)}
 
-    for base, is_subdir, walk, root_dirs, root_aliases, requires_basename_head in trees:
+    for base, is_subdir, walk, root_dirs, root_aliases, requires_basename_head, _ in trees:
         root_index = len(source_roots)
         # The blocker's flag records whether copy would recurse into it.
         root_blocks, root_files = {}, {}
@@ -4273,17 +4387,11 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                                                or not fn.startswith(basename_head)):
                     # A different root can still select this normalized name
                     # via traversal. Retain blockers without opening any payload.
-                    if not stat.S_ISREG(mode):
+                    if stat.S_ISREG(mode):
+                        root_files.setdefault(rel, None)
+                    else:
                         root_blocks[rel] = stat.S_ISDIR(mode)
                         blockers.setdefault(rel, set()).add(root_index)
-                    continue
-                earlier_sources = []
-                for earlier_base, earlier_index in skipped:
-                    earlier_path = os.path.join(earlier_base, rel)
-                    earlier_mode = _role_source_mode(earlier_path)
-                    if earlier_mode is not None:
-                        earlier_sources.append((earlier_base, earlier_index, earlier_path, earlier_mode))
-                if any(stat.S_ISREG(earlier_mode) for _, _, _, earlier_mode in earlier_sources):
                     continue
                 if not stat.S_ISREG(mode):
                     root_blocks[rel] = stat.S_ISDIR(mode)
@@ -4296,50 +4404,96 @@ def _bake_search_tree(node, task, basedir, subdir, src):
                     root_files[rel] = None
                     deferred_duplicates.setdefault(rel, []).append((root_index, full))
                     continue
-                for earlier_base, earlier_index, earlier_path, earlier_mode in earlier_sources:
-                    earlier_dirs, earlier_aliases, earlier_blocks, _ = source_roots[earlier_index]
-                    if not earlier_dirs:
-                        found_dirs, found_aliases = _role_source_layout(earlier_base, os.walk(earlier_base))
-                        earlier_dirs.update(found_dirs)
-                        earlier_aliases.update(found_aliases)
-                    is_directory = stat.S_ISDIR(earlier_mode)
-                    earlier_blocks[rel] = is_directory
-                    resolved_rel = os.path.relpath(os.path.realpath(earlier_path), os.path.realpath(earlier_base))
-                    earlier_blocks[resolved_rel] = is_directory
-                    blockers.setdefault(rel, set()).add(earlier_index)
                 bake_source(full, rel, root_index, alternate)
-    # A later blocker or special traversal can make an earlier duplicate
-    # selectable. Read those payloads only after the search layout is known.
+    wanted = {os.path.basename(rel) for _, _, _, files in source_roots for rel in files}
+    for (base, _, walk, *_), (root_dirs, root_aliases, root_blocks, root_files) in zip(trees, source_roots):
+        if not root_aliases:
+            continue
+        walked = {os.path.relpath(directory, base) for directory, _, _ in walk}
+        # A linked path may use ".." to reach a file beside the alias target.
+        # The target's ancestors are already in the route but weren't walked.
+        for relative in sorted(root_dirs - walked):
+            _collect_role_traversal_entries(base, os.path.join(base, relative), wanted, root_blocks, root_files)
+    for base, root_index in skipped:
+        if not wanted:
+            break
+        root_dirs, root_aliases, root_blocks, root_files = source_roots[root_index]
+        # Keep metadata for possible traversal targets without reading payloads
+        # from a search root the payload scan excluded.
+        walked = set()
+        for directory, names, filenames in os.walk(base):
+            names.sort()
+            walked.add(os.path.relpath(directory, base))
+            _collect_role_traversal_entries(base, directory, wanted.intersection(names + filenames),
+                                            root_blocks, root_files)
+            found_dirs, found_aliases = _role_source_layout(base, [(directory, names, filenames)])
+            root_dirs.update(found_dirs)
+            root_aliases.update(found_aliases)
+        for directory, names, filenames in _role_linked_traversal_walk(
+                base, root_dirs, root_aliases, visible_roots, walked):
+            walked.add(os.path.relpath(directory, base))
+            _collect_role_traversal_entries(base, directory, wanted.intersection(names + filenames),
+                                            root_blocks, root_files)
+        if root_aliases:
+            for relative in sorted(root_dirs - walked):
+                _collect_role_traversal_entries(base, os.path.join(base, relative), wanted, root_blocks, root_files)
+        for rel in (root_blocks.keys() | root_files.keys()) & claimed:
+            later_roots = {index for index in range(root_index + 1, len(source_roots))
+                           if rel in source_roots[index][3]}
+            if later_roots:
+                blockers.setdefault(rel, set()).add(root_index)
+                shadowed.setdefault(rel, set()).update(later_roots)
+    # A duplicate is needed when this root can satisfy a route unavailable
+    # in earlier roots. Read those payloads only after the layout is known.
+    literal_directories = set(literal_tail[:-1]) - {".", ".."}
+    directory_names = [{os.path.basename(path) for path in dirs | aliases.keys()}
+                       for dirs, aliases, _, _ in source_roots] if literal_directories else []
     for rel, candidates in deferred_duplicates.items():
-        if rel in shadowed:
-            for root_index, full in candidates:
+        for root_index, full in candidates:
+            directories_here, aliases_here, blocks_here, files_here = source_roots[root_index]
+            if literal_directories and not literal_directories <= directory_names[root_index]:
+                continue
+            earlier_covers_route = any(
+                (rel in blocks_before or rel in files_before)
+                and (not trees[earlier_index][-1] or trees[root_index][-1])
+                and directories_here <= directories_before
+                and aliases_here == aliases_before
+                and (not aliases_here or all(
+                    path in blocks_before or path in files_before
+                    for path in (*blocks_here, *files_here) if os.path.basename(path) == os.path.basename(rel)
+                ))
+                for earlier_index, (directories_before, aliases_before, blocks_before, files_before)
+                in enumerate(source_roots[:root_index])
+            )
+            if rel in shadowed or not earlier_covers_route:
                 bake_source(full, rel, root_index, alternate=True)
     assets, metadata, direct = _bake_linked_role_sources(task, basedir, subdir, src, meta)
     baked.update(assets)
     meta.update(metadata)
-    if not baked:
+    if not baked and not direct:
         return False
     node["_baked"] = baked
     meta.update(alternate_meta)
+    by_path = {details["fullpath"]: key for key, details in meta.items()}
+    for base, root_index in skipped:
+        root_files = source_roots[root_index][3]
+        for rel in root_files:
+            root_files[rel] = by_path.get(os.path.abspath(os.path.join(base, rel)))
     node["_baked_meta"] = meta
     node["_baked_tree"] = subdir
     if direct:
         node["_baked_direct_sources"] = direct
-    # The runtime resolves ".." against these, so a prefix's parent dirs count as walked too.
-    node["_baked_tree_dirs"] = sorted(directories)
-    if aliases:
-        node["_baked_tree_aliases"] = aliases
     if shadowed:
         node["_baked_tree_shadowed"] = {rel: sorted(blockers.get(rel, set()) | roots) for rel, roots in shadowed.items()}
-    has_special_traversal = any(root_aliases and False in root_blocks.values()
-                                for _, root_aliases, root_blocks, _ in source_roots)
-    if shadowed or has_special_traversal:
         baked["\0blocked"] = {"__ansiroll_source_error__": "an earlier role source is not a regular file"}
-        node["_baked_tree_roots"] = [
-            (sorted(root_dirs), {path: target for path, target in root_aliases.items() if target in root_dirs},
-             dict(sorted(root_blocks.items())), root_files)
-            for root_dirs, root_aliases, root_blocks, root_files in source_roots
-        ]
+    node["_baked_tree_traversal"] = [
+        (os.path.abspath(base), sorted(root_dirs),
+         {path: target for path, target in sorted(root_aliases.items()) if target in root_dirs},
+         dict(sorted(root_blocks.items())), root_files,
+         _role_traversal_template_metadata(base, wanted, root_blocks, root_files)
+         if subdir == "templates" and root_aliases else {}, conditional)
+        for (base, *_, conditional), (root_dirs, root_aliases, root_blocks, root_files) in zip(trees, source_roots)
+    ]
     return True
 
 
@@ -4352,11 +4506,13 @@ def _raw_search_path(task, basedir):
     return stack or [basedir]
 
 
-def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
+def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False, track_conditional=False):
     """Directories DataLoader.path_dwim_relative_stack searches, in order, for
     a file under ``subdir`` (ansible/parsing/dataloader.py) as lookup plugins
     call it: each task search path (role-aware), then the loader basedir.
-    With ``tagged``, each comes paired with whether it is a ``subdir`` dir."""
+    With ``tagged``, each comes paired with whether it is a ``subdir`` dir.
+    With ``track_conditional``, also mark expansions Core 2.21 omits when the
+    rendered source already starts with ``subdir``."""
     loader = getattr(task, "_loader", None)
     try:
         stack = list(task.get_search_path() or [])
@@ -4380,19 +4536,23 @@ def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
             except Exception:
                 pass
         if is_role and pb_base_dir.endswith("/tasks"):
-            dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True))
-            dirs.append((pb_base_dir, False))
+            dirs.append((os.path.join(os.path.dirname(pb_base_dir), subdir), True, False))
+            dirs.append((pb_base_dir, False, False))
         if not explicit_subdir:
-            dirs.append((os.path.join(upath, subdir), True))
-        dirs.append((upath, False))
+            dirs.append((os.path.join(upath, subdir), True, True))
+        dirs.append((upath, False, False))
     try:
         base = loader.get_basedir()
     except Exception:
         base = basedir
     if not explicit_subdir:
-        dirs.append((os.path.join(base, subdir), True))
-    dirs.append((base, False))
-    return dirs if tagged else [d for d, _ in dirs]
+        dirs.append((os.path.join(base, subdir), True, True))
+    dirs.append((base, False, False))
+    if not tagged:
+        return [path for path, _, _ in dirs]
+    if track_conditional:
+        return dirs
+    return [(path, tagged_subdir) for path, tagged_subdir, _ in dirs]
 
 
 def _linked_role_source_patterns(src):
@@ -4581,6 +4741,16 @@ def _role_source_roots(task, basedir):
                  (basedir, magic.get("role_path"), *(magic.get("ansible_parent_role_paths") or ())) if root)
 
 
+def _role_source_path_allowed(absolute, target, roots):
+    """Respect linked source filters while allowing declared roots reached through symlinks."""
+    return target == absolute or any(
+        os.path.commonpath((absolute, root)) == root
+        and os.path.join(real_root, os.path.relpath(absolute, root)) == target
+        for root, real_root in roots.items()
+    ) or (any(_visible_below(absolute, root) for root in roots)
+          and any(_visible_below(target, root) for root in roots.values()))
+
+
 def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
     """Bake direct lookup candidates separately from the legacy parent-path map."""
     from collections import deque
@@ -4599,6 +4769,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         prefix = ""
     source_roots = _role_source_roots(task, basedir)
     real_roots = tuple(os.path.realpath(root) for root in source_roots)
+    roots = dict(zip(map(os.path.abspath, source_roots), real_roots))
 
     def visible(path):
         return any(_visible_below(path, root) for root in real_roots)
@@ -4609,7 +4780,7 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
         if relative not in winners:
             winners[relative] = _find_needle(task, subdir, relative)
         winner = winners[relative]
-        return os.path.normpath(winner) if winner else None
+        return os.path.abspath(winner) if winner else None
 
     def lookup_paths(relative):
         matching_heads = [prefix for prefix, pattern in patterns if _linked_role_source_matches(pattern, relative)]
@@ -4745,9 +4916,13 @@ def _bake_linked_role_sources(task, basedir, subdir, src, ordinary):
             metadata[key] = {"fullpath": os.path.abspath(path), "mtime": info.st_mtime, "uid": info.st_uid,
                              "mode": stat.S_IMODE(info.st_mode)}
             direct.update(dict.fromkeys(paths_to_bake, key))
+    for spelling, key in direct.items():
+        winner = winners[spelling]
+        if key is None and winner and _role_source_path_allowed(winner, os.path.realpath(winner), roots):
+            direct[spelling] = "\0live"
     if subdir == "templates":
         for spelling, key in direct.items():
-            if key is not None and winners[spelling].endswith(os.sep + spelling):
+            if key not in (None, "\0live") and winners[spelling].endswith(os.sep + spelling):
                 meta = metadata[key] if key in metadata else ordinary[key]
                 meta.setdefault("lookup_roots", {})[spelling] = winners[spelling][:-len(spelling)]
     return assets, metadata, direct
