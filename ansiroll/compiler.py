@@ -939,6 +939,10 @@ def _build_bundles(plays, modules, group_vars=None, specialized_vars=None,
         if entries and play.get("ordered_vars_files"):
             index = {id(entry): position for position, entry in enumerate(entries)}
             play["ordered_vars_files"] = [index.get(id(entry), entry) for entry in play["ordered_vars_files"]]
+    for node in _walk_play_nodes(compact_plays):
+        if node.get("special") == "set_fact" and None in node["args"]:
+            # JSON object keys would turn YAML null into a valid fact name.
+            node["set_fact_arg_items"] = list(node.pop("args").items())
     data_entries = {
         "plays.json": json.dumps(compact_plays, default=_json_default).encode("utf-8"),
         "fact-key-templates.json": json.dumps({

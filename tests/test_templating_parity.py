@@ -3664,6 +3664,22 @@ def test_set_fact_preserves_an_explicit_raw_params_fact(tmp_path, use_strategy):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True])
+def test_set_fact_distinguishes_null_and_string_keys(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - block:
+        - set_fact: {null: invalid}
+      rescue:
+        - debug: {msg: rejected-null-key}
+    - set_fact: {'null': valid}
+    - debug: {msg: "{{ vars['null'] }}"}
+""", use_strategy=use_strategy)
+    assert messages == ["rejected-null-key", "valid"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True])
 def test_loop_preserves_distinct_registered_results(tmp_path, use_strategy):
     _, recap = _assert_parity(tmp_path, """
 - hosts: localhost

@@ -6401,7 +6401,7 @@ class Runtime:
         return {"changed": False, "ansible_facts": facts, "_ansible_facts_cacheable": cacheable}
 
     def _set_fact_args(self, task, ctx):
-        raw = dict(task.get("args") or {})
+        raw = dict(task.get("set_fact_arg_items", task.get("args")) or {})
         modern = _core_at_least(2, 19)
         legacy_omit = ctx.get("omit") if not modern else None
 
