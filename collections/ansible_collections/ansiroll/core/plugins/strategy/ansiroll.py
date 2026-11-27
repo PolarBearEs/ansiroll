@@ -648,8 +648,7 @@ class StrategyModule(StrategyBase):
                 if lookup_task_id and role_task is None:
                     source_result = {"error": "could not identify the role source's task"}
                 else:
-                    source_result = self._read_controller_source(
-                        frame.get("path"), role_task=role_task, decrypt=frame.get("decrypt") is True)
+                    source_result = self._read_controller_source(frame.get("path"), role_task=role_task)
                 chan.send({
                     "t": "source_result",
                     "source": source_result,
@@ -671,12 +670,8 @@ class StrategyModule(StrategyBase):
         return host_failed
 
     @staticmethod
-    def _read_controller_source(path, *, role_task=None, decrypt=False):
+    def _read_controller_source(path, *, role_task=None):
         """Read a runtime-created controller file for in-memory target transfer."""
-        if decrypt and (role_task is None or role_task.action not in ("copy", "ansible.builtin.copy")
-                        or not isinstance(path, str) or os.path.isabs(os.path.expanduser(path))
-                        or ".." in path.split(os.path.sep)):
-            return {"error": "controller decryption requires a relative role copy source"}
         if not path or (role_task is None and not os.path.isfile(path)):
             return {"error": "controller source %r is not a regular file" % path}
         fd = None
@@ -711,17 +706,13 @@ class StrategyModule(StrategyBase):
                 if not stat.S_ISREG(st.st_mode):
                     return {"error": "controller source %r is not a regular file" % path}
                 data = fh.read()
-            plaintext = True
-            if decrypt:
-                data, plaintext = role_task._loader._decrypt_if_vault_data(data)
             return {
                 "data": base64.b64encode(data).decode("ascii"),
                 "meta": {
                     "fullpath": fullpath,
                     "mtime": st.st_mtime,
                     "uid": st.st_uid,
-                    "mode": stat.S_IMODE(st.st_mode) if plaintext else 0o600,
-                    "vault_decrypted": not plaintext,
+                    "mode": stat.S_IMODE(st.st_mode),
                 },
             }
         except (OSError, AnsibleError) as ex:

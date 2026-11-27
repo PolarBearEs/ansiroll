@@ -6708,12 +6708,8 @@ class Runtime:
                 lookup_task_id = task.get("runtime_id")
             if raw is None and self.controller_source_fn and (key is not None or lookup_task_id):
                 try:
-                    if lookup_task_id:
-                        fetch_options = {"decrypt": True} if name == "copy" and _ansible_boolean(
-                            args.get("decrypt", True)) else {}
-                        fetched = self.controller_source_fn(src, lookup_task_id, **fetch_options)
-                    else:
-                        fetched = self.controller_source_fn(src)
+                    fetched = (self.controller_source_fn(src, lookup_task_id) if lookup_task_id
+                               else self.controller_source_fn(src))
                     raw = fetched.get("data")
                     meta = fetched.get("meta") or {}
                     if isinstance(raw, bytes):
@@ -6727,8 +6723,7 @@ class Runtime:
                         "msg": "%s: src %r was not baked into the compiled file" % (name, src)}
             try:
                 raw = self._asset_text(raw)
-                if (name == "copy" and not (task.get("_vault_plaintext") or meta.get("vault_decrypted"))
-                        and _ansible_boolean(args.get("decrypt", True))
+                if (name == "copy" and not task.get("_vault_plaintext") and _ansible_boolean(args.get("decrypt", True))
                         and raw.startswith("$ANSIBLE_VAULT;")):
                     raise RuntimeError("Vault source requires controller decryption. " + _vault_source_recompile_note(task))
             except Exception as ex:
@@ -8508,8 +8503,8 @@ def agent_main():
             return reply.get("result", {})
         rt.delegate_fn = _delegate
 
-        def _controller_source(path, lookup_task_id=None, *, decrypt=False):
-            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id, "decrypt": decrypt})
+        def _controller_source(path, lookup_task_id=None):
+            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id})
             reply = _chan_recv()
             if not reply or reply.get("t") != "source_result":
                 raise RuntimeError("controller did not return a source result")

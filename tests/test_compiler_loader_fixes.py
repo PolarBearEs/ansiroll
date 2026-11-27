@@ -1980,17 +1980,28 @@ def test_strategy_copies_vault_source_created_during_play(tmp_path, decrypt):
 - copy:
     src: '{{ source_name }}.vault'
     dest: '{{ playbook_dir }}/installed'
-    decrypt: '{{ decrypt_source }}'
+    decrypt: DECRYPT
     mode: preserve
   diff: false
-""",
+""".replace("DECRYPT", json.dumps(decrypt)),
     })
-    _ansible(tmp_path / "pb.yml", "--vault-password-file", str(password),
-             "-e", json.dumps({"encrypted_fixture": encrypted.decode(), "decrypt_source": decrypt}),
-             strategy="ansiroll.core.ansiroll", returncode=0)
+    from tests import ansible_playbook_command
+
+    cmd = ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "--vault-password-file", str(password),
+                                        "-e", json.dumps({"encrypted_fixture": encrypted.decode()}),
+                                        "-e", "ansible_python_interpreter=" + sys.executable, str(tmp_path / "pb.yml")]
+    env = {**_env(), "ANSIBLE_STRATEGY": "ansiroll.core.ansiroll", "ANSIROLL_PROVENANCE": "1"}
+    if not decrypt:
+        env["ANSIROLL_NATIVE_ONLY"] = "1"
+    result = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = [json.loads(line.split("ANSIROLL_PROVENANCE ", 1)[1])
+               for line in result.stdout.splitlines() if "ANSIROLL_PROVENANCE " in line]
+    assert any(record["scope"] == "play" and record["mode"] == ("linear-fallback" if decrypt else "native-agent")
+               for record in records)
     installed = tmp_path / "installed"
     assert installed.read_bytes() == (payload if decrypt else encrypted)
-    assert S_IMODE(installed.stat().st_mode) == (0o600 if decrypt else 0o640)
+    assert S_IMODE(installed.stat().st_mode) == 0o640
 
 
 def test_builtin_unarchive_normalizes_options_before_dispatch():

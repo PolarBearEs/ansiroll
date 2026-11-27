@@ -2561,11 +2561,15 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
         _bake_sources(node, task, basedir, controller_execution=controller_execution,
                       unknown_defaults=unknown_defaults or bool(argument_layers))
         decrypt = node["args"].get("decrypt", True)
+        # With Vault secrets available, a live role source may need decryption.
+        # Let Core select the source on the controller in that case.
+        live_role_copy = (controller_execution and source_action == "copy" and node.get("_baked_tree")
+                          and task._loader._vault.secrets)
         if (source_action in ("copy", "unarchive") and not node.get("_vault_plaintext")
                 and (unknown_defaults or argument_layers or _contains_dynamic_value(decrypt)
                      or (_source_flag(decrypt) if source_action == "copy" else bool(decrypt)))
-                and any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
-                        for value in (node.get("_baked") or {}).values())):
+                and (live_role_copy or any(isinstance(value, str) and value.startswith("$ANSIBLE_VAULT;")
+                                           for value in (node.get("_baked") or {}).values()))):
             node["_deferred_vault_source"] = True
             node["_vault_source_inputs"] = [
                 key for key in ("src", "remote_src", "copy", "decrypt", "content")
