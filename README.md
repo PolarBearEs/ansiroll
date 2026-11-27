@@ -332,6 +332,39 @@ GitHub Actions event policy must allow `pull_request_target` for automatic
 head-check invalidation on PR updates. The invalidation job uses GitHub's API
 and runs without a checkout or test jobs.
 
+### Manual CI merge protection
+
+`Manual Full CI` is the check shown on the PR head. Protect `master` with the
+GitHub Actions commit status `Manual Full CI (merge candidate)`, which the
+workflow publishes only on GitHub's verified test merge commit. GitHub can
+[fall back to head checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#conflicts-between-head-commit-and-test-merge-commit)
+when the candidate has no status, so the display check alone cannot confirm
+that the current candidate passed.
+
+Repository administrators should migrate the existing protection in this order.
+
+1. Pause other merges and let outstanding manual runs finish. Land the workflow
+   update through the existing protection after verifying that the legacy
+   commit status passed on the update PR's current test merge SHA. The updated
+   workflow publishes both commit statuses during the transition.
+2. With merges still paused, use the updated workflow on `master` for a reviewed
+   PR through the normal manual procedure above. Verify that both statuses
+   passed on its current test merge SHA and that the head shows the display
+   check. GitHub needs a successful result from the last seven days to offer
+   a new required status.
+3. In the `master` protection rule, replace the required `Manual Full CI`
+   context with `Manual Full CI (merge candidate)` in one update. Select
+   **GitHub Actions** as the expected source and keep **Require branches to be
+   up to date before merging** and the other protection settings enabled as
+   configured. Read back the rule before resuming merges. Commit statuses are
+   tied to a SHA, so continue verifying the current test merge SHA before each
+   merge.
+
+Keep the legacy commit status until the cutover is verified. If a rollback is
+needed, pause merges and restore the legacy requirement with the same source
+and strict setting while both statuses are still available. Continue checking
+the exact merge candidate throughout the rollback.
+
 See `PLAN.md` for the full design and rationale.
 
 ## License and generated artifacts

@@ -13,6 +13,15 @@ HEAD = "a" * 40
 BASE = "b" * 40
 OLD_BASE = "c" * 40
 MERGE = "d" * 40
+MERGE_CONTEXT = "Manual Full CI (merge candidate)"
+LEGACY_CONTEXT = "Manual Full CI"
+CURRENT_PR = {
+    "state": "open",
+    "head": {"sha": HEAD},
+    "base": {"sha": BASE, "ref": "master"},
+    "mergeable": True,
+    "merge_commit_sha": MERGE,
+}
 
 
 @pytest.fixture
@@ -54,13 +63,15 @@ else:
     monkeypatch.setenv("GITHUB_RUN_ID", "100")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
 
-    def run(job, routes, **env):
+    def run(job, routes, *, expected_exit=0, **env):
         (tmp_path / "routes").write_text(json.dumps({f"repos/example/ansiroll/{k}": v for k, v in routes.items()}))
+        for key, value in workflow.get("env", {}).items():
+            monkeypatch.setenv(key, value)
         for key, value in env.items():
             monkeypatch.setenv(key, value)
         script = workflow["jobs"][job]["steps"][0]["run"]
         result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True)
-        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.returncode == expected_exit, result.stdout + result.stderr
         return [json.loads(line) for line in (tmp_path / "calls").read_text().splitlines()]
 
     return run
@@ -125,13 +136,34 @@ def test_synchronize_only_reconciles_head_checks(workflow):
     assert "uses" not in workflow["jobs"]["invalidate-head-checks"]["steps"][0]
 
 
-def test_report_records_pr_owner(run_step):
+def test_dispatch_marks_both_merge_statuses_pending(run_step, tmp_path):
+    output = tmp_path / "outputs"
+    calls = run_step(
+        "reviewed-head",
+        {
+            "pulls/12": json.dumps(CURRENT_PR),
+            f"git/commits/{MERGE}": json.dumps({"parents": [{"sha": BASE}, {"sha": HEAD}]}),
+            f"statuses/{MERGE}": "{}",
+        },
+        PR="12", EXPECTED_HEAD=HEAD, GITHUB_SHA=BASE, GITHUB_OUTPUT=str(output),
+    )
+    writes = [args for args in calls if "POST" in args]
+    assert len(writes) == 2
+    for args, context in zip(writes, [MERGE_CONTEXT, LEGACY_CONTEXT]):
+        assert f"repos/example/ansiroll/statuses/{MERGE}" in args
+        assert f"context={context}" in args
+        assert "state=pending" in args
+    assert f"merge={MERGE}" in output.read_text().splitlines()
+
+
+@pytest.mark.parametrize(("tests_result", "exit_code"), [("success", 0), ("failure", 1)])
+def test_report_publishes_merge_statuses_and_pr_head_check(run_step, tests_result, exit_code):
     calls = run_step(
         "report-pr-ci",
         {
             f"commits/{MERGE}/status": json.dumps(
                 {"statuses": [{
-                    "context": "Manual Full CI",
+                    "context": MERGE_CONTEXT,
                     "target_url": "https://github.example/example/ansiroll/actions/runs/100",
                     "description": f"Testing merge {MERGE}",
                 }]}
@@ -143,18 +175,37 @@ def test_report_records_pr_owner(run_step):
                 ]}
             ),
             f"statuses/{MERGE}": "{}",
-            "pulls/12": json.dumps(
-                {
-                    "state": "open", "head": {"sha": HEAD}, "base": {"sha": BASE, "ref": "master"},
-                    "mergeable": True, "merge_commit_sha": MERGE,
-                }
-            ),
+            "pulls/12": json.dumps(CURRENT_PR),
             "check-runs": "123",
         },
-        PR="12", HEAD=HEAD, BASE=BASE, MERGE=MERGE, MERGE_ATTEMPT="1", TESTS_RESULT="success",
+        expected_exit=exit_code,
+        PR="12", HEAD=HEAD, BASE=BASE, MERGE=MERGE, MERGE_ATTEMPT="1", TESTS_RESULT=tests_result,
     )
+    writes = [args for args in calls if "POST" in args and f"repos/example/ansiroll/statuses/{MERGE}" in args]
+    assert len(writes) == 2
+    for args, context in zip(writes, [LEGACY_CONTEXT, MERGE_CONTEXT]):
+        assert f"context={context}" in args
+        assert f"state={tests_result}" in args
     creation = next(args for args in calls if "repos/example/ansiroll/check-runs" in args)
     assert "external_id=manual-full-ci:pr:12" in creation
     assert f"head_sha={HEAD}" in creation
-    assert "conclusion=success" in creation
+    assert f"name={LEGACY_CONTEXT}" in creation
+    assert f"conclusion={tests_result}" in creation
     assert f"output[summary]=Merge commit: {MERGE}\nBase commit: {BASE}" in creation
+
+
+def test_legacy_status_cannot_claim_merge_gate(run_step):
+    calls = run_step(
+        "report-pr-ci",
+        {
+            f"commits/{MERGE}/status": json.dumps(
+                {"statuses": [{
+                    "context": LEGACY_CONTEXT,
+                    "target_url": "https://github.example/example/ansiroll/actions/runs/100",
+                    "description": f"Testing merge {MERGE}",
+                }]}
+            ),
+        },
+        PR="12", HEAD=HEAD, BASE=BASE, MERGE=MERGE, MERGE_ATTEMPT="1", TESTS_RESULT="success",
+    )
+    assert calls == [[f"repos/example/ansiroll/commits/{MERGE}/status"]]

@@ -20,6 +20,9 @@ on:
 
 permissions: {}
 
+env:
+  MERGE_STATUS_CONTEXT: Manual Full CI (merge candidate)
+
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_dispatch' && format('manual-full-ci-pr-{0}', inputs.pr_number) || github.run_id }}
@@ -97,9 +100,12 @@ jobs:
           fi
           runs="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
           printf 'head=%s\nbase=%s\nattempt=%s\n' "$head" "$base" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          gh api --method POST "$api/statuses/$merge" \
-            -f context='Manual Full CI' -f state=pending -f description="Testing merge $merge" \
-            -f target_url="$runs$GITHUB_RUN_ID"
+          # Keep the legacy merge status until master protection is migrated.
+          for context in "$MERGE_STATUS_CONTEXT" 'Manual Full CI'; do
+            gh api --method POST "$api/statuses/$merge" \
+              -f context="$context" -f state=pending -f description="Testing merge $merge" \
+              -f target_url="$runs$GITHUB_RUN_ID"
+          done
           printf 'merge=%s\n' "$merge" >> "$GITHUB_OUTPUT"
 
   tests:
@@ -158,8 +164,8 @@ jobs:
             return 1
           }
           if combined=$(gh api "$api/commits/$MERGE/status"); then
-            if ! jq -e --arg run "$run_url" --arg merge "$MERGE" '.statuses | any(
-              .context == "Manual Full CI" and .target_url == $run and
+            if ! jq -e --arg run "$run_url" --arg merge "$MERGE" --arg context "$MERGE_STATUS_CONTEXT" '.statuses | any(
+              .context == $context and .target_url == $run and
               (.description // "" | endswith(" merge " + $merge))
             )' <<< "$combined" >/dev/null; then
               echo 'Another run owns the status for this merge commit.'
@@ -178,9 +184,13 @@ jobs:
               success) description="Tests passed on merge $MERGE" ;;
               failure) description="CI failed on merge $MERGE" ;;
             esac
-            gh api --method POST "$api/statuses/$MERGE" \
-              -f context='Manual Full CI' -f state="$state" -f description="$description" \
-              -f target_url="$run_url" || report_error=$?
+            # Publish the required merge-candidate result only after the legacy
+            # status has been published for the transition.
+            for context in 'Manual Full CI' "$MERGE_STATUS_CONTEXT"; do
+              gh api --method POST "$api/statuses/$MERGE" \
+                -f context="$context" -f state="$state" -f description="$description" \
+                -f target_url="$run_url" || { report_error=$?; break; }
+            done
           else
             report_error=$?
           fi
@@ -221,7 +231,7 @@ jobs:
           }
           if current_revision; then
             for attempt in 1 2 3; do
-              # GitHub also expects the protected check on the PR head.
+              # Keep the result visible on the PR head under a distinct name.
               if check=$(gh api --method POST "$api/check-runs" --jq '.id' \
                 -f name="Manual Full CI" -f head_sha="$HEAD" -f details_url="$details_url" \
                 -f external_id="manual-full-ci:pr:$PR" \
