@@ -16,7 +16,7 @@ import stat
 import time
 from copy import copy
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import lru_cache, partial
 
 from .compat import find_module, init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
@@ -3737,8 +3737,23 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
             return
         source_is_plaintext = True
         try:
-            with _checked_role_source(path) as (fh, st):
+            # The loader opens the normalized path, while template metadata
+            # and the copy destination basename still use the lookup path.
+            read_path = task._loader.path_dwim(path) if role_path else path
+            source_path = read_path
+            opener = None
+            if read_path != path:
+                source_path = os.path.realpath(read_path)
+                if source_path != os.path.realpath(path):
+                    roots = _role_source_roots(task, basedir)
+                    if not (any(_visible_below(read_path, root) for root in roots)
+                            and any(_visible_below(source_path, os.path.realpath(root)) for root in roots)):
+                        raise OSError("normalized source is outside the visible role and playbook roots")
+                opener = partial(_open_role_source, opener=_open_linked_role_source)
+            with _checked_role_source(source_path, opener=opener) as (fh, st):
                 raw = fh.read()
+            if name == "template" and read_path != path:
+                st = os.stat(path)
         except (OSError, _RoleSourceLeaseError) as ex:
             baked[rel] = {"__ansiroll_source_error__": "cannot load source %r: %s" % (rel, ex)}
             continue
@@ -3761,7 +3776,7 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
         baked[rel] = raw.decode("utf-8", "surrogateescape")
         if not with_meta:
             continue
-        meta[rel] = {"fullpath": os.path.abspath(path),
+        meta[rel] = {"fullpath": path if role_path and name == "template" else os.path.abspath(path),
                      "mtime": st.st_mtime, "uid": st.st_uid,
                      # Vault's temporary plaintext source is owner-only.
                      "mode": stat.S_IMODE(st.st_mode) if source_is_plaintext else 0o600}
@@ -3833,9 +3848,11 @@ class _RoleSourceLeaseError(ValueError):
     pass
 
 
-def _open_role_source(path):
+def _open_role_source(path, *, opener=None):
     for attempt in range(5):
         try:
+            if opener is not None:
+                return opener(path)
             return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError as ex:
             if ex.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):

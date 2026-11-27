@@ -96,6 +96,75 @@ def _bundle_json(source, entry="plays.json"):
     return json.loads(archive.read(entry).decode("utf-8"))
 
 
+@pytest.mark.parametrize("action, subdir", [("template", "templates"), ("copy", "files")])
+@pytest.mark.parametrize("literal_loop", [False, True])
+def test_literal_role_source_reads_loader_normalized_path(tmp_path, monkeypatch, action, subdir, literal_loop):
+    monkeypatch.setenv("ANSIROLL_TEST_ROLE_SOURCE_NAME", "selected")
+    source = "${ANSIROLL_TEST_ROLE_SOURCE_NAME}/app.txt"
+    role_sources = "roles/r/" + subdir + "/"
+    lookup_path = tmp_path / (role_sources + source)
+    selected_path = tmp_path / (role_sources + "selected/app.txt")
+    dest = tmp_path / "installed"
+    rendered_name = "{{ item }}/app.txt" if literal_loop else source
+    loop = "  loop: ['${ANSIROLL_TEST_ROLE_SOURCE_NAME}']\n" if literal_loop else ""
+    selected = "selected payload\n"
+    if action == "template":
+        selected = "{{ template_fullpath }} ({{ template_mtime.year }})\n"
+    _write(tmp_path, {
+        "pb.yml": "- hosts: localhost\n  gather_facts: false\n  roles: [r]\n",
+        "roles/r/tasks/main.yml": (
+            f"- {action}:\n    src: '{rendered_name}'\n    dest: '{dest}'\n    mode: preserve\n" + loop
+        ),
+        role_sources + source: "lookup payload\n",
+        role_sources + "selected/app.txt": selected,
+    })
+    lookup_path.chmod(0o640)
+    selected_path.chmod(0o644)
+    lookup_timestamp = datetime(2020, 6, 1).timestamp()
+    selected_timestamp = datetime(2021, 6, 1).timestamp()
+    os.utime(lookup_path, (lookup_timestamp, lookup_timestamp))
+    os.utime(selected_path, (selected_timestamp, selected_timestamp))
+
+    playbook = tmp_path / "pb.yml"
+    native = _ansible(playbook, returncode=0)
+    expected = (f"{lookup_path} (2020)\n", 0o640) if action == "template" else (selected, 0o644)
+    assert (dest.read_text(), dest.stat().st_mode & 0o777) == expected
+    dest.unlink()
+
+    assert _ansiroll(playbook, tmp_path, returncode=0) == native
+    assert (dest.read_text(), dest.stat().st_mode & 0o777) == expected
+
+
+def test_literal_role_source_retries_normalized_read(tmp_path, monkeypatch):
+    import errno
+
+    from ansiroll import loader
+
+    monkeypatch.setenv("ANSIROLL_TEST_ROLE_SOURCE_NAME", "selected")
+    _write(tmp_path, {
+        "pb.yml": "- hosts: localhost\n  gather_facts: false\n  roles: [r]\n",
+        "roles/r/tasks/main.yml": "- copy: {src: '${ANSIROLL_TEST_ROLE_SOURCE_NAME}/app.txt', dest: installed}\n",
+        "roles/r/files/${ANSIROLL_TEST_ROLE_SOURCE_NAME}/app.txt": "lookup payload\n",
+        "roles/r/files/selected/app.txt": "selected payload\n",
+    })
+    selected_path = str(tmp_path / "roles/r/files/selected/app.txt")
+    attempts = []
+    open_linked = loader._open_linked_role_source
+
+    def try_open(path):
+        if path == selected_path:
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+        return open_linked(path)
+
+    monkeypatch.setattr(loader, "_open_linked_role_source", try_open)
+    artifact, _ = compile_playbook(str(tmp_path / "pb.yml"))
+    task = next(node for node in _task_nodes(_bundle_json(artifact)[0]["tasks"]) if node.get("special") == "copy")
+    assert "__ansiroll_asset__" in task["_baked"]["${ANSIROLL_TEST_ROLE_SOURCE_NAME}/app.txt"]
+    assert attempts == [selected_path, selected_path]
+
+
 def test_user_dicts_shaped_like_plugins_are_not_externalized(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
