@@ -5734,6 +5734,75 @@ def test_standalone_task_omit_preserves_invocation_check_mode(tmp_path):
     assert not runtime.failed
 
 
+@pytest.mark.parametrize("parent", [None, False, True])
+@pytest.mark.parametrize("scope", ["block", "include"])
+@pytest.mark.parametrize("cli_become", [False, True])
+def test_standalone_become_omit_preserves_enclosing_mode(tmp_path, monkeypatch, parent, scope, cli_become):
+    from ansible import context
+    from ansible.utils.context_objects import CLIArgs
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native task keyword omission")
+    monkeypatch.setattr(context, "CLIARGS", CLIArgs(dict(context.CLIARGS, become=cli_become)))
+    child = "- ping:\n  become: '{{ omit }}'\n"
+    if scope == "include":
+        (tmp_path / "child.yml").write_text(child)
+        tasks = "- include_tasks:\n    file: child.yml\n"
+        if parent is not None:
+            tasks += "    apply: {become: %s}\n" % str(parent).lower()
+    else:
+        tasks = "- block:\n" + textwrap.indent(child, "    ")
+        if parent is not None:
+            tasks += "  become: %s\n" % str(parent).lower()
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks:\n"
+                        + textwrap.indent(child + tasks, "    "))
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    observed = []
+
+    def run_module(action, args, become=False):
+        observed.append(become)
+        return {"changed": False}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert observed == [cli_become, cli_become if parent is None else parent]
+
+
+def test_strategy_distinguishes_null_and_unset_check_mode(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native task keyword validation")
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - file: {path: '{{ playbook_dir }}/unset', state: touch}
+    - file: {path: '{{ playbook_dir }}/null', state: touch}
+      check_mode: null
+    - block:
+        - file: {path: '{{ playbook_dir }}/inherited', state: touch}
+        - file: {path: '{{ playbook_dir }}/overridden', state: touch}
+          check_mode: null
+      check_mode: true
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "--check",
+                                    "-e", "ansible_python_interpreter=" + sys.executable,
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        for name in ("unset", "inherited"):
+            assert not (tmp_path / name).exists()
+        for name in ("null", "overridden"):
+            marker = tmp_path / name
+            assert marker.is_file(), result.stdout
+            marker.unlink()
+
+
 @pytest.mark.parametrize("scope", ["invocation", "parent", "tasks-apply", "role-apply", "play", "raw-parent"])
 def test_strategy_preserves_check_mode_on_omit(tmp_path, scope):
     task = """- file:
@@ -5778,7 +5847,8 @@ def test_strategy_preserves_check_mode_on_omit(tmp_path, scope):
 
 @pytest.mark.parametrize("include", ["tasks", "role"])
 @pytest.mark.parametrize(("apply_mode", "check", "writes"), [
-    ("omit", True, False), ("none", True, True), ("safe", False, False),
+    ("{{ omit }}", True, False), ("{{ none }}", True, True),
+    ("{{ safe }}", False, False), ("{# dry run #}true", False, False),
 ])
 def test_strategy_restores_resolved_include_apply_check_mode(tmp_path, include, apply_mode, check, writes,
                                                             monkeypatch):
@@ -5804,7 +5874,7 @@ def test_strategy_restores_resolved_include_apply_check_mode(tmp_path, include, 
     - include_KIND:
         TARGET
         apply:
-          check_mode: '{{ MODE }}'
+          check_mode: 'MODE'
 """.replace("KIND", include).replace("TARGET", target).replace("MODE", apply_mode)
     options = ["-e", "ansible_python_interpreter=" + sys.executable]
     if check:
