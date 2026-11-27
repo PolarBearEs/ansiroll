@@ -5752,6 +5752,58 @@ def test_strategy_preserves_check_mode_on_omit(tmp_path, scope):
     assert output.exists() == native_wrote_file
 
 
+@pytest.mark.parametrize("include", ["tasks", "role"])
+@pytest.mark.parametrize(("apply_mode", "check", "writes"), [
+    ("omit", True, False), ("none", True, True), ("safe", False, False),
+])
+def test_strategy_restores_resolved_include_apply_check_mode(tmp_path, include, apply_mode, check, writes,
+                                                            monkeypatch):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native include-time apply rendering")
+    if include == "role":
+        child = tmp_path / "roles" / "child" / "tasks" / "main.yml"
+        child.parent.mkdir(parents=True)
+        target = "name: child"
+    else:
+        child = tmp_path / "child.yml"
+        target = "file: child.yml"
+    child.write_text("""- file: {path: '{{ playbook_dir }}/result', state: touch}
+  check_mode: '{{ omit }}'
+""")
+    play = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars: {safe: true}
+  tasks:
+    - include_KIND:
+        TARGET
+        apply:
+          check_mode: '{{ MODE }}'
+""".replace("KIND", include).replace("TARGET", target).replace("MODE", apply_mode)
+    options = ["-e", "ansible_python_interpreter=" + sys.executable]
+    if check:
+        options.append("--check")
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, play, *options, environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        output = tmp_path / "result"
+        assert output.exists() is writes, result.stdout + result.stderr
+        if writes:
+            output.unlink()
+
+    source, _ = compile_playbook(str(tmp_path / "play.yml"))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, check_mode=check)
+    observed = []
+    monkeypatch.setattr(runtime, "_run_accelerated_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: observed.append(runtime.check_mode)
+                        or {"changed": False})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert observed == [not writes]
+
+
 @pytest.mark.parametrize(("action", "invocation_check", "delegated"), [
     ("copy", True, False),
     ("template", True, False),

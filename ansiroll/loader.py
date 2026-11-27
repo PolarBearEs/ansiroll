@@ -1929,6 +1929,29 @@ class _AppliedExecutionFlag(str):
     """An inherited flag whose value is resolved by the include invocation."""
 
 
+def _include_apply_flags(task, keywords):
+    # Core's looped include uses its original apply mapping for child tasks.
+    if _core_version() < (2, 19) or task.loop is not None:
+        return {}
+    applied = (task.args or {}).get("apply")
+    if not isinstance(applied, dict):
+        return {}
+    flags = {key: _tag_untrusted(applied[key]) for key in keywords if _is_templated(applied.get(key))}
+    if not flags:
+        return {}
+    fallbacks = {
+        key: _execution_omit_fallback(task._get_parent_attribute(key, omit=True), keyword=key) for key in flags
+    }
+    return {"apply_flags": flags, "apply_omit_fallback": fallbacks}
+
+
+def _bind_include_apply_flags(parent, options):
+    for key in options.get("apply_flags", ()):
+        value = _AppliedExecutionFlag(getattr(parent, key))
+        value.keyword = key
+        setattr(parent, key, value)
+
+
 def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, includes):
     """Expand a compile-time-resolvable include_tasks.
 
@@ -1967,13 +1990,9 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
         return _unresolved_recursive_include(task, actions, basedir)
     include_id = None
     tasks = []
-    apply_flags = {}
-    # Core's looped include uses its original apply mapping for child tasks.
+    apply_options = _include_apply_flags(task, ("check_mode", "diff", "no_log", "become"))
     applied = args.get("apply") or {}
     render_apply = _core_version() >= (2, 19) and task.loop is None
-    if render_apply:
-        apply_flags = {flag: _tag_untrusted(applied[flag]) for flag in ("check_mode", "diff", "no_log", "become")
-                       if _is_templated(applied.get(flag))}
     if ref is None:
         try:
             from ansible.playbook.helpers import load_list_of_blocks
@@ -2009,10 +2028,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
             for nested in nested_includes:
                 nested._ansiroll_stable_include = True
         include_id = _new_include_id()
-        for flag in apply_flags:
-            value = _AppliedExecutionFlag(getattr(parent, flag))
-            value.keyword = flag
-            setattr(parent, flag, value)
+        _bind_include_apply_flags(parent, apply_options)
         _INCLUDE_STACK[key] = include_id
         try:
             tasks = [c for c in (_convert_node(b, actions, basedir, only_tags=only_tags,
@@ -2027,11 +2043,7 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
                          role_defaults, role_vars, tasks, include_id, ref)
     if render_apply and applied.get("vars"):
         node["apply_vars"] = _tag_untrusted(applied["vars"])
-    if apply_flags:
-        node["apply_flags"] = apply_flags
-        node["apply_omit_fallback"] = {
-            flag: _execution_omit_fallback(task._get_parent_attribute(flag, omit=True)) for flag in apply_flags
-        }
+    node.update(apply_options)
     return node
 
 
@@ -2399,8 +2411,10 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
     except Exception:
         return None
     task._role_path = getattr(ri, "_role_path", None)
+    apply_options = _include_apply_flags(task, ("check_mode",))
     key = ("role", task._role_path or name, tuple(sorted(from_files.items())),
-           _is_handler(task), _include_search_context(task), _include_scope_key(task), repr(args.get("apply")))
+           _is_handler(task), _include_search_context(task), _include_scope_key(task), repr(args.get("apply")),
+           bool(apply_options))
     ref = _include_ref(key)
     if ref is None and _too_many_include_contexts(key):
         return _unresolved_recursive_include(task, actions, basedir)
@@ -2427,6 +2441,7 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
                 parent = include.build_parent_block()
             for block in blocks + handler_blocks:
                 block._parent = parent
+            _bind_include_apply_flags(parent, apply_options)
         except Exception:
             return None
         includes.record_writes(blocks + handler_blocks)
@@ -2468,8 +2483,10 @@ def _convert_include_role(task, actions, basedir, only_tags, skip_tags, includes
             for root in role_roots:
                 del _INCLUDE_ROLE_PARENTS[root]
     role_defaults, role_vars = _role_vars(task)
-    return _include_node(task, "include_role", name, basedir,
+    node = _include_node(task, "include_role", name, basedir,
                          role_defaults, role_vars, tasks, include_id, ref, handlers)
+    node.update(apply_options)
+    return node
 
 
 def _play_of(task):
@@ -4280,14 +4297,14 @@ def _execution_keyword(task, keyword, *, node_key=None):
     return result
 
 
-def _execution_omit_fallback(value):
+def _execution_omit_fallback(value, *, keyword=None):
     from ansible.module_utils.parsing.convert_bool import boolean
     from ansible.playbook.base import Sentinel
 
     if isinstance(value, _AppliedExecutionFlag):
         return {"__ansiroll_apply_flag__": value.keyword}
     if value is Sentinel:
-        return None
+        return {"__ansiroll_invocation_check_mode__": True} if keyword == "check_mode" else None
     if _is_templated(value):
         return _tag_untrusted(value)
     try:

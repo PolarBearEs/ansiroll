@@ -6175,11 +6175,14 @@ class Runtime:
                 raise ValueError("invalid inherited check_mode value")
             value = self._execution_flag_value(fallback, ctx)
         if value is None:
-            return (False if check_mode and isinstance(authored, str) else default), omitted
+            return (False if check_mode and authored is not None else default), omitted
         return _boolean(value, strict=True), omitted
 
     def _execution_flag_value(self, value, ctx):
-        return _fail_on_undef(self.template(self._bound_apply_flag(value, ctx), ctx))
+        value = self._bound_apply_flag(value, ctx)
+        if isinstance(value, dict) and value == {"__ansiroll_invocation_check_mode__": True}:
+            return self._invocation_check_mode
+        return _fail_on_undef(self.template(value, ctx))
 
     @staticmethod
     def _bound_apply_flag(value, ctx):
