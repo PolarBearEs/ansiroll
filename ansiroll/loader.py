@@ -3641,7 +3641,7 @@ def _apply_file_source_defaults(task, action, node):
             entries.append(defaults[resolved])
     source_keys = {"decrypt", "remote_src", "src"}
     if action == "unarchive":
-        source_keys.add("copy")
+        source_keys.update(("copy", "creates"))
     else:
         source_keys.update(("content", "mode"))
     missing = source_keys - args.keys()
