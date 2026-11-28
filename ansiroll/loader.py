@@ -164,18 +164,24 @@ def parse_playbook(path, vault_password_file=None, *, extra_vars=None, on_playbo
                 play, node.get("ordered_vars_files") or (), node.get("gather_timeout_template"),
                 scoped_options=scoped_options, setup_compile_vars=setup_compile_vars)
             lookups = setup_layers.pop("_setup_controller_lookups", {})
-            env_names = lookups.get("env", ())
-            if env_names:
-                node.setdefault("controller_env", {}).update({
-                    name: os.environ[name] for name in sorted(env_names) if name in os.environ
-                })
-            node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
             if scoped_options:
+                env_names = lookups.get("env", ())
+                if env_names:
+                    node.setdefault("controller_env", {}).update({
+                        name: os.environ[name] for name in sorted(env_names) if name in os.environ
+                    })
+                node["controller_config"].update(_controller_config_values(lookups.get("config", ())))
+                scoped = lookups["unrelated_defaults"]
+                scoped_env = scoped["env"]
+                files, file_errors = _capture_setup_files(play, lookups.get("file", {}))
                 setup_scope = setup_layers["gather_setup_scope"]
                 setup_scope["controller_lookups"] = {
-                    "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names)),
-                    "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ()))),
-                    "file": _capture_setup_files(play, lookups.get("file", {})),
+                    "env": sorted(set(node.pop("_gather_compile_env_names", ())) | set(env_names) | scoped_env),
+                    "config": sorted(set(node["controller_config"]) | set(lookups.get("config", ())) | scoped["config"]),
+                    "env_values": {name: os.environ[name] for name in sorted(scoped_env) if name in os.environ},
+                    "config_values": _controller_config_values(scoped["config"]),
+                    "file": files,
+                    "file_errors": file_errors,
                 }
             node.update(setup_layers)
         # The standalone file never maps back to ansible-core Task objects
@@ -349,19 +355,26 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     setup_names = set()
     computed = set()
     setup_lookups = {"env": set(), "config": set()}
-    setup_sources = [source for source, _, _ in _selector_template_sources(scoped_options or {})]
+    unrelated_lookups = {"env": set(), "config": set()}
+    setup_sources = []
+    legacy = _core_version() < (2, 19)
+    for option, value in (scoped_options or {}).items():
+        unrelated = option == "unrelated_defaults"
+        legacy_setup = legacy and (unrelated or option == "module_defaults")
+        setup_sources.extend((source, legacy_setup, unrelated) for source, _, _ in
+                             _selector_template_sources(value, legacy_setup=legacy_setup))
     lookup_scope = combine_vars(defaults, setup_compile_vars or play_vars)
     for layer in (*exports, play.get_variable_manager().extra_vars, magic):
         lookup_scope = combine_vars(lookup_scope, layer)
-    for source in setup_sources:
+    for source, legacy_setup, unrelated in setup_sources:
         dependencies = _gather_timeout_dependencies(
             source, timeout_scope, _GATHER_STRING_METHODS, allow_controller=True,
-            computed=computed, retain_mutable=True)
+            computed=computed, retain_mutable=True, legacy_setup=legacy_setup)
         if dependencies is not None:
             setup_names.update(dependencies[1])
         _gather_timeout_dependencies(
             source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
-            computed=computed, lookups=setup_lookups)
+            computed=computed, lookups=unrelated_lookups if unrelated else setup_lookups, legacy_setup=legacy_setup)
     file_aliases = {}
     file_names = set()
     file_values = {}
@@ -399,10 +412,11 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
         # File lookups can refer to explicitly authored assets in any reachable
         # branch. Environment and config capture still follows the build scope.
         file_lookups = {"file": {}}
-        for source in setup_sources:
+        for source, legacy_setup, _ in setup_sources:
             _gather_timeout_dependencies(
                 source, lookup_scope, _GATHER_STRING_METHODS, allow_controller=True,
-                computed=computed, retain_mutable=True, lookups=file_lookups, alternate_values=file_values)
+                computed=computed, retain_mutable=True, lookups=file_lookups, alternate_values=file_values,
+                legacy_setup=legacy_setup)
         setup_lookups.update(file_lookups)
     if computed_selector_names:
         selector_names.update(defaults)
@@ -442,6 +456,7 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
         "vars_file_magic": _tag_untrusted({key: magic[key] for key in sorted(selector_names & magic.keys())}),
     }
     if scoped_options:
+        setup_lookups["unrelated_defaults"] = unrelated_lookups
         result["_setup_controller_lookups"] = setup_lookups
         result["gather_setup_scope"] = _tag_untrusted({
             "defaults": {key: value for key, value in defaults.items() if computed or key in setup_names},
@@ -463,7 +478,7 @@ def _capture_setup_files(play, terms_by_alias):
     from ansible.plugins.lookup import file as builtin_file
 
     if not terms_by_alias:
-        return {}
+        return {}, {}
     loader = play._loader
     plugin = plugin_loader.lookup_loader.get("ansible.builtin.file", loader=loader)
     search_path = play.get_search_path() if hasattr(play, "get_search_path") else [loader.get_basedir()]
@@ -473,6 +488,7 @@ def _capture_setup_files(play, terms_by_alias):
     overrides_file = any(os.path.isfile(os.path.join(root, "lookup_plugins", "file.py")) for root in plugin_dirs)
     builtin_path = os.path.realpath(builtin_file.__file__)
     captured = {}
+    failures = {}
     for alias, names in sorted(terms_by_alias.items()):
         if alias != "ansible.builtin.file":
             resolved = plugin_loader.lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
@@ -482,27 +498,34 @@ def _capture_setup_files(play, terms_by_alias):
         for name in sorted(names):
             try:
                 files[name], = plugin.run([name], variables=variables, lstrip=False, rstrip=False)
-            except (AnsibleError, OSError):
-                # Missing terms fail only if the runner actually selects them.
-                continue
-    return captured
+            except (AnsibleError, OSError) as exc:
+                # Replay a failure only for terms the controller tried to read.
+                failures.setdefault(alias, {})[name] = str(exc)
+    return captured, failures
 
 
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
                                  unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None,
-                                 vars_lookup_allowed=None):
+                                 vars_lookup_allowed=None, legacy_setup=False):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
-                          _selector_template_sources, _setup_builtin_lookup)
+    from .runtime import (_LEGACY_SETUP_TEMPLATE, _has_template_delimiter, _is_literal_vars_lookup,
+                          _legacy_setup_template_parts,
+                          _selector_input_paths, _selector_projection_cycle, _selector_scope, _selector_template_sources,
+                          _setup_builtin_lookup)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
-    key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
+    key_scope = {key: _tag_untrusted(value, template_syntax_only=not legacy_setup) if isinstance(value, str) else value
                  for key, value in variables.items()}
     key_scope["__ansiroll_controller_config"] = {"DEFAULT_JINJA2_NATIVE": getattr(C, "DEFAULT_JINJA2_NATIVE", None)}
+    if legacy_setup:
+        key_scope[_LEGACY_SETUP_TEMPLATE] = None
+        key_scope["__ansiroll_controller_config"].update(
+            _controller_config_values(("DEFAULT_UNDEFINED_VAR_BEHAVIOR", "DEFAULT_NULL_REPRESENTATION",
+                                       "DEFAULT_JINJA2_NATIVE")))
     pending = [(source, (), None, ())]
     scope = {}
     names = set()
@@ -516,8 +539,14 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             return None
         ancestors = (*ancestors, (origin, remaining))
         try:
-            expression = env.parse(source)
-        except TemplateSyntaxError:
+            if legacy_setup:
+                source, parse_env = _legacy_setup_template_parts(source, env)
+                if not _has_template_delimiter(source, parse_env):
+                    continue
+            else:
+                parse_env = env
+            expression = parse_env.parse(source)
+        except (TemplateSyntaxError, ValueError, SyntaxError, TypeError):
             if retain_mutable:
                 continue
             return None
@@ -549,7 +578,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             names.add(name)
             for value in (alternate_values or {}).get(name, ()):
                 pending.extend((alias, suffix, (name, location), ancestors)
-                               for alias, suffix, location in _selector_template_sources(value, path))
+                               for alias, suffix, location in _selector_template_sources(
+                                   value, path, legacy_setup=legacy_setup))
             if name not in variables:
                 continue
             value = variables[name]
@@ -558,9 +588,10 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 if retain_mutable:
                     continue
                 return None
-            scope[name] = _tag_untrusted(value, template_syntax_only=allow_controller)
+            scope[name] = _tag_untrusted(value, template_syntax_only=allow_controller and not legacy_setup)
             pending.extend((alias, suffix, (name, location), ancestors)
-                           for alias, suffix, location in _selector_template_sources(scope[name], path))
+                           for alias, suffix, location in _selector_template_sources(
+                               scope[name], path, legacy_setup=legacy_setup))
     return scope, names
 
 
@@ -772,9 +803,17 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         gather = play.gather_facts
         if gather is None:
             gather = C.DEFAULT_GATHERING != "explicit"
-    setup_defaults = _setup_module_defaults(play, "ansible.builtin.setup") if gather else []
-    gather_defaults = _setup_module_defaults(play, "ansible.builtin.gather_facts") if gather else []
-    if (setup_defaults or gather_defaults) and _core_version() >= (2, 19):
+    core_version = _core_version()
+    module_defaults = _play_module_defaults(play) if gather else {}
+    setup_keys = _setup_default_keys(play, module_defaults, "ansible.builtin.setup", core_version)
+    gather_keys = _setup_default_keys(play, module_defaults, "ansible.builtin.gather_facts", core_version)
+    setup_defaults = [module_defaults[key] for key in setup_keys]
+    gather_defaults = [module_defaults[key] for key in gather_keys]
+    legacy_defaults = (
+        _legacy_setup_defaults(module_defaults, set(setup_keys + gather_keys))
+        if core_version < (2, 19) else {}
+    )
+    if (setup_defaults or gather_defaults) and core_version >= (2, 19):
         explicit = {
             key for key in ("fact_path", "gather_subset", "gather_timeout")
             if key in (play.get_ds() or {}) and _known_setup_arg(getattr(play, key, None))
@@ -806,8 +845,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
     }
     default_sources = _tag_untrusted(setup_defaults + gather_defaults)
-    if any(_selector_template_sources(default_sources)):
+    if any(_selector_template_sources(default_sources, legacy_setup=bool(legacy_defaults))):
         scoped_options["module_defaults"] = default_sources
+    selected_default_keys = set(setup_keys + gather_keys)
+    unrelated_defaults = {key: value for key, value in legacy_defaults.items() if key not in selected_default_keys}
+    if unrelated_defaults:
+        scoped_options["unrelated_defaults"] = unrelated_defaults
     early_setup = (play.gather_facts is not False
                    and (play.gather_facts or C.DEFAULT_GATHERING != "explicit")
                    and (scoped_options or _is_templated(play.gather_timeout)))
@@ -882,7 +925,6 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     _assign_runtime_ids(tasks, handlers)
     if gather:
         actions.add("ansible.builtin.setup")  # implicit fact gathering needs the module
-    core_version = _core_version()
     result = {
         "name": play.name or "",
         "hosts": hosts,
@@ -922,10 +964,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         if (not (setup_defaults or gather_defaults) and setup_options.get("gather_subset") == ["all"]
                 and "gather_subset" not in play_data):
             del setup_options["gather_subset"]
+        if legacy_defaults:
+            result["gather_legacy_defaults"] = legacy_defaults
         if setup_defaults:
-            result["gather_setup_defaults"] = _tag_untrusted(setup_defaults)
+            result["gather_setup_defaults"] = setup_keys if legacy_defaults else _tag_untrusted(setup_defaults)
         if gather_defaults:
-            result["gather_action_defaults"] = _tag_untrusted(gather_defaults)
+            result["gather_action_defaults"] = gather_keys if legacy_defaults else _tag_untrusted(gather_defaults)
         if setup_defaults or gather_defaults:
             if "gather_timeout" not in play_data and play.gather_timeout is not None:
                 result["gather_timeout"] = play.gather_timeout
@@ -947,6 +991,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     lookup_sources.pop("_gather_setup_scoped", None)
     lookup_sources.pop("gather_setup_defaults", None)
     lookup_sources.pop("gather_action_defaults", None)
+    lookup_sources.pop("gather_legacy_defaults", None)
     lookup_sources.pop("_gather_setup_compile_vars", None)
     names = _controller_env_names(lookup_sources)
     if "_gather_setup_scoped" in result:
@@ -962,6 +1007,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
                          "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
     if setup_defaults or gather_defaults:
         config_names.add("DEFAULT_GATHER_SUBSET")
+    if legacy_defaults:
+        config_names.update(("DEFAULT_UNDEFINED_VAR_BEHAVIOR", "DEFAULT_NULL_REPRESENTATION"))
     if core_version >= (2, 19):
         config_names.add("DISPLAY_TRACEBACK")
     controller_config = _controller_config_values(config_names)
@@ -1100,23 +1147,44 @@ def _prune_setup_defaults(layers, overrides):
             if isinstance(layer, dict) else layer for layer in layers]
 
 
-def _setup_module_defaults(play, action):
+def _play_module_defaults(play):
     defaults = {}
     layers = play.module_defaults or ()
     if isinstance(layers, dict):
         layers = (layers,)
     for layer in layers:
         defaults.update(layer)
+    return defaults
+
+
+def _setup_default_keys(play, defaults, action, core_version):
     groups = (getattr(play, "_action_groups", None) or {}).get(action, ())
-    inherited = [value for key, value in defaults.items() if key.startswith("group/") and key[6:] in groups]
-    if _core_version() < (2, 12):
+    inherited = [key for key in defaults if key.startswith("group/") and key[6:] in groups]
+    if core_version < (2, 12):
         short = action.rsplit(".", 1)[-1]
-        inherited.append(defaults.get(short))
+        inherited.append(short)
         if short == "setup":
-            inherited.append(defaults.get("ansible.legacy.setup"))
+            inherited.append("ansible.legacy.setup")
     else:
-        inherited.append(defaults.get(action))
-    return [entry for entry in inherited if entry]
+        inherited.append(action)
+    return [key for key in inherited if defaults.get(key)]
+
+
+def _legacy_setup_defaults(defaults, selected_keys):
+    from .runtime import _selector_template_sources
+
+    retained = {}
+    for key, value in defaults.items():
+        tagged = _tag_untrusted(value)
+        if key in selected_keys:
+            retained[key] = tagged
+        else:
+            # Legacy Core templates unrelated defaults but never uses their
+            # literal values. Keep only authored templates in evaluation order.
+            sources = [source for source, _, _ in _selector_template_sources(tagged, legacy_setup=True)]
+            if sources:
+                retained[key] = sources[::-1]
+    return retained
 
 
 def _controller_env_names(value, *, trusted_only=False):

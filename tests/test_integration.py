@@ -4808,6 +4808,67 @@ def test_runtime_timeout_folds_aliases_using_legacy_rendering_mode(tmp_path, mon
         assert called == [("ansible.builtin.setup", {"gather_timeout": expected})]
 
 
+@pytest.mark.parametrize(("template", "vars_file"), [
+    ("{% set use_base = flag %}{{ base if use_base else unused }}",
+     "flag: !unsafe '{{ 0 }}'\nbase: 45\nunused: \"{{ lookup('unused') }}\"\n"),
+    ("{% set value = member %}{% set key = value.strip() %}{% set value = 'unused' %}{{ cfg[key] }}",
+     "member: ' active '\ncfg: {active: 45, unused: \"{{ lookup('unused') }}\"}\n"),
+], ids=["unsafe-alias", "string-method-alias"])
+def test_gather_timeout_reads_selected_vars_file_member(tmp_path, monkeypatch, template, vars_file):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars: {profile: default, base: 23, flag: true, member: active, cfg: {active: 23}}
+  vars_files: ['timeout-{{ profile }}.yml']
+  gather_timeout: >-
+    %s
+  tasks: []
+""" % template)
+    (tmp_path / "timeout-default.yml").write_text("{}\n")
+    (tmp_path / "timeout-runtime.yml").write_text(vars_file)
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_timeout"] == 23
+    called = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "runtime"})
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 45})]
+
+
+def test_legacy_gather_defaults_do_not_bundle_unused_vault_value(tmp_path):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import _core_version
+
+    core = _core_version()
+    if core >= (2, 19):
+        pytest.skip("modern Core does not render unrelated defaults")
+    password_file = tmp_path / "vault-password"
+    password_file.write_text("synthetic-password\n")
+    secret = VaultSecret(b"synthetic-password")
+    vault = VaultLib([("default", secret)])
+    unused = "unused-synthetic-module-default"
+    ciphertext = vault.encrypt(unused.encode(), secret=secret).decode()
+    playbook = tmp_path / "play.yml"
+    copy_action = "copy" if core < (2, 12) else "ansible.builtin.copy"
+    playbook.write_text(
+        "- hosts: localhost\n"
+        "  module_defaults:\n"
+        "    %s:\n"
+        "      owner: !vault |\n" % copy_action
+        + "".join("        " + line + "\n" for line in ciphertext.splitlines())
+        + "      group: '{{ optional_group | default(\"default\") }}'\n"
+        + "  tasks: []\n"
+    )
+    source, _ = compile_playbook(str(playbook), vault_password_file=str(password_file))
+    plan = _compiled_plays(source, tmp_path)[0]
+    assert plan["gather_legacy_defaults"] == {
+        copy_action: ['{{ optional_group | default("default") }}'],
+    }
+    assert unused not in json.dumps(plan)
+
+
 def test_controller_timeout_cache_tracks_macro_captures_at_call_time(tmp_path, monkeypatch):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

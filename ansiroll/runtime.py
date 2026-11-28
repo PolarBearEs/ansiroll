@@ -74,6 +74,7 @@ _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 _CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
 _INCLUDE_APPLY_FLAGS = "__ansiroll_apply_flags"
+_LEGACY_SETUP_TEMPLATE = "__ansiroll_legacy_setup_template"
 
 
 def _rendered_number(value, source, ctx):
@@ -85,13 +86,26 @@ def _rendered_number(value, source, ctx):
     return value
 
 
+def _legacy_setup_null_value(source, ctx):
+    bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", source)
+    if bare and dict.get(ctx, bare.group(1), _MISSING_VARS_FILE_INPUT) is None:
+        return (ctx.get("__ansiroll_controller_config") or {}).get("DEFAULT_NULL_REPRESENTATION")
+    # The expression contributes no text, but Jinja still emits its surrounding data.
+    env = jinja2.Environment(keep_trailing_newline=True)
+    text = "".join(value for _, kind, value in env.lex(source) if kind == "data")
+    trailing = len(source) - len(source.rstrip("\n"))
+    rendered_trailing = len(text) - len(text.rstrip("\n"))
+    return text + "\n" * (trailing - rendered_trailing)
+
+
 def _vars_snapshot(ctx):
     # Ansible exposes a shallow copy of the task context under the magic
     # variable. From 2.20 onward it also exposes one nested copy under 'vars'.
     excluded = {"vars", "__ansiroll_controller_config", "__ansiroll_controller_env",
                 "__ansiroll_search_dirs", "__ansiroll_lazy_selector_members", "__ansiroll_vars_file_selector",
                 "__ansiroll_setup_controller_lookups",
-                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT, _INCLUDE_APPLY_FLAGS, _CHECK_MODE_TEMPLATE}
+                _DEFER_LOOKUP_NAMES, _TEMPLATE_FILE_TEXT, _INCLUDE_APPLY_FLAGS, _CHECK_MODE_TEMPLATE,
+                _LEGACY_SETUP_TEMPLATE}
     snapshot = {key: value for key, value in ctx.items() if key not in excluded}
     if _core_at_least(2, 20):
         snapshot["vars"] = dict(snapshot)
@@ -285,26 +299,69 @@ def _looks_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
+def _looks_setup_template(value):
+    return isinstance(value, str) and (
+        _looks_templated(value) or "{#" in value or value.startswith("#jinja2:") and _core_at_least(2, 15, 2))
+
+
+def _legacy_setup_template_parts(source, env, warn=lambda _message: None):
+    if not source.startswith("#jinja2:"):
+        return source, env
+    source, options, _ = _template_file_options(source, {}, warn)
+    overlay = env.overlay()
+    for name, value in options:
+        setattr(overlay, name, value)
+    return source, overlay
+
+
+def _has_template_delimiter(source, env):
+    delimiters = (env.variable_start_string, env.block_start_string, env.comment_start_string)
+    if any(not isinstance(delimiter, str) or not delimiter for delimiter in delimiters):
+        raise ValueError("template opening delimiters must be non-empty strings")
+    return any(delimiter in source for delimiter in delimiters)
+
+
 def _selector_local_values(names, bindings, variables=None):
-    """Follow assignment-time names to constants, leaving other locals opaque."""
-    values = dict.fromkeys(names, _UNRESOLVED_SELECTOR_KEY)
-    for name, sources in names.items():
-        visited = set()
-        while len(sources) == 1:
-            source, = sources
-            if isinstance(source, jinja2.nodes.Const):
-                literal = source.value
-                values[name] = _UnsafeText(literal) if isinstance(literal, str) else literal
-                break
-            if not isinstance(source, jinja2.nodes.Name) or id(source) in visited:
-                break
-            visited.add(id(source))
-            sources = bindings.get(id(source), {}).get(source.name, ())
-            if not sources and variables is not None:
-                value = _selector_vars_key(source, variables, ())
-                if isinstance(value, (str, int, float, bool, type(None))):
-                    values[name] = value
-    return values
+    """Resolve scalar assignments using the bindings visible at their definition."""
+    unknown = _UNRESOLVED_SELECTOR_KEY
+    nodes = jinja2.nodes
+    cache = {}
+
+    def resolve(sources, depth):
+        if len(sources) != 1 or depth >= 64:
+            return unknown
+        source, = sources
+        if isinstance(source, nodes.Const):
+            return _selector_literal(source.value)
+        if not isinstance(source, (nodes.Name, nodes.Call)):
+            return unknown
+        key = id(source)
+        if key not in cache:
+            scope = bindings.get(key, {})
+
+            def resolve_name(node):
+                if node.name in scope:
+                    return resolve(scope[node.name], depth + 1)
+                if variables is not None:
+                    return _selector_vars_key(node, variables, ())
+                return unknown
+
+            value = _selector_vars_key(source, variables or {}, resolve_name=resolve_name)
+            cache[key] = (_selector_literal(value)
+                          if isinstance(value, (str, int, float, bool, type(None))) else unknown)
+        return cache[key]
+
+    return {name: resolve(sources, 0) for name, sources in names.items()}
+
+
+def _selector_literal(value):
+    return _UnsafeText(value) if isinstance(value, str) else value
+
+
+def _is_selector_string_call(node):
+    nodes = jinja2.nodes
+    return (isinstance(node, nodes.Call) and isinstance(node.node, nodes.Getattr)
+            and node.node.attr in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None)
 
 
 def _selector_scope(expression, variables, *, retain_mutable=False):
@@ -441,8 +498,9 @@ def _selector_scope(expression, variables, *, retain_mutable=False):
             local = names.copy()
         for child in node.iter_child_nodes():
             visit(child, local, top if local is names else context)
-        if isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name) and isinstance(
-                node.node, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Const)):
+        if (isinstance(node, nodes.Assign) and isinstance(node.target, nodes.Name)
+                and (isinstance(node.node, (nodes.Name, nodes.Getattr, nodes.Getitem, nodes.Const))
+                     or _is_selector_string_call(node.node))):
             names[node.target.name] = frozenset({node.node})
         elif isinstance(node, (nodes.Assign, nodes.AssignBlock)):
             names.update(dict.fromkeys(target_names(node.target), unknown_local))
@@ -638,13 +696,14 @@ def _selector_default_uses_fallback(value, boolean):
     return not truth if boolean is True and truth is not None else None
 
 
-def _selector_vars_key(node, variables, aliases=None, *, template_variables=None):
+def _selector_vars_key(node, variables, aliases=None, *, template_variables=None, resolve_name=None):
     """Resolve known values without running template plugins."""
     if template_variables is None:
         template_variables = variables
 
     def resolve(child):
-        return _selector_vars_key(child, variables, aliases, template_variables=template_variables)
+        return _selector_vars_key(child, variables, aliases, template_variables=template_variables,
+                                  resolve_name=resolve_name)
 
     unknown = _UNRESOLVED_SELECTOR_KEY
     missing = _MISSING_VARS_FILE_INPUT
@@ -667,12 +726,16 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
         if truth is not None:
             return not truth
     if isinstance(node, jinja2.nodes.Name):
+        if resolve_name is not None:
+            return resolve_name(node)
         value = variables.get(node.name, missing)
         if value is None or value is missing:
             return value
         if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
-            return value["__ansiroll_unsafe__"]
-        if isinstance(value, str) and (not _looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
+            return _selector_literal(value["__ansiroll_unsafe__"])
+        legacy_setup = _LEGACY_SETUP_TEMPLATE in template_variables
+        looks_templated = _looks_setup_template if legacy_setup else _looks_templated
+        if isinstance(value, str) and (not looks_templated(value) or isinstance(value, _NO_TEMPLATE)):
             return value
         if isinstance(value, (int, float, dict, list, tuple)):
             return value
@@ -685,6 +748,12 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
                     return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
                     rendered = _selector_vars_key(body[0].nodes[0], template_variables, (*aliases, node.name))
+                    if rendered is missing and legacy_setup:
+                        config = template_variables.get("__ansiroll_controller_config", {})
+                        if config.get("DEFAULT_UNDEFINED_VAR_BEHAVIOR") is False:
+                            return _selector_literal(value)
+                    if rendered is None and legacy_setup and _legacy_non_native(template_variables):
+                        return _legacy_setup_null_value(value, template_variables)
                     return _rendered_number(rendered, value, template_variables)
     if isinstance(node, jinja2.nodes.Compare):
         # Delegate each comparison of known scalars to Jinja's own operator
@@ -704,18 +773,16 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
                 return unknown
             left = right
         return True
-    if isinstance(node, jinja2.nodes.Call) and isinstance(node.node, jinja2.nodes.Getattr):
-        method = node.node.attr
-        if method in _GATHER_STRING_METHODS and node.dyn_args is None and node.dyn_kwargs is None:
-            value = resolve(node.node.node)
-            args = [resolve(arg) for arg in node.args]
-            kwargs = {kw.key: resolve(kw.value) for kw in node.kwargs}
-            if isinstance(value, str) and all(arg is not unknown and arg is not missing
-                                              for arg in (*args, *kwargs.values())):
-                try:
-                    return getattr(str, method)(value, *args, **kwargs)
-                except (TypeError, ValueError, OverflowError):
-                    return unknown
+    if _is_selector_string_call(node):
+        value = resolve(node.node.node)
+        args = [resolve(arg) for arg in node.args]
+        kwargs = {kw.key: resolve(kw.value) for kw in node.kwargs}
+        if isinstance(value, str) and all(arg is not unknown and arg is not missing
+                                          for arg in (*args, *kwargs.values())):
+            try:
+                return getattr(str, node.node.attr)(value, *args, **kwargs)
+            except (TypeError, ValueError, OverflowError):
+                return unknown
     if isinstance(node, jinja2.nodes.Getitem):
         value = resolve(node.node)
         index = resolve(node.arg)
@@ -858,10 +925,11 @@ def _selector_projection_cycle(origin, path, ancestors):
     return False
 
 
-def _selector_template_sources(value, path=(), *, include_members=True):
+def _selector_template_sources(value, path=(), *, include_members=True, legacy_setup=False):
     """Yield each required template with its remaining path and its location in the input."""
+    looks_templated = _looks_setup_template if legacy_setup else _looks_templated
     for index, key in enumerate(path):
-        if _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+        if looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             yield value, path[index:], path[:index]
             return
         if key is None:
@@ -890,7 +958,7 @@ def _selector_template_sources(value, path=(), *, include_members=True):
                 pending.extend((item, (*location, key)) for key, item in value.items())
             else:
                 pending.extend((item, (*location, index)) for index, item in enumerate(value))
-        elif _looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
+        elif looks_templated(value) and not isinstance(value, _NO_TEMPLATE):
             yield value, (), location
 
 
@@ -1513,6 +1581,34 @@ def _f_quote(v):
         return _to_text_str(v)
 
 
+def _f_comment(text, style="plain", **kwargs):
+    beginning, decoration, end = {
+        "plain": ("", "# ", ""),
+        "erlang": ("", "% ", ""),
+        "c": ("", "// ", ""),
+        "cblock": ("/*", " * ", " */"),
+        "xml": ("<!--", " - ", "-->"),
+    }[style]
+    decoration = kwargs.get("decoration", decoration)
+    border = decoration.rstrip()
+    newline = kwargs.get("newline", "\n")
+    beginning = kwargs.get("beginning", beginning)
+    end = kwargs.get("end", end)
+    prefix = kwargs.get("prefix", border)
+    postfix = kwargs.get("postfix", border)
+    content = (decoration + text.replace(newline, newline + decoration)).replace(
+        decoration + newline, border + newline)
+    if prefix:
+        line = newline if prefix == newline else prefix + newline
+        content = line * int(kwargs.get("prefix_count", 1)) + content
+    content += newline.join([""] + [postfix] * kwargs.get("postfix_count", 1))
+    if beginning:
+        content = beginning + newline + content
+    if end:
+        content += newline + end
+    return content
+
+
 def _f_to_json(v, **kwargs):
     return json.dumps(_mark_unsafe(v, reject_vault=True), **kwargs)
 
@@ -1623,6 +1719,8 @@ _ANSIBLE_FILTERS = {
     "symmetric_difference": _f_symmetric_difference,
     "flatten": _f_flatten,
     "quote": _f_quote,
+    "comment": _f_comment,
+    "ansible.builtin.comment": _f_comment,
     "type_debug": lambda v: _type_debug(v),
     "basename": lambda v: os.path.basename(str(v)),
     "dirname": lambda v: os.path.dirname(str(v)),
@@ -1710,12 +1808,36 @@ def _setup_builtin_lookup(name):
     return None
 
 
+class _UncapturedSetupLookup(ValueError):
+    pass
+
+
+def _legacy_setup_supports_lookup(name):
+    namespace, _, short = name.rpartition(".")
+    local = short in ("vars", "list", "items", "flattened", "together", "dict", "nested", "indexed_items")
+    return _setup_builtin_lookup(name) is not None or (namespace in ("", "ansible.builtin", "ansible.legacy") and local)
+
+
+def _warn_setup_template(ctx, message):
+    warnings = ctx.get(_LEGACY_SETUP_TEMPLATE)
+    if warnings is not None:
+        if message in warnings:
+            return
+        warnings.add(message)
+    sys.stderr.write("[WARNING]: %s\n" % message)
+
+
 def _lookup_values(name, args, kwargs, ctx=None):
+    ctx = ctx or {}
     qualified_name = str(name)
     name = qualified_name.rsplit(".", 1)[-1]
-    if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
+    if name in ("file", "pipe") and ctx.get("__ansiroll_vars_file_selector"):
         raise ValueError("lookup %r in a vars_files selector requires recompilation on the controller" % name)
-    setup_lookups = (ctx or {}).get("__ansiroll_setup_controller_lookups")
+    setup_lookups = ctx.get("__ansiroll_setup_controller_lookups")
+    if _LEGACY_SETUP_TEMPLATE in ctx:
+        if not _legacy_setup_supports_lookup(qualified_name):
+            raise _UncapturedSetupLookup("setup requires an uncaptured controller lookup %r" % qualified_name)
+        setup_lookups = setup_lookups or {}
     if setup_lookups is not None and name in ("env", "config", "file") and not _setup_builtin_lookup(qualified_name):
         raise _UnsupportedLookup(qualified_name)
     if setup_lookups is not None and name in ("env", "config") and "default" not in kwargs:
@@ -1740,14 +1862,18 @@ def _lookup_values(name, args, kwargs, ctx=None):
         return vals
     if name == "env":
         default = kwargs.get("default", "")
-        controller_env = (ctx or {}).get("__ansiroll_controller_env")
+        controller_env = ctx.get("__ansiroll_controller_env")
+        if setup_lookups is not None:
+            controller_env = {**(controller_env or {}), **setup_lookups.get("env_values", {})}
         if isinstance(controller_env, dict):
             return [controller_env.get(str(a), default) for a in args]
         return [os.environ.get(str(a), default) for a in args]
     if name == "config":
-        controller_config = (ctx or {}).get(
+        controller_config = ctx.get(
             "__ansiroll_controller_config"
         )
+        if setup_lookups is not None:
+            controller_config = {**(controller_config or {}), **setup_lookups.get("config_values", {})}
         if isinstance(controller_config, dict):
             return [controller_config.get(str(a)) for a in args]
         return [None for _a in args]
@@ -1757,7 +1883,17 @@ def _lookup_values(name, args, kwargs, ctx=None):
         rstrip = kwargs.get("rstrip", True)
         if setup_lookups is not None:
             files = setup_lookups.get("file", {}).get(qualified_name, {})
+            failures = setup_lookups.get("file_errors", {}).get(qualified_name, {})
             for term in map(str, args):
+                if term in failures:
+                    message = "lookup plugin %r failed for controller file %r: %s" % (
+                        qualified_name, term, failures[term])
+                    mode = kwargs.get("errors", "strict")
+                    if mode == "warn":
+                        _warn_setup_template(ctx, message)
+                    elif mode != "ignore":
+                        raise ValueError(message)
+                    return None
                 if term not in files:
                     raise ValueError("setup requires an uncaptured controller file %r" % term)
                 value = files[term]
@@ -1765,7 +1901,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
                     value = value.lstrip()
                 vals.append(value.rstrip() if rstrip else value)
             return vals
-        dirs = (ctx or {}).get("__ansiroll_search_dirs") or []
+        dirs = ctx.get("__ansiroll_search_dirs") or []
         for a in args:
             path = os.path.expanduser(str(a))
             if not os.path.isabs(path):
@@ -1850,6 +1986,8 @@ def _lookup(name, *args, **kwargs):
     ctx = kwargs.pop("_ansiroll_ctx", None)
     wantlist = kwargs.pop("wantlist", False)
     vals = _lookup_values(name, args, kwargs, ctx)
+    if vals is None:
+        return [] if wantlist else None
     if wantlist:
         return vals
     if len(vals) == 1:
@@ -1860,7 +1998,8 @@ def _lookup(name, *args, **kwargs):
 def _query(name, *args, **kwargs):
     ctx = kwargs.pop("_ansiroll_ctx", None)
     kwargs.pop("wantlist", None)
-    return _lookup_values(name, args, kwargs, ctx)
+    vals = _lookup_values(name, args, kwargs, ctx)
+    return [] if vals is None else vals
 
 
 def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
@@ -3353,6 +3492,8 @@ def _wrap_filter(fn):
     def wrapped(*a, **k):
         try:
             return fn(*a, **k)
+        except _UncapturedSetupLookup:
+            raise
         except Exception as e:
             return _captured_jinja_error(e)
     return wrapped
@@ -3726,6 +3867,8 @@ class _Templater:
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
+        except _UncapturedSetupLookup:
+            raise
         except jinja2.UndefinedError as e:
             return _captured_jinja_error(e)
         except Exception as e:
@@ -3740,6 +3883,8 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)
+        except _UncapturedSetupLookup:
+            raise
         except jinja2.UndefinedError as e:
             return _captured_jinja_error(e)
         except Exception as e:
@@ -3834,7 +3979,8 @@ class _Templater:
         if isinstance(value, _DelegatedTemplateValue):
             return value.resolve()
         self._observe_untrusted(value)
-        if type(value) in (str, _TaskVarTemplate, _BlockVarTemplate, _PlayVarTemplate) and _looks_templated(value):
+        looks_templated = _looks_setup_template if _LEGACY_SETUP_TEMPLATE in ctx else _looks_templated
+        if type(value) in (str, _TaskVarTemplate, _BlockVarTemplate, _PlayVarTemplate) and looks_templated(value):
             cache = None
             if isinstance(ctx, _PlayVarScope) and isinstance(value, _TaskVarTemplate):
                 cache = ctx.resolved_task
@@ -3898,8 +4044,10 @@ class _Templater:
     def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None, file_options=(), file_header=False):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
+        legacy_setup = file_newline is None and _LEGACY_SETUP_TEMPLATE in ctx
         if file_newline is None:
-            templated = _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text)
+            templated = (_looks_setup_template(text) if legacy_setup else
+                         _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text))
         else:
             settings = dict(file_options)
             starts = [
@@ -3928,6 +4076,17 @@ class _Templater:
             with self._plugin_arg_scope(None):
                 result = self._render_string(
                     text, ctx, strict, file_newline=file_newline, file_options=file_options, file_header=file_header)
+            if legacy_setup:
+                config = ctx.get("__ansiroll_controller_config", {})
+                if config.get("DEFAULT_UNDEFINED_VAR_BEHAVIOR") is False:
+                    try:
+                        _fail_on_undef(result)
+                    except _CapturedTemplateError:
+                        raise
+                    except jinja2.UndefinedError:
+                        return _UnsafeText(text)
+                if result is None and _legacy_non_native(ctx):
+                    return _legacy_setup_null_value(text, ctx)
             if alias:
                 if isinstance(result, (bool, dict, list, tuple)):
                     # Collection members carry their own markers, which the
@@ -3949,7 +4108,8 @@ class _Templater:
         if isinstance(result, str):
             # Rendered output is data: like Ansible, it is never templated
             # again (trusted variable values are templated when looked up).
-            return (_UnsafeText(result) if _looks_templated(result)
+            looks_templated = _looks_setup_template if legacy_setup else _looks_templated
+            return (_UnsafeText(result) if looks_templated(result)
                     else str(result) if isinstance(result, _UnsafeTemplate)
                     else result)
         return _rendered_number(result, text, ctx)
@@ -4148,11 +4308,17 @@ class _Templater:
         check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
         native_keyword = check_mode_template is True
         tracking = self._untrusted_task_interpolation is not None
-        lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
+        lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES)) or _LEGACY_SETUP_TEMPLATE in ctx
         if lazy_names:
             env = self._strict_conditional_env if strict else self._conditional_env
         else:
             env = self._strict_env if strict else self.env
+        setup_header = file_newline is None and _LEGACY_SETUP_TEMPLATE in ctx and text.startswith("#jinja2:")
+        template_source = text
+        if setup_header:
+            text, env = _legacy_setup_template_parts(text, env, partial(_warn_setup_template, ctx))
+            if _core_at_least(2, 15, 2) and not _has_template_delimiter(text, env):
+                return template_source
         native_file = file_newline is not None and not _legacy_templating()
         if native_keyword:
             if env not in self._keyword_environments:
@@ -4183,11 +4349,11 @@ class _Templater:
             env = self._file_environments[key]
         expr = None
         legacy_header = file_header and not native_file
-        if (not legacy_header and (check_mode_template is None or text == stripped)
+        if (not (legacy_header or setup_header) and (check_mode_template is None or text == stripped)
                 and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
             expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
         template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
-        template_key = (text, *template_options)
+        template_key = (template_source, setup_header, *template_options)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
         if expr is not None:
@@ -4202,6 +4368,8 @@ class _Templater:
                     compiled = env.compile_expression(expr, undefined_to_none=False)
                     self._expr_cache[expr_key] = compiled
                 result = compiled(**ctx)
+            except _UncapturedSetupLookup:
+                raise
             except Exception as e:
                 # Capture evaluation errors without replaying lookups.
                 return _captured_jinja_error(e, syntax=isinstance(e, jinja2.TemplateSyntaxError))
@@ -4219,10 +4387,20 @@ class _Templater:
                     result = _concat_keyword_segments(tmpl.generate(**ctx))
                 else:
                     result = tmpl.render(**ctx)
+                    if setup_header and (not _legacy_non_native(ctx) or result.startswith(("{", "["))
+                                         or result in ("True", "False")):
+                        import ast
+
+                        try:
+                            result = ast.literal_eval(ast.parse(result, mode="eval"))
+                        except (TypeError, SyntaxError, ValueError):
+                            pass
             except jinja2.TemplateError as e:
                 return _captured_jinja_error(
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
                 )
+            except _UncapturedSetupLookup:
+                raise
             except Exception as e:
                 if not has_lookup:
                     raise
@@ -5019,6 +5197,7 @@ class Runtime:
                 setup_options=play.get("gather_setup_options"),
                 setup_defaults=play.get("gather_setup_defaults"),
                 gather_defaults=play.get("gather_action_defaults"),
+                legacy_defaults=play.get("gather_legacy_defaults"),
                 option_contexts=option_contexts,
                 timeout_template=timeout_template, timeout_vars=timeout_vars,
                 blocked_timeout_inputs=blocked_timeout_inputs,
@@ -5616,6 +5795,7 @@ class Runtime:
 
     def _pre_setup_template_inputs(self, source, ctx, *, selector=False, paths=None, setup_lookups=False,
                                    mapping_shape=False):
+        legacy_setup = _LEGACY_SETUP_TEMPLATE in ctx
         inputs = {}
         pending = [(source, (), None, ())]
         seen = set()
@@ -5625,7 +5805,12 @@ class Runtime:
                 return None
             ancestors = (*ancestors, (origin, remaining))
             try:
-                expression = self.templater.env.parse(source)
+                env = self.templater.env
+                if legacy_setup:
+                    source, env = _legacy_setup_template_parts(source, env)
+                    if not _has_template_delimiter(source, env):
+                        continue
+                expression = env.parse(source)
             except jinja2.TemplateSyntaxError:
                 return None
             analysis = _selector_scope(expression, ctx)
@@ -5641,6 +5826,12 @@ class Runtime:
                 if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
                     continue
                 if selector and _is_literal_vars_lookup(call):
+                    continue
+                if (legacy_setup and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
+                        and call.args and isinstance(call.args[0], nodes.Const)
+                        and isinstance(call.args[0].value, str)
+                        and not _legacy_setup_supports_lookup(call.args[0].value)):
+                    # The renderer rejects these lookups if execution reaches them.
                     continue
                 if (setup_lookups and isinstance(method, jinja2.nodes.Name) and method.name in ("lookup", "query", "q")
                         and call.args and all(isinstance(arg, jinja2.nodes.Const) and isinstance(arg.value, str)
@@ -5670,7 +5861,7 @@ class Runtime:
                 inputs[name] = value
                 pending.extend((alias, suffix, (name, location), ancestors)
                                for alias, suffix, location in _selector_template_sources(
-                                   value, path, include_members=not direct_mapping))
+                                   value, path, include_members=not direct_mapping, legacy_setup=legacy_setup))
         return inputs
 
     def _task_ctx(self, task, overlay):
@@ -7862,22 +8053,28 @@ class Runtime:
                 raise ValueError("gather_timeout must be an integer")
         return int(value)
 
-    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False):
-        def check_dependencies(value, *, mapping_shape=False):
-            if not blocked:
-                return
-            for source, _, _ in _selector_template_sources(value):
-                paths = set()
-                inputs = self._pre_setup_template_inputs(
-                    source, ctx, selector=True, paths=paths, setup_lookups=True, mapping_shape=mapping_shape)
-                if inputs is None or _vars_file_reads_blocked(blocked, paths):
-                    raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
+    def _check_setup_default_dependencies(self, value, ctx, blocked, *, mapping_shape=False):
+        if not blocked:
+            return
+        for source, _, _ in _selector_template_sources(value, legacy_setup=_LEGACY_SETUP_TEMPLATE in ctx):
+            paths = set()
+            inputs = self._pre_setup_template_inputs(
+                source, ctx, selector=True, paths=paths, setup_lookups=True, mapping_shape=mapping_shape)
+            if inputs is None or _vars_file_reads_blocked(blocked, paths):
+                raise ValueError("setup module defaults require a vars file that cannot be selected before setup")
 
+    def _render_setup_defaults(self, layers, explicit_args, ctx, blocked, *, final_setup=False,
+                               legacy_defaults=None):
+        if legacy_defaults:
+            # Legacy Core templates the whole defaults map before selecting an action.
+            self._check_setup_default_dependencies(legacy_defaults, ctx, blocked)
+            rendered = _fail_on_undef(self.template(legacy_defaults, ctx, strict=True))
+            layers = [rendered[key] for key in layers or ()]
         defaults = {}
         modern = _core_at_least(2, 19)
         for entry in layers or ():
-            if isinstance(entry, str):
-                check_dependencies(entry, mapping_shape=modern)
+            if isinstance(entry, str) and not legacy_defaults:
+                self._check_setup_default_dependencies(entry, ctx, blocked, mapping_shape=modern)
                 entry = self.templater.render_string(entry, ctx, strict=True)
                 if isinstance(entry, _LazyTplDict):
                     entry = entry._raw
@@ -7885,13 +8082,13 @@ class Runtime:
                 _fail_on_undef(entry)
             if not isinstance(entry, dict) or set(entry) == {"__ansiroll_unsafe__"}:
                 raise ValueError("setup module defaults must resolve to a dictionary")
-            if not modern:
-                check_dependencies(entry)
+            if not modern and not legacy_defaults:
+                self._check_setup_default_dependencies(entry, ctx, blocked)
                 entry = _fail_on_undef(self.template(entry, ctx, strict=True))
             defaults.update(entry)
         inherited = {key: value for key, value in defaults.items() if key not in explicit_args}
         if modern:
-            check_dependencies(inherited)
+            self._check_setup_default_dependencies(inherited, ctx, blocked)
             return _setup_omit(self.template(inherited, ctx, strict=True))
         # Legacy Core removes omit before the setup action applies its own defaults.
         return inherited if final_setup else _setup_omit(inherited)
@@ -7899,7 +8096,8 @@ class Runtime:
     def gather_facts(self, environment=None, become=False, become_user=None,
                      fact_schema=None, ignore_errors=None, ctx=None, when=None, no_log=False,
                      gather_timeout=None, timeout_template=None, timeout_vars=None, blocked_timeout_inputs=(),
-                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None):
+                     setup_options=None, setup_defaults=None, gather_defaults=None, option_contexts=None,
+                     legacy_defaults=None):
         # Reported as a task so the recap matches Ansible's "Gathering Facts".
         node = {"name": "Gathering Facts", "action": "gather_facts",
                 "uuid": "__gather_facts__", "runtime_id": "__gather_facts__",
@@ -7925,7 +8123,8 @@ class Runtime:
                 self.become_user = _as_text(self.template(become_user, ctx))
             self._module_env = self._task_environment(
                 {"environment": environment}, ctx)
-            if self.gather_setup_fn is not None and (setup_options or setup_defaults or gather_defaults):
+            has_module_defaults = bool(setup_defaults or gather_defaults or legacy_defaults)
+            if self.gather_setup_fn is not None and (setup_options or has_module_defaults):
                 controller_setup = self.gather_setup_fn()
                 if controller_setup["error"] is not None:
                     raise ValueError(controller_setup["error"])
@@ -7967,15 +8166,19 @@ class Runtime:
                     gather_timeout, timeout_template, ctx, timeout_vars, blocked_timeout_inputs)
                 if gather_timeout is not None and (gather_timeout or _core_at_least(2, 13)):
                     setup_args["gather_timeout"] = gather_timeout
-                if gather_defaults or setup_defaults:
+                if has_module_defaults:
                     defaults_ctx, defaults_blocks = (option_contexts or {}).get("fact_path", (ctx, ()))
+                    if legacy_defaults:
+                        defaults_ctx = {**defaults_ctx, _LEGACY_SETUP_TEMPLATE: set()}
                     gather_args = {**setup_args, **{key: value for key, value in resolved_options.items() if value == _OMIT}}
-                    setup_args.update(self._render_setup_defaults(gather_defaults, gather_args, defaults_ctx, defaults_blocks))
+                    setup_args.update(self._render_setup_defaults(
+                        gather_defaults, gather_args, defaults_ctx, defaults_blocks, legacy_defaults=legacy_defaults))
                     setup_args.pop("parallel", None)
                 setup_args = {key: value for key, value in setup_args.items() if value is not None}
-                if setup_defaults:
+                if setup_defaults or legacy_defaults:
                     setup_args.update(self._render_setup_defaults(
-                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True))
+                        setup_defaults, setup_args, defaults_ctx, defaults_blocks, final_setup=True,
+                        legacy_defaults=legacy_defaults))
             fast_facts = os.environ.get("ANSIROLL_FAST_FACTS", "").lower()
             if not setup_args and fast_facts in ("1", "true", "yes", "on"):
                 from ansiroll.accelerated_modules import facts
