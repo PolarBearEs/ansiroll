@@ -487,6 +487,45 @@ def test_first_found_vars_files_does_not_use_blocked_search_path_before_setup(tm
     assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
 
 
+@pytest.mark.parametrize("compile_profile", [False, True], ids=["changed-path", "verified-path"])
+def test_first_found_rechecks_search_path_from_earlier_vars_file(tmp_path, compile_profile):
+    from tests import ansible_playbook_command
+
+    preferred = tmp_path / "preferred"
+    preferred.mkdir()
+    (preferred / "prod.yml").write_text("selected: preferred\n")
+    (tmp_path / "prod.yml").write_text("selected: fallback\n")
+    (tmp_path / "settings-prod.yml").write_text("ansible_search_path: " + json.dumps([str(preferred)]) + "\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+COMPILE_PROFILE  vars_files:
+    - 'settings-{{ profile }}.yml'
+    - "{{ lookup('first_found', ['prod.yml']) }}"
+  tasks:
+    - debug: {var: selected}
+""".replace("COMPILE_PROFILE", "  vars: {profile: prod}\n" if compile_profile else ""))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    assert '"selected": "preferred"' in native.stdout
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": "prod"})},
+    )
+    if compile_profile:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert '"selected": "preferred"' in result.stdout
+    else:
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "first_found ansible_search_path differs from the bundled search paths" in result.stderr
+    assert '"selected": "fallback"' not in result.stdout
+
+
 @pytest.mark.parametrize("keyword_files", [False, True], ids=["positional", "keyword"])
 def test_legacy_first_found_vars_files_evaluates_embedded_filename(tmp_path, keyword_files):
     from ansiroll.loader import _core_version
@@ -738,27 +777,29 @@ def test_legacy_first_found_vars_files_bundles_positional_fallback(tmp_path):
     assert runtime.vars["selected"] == "production"
 
 
-def test_first_found_vars_files_preserves_bundled_custom_lookup(tmp_path):
+@pytest.mark.parametrize("compile_profile", [False, True], ids=["deferred", "compile-selection"])
+def test_first_found_vars_files_preserves_bundled_custom_lookup(tmp_path, compile_profile):
     lookup_dir = tmp_path / "lookup_plugins"
     lookup_dir.mkdir()
-    (lookup_dir / "first_found.py").write_text("""class LookupModule:
-    def __init__(self, **kwargs):
-        pass
+    (lookup_dir / "first_found.py").write_text("""from ansible.plugins.lookup import LookupBase
 
+class LookupModule(LookupBase):
     def run(self, terms, variables=None, **kwargs):
-        return ["custom.yml"]
+        return ["custom.yml" if terms[0] == "prod.yml" else "fallback.yml"]
 """)
     (tmp_path / "custom.yml").write_text("selected: custom\n")
     (tmp_path / "prod.yml").write_text("selected: builtin\n")
     (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    (tmp_path / "static.yml").write_text("unused: true\n")
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
   gather_facts: false
-  vars_files:
+COMPILE_PROFILE  vars_files:
     - ["{{ lookup('first_found', profile ~ '.yml') }}", fallback.yml]
+    - static.yml
   tasks:
     - assert: {that: "selected == 'custom'"}
-""")
+""".replace("COMPILE_PROFILE", "  vars: {profile: compile}\n" if compile_profile else ""))
     artifact = tmp_path / "artifact.py"
     compiled = subprocess.run(
         [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],

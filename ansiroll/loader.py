@@ -1246,7 +1246,22 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                         if dependencies is not None and not unknown_lookup:
                             if "first_found" in filename and _vars_first_found_patterns(filename, basedir, True) is not None:
                                 defer_for_order |= bool(dependencies[1] - extra_replacements - selector_magic.keys())
+                            checked_search_path = False
+                            if _vars_first_found_model(play, basedir, filename) is not None:
+                                # A preceding replayed vars file can change this
+                                # input even when the explicit terms are constant.
+                                search_path = "ansible_search_path"
+                                dependencies[1].add(search_path)
+                                paths.add((search_path, ()))
+                                path_value = inputs.get(search_path)
+                                if isinstance(path_value, (list, tuple)) and all(
+                                        isinstance(path, str) and not _is_templated(path) for path in path_value):
+                                    checked_search_path = True
+                                if search_path in inputs:
+                                    dependencies[0][search_path] = _tag_untrusted(path_value, template_syntax_only=True)
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
+                            if checked_search_path:
+                                controller_inputs["first_found_search_path_checked"] = True
                             if requires_controller:
                                 controller_inputs["controller_only"] = True
                             if required_plugins:
@@ -1504,6 +1519,20 @@ def _vars_file_has_dynamic_directory(name):
         os.path.sep in literal for literal in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _vars_first_found_model(play, basedir, source):
+    if "first_found" not in source:
+        return None
+    from ansible.plugins.loader import lookup_loader
+    from ansible.plugins.lookup import first_found as builtin_first_found
+
+    roots = (list(play.get_search_path()) if _core_version() >= (2, 12) else []) + [basedir]
+    resolved = lookup_loader.find_plugin_with_context("first_found").plugin_resolved_path
+    has_local_override = any(os.path.isfile(os.path.join(root, "lookup_plugins", "first_found.py")) for root in roots)
+    return _vars_first_found_patterns(
+        source, basedir, bool(resolved and not has_local_override
+                              and os.path.realpath(resolved) == os.path.realpath(builtin_first_found.__file__)))
+
+
 def _finite_vars_file_names(source):
     """Return closed literal alternatives of inline conditional file names."""
     from jinja2 import Environment, TemplateSyntaxError, nodes
@@ -1564,15 +1593,7 @@ def _deferred_vars_files(play, basedir, entries):
         unmodeled = []
         for position, name in enumerate(names):
             if _is_templated(name) and "first_found" in name:
-                from ansible.plugins.loader import lookup_loader
-                from ansible.plugins.lookup import first_found as builtin_first_found
-
-                resolved = lookup_loader.find_plugin_with_context("first_found").plugin_resolved_path
-                has_local_override = any(os.path.isfile(os.path.join(root, "lookup_plugins", "first_found.py"))
-                                         for root in dirs)
-                modeled = _vars_first_found_patterns(
-                    name, basedir, bool(resolved and not has_local_override
-                               and os.path.realpath(resolved) == os.path.realpath(builtin_first_found.__file__)))
+                modeled = _vars_first_found_model(play, basedir, name)
                 if modeled is not None:
                     if first_found_search is None:
                         first_found_search = _vars_first_found_search(play, basedir)
