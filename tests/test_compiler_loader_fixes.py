@@ -288,18 +288,27 @@ def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, mo
     assert node["_baked"] == {selected: "usable template\n"}
 
 
-def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_path):
+@pytest.mark.parametrize(("source", "expected"), [
+    ("{{ selection }} ", "padded"),
+    ("{{ selection -}} ", "unpadded"),
+])
+def test_compile_dynamic_role_source_honors_inline_whitespace(tmp_path, source, expected):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
 - set_fact: {selection: app}
-- template: {src: "{{ selection }} ", dest: "rendered.txt"}
-""", "roles/r/templates/app": "selected template\n"})
+- template: {src: SOURCE, dest: "rendered.txt"}
+""".replace("SOURCE", json.dumps(source)), "roles/r/templates/app": "unpadded\n", "roles/r/templates/app ": "padded\n"})
 
-    _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
-    assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+    playbook = tmp_path / "pb.yml"
+    output = tmp_path / "rendered.txt"
+    native = _ansible(playbook, returncode=0)
+    assert output.read_text() == expected + "\n"
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == native
+    assert output.read_text() == expected + "\n"
 
 
 def test_compile_dynamic_role_source_keeps_a_reachable_parent_path(tmp_path):
