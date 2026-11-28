@@ -585,6 +585,37 @@ def test_implicit_setup_replays_missing_controller_file(tmp_path, monkeypatch, m
             1 if mode == "warn" else 0)
 
 
+@pytest.mark.parametrize(("lookup", "term", "errors", "branch"), [
+    pytest.param("lookup", '"missing-fact-path.txt"', None, "true", id="default-strict"),
+    pytest.param("query", '"missing-fact-path.txt"', "strict", "true", id="explicit-strict"),
+    pytest.param("q", "path_name", None, "true", id="uncaptured-strict"),
+    pytest.param("q", '"missing-fact-path.txt"', "ignore", "true", id="ignore"),
+    pytest.param("lookup", '"missing-fact-path.txt"', "warn", "true", id="warn"),
+    pytest.param("lookup", '"missing-fact-path.txt"', None, "false", id="unused-branch"),
+])
+def test_implicit_setup_discarded_file_lookup(tmp_path, lookup, term, errors, branch):
+    args = '"ansible.builtin.file", ' + term
+    if errors is not None:
+        args += ', errors=' + json.dumps(errors)
+    source = f"{{% if {branch} %}}{{% set unused = {lookup}({args}) %}}{{% endif %}}empty-fact-path"
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  gather_subset: ['!all', '!min', local]
+  vars:
+    path_name: missing-fact-path.txt
+  module_defaults:
+    SETUP_ACTION:
+      fact_path: FACT_PATH_EXPRESSION
+  tasks:
+    - debug: {msg: gathered}
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup").replace(
+        "FACT_PATH_EXPRESSION", json.dumps(source)))
+    failed = not MODERN_TEMPLATING and branch == "true" and errors in (None, "strict")
+    assert recap[3] == ("1" if failed else "0")
+    assert messages == ([] if failed else ["gathered"])
+
+
 def test_implicit_setup_cannot_suppress_uncaptured_controller_file(tmp_path):
     path = _write(tmp_path, """
 - hosts: localhost
