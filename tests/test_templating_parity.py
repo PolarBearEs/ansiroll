@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+from textwrap import indent
 
 import pytest
 
@@ -1531,6 +1532,41 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     assert expected_text == "prefix=controller/" + suffix + "\n"
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
+    assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Ansible resolves collection members lazily")
+@pytest.mark.parametrize("scope", ["play", "task"])
+@pytest.mark.parametrize("member", ["available", "missing"])
+def test_delegated_template_resolves_only_read_alias_members(tmp_path, scope, member):
+    definitions = """vars:
+  alias: "{{ payload }}"
+  payload:
+    available: ready
+    missing: "{{ absent_value }}"
+"""
+    play_vars = indent(definitions, "  ") if scope == "play" else ""
+    task_vars = indent(definitions, "      ") if scope == "task" else ""
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+""" + play_vars + """  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+""" + task_vars, {"sample.j2": "value={{ alias." + member + " }}\n"})
+    output = tmp_path / "rendered.txt"
+    output.write_text("existing\n")
+    native = _ansible(path, tmp_path)
+    assert native[1][3] == ("0" if member == "available" else "1")
+    expected_text = "value=ready\n" if member == "available" else "existing\n"
+    assert output.read_text() == expected_text
+    output.write_text("existing\n")
+    assert _ansiroll(path, tmp_path) == native
+    assert output.read_text() == expected_text
+    output.write_text("existing\n")
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == native
     assert output.read_text() == expected_text
 
 

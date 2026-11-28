@@ -5703,8 +5703,9 @@ class Runtime:
         # Inherited lookups can be reached through aliases in task vars.
         mixed_lookup = self.templater._contains_mixed_lookup(
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
-        block_template = (task.get("delegate_to") and task.get("special") == "template"
-                          and any(_is_deferred_block_var(value) for value in ctx.values()))
+        delegated_template = task.get("delegate_to") and task.get("special") == "template"
+        block_template = delegated_template and any(_is_deferred_block_var(value) for value in ctx.values())
+        lazy_template_vars = delegated_template and self.delegate_fn is not None and _core_at_least(2, 19)
         # Keep child aliases lazy when an include parameter still needs the
         # complete child context, including the native check-mode omit value.
         include_aliases = bool(task_vars) and any(
@@ -5714,7 +5715,7 @@ class Runtime:
         check_mode_aliases = bool(task_vars) and _core_at_least(2, 19) and _looks_templated(task.get("check_mode"))
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
                                       defer=looped or mixed_lookup or block_template
-                                      or include_aliases or check_mode_aliases))
+                                      or lazy_template_vars or include_aliases or check_mode_aliases))
         ctx.update(higher_vars)
         if "include_selector_inputs" in task and self.vars.get("__ansiroll_controller_config", {}).get(
                 "DEFAULT_HASH_BEHAVIOUR") == "merge":
@@ -9211,8 +9212,10 @@ def agent_main():
                 ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
+            # Modern rendering can read one member without resolving its siblings.
             defer_template = action == "template" and (
-                ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
+                _core_at_least(2, 19) or ctx.get(_DEFER_LOOKUP_NAMES)
+                or any(_is_deferred_block_var(value) for value in ctx.values())
             )
             if defer_template:
                 resolve_keys = {"omit"}
