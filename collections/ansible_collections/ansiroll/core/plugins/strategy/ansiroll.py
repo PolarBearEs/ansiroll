@@ -338,6 +338,8 @@ class StrategyModule(StrategyBase):
         if any(item["kind"] == "vars-file-include" for item in controller_reasons):
             self._requires_linear_fallback = True
             linear_reason = "vars-file task selection requires core linear"
+        elif any(item["kind"] == "vars-file-handler" for item in controller_reasons):
+            linear_reason = "templated handler names with dynamic vars files require core linear"
         elif self._requires_linear_fallback:
             linear_reason = "dynamic role or templated action requires core linear"
         elif any(item["kind"] == "vault-source" for item in controller_reasons):
@@ -472,7 +474,7 @@ class StrategyModule(StrategyBase):
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
         self._deferred_vars_file_keys = (
-            set(play_node.get("vars") or {}) if play_node.get("deferred_vars_files") else None
+            set(play.vars or {}) if play_node.get("controller_vars_files") else None
         )
 
         self._ansiballz = embedder.ansiballz_code or ""
@@ -1459,7 +1461,7 @@ class StrategyModule(StrategyBase):
         missing = sorted(keys - current_vars.keys(), key=str)
         mapping_keys = []
         try:
-            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys)
+            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys, play_scope=True)
         except AnsibleError as ex:
             return {"error": str(ex)}
         if snapshot is not None:
@@ -1471,8 +1473,7 @@ class StrategyModule(StrategyBase):
             "names": sorted(set(self._cur_play.vars or {}) | active_keys, key=str),
             "missing": missing,
             "mapping_keys": mapping_keys,
-            "controller_lookups": self._controller_lookups(
-                {key: current_vars[key] for key in active_keys & current_vars.keys()}),
+            "controller_lookups": self._controller_lookups(refreshed),
         }
 
     @staticmethod
@@ -1493,7 +1494,9 @@ class StrategyModule(StrategyBase):
         }
 
     def _controller_lookup_header(self, variables, selected_vars_files):
-        keys = self._vars_file_keys(selected_vars_files) & variables.keys()
+        keys = self._vars_file_keys(selected_vars_files)
+        keys.update(self._deferred_vars_file_keys or ())
+        keys.intersection_update(variables)
         if not keys:
             return ""
         sources = {key: variables[key] for key in keys}
@@ -1963,6 +1966,9 @@ def _controller_fallbacks(play_node):
             if node.get("type") == "include":
                 walk(node.get("tasks"))
                 walk(node.get("handlers"))
+            if node.get("controller_handler_name"):
+                found.append({"kind": "vars-file-handler", "task": node.get("name"),
+                              "reason": "handler name requires hostless vars-file selection"})
             if node.get("fallback"):
                 kind = "controller-fallback"
                 if node.get("_deferred_vault_source"):
@@ -2297,7 +2303,7 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values, mapping_keys=None, *, strict_keys=()):
+def _json_blob(values, mapping_keys=None, *, strict_keys=(), play_scope=False):
     from ansiroll.loader import _tag_untrusted
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
@@ -2314,7 +2320,7 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        tagged = _tag_untrusted(values, template_syntax_only=True)
+        tagged = _tag_untrusted(values, template_syntax_only=not play_scope, preserve_vault=play_scope)
         if mapping_keys is None or not _contains_typed_mapping_keys(tagged):
             return json.dumps(tagged, default=str)
     except Exception:
@@ -2322,7 +2328,7 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     safe = {}
     for k, v in (values or {}).items():
         try:
-            v = _tag_untrusted(v, template_syntax_only=True)
+            v = _tag_untrusted(v, template_syntax_only=not play_scope, preserve_vault=play_scope)
             if mapping_keys is not None and _contains_typed_mapping_keys(v):
                 packed = _pack_delegated_value(v)
                 if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):

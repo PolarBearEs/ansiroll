@@ -4931,7 +4931,9 @@ class Runtime:
         gather_cached = (play.get("smart_gathering") and isinstance(saved_facts, dict)
                          and saved_facts.get("_ansible_facts_gathered"))
         timeout_template = play.get("gather_timeout_template") or {}
-        play_vars = dict(play.get("vars") or {})
+        controller_files = play.get("controller_vars_files") and self.controller_vars_files_fn is not None
+        # The controller snapshot already applies vars-file precedence for setup.
+        play_vars = {} if controller_files else dict(play.get("vars") or {})
         deferred_files = play.get("deferred_vars_files") or ()
         ordered_files = play.get("ordered_vars_files", timeout_template.get("vars_files"))
         vars_files = ordered_files if ordered_files is not None else deferred_files
@@ -5028,7 +5030,7 @@ class Runtime:
                 self.check_mode = invocation_check_mode
                 return
         # Play templates resolve when consumed, after task precedence is applied.
-        if vars_files and self.controller_vars_files_fn is not None:
+        if controller_files or (vars_files and self.controller_vars_files_fn is not None):
             state = self.controller_vars_files_fn()
             for key in state["missing"]:
                 self.vars.pop(key, None)
@@ -6839,6 +6841,8 @@ class Runtime:
                 # `var:` takes an expression (often dotted), evaluated against vars.
                 try:
                     val = self.templater.evaluate(key, ctx)
+                except VarsFilesError:
+                    raise
                 except jinja2.UndefinedError as ex:
                     val = _captured(str(ex))
                 except Exception:
@@ -9100,6 +9104,19 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
     return safe
 
 
+def _decode_controller_vars_file_values(value):
+    def unavailable():
+        raise VarsFilesError("could not serialize selected vars file value: Vault value is undecryptable")
+
+    if isinstance(value, dict):
+        if value.keys() == {"__ansiroll_vault__"}:
+            return _DelegatedTemplateValue(unavailable)
+        return {key: _decode_controller_vars_file_values(member) for key, member in value.items()}
+    if isinstance(value, list):
+        return [_decode_controller_vars_file_values(member) for member in value]
+    return value
+
+
 def agent_main():
     """Entry point when launched as a controller-driven agent (see AGENT_BOOTSTRAP).
 
@@ -9301,7 +9318,7 @@ def agent_main():
             raise VarsFilesError(result["error"])
         variables = json.loads(result["vars"])
         _restore_delegated_mapping_keys(variables, result["mapping_keys"])
-        result["vars"] = variables
+        result["vars"] = _decode_controller_vars_file_values(variables)
         return result
 
     rt.controller_vars_files_fn = _controller_vars_files
