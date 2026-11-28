@@ -5130,6 +5130,12 @@ class Runtime:
             # A recursive invocation also loads the referenced role's handlers.
             tasks, handlers = targets.get(node["tasks_ref"], (tasks, handlers))
 
+        def include_result(filename):
+            if _core_at_least(2, 21):
+                # UnifiedTaskResult keeps the dispatch filename off its public result.
+                return {"changed": False, "failed": False}
+            return {"changed": False, "include": filename}
+
         def select_body(ctx):
             if "include_selector" not in node:
                 return node.get("file"), tasks, handlers
@@ -5206,7 +5212,7 @@ class Runtime:
         legacy_failure = None
         for i, item in enumerate(items if looped else [None]):
             if not looped:
-                result = {"changed": False, "include": filename}
+                result = include_result(filename)
                 selected.append((base_ctx, {}, result, item, include_no_log, body, body_handlers, apply_flags, apply_vars))
                 break
             try:
@@ -5224,7 +5230,7 @@ class Runtime:
             if blocked is None:
                 try:
                     filename, body, body_handlers = select_body(ctx)
-                    result = {"changed": False, "include": filename}
+                    result = include_result(filename)
                 except Exception as error:
                     result = {"changed": False, "failed": True, "msg": str(error)}
             else:
