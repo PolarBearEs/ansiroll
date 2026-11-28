@@ -3408,6 +3408,22 @@ def test_vars_file_replay_does_not_cache_templated_vars_lookup_terms():
     assert runtime._pre_setup_template_inputs(dynamic, {"first": "a"}, selector=True) is None
 
 
+@pytest.mark.parametrize(("alias", "path", "expected"), [
+    ("{{ 'fast' }}", ("fast",), 1),
+    (" {{ 'fast' }} ", (), 2),
+    ("{{ 'fast' }}\n", (), 3),
+])
+def test_selector_input_paths_respect_inline_alias_whitespace(alias, path, expected):
+    runtime = Runtime({}, "", {})
+    context = {"key": alias, "choices": {"fast": 1, " fast ": 2, "fast\n": 3}}
+    source = "{{ choices[key] }}"
+    paths = set()
+
+    assert runtime._pre_setup_template_inputs(source, context, paths=paths, selector=True) == context
+    assert paths == {("key", ()), ("choices", path)}
+    assert runtime.templater.render_string(source, context) == expected
+
+
 def test_standalone_replays_later_vars_file_after_launch_selected_earlier_file(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
