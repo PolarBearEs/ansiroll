@@ -334,7 +334,7 @@ def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strate
 
 
 def test_implicit_setup_file_lookup_with_null_rstrip(tmp_path):
-    contents = "payload\n\n"
+    contents = "payload \t\n\n"
     lookup = 'lookup("file", "strip-null.txt", rstrip=none)'
     selected = f'"ansible_distribution" if {lookup} | length == {len(contents.rstrip())} else "ansible_hostname"'
     expression = "{{ " + (selected if LEGACY_SETUP else f"[{selected}]") + " }}"
@@ -1417,7 +1417,7 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
 
 
 def test_file_lookup_with_null_strip_options(tmp_path):
-    contents = " \tpayload\n\n"
+    contents = " \tpayload \t\n\n"
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
