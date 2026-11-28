@@ -310,16 +310,70 @@ delegation fallback. `ANSIROLL_PROVENANCE=1` emits one JSON record per play and
 task with `native-agent`, `real-ansiballz`, `controller-fallback`, or
 `linear-fallback`; CI asserts the native-only lane contains no fallback records.
 
-Before merging a PR into `master`, run **Manual Full PR CI** from GitHub
-Actions using the PR number and its current full commit SHA. The workflow tests
-GitHub's proposed merge and requires all 20 CI jobs, including the Ansible 2.10
-jobs, to pass. Refresh the PR branch and run CI again if `master` advances.
+Before dispatching **Manual Full PR CI**, a maintainer must confirm that review
+covers the PR's current full head SHA. Address findings introduced by the PR
+before dispatch. If a maintainer confirms a finding is present on the base and
+already tracked, link its issue in the PR and treat that finding as resolved
+for this dispatch.
+
+Manually run **Manual Full PR CI** from `master` with the PR number and that
+reviewed SHA. All 20 CI jobs, including the Ansible 2.10 jobs, must pass on
+GitHub's exact proposed merge commit. Verify the tested head and merge commit
+before merging. If the PR head changes, confirm review again. If the head or
+merge candidate changes, run CI again. Older head checks without a recorded PR
+owner can remain visible. Use a fresh manual run for the current candidate.
 
 ```bash
 pr=123
-head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid)
+head='<full SHA confirmed in review>'
 gh workflow run reviewed-ci.yml --ref master -f pr_number="$pr" -f head_sha="$head"
 ```
+
+**Reconcile PR CI head checks** scans PRs targeting `master` on pushes to
+`master`. It scans all open PRs hourly at minute 23 UTC, including reopened
+PRs and PRs retargeted away from `master`. It runs from `master` and uses
+GitHub's API to read PR and merge commit metadata and update stale head checks.
+GitHub can delay or skip scheduled scans. If GitHub disables the workflow after 60 days of
+repository inactivity, both push and scheduled cleanup stop. A maintainer can
+restore cleanup with `gh workflow enable reconcile-pr-ci.yml`. The separate
+**Manual Full PR CI** workflow runs only by dispatch. [GitHub Actions schedule
+behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+
+### Manual CI merge protection
+
+`Manual Full CI` is the check shown on the PR head. Protect `master` with the
+GitHub Actions commit status `Manual Full CI (merge candidate)`, which the
+workflow publishes only on GitHub's verified test merge commit. GitHub can
+[fall back to head checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#conflicts-between-head-commit-and-test-merge-commit)
+when the candidate has no status, so the display check alone cannot confirm
+that the current candidate passed.
+
+Repository administrators should migrate the existing protection in this order.
+
+1. Pause other merges and let outstanding manual runs finish. Land the workflow
+   update through the existing protection after verifying that the legacy
+   commit status passed on the update PR's current test merge SHA. The updated
+   workflow publishes both commit statuses during the transition.
+2. With merges still paused, use the updated workflow on `master` for a reviewed
+   PR through the normal manual procedure above. Verify that both statuses
+   passed on its current test merge SHA and that the head shows the display
+   check. GitHub needs a successful result from the last seven days to offer
+   a new required status.
+3. In the `master` protection rule, replace the required `Manual Full CI`
+   context with `Manual Full CI (merge candidate)` in one update. Select
+   **GitHub Actions** as the expected source and keep **Require branches to be
+   up to date before merging** and the other protection settings enabled as
+   configured. Read back the rule and confirm the new source and context.
+4. After verifying the rule, set the repository Actions variable
+   `MANUAL_CI_LEGACY_STATUS_OPTIONAL` to `true` and resume merges. This lets
+   the workflow continue if a legacy status write fails. A status stays with
+   its SHA if that commit later appears as a PR head, so keep verifying the
+   run recorded against the current test merge SHA before each merge.
+
+Keep the variable unset until the cutover is verified. If a rollback is needed,
+pause merges, unset the variable, and restore the legacy requirement with the
+same source and strict setting. Continue checking the exact merge candidate
+throughout the rollback.
 
 See `PLAN.md` for the full design and rationale.
 

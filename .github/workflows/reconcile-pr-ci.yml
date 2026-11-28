@@ -1,0 +1,119 @@
+name: Reconcile PR CI head checks
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '23 * * * *'
+
+permissions: {}
+
+jobs:
+  invalidate-head-checks:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          api="repos/$GITHUB_REPOSITORY"
+          retry_api() {
+            local attempt output
+            for attempt in 1 2 3; do
+              if output=$(gh api "$@"); then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              [[ "$attempt" == 3 ]] || sleep "$attempt"
+            done
+            return 1
+          }
+          filter='select(.state == "open") | [.number, .head.sha, .base.sha, .base.ref] | @tsv'
+          endpoint="$api/pulls?state=open&per_page=100"
+          # A scheduled scan also needs PRs that were retargeted away from master.
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            endpoint+="&base=master"
+          fi
+          prs=$(retry_api --paginate "$endpoint" --jq ".[] | $filter")
+          failed=0
+          while IFS=$'\t' read -r pr head base branch; do
+            [[ -n "$pr" ]] || continue
+            # Check runs are attached to commits. Include older reports so a
+            # newer check for another PR with the same head can't hide ours.
+            # Legacy reports have no reliable owner and are left alone.
+            if ! checks=$(retry_api --method GET --paginate "$api/commits/$head/check-runs" \
+              -f check_name="Manual Full CI" -f filter=all -F per_page=100) ||
+               ! owned=$(jq -cs --arg owner "manual-full-ci:pr:$pr" '
+              [.[].check_runs[] | select(.app.slug == "github-actions" and .external_id == $owner and
+                .conclusion != "cancelled")]
+            ' <<< "$checks"); then
+              echo "::warning::Could not inspect CI checks for PR #$pr."
+              failed=1
+              continue
+            fi
+            [[ "$owned" != '[]' ]] || continue
+            revision="$pr"$'\t'"$head"$'\t'"$base"$'\t'"$branch"
+            if ! current=$(retry_api "$api/pulls/$pr"); then
+              echo "::warning::Could not recheck the revision of PR #$pr."
+              failed=1
+              continue
+            fi
+            [[ "$(jq -r "$filter" <<< "$current")" == "$revision" ]] || continue
+
+            # GitHub can regenerate the test merge even when the original head
+            # and base return. Use its SHA only after confirming both parents.
+            merge_filter='select(.mergeable == true) | .merge_commit_sha // empty'
+            candidate=''
+            if [[ "$branch" == master ]]; then
+              for delay in 1 2; do
+                [[ "$(jq -r '.mergeable' <<< "$current")" == null ]] || break
+                sleep "$delay"
+                if ! current=$(retry_api "$api/pulls/$pr"); then
+                  echo "::warning::Could not recheck the revision of PR #$pr."
+                  failed=1
+                  continue 2
+                fi
+                [[ "$(jq -r "$filter" <<< "$current")" == "$revision" ]] || continue 2
+              done
+              merge=$(jq -r "$merge_filter" <<< "$current")
+              if [[ "$merge" =~ ^[a-f0-9]{40}$ ]] &&
+                 commit=$(retry_api "$api/git/commits/$merge") &&
+                 jq -e --arg base "$base" --arg head "$head" '
+                   [.parents[].sha] == [$base, $head]
+                 ' <<< "$commit" >/dev/null; then
+                candidate="$merge"
+              fi
+              if [[ -z "$candidate" && "$(jq -r '.mergeable' <<< "$current")" != false ]]; then
+                echo "::warning::Could not verify the merge candidate for PR #$pr."
+              fi
+            fi
+            stale=$(jq -r --arg base "$base" --arg branch "$branch" --arg merge "$candidate" '
+              .[] | select((.output.summary // "") as $summary |
+                $branch != "master" or ($summary | endswith("Base commit: " + $base) | not) or
+                ($merge != "" and ($summary | startswith("Merge commit: " + $merge + "\n") | not))) | .id
+            ' <<< "$owned")
+            [[ -n "$stale" ]] || continue
+            if [[ -n "$candidate" ]]; then
+              if ! current=$(retry_api "$api/pulls/$pr"); then
+                echo "::warning::Could not recheck the merge candidate for PR #$pr."
+                failed=1
+                continue
+              fi
+              [[ "$(jq -r "$filter" <<< "$current")" == "$revision" &&
+                 "$(jq -r "$merge_filter" <<< "$current")" == "$candidate" ]] || continue
+            fi
+            while read -r id; do
+              if ! retry_api --silent --method PATCH "$api/check-runs/$id" \
+                -f status=completed -f conclusion=cancelled \
+                -f 'output[title]=PR merge candidate changed' \
+                -f 'output[summary]=Run Manual Full PR CI for the new merge commit.'; then
+                echo "::warning::Could not cancel stale CI check $id for PR #$pr."
+                failed=1
+              fi
+            done <<< "$stale"
+          done <<< "$prs"
+          exit "$failed"

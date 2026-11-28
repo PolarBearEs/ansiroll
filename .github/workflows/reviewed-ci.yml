@@ -1,6 +1,5 @@
 name: Manual Full PR CI
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('Full CI for PR #{0}', inputs.pr_number) || 'Invalidate stale PR CI checks' }}
+run-name: 'Full CI for PR #${{ inputs.pr_number }}'
 
 on:
   workflow_dispatch:
@@ -13,16 +12,15 @@ on:
         description: Full SHA of the pull request commit to test
         type: string
         required: true
-  push:
-    branches: [master]
-  pull_request_target:
-    types: [edited, reopened]
 
 permissions: {}
 
+env:
+  MERGE_STATUS_CONTEXT: Manual Full CI (merge candidate)
+  LEGACY_MERGE_STATUS_OPTIONAL: ${{ vars.MANUAL_CI_LEGACY_STATUS_OPTIONAL }}
+
 concurrency:
-  group: >-
-    ${{ github.event_name == 'workflow_dispatch' && format('manual-full-ci-pr-{0}', inputs.pr_number) || github.run_id }}
+  group: manual-full-ci-pr-${{ inputs.pr_number }}
   queue: max
 
 jobs:
@@ -97,9 +95,17 @@ jobs:
           fi
           runs="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/"
           printf 'head=%s\nbase=%s\nattempt=%s\n' "$head" "$base" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          gh api --method POST "$api/statuses/$merge" \
-            -f context='Manual Full CI' -f state=pending -f description="Testing merge $merge" \
-            -f target_url="$runs$GITHUB_RUN_ID"
+          # Keep the legacy merge status until master protection is migrated.
+          for context in "$MERGE_STATUS_CONTEXT" 'Manual Full CI'; do
+            gh api --method POST "$api/statuses/$merge" \
+              -f context="$context" -f state=pending -f description="Testing merge $merge" \
+              -f target_url="$runs$GITHUB_RUN_ID" && continue
+            status_error=$?
+            if [[ "$context" == "$MERGE_STATUS_CONTEXT" || "$LEGACY_MERGE_STATUS_OPTIONAL" != true ]]; then
+              exit "$status_error"
+            fi
+            echo '::warning::Could not publish the legacy merge status.'
+          done
           printf 'merge=%s\n' "$merge" >> "$GITHUB_OUTPUT"
 
   tests:
@@ -158,8 +164,8 @@ jobs:
             return 1
           }
           if combined=$(gh api "$api/commits/$MERGE/status"); then
-            if ! jq -e --arg run "$run_url" --arg merge "$MERGE" '.statuses | any(
-              .context == "Manual Full CI" and .target_url == $run and
+            if ! jq -e --arg run "$run_url" --arg merge "$MERGE" --arg context "$MERGE_STATUS_CONTEXT" '.statuses | any(
+              .context == $context and .target_url == $run and
               (.description // "" | endswith(" merge " + $merge))
             )' <<< "$combined" >/dev/null; then
               echo 'Another run owns the status for this merge commit.'
@@ -178,9 +184,18 @@ jobs:
               success) description="Tests passed on merge $MERGE" ;;
               failure) description="CI failed on merge $MERGE" ;;
             esac
-            gh api --method POST "$api/statuses/$MERGE" \
-              -f context='Manual Full CI' -f state="$state" -f description="$description" \
-              -f target_url="$run_url" || report_error=$?
+            # Require both writes until the protection cutover is verified.
+            for context in 'Manual Full CI' "$MERGE_STATUS_CONTEXT"; do
+              gh api --method POST "$api/statuses/$MERGE" \
+                -f context="$context" -f state="$state" -f description="$description" \
+                -f target_url="$run_url" && continue
+              status_error=$?
+              if [[ "$context" == "$MERGE_STATUS_CONTEXT" || "$LEGACY_MERGE_STATUS_OPTIONAL" != true ]]; then
+                report_error=$status_error
+                break
+              fi
+              echo '::warning::Could not publish the legacy merge status.'
+            done
           else
             report_error=$?
           fi
@@ -221,9 +236,10 @@ jobs:
           }
           if current_revision; then
             for attempt in 1 2 3; do
-              # GitHub also expects the protected check on the PR head.
+              # Keep the result visible on the PR head under a distinct name.
               if check=$(gh api --method POST "$api/check-runs" --jq '.id' \
                 -f name="Manual Full CI" -f head_sha="$HEAD" -f details_url="$details_url" \
+                -f external_id="manual-full-ci:pr:$PR" \
                 -f status=completed -f conclusion="$conclusion" -f "output[title]=$title" \
                 -f "output[summary]=$(printf 'Merge commit: %s\nBase commit: %s' "$MERGE" "$BASE")"); then
                 revision_status=0
@@ -255,64 +271,3 @@ jobs:
           fi
           ((report_error == 0)) || exit "$report_error"
           [[ "$state" == success ]]
-
-  invalidate-head-checks:
-    if: github.event_name == 'push' ||
-      (github.event_name == 'pull_request_target' &&
-        (github.event.action == 'reopened' || github.event.changes.base.ref.from != ''))
-    runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      pull-requests: read
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_PR: ${{ github.event.pull_request.number }}
-        run: |
-          api="repos/$GITHUB_REPOSITORY"
-          retry_api() {
-            local attempt output
-            for attempt in 1 2 3; do
-              if output=$(gh api "$@"); then
-                printf '%s\n' "$output"
-                return 0
-              fi
-              [[ "$attempt" == 3 ]] || sleep "$attempt"
-            done
-            return 1
-          }
-          filter='. | [.number, .head.sha, .base.sha, .base.ref] | @tsv'
-          if [[ -n "$EVENT_PR" ]]; then
-            prs=$(retry_api "$api/pulls/$EVENT_PR" --jq "$filter")
-          else
-            prs=$(retry_api --paginate "$api/pulls?state=open&base=master&per_page=100" --jq ".[] | $filter")
-          fi
-          failed=0
-          while IFS=$'\t' read -r pr head base branch; do
-            [[ -n "$pr" ]] || continue
-            if ! checks=$(retry_api --method GET "$api/commits/$head/check-runs" -f check_name="Manual Full CI") ||
-               ! stale=$(jq -r --arg base "$base" --arg branch "$branch" '
-              .check_runs[] | select(.app.slug == "github-actions" and .conclusion != "cancelled" and
-                ($branch != "master" or (.output.summary // "" | endswith("Base commit: " + $base) | not))) | .id
-            ' <<< "$checks"); then
-              echo "::warning::Could not inspect CI checks for PR #$pr."
-              failed=1
-              continue
-            fi
-            [[ -n "$stale" ]] || continue
-            if ! current=$(retry_api "$api/pulls/$pr" --jq "$filter"); then
-              echo "::warning::Could not recheck the revision of PR #$pr."
-              failed=1
-              continue
-            fi
-            [[ "$current" == "$pr"$'\t'"$head"$'\t'"$base"$'\t'"$branch" ]] || continue
-            while read -r id; do
-              if ! retry_api --silent --method PATCH "$api/check-runs/$id" \
-                -f status=completed -f conclusion=cancelled \
-                -f 'output[title]=PR base changed' -f 'output[summary]=Run Manual Full PR CI for the new merge commit.'; then
-                echo "::warning::Could not cancel stale CI check $id for PR #$pr."
-                failed=1
-              fi
-            done <<< "$stale"
-          done <<< "$prs"
-          exit "$failed"
