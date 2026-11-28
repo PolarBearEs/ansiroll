@@ -5,6 +5,7 @@ Skipped automatically where ansible-core is not importable.
 
 import importlib.util
 import base64
+import errno
 import getpass
 import io
 import json
@@ -5588,15 +5589,135 @@ def test_strategy_extra_vars_helper_preserves_json_booleans():
     assert json.loads(blob)["report_to_slack"] is False
 
 
-def test_strategy_reads_runtime_created_controller_source_losslessly(tmp_path):
+@pytest.mark.parametrize("link", [None, "file", "directory"])
+def test_strategy_reads_runtime_created_controller_source_losslessly(tmp_path, link):
+    strategy = _load_strategy_module()
+    directory = tmp_path / "sources"
+    directory.mkdir()
+    source = directory / "runtime.bin"
+    source.write_bytes(b"\x00\xff'\\\n")
+    source.chmod(0o641)
+    path = source
+    if link == "file":
+        path = tmp_path / "linked.bin"
+        path.symlink_to(source.relative_to(tmp_path))
+    elif link == "directory":
+        alias = tmp_path / "linked-dir"
+        alias.symlink_to(directory.name, target_is_directory=True)
+        path = alias / source.name
+
+    result = strategy.StrategyModule._read_controller_source(str(path))
+
+    metadata = source.stat()
+    assert base64.b64decode(result["data"]) == source.read_bytes()
+    assert result["meta"] == {
+        "fullpath": str(path),
+        "mode": 0o641,
+        "mtime": metadata.st_mtime,
+        "uid": metadata.st_uid,
+    }
+
+
+def test_strategy_skips_open_for_nonregular_runtime_created_controller_source(tmp_path, monkeypatch):
+    strategy = _load_strategy_module()
+
+    def unexpected_open(*args, **kwargs):
+        pytest.fail("the controller should skip known non-regular paths")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", unexpected_open)
+        result = strategy.StrategyModule._read_controller_source(str(tmp_path))
+
+    assert result == {"error": "controller source %r is not a regular file" % str(tmp_path)}
+
+
+def test_strategy_reports_runtime_created_controller_source_open_error(tmp_path, monkeypatch):
     strategy = _load_strategy_module()
     source = tmp_path / "runtime.bin"
-    source.write_bytes(b"\x00\xff'\\\n")
+    source.write_bytes(b"fixture")
 
-    result = strategy.StrategyModule._read_controller_source(str(source))
+    def deny_open(path, flags):
+        assert path == str(source)
+        assert flags & os.O_NONBLOCK
+        raise PermissionError("mocked access denial")
 
-    assert base64.b64decode(result["data"]) == source.read_bytes()
-    assert result["meta"]["fullpath"] == str(source)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", deny_open)
+        result = strategy.StrategyModule._read_controller_source(str(source))
+
+    assert result == {"error": "could not read controller source %r: mocked access denial" % str(source)}
+
+
+@pytest.mark.parametrize("busy_attempts", [1, 5])
+def test_strategy_retries_busy_runtime_created_controller_source(tmp_path, monkeypatch, busy_attempts):
+    strategy = _load_strategy_module()
+    source = tmp_path / "runtime.bin"
+    source.write_bytes(b"fixture")
+    real_open = os.open
+    attempts = []
+    delays = []
+
+    def open_source(path, flags):
+        assert flags & os.O_NONBLOCK
+        attempts.append(path)
+        if len(attempts) <= busy_attempts:
+            raise BlockingIOError(errno.EAGAIN, "mocked busy source")
+        return real_open(path, flags)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", open_source)
+        patch.setattr(time, "sleep", delays.append)
+        result = strategy.StrategyModule._read_controller_source(str(source))
+
+    if busy_attempts == 1:
+        assert attempts == [str(source)] * 2
+        assert delays == [0.05]
+        assert base64.b64decode(result["data"]) == b"fixture"
+    else:
+        assert attempts == [str(source)] * 5
+        assert delays == [0.05] * 4
+        assert "mocked busy source" in result["error"]
+
+
+def test_strategy_checks_runtime_created_controller_source_descriptor_before_reading(tmp_path, monkeypatch):
+    strategy = _load_strategy_module()
+    source = tmp_path / "runtime.bin"
+    source.write_bytes(b"fixture")
+    fd = os.open(source, os.O_RDONLY)
+
+    def check_descriptor(opened_fd):
+        assert opened_fd == fd
+        return SimpleNamespace(st_mode=stat.S_IFDIR)
+
+    def unexpected_reader(*args, **kwargs):
+        pytest.fail("the descriptor must be validated before opening the reader")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", lambda path, flags: fd)
+        patch.setattr(os, "fstat", check_descriptor)
+        patch.setattr(os, "fdopen", unexpected_reader)
+        result = strategy.StrategyModule._read_controller_source(str(source))
+
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    assert result == {"error": "controller source %r is not a regular file" % str(source)}
+
+
+def test_strategy_reports_runtime_created_controller_source_close_error(tmp_path, monkeypatch):
+    strategy = _load_strategy_module()
+    source = tmp_path / "runtime.bin"
+    source.write_bytes(b"fixture")
+    real_close = os.close
+
+    def report_close_error(fd):
+        real_close(fd)
+        raise OSError("mocked close error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "close", report_close_error)
+        result = strategy.StrategyModule._read_controller_source(str(source))
+
+    assert result == {"error": "could not read controller source %r: mocked close error" % str(source)}
 
 
 @pytest.mark.parametrize("action", ["copy", "template"])
