@@ -491,7 +491,7 @@ def _capture_setup_files(play, terms_by_alias):
 def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  selector=False, allow_controller=False, computed=None, paths=None,
                                  unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None,
-                                 vars_lookup_allowed=None):
+                                 vars_lookup_allowed=None, dynamic_vars_lookups=None):
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
@@ -499,7 +499,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                           _selector_template_sources, _setup_builtin_lookup)
 
     env = Environment()
-    resolve_aliases = computed is not None or unknown_lookup is not None
+    resolve_aliases = computed is not None or unknown_lookup is not None or dynamic_vars_lookups is not None
     key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
                  for key, value in variables.items()}
     key_scope["__ansiroll_controller_config"] = {"DEFAULT_JINJA2_NATIVE": getattr(C, "DEFAULT_JINJA2_NATIVE", None)}
@@ -524,6 +524,16 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
         analysis = _selector_scope(expression, key_scope, retain_mutable=retain_mutable)
         for call in analysis[2]:
             method = call.node
+            if (dynamic_vars_lookups is not None and isinstance(method, nodes.Name)
+                    and method.name in ("lookup", "query", "q") and call.args
+                    and isinstance(call.args[0], nodes.Const)
+                    and call.args[0].value in ("vars", "ansible.builtin.vars", "ansible.legacy.vars")):
+                alias = call.args[0].value
+                dynamic_vars_lookups[alias] = dynamic_vars_lookups.get(alias, False) or not _is_literal_vars_lookup(call)
+            elif dynamic_vars_lookups is not None and not (
+                    isinstance(method, nodes.Getattr) and method.attr in scalar_methods):
+                # Replaying a computed lookup must not repeat controller calls.
+                dynamic_vars_lookups[None] = False
             if not allow_controller and not (
                 isinstance(method, nodes.Getattr) and method.attr in scalar_methods
                 or selector and _is_literal_vars_lookup(call)
@@ -814,8 +824,16 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup or include_replay) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
+    computed_selectors = [] if gather_facts is None and ordered_vars_files is None else None
     play_vars = _resolved_play_vars(
-        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
+        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope,
+        computed_selectors=computed_selectors)
+    if computed_selectors:
+        unresolved_vars_files.clear()
+        ordered_vars_files = []
+        hash_scope = {} if C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
+        play_vars = _resolved_play_vars(
+            play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
     deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
     for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
         deferred[index]["files"].update(selected)
@@ -1179,7 +1197,8 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None,
+                        *, computed_selectors=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -1236,6 +1255,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                         dependencies = _gather_timeout_dependencies(
                             filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                             paths=paths, unknown_lookup=unknown_lookup)
+                        if (dependencies is not None and not unknown_lookup
+                                and not _vars_file_has_dynamic_directory(filename)
+                                and _dynamic_builtin_vars_file_lookup(play, filename, inputs)):
+                            defer_for_order |= bool(dependencies[1] - extra_replacements - selector_magic.keys())
                         if dependencies is not None and not unknown_lookup:
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
                             if requires_controller:
@@ -1269,6 +1292,12 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                 selector_vars = dict(hash_scope if hash_scope is not None else {**role_defaults, **out},
                                      playbook_dir=basedir)
                 filename = _template_vars_file_name(play, raw, selector_vars, all_vars, selector_magic)
+                if computed_selectors is not None:
+                    # Keep the native lookup/plugin resolution and examine
+                    # its inputs before the selected file replaces them.
+                    scope = {**selector_vars, **(all_vars or {}), **play.get_variable_manager().extra_vars}
+                    if _dynamic_builtin_vars_file_lookup(play, candidate_source, scope):
+                        computed_selectors.append(candidate_source)
                 if filename is None:
                     if unresolved is not None and not defer_for_order:
                         if ordered is not None:
@@ -1332,6 +1361,32 @@ def _vars_filename_template_environment():
     from .runtime import _Templater
 
     return _Templater().env
+
+
+def _dynamic_builtin_vars_file_lookup(play, source, scope):
+    from .runtime import _GATHER_STRING_METHODS
+
+    aliases = {}
+    dependencies = _gather_timeout_dependencies(
+        source, scope, _GATHER_STRING_METHODS, selector=True, allow_controller=True, retain_mutable=True,
+        dynamic_vars_lookups=aliases)
+    if dependencies is None or None in aliases or not any(aliases.values()):
+        return False
+    roots = [play._loader.get_basedir()]
+    roots.extend(role._role_path for role in _gather_public_roles(play))
+    if not all(_builtin_vars_lookup(alias, roots) for alias in aliases):
+        return False
+
+    @lru_cache(maxsize=2)
+    def builtin_path(kind):
+        return _jinja_paths_are_builtin(kind, roots)
+
+    def builtin_plugin(kind, name):
+        namespace, _, _ = name.rpartition(".")
+        return namespace == "ansible.builtin" or (
+            namespace in ("", "ansible.legacy") and builtin_path(kind))
+
+    return not _vars_filename_controller_requirements(source, dependencies, jinja_plugin_allowed=builtin_plugin)[0]
 
 
 def _vars_filename_controller_requirements(source, portable, *, paths=None, jinja_plugin_allowed=None):
@@ -2867,42 +2922,55 @@ def _include_template_variables(task, includes):
     return variables, (role_vars, task_vars, role_params, include_params, extra_vars)
 
 
-def _portable_include_scope(task, sources, variables):
+def _builtin_vars_lookup(alias, roots):
     from ansible.errors import AnsibleError
-    from ansible.plugins.loader import filter_loader, lookup_loader, test_loader
+    from ansible.plugins.loader import lookup_loader
     from ansible.plugins.lookup import vars as builtin_vars
 
+    if alias == "ansible.builtin.vars":
+        # Resolving the qualified name can populate Core's short-name cache.
+        # The explicit builtin namespace already identifies the plugin.
+        return True
+    if any(os.path.lexists(os.path.join(root, "lookup_plugins", "vars.py")) for root in roots):
+        return False
+    try:
+        resolved = lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
+    except (AnsibleError, ImportError):
+        return False
+    return bool(resolved and os.path.realpath(resolved) == os.path.realpath(builtin_vars.__file__))
+
+
+def _jinja_paths_are_builtin(kind, roots):
+    from ansible.plugins.loader import filter_loader, test_loader
+
+    loader = filter_loader if kind == "filter" else test_loader
+    directories = [entry.path for entry in loader._get_paths_with_context() if not entry.internal]
+    directories.extend(os.path.join(root, kind + "_plugins") for root in roots)
+    for directory in set(directories):
+        try:
+            with os.scandir(directory) as entries:
+                if any(entry.name.endswith(".py") for entry in entries):
+                    return False
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            return False
+    return True
+
+
+def _portable_include_scope(task, sources, variables):
     from .runtime import _GATHER_STRING_METHODS
 
     roots = [*task.get_search_path(), task._loader.get_basedir()]
 
     @lru_cache(maxsize=None)
     def builtin_lookup(alias):
-        if alias != "ansible.builtin.vars" and any(
-                os.path.lexists(os.path.join(root, "lookup_plugins", "vars.py")) for root in roots):
-            return False
-        try:
-            resolved = lookup_loader.find_plugin_with_context(alias).plugin_resolved_path
-        except (AnsibleError, ImportError):
-            return False
-        return bool(resolved and os.path.realpath(resolved) == os.path.realpath(builtin_vars.__file__))
+        return _builtin_vars_lookup(alias, roots)
 
     @lru_cache(maxsize=None)
     def builtin_jinja_path(kind):
         # Core can import plugin modules just to discover which names they export.
-        loader = filter_loader if kind == "filter" else test_loader
-        directories = [entry.path for entry in loader._get_paths_with_context() if not entry.internal]
-        directories.extend(os.path.join(root, kind + "_plugins") for root in roots)
-        for directory in set(directories):
-            try:
-                with os.scandir(directory) as entries:
-                    if any(entry.name.endswith(".py") for entry in entries):
-                        return False
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-            except OSError:
-                return False
-        return True
+        return _jinja_paths_are_builtin(kind, roots)
 
     def builtin_jinja_plugin(kind, name):
         namespace, _, _ = name.rpartition(".")

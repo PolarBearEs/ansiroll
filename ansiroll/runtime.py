@@ -719,8 +719,10 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
     if isinstance(node, jinja2.nodes.Getitem):
         value = resolve(node.node)
         index = resolve(node.arg)
-        if isinstance(value, (str, list)) and isinstance(index, int) and -len(value) <= index < len(value):
+        if isinstance(value, (str, list, tuple)) and isinstance(index, int) and -len(value) <= index < len(value):
             return value[index]
+        if isinstance(value, dict) and isinstance(index, (str, int, float, type(None))) and dict.__contains__(value, index):
+            return dict.__getitem__(value, index)
     if isinstance(node, jinja2.nodes.Filter) and node.name in ("default", "d"):
         arguments = _selector_default_arguments(node)
         if arguments is None:
