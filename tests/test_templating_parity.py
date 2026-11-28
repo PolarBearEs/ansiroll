@@ -3284,6 +3284,34 @@ def test_include_apply_vars_select_nested_filename_in_native_scope(tmp_path, use
     assert messages == ["outer-filename" if MODERN_TEMPLATING and not looped else "applied-filename"]
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("expression", ["'{{ mapping.keys() }}'", "|\n              {{ mapping.keys() }}"],
+                         ids=["inline", "block-scalar"])
+def test_include_apply_vars_normalize_bare_mapping_keys(tmp_path, use_strategy, expression):
+    # Modern Core can read the keys even when a mapping value is undefined.
+    mapping_value = "'{{ unused_value }}'" if MODERN_TEMPLATING else "present"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    mapping:
+      prod: MAPPING_VALUE
+      stage: present
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          vars:
+            label: KEY_EXPRESSION
+""".replace("MAPPING_VALUE", mapping_value).replace("KEY_EXPRESSION", expression), {
+        "child.yml": """
+- debug: {msg: '{{ label | type_debug }}'}
+  when: label == ['prod', 'stage']
+""",
+    }, use_strategy=use_strategy)
+    assert messages == ["list"]
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Core prepares non-looped apply vars at inclusion")
 def test_include_apply_runtime_binding_defers_nested_filename_expansion(tmp_path):
     playbook = """

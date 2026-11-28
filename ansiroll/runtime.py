@@ -4229,6 +4229,10 @@ class _Templater:
                 return _captured_jinja_error(e)
         try:
             result = _concretize(result)
+            # Core exposes a returned key view as a list. Iterating just
+            # the keys keeps unused mapping values lazy.
+            if file_newline is None and isinstance(result, KeysView):
+                result = list(result)
             if file_newline is not None and expr is not None:
                 # The lexer applies whitespace controls before deciding whether
                 # a native result needs text conversion.
