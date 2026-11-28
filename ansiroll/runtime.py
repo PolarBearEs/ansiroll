@@ -6841,6 +6841,8 @@ class Runtime:
                 # `var:` takes an expression (often dotted), evaluated against vars.
                 try:
                     val = self.templater.evaluate(key, ctx)
+                except VarsFilesError:
+                    raise
                 except jinja2.UndefinedError as ex:
                     val = _captured(str(ex))
                 except Exception:
@@ -9102,6 +9104,19 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
     return safe
 
 
+def _decode_controller_vars_file_values(value):
+    def unavailable():
+        raise VarsFilesError("could not serialize selected vars file value: Vault value is undecryptable")
+
+    if isinstance(value, dict):
+        if value.keys() == {"__ansiroll_vault__"}:
+            return _DelegatedTemplateValue(unavailable)
+        return {key: _decode_controller_vars_file_values(member) for key, member in value.items()}
+    if isinstance(value, list):
+        return [_decode_controller_vars_file_values(member) for member in value]
+    return value
+
+
 def agent_main():
     """Entry point when launched as a controller-driven agent (see AGENT_BOOTSTRAP).
 
@@ -9303,7 +9318,7 @@ def agent_main():
             raise VarsFilesError(result["error"])
         variables = json.loads(result["vars"])
         _restore_delegated_mapping_keys(variables, result["mapping_keys"])
-        result["vars"] = variables
+        result["vars"] = _decode_controller_vars_file_values(variables)
         return result
 
     rt.controller_vars_files_fn = _controller_vars_files

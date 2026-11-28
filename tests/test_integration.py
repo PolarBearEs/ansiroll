@@ -6464,6 +6464,40 @@ def test_strategy_agent_receives_only_its_selected_vars_file(tmp_path, monkeypat
             assert (f"lookup-value-{candidate}" in combined) == (candidate == name)
 
 
+def test_strategy_vars_file_serialization_preserves_nested_text_trust(tmp_path):
+    from ansible.parsing.dataloader import DataLoader
+
+    loader = DataLoader()
+    source = tmp_path / "vars.yml"
+    source.write_text("checks: [!unsafe ordinary-data, authored-text]\n")
+    try:
+        variables = loader.load_from_file(str(source), trusted_as_template=True)
+    except TypeError:
+        variables = loader.load_from_file(str(source))
+    blob = _load_strategy_module()._json_blob(variables, [], play_scope=True)
+    assert json.loads(blob)["checks"] == [{"__ansiroll_unsafe__": "ordinary-data"}, "authored-text"]
+
+
+def test_strategy_keeps_unused_inline_vault_value_lazy(tmp_path):
+    from textwrap import indent
+
+    from ansible.parsing.vault import VaultLib, VaultSecret
+
+    key = VaultSecret(b"synthetic-test-password")
+    encrypted = VaultLib([("default", key)]).encrypt(b"synthetic content", secret=key).decode()
+    (tmp_path / "profile-fixed.yml").write_text("unused: !vault |\n" + indent(encrypted, "  "))
+    result = _run_strategy_play(tmp_path, """- hosts: localhost
+  gather_facts: false
+  connection: local
+  vars: {profile: fixed}
+  vars_files: ['profile-{{ profile }}.yml']
+  tasks:
+    - debug: {msg: reached}
+""", timeout=40)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "reached" in result.stdout
+
+
 def test_strategy_vars_file_handler_names_use_controller_scope(tmp_path):
     (tmp_path / "profile-default.yml").write_text("handler_name: native-handler\n")
     result = _run_strategy_play(tmp_path, """- hosts: localhost
@@ -8744,7 +8778,8 @@ def _run_vars_file_include_profile(plan, profile, **extra_vars):
     return runtime, [frame["result"]["msg"] for frame in frames if "msg" in frame.get("result", {})]
 
 
-def test_vars_file_include_uses_controller_fallback_for_host_selection(tmp_path):
+@pytest.mark.parametrize("selector", ["task_file", "vars.get('task_file', 'default.yml')"])
+def test_vars_file_include_uses_controller_fallback_for_host_selection(tmp_path, selector):
     (tmp_path / "profile-localhost.yml").write_text("task_file: selected.yml\n")
     (tmp_path / "default.yml").write_text("- fail: {msg: compile-default-chosen}\n")
     (tmp_path / "selected.yml").write_text("- debug: {msg: host-selected-include}\n")
@@ -8754,8 +8789,8 @@ def test_vars_file_include_uses_controller_fallback_for_host_selection(tmp_path)
   vars: {task_file: default.yml}
   vars_files: ['profile-{{ inventory_hostname }}.yml']
   tasks:
-    - include_tasks: '{{ task_file }}'
-""")
+    - include_tasks: "{{ SELECTOR }}"
+""".replace("SELECTOR", selector))
     assert result.returncode == 0, result.stdout + result.stderr
     assert "host-selected-include" in result.stdout
 

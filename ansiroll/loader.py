@@ -1618,7 +1618,7 @@ def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
     return rendered
 
 
-def _tag_untrusted(value, template_syntax_only=False):
+def _tag_untrusted(value, template_syntax_only=False, preserve_vault=False):
     """Mark strings that are explicitly not trusted (for example `!unsafe`)."""
     from .runtime import _FactKeyTemplate
 
@@ -1632,6 +1632,10 @@ def _tag_untrusted(value, template_syntax_only=False):
             return not TrustedAsTemplate.is_tagged_on(v)
 
     def walk(v):
+        if preserve_vault and getattr(v, "_ciphertext", None) is not None:
+            from .compiler import _json_default
+
+            return _json_default(v)
         if isinstance(v, str) and untrusted(v):
             if not template_syntax_only or "{{" in v or "{%" in v:
                 return {"__ansiroll_unsafe__": str(v)}
@@ -3025,6 +3029,8 @@ def _template_include_value(task, value, includes, *, runtime_portable=False, po
 
     def is_runtime(name):
         if name in loop_names or variables.get(name) is _UNRESOLVED_INCLUDE_VALUE:
+            return True
+        if name == "vars" and includes.controller_execution and incomplete_scope:
             return True
         if ((incomplete_scope or name in includes.vars_file_writes)
                 and name not in _MAGIC_VAR_NAMES and not is_reserved_name(name)

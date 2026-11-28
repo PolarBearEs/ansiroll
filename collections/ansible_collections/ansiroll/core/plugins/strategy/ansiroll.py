@@ -1432,7 +1432,7 @@ class StrategyModule(StrategyBase):
         missing = sorted(keys - current_vars.keys(), key=str)
         mapping_keys = []
         try:
-            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys)
+            serialized = _json_blob(refreshed, mapping_keys, strict_keys=active_keys, play_scope=True)
         except AnsibleError as ex:
             return {"error": str(ex)}
         if snapshot is not None:
@@ -2274,7 +2274,7 @@ def _extra_vars(variable_manager):
     return {}
 
 
-def _json_blob(values, mapping_keys=None, *, strict_keys=()):
+def _json_blob(values, mapping_keys=None, *, strict_keys=(), play_scope=False):
     from ansiroll.loader import _tag_untrusted
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
@@ -2291,7 +2291,7 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     # Keep literal template-looking data tagged across the JSON boundary.
     # Other host values also serve as connection metadata and identifiers.
     try:
-        tagged = _tag_untrusted(values, template_syntax_only=True)
+        tagged = _tag_untrusted(values, template_syntax_only=not play_scope, preserve_vault=play_scope)
         if mapping_keys is None or not _contains_typed_mapping_keys(tagged):
             return json.dumps(tagged, default=str)
     except Exception:
@@ -2299,7 +2299,7 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
     safe = {}
     for k, v in (values or {}).items():
         try:
-            v = _tag_untrusted(v, template_syntax_only=True)
+            v = _tag_untrusted(v, template_syntax_only=not play_scope, preserve_vault=play_scope)
             if mapping_keys is not None and _contains_typed_mapping_keys(v):
                 packed = _pack_delegated_value(v)
                 if packed["undefined"] or packed.get("errors") or not packed.get("mapping_keys"):
