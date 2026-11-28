@@ -1605,8 +1605,8 @@ def _template_vars_file_name(play, filename, play_vars, all_vars, magic_vars):
     return rendered
 
 
-def _tag_untrusted(value, template_syntax_only=False):
-    """Mark strings that are explicitly not trusted (for example `!unsafe`)."""
+def _tag_untrusted(value, template_syntax_only=False, *, tag_values=True):
+    """Mark untrusted values and preserve authored template keys in mappings."""
     from .runtime import _FactKeyTemplate
 
     try:
@@ -1619,7 +1619,7 @@ def _tag_untrusted(value, template_syntax_only=False):
             return not TrustedAsTemplate.is_tagged_on(v)
 
     def walk(v):
-        if isinstance(v, str) and untrusted(v):
+        if tag_values and isinstance(v, str) and untrusted(v):
             if not template_syntax_only or "{{" in v or "{%" in v:
                 return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):

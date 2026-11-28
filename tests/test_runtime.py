@@ -65,6 +65,87 @@ def by_name(frames, name):
     return [f for f in frames if f["task"] == name]
 
 
+@pytest.mark.parametrize("controller", [False, True])
+def test_public_loop_frame_omits_cross_item_metadata(controller, monkeypatch):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.21.0")
+    frames = []
+    rt = Runtime({}, "", {}, on_result=frames.append)
+    rt._controller_result_transport = controller
+    items = ["first", {datetime.date(2026, 1, 1): "fixture"}]
+    task = _task("loop", "loop", "debug", loop=items, loop_extended=True)
+    loop_item = rt._loop_item(task, items, 0, {}, metadata_flags=(True, True))
+    rt.emit(task, "ok", {"msg": "first"}, item=items[0], is_item=True, loop_item=loop_item)
+
+    frame = json.loads(json.dumps(frames[0]))
+    extended = frame["loop"]["extended"] if controller else frame["result"]["ansible_loop"]
+    assert extended == {"index": 1, "index0": 0, "first": True, "last": False,
+                        "length": 2, "revindex": 2, "revindex0": 1}
+    assert loop_item.extended["nextitem"] is items[1]
+    assert loop_item.extended["allitems"] is items
+
+
+def test_registered_loop_state_encodes_allitems_once(monkeypatch):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.21.0")
+
+    def frames_for(count):
+        frames = []
+        rt = Runtime({}, "", {}, on_result=frames.append)
+        rt._controller_result_transport = True
+        items = [{datetime.date(2026, 1, 1): "fixture", 42: "integer", "42": "text"}, *range(count - 1)]
+        task = _task("loop", "loop", "debug", loop=items, args={"msg": "sample"},
+                     register="saved", loop_extended=True)
+        rt.run_play({"tasks": [task], "gather_facts": False})
+        assert not rt.failed
+        return json.dumps(frames, default=str)
+
+    small = frames_for(64)
+    large = frames_for(128)
+    assert len(large) < 2.4 * len(small)
+    frames = json.loads(large)
+    assert frames[0]["item"] == {"2026-01-01": "fixture", "42 (1)": "integer", "42": "text"}
+    packed = frames[-1]["private_result"]
+    assert packed["loop_allitems_indices"] == list(range(128))
+    assert len(packed["loop_allitems"]["value"]) == 128
+    assert not any("allitems" in entry["ansible_loop"] for entry in packed["value"]["results"])
+    assert not any("allitems" in entry["ansible_loop"] for entry in frames[-1]["result"]["results"])
+    assert packed["loop_allitems"]["mapping_keys"]
+
+
+def test_modern_loop_projection_tracks_executor_fields(monkeypatch):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.21.0")
+    it = runtime._LoopItem("attempts", "loop value", "skip_reason", 0, None)
+    mod_result = runtime._ExecutorResult({"attempts": 42, "skip_reason": "module value"})
+    assert runtime._loop_item_result(mod_result, it)["attempts"] == 42
+    assert runtime._loop_item_result(mod_result, it)["skip_reason"] == "module value"
+    mod_result.set_executor_field("attempts", 1)
+    mod_result.set_executor_field("skip_reason", "executor value")
+    assert runtime._loop_item_result(mod_result, it)["attempts"] == 42
+    assert runtime._loop_item_result(mod_result, it)["skip_reason"] == "module value"
+
+    executor_result = runtime._ExecutorResult({})
+    executor_result.set_executor_field("attempts", 1)
+    executor_result.set_executor_field("skip_reason", "executor value")
+    projected = runtime._loop_item_result(executor_result, it)
+    assert projected["attempts"] == "loop value"
+    assert projected["skip_reason"] == 0
+
+
+def test_standalone_item_status_uses_outcome_before_projection(capsys, monkeypatch):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.21.0")
+    rt = Runtime({}, "", {"inventory_hostname": "h"}, pretty=True)
+    task = _task("loop", "loop", "debug", loop=["sample"], args={"msg": "sample"}, loop_var="changed")
+    rt.run_play({"tasks": [task], "gather_facts": False})
+    assert "ok: [h] => (item=sample)" in capsys.readouterr().out
+
+
 def test_rescued_datetime_keys_preserve_fractional_offsets():
     from ansiroll import runtime
 

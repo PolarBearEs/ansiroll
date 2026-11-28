@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, MappingView, Set
+from contextlib import contextmanager
 from itertools import count
 
 DOCUMENTATION = """
@@ -400,8 +401,9 @@ class StrategyModule(StrategyBase):
             # Linear still needs the raw flag to identify quoted false values.
             # Dynamic roles can introduce delegated set_fact after compilation.
             routed_facts = self._requires_linear_fallback or bool(delegated_fact_tasks)
+            run_with_rescue_facts = self._run_linear_with_rescue_facts
             self.__class__ = _SetFactLinearStrategy if routed_facts else _LinearStrategy
-            return self.run(iterator, play_context)
+            return run_with_rescue_facts(iterator, play_context)
         self._emit_provenance({
             "scope": "play",
             "play": play.name or play.get_name(),
@@ -717,14 +719,48 @@ class StrategyModule(StrategyBase):
             last_frame = now
         return host_failed
 
+    def _run_linear_with_rescue_facts(self, iterator, play_context):
+        manager = self._variable_manager
+        if not getattr(manager, "_ansiroll_private_rescue_facts", None):
+            return self.run(iterator, play_context)
+        get_vars = manager.get_vars
+        set_facts = manager.set_nonpersistent_facts
+        controller_pid = os.getpid()
+
+        def task_vars(play=None, host=None, task=None, include_hostvars=True, *args, **kwargs):
+            resolve = get_vars
+            if host is not None and task is not None and include_hostvars and os.getpid() == controller_pid:
+                private = _private_rescue_facts(manager, host.name)
+                if private:
+                    # Resolve at normal set_fact precedence on a copy. Native
+                    # hostvars and delegated lookups use the original cache.
+                    local = object.__new__(type(manager))
+                    vars(local).update(vars(manager))
+                    local.get_vars = get_vars
+                    local._nonpersistent_fact_cache = manager._nonpersistent_fact_cache.copy()
+                    local._nonpersistent_fact_cache[host.name] = {
+                        **manager._nonpersistent_fact_cache.get(host.name, {}), **private,
+                    }
+                    resolve = get_vars.__func__.__get__(local)
+            return resolve(play, host, task, include_hostvars, *args, **kwargs)
+
+        def public_facts(host_name, facts):
+            set_facts(host_name, facts)
+            _discard_private_rescue_facts(manager, host_name, facts)
+
+        with _temporary_manager_method(manager, "get_vars", task_vars):
+            with _temporary_manager_method(manager, "set_nonpersistent_facts", public_facts):
+                return self.run(iterator, play_context)
+
     def _restore_rescue_value(self, packed):
-        from ansiroll.runtime import _restore_rescue_scalars
+        from ansiroll.runtime import _restore_loop_allitems, _restore_rescue_scalars
 
         value = _restore_rescue_scalars(packed)
         if _UnifiedTaskResult is None:
             value = _wrap_legacy_rescue_value(value)
-        return self._restore_play_fallback(
+        value = self._restore_play_fallback(
             value, packed["undefined"], packed.get("errors", ()), packed.get("mapping_keys", ()))
+        return _restore_loop_allitems(value, packed, self._restore_rescue_value)
 
     def _mirror_rescued_failure(self, host, task, result, args=None, name=None):
         # This is variable state for later plays. Display has already received
@@ -744,29 +780,31 @@ class StrategyModule(StrategyBase):
 
     def _mirror_rescue_overrides(self, host_name, writes):
         manager = self._variable_manager
-        previously_private = set(_private_rescue_facts(manager, host_name))
-        # Apply accepted writes in item order. A public item must not stop a
-        # later censored item updating a fact that was private before the loop.
+        # Apply writes in item order. The agent only sends censored writes
+        # when the task succeeds.
         for packed, no_log, cacheable in writes:
             facts = self._restore_rescue_value(packed)
-            if no_log:
-                accepted = {name: value for name, value in facts.items() if name in previously_private}
-                if accepted:
-                    self._save_rescue_facts(host_name, accepted, accepted.keys())
-            else:
-                if cacheable:
-                    manager.set_host_facts(host_name, dict(facts))
-                self._save_rescue_facts(host_name, facts, ())
+            if cacheable and not no_log:
+                manager.set_host_facts(host_name, dict(facts))
+            self._save_rescue_facts(host_name, facts, facts.keys() if no_log else ())
 
     def _save_rescue_facts(self, host_name, facts, private_names):
         manager = self._variable_manager
+        public = {key: value for key, value in facts.items() if key not in private_names}
+        if public:
+            self._publish_nonpersistent_facts(host_name, public)
+        if private_names:
+            cache = manager._nonpersistent_fact_cache
+            previous = cache.get(host_name, {})
+            if previous.keys() & private_names:
+                cache[host_name] = {key: value for key, value in previous.items() if key not in private_names}
+            private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
+            private.setdefault(host_name, {}).update({key: facts[key] for key in private_names})
+
+    def _publish_nonpersistent_facts(self, host_name, facts):
+        manager = self._variable_manager
         manager.set_nonpersistent_facts(host_name, facts)
-        private = vars(manager).setdefault("_ansiroll_private_rescue_facts", {})
-        tracked = private.setdefault(host_name, {})
-        for key in facts:
-            tracked.pop(key, None)
-        stored = manager._nonpersistent_fact_cache[host_name]
-        tracked.update({key: stored[key] for key in private_names})
+        _discard_private_rescue_facts(manager, host_name, facts)
 
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
@@ -1096,12 +1134,20 @@ class StrategyModule(StrategyBase):
         markers = [(path, missing) for path in undefined]
         markers.extend((path, error_marker(message)) for path, message in errors)
         value = _replace_delegated_values(value, markers)
+        if mapping_keys and runtime_marker is None:
+            try:
+                from ansible.template import trust_as_template
+            except ImportError:
+                pass
+            else:
+                return _restore_delegated_mapping_keys(value, mapping_keys, fact_template=trust_as_template)
         return _restore_delegated_mapping_keys(value, mapping_keys)
 
     def _restore_private_result(self, packed, *, wrap_result=False):
         from ansiroll.loader import _core_version
+        from ansiroll.runtime import _restore_loop_allitems, _restore_rescue_scalars
 
-        value = packed["value"]
+        value = _restore_rescue_scalars(packed)
         if _core_version() < (2, 19):
             from ansible.utils.unsafe_proxy import wrap_var
 
@@ -1116,8 +1162,10 @@ class StrategyModule(StrategyBase):
                     for key in path[:-1]:
                         container = container[key]
                     container[path[-1]] = wrap_var(container[path[-1]])
-        return self._restore_play_fallback(value, packed["undefined"], packed.get("errors", ()),
-                                           packed.get("mapping_keys", ()))
+        value = self._restore_play_fallback(value, packed["undefined"], packed.get("errors", ()),
+                                            packed.get("mapping_keys", ()))
+        return _restore_loop_allitems(value, packed, lambda shared: self._restore_private_result(
+            shared, wrap_result=wrap_result))
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
@@ -1531,6 +1579,7 @@ class StrategyModule(StrategyBase):
     def _var_header(self, host, hv, become_pass=None):
         """Inject this host's vars (extra-vars, inventory, group_vars) plus the
         resolved become password into the streamed run (stdin only -- never on disk)."""
+        from ansiroll.loader import _core_version, _tag_untrusted
         from ansiroll.runtime import _pack_include_value
 
         mapping_keys = {"host": [], "extra": [], "overrides": []}
@@ -1540,8 +1589,11 @@ class StrategyModule(StrategyBase):
             self._variable_manager, "_nonpersistent_fact_cache", {}
         ).get(host.name, {})
         rescue = _private_rescue_facts(self._variable_manager, host.name)
-        override_blob = _json_blob(
-            {key: value for key, value in nonpersistent.items() if key not in rescue}, mapping_keys["overrides"])
+        override_blob = _json_blob(nonpersistent, mapping_keys["overrides"])
+        if rescue and _core_version() >= (2, 19):
+            # Modern Core restores native trust tags. Legacy already keeps
+            # explicit runtime key markers when restoring the wire data.
+            rescue = _tag_untrusted(rescue, tag_values=False)
         rescue_blob = json.dumps(_pack_include_value(rescue, preserve_scalars=True)) if rescue else "null"
         return (
             "_INJECTED_HOST = %r\n"
@@ -1743,12 +1795,12 @@ class StrategyModule(StrategyBase):
                     registered_result = _restore_included_vars(
                         state, included_vars, frame.get("included_vars_references"),
                     )
-                self._variable_manager.set_nonpersistent_facts(
+                self._publish_nonpersistent_facts(
                     host.name, {reg: dict(registered_result) for reg in registers}
                 )
             facts = state.get("ansible_facts")
             if (action == "set_fact" and isinstance(facts, dict)
-                    and ("private_result" in frame or frame.get("is_item"))):
+                    and (frame.get("no_log") or frame.get("is_item"))):
                 # Commit rescue-name writes in item order after the task,
                 # with censored writes allowed only on success.
                 from ansiroll.runtime import _RESCUE_FACT_NAMES
@@ -1774,7 +1826,7 @@ class StrategyModule(StrategyBase):
                         host.name, dict(facts)
                     )
                 if is_set_fact:
-                    self._variable_manager.set_nonpersistent_facts(
+                    self._publish_nonpersistent_facts(
                         host.name, dict(facts)
                     )
 
@@ -1789,7 +1841,7 @@ class StrategyModule(StrategyBase):
                     if other.name == host.name:
                         continue
                     if registers:
-                        self._variable_manager.set_nonpersistent_facts(
+                        self._publish_nonpersistent_facts(
                             other.name,
                             {reg: dict(registered_result) for reg in registers},
                         )
@@ -1799,7 +1851,7 @@ class StrategyModule(StrategyBase):
                                 other.name, dict(facts)
                             )
                         if is_set_fact:
-                            self._variable_manager.set_nonpersistent_facts(
+                            self._publish_nonpersistent_facts(
                                 other.name, dict(facts)
                             )
         except Exception:
@@ -1809,8 +1861,9 @@ class StrategyModule(StrategyBase):
             task = original.copy(exclude_parent=True)
             task._parent = original._parent
             task.no_log = frame["no_log"]
-        tr = self._make_result(host, task, result_data)
         is_item = frame.get("is_item")
+        tr = self._make_result(host, task, result_data, loop=frame.get("loop"),
+                               item=frame.get("item"), executor_fields=frame.get("executor_fields"))
         ignored = frame.get("ignored")
         if status == "unreachable" and is_item:
             # Ansible emits the task-level unreachable callback for the loop.
@@ -1825,8 +1878,10 @@ class StrategyModule(StrategyBase):
         self._tqm.send_callback(method, tr)
         return False
 
-    def _make_result(self, host, task, result_data):
+    def _make_result(self, host, task, result_data, *, loop=None, item=None, executor_fields=None):
         result_data = dict(result_data)
+        if loop is not None:
+            result_data.setdefault("_ansible_item_label", item)
         # 2.19+ callbacks expect a structured error summary. Reconstruct one
         # from the agent's plain result so native-style diagnostics (including
         # task source context) are retained.
@@ -1885,7 +1940,20 @@ class StrategyModule(StrategyBase):
                 result_data["warnings"] = warnings
         if _UnifiedTaskResult is not None:
             unified = _UnifiedTaskResult.from_action_result_dict(dict(result_data))
+            if loop is not None:
+                for field, value in (executor_fields or {}).items():
+                    setattr(unified, field, value)
+                unified.loop_var = loop["name"]
+                unified.loop_item = item
+                unified.loop_index_var = loop["index_name"]
+                unified.loop_index = loop["index"] if unified.loop_index_var else None
+                unified.loop_extended = loop["extended"]
             return _ResultClass(host, task, unified)
+        if loop is not None:
+            from ansiroll.runtime import _LoopItem
+
+            result_data.update(_LoopItem(loop["name"], item, loop["index_name"],
+                                         loop["index"], loop["extended"]).variables())
         try:
             return _ResultClass(host, task, dict(result_data), task.dump_attrs())
         except TypeError:
@@ -2340,21 +2408,34 @@ def _json_blob(values, mapping_keys=None, *, strict_keys=()):
 
 
 def _private_rescue_facts(manager, host_name):
+    return getattr(manager, "_ansiroll_private_rescue_facts", {}).get(host_name, {})
+
+
+def _discard_private_rescue_facts(manager, host_name, facts):
     private = getattr(manager, "_ansiroll_private_rescue_facts", {})
-    tracked = private.get(host_name, {})
-    if not tracked:
-        return {}
-    current = manager._nonpersistent_fact_cache.get(host_name, {})
-    active = {key: value for key, value in tracked.items() if key in current and current[key] is value}
-    if active:
-        private[host_name] = active
-    else:
-        private.pop(host_name, None)
-    return active
+    tracked = private.get(host_name)
+    if tracked:
+        for key in tracked.keys() & facts.keys():
+            del tracked[key]
+        if not tracked:
+            del private[host_name]
+
+
+@contextmanager
+def _temporary_manager_method(manager, name, method):
+    attributes = vars(manager)
+    original = attributes.get(name)
+    attributes[name] = method
+    try:
+        yield
+    finally:
+        if original is None:
+            del attributes[name]
+        else:
+            attributes[name] = original
 
 
 def _hostvars_snapshot(hostvars, *, preserve_keys=False):
-    from ansiroll.loader import _core_version
     from ansiroll.runtime import _contains_typed_mapping_keys, _pack_delegated_value
 
     if hostvars is None:
@@ -2368,33 +2449,10 @@ def _hostvars_snapshot(hostvars, *, preserve_keys=False):
     except Exception:
         return out
     raw_get = getattr(hostvars, "raw_get", None)
-    manager = getattr(hostvars, "_variable_manager", None)
-    inventory = getattr(hostvars, "_inventory", None)
     for name in names:
         try:
-            host = inventory.get_host(name) if inventory is not None else None
-            private_names = _private_rescue_facts(manager, host.name if host else name)
-            if private_names:
-                from ansible.vars.hostvars import HostVarsVars
-
-                if host is None:
-                    continue
-                # Remove only the private fact layer before precedence is
-                # applied. This also keeps aliases from resolving it.
-                public_manager = object.__new__(type(manager))
-                vars(public_manager).update(vars(manager))
-                cache = manager._nonpersistent_fact_cache.copy()
-                cache[host.name] = {key: value for key, value in cache[host.name].items() if key not in private_names}
-                public_manager._nonpersistent_fact_cache = cache
-                raw = public_manager.get_vars(host=host, include_hostvars=False)
-                raw = {key: value for key, value in raw.items()
-                       if key not in ("vars", "hostvars")}
-                raw["vars"] = dict(raw)
-                host_kw = {"host": name} if _core_version() >= (2, 19) else {}
-                source = HostVarsVars(raw, loader=hostvars._loader, **host_kw)
-            else:
-                raw = raw_get(name) if raw_get is not None and preserve_keys else {}
-                source = hostvars[name]
+            raw = raw_get(name) if raw_get is not None and preserve_keys else {}
+            source = hostvars[name]
             keys = list(source)
         except Exception:
             continue
