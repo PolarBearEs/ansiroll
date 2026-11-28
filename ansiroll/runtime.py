@@ -73,6 +73,7 @@ def _legacy_non_native(ctx):
 _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 _CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
+_LEGACY_NATIVE_KEYWORD = object()
 _INCLUDE_APPLY_FLAGS = "__ansiroll_apply_flags"
 
 
@@ -3090,6 +3091,19 @@ def _concat_keyword_segments(nodes):
     return "".join(str(_setup_omit(part)) for part in parts if part is not _KEYWORD_OMIT)
 
 
+def _concat_legacy_keyword_segments(nodes):
+    parts = list(nodes)
+    # Keep a single segment's type, including a null explicitly converted to text.
+    if len(parts) < 2:
+        return parts[0] if parts else None
+    text = "".join(str(part) for part in parts)
+    # Core's native parser also accepts a null followed by whitespace or
+    # preceded by complete blank lines. An indent on the null line is invalid.
+    if any(part is None for part in parts) and re.fullmatch(r"(?:[ \t\f]*\n)*\f*None[ \t\f\n]*", text):
+        return None
+    return text
+
+
 def _finalize_text_segment(context, value):
     if value is None:
         config = context.get("__ansiroll_controller_config") or {}
@@ -4145,8 +4159,9 @@ class _Templater:
 
     def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=(), file_header=False):
         stripped = text.strip()
-        check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
-        native_keyword = check_mode_template is True
+        keyword_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
+        native_keyword = keyword_template is True
+        legacy_native_keyword = keyword_template is _LEGACY_NATIVE_KEYWORD
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
@@ -4154,20 +4169,22 @@ class _Templater:
         else:
             env = self._strict_env if strict else self.env
         native_file = file_newline is not None and not _legacy_templating()
-        if native_keyword:
-            if env not in self._keyword_environments:
+        if native_keyword or legacy_native_keyword:
+            key = (env, native_keyword)
+            if key not in self._keyword_environments:
                 keyword_env = env.overlay()
-                keyword_env.context_class = _KeywordContext
-                keyword_env.getattr = partial(self._keyword_member, env.getattr)
-                keyword_env.getitem = partial(self._keyword_member, env.getitem)
+                if native_keyword:
+                    keyword_env.context_class = _KeywordContext
+                    keyword_env.getattr = partial(self._keyword_member, env.getattr)
+                    keyword_env.getitem = partial(self._keyword_member, env.getitem)
                 keyword_env.keep_trailing_newline = False
                 keyword_env.trim_blocks = True
-                keyword_env.concat = _concat_keyword_segments
+                keyword_env.concat = _concat_keyword_segments if native_keyword else _concat_legacy_keyword_segments
                 keyword_env.finalize = _concretize
                 keyword_env.code_generator_class = (
                     _ConditionalKeywordCodeGenerator if lazy_names else _KeywordCodeGenerator)
-                self._keyword_environments[env] = keyword_env
-            env = self._keyword_environments[env]
+                self._keyword_environments[key] = keyword_env
+            env = self._keyword_environments[key]
         if file_newline is not None:
             key = (env, file_newline, file_options, native_file)
             if key not in self._file_environments:
@@ -4183,10 +4200,11 @@ class _Templater:
             env = self._file_environments[key]
         expr = None
         legacy_header = file_header and not native_file
-        if (not legacy_header and (check_mode_template is None or text == stripped)
+        if (not legacy_header and (keyword_template is None or text == stripped)
                 and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
             expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
-        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
+        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword,
+                            legacy_native_keyword)
         template_key = (text, *template_options)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
@@ -4215,8 +4233,8 @@ class _Templater:
                     # Bundled Jinja uses the global text concatenator in
                     # Template.render, even when the overlay has a native one.
                     result = _concat_file_output(tmpl.root_render_func(tmpl.new_context(ctx)))
-                elif native_keyword:
-                    result = _concat_keyword_segments(tmpl.generate(**ctx))
+                elif native_keyword or legacy_native_keyword:
+                    result = env.concat(tmpl.generate(**ctx))
                 else:
                     result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
@@ -5339,14 +5357,17 @@ class Runtime:
             return no_log, {}, {}, failure
         try:
             flags = {
-                key: self._execution_flag_value(value, ctx, check_mode=key == "check_mode")
+                key: self._execution_flag_value(value, ctx, keyword=key)
                 for key, value in authored_flags.items()
             }
             for key, value in flags.items():
                 if isinstance(value, _Omit) or value is _KEYWORD_OMIT:
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
                     flags[key] = self._bound_apply_flag(inherited, ctx)
-            applied_vars = _setup_omit(self.template(authored_vars, self._check_mode_template_context(ctx)))
+                elif key == "become" and isinstance(value, str):
+                    # Rendered apply values can contain template delimiters as data.
+                    flags[key] = _UnsafeText(value)
+            applied_vars = _setup_omit(self.template(authored_vars, self._keyword_template_context(ctx)))
         except Exception as ex:
             return no_log or "no_log" in authored_flags, {}, {}, {
                 "failed": True, "changed": False, "msg": str(ex),
@@ -6340,16 +6361,17 @@ class Runtime:
     def _execution_flag(self, task, key, ctx, default):
         authored = task.get(key)
         check_mode = key == "check_mode"
+        become = key == "become_override"
         omit_token = ctx.get("omit")
-        value = self._execution_flag_value(authored, ctx, check_mode=check_mode)
-        legacy_omit = (check_mode and _legacy_templating() and isinstance(omit_token, str)
+        value = self._execution_flag_value(authored, ctx, keyword=key)
+        legacy_omit = ((check_mode or become) and _legacy_templating() and isinstance(omit_token, str)
                        and omit_token.startswith("__omit_place_holder__") and value == omit_token)
         omitted = isinstance(value, _Omit) or value is _KEYWORD_OMIT or legacy_omit
         if omitted:
             fallback = task.get(key + "_on_omit", default)
-            if key == "become_override":
+            if become:
                 # Core validates the restored keyword before applying inventory
-                # settings. An apply binding can supply an include-time value.
+                # settings. An unrendered parent template is invalid here.
                 value = self._bound_apply_flag(fallback, ctx)
                 try:
                     value = value is not None and _boolean(value, strict=True)
@@ -6358,22 +6380,24 @@ class Runtime:
                 if not (self.delegate_fn and task.get("delegate_to")):
                     inventory_become = ctx.get("ansible_become")
                     if inventory_become is not None:
-                        value = self._execution_flag_value(inventory_become, self._check_mode_template_context(ctx))
+                        value = _fail_on_undef(self.template(inventory_become, self._keyword_template_context(ctx)))
                         return _boolean(value, strict=True), omitted
             elif check_mode and fallback == "invocation":
                 return self._invocation_check_mode, omitted
             elif check_mode and fallback == "invalid":
                 raise ValueError("invalid inherited check_mode value")
             else:
-                value = self._execution_flag_value(fallback, ctx, check_mode=check_mode, on_omit=True)
+                value = self._execution_flag_value(fallback, ctx, keyword=key, on_omit=True)
         if value is None:
             explicit_check_mode = check_mode and (authored is not None or task.get("check_mode_null"))
-            return (False if explicit_check_mode else default), omitted
+            if (become and key in task) or explicit_check_mode:
+                return False, omitted
+            return default, omitted
         return _boolean(value, strict=True), omitted
 
-    def _execution_flag_value(self, value, ctx, *, check_mode=False, on_omit=False):
+    def _execution_flag_value(self, value, ctx, *, keyword, on_omit=False):
         value = self._bound_apply_flag(value, ctx)
-        if check_mode:
+        if keyword == "check_mode":
             if isinstance(value, dict):
                 if value == {"__ansiroll_invocation_check_mode__": True}:
                     return self._invocation_check_mode
@@ -6383,14 +6407,29 @@ class Runtime:
                     if on_omit:
                         raise ValueError("invalid inherited check_mode value")
                     value = value["__ansiroll_raw_apply_check_mode__"]
-            if isinstance(value, str):
-                ctx = self._check_mode_template_context(ctx)
-        return _fail_on_undef(self.template(value, ctx))
+        become = keyword in ("become", "become_override")
+        if (keyword == "check_mode" or become) and isinstance(value, str):
+            ctx = self._keyword_template_context(ctx, become=become)
+        rendered = _fail_on_undef(self.template(value, ctx))
+        if become and rendered is None and isinstance(value, str) and _legacy_templating():
+            # Core preserves a bare null variable before rendering. In its
+            # non-native renderer a null produced by Jinja is instead empty text.
+            bare = re.match(r"^\{\{\s*(\w+)\s*\}\}$", value)
+            if bare is not None and ctx.get(bare.group(1), ...) is None:
+                return (ctx.get("__ansiroll_controller_config") or {}).get("DEFAULT_NULL_REPRESENTATION")
+            if _legacy_non_native(ctx):
+                return ""
+        return rendered
 
     @staticmethod
-    def _check_mode_template_context(ctx):
+    def _keyword_template_context(ctx, *, become=False):
         native_keyword = _core_at_least(2, 19)
-        ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
+        mode = native_keyword
+        if become and not native_keyword:
+            config = ctx.get("__ansiroll_controller_config") or {}
+            if config.get("DEFAULT_JINJA2_NATIVE") is True:
+                mode = _LEGACY_NATIVE_KEYWORD
+        ctx = {**ctx, _CHECK_MODE_TEMPLATE: mode}
         if native_keyword and ctx.get("omit") is _OMIT:
             ctx["omit"] = _KEYWORD_OMIT
         return ctx
