@@ -3919,12 +3919,10 @@ def _literal_head(src):
 def _literal_role_source_edges(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import _bare_template_expression
+    from .runtime import _INLINE_TEMPLATE_OPTIONS, _with_inline_newlines
 
-    if _bare_template_expression(src) is not None:
-        return "", ""
     try:
-        body = Environment(keep_trailing_newline=True).parse(src).body
+        body = Environment(**_INLINE_TEMPLATE_OPTIONS).parse(src).body
     except TemplateSyntaxError:
         return "", ""
     head = tail = ""
@@ -3936,7 +3934,7 @@ def _literal_role_source_edges(src):
         output = body[-1].nodes
         if output and isinstance(output[-1], nodes.TemplateData):
             tail = output[-1].data
-    return head, tail
+    return head, _with_inline_newlines(src, tail)
 
 
 def _role_source_layout(base, walk):
@@ -4089,13 +4087,15 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     if getattr(task, "_role", None) is None:
         return False
     newline = ""
-    prefix = _literal_head(src).rpartition("/")[0]
+    head, tail = _literal_role_source_edges(src)
+    if os.path.isabs(head):
+        return False
+    prefix = head.rpartition(os.sep)[0]
     if ".." in prefix.split("/"):
         if os.path.normpath(prefix).split("/")[0] == "..":
             return False
         # The runtime resolves ".." against the walked dirs, so walk what an unnarrowed src would.
         prefix = ""
-    head, tail = _literal_role_source_edges(src)
     head_dir, _, basename_head = head.rpartition(os.sep)
     prefix_dir = os.path.normpath(prefix)
     if (basename_head in (".", "..") or ".." in head_dir.split(os.sep)
@@ -4118,7 +4118,7 @@ def _bake_search_tree(node, task, basedir, subdir, src):
     directories = set()
     aliases = {}
     # Before 2.21 Ansible compared the byte path component to a text dirname.
-    explicit_subdir = _literal_head(src).startswith(subdir + "/") and _core_version() >= (2, 21)
+    explicit_subdir = head.startswith(subdir + "/") and _core_version() >= (2, 21)
     for base, is_subdir in _search_dirs(task, basedir, subdir, tagged=True, explicit_subdir=explicit_subdir):
         walk = []
         requires_basename_head = False
@@ -4398,8 +4398,10 @@ def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
 def _linked_role_source_patterns(src):
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
+    from .runtime import _INLINE_TEMPLATE_OPTIONS, _with_inline_newlines
+
     try:
-        parsed = Environment(keep_trailing_newline=True).parse(src)
+        parsed = Environment(**_INLINE_TEMPLATE_OPTIONS).parse(src)
     except TemplateSyntaxError:
         return None
     body = parsed.body
@@ -4415,7 +4417,7 @@ def _linked_role_source_patterns(src):
 
     head = literal(output_nodes[0], 0)
     if (not (len(output_nodes) == 1 and isinstance(output_nodes[0], nodes.Output))
-            and not literal(output_nodes[-1], -1)):
+            and not _with_inline_newlines(src, literal(output_nodes[-1], -1))):
         return None
     referenced = {name.name for name in parsed.find_all(nodes.Name) if name.ctx == "load"}
 
@@ -4494,7 +4496,7 @@ def _linked_role_source_patterns(src):
     except (ValueError, OverflowError):
         return None
     patterns = []
-    for candidate in dict.fromkeys(path for path, _ in candidates):
+    for candidate in dict.fromkeys(_with_inline_newlines(src, path) for path, _ in candidates):
         if not candidate or os.path.isabs(candidate) or ".." in candidate.split(os.sep):
             continue
         # These spellings require a directory, even after the variables render.

@@ -96,6 +96,106 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize("legacy_native", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Jinja native mode")),
+], ids=["default", "legacy-native"])
+def test_inline_template_whitespace_matches_linear(tmp_path, monkeypatch, use_strategy, legacy_native):
+    if not MODERN_TEMPLATING:
+        monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", str(legacy_native))
+        monkeypatch.setattr(C, "DEFAULT_JINJA2_NATIVE", legacy_native)
+    cases = [
+        ("{{ 'value' }}\n", "value\n"),
+        (" \t{{ 'value' }} \t", " \tvalue \t"),
+        (" \t{{- 'value' }} \n", "value \n"),
+        (" \t{{ 'value' -}} \n", " \tvalue\n"),
+        (" \t{{- 'value' -}}  ", "value"),
+        ("{{ 'value' }}\n\n", "value\n\n"),
+        ("{% set value = 'ok' %}\n{{ value }}", "ok"),
+        ("{% set value = 'ok' %}\n\n{{ value }}", "\nok"),
+        ("{% set value = 'ok' -%}\n\n{{ value }}", "ok"),
+        ("{% set value = 'ok' %}\n{{ value }}{% set unused = 1 %}\n", "ok\n"),
+        ("{{ 'a' }}{# note #}\n{{ 'b' }}", "ab"),
+        ("{{ 'a' }}{# note +#}\n{{ 'b' }}", "a\nb"),
+        ("{{ 42 }}\n", 42 if MODERN_TEMPLATING or legacy_native else "42\n"),
+        (" {{ 42 }}", " 42"),
+        ("{{ [1, 2] }}\n", [1, 2]),
+        ("{{ [1, 2] }} ", "[1, 2] " if MODERN_TEMPLATING else [1, 2]),
+        (" \t{{- [1, 2] -}} \n", [1, 2]),
+        (" {{ [1, 2] }}", " [1, 2]"),
+    ]
+    if MODERN_TEMPLATING:
+        cases.extend([
+            (" {{ missing | default(omit) }}\n", " \n"),
+            (" {{ none }} ", " None " if Version(__version__) < Version("2.19.1") else "  "),
+            ("{{ [1, omit, {'gone': omit, 'keep': (2, omit)}] }} ", "[1, {'keep': [2]}] "),
+            ("{{ {omit: 4} }} ", "{<<Omit>>: 4} "),
+        ])
+    elif legacy_native:
+        expected = '"hello"' if Version(__version__) >= Version("2.14.1") else "hello"
+        cases.append(("{{ '\"hello\"' }} ", expected))
+    tasks = []
+    for source, _ in cases:
+        tasks.extend([
+            {"set_fact": {"rendered": source}},
+            {"debug": {"msg": "{{ rendered | to_json }}"}},
+        ])
+    playbook = json.dumps([{"hosts": "localhost", "gather_facts": False, "tasks": tasks}])
+    messages, _ = _assert_parity(tmp_path, playbook, use_strategy=use_strategy)
+    assert [json.loads(message) for message in messages] == [expected for _, expected in cases]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_padded_inline_collections_reject_undefined_members(tmp_path, monkeypatch, use_strategy):
+    if Version(__version__) < Version("2.13"):
+        # Legacy non-native concatenation through 2.12 stringifies Undefined
+        # inside a collection. Exercise the native mode's recursive check.
+        monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "True")
+        monkeypatch.setattr(C, "DEFAULT_JINJA2_NATIVE", True)
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        rendered: "{{ [{'key': missing}] }} "
+""", use_strategy=use_strategy)
+    assert recap[3] == "1"
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_padded_boolean_conditions_match_linear(tmp_path, use_strategy):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {enabled: true, disabled: false}
+  tasks:
+    - debug: {msg: enabled}
+      when: ' {{ enabled }} '
+    - debug: {msg: disabled}
+      when: ' {{ disabled }} '
+""", use_strategy=use_strategy)
+    assert messages == ["enabled"]
+    assert recap[4] == "1"
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy native conditions can use non-booleans")
+def test_padded_legacy_native_conditions_keep_typed_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "True")
+    monkeypatch.setattr(C, "DEFAULT_JINJA2_NATIVE", True)
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: integer}
+      when: ' {{ 1 }} '
+    - debug: {msg: "null"}
+      when: ' {{ none }} '
+""")
+    assert messages == ["integer"]
+    assert recap[4] == "1"
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 @pytest.mark.parametrize("custom_path", [True, False], ids=["custom", "omit"])
 def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypatch, use_strategy, custom_path):
     monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")
@@ -1919,6 +2019,20 @@ def test_template_file_newline_mode_does_not_affect_later_expressions():
     assert templater.render_string(source, {}, file_newline="\r\n") == "a\r\nb"
     assert templater.render_string(source, {}, file_newline="\n") == "a\nb"
     assert templater.render_string(source, {}) == "a\nb"
+
+
+def test_inline_block_defaults_do_not_change_explicit_file_or_legacy_keyword_settings(monkeypatch):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.18.0")
+    templater = runtime.Runtime({}, "", {}).templater
+    source = "{% set value = 'ok' %}\n{{ value }}\n"
+    keyword_ctx = runtime.Runtime._check_mode_template_context({})
+
+    assert templater.render_string(source, {}) == "ok\n"
+    assert templater.render_string(source, keyword_ctx) == "\nok\n"
+    assert templater.render_string(source, {}, file_newline="\n", file_options=(("trim_blocks", False),)) == "\nok\n"
+    assert templater.render_string(source, {}) == "ok\n"
 
 
 @pytest.mark.skipif(not Version("2.13") <= Version(__version__) < Version("2.19"),

@@ -288,18 +288,35 @@ def test_compile_dynamic_role_source_ignores_unrelated_locked_files(tmp_path, mo
     assert node["_baked"] == {selected: "usable template\n"}
 
 
-def test_compile_dynamic_role_source_preserves_bare_expression_resolution(tmp_path):
+@pytest.mark.parametrize(("source", "filename"), [
+    ("{{ selection }} ", "app "),
+    ("{{ selection -}} ", "app"),
+    ("{{ selection }}{# note #}\n.txt", "app.txt"),
+    ("{{ selection }}{# note #}\n.txt\n\n", "app.txt\n\n"),
+    ("sites/{# note #}\nprod/{{ selection }}.txt", "sites/prod/app.txt"),
+])
+def test_compile_dynamic_role_source_honors_inline_whitespace(tmp_path, source, filename):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   gather_facts: false
   roles: [r]
 """, "roles/r/tasks/main.yml": """
 - set_fact: {selection: app}
-- template: {src: "{{ selection }} ", dest: "rendered.txt"}
-""", "roles/r/templates/app": "selected template\n"})
+- template: {src: SOURCE, dest: "rendered.txt"}
+""".replace("SOURCE", json.dumps(source)), "roles/r/templates/" + filename: "selected\n"})
 
-    _ansiroll(tmp_path / "pb.yml", tmp_path, returncode=0)
-    assert (tmp_path / "rendered.txt").read_text() == "selected template\n"
+    playbook = tmp_path / "pb.yml"
+    output = tmp_path / "rendered.txt"
+    native = _ansible(playbook, returncode=0)
+    assert output.read_text() == "selected\n"
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == native
+    assert output.read_text() == "selected\n"
+
+    from ansiroll.loader import _linked_role_source_matches, _linked_role_source_patterns
+
+    _, patterns = _linked_role_source_patterns(source)
+    assert any(_linked_role_source_matches(pattern, filename) for _, pattern in patterns)
 
 
 def test_compile_dynamic_role_source_keeps_a_reachable_parent_path(tmp_path):
@@ -3061,6 +3078,29 @@ def test_dynamic_role_template_bakes_only_conditional_directory_choices(tmp_path
     template = next(node for node in _task_nodes(_bundle_json((tmp_path / "compiled.py").read_text())[0]["tasks"])
                     if node.get("action", "").endswith("template"))
     assert set(template["_baked_direct_sources"]) == {"sites/%s/app.j2" % name for name in ("blue", "green", "orange")}
+
+
+def test_dynamic_role_source_restores_newline_after_a_block_for_linked_assets(tmp_path):
+    source = "{% if selection %}sites/alias/{{ selection }}.txt{% endif %}\n"
+    _write(tmp_path, {"pb.yml": """
+- hosts: localhost
+  gather_facts: false
+  roles: [r]
+""", "roles/r/tasks/main.yml": """
+- set_fact: {selection: app}
+- template: {src: SOURCE, dest: "output.txt"}
+""".replace("SOURCE", json.dumps(source)),
+        "roles/r/templates/sites/local.txt": "ordinary\n",
+        "shared/app.txt\n": "linked\n"})
+    (tmp_path / "roles/r/templates/sites/alias").symlink_to(tmp_path / "shared", target_is_directory=True)
+
+    playbook = tmp_path / "pb.yml"
+    expected = _ansible(playbook, returncode=0)
+    output = tmp_path / "output.txt"
+    assert output.read_text() == "linked\n"
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path, returncode=0) == expected
+    assert output.read_text() == "linked\n"
 
 
 def test_dynamic_role_template_pattern_handles_many_repeated_literals():

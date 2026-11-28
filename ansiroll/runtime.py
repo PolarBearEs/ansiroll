@@ -74,6 +74,13 @@ _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 _CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
 _INCLUDE_APPLY_FLAGS = "__ansiroll_apply_flags"
+_INLINE_TEMPLATE_OPTIONS = {"trim_blocks": True}
+
+
+def _with_inline_newlines(source, result):
+    source_newlines = len(source) - len(source.rstrip("\n"))
+    result_newlines = len(result) - len(result.rstrip("\n"))
+    return result + "\n" * (source_newlines - result_newlines)
 
 
 def _rendered_number(value, source, ctx):
@@ -677,7 +684,7 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
         if isinstance(value, (int, float, dict, list, tuple)):
             return value
         if aliases is not None and len(aliases) < 64 and node.name not in aliases and isinstance(value, str):
-            source = _bare_template_expression(value)
+            source = _bare_template_expression(value, preserve_outer=True)
             if source is not None:
                 try:
                     body = jinja2.Environment().parse("{{ " + source + " }}").body
@@ -685,7 +692,10 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
                     return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
                     rendered = _selector_vars_key(body[0].nodes[0], template_variables, (*aliases, node.name))
-                    return _rendered_number(rendered, value, template_variables)
+                    rendered = _rendered_number(rendered, value, template_variables)
+                    if value.endswith("\n") and isinstance(rendered, str) and not isinstance(rendered, _Omit):
+                        return _with_inline_newlines(value, rendered)
+                    return rendered
     if isinstance(node, jinja2.nodes.Compare):
         # Delegate each comparison of known scalars to Jinja's own operator
         # semantics. Evaluate chained operands only when needed.
@@ -3102,6 +3112,44 @@ def _finalize_text_segment(context, value):
     return _concretize(value)
 
 
+def _finalize_padded_legacy_segment(context, value):
+    return _fail_on_undef(_finalize_text_segment(context, value))
+
+
+def _modern_inline_collection(value):
+    if isinstance(value, dict):
+        return {_modern_inline_collection(key): _modern_inline_collection(member)
+                for key, member in value.items() if not isinstance(member, _Omit)}
+    if isinstance(value, (list, tuple)):
+        return [_modern_inline_collection(member) for member in value if not isinstance(member, _Omit)]
+    if isinstance(value, _Omit):
+        # Omit mapping keys survive, using Core's representation in text.
+        return _KEYWORD_OMIT
+    return _fail_on_undef(value)
+
+
+def _finalize_padded_inline_segment(value):
+    if isinstance(value, _Omit) or (value is None and _core_at_least(2, 19, 1)):
+        return ""
+    return _modern_inline_collection(_concretize(value))
+
+
+def _legacy_padded_expression_value(result, ctx):
+    """Restore the native values legacy Core parses from concatenated text."""
+    import ast
+
+    if _legacy_non_native(ctx) and not result.startswith(("[", "{")):
+        return result
+    try:
+        value = ast.literal_eval(ast.parse(result, mode="eval"))
+    except (ValueError, SyntaxError):
+        return result
+    if isinstance(value, str) and _core_at_least(2, 14, 1):
+        quote = result[0]
+        return quote + value + quote
+    return value
+
+
 class _CapturedTemplateError(jinja2.UndefinedError):
     """A template failure represented lazily as an undefined object."""
 
@@ -3577,23 +3625,24 @@ def _captured_jinja_error(error, syntax=False):
     return _captured(message, missing=missing)
 
 
-def _bare_template_expression(text, *, lex=None, verify=False):
+def _bare_template_expression(text, *, lex=None, verify=False, preserve_outer=False):
     stripped = text.strip()
     if not (stripped.startswith("{{") and stripped.endswith("}}")):
         return None
     inner = stripped[2:-2]
-    if not (verify or "{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
+    if not (verify or (preserve_outer and text != stripped)
+            or "{{" in inner or "}}" in inner or "{%" in inner or inner.startswith(("-", "+"))
             or inner.endswith(("-", "}"))):
         return inner.strip()
     try:
-        tokens = iter((lex or jinja2.Environment().lex)(stripped))
+        tokens = iter((lex or jinja2.Environment().lex)(text if preserve_outer else stripped))
         _, kind, opening = next(tokens, (None, None, None))
         if kind != "variable_begin":
             return None
         for _, kind, closing in tokens:
             if kind == "variable_end":
                 if next(tokens, None) is None:
-                    return stripped[len(opening):-len(closing)].strip()
+                    return stripped[len(opening):-len(closing.rstrip())].strip()
                 break
     except jinja2.TemplateSyntaxError:
         # Rendering reports the error when the variable is consumed.
@@ -3613,6 +3662,7 @@ class _Templater:
         self._template_cache = {}
         self._file_environments = {}
         self._keyword_environments = {}
+        self._padded_inline_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
         self._current_ctx = {}
@@ -3624,8 +3674,8 @@ class _Templater:
         self._lookup_errors = {}    # name -> load error text
         self.env = jinja2.Environment(
             undefined=_AnsirollUndefined,
-            keep_trailing_newline=True,
             finalize=(getattr(jinja2, "pass_context", None) or jinja2.contextfunction)(_finalize_text_segment),
+            **_INLINE_TEMPLATE_OPTIONS,
         )
         self.env.context_class = _AnsirollContext
         self.env.code_generator_class = _AnsirollCodeGenerator
@@ -4131,7 +4181,8 @@ class _Templater:
                 if _looks_templated(stripped) and self._SCOPE_REFERENCE.search(stripped):
                     return True
                 if self._has_lookup_call(stripped):
-                    if self._lookup_templates[stripped][1] or _bare_template_expression(stripped, lex=self.env.lex) is None:
+                    if (self._lookup_templates[stripped][1]
+                            or _bare_template_expression(value, lex=self.env.lex, preserve_outer=True) is None):
                         return True
             elif type(value) in (dict, list, tuple) and id(value) not in seen:
                 seen.add(id(value))
@@ -4146,6 +4197,7 @@ class _Templater:
     def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=(), file_header=False):
         stripped = text.strip()
         check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
+        inline = file_newline is None and check_mode_template is None
         native_keyword = check_mode_template is True
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
@@ -4154,20 +4206,25 @@ class _Templater:
         else:
             env = self._strict_env if strict else self.env
         native_file = file_newline is not None and not _legacy_templating()
-        if native_keyword:
-            if env not in self._keyword_environments:
+        if check_mode_template is not None:
+            key = (env, native_keyword)
+            if key not in self._keyword_environments:
                 keyword_env = env.overlay()
-                keyword_env.context_class = _KeywordContext
-                keyword_env.getattr = partial(self._keyword_member, env.getattr)
-                keyword_env.getitem = partial(self._keyword_member, env.getitem)
-                keyword_env.keep_trailing_newline = False
-                keyword_env.trim_blocks = True
-                keyword_env.concat = _concat_keyword_segments
-                keyword_env.finalize = _concretize
-                keyword_env.code_generator_class = (
-                    _ConditionalKeywordCodeGenerator if lazy_names else _KeywordCodeGenerator)
-                self._keyword_environments[env] = keyword_env
-            env = self._keyword_environments[env]
+                if native_keyword:
+                    keyword_env.context_class = _KeywordContext
+                    keyword_env.getattr = partial(self._keyword_member, env.getattr)
+                    keyword_env.getitem = partial(self._keyword_member, env.getitem)
+                    keyword_env.concat = _concat_keyword_segments
+                    keyword_env.finalize = _concretize
+                    keyword_env.code_generator_class = (
+                        _ConditionalKeywordCodeGenerator if lazy_names else _KeywordCodeGenerator)
+                else:
+                    # Legacy keyword and include-apply vars retain their own
+                    # rendering behavior when inline defaults change.
+                    keyword_env.keep_trailing_newline = True
+                    keyword_env.trim_blocks = False
+                self._keyword_environments[key] = keyword_env
+            env = self._keyword_environments[key]
         if file_newline is not None:
             key = (env, file_newline, file_options, native_file)
             if key not in self._file_environments:
@@ -4185,8 +4242,19 @@ class _Templater:
         legacy_header = file_header and not native_file
         if (not legacy_header and (check_mode_template is None or text == stripped)
                 and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
-            expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
-        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
+            expr = _bare_template_expression(text, lex=env.lex, verify=file_newline is not None,
+                                             preserve_outer=inline)
+        padded_inline = (inline and expr is None and text != stripped
+                         and _bare_template_expression(stripped, lex=env.lex) is not None)
+        if padded_inline:
+            if env not in self._padded_inline_environments:
+                finalize = _finalize_padded_inline_segment
+                if _legacy_templating():
+                    pass_context = getattr(jinja2, "pass_context", None) or jinja2.contextfunction
+                    finalize = pass_context(_finalize_padded_legacy_segment)
+                self._padded_inline_environments[env] = env.overlay(finalize=finalize)
+            env = self._padded_inline_environments[env]
+        template_options = (strict, lazy_names, file_newline, file_options, native_file, check_mode_template)
         template_key = (text, *template_options)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
@@ -4246,6 +4314,17 @@ class _Templater:
                 elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
                     result = (str(_finalize_text_segment(ctx, result)) if result is None
                               else str(_as_text(result)))
+            if inline:
+                if padded_inline and isinstance(result, str) and _legacy_templating():
+                    result = _legacy_padded_expression_value(result, ctx)
+                if text.endswith("\n"):
+                    # Native restores source newlines only for text, after
+                    # converting numbers in legacy non-native mode.
+                    result = _rendered_number(result, text, ctx)
+                    if isinstance(result, str) and not isinstance(result, _Omit):
+                        padded = _with_inline_newlines(text, result)
+                        if padded != result:
+                            result = type(result)(padded) if isinstance(result, _NO_TEMPLATE) else padded
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
                 if file_header and source_newlines == len(text):
@@ -4649,7 +4728,7 @@ class Runtime:
                     "cannot be evaluated." % cond)
             if self._direct_previous_register(cond, ctx):
                 raise UntrustedConditional("Encountered untrusted template or expression.")
-            result = self.templater.render_conditional_template(cond, ctx, strict=strict_vars)
+            result = self.templater.render_conditional_template(cond.strip(), ctx, strict=strict_vars)
             # Assert accepts an indirected list of expressions (for
             # example `that: "{{ expression_list }}"`). Evaluate the
             # resolved members as conditions rather than treating the
