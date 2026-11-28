@@ -3102,6 +3102,36 @@ def test_outer_rescue_drops_partial_include_bodies_but_keeps_handlers(tmp_path):
     assert messages == ["handler ran"]
 
 
+@pytest.mark.parametrize("action", [
+    "include_tasks: included.yml", "include_role: {name: r}",
+], ids=["tasks", "role"])
+def test_include_loop_register_preserves_aggregate_skipped_key(tmp_path, action):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ACTION
+      loop: [first, skip, last]
+      when: item != 'skip'
+      register: mixed
+    - ACTION
+      loop: [first, last]
+      register: successful
+    - debug:
+        msg: "mixed skipped={{ mixed.skipped | default('missing') | lower }}"
+    - debug:
+        msg: "successful skipped={{ successful.skipped | default('missing') | lower }}"
+""".replace("ACTION", action), {
+        "included.yml": '- debug: {msg: "{{ item }}"}\n',
+        "roles/r/tasks/main.yml": '- debug: {msg: "{{ item }}"}\n',
+    })
+    skipped = "false" if Version("2.11") <= Version(__version__) < Version("2.21") else "missing"
+    assert messages == [
+        "first", "last", "first", "last",
+        f"mixed skipped={skipped}", f"successful skipped={skipped}",
+    ]
+
+
 @pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="older cores merge loop metadata into item status")
 def test_include_loop_keeps_failed_loop_var_separate_from_item_status(tmp_path):
     messages, _ = _assert_parity(tmp_path, """

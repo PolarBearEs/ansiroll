@@ -5283,6 +5283,9 @@ class Runtime:
                 else:
                     aggregate["msg"] = "All items completed"
                 ignored = ignore_loop if _core_at_least(2, 21) else failed_items_ignored
+                # Core 2.11 through 2.20 includes the flag even when it is false.
+                if not skipped and _core_at_least(2, 11) and not _core_at_least(2, 21):
+                    aggregate["skipped"] = False
                 for item, outcome, reported, item_no_log in results:
                     status = _status_of(outcome)
                     if status != "ok":
