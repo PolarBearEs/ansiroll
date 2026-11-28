@@ -1808,8 +1808,8 @@ def _setup_builtin_lookup(name):
     return None
 
 
-class _UncapturedSetupLookup(ValueError):
-    pass
+class _EagerSetupLookupError(ValueError):
+    """A legacy setup lookup error that must abort even if its result is unused."""
 
 
 def _legacy_setup_supports_lookup(name):
@@ -1836,7 +1836,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
     setup_lookups = ctx.get("__ansiroll_setup_controller_lookups")
     if _LEGACY_SETUP_TEMPLATE in ctx:
         if not _legacy_setup_supports_lookup(qualified_name):
-            raise _UncapturedSetupLookup("setup requires an uncaptured controller lookup %r" % qualified_name)
+            raise _EagerSetupLookupError("setup requires an uncaptured controller lookup %r" % qualified_name)
         setup_lookups = setup_lookups or {}
     if setup_lookups is not None and name in ("env", "config", "file") and not _setup_builtin_lookup(qualified_name):
         raise _UnsupportedLookup(qualified_name)
@@ -1892,10 +1892,15 @@ def _lookup_values(name, args, kwargs, ctx=None):
                     if mode == "warn":
                         _warn_setup_template(ctx, message)
                     elif mode != "ignore":
+                        if _legacy_templating():
+                            raise _EagerSetupLookupError(message)
                         raise ValueError(message)
                     return None
                 if term not in files:
-                    raise ValueError("setup requires an uncaptured controller file %r" % term)
+                    message = "setup requires an uncaptured controller file %r" % term
+                    if _legacy_templating() and kwargs.get("errors", "strict") not in ("ignore", "warn"):
+                        raise _EagerSetupLookupError(message)
+                    raise ValueError(message)
                 value = files[term]
                 if lstrip:
                     value = value.lstrip()
@@ -3492,7 +3497,7 @@ def _wrap_filter(fn):
     def wrapped(*a, **k):
         try:
             return fn(*a, **k)
-        except _UncapturedSetupLookup:
+        except _EagerSetupLookupError:
             raise
         except Exception as e:
             return _captured_jinja_error(e)
@@ -3867,7 +3872,7 @@ class _Templater:
             if k.pop("wantlist", False):
                 return vals
             return vals[0] if len(vals) == 1 else ",".join(str(v) for v in vals)
-        except _UncapturedSetupLookup:
+        except _EagerSetupLookupError:
             raise
         except jinja2.UndefinedError as e:
             return _captured_jinja_error(e)
@@ -3883,7 +3888,7 @@ class _Templater:
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             return vals if _is_undef(vals) else _mark_unsafe(vals)
-        except _UncapturedSetupLookup:
+        except _EagerSetupLookupError:
             raise
         except jinja2.UndefinedError as e:
             return _captured_jinja_error(e)
@@ -3952,6 +3957,8 @@ class _Templater:
                     options = _custom_plugin_arg(kwargs, converted)
                     result = list(self._lookup_loaded[name](terms, variables, **options))
                 return _restore_plugin_result(result, converted)
+            except _EagerSetupLookupError:
+                raise
             except Exception as e:
                 return _captured("lookup plugin '%s' failed: %s" % (name, e))
         if name in self._lookup_errors:
@@ -4368,7 +4375,7 @@ class _Templater:
                     compiled = env.compile_expression(expr, undefined_to_none=False)
                     self._expr_cache[expr_key] = compiled
                 result = compiled(**ctx)
-            except _UncapturedSetupLookup:
+            except _EagerSetupLookupError:
                 raise
             except Exception as e:
                 # Capture evaluation errors without replaying lookups.
@@ -4399,7 +4406,7 @@ class _Templater:
                 return _captured_jinja_error(
                     e, syntax=isinstance(e, jinja2.TemplateSyntaxError)
                 )
-            except _UncapturedSetupLookup:
+            except _EagerSetupLookupError:
                 raise
             except Exception as e:
                 if not has_lookup:
