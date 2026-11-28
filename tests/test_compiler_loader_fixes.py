@@ -3413,7 +3413,11 @@ def test_deferred_vars_files_abort_like_ansible(tmp_path, name, gather, aborts):
 
 
 @pytest.mark.parametrize("ordered", [False, True])
-@pytest.mark.parametrize("selector", ["vars/{{ profile }}-missing.yml", "{{ folder }}/missing.yml"])
+@pytest.mark.parametrize("selector", [
+    "vars/{{ profile }}-missing.yml",
+    "{{ folder }}/missing.yml",
+    'vars/{{ deployment | default("offline") }}.yml',
+])
 def test_compile_resolved_missing_vars_file_matches_core(tmp_path, ordered, selector):
     later_file = "    - vars/default.yml\n" if ordered else ""
     _write(tmp_path, {"pb.yml": """- hosts: localhost
@@ -3465,12 +3469,14 @@ def test_legacy_compile_does_not_treat_hostless_vars_file_miss_as_final(tmp_path
   vars_files:
     - "vars/{{ INVENTORY_NAME | default('offline') }}.yml"
   tasks:
-    - debug: {msg: reached}
-""".replace("INVENTORY_NAME", name), "vars/localhost.yml": "selected: true\n",
-        "group_vars/all.yml": "deployment: localhost\n"})
-    for returncode, output in _run_both(tmp_path / "pb.yml", tmp_path):
-        assert returncode == 0, output
-        assert "reached" in output
+    - assert: {that: selected}
+""".replace("INVENTORY_NAME", name), "vars/localhost.yml": "selected: true\n"})
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(tmp_path / "pb.yml"))[0])
+    env = dict(_env(), ANSIROLL_EXTRA_VARS=json.dumps({name: "localhost"}))
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.skipif(_CORE >= (2, 15), reason="newer Core tolerates missing vars files")

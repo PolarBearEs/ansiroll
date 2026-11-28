@@ -1365,7 +1365,7 @@ def _vars_file_miss_inputs(entry, scope):
             dependencies = _gather_timeout_dependencies(
                 source, scope, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                 unknown_lookup=unknown, retain_mutable=True)
-            if dependencies is None or unknown or dependencies[1] - scope.keys():
+            if dependencies is None or unknown:
                 return None
             names.update(dependencies[1])
     return names
