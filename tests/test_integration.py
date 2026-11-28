@@ -5849,6 +5849,70 @@ def test_omitted_become_uses_delegated_host_inventory(tmp_path, monkeypatch, ori
     assert observed == [expected]
 
 
+@pytest.mark.parametrize(("scope", "child_override", "expected"), [
+    ("block", "", [False]),
+    ("block", "  become: '{{ omit }}'\n", []),
+    ("block-inventory", "  become: '{{ omit }}'\n", []),
+    ("apply", "  become: '{{ omit }}'\n", [False]),
+    ("apply-null", "  become: '{{ omit }}'\n", [False]),
+    ("role-apply", "  become: '{{ omit }}'\n", [False]),
+    ("role-apply-context", "  become: '{{ omit }}'\n", [False]),
+])
+def test_standalone_become_omit_validates_inherited_template(tmp_path, monkeypatch, scope, child_override, expected):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        pytest.skip("requires native task keyword omission")
+    child = "- ping:\n" + child_override
+    if scope in ("block", "block-inventory"):
+        tasks = "- block:\n" + textwrap.indent(child, "    ") + "  become: '{{ mode }}'\n"
+    elif scope in ("role-apply", "role-apply-context"):
+        role_tasks = tmp_path / "roles" / "child" / "tasks"
+        role_tasks.mkdir(parents=True)
+        (role_tasks / "main.yml").write_text(child)
+        tasks = "- include_role:\n    name: child\n    apply: {become: '{{ mode }}'}\n"
+        if scope == "role-apply-context":
+            caller = tmp_path / "roles" / "caller"
+            (caller / "files").mkdir(parents=True)
+            (caller / "files" / "caller.txt").write_text("false\n")
+            (caller / "tasks").mkdir()
+            (caller / "tasks" / "main.yml").write_text("""- include_role:
+    name: child
+    apply:
+      become: "{{ lookup('file', ansible_role_name ~ '.txt') | bool }}"
+""")
+            tasks = "- include_role: {name: caller}\n"
+    else:
+        (tmp_path / "child.yml").write_text(child)
+        apply_value = "none" if scope == "apply-null" else "mode"
+        tasks = "- include_tasks:\n    file: child.yml\n    apply: {become: '{{ %s }}'}\n" % apply_value
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  vars: {mode: false}\n  tasks:\n"
+                        + textwrap.indent(tasks, "    "))
+    source, _ = compile_playbook(str(playbook))
+    if scope == "role-apply-context":
+        launch_dir = tmp_path / "launch"
+        launch_dir.mkdir()
+        monkeypatch.chdir(launch_dir)
+    frames = []
+    host_vars = {"inventory_hostname": "localhost"}
+    if scope == "block-inventory":
+        host_vars["ansible_become"] = False
+    runtime = Runtime({}, "", host_vars, on_result=frames.append)
+    observed = []
+
+    def run_module(action, args, become=False):
+        observed.append(become)
+        return {"changed": False}
+
+    monkeypatch.setattr(runtime, "run_module", run_module)
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert observed == expected
+    assert runtime.failed is (not expected)
+    if runtime.failed:
+        assert "invalid inherited become value" in frames[-1]["result"]["msg"]
+
+
 def test_strategy_distinguishes_null_and_unset_check_mode(tmp_path):
     from ansiroll.loader import _core_version
 
