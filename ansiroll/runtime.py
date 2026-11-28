@@ -3090,7 +3090,7 @@ def _concat_keyword_segments(nodes):
     return "".join(map(str, _native_output_value(parts)))
 
 
-def _native_output_value(value, plain_strings=False, seen=None):
+def _native_output_value(value, plain_strings=False, seen=None, *, file_output=False):
     """Materialize the members of a native template segment before stringification."""
     if seen is None:
         seen = {}
@@ -3110,11 +3110,14 @@ def _native_output_value(value, plain_strings=False, seen=None):
                 key = _KEYWORD_OMIT
             elif plain_strings and isinstance(key, str):
                 key = str(key)
+            elif file_output and isinstance(key, tuple):
+                # Core finalizes tuple keys into lists before rebuilding the mapping.
+                key = _native_output_value(key, plain_strings, seen, file_output=True)
             else:
                 key = _fail_on_undef(key)
-            result[key] = _native_output_value(member, plain_strings, seen)
+            result[key] = _native_output_value(member, plain_strings, seen, file_output=file_output)
     elif isinstance(value, (list, tuple, _RawSnapshotList)):
-        result = [_native_output_value(member, plain_strings, seen) for member in value
+        result = [_native_output_value(member, plain_strings, seen, file_output=file_output) for member in value
                   if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT]
     else:
         return str(value) if plain_strings and isinstance(value, str) else _fail_on_undef(value)
@@ -3499,13 +3502,13 @@ def _concat_file_output(nodes):
     values = [value for value in nodes if preserve_none or value is not None]
     if len(values) < 2:
         return values[0] if values else None
-    return "".join(map(str, _native_output_value(values)))
+    return "".join(map(str, _native_output_value(values, file_output=True)))
 
 
 def _native_file_text(value):
     if value is None:
         return ""
-    return str(_native_output_value(value, plain_strings=True))
+    return str(_native_output_value(value, plain_strings=True, file_output=True))
 
 
 class _KeywordCodeGenerator(_AnsirollCodeGenerator, NativeCodeGenerator):
@@ -4279,7 +4282,7 @@ class _Templater:
                     result = prefix + str(_finalize_text_segment(ctx, result)) + suffix
                 elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
                     result = (str(_finalize_text_segment(ctx, result)) if result is None
-                              else str(_as_text(result)))
+                              else _legacy_file_text(result))
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
                 if file_header and source_newlines == len(text):
@@ -4341,6 +4344,57 @@ def _as_text(v):
     if isinstance(v, bool):
         return "true" if v else "false"
     return str(v)
+
+
+def _has_tuple_mapping_key(value):
+    pending = [value]
+    seen = set()
+    while pending:
+        member = pending.pop()
+        if not isinstance(member, (dict, list, tuple)) or id(member) in seen:
+            continue
+        seen.add(id(member))
+        if isinstance(member, dict):
+            if any(isinstance(key, tuple) for key in member):
+                return True
+            pending.extend(member.values())
+        else:
+            pending.extend(member)
+    return False
+
+
+def _materialize_legacy_file_value(value, seen):
+    if id(value) in seen:
+        return seen[id(value)][1]
+    if type(value) is dict or isinstance(value, (_LazyTplDict, _PlayVarView, _RawSnapshotMapping)):
+        result = {}
+        seen[id(value)] = (value, result)
+        result.update((key, _materialize_legacy_file_value(member, seen))
+                      for key, member in value.items())
+        return result
+    if type(value) is list or isinstance(value, (_LazyTplList, _HostVarEntries, _RawSnapshotList)):
+        result = []
+        seen[id(value)] = (value, result)
+        result.extend(_materialize_legacy_file_value(member, seen) for member in value)
+        return result
+    if type(value) is tuple or isinstance(value, _LazyTplTuple):
+        return tuple(_materialize_legacy_file_value(member, seen) for member in value)
+    # Caller-supplied container subclasses retain their JSON and text behavior.
+    return value
+
+
+def _legacy_file_text(value):
+    # Keep the rendered members if JSON fails on a tuple key.
+    value = _materialize_legacy_file_value(value, {})
+    try:
+        return str(_as_text(value))
+    except TypeError:
+        # Legacy Core can stringify tuple keys that JSON cannot encode.
+        if _has_tuple_mapping_key(value):
+            if _core_at_least(2, 13):
+                _fail_on_undef(value)
+            return str(value)
+        raise
 
 
 _SEQUENCE_SHORTCUT_RE = re.compile(
@@ -7390,7 +7444,7 @@ class Runtime:
                     if modern and (isinstance(rendered, _Omit) or rendered is _KEYWORD_OMIT):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
-                    rendered = _native_file_text(rendered) if modern else _as_text(rendered)
+                    rendered = _native_file_text(rendered) if modern else _legacy_file_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}

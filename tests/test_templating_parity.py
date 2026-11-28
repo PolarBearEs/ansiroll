@@ -2119,6 +2119,28 @@ def test_template_file_does_not_overwrite_destination_for_undefined_collection_m
     assert output.read_text() == "existing content\n"
 
 
+@pytest.mark.parametrize("prefix,newline", [("", "\n"), ("", ""), ("prefix ", "\n")])
+def test_template_file_tuple_mapping_keys(tmp_path, prefix, newline):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": prefix + "{{ {('north', 2): 'kept'} }}" + newline})
+    output = tmp_path / "rendered.txt"
+    original = b"existing content\n"
+    output.write_bytes(original)
+    native = _ansible(path, tmp_path)
+    expected = original if MODERN_TEMPLATING else (prefix + "{('north', 2): 'kept'}" + newline).encode()
+    assert native[1][3] == ("1" if MODERN_TEMPLATING else "0")
+    assert output.read_bytes() == expected
+    output.write_bytes(original)
+    assert _ansiroll(path, tmp_path) == native
+    assert output.read_bytes() == expected
+
+
 @pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy templates render omit placeholder text")
 @pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
 def test_legacy_template_file_keeps_omit_text_between_whitespace(tmp_path, delegated):

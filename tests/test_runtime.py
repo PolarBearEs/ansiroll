@@ -1246,6 +1246,45 @@ def test_template_writes_nested_hostvars_entries(monkeypatch):
     assert "ready/tail" in rendered["values"]
 
 
+def test_legacy_template_materializes_tuple_key_mapping_only_once(monkeypatch):
+    from ansiroll import runtime as runtime_mod
+
+    monkeypatch.setattr(runtime_mod, "_ANSIROLL_CORE_VERSION", "2.10.17")
+    runtime = Runtime({}, "", {})
+    lookups = []
+
+    def lookup(name):
+        lookups.append(name)
+        return "call-%d" % len(lookups)
+
+    runtime.templater.env.globals["lookup"] = lookup
+    data = runtime_mod._LazyTplDict({"stamp": "{{ lookup('counting') }}", ("north", 2): "kept"}, runtime, {})
+    task = _task("1", "Write mapping", "template", _baked={"out.j2": "{{ data }}\n"})
+    monkeypatch.setattr(runtime, "_copy_single_file", lambda _task, _args, content, *_rest: content)
+    result = runtime._run_file_action("template", task, {"src": "out.j2", "dest": "/out"}, {"data": data})
+    assert result == b"{'stamp': 'call-1', ('north', 2): 'kept'}\n"
+    assert lookups == ["counting"]
+
+
+def test_legacy_template_keeps_custom_container_iteration(monkeypatch):
+    from collections import OrderedDict
+
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.10.17")
+    runtime = Runtime({}, "", {})
+    order = OrderedDict([("first", 1), ("second", 2)])
+    order.move_to_end("first")
+
+    class ReversedList(list):
+        def __iter__(self):
+            return reversed(self)
+
+    runtime.templater.env.filters["custom"] = lambda value: [order, ReversedList(value)]
+    task = _task("1", "Write containers", "template", _baked={"out.j2": "{{ [1, 2] | custom }}\n"})
+    monkeypatch.setattr(runtime, "_copy_single_file", lambda _task, _args, content, *_rest: content)
+    result = runtime._run_file_action("template", task, {"src": "out.j2", "dest": "/out"}, {})
+    assert result == b'[{"second": 2, "first": 1}, [2, 1]]\n'
+
+
 def test_flatten_treats_lazy_hostvars_entries_as_lists():
     runtime = Runtime({}, "", {"inventory_hostname": "h"})
     runtime.templater.env.globals["lookup"] = lambda name: "ready"
