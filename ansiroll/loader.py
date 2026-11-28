@@ -814,8 +814,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     ordered_vars_files = [] if gather_facts is None and (replay_order or early_setup or include_replay) else None
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
+    authored_source_vars = {}
     play_vars = _resolved_play_vars(
-        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
+        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope,
+        authored_source_vars=authored_source_vars)
     deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
     for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
         deferred[index]["files"].update(selected)
@@ -840,6 +842,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         for host_vars in getattr(manager, cache_name, {}).values():
             known_writes.update(host_vars)
     includes = _IncludeVariables(play_vars, all_vars, known_writes, controller_execution=gather_facts is not None)
+    includes.authored_source_vars = authored_source_vars
     includes.incomplete = any(index not in order_deferred or entry.get("unmodeled")
                               for index, entry in enumerate(deferred))
     includes.unresolved_vars_file = include_replay and any(
@@ -1179,7 +1182,8 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None,
+                        *, authored_source_vars=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -1190,6 +1194,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     from ansible.utils.vars import combine_vars
 
     out = dict(play.vars or {})
+    dynamic_source_keys = set()
     use_search_stack = _core_version() >= (2, 12)
     compile_extra_vars = {}
     selector_magic = {}
@@ -1215,6 +1220,7 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                 continue
             raw = filename
             filename = _PLAYBOOK_DIR_RE.sub(lambda _m: basedir, filename)
+            authored_filename = not _is_templated(filename)
             candidate_source = filename
             controller_inputs = None
             if _is_templated(filename):
@@ -1292,6 +1298,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
             for item in mappings:
                 out = combine_vars(out, item)
+                if authored_source_vars is not None and not authored_filename:
+                    dynamic_source_keys.update(item)
                 if hash_scope is not None:
                     hash_scope.update(combine_vars(hash_scope, item))
             if defer_for_order:
@@ -1306,6 +1314,10 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                 order_deferred[len(unresolved)] = (selected, checked_paths, controller_candidates)
             ordered.append(len(unresolved))
             unresolved.append(entry)
+    # Candidate paths can come from authored vars and literal vars files.
+    # Capture those values before inventory and extra vars can overlay them.
+    if authored_source_vars is not None:
+        authored_source_vars.update({key: value for key, value in out.items() if key not in dynamic_source_keys})
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
     # and unrelated inventory state are not baked into every play.
@@ -1814,7 +1826,8 @@ def _convert_node(node, actions, basedir,
                                         skip_tags, includes)
             if inc is not None:
                 return inc
-        return _convert_task(node, actions, basedir, controller_execution=includes.controller_execution)
+        return _convert_task(node, actions, basedir, controller_execution=includes.controller_execution,
+                             source_vars=includes.authored_source_vars)
     return None
 
 
@@ -1942,6 +1955,7 @@ def _depends_on_vars(value, variables, matches):
 class _IncludeVariables:
     def __init__(self, play_vars, all_vars, runtime_writes, *, controller_execution=False):
         self.play_vars = play_vars
+        self.authored_source_vars = None
         self.compile_selected_vars = play_vars
         self.all_vars = all_vars
         self.runtime_writes = runtime_writes
@@ -2201,6 +2215,7 @@ def _include_variant_branch(includes, base_scope, candidates):
     branch = _IncludeVariables(
         _native_include_values(base_scope), includes.all_vars, includes.runtime_writes | includes.variant_writes,
         controller_execution=includes.controller_execution)
+    branch.authored_source_vars = includes.authored_source_vars
     branch.vars_file_scopes = candidates
     branch.vars_file_writes = {
         key for scope in candidates for key in scope.keys() | base_scope.keys()
@@ -3223,7 +3238,7 @@ def _matches_tags(task, only_tags=None, skip_tags=None, all_vars=None):
         return True
 
 
-def _convert_task(task, actions, basedir, *, controller_execution=False):
+def _convert_task(task, actions, basedir, *, controller_execution=False, source_vars=None):
     action = task.action
 
     if action in ("meta", "ansible.builtin.meta"):
@@ -3349,7 +3364,7 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
                 node["fallback"] = True
                 node["fallback_reason"] = "templated file source arguments require controller selection"
         _bake_sources(node, task, basedir, controller_execution=controller_execution,
-                      unknown_defaults=unknown_defaults or bool(argument_layers))
+                      unknown_defaults=unknown_defaults or bool(argument_layers), source_vars=source_vars)
         decrypt = node["args"].get("decrypt", True)
         # With Vault secrets available, a live dynamic source may need decryption.
         # Let Core select the source on the controller in that case.
@@ -3655,7 +3670,7 @@ def _apply_file_source_defaults(task, action, node):
     return False
 
 
-def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_defaults=False):
+def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_defaults=False, source_vars=None):
     """Bake controller-side src file(s) for template/copy/unarchive.
 
     Stores node['_baked'] = {rendered_src: text}. Resolves src using Ansible's
@@ -3664,10 +3679,17 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     back when src is dynamic in a way we cannot resolve, or the file is missing.
     """
     args = node.get("args") or {}
+    name = node.get("action", "").split(".")[-1]
+    inferred = (name == "unarchive" and "src" not in args and node.get("_file_source_defaults")
+                and not node.get("_file_source_argument_layers"))
+    if inferred:
+        try:
+            args = _unarchive_default_source_args(task, node, args, source_vars)
+        except RecursionError:
+            return
     src = args.get("src")
     if not src:
         return  # copy with `content:` -- nothing to bake, templated at runtime
-    name = node.get("action", "").split(".")[-1]
     remote = _remote_src(args, unarchive=name == "unarchive") if name in ("copy", "unarchive") else False
     if remote is True:
         inherited = node.get("_file_source_inherited_args", ())
@@ -3694,6 +3716,8 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     role_path = getattr(getattr(task, "_role", None), "_role_path", None)
     if role_path:
         src = _ROLE_PATH_RE.sub(lambda _m: role_path, src)
+    if inferred and (remote is not False or _contains_dynamic_value(src)):
+        return  # Only bake an identifiable controller archive from templated defaults.
 
     decrypt = args.get("decrypt", True)
     decrypt_selected = (
@@ -3729,6 +3753,10 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     meta = {}
     for rel in candidates:
         path = _find_needle(task, subdir, rel)
+        if inferred:
+            raw = _read_inferred_unarchive_source(path, (basedir, role_path)) if path else None
+            if raw is None:
+                continue
         if path is None:
             if remote is None:
                 continue  # may be a target path if remote_src renders true
@@ -3736,8 +3764,9 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
             node["fallback_reason"] = "baked src not found: %s" % rel
             return
         source_is_plaintext = True
-        with open(path, "rb") as fh:
-            raw = fh.read()
+        if not inferred:
+            with open(path, "rb") as fh:
+                raw = fh.read()
         if decrypt_selected and raw.startswith(b"$ANSIBLE_VAULT;"):
             if controller_execution:
                 node["_deferred_vault_source"] = True
@@ -3768,6 +3797,94 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     node["_baked"] = baked
     if meta:
         node["_baked_meta"] = meta
+
+
+def _read_inferred_unarchive_source(path, roots):
+    resolved = os.path.realpath(path)
+    if not any(_visible_below(path, root) and _visible_below(resolved, os.path.realpath(root))
+               for root in roots if root):
+        return None
+    try:
+        fd = _open_linked_role_source(resolved)
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                with os.fdopen(fd, "rb", closefd=False) as source:
+                    return source.read()
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+
+def _unarchive_default_source_args(task, node, explicit, source_vars):
+    """Find a candidate in authored defaults without evaluating controller templates."""
+    from ansible.utils.vars import combine_vars
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    if source_vars is None:
+        source_vars = getattr(_play_of(task), "vars", None) or {}
+    role_defaults, role_vars = _role_vars(task)
+    variables = {}
+    for layer in (role_defaults, source_vars, role_vars, task.get_vars(), _role_params(task), task.get_include_params()):
+        variables = combine_vars(variables, layer)
+    keys = {"src", "copy", "remote_src"} - explicit.keys()
+    env = Environment()
+    unresolved = object()
+    omitted = object()
+
+    def project(value, seen, *, mapping=False):
+        templates = set()
+        while True:
+            if _is_templated(value):
+                if value in templates or not isinstance(_tag_untrusted(value, template_syntax_only=True), str):
+                    return unresolved
+                templates.add(value)
+                try:
+                    output, = env.parse(value).body
+                    value, = output.nodes if isinstance(output, nodes.Output) else ()
+                except (TemplateSyntaxError, ValueError):
+                    return value
+            if isinstance(value, (nodes.Getattr, nodes.Getitem)):
+                base = project(value.node, seen)
+                if not isinstance(base, dict):
+                    return unresolved
+                if isinstance(value, nodes.Getattr):
+                    key = value.attr
+                    if hasattr(type(base), key):
+                        return unresolved
+                elif isinstance(value.arg, nodes.Const) and isinstance(value.arg.value, str):
+                    key = value.arg.value
+                else:
+                    return unresolved
+                value = base.get(key, unresolved)
+                continue
+            if not isinstance(value, nodes.Name):
+                break
+            if value.name == "omit" and value.name not in variables:
+                return omitted
+            if value.name in seen or value.name not in variables:
+                return unresolved
+            seen = seen | {value.name}
+            value = variables[value.name]
+        if isinstance(value, nodes.Const):
+            return unresolved if _is_templated(value.value) else value.value
+        if mapping and isinstance(value, nodes.Dict) and all(isinstance(pair.key, nodes.Const) for pair in value.items):
+            return {pair.key.value: project(pair.value, seen) for pair in value.items if pair.key.value in keys}
+        return unresolved if isinstance(value, nodes.Node) else value
+
+    selected = {}
+    for entry in node["_file_source_defaults"]:
+        layer = project(entry, set(), mapping=True)
+        if not isinstance(layer, dict) or "__ansiroll_unsafe__" in layer:
+            return {}
+        selected.update({key: layer[key] for key in keys & layer.keys()})
+    # Evaluate authored source flags for baking while the runtime keeps the
+    # original task arguments and chooses the effective source itself.
+    selected.update({key: explicit[key] for key in ("copy", "remote_src") if key in explicit})
+    selected = {key: project(value, set()) for key, value in selected.items()}
+    if any(value is unresolved for value in selected.values()) or not isinstance(selected.get("src"), str):
+        return {}
+    return {key: value for key, value in {**explicit, **selected}.items() if value is not omitted}
 
 
 def _is_builtin_unarchive(action):

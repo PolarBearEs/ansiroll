@@ -6334,6 +6334,13 @@ class Runtime:
                 args = self.template(raw_args, ctx)
             if source_task and source_task.get("_file_source_defaults"):
                 args = {**self._render_file_source_defaults(source_task, ctx, args.keys()), **args}
+                if self._is_builtin_unarchive(source_task) and _legacy_templating():
+                    # Legacy hosts use their controller's omit token. An
+                    # omitted flag masks its default before leaving the args.
+                    for key in ("copy", "remote_src"):
+                        value = args.get(key)
+                        if isinstance(value, str) and value == self._legacy_omit_token:
+                            del args[key]
             args_cache["args"] = args
         return args_cache["args"]
 
