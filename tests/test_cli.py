@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import select
 import stat
 import subprocess
 import sys
@@ -489,6 +490,37 @@ with cli._hold_compile_diagnostics(lambda info: False):
         subprocess.run([sys.executable, "-c", driver], stdout=stdout, stderr=stderr,
                        check=True, timeout=10)
     assert log.read_bytes() == b"..stdoutstderr"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux descriptor identity query")
+def test_file_compile_preserves_shell_merged_diagnostic_order(tmp_path):
+    import fcntl
+
+    log = tmp_path / "diagnostics"
+    driver = """
+import os
+import sys
+from ansiroll import cli
+
+def compile_playbook(*args, **kwargs):
+    os.write(2, b"first\\n")
+    os.write(1, b"second\\n")
+    os.write(2, b"third\\n")
+    return "pass\\n", {"modules": [], "fallback_tasks": []}
+
+cli.compile_playbook = compile_playbook
+raise SystemExit(cli.main(["compile", "play.yml", "-o", sys.argv[1]]))
+"""
+    output = tmp_path / "compiled.py"
+    with log.open("wb") as stdout:
+        try:
+            fcntl.fcntl(stdout.fileno(), getattr(fcntl, "F_DUPFD_QUERY", 1027), stdout.fileno())
+        except OSError:
+            pytest.skip("the kernel does not support F_DUPFD_QUERY")
+        subprocess.run([sys.executable, "-c", driver, str(output)], stdout=stdout,
+                       stderr=subprocess.STDOUT, check=True, timeout=10)
+    assert output.read_bytes() == b"pass\n"
+    assert log.read_bytes().splitlines()[:3] == [b"first", b"second", b"third"]
 
 
 def test_compile_diagnostic_capture_keeps_saved_stream_off_closed_stdout():
@@ -2209,6 +2241,18 @@ raise SystemExit(cli.main(['compile', 'play.yml', '-o', sys.argv[1], '-m', sys.a
     assert received == "pass\n" + json.dumps({"modules": [], "fallback_tasks": []}, indent=2)
 
 
+_FIFO_COMPILE_SCRIPT = """
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **kw: (
+    "pass\\n" * (512 * 1024),
+    {"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)},
+)
+raise SystemExit(cli.main(["compile", "play.yml", "-o", "-", "-m", sys.argv[1]], _standalone=True))
+"""
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
 @pytest.mark.parametrize("manifest_first", [False, True])
 def test_stdout_compile_streams_with_either_sequential_fifo_order(tmp_path, manifest_first):
@@ -2231,18 +2275,8 @@ else:
     read_stdout()
     read_manifest()
 """
-    compile_script = """
-import sys
-from ansiroll import cli
-
-cli.compile_playbook = lambda *a, **k: (
-    'pass\\n' * (512 * 1024),
-    {'modules': [], 'fallback_tasks': [], 'padding': 'x' * (2 * 1024 * 1024)},
-)
-raise SystemExit(cli.main(['compile', 'play.yml', '-o', '-', '-m', sys.argv[1]], _standalone=True))
-"""
     producer = subprocess.Popen(
-        [sys.executable, "-c", compile_script, str(manifest)],
+        [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     reader = subprocess.Popen(
@@ -2263,6 +2297,107 @@ raise SystemExit(cli.main(['compile', 'play.yml', '-o', '-', '-m', sys.argv[1]],
     source = "pass\n" * (512 * 1024)
     metadata = json.dumps({"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)}, indent=2)
     assert received == (metadata + source if manifest_first else source + metadata)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_stdout_compile_keeps_inherited_pipe_blocking_while_waiting_for_manifest(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb") as inherited:
+        with subprocess.Popen(
+            [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+            stdout=inherited, stderr=subprocess.PIPE,
+        ) as producer:
+            try:
+                # Seeing Python bytes proves the producer started writing
+                # while the manifest FIFO still has no reader.
+                assert select.select([reader], [], [], 10)[0]
+                assert os.get_blocking(inherited.fileno())
+            finally:
+                producer.kill()
+                producer.communicate()
+        assert os.get_blocking(inherited.fileno())
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_stdout_compile_reports_broken_stdout_without_manifest_reader(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    with os.fdopen(write_fd, "wb") as stdout:
+        result = subprocess.run(
+            [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+            stdout=stdout, stderr=subprocess.PIPE, timeout=10,
+        )
+    assert result.returncode != 0
+    assert b"BrokenPipeError" in result.stderr
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_stdout_compile_finishes_connected_manifest_after_broken_stdout(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    stdout_reader, stdout_writer = os.pipe()
+    os.close(stdout_reader)
+    with os.fdopen(stdout_writer, "wb") as stdout, \
+            os.fdopen(os.open(manifest, os.O_RDONLY | os.O_NONBLOCK), "rb") as manifest_reader, \
+            os.fdopen(os.open(manifest, os.O_WRONLY | os.O_NONBLOCK), "wb") as keepalive:
+        # Keep the FIFO connected while a separate reader drains the JSON.
+        os.set_blocking(manifest_reader.fileno(), True)
+        with subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+            stdin=manifest_reader, stdout=subprocess.PIPE,
+        ) as reader:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+                    stdout=stdout, stderr=subprocess.PIPE, timeout=10,
+                )
+                keepalive.close()
+                received, _ = reader.communicate(timeout=10)
+            finally:
+                if reader.poll() is None:
+                    reader.kill()
+                    reader.communicate()
+    assert result.returncode != 0
+    assert b"BrokenPipeError" in result.stderr
+    assert reader.returncode == 0
+    assert json.loads(received) == {"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)}
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires Linux descriptor pins")
+def test_stdout_compile_can_stream_manifest_fifo_with_one_fd_available(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    driver = """
+import os
+import resource
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **kw: ("pass\\n", {"modules": [], "fallback_tasks": []})
+write_manifest = cli._write_stdout_manifest
+
+def write_with_one_free_fd(*args, **kwargs):
+    # Listing the fd directory uses the descriptor we leave available.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    free_fd = max(map(int, os.listdir("/proc/self/fd")))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (free_fd + 1, hard))
+    try:
+        return write_manifest(*args, **kwargs)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+cli._write_stdout_manifest = write_with_one_free_fd
+raise SystemExit(cli.main(["compile", "play.yml", "-o", "-", "-m", sys.argv[1]], _standalone=True))
+"""
+    with os.fdopen(os.open(manifest, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
+        result = subprocess.run([sys.executable, "-c", driver, str(manifest)],
+                                capture_output=True, check=True, timeout=10)
+        assert json.load(reader) == {"modules": [], "fallback_tasks": []}
+    assert result.stdout == b"pass\n"
 
 
 def test_run_streams_compiled_source_without_creating_a_file(monkeypatch):

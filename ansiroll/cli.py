@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 
@@ -275,8 +276,9 @@ def _open_manifest_fd(path, flags, validate, before_fifo):
             if info is None or not stat.S_ISFIFO(info.st_mode):
                 raise
             validate(info, None)
-            if before_fifo is None or not before_fifo():
-                time.sleep(0.01)
+            if before_fifo is not None:
+                before_fifo(connected=False)
+            time.sleep(0.01)
 
 
 @contextmanager
@@ -363,7 +365,7 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
             if nonblocking_open:
                 os.set_blocking(fd, True)
             if before_fifo is not None and stat.S_ISFIFO(info.st_mode):
-                before_fifo()
+                before_fifo(connected=True)
                 validate(info, fd)
             if prepare is not None:
                 reference = prepare(info, fd)
@@ -404,70 +406,89 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
             yield writer
 
 
-def _write_available(fd, pending):
-    try:
-        return pending[os.write(fd, pending):]
-    except BlockingIOError:
-        return pending
-
-
-def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None, streamed_source=None):
+def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None, streamed_source=None,
+                           stdout_owner=None):
     path = _manifest_for_stdout(path, stdout_fd)
     stdout, source, playbook = streamed_source if streamed_source is not None else (None, b"", None)
-    source = memoryview(source)
     stdout_info = None
+    stdout_writer = None
+    stdout_error = None
+    stop = threading.Event()
+    manifest_done = threading.Event()
 
     def validate(info, fd):
-        closed_stdout = stdout_info if stdout is not None and stdout.closed else None
+        closed_stdout = stdout_info if stdout_info is not None and not stat.S_ISCHR(stdout_info.st_mode) else None
         _validate_stdout_manifest(path, info, stdout_fd, fd, closed_stdout=closed_stdout)
         if validate_input is not None:
             validate_input(info, "manifest path", path)
 
-    with ExitStack() as restore_stdout_flags:
-        def advance_stdout():
-            nonlocal stdout_info, source
-            if stdout_info is None:
-                info = os.fstat(stdout_fd)
-                if validate_input is not None:
-                    validate_input(info, "stdout", playbook)
-                previous_blocking = os.get_blocking(stdout_fd)
-                os.set_blocking(stdout_fd, False)
-                restore_stdout_flags.callback(os.set_blocking, stdout_fd, previous_blocking)
-                stdout_info = info
-            elif not source:
-                return False
-            remaining = len(source)
-            source = _write_available(stdout_fd, source)
-            if not source and not stat.S_ISCHR(stdout_info.st_mode):
-                restore_stdout_flags.close()
-                stdout.close()
-            return len(source) < remaining
+    def write_stdout(fd, owner):
+        nonlocal stdout_error
+        try:
+            pending = memoryview(source)
+            while pending and not stop.is_set():
+                try:
+                    pending = pending[os.write(fd, pending):]
+                except BlockingIOError:
+                    # A caller can supply an already nonblocking stdout.
+                    stop.wait(0.01)
+        except Exception as ex:
+            stdout_error = ex
+        finally:
+            if stat.S_ISCHR(stdout_info.st_mode):
+                # Manifest validation may still need the live terminal handle.
+                manifest_done.wait()
+            try:
+                owner.close()
+            except OSError as ex:
+                if stdout_error is None:
+                    stdout_error = ex
 
-        with _open_compile_destination(path, validate, manifest=True,
-                                       before_fifo=advance_stdout if stdout is not None else None) as fh:
-            manifest_fd = fh.fileno()
-            if stdout_info is not None and stat.S_ISFIFO(os.fstat(manifest_fd).st_mode):
-                # Either reader may wait for the other output to reach EOF.
-                os.set_blocking(manifest_fd, False)
-                pending = memoryview(json.dumps(manifest, indent=2).encode("ascii"))
-                while pending or source:
-                    remaining = len(pending) + len(source)
-                    if pending:
-                        pending = _write_available(manifest_fd, pending)
-                        if not pending:
-                            fh.close()
-                    advance_stdout()
-                    if len(pending) + len(source) == remaining:
-                        time.sleep(0.01)
+    def start_stdout(*, connected):
+        nonlocal stdout_info, stdout_writer
+        if stdout_writer is None:
+            stdout_info = os.fstat(stdout_fd)
+            if validate_input is not None:
+                validate_input(stdout_info, "stdout", playbook)
+            # Either reader can wait for the other stream's EOF. Keep stdout's
+            # inherited status flags and give its saved handle to the worker.
+            fd = stdout_fd
+            if stdout_owner is None:
+                fd = os.dup(stdout_fd)
+                owner = ExitStack()
+                owner.callback(os.close, fd)
             else:
-                json.dump(manifest, fh, indent=2)
+                owner = stdout_owner.pop_all()
+            try:
+                worker = threading.Thread(target=write_stdout, args=(fd, owner), daemon=True)
+                worker.start()
+            except Exception:
+                owner.close()
+                raise
+            stdout_writer = worker
+            if stdout_owner is None and not stat.S_ISCHR(stdout_info.st_mode):
+                stdout.close()
+        if not connected and stdout_error is not None:
+            # There's no manifest connection to finish after this failed open.
+            raise stdout_error
 
-        # A FIFO pathname can become a regular file while waiting for a reader.
-        if stdout_info is not None:
-            while source:
-                if not advance_stdout():
-                    time.sleep(0.01)
-    return stdout_info is not None
+    try:
+        with _open_compile_destination(path, validate, manifest=True,
+                                       before_fifo=start_stdout if stdout is not None else None) as fh:
+            json.dump(manifest, fh, indent=2)
+    except BaseException:
+        # On a manifest error the stdout reader may still be waiting for it.
+        # The daemon owns its descriptor and CLI exit releases a blocked write.
+        stop.set()
+        raise
+    finally:
+        manifest_done.set()
+    if stdout_writer is not None:
+        # Finish and close the manifest before propagating a stdout error.
+        stdout_writer.join()
+        if stdout_error is not None:
+            raise stdout_error
+    return stdout_writer is not None
 
 
 def _stat_if_present(path):
@@ -774,6 +795,18 @@ def _reserve_closed_standard_fds(stack):
             stack.callback(os.close, fd)
 
 
+def _shares_open_file_description(first, second):
+    if sys.platform.startswith("linux"):
+        import fcntl
+
+        try:
+            # Linux supports F_DUPFD_QUERY before some Python versions name it.
+            return fcntl.fcntl(first, getattr(fcntl, "F_DUPFD_QUERY", 1027), second) == 1
+        except OSError:
+            pass  # Older kernels cannot query descriptor identity this way.
+    return False
+
+
 @contextmanager
 def _hold_compile_diagnostics(input_alias, *, shared_stdout=False):
     # Ansible may emit warnings before it opens even the first playbook.
@@ -790,6 +823,8 @@ def _hold_compile_diagnostics(input_alias, *, shared_stdout=False):
         info = _writable_stream_stat(fd)
         if info is not None and (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
             destinations[fd] = info
+    if 1 in destinations and 2 in destinations:
+        shared_stdout = shared_stdout or _shares_open_file_description(1, 2)
     with ExitStack() as buffers, ExitStack() as redirects:
         if destinations:
             _reserve_closed_standard_fds(buffers)
@@ -843,10 +878,12 @@ def _cmd_compile_stdout(args):
         if _same_stream(stdout_stat, stderr_stat) and not _discard_stream(stdout_stat):
             raise ValueError("compile -o - requires separate stdout and stderr streams")
         args.manifest = _manifest_for_stdout(args.manifest, 1)
-        with os.fdopen(os.dup(1), "wb") as stdout:
+        with ExitStack() as stdout_owner:
+            stdout = stdout_owner.enter_context(os.fdopen(os.dup(1), "wb"))
             # Keep inherited stdout and native buffers on stderr through CLI exit.
             os.dup2(2, 1)
             args.stdout_redirected_to_stderr = True
+            args.stdout_owner = stdout_owner
             sys.stdout.flush()
             with redirect_stdout(sys.stderr):
                 return _cmd_compile(args, stdout)
@@ -1000,6 +1037,7 @@ def _cmd_compile(args, stdout=None):
             if not args.manifest or not _write_stdout_manifest(
                 args.manifest, manifest, stdout.fileno(), validate_input=validate_input,
                 streamed_source=(stdout, encoded, args.playbook),
+                stdout_owner=getattr(args, "stdout_owner", None),
             ):
                 validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
                 stdout.write(encoded)
