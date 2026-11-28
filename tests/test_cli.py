@@ -39,6 +39,94 @@ def test_compile_streams_executable_python_and_writes_manifest(tmp_path):
     assert json.loads(manifest.read_text())["playbook"] == str(playbook)
 
 
+@pytest.mark.parametrize("destination", ["output", "manifest"])
+@pytest.mark.parametrize("stream", ["stdout", "stderr", "both"])
+def test_file_compile_rejects_artifact_shared_with_diagnostics(tmp_path, destination, stream):
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    target = output if destination == "output" else manifest
+    original = b"previous artifact\n"
+    target.write_bytes(original)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+
+    with target.open("ab") as diagnostics:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+             "-o", str(output), "-m", str(manifest)],
+            stdout=diagnostics if stream in ("stdout", "both") else subprocess.PIPE,
+            stderr=diagnostics if stream in ("stderr", "both") else subprocess.PIPE,
+            timeout=30,
+        )
+
+    assert result.returncode == 2
+    assert target.read_bytes() == original
+    assert not (manifest if destination == "output" else output).exists()
+    if stream == "stdout":
+        assert result.stderr == f"ansiroll: {destination} path points to stdout: {target}\n".encode()
+    elif stream == "stderr":
+        assert result.stdout == b""
+
+
+def test_file_compile_preserves_separate_redirected_diagnostics(tmp_path):
+    pytest.importorskip("ansible")
+    output = tmp_path / "compiled.py"
+    manifest = tmp_path / "manifest.json"
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    log = tmp_path / "compile.log"
+
+    with log.open("wb") as diagnostics:
+        subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+             "-o", str(output), "-m", str(manifest)],
+            stdout=diagnostics, stderr=diagnostics, check=True, timeout=30,
+        )
+
+    assert output.read_bytes().startswith(b"#!")
+    assert json.loads(manifest.read_text())["playbook"] == str(playbook)
+    assert f"ansiroll: compiled {playbook} -> {output}" in log.read_text()
+
+
+def test_file_compile_rejects_stdout_alias_without_writable_stderr(tmp_path):
+    output = tmp_path / "compiled.py"
+    output.write_bytes(b"previous artifact\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("- hosts: localhost\n  gather_facts: false\n  tasks: []\n")
+    log = tmp_path / "compile.log"
+    log.touch()
+
+    with output.open("ab") as stdout, log.open("rb") as stderr:
+        result = subprocess.run(
+            [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(output)],
+            stdout=stdout, stderr=stderr, timeout=30,
+        )
+
+    assert result.returncode == 2
+    assert output.read_bytes() == b"previous artifact\n"
+    assert not log.read_bytes()
+
+
+def test_file_compile_can_create_output_with_stdout_closed(tmp_path):
+    output = tmp_path / "compiled.py"
+    script = """
+import os
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **k: ('pass\\n', {'modules': [], 'fallback_tasks': []})
+sys.stdout = None
+os.close(1)
+raise SystemExit(cli.main(['compile', 'play.yml', '-o', sys.argv[1]]))
+"""
+    result = subprocess.run([sys.executable, "-c", script, str(output)],
+                            capture_output=True, check=True, timeout=30)
+
+    assert result.stdout == b""
+    assert f"ansiroll: compiled play.yml -> {output}".encode() in result.stderr
+    assert output.read_text() == "pass\n"
+
+
 def test_stdout_compile_keeps_compiler_subprocess_diagnostics_on_stderr():
     script = """
 import ctypes

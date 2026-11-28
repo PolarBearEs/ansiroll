@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from functools import wraps
 
 from .compiler import compile_playbook
 
@@ -100,7 +101,7 @@ def _linux_terminal_device(fd):
         return None
 
 
-def _same_manifest_stream(path, info, fd, destination_fd=None):
+def _same_manifest_stream(path, info, fd, destination_fd=None, *, name="manifest path"):
     stream = os.fstat(fd)
     if not (sys.platform.startswith("linux") and stat.S_ISCHR(info.st_mode) and stat.S_ISCHR(stream.st_mode)):
         return _same_stream(info, stream)
@@ -112,7 +113,7 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
             return False
         # TIOCGDEV reports the tty opened, which can differ from the device
         # receiving writes after a TIOCCONS redirection.
-        raise ValueError("cannot verify redirected console for manifest path %s" % path)
+        raise ValueError("cannot verify redirected console for %s %s" % (name, path))
 
     controlling_alias = os.makedev(5, 0)
     destination_alias = info.st_rdev == controlling_alias
@@ -125,7 +126,7 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
 
     if 1 in (os.major(info.st_rdev), os.major(stream.st_rdev)):
         return False
-    probe_error = "cannot verify terminal for manifest path %s" % path
+    probe_error = "cannot verify terminal for %s %s" % (name, path)
     stream_device = _linux_terminal_device(fd) if stream_alias else stream.st_rdev
     if stream_device is None:
         raise ValueError(probe_error)
@@ -172,7 +173,7 @@ def _same_manifest_stream(path, info, fd, destination_fd=None):
         destination_controlled = controls_terminal(destination_fd)
         stream_controlled = controls_terminal(fd)
         if not (destination_controlled or stream_controlled):
-            raise ValueError("cannot distinguish terminal for manifest path %s from a redirected stream" % path)
+            raise ValueError("cannot distinguish terminal for %s %s from a redirected stream" % (name, path))
         return destination_controlled and stream_controlled
 
 
@@ -505,12 +506,77 @@ def _open_private_compile_destination(path, validate, *, prepare):
             pass
 
 
+class _FileDiagnosticConflict(Exception):
+    def __init__(self, stream, message):
+        super().__init__(message)
+        self.stream = stream
+
+
+def _python_stream_fd(stream):
+    try:
+        return stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None  # In-memory streams and closed streams have no descriptor.
+
+
+def _check_file_diagnostics(destinations):
+    # Check both paths against stderr before reporting a stdout conflict.
+    for stream, inherited, python_stream in (("stderr", 2, sys.stderr), ("stdout", 1, sys.stdout)):
+        descriptors = {inherited, _python_stream_fd(python_stream)} - {None}
+
+        for name, path, info, destination_fd in destinations:
+            if info is None:
+                continue
+            for fd in descriptors:
+                if fd == destination_fd:
+                    continue  # The writer can reuse a previously closed standard descriptor.
+                try:
+                    if _fd_is_read_only(fd):
+                        continue
+                    shares_stream = _same_manifest_stream(path, info, fd, destination_fd, name=name)
+                except OSError as ex:
+                    if ex.errno != errno.EBADF:
+                        raise
+                    continue
+                except ValueError as ex:
+                    raise _FileDiagnosticConflict(stream, str(ex)) from ex
+                if shares_stream and not _discard_stream(info):
+                    raise _FileDiagnosticConflict(stream, "%s points to %s: %s" % (name, stream, path))
+
+
+def _guard_file_compile(compile_command):
+    @wraps(compile_command)
+    def compile_with_separate_diagnostics(args, stdout=None):
+        if stdout is not None:
+            return compile_command(args, stdout)
+
+        try:
+            destinations = [("output path", args.output, _try_stat(args.output), None)]
+            if args.manifest:
+                destinations.append(("manifest path", args.manifest, _try_stat(args.manifest), None))
+            _check_file_diagnostics(destinations)
+            return compile_command(args, stdout)
+        except _FileDiagnosticConflict as ex:
+            # An error on the conflicting stderr would also reach the artifact.
+            if ex.stream == "stdout" and sys.stderr is not None:
+                try:
+                    fd = _python_stream_fd(sys.stderr)
+                    if fd is None or not _fd_is_read_only(fd):
+                        sys.stderr.write("ansiroll: %s\n" % ex)
+                except (OSError, ValueError):
+                    pass  # A closed or unwritable stderr cannot report the conflict.
+            return 2
+
+    return compile_with_separate_diagnostics
+
+
 def _write_compile_files(output_path, manifest_path, source, manifest, validate_input):
     # Paths can change during compilation or between the check and open.
     if manifest_path:
         _check_file_destinations(output_path, manifest_path)
 
-    def validate_output(info, _fd):
+    def validate_output(info, fd):
+        _check_file_diagnostics([("output path", output_path, info, fd)])
         # The manifest lookup may block while the input pathname changes.
         if manifest_path:
             _check_manifest_path(manifest_path, info)
@@ -543,7 +609,8 @@ def _write_compile_files(output_path, manifest_path, source, manifest, validate_
         if not manifest_path:
             return
 
-        def validate_manifest(info, _fd):
+        def validate_manifest(info, fd):
+            _check_file_diagnostics([("manifest path", manifest_path, info, fd)])
             try:
                 current_output = os.stat(output_path)
             except OSError:
@@ -678,6 +745,7 @@ def _try_stat(path):
         return None
 
 
+@_guard_file_compile
 def _cmd_compile(args, stdout=None):
     input_path = None
     input_stat = None
