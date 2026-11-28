@@ -51,12 +51,13 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, check=False, interpreter=sys.executable):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
-        ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
+        ansible_playbook_command() + (["--diff"] if diff else []) + (["--check"] if check else [])
+        + ["-i", "localhost,", "-c", "local",
          "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
@@ -1695,6 +1696,25 @@ def test_delegated_template_redacts_registered_diff(tmp_path, strategy):
     ("{% if true %}{{ [true, 'ready'] }}{% endif %}", None, "\n", b"[True, 'ready']"),
     ("{% if true %}{{ {'value': true} }}{% endif %}", None, "\n", b"{'value': True}"),
     (" {{ value }}\n", True, "\n", b" True\n"),
+    pytest.param(" {{ none }}\n", None, "\n",
+                 b" None\n" if Version(__version__) < Version("2.19.1") else b" \n",
+                 id="padded-none",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern None output segments")),
+    pytest.param("{{ true }}", None, "\n", b"True",
+                 id="bare-boolean",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="bare native file output")),
+    pytest.param("{{ {'flag': true} }}", None, "\n", b"{'flag': True}",
+                 id="bare-mapping",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="bare native file output")),
+    pytest.param(" {{ [omit, value] }}\n", "ready", "\n", b" ['ready']\n",
+                 id="padded-list-omit",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native container omit semantics")),
+    pytest.param("{{ {'keep': [1, omit, 2], 'drop': omit} }}", None, "\n", b"{'keep': [1, 2]}",
+                 id="bare-nested-omit",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native container omit semantics")),
+    pytest.param("prefix {{ [1, {'drop': omit}, omit, 2] }}\n", None, "\n", b"prefix [1, {}, 2]\n",
+                 id="mixed-nested-omit",
+                 marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native container omit semantics")),
     pytest.param(" {{ missing | default(omit) }}\n", None, "\n", b" \n",
                  marks=pytest.mark.skipif(not MODERN_TEMPLATING, reason="native scalar omit semantics")),
 ])
@@ -1720,8 +1740,64 @@ def test_template_file_preserves_single_expression_whitespace(tmp_path, delegate
     assert output.read_bytes() == expected
 
 
-@pytest.mark.parametrize("override", ['trim_blocks: "False"', 'newline_sequence: "X"', 'unknown_option: 1'])
-def test_modern_template_rejects_invalid_header_without_writing(tmp_path, override):
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="native file container output")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_materializes_shared_lazy_container_once(tmp_path, delegated):
+    marker = tmp_path / "lookups"
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    data:
+      stamp: "{{ lookup('pipe', 'printf x >> ' ~ ((playbook_dir ~ '/lookups') | quote) ~ '; printf ready') }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""),
+                  {"sample.j2": "{% set d = data %}{{ [d, d] }}"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert marker.read_text() == "x"
+    assert output.read_bytes() == b"[{'stamp': 'ready'}, {'stamp': 'ready'}]"
+    marker.unlink()
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == expected
+    assert marker.read_text() == "x"
+    assert output.read_bytes() == b"[{'stamp': 'ready'}, {'stamp': 'ready'}]"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="native file container output")
+def test_template_file_serializes_nested_markup_as_text(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    literal: !unsafe "{{ placeholder }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "{{ [literal | safe, '<x>' | escape] }}"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert output.read_bytes() == b"['{{ placeholder }}', '&lt;x&gt;']"
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"['{{ placeholder }}', '&lt;x&gt;']"
+
+
+@pytest.mark.parametrize(("task_options", "header"), [
+    ("", 'trim_blocks: "False"'),
+    ("", 'newline_sequence: "X"'),
+    ("", "unknown_option: 1"),
+    ("", 'comment_start_string: "{{"'),
+    ("        comment_start_string: null\n", None),
+    ("        comment_end_string: null\n", None),
+    ('        comment_start_string: !unsafe "{{"\n', 'comment_start_string: "[["'),
+])
+def test_modern_template_rejects_invalid_delimiters_or_header_without_writing(tmp_path, task_options, header):
     if not MODERN_TEMPLATING:
         pytest.skip("modern Core validates the template header")
     path = _write(tmp_path, """
@@ -1731,11 +1807,38 @@ def test_modern_template_rejects_invalid_header_without_writing(tmp_path, overri
     - template:
         src: sample.j2
         dest: "{{ playbook_dir }}/rendered.txt"
-""", {"sample.j2": f"#jinja2: {override}\nstart{{# note #}}\nend\n", "rendered.txt": "original"})
+""" + task_options, {"sample.j2": (f"#jinja2: {header}\n" if header else "") + "plain template\n",
+                      "rendered.txt": "original"})
     for run in (_ansible, _ansiroll):
         _, recap = run(path, tmp_path)
         assert recap[3] == "1"
         assert (tmp_path / "rendered.txt").read_text() == "original"
+
+
+def test_template_file_honors_block_closing_modifier(tmp_path):
+    from jinja2 import Environment, TemplateSyntaxError
+
+    source = "{% if true +%}\nline\n{% endif %}\nnext\n{% raw %}raw{% endraw +%}\nlast\n"
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+        trim_blocks: true
+""", {"sample.j2": source})
+    output = tmp_path / "rendered.txt"
+    actual = _ansiroll(path, tmp_path)
+    assert output.read_bytes() == b"\nline\nnext\nraw\nlast\n"
+    try:
+        Environment(trim_blocks=True).parse(source)
+    except TemplateSyntaxError:
+        # Older controllers use a Jinja release without the bundled backport.
+        return
+    output.unlink()
+    assert _ansible(path, tmp_path) == actual
+    assert output.read_bytes() == b"\nline\nnext\nraw\nlast\n"
 
 
 def test_legacy_template_keeps_valid_header_options_alongside_an_unknown_key(tmp_path):
@@ -3259,6 +3362,36 @@ def test_include_apply_vars_resolve_in_native_scope(tmp_path, use_strategy, loop
         "child.yml": "- debug: {msg: '{{ chosen }}'}\n  vars: {flavor: child}\n",
     }, use_strategy=use_strategy)
     assert messages == ["outer" if MODERN_TEMPLATING and not looped else "child"]
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="native keyword concatenation")
+def test_include_apply_vars_concatenates_mapping_keys_in_check_mode(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    mapping: {prod: true}
+  tasks:
+    - include_tasks:
+        file: child.yml
+        apply:
+          vars:
+            label: "{{ mapping.keys() }}-suffix"
+""", {"child.yml": """
+- debug:
+    msg: "{{ label }}"
+- file:
+    path: "{{ playbook_dir }}/result"
+    state: touch
+  check_mode: >-
+    {{ label == "['prod']-suffix" }}
+"""})
+    expected = _ansible(path, tmp_path, check=True)
+    assert expected[0] == ["['prod']-suffix"]
+    assert expected[1][3] == "0"
+    assert not (tmp_path / "result").exists()
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", check=True) == expected
+    assert not (tmp_path / "result").exists()
 
 
 @pytest.mark.parametrize("use_strategy", [False, True])
