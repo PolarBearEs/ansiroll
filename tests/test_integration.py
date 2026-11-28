@@ -102,6 +102,136 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+@pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize("binding", ["direct", "play-vars", "vars-file"])
+@pytest.mark.parametrize("term", ["which", "profile_keys[which]"])
+def test_vars_file_replays_dynamic_vars_lookup(tmp_path, ordered, binding, term):
+    from tests import ansible_playbook_command
+
+    for profile in ("normal", "alternate"):
+        contents = f"tier: {profile}\n" if ordered else f"chosen: {profile}\n"
+        if binding == "vars-file":
+            contents += "selector: unrelated\n"
+        (tmp_path / f"profile-{profile}.yml").write_text(contents)
+        (tmp_path / f"settings-{profile}.yml").write_text(f"chosen: {profile}\n")
+    lookup = f"lookup('vars', {term})"
+    selection = "selector" if binding != "direct" else lookup
+    alias_definition = 'selector: "{{ ' + lookup + ' }}"\n'
+    authored = "    " + alias_definition if binding == "play-vars" else ""
+    earlier_file = ""
+    if binding == "vars-file":
+        (tmp_path / "selectors.yml").write_text(alias_definition)
+        earlier_file = "    - selectors.yml\n"
+    follow_up = "    - 'settings-{{ tier }}.yml'\n" if ordered else ""
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    which: first
+    profile_keys: {first: first, second: second}
+    first: normal
+    second: alternate
+PLAY_ALIAS  vars_files:
+FIRST_FILE    - "profile-{{ SELECTION }}.yml"
+FOLLOW_UP  tasks:
+    - assert: {that: chosen == 'alternate'}
+""".replace("SELECTION", selection).replace("FOLLOW_UP", follow_up)
+            .replace("PLAY_ALIAS", authored).replace("FIRST_FILE", earlier_file))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "which=second", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    executed = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"which": "second"})},
+    )
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+
+
+def test_vars_file_replay_does_not_replace_a_custom_vars_lookup(tmp_path):
+    plugin_dir = tmp_path / "lookup_plugins"
+    plugin_dir.mkdir()
+    (plugin_dir / "vars.py").write_text("""from ansible.plugins.lookup import LookupBase
+
+class LookupModule(LookupBase):
+    def run(self, terms, variables=None, **kwargs):
+        return ["custom"]
+""")
+    (tmp_path / "profile-start-custom.yml").write_text("chosen: custom\n")
+    (tmp_path / "profile-start-alternate.yml").write_text("chosen: alternate\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {source_key: key, key: start, which: first, first: normal, second: alternate}
+  vars_files:
+    - "profile-{{ lookup('ansible.builtin.vars', source_key) }}-{{ lookup('vars', 'which') }}.yml"
+  tasks:
+    - assert: {that: chosen == 'custom'}
+""")
+    artifact = tmp_path / "compiled.py"
+    env = {**os.environ, "ANSIBLE_LOOKUP_PLUGINS": str(plugin_dir), "PYTHONPATH": ROOT}
+    compiled = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"which": "second"})},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kind", ["lookup", "filter"])
+def test_vars_file_compile_does_not_repeat_a_controller_plugin(tmp_path, kind):
+    plugin_dir = tmp_path / (kind + "_plugins")
+    plugin_dir.mkdir()
+    lookup = """from ansible.plugins.lookup import LookupBase
+class LookupModule(LookupBase):
+    def run(self, terms, variables=None, **kwargs):
+        return [choose(terms[0])]
+"""
+    filter_plugin = """class FilterModule:
+    def filters(self):
+        return {"fixture_choice": choose}
+"""
+    (plugin_dir / "fixture_choice.py").write_text("""from pathlib import Path
+
+def choose(filename):
+    marker = Path(filename)
+    if marker.exists():
+        return "later"
+    marker.touch()
+    return "initial"
+
+""" + (lookup if kind == "lookup" else filter_plugin))
+    (tmp_path / "profile-initial-default.yml").write_text("chosen: stable\n")
+    (tmp_path / "profile-later-default.yml").write_text("chosen: repeated\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile_key: normal, normal: default}
+  vars_files:
+    - >-
+      profile-{{ PLUGIN_EXPRESSION }}-{{ lookup('vars', profile_key) }}.yml
+  tasks:
+    - assert: {that: chosen == 'stable'}
+""".replace("PLUGIN_EXPRESSION", "lookup('fixture_choice', playbook_dir ~ '/called')" if kind == "lookup"
+            else "(playbook_dir ~ '/called') | fixture_choice"))
+    artifact = tmp_path / "artifact.py"
+    env = {**os.environ, f"ANSIBLE_{kind.upper()}_PLUGINS": str(plugin_dir), "PYTHONPATH": ROOT}
+    compiled = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_path, monkeypatch):
     import builtins
 
