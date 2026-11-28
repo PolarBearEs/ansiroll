@@ -4010,6 +4010,42 @@ def test_set_fact_uses_legacy_omit_token_with_task_vars(tmp_path, use_strategy):
 """, use_strategy=use_strategy)
 
 
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_set_fact_string_filter_on_omit(tmp_path, use_strategy):
+    playbook = """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        ready: true
+        bare: '{{ omit }}'
+        converted: '{{ missing | default(omit) | string }}'
+    - assert:
+        quiet: true
+        that:
+          - ready
+          - bare is undefined
+          - EXPECTED_CONVERSION
+"""
+    expected = "converted == '<<Omit>>'" if MODERN_TEMPLATING else "converted is undefined"
+    if MODERN_TEMPLATING:
+        playbook += """
+    - set_fact:
+        marker: "{{ '__omit_place_holder__ansiroll' | string }}"
+        label: '<<Omit>>'
+        nested: ['{{ omit }}', '{{ omit | string }}']
+    - assert:
+        quiet: true
+        that:
+          - marker == '__omit_place_holder__ansiroll'
+          - label == '<<Omit>>'
+          - nested == ['<<Omit>>']
+      check_mode: "{{ true if omit | string == '<<Omit>>' else 'invalid' }}"
+"""
+    _, recap = _assert_parity(tmp_path, playbook.replace("EXPECTED_CONVERSION", expected), use_strategy=use_strategy)
+    assert recap[3] == "0"
+
+
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="older parsers consume raw_params as an internal argument")
 @pytest.mark.parametrize("use_strategy", [False, True])
 def test_set_fact_preserves_an_explicit_raw_params_fact(tmp_path, use_strategy):
