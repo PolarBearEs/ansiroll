@@ -1878,6 +1878,23 @@ def test_delegation_resolves_selected_action_variables():
     assert sent["unused"] == "{{ rsync_binary }}"
 
 
+@pytest.mark.parametrize("task_vars", [False, True], ids=["play", "task"])
+def test_delegated_template_sends_literal_collections_inline(task_vars):
+    from ansiroll.runtime import _delegate_vars
+
+    rt = Runtime({}, "", {})
+    data = {"labels": ["first", "second"], "metadata": {"size": 2, "empty": None}}
+    values = rt.template_vars({
+        "literal": data,
+        "templated": {"labels": ["{{ missing }}"]},
+        "typed_keys": {1: "numeric", "1": "string"},
+    }, {}, dynamic=not task_vars, defer=task_vars)
+    deferred = {}
+    sent = _delegate_vars(values, rt.templater, {"omit"}, deferred, inline_literals=True)
+    assert sent["literal"] == data
+    assert deferred == dict.fromkeys(("templated", "typed_keys"), "task" if task_vars else "play")
+
+
 def test_delegated_play_fallback_renders_each_member_once():
     from ansiroll.runtime import _delegate_vars, _resolve_delegated_play_var
 

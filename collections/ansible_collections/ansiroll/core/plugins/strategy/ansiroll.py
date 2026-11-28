@@ -1162,6 +1162,7 @@ class StrategyModule(StrategyBase):
             if names := frame.get("lazy_template_vars"):
                 from ansiroll.runtime import (
                     _DEFER_LOOKUP_NAMES,
+                    _OMIT,
                     _AnsirollUndefined,
                     _captured,
                     _DelegatedTemplateValue,
@@ -1185,6 +1186,10 @@ class StrategyModule(StrategyBase):
                         return _captured("unable to resolve delegated template value")
                     if "error" in resolved:
                         return _captured(resolved["error"])
+                    if [] in resolved.get("omit_paths", ()):
+                        return _OMIT
+                    if "undefined_hint" in resolved:
+                        return runtime_marker(resolved["undefined_hint"], missing=True)
                     value = self._restore_play_fallback(
                         _mark_unsafe(resolved["value"]), resolved["undefined"], resolved.get("errors", ()),
                         resolved.get("mapping_keys", ()), runtime_marker=runtime_marker,

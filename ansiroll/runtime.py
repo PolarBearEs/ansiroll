@@ -1865,7 +1865,7 @@ def _query(name, *args, **kwargs):
 
 def _lazy_container(value, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
     if isinstance(value, dict):
-        return _LazyTplDict(value, rt, ctx, dynamic, origin, task_vars)
+        return _LazyTplDict(value, rt, ctx, dynamic, origin, task_vars, delegated=delegated)
     if isinstance(value, list):
         return _LazyTplList(value, rt, ctx, dynamic, origin, task_vars, delegated=delegated)
     return value
@@ -1935,7 +1935,7 @@ def _read_lazy_member(container, value):
 class _LazyTplDict(dict):
     """A vars container whose values render only when accessed."""
 
-    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False):
+    def __init__(self, raw, rt, ctx, dynamic=False, origin=None, task_vars=False, *, delegated=False):
         dict.__init__(self, raw)
         self._raw = raw
         self._rt = rt
@@ -1944,6 +1944,7 @@ class _LazyTplDict(dict):
         self._origin = ctx if origin is None else origin
         self._dynamic = dynamic
         self._task_vars = task_vars
+        self._check_materialized_members = delegated and _core_at_least(2, 19)
 
     def _render_ctx(self):
         if not self._dynamic:
@@ -1990,10 +1991,24 @@ class _LazyTplDict(dict):
         return KeysView(self)
 
     def items(self):
+        if self._check_materialized_members:
+            return self._delegated_entries(self, include_keys=True)
         return [(k, self[k]) for k in self]
 
     def values(self):
+        if self._check_materialized_members:
+            return self._delegated_entries(dict.keys(self), include_keys=False)
         return [self[k] for k in dict.keys(self)]
+
+    def _delegated_entries(self, keys, *, include_keys):
+        entries = []
+        for key in keys:
+            value = self[key]
+            if _is_undef(value):
+                # Keep the failure at the call result so default can recover.
+                return value
+            entries.append((key, value) if include_keys else value)
+        return entries
 
     def copy(self):
         raw_items = dict.items(self)
@@ -2218,6 +2233,7 @@ class _LazyMappingSnapshot(_LazyTplDict):
 
     def __init__(self, source, bindings, *, inventory=False):
         super().__init__(bindings, source._rt, source._render_ctx(), origin=source._origin, task_vars=source._task_vars)
+        self._check_materialized_members = source._check_materialized_members
         self._task_binding = getattr(source, "_task_binding", None)
         self._inventory_snapshot = inventory
         if inventory:
@@ -3886,10 +3902,10 @@ class _Templater:
         finally:
             self._untrusted_task_interpolation = previous
 
-    def _play_var_scope(self, ctx, strict):
+    def _play_var_scope(self, ctx, strict, *, force=False):
         if isinstance(ctx, _PlayVarScope):
             return ctx
-        if (ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
+        if (force or ctx.get(_DEFER_LOOKUP_NAMES) or isinstance(ctx.get("vars"), _LoopVarsSnapshot)
                 or any(isinstance(value, (_PlayVarTemplate, _DelegatedTemplateValue)) or _is_deferred_block_var(value)
                        for value in ctx.values())):
             return _PlayVarScope(ctx, self, strict)
@@ -5703,8 +5719,9 @@ class Runtime:
         # Inherited lookups can be reached through aliases in task vars.
         mixed_lookup = self.templater._contains_mixed_lookup(
             {**ctx, **higher_vars}, task_vars, (role_defaults, role_vars))
-        block_template = (task.get("delegate_to") and task.get("special") == "template"
-                          and any(_is_deferred_block_var(value) for value in ctx.values()))
+        delegated_template = task.get("delegate_to") and task.get("special") == "template"
+        block_template = delegated_template and any(_is_deferred_block_var(value) for value in ctx.values())
+        lazy_template_vars = delegated_template and self.delegate_fn is not None and _core_at_least(2, 19)
         # Keep child aliases lazy when an include parameter still needs the
         # complete child context, including the native check-mode omit value.
         include_aliases = bool(task_vars) and any(
@@ -5714,7 +5731,7 @@ class Runtime:
         check_mode_aliases = bool(task_vars) and _core_at_least(2, 19) and _looks_templated(task.get("check_mode"))
         ctx.update(self.template_vars(task_vars, ctx, higher_vars=higher_vars,
                                       defer=looped or mixed_lookup or block_template
-                                      or include_aliases or check_mode_aliases))
+                                      or lazy_template_vars or include_aliases or check_mode_aliases))
         ctx.update(higher_vars)
         if "include_selector_inputs" in task and self.vars.get("__ansiroll_controller_config", {}).get(
                 "DEFAULT_HASH_BEHAVIOUR") == "merge":
@@ -5749,7 +5766,7 @@ class Runtime:
                 continue
             if isinstance(value, (_PlayVarTemplate, _TaskVarTemplate)) or (
                     isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic):
-                if (mixed_lookup or block_template) and key in task_vars:
+                if (mixed_lookup or block_template or lazy_template_vars) and key in task_vars:
                     host_task_bindings[key] = value
                 # An alias can refer back to the host value it shadows.
                 if key in self._initial_host_vars:
@@ -9046,6 +9063,8 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
                      else [reserve(index) for index in range(len(rendered))])
         else:
             slots = None
+        if members is not None and _core_at_least(2, 19) and isinstance(rendered, _Omit):
+            return {"value": None, "undefined": [], "omit_paths": [[]]}
         result = _pack_delegated_value(rendered if slots is None else slots)
         if slots is not None:
             result["lazy_members"] = True
@@ -9054,14 +9073,45 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
         return result
     except _CapturedTemplateError as error:
         return {"error": str(error)}
-    except jinja2.UndefinedError:
-        return {"value": None, "undefined": [[]]}
+    except jinja2.UndefinedError as error:
+        result = {"value": None, "undefined": [[]]}
+        if members is not None and _core_at_least(2, 19):
+            result["undefined_hint"] = str(error)
+        return result
     except Exception as error:
         # Finish the channel exchange even when a plugin or expression fails.
         return {"error": "%s: %s" % (type(error).__name__, error)}
 
 
-def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None):
+def _is_inline_template_data(value):
+    """Check raw data without resolving any members or losing types on the wire."""
+    pending = [value]
+    seen = set()
+    while pending:
+        member = pending.pop()
+        kind = type(member)
+        if kind in (dict, list):
+            if id(member) in seen:
+                continue
+            seen.add(id(member))
+            if kind is dict:
+                if any(type(key) is not str for key in member):
+                    return False
+                if len(member) == 1 and ("__ansiroll_unsafe__" in member or "__ansiroll_vault__" in member):
+                    return False
+                pending.extend(member.values())
+            else:
+                pending.extend(member)
+        elif kind is str:
+            if _looks_templated(member):
+                return False
+        elif kind not in (int, float, bool, type(None)):
+            return False
+    return True
+
+
+def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None,
+                   inline_literals=False):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
@@ -9077,7 +9127,8 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
                 elif isinstance(value, _PlayVarTemplate):
                     deferred[key] = "play"
                 elif isinstance(value, (_LazyTplDict, _LazyTplList)) and value._dynamic:
-                    deferred[key] = "task" if value._task_vars else "play"
+                    if not (inline_literals and _is_inline_template_data(value._raw)):
+                        deferred[key] = "task" if value._task_vars else "play"
                     value = value._raw
                 elif isinstance(value, _RegisteredResult) or (
                         isinstance(value, _NO_TEMPLATE) and _looks_templated(value)):
@@ -9207,24 +9258,29 @@ def agent_main():
             # Only the agent has the play's bundled filters and lookup plugins.
             # Synchronize also reads connection and executable vars directly.
             action = (task.get("action") or "").rsplit(".", 1)[-1]
+            modern_template = action == "template" and _core_at_least(2, 19)
             if action == "template":
                 ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
             templater = rt.templater if action in ("template", "synchronize") else None
             resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
+            block_template = action == "template" and any(_is_deferred_block_var(value) for value in ctx.values())
+            # Modern rendering can read one member without resolving its siblings.
             defer_template = action == "template" and (
-                ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
+                modern_template or ctx.get(_DEFER_LOOKUP_NAMES) or block_template
             )
             if defer_template:
                 resolve_keys = {"omit"}
             deferred = {} if resolve_keys is not None else None
             lazy_play = set() if action == "synchronize" else None
-            scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
+            scope = (templater._play_var_scope(ctx, strict=False, force=modern_template)
+                     if templater is not None else ctx)
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
                 "runtime_id": task.get("runtime_id"),
                 "action": task.get("action"), "args": args,
                 "vars": _delegate_vars(scope, templater, resolve_keys, deferred,
-                                       controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play),
+                                       controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play,
+                                       inline_literals=modern_template),
                 "become": become, "to": task.get("delegate_to"),
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
@@ -9253,8 +9309,10 @@ def agent_main():
                 if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
                     requested_names.add("hostvars")
                 frame["lazy_template_vars"] = sorted(requested_names)
-                # Transport can be lazy while Jinja resolves each referenced name.
-                frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES))
+                # Existing block aliases can perform lookups when Jinja binds names.
+                frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES) or (
+                    modern_template and not block_template
+                ))
             _chan_send(resp_fd, frame)
             reply = _chan_recv()
             while reply and reply.get("t") == "delegate_play_var":
@@ -9267,7 +9325,7 @@ def agent_main():
                         for key in ("template_mtime", "template_run_date"):
                             if template_vars.get(key) is not None:
                                 template_vars[key] = _decode_iso_datetime(template_vars[key])
-                        scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
+                        scope = templater._play_var_scope({**ctx, **template_vars}, strict=False, force=modern_template)
                     fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
                 elif members is not None and type(member) is int and 0 <= member < len(members):
                     fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)

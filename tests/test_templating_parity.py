@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 import sys
+from textwrap import indent
 
 import pytest
 
@@ -1532,6 +1533,91 @@ def test_delegated_template_alias_uses_file_text_mode(tmp_path, monkeypatch):
     output.unlink()
     assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == expected
     assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Ansible resolves collection members lazily")
+@pytest.mark.parametrize("scope", ["play", "task"])
+@pytest.mark.parametrize(("expression", "expected_text"), [
+    ("alias.available", "value=ready\n"),
+    ("alias.missing", None),
+    ("alias.missing | default('fallback')", "value=fallback\n"),
+    ("alias.values() | first", None),
+    ("alias.items() | first", None),
+    ("alias.values() | default('fallback')", "value=fallback\n"),
+    ("alias.items() | default('fallback')", "value=fallback\n"),
+])
+def test_delegated_template_resolves_only_read_alias_members(tmp_path, scope, expression, expected_text):
+    definitions = """vars:
+  alias: "{{ payload }}"
+  payload:
+    available: ready
+    missing: "{{ absent_value }}"
+"""
+    play_vars = indent(definitions, "  ") if scope == "play" else ""
+    task_vars = indent(definitions, "      ") if scope == "task" else ""
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+""" + play_vars + """  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+""" + task_vars, {"sample.j2": "value={{ " + expression + " }}\n"})
+    output = tmp_path / "rendered.txt"
+    output.write_text("existing\n")
+    native = _ansible(path, tmp_path)
+    assert native[1][3] == ("1" if expected_text is None else "0")
+    expected_text = expected_text or "existing\n"
+    assert output.read_text() == expected_text
+    if expression in ("alias.available", "alias.missing"):
+        output.write_text("existing\n")
+        assert _ansiroll(path, tmp_path) == native
+        assert output.read_text() == expected_text
+    output.write_text("existing\n")
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") == native
+    assert output.read_text() == expected_text
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern Ansible has a typed omit value")
+def test_delegated_template_does_not_write_omit_alias(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+      vars:
+        alias: "{{ omit }}"
+""", {"sample.j2": "{{ alias }}"})
+    output = tmp_path / "rendered.txt"
+    output.write_text("existing\n")
+    native = _ansible(path, tmp_path)
+    assert native[1][3] == "1"
+    assert output.read_text() == "existing\n"
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")[1] == native[1]
+    assert output.read_text() == "existing\n"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="ordinary task alias deferral requires modern Ansible")
+def test_delegated_template_preserves_current_host_task_bindings(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        source: inventory
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      delegate_to: localhost
+      vars:
+        alias: "{{ source | upper }}"
+""", {"sample.j2": "{{ hostvars[inventory_hostname].alias }}\n"})
+    assert _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")[1][3] == "0"
+    assert (tmp_path / "rendered.txt").read_text() == "INVENTORY\n"
 
 
 @pytest.mark.parametrize("src", ["sites/app.j2", "sites/{{ site }}.j2"])
