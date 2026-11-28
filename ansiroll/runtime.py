@@ -6684,7 +6684,7 @@ class Runtime:
             args["remote_src"] = not _ansible_boolean(args.pop("copy"))
 
     def _baked_module_source(self, task, args):
-        """Return baked controller-side input for worker-local memory transport."""
+        """Return controller-side archive bytes for worker-local memory transport."""
         if not self._is_builtin_unarchive(task):
             return None
         decrypt = args.pop("decrypt", True)
@@ -6694,6 +6694,12 @@ class Runtime:
         key = self._baked_source_key(task, src)
         marker = (task.get("_baked") or {}).get(key)
         if marker is None:
+            lookup_task_id = task.get("runtime_id")
+            if (self.controller_source_fn and task.get("_live_archive_source") and lookup_task_id
+                    and isinstance(src, str) and src and key != "\0blocked"):
+                if self.native_only:
+                    raise RuntimeError("ansiroll: native-only mode rejected live controller archive %r" % src)
+                return self.controller_source_fn(src, lookup_task_id, archive_decrypt=bool(decrypt))["data"]
             raise RuntimeError("unarchive: src %r was not baked into the compiled file" % src)
         data = self._asset_bytes(marker)
         if not task.get("_vault_plaintext") and decrypt and data.startswith(b"$ANSIBLE_VAULT;"):
@@ -9276,8 +9282,11 @@ def agent_main():
             return reply.get("result", {})
         rt.delegate_fn = _delegate
 
-        def _controller_source(path, lookup_task_id=None):
-            _chan_send(resp_fd, {"t": "source", "path": path, "lookup_task_id": lookup_task_id})
+        def _controller_source(path, lookup_task_id=None, *, archive_decrypt=None):
+            frame = {"t": "source", "path": path, "lookup_task_id": lookup_task_id}
+            if archive_decrypt is not None:
+                frame["archive_decrypt"] = archive_decrypt
+            _chan_send(resp_fd, frame)
             reply = _chan_recv()
             if not reply or reply.get("t") != "source_result":
                 raise RuntimeError("controller did not return a source result")

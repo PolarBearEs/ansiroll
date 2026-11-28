@@ -5720,6 +5720,43 @@ def test_strategy_reports_runtime_created_controller_source_close_error(tmp_path
     assert result == {"error": "could not read controller source %r: mocked close error" % str(source)}
 
 
+def test_strategy_reads_live_archives_only_below_task_source_roots(tmp_path):
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import _linked_role_source_patterns
+
+    strategy = _load_strategy_module()
+    root = tmp_path / "playbook"
+    root.mkdir()
+    (root / "nested").mkdir()
+    inside = root / "archive-live.zip"
+    inside.write_bytes(b"inside")
+    unrelated = root / "unrelated.zip"
+    secret = VaultSecret(b"synthetic-test-password")
+    unrelated.write_bytes(VaultLib([("default", secret)]).encrypt(b"unrelated", secret=secret))
+    outside = tmp_path / "archive-outside.zip"
+    outside.write_bytes(b"outside")
+    alias = root / "archive-linked.zip"
+    alias.symlink_to(outside)
+    loader = DataLoader()
+    loader.set_basedir(str(root))
+    loader.set_vault_secrets([("default", secret)])
+    task = SimpleNamespace(_loader=loader, action="unarchive", get_search_path=lambda: [str(root)])
+    read = strategy.StrategyModule._read_controller_source
+    patterns = [pattern for _, pattern in _linked_role_source_patterns(
+        str(tmp_path) + "/{{ directories }}archive-{{ name }}.zip", allow_absolute=True)[1]]
+
+    def read_archive(path, decrypt=True):
+        return read(str(path), role_task=task, archive_decrypt=decrypt, archive_patterns=patterns)
+
+    assert base64.b64decode(read_archive(inside, decrypt=False)["data"]) == b"inside"
+    assert "does not match the task's src" in read_archive(unrelated)["error"]
+    assert "does not match the task's src" in read_archive(root / "nested" / ".." / inside.name)["error"]
+    for path in (outside, alias):
+        result = read_archive(path)
+        assert "outside its task's source directories" in result["error"]
+
+
 @pytest.mark.parametrize("action", ["copy", "template"])
 def test_strategy_preserves_runtime_created_source_mode(tmp_path, action):
     delegation = "      delegate_to: localhost" if action == "template" else ""
