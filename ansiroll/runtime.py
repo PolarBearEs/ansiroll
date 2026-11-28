@@ -5176,6 +5176,8 @@ class Runtime:
         elif items is not None:
             result = {"changed": False, "skipped": True, "results": [],
                       "msg": "No items in the list"}
+            if _core_at_least(2, 21):
+                result["failed"] = False
         if result is None and items is None:
             result, ignore = self._task_gate(node, base_ctx)
             if result is None:
@@ -5280,6 +5282,8 @@ class Runtime:
                     aggregate["msg"] = "One or more items failed"
                 elif skipped:
                     aggregate.update(skipped=True, msg="All items skipped")
+                    if _core_at_least(2, 11) and not _core_at_least(2, 21):
+                        del aggregate["failed"]
                 else:
                     aggregate["msg"] = "All items completed"
                 ignored = ignore_loop if _core_at_least(2, 21) else failed_items_ignored

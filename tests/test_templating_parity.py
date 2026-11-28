@@ -2939,6 +2939,44 @@ def test_inherited_conditions_are_evaluated_at_each_task(tmp_path):
     assert recap == ("6", "0", "0", "2", "1", "1", "5")
 
 
+@pytest.mark.parametrize(("action", "use_strategy"), [
+    ("include_tasks: child.yml", False),
+    ("include_role: {name: child}", False),
+    ("include_tasks: child.yml", True),
+], ids=["standalone-tasks", "standalone-role", "strategy-tasks"])
+@pytest.mark.parametrize(("items", "count"), [
+    ("[]", 0),
+    pytest.param("[first, second]", 2, marks=pytest.mark.skipif(
+        Version(__version__) < Version("2.11"), reason="Ansible 2.10 register covered separately")),
+], ids=["empty", "all-skipped"])
+def test_skipped_include_loop_aggregate_failed_key(tmp_path, monkeypatch, action, use_strategy, items, count):
+    if use_strategy:
+        monkeypatch.setenv("ANSIROLL_NATIVE_ONLY", "1")
+    child = "- debug: {msg: unexpected included body}\n"
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ACTION
+      loop: ITEMS
+      when: false
+      register: selected
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: >-
+          {{ [selected.failed | default('absent'), selected.skipped, selected.changed,
+              selected.results | length] | join('/') | lower }}
+""".replace("ACTION", action).replace("ITEMS", items), {
+        "child.yml": child,
+        "roles/child/tasks/main.yml": child,
+    }, use_strategy=use_strategy)
+    failed = "false" if Version(__version__) >= Version("2.21") else "absent"
+    assert messages == [f"{failed}/true/false/{count}"]
+    assert recap == ("1", "0", "0", "0", "1", "0", "0")
+
+
 @pytest.mark.parametrize("action", [
     "include_tasks: included.yml", "include_role: {name: r}",
 ], ids=["tasks", "role"])
