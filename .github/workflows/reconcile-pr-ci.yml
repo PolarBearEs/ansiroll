@@ -69,6 +69,16 @@ jobs:
             merge_filter='select(.mergeable == true) | .merge_commit_sha // empty'
             candidate=''
             if [[ "$branch" == master ]]; then
+              for delay in 1 2; do
+                [[ "$(jq -r '.mergeable' <<< "$current")" == null ]] || break
+                sleep "$delay"
+                if ! current=$(retry_api "$api/pulls/$pr"); then
+                  echo "::warning::Could not recheck the revision of PR #$pr."
+                  failed=1
+                  continue 2
+                fi
+                [[ "$(jq -r "$filter" <<< "$current")" == "$revision" ]] || continue 2
+              done
               merge=$(jq -r "$merge_filter" <<< "$current")
               if [[ "$merge" =~ ^[a-f0-9]{40}$ ]] &&
                  commit=$(retry_api "$api/git/commits/$merge") &&
@@ -76,6 +86,9 @@ jobs:
                    [.parents[].sha] == [$base, $head]
                  ' <<< "$commit" >/dev/null; then
                 candidate="$merge"
+              fi
+              if [[ -z "$candidate" && "$(jq -r '.mergeable' <<< "$current")" != false ]]; then
+                echo "::warning::Could not verify the merge candidate for PR #$pr."
               fi
             fi
             stale=$(jq -r --arg base "$base" --arg branch "$branch" --arg merge "$candidate" '

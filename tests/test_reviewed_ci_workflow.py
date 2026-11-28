@@ -72,13 +72,16 @@ else:
 """
     )
     gh.chmod(0o755)
+    sleep = tmp_path / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n")
+    sleep.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path), prepend=":")
     monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.example")
     monkeypatch.setenv("GITHUB_REPOSITORY", "example/ansiroll")
     monkeypatch.setenv("GITHUB_RUN_ID", "100")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "1")
 
-    def run(job, routes, *, expected_exit=0, **env):
+    def run(job, routes, *, expected_exit=0, expected_warning=None, **env):
         (tmp_path / "routes").write_text(json.dumps({f"repos/example/ansiroll/{k}": v for k, v in routes.items()}))
         for key, value in workflow.get("env", {}).items():
             monkeypatch.setenv(key, value)
@@ -88,6 +91,8 @@ else:
         script = jobs[job]["steps"][0]["run"]
         result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True)
         assert result.returncode == expected_exit, result.stdout + result.stderr
+        if expected_warning is not None:
+            assert expected_warning in result.stdout
         return [json.loads(line) for line in (tmp_path / "calls").read_text().splitlines()]
 
     return run
@@ -149,24 +154,33 @@ def test_base_push_skips_a_pr_that_moved_since_listing(run_step):
 @pytest.mark.parametrize(("metadata", "cancelled"), [
     ("verified", {1, 3}),
     ("pending", {3}),
+    ("pending_then_verified", {1, 3}),
+    ("pending_then_moved", set()),
     ("wrong_parents", {3}),
     ("replaced", set()),
 ])
 def test_reconcile_returning_head_against_verified_candidate(run_step, metadata, cancelled):
     owner = "manual-full-ci:pr:12"
     checks = [report(1, owner, BASE, merge=OLD_MERGE), report(2, owner, BASE), report(3, owner, OLD_BASE)]
-    current = dict(CURRENT_PR, mergeable=None) if metadata == "pending" else CURRENT_PR
+    pending = dict(CURRENT_PR, mergeable=None)
     routes = {
         "pulls?state=open&per_page=100": f"12\t{HEAD}\t{BASE}\tmaster",
-        "pulls/12": json.dumps(current),
+        "pulls/12": json.dumps(CURRENT_PR),
         f"commits/{HEAD}/check-runs": json.dumps({"check_runs": checks}),
     }
-    if metadata != "pending":
+    if metadata not in ("pending", "pending_then_moved"):
         parent_base = OLD_BASE if metadata == "wrong_parents" else BASE
         routes[f"git/commits/{MERGE}"] = json.dumps({"parents": [{"sha": parent_base}, {"sha": HEAD}]})
-    if metadata == "replaced":
-        routes["pulls/12"] = [json.dumps(current), json.dumps(dict(current, merge_commit_sha=OLD_MERGE))]
-    calls = run_step("invalidate-head-checks", routes, GITHUB_EVENT_NAME="schedule")
+    responses = {
+        "pending": [pending] * 3,
+        "pending_then_verified": [pending, CURRENT_PR, CURRENT_PR],
+        "pending_then_moved": [pending, dict(CURRENT_PR, head={"sha": OLD_MERGE})],
+        "replaced": [CURRENT_PR, dict(CURRENT_PR, merge_commit_sha=OLD_MERGE)],
+    }
+    if metadata in responses:
+        routes["pulls/12"] = [json.dumps(response) for response in responses[metadata]]
+    expected_warning = "Could not verify the merge candidate" if metadata in ("pending", "wrong_parents") else None
+    calls = run_step("invalidate-head-checks", routes, expected_warning=expected_warning, GITHUB_EVENT_NAME="schedule")
     assert {int(args[args.index("PATCH") + 1].rsplit("/", 1)[1]) for args in calls if "PATCH" in args} == cancelled
 
 
