@@ -5490,6 +5490,28 @@ def test_compiled_simple_runs_and_matches(tmp_path):
                <= set(task) for task in engine["slow_tasks"])
 
 
+@pytest.mark.parametrize("action", ["include_vars", "ansible.builtin.include_vars"])
+def test_standalone_include_vars_reports_controller_requirement_when_reached(tmp_path, action):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - {action}: {{file: selected.yml, name: selected}}
+      when: false
+    - {action}: {{file: selected.yml, name: selected}}
+""")
+    (tmp_path / "selected.yml").write_text("color: blue\n")
+    src, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(src)
+
+    result = subprocess.run([sys.executable, "-I", "-S", str(artifact)], capture_output=True, text=True, timeout=30)
+
+    assert result.returncode == 1
+    assert "skipped=1" in result.stdout
+    assert "include_vars requires the Ansiroll strategy controller" in result.stdout
+
+
 def test_ssh_command_builder_handles_ansible_210_and_newer_signatures():
     strategy = _load_strategy_module()
     assert not hasattr(strategy, "_build_tsh_command")

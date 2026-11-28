@@ -102,6 +102,9 @@ of runtime-selected `vars_files` are omitted from the standalone artifact. For
 runtime-selected data, use a play variable and supply its value at launch
 through `ANSIROLL_EXTRA_VARS` or the JSON file named by `ANSIROLL_VARS_FILE`.
 
+Use the Ansiroll strategy plugin for `include_vars` tasks. A standalone artifact
+has no strategy controller, so any `include_vars` task it reaches fails at runtime.
+
 ### Run a playbook locally (compile + execute)
 
 ```bash
