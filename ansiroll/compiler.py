@@ -26,6 +26,7 @@ from .loader import (
     COPY_ACTION_MODULES,
     _can_write_var,
     _depends_on_vars,
+    _is_templated,
     _loop_binding_names,
     _runtime_write_names,
     load_adjacent_group_vars,
@@ -125,8 +126,6 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
         plays, group_vars, extra_vars or {}, bool(freeze_playbook_vars),
         set(freeze_vars or []),
     )
-    for play in plays:
-        play.pop("ordered_vars_file_mutable_names", None)
     specialized_vars = dict(frozen_vars)
     specialized_vars.update(extra_vars or {})
     original_actions = set(actions)
@@ -134,10 +133,12 @@ def compile_playbook(playbook_path, python_interpreter="/usr/bin/python3",
     if tree_shake:
         _tree_shake_plays(plays, specialized_vars, shake_stats)
         shake_stats["specialized_accelerators"] = _specialize_accelerators(
-            plays, specialized_vars
+            plays, specialized_vars, group_vars=group_vars
         )
         present = _actions_in_plays(plays)
         actions = {action for action in actions if action in present}
+    for play in plays:
+        play.pop("ordered_vars_file_mutable_names", None)
     surviving_actions = set(actions)
     accelerated_only_actions = _accelerated_only_actions(plays, actions)
     if accelerated_only_actions:
@@ -265,13 +266,16 @@ def _walk_play_nodes(plays, *, include_disabled_handlers=False):
         yield from walk(play.get("handlers"))
 
 
-def _shadowed_var_names(plays):
+def _shadowed_var_names(plays, *, include_defaults_and_params=False):
     names = set()
     for node in _walk_play_nodes(plays):
         names.update(node.get("vars") or {})
         names.update(node.get("handler_block_vars") or {})
         names.update(node.get("role_vars") or {})
         names.update(node.get("role_params") or {})
+        if include_defaults_and_params:
+            names.update(node.get("role_defaults") or {})
+            names.update(node.get("include_params") or {})
         names.update(_runtime_write_names(
             node.get("action"), node.get("args") or {}, node.get("register"),
             raw_params_is_fact=node.get("set_fact_raw_params_is_fact", False),
@@ -714,11 +718,46 @@ def _actions_in_plays(plays):
     return actions
 
 
-def _specialize_accelerators(plays, variables):
+def _accelerator_global_variants(args, variables, is_runtime_input, templater, callable_globals):
+    """Bound the arguments when an overridable global only selects a literal."""
+    from jinja2 import TemplateSyntaxError, nodes
+
+    for key, source in args.items():
+        if not isinstance(source, str) or not any(name in source for name in callable_globals):
+            continue
+        try:
+            parsed = templater.env.parse(source)
+        except TemplateSyntaxError:
+            continue
+        if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output):
+            continue
+        output = parsed.body[0].nodes
+        if len(output) != 1 or not isinstance(output[0], nodes.CondExpr):
+            continue
+        condition = output[0]
+        branches = condition.expr1, condition.expr2
+        if not all(isinstance(branch, nodes.Const) and isinstance(branch.value, str)
+                   and not _is_templated(branch.value) for branch in branches):
+            continue
+        if (not _depends_on_vars(source, variables, is_runtime_input)
+                or _depends_on_vars(source, variables, is_runtime_input, callable_globals=callable_globals)):
+            continue
+        variants = tuple({**args, key: branch.value} for branch in branches)
+        if not _depends_on_vars(variants, variables, is_runtime_input):
+            return variants
+    return ()
+
+
+def _specialize_accelerators(plays, variables, *, group_vars=None):
     from .runtime import Runtime
 
     runtime = Runtime({}, "", {})
     count = 0
+    shadowed = _shadowed_var_names(plays, include_defaults_and_params=True)
+    shadowed.update(group_vars or {})
+    for play in plays:
+        shadowed.update(play.get("vars") or {})
+    callable_globals = set() if None in shadowed else _DETERMINISTIC_GLOBALS - shadowed
 
     def is_runtime_input(name):
         return name not in variables
@@ -729,19 +768,20 @@ def _specialize_accelerators(plays, variables):
         args = node.get("args") or {}
         # An unresolved alias can render to a valid default at build time
         # even though the runtime arguments need the official module.
+        variants = (args,)
         if _depends_on_vars(args, variables, is_runtime_input):
+            variants = _accelerator_global_variants(args, variables, is_runtime_input,
+                                                   runtime.templater, callable_globals)
+        if not variants:
             continue
+
         try:
-            resolved = runtime.template(args, dict(variables))
+            resolved = [runtime.template(candidate, dict(variables)) for candidate in variants]
         except Exception:
             continue
-        if (
-                not _contains_undefined(resolved)
-                and can_accelerate(
-                    str(node.get("action") or "").split(".")[-1],
-                    resolved,
-                    check_mode=False,
-                )):
+        action = str(node.get("action") or "").split(".")[-1]
+        if all(not _contains_undefined(candidate) and can_accelerate(action, candidate, check_mode=False)
+               for candidate in resolved):
             node["accelerator"] = "always"
             count += 1
     return count

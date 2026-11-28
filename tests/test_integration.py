@@ -1743,11 +1743,17 @@ def test_accelerated_user_creates_missing_home_parents_before_useradd(
     assert oct(os.stat(str(home)).st_mode & 0o777) == oct(0o700)
 
 
+@pytest.mark.parametrize("path_source", ["literal", "local", "global"])
 def test_compile_omits_total_static_official_module_and_forces_accelerator(
-        tmp_path):
+        tmp_path, path_source):
     destination = tmp_path / "accelerated-only-file"
     destination.write_text("present")
     playbook = tmp_path / "accelerated-only.yml"
+    path = str(destination)
+    if path_source == "local":
+        path = "{% set path = " + repr(path) + " %}{{ path }}"
+    elif path_source == "global":
+        path = "{{ " + repr(path) + " if range(1) | list else '/missing' }}"
     playbook.write_text(
         "- hosts: localhost\n"
         "  gather_facts: false\n"
@@ -1756,10 +1762,10 @@ def test_compile_omits_total_static_official_module_and_forces_accelerator(
         "        path: %s\n"
         "      register: accelerated_stat\n"
         "    - ansible.builtin.assert:\n"
-        "        that: accelerated_stat.stat.exists\n" % destination
+        "        that: accelerated_stat.stat.exists\n" % json.dumps(path)
     )
 
-    source, manifest = compile_playbook(str(playbook))
+    source, manifest = compile_playbook(str(playbook), tree_shake=path_source != "literal")
     agent = tmp_path / "accelerated-only.py"
     agent.write_text(source)
     environment = dict(os.environ)
@@ -1775,6 +1781,33 @@ def test_compile_omits_total_static_official_module_and_forces_accelerator(
     assert destination.is_file()
     assert not any(name.endswith("stat") for name in manifest["modules"])
     assert manifest["accelerated_only_modules"] == ["ansible.builtin.stat"]
+
+
+@pytest.mark.parametrize("predicate, override", [("range", ""), ("not range(0)", "{{ joiner }}")])
+def test_compile_retains_module_when_jinja_global_override_can_change_capability(tmp_path, predicate, override):
+    destination = tmp_path / "target"
+    destination.write_text("present")
+    playbook = tmp_path / "shadowed-global.yml"
+    playbook.write_text("""
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - stat:
+        path: PATH
+        get_checksum: "{{ true if PREDICATE else 'no' }}"
+      register: inspected
+    - assert:
+        that: inspected.stat.checksum is undefined
+""".replace("PATH", json.dumps(str(destination))).replace("PREDICATE", predicate))
+    source, manifest = compile_playbook(str(playbook), tree_shake=True)
+    assert not manifest["accelerated_only_modules"]
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    environment = dict(os.environ, ANSIROLL_ACCELERATED_MODULES="stat",
+                       ANSIROLL_EXTRA_VARS=json.dumps({"range": override}))
+
+    result = subprocess.run([sys.executable, str(artifact)], env=environment, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "directory", "symlink"])

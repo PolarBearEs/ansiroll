@@ -427,31 +427,51 @@ class FilterModule:
     assert calls == ["raw"]
 
 
-@pytest.mark.parametrize("batch, member", [("[entry]", "0"), ("{'entry': entry}", "'entry'")])
-def test_custom_filter_keeps_inventory_views_in_caller_containers(monkeypatch, batch, member):
+@pytest.mark.parametrize("batch, member, added", [("[entry]", "0", "1"), ("{'entry': entry}", "'entry'", "'added'")])
+def test_custom_filter_keeps_inventory_views_in_caller_containers(monkeypatch, batch, member, added):
     from ansiroll import runtime as runtime_module
 
     monkeypatch.setattr(runtime_module, "_ANSIROLL_CORE_VERSION", "2.12.10")
     runtime = Runtime({}, "", {"payload": {"count": 1}})
     runtime.templater.env.globals["lookup"] = lambda name: pytest.fail(name)
     runtime.templater.register_plugins([{"kind": "filter", "name": "increment", "source": """
+import json
+
+cached = None
+
 def increment(batch, key):
+    global cached
     assert type(batch[key]) is dict
     batch[key]['count'] += 1
-    return ''
+    fresh = [batch[key], 4]
+    if type(batch) is list:
+        batch[:] = [batch[key], fresh]
+    else:
+        batch['added'] = fresh
+    cached = batch
+    return [batch, fresh]
 
 class FilterModule:
     def filters(self):
-        return {'increment': increment}
+        return {'increment': increment, 'read_cached_argument': lambda _: json.dumps(cached)}
 """}])
     task = _task("1", "Mutate a nested plugin argument twice", "debug",
                  vars={"unused": "{{ lookup('unread') }}/tail"})
     template = ("{% set copied = vars.copy() %}"
                 "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
                 "{% set batch = " + batch + " %}"
-                "{{ batch | increment(" + member + ") }}{{ batch | increment(" + member + ") }}"
-                "{{ [copied.payload.count, entry.count, batch[" + member + "].count] | to_json }}")
-    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [3, 3, 3]
+                "{% set ignored = batch | increment(" + member + ") %}"
+                "{% set returned = batch | increment(" + member + ") %}"
+                "{{ [copied.payload.count, entry.count, batch[" + member + "].count, "
+                "batch is sameas returned[0], batch[" + member + "] is sameas entry, "
+                "batch[" + added + "] is sameas returned[1], batch | length, "
+                "entry.count | read_cached_argument | from_json] | to_json }}")
+    entry = {"count": 3}
+    fresh = [entry, 4]
+    cached = [entry, fresh] if member == "0" else {"entry": entry, "added": fresh}
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        3, 3, 3, True, True, True, 2, cached,
+    ]
 
 
 def test_custom_filter_keeps_inventory_writes_from_jinja_callbacks(monkeypatch):
@@ -480,6 +500,32 @@ class FilterModule:
                 "{{ [entry, copied.payload] | to_json }}")
     result = runtime.template(template, runtime._task_ctx(task, {}))
     assert json.loads(str(result)) == [[1, 2, 3, 4]] * 2
+
+
+def test_custom_filter_sort_callback_retains_copied_inventory_bindings(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.12.10")
+    runtime = Runtime({}, "", {"payload": ["{{ count }}", "first"], "count": 17})
+    runtime.templater.register_plugins([{"kind": "filter", "name": "sort_inventory", "source": """
+def sort_inventory(values, callback):
+    assert type(values) is list
+    values.sort(key=callback)
+    return ''
+
+class FilterModule:
+    def filters(self):
+        return {'sort_inventory': sort_inventory}
+"""}])
+    task = _task("sort", "Sort copied inventory", "debug", vars={
+        "unused": "{{ lookup('unused') }}/tail",
+    })
+    template = ("{% set copied = vars.copy() %}"
+                "{% set entry = (copied.items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
+                "{% macro rank(value) %}{{ 'a' if value == 'first' and entry | length == 2 else 'z' }}{% endmacro %}"
+                "{{ entry | sort_inventory(rank) }}"
+                "{{ [entry, copied.payload] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [
+        ["first", "{{ count }}"], ["first", 17],
+    ]
 
 
 def test_custom_filter_writes_inventory_keys_in_the_final_order(monkeypatch):
@@ -541,7 +587,9 @@ def test_generator_filter_keeps_its_yielded_collections_builtin(monkeypatch):
 import json
 
 def generate_inventory(values):
-    item = [values]
+    item = [values, 0]
+    yield item
+    item[1] = 1
     yield item
     yield json.dumps(item)
 
@@ -551,9 +599,10 @@ class FilterModule:
 """}])
     task = _task("1", "Reuse a yielded collection", "debug", vars={"unused": "{{ lookup('unread') }}/tail"})
     template = ("{% set entry = (vars.copy().items() | selectattr('0', 'equalto', 'payload') | first)[1] %}"
-                "{{ entry | generate_inventory | list | to_json }}")
+                "{% set entries = entry | generate_inventory | list %}"
+                "{{ [entries, entries[0] is sameas entries[1]] | to_json }}")
     result = runtime.template(template, runtime._task_ctx(task, {}))
-    assert json.loads(str(result)) == [[[1]], "[[1]]"]
+    assert json.loads(str(result)) == [[[[1], 1], [[1], 1], "[[1], 1]"], True]
 
 
 def test_custom_filter_result_keeps_plugin_owned_collections(monkeypatch):
@@ -1473,7 +1522,12 @@ def test_legacy_vars_iteration_preserves_unresolved_sources(monkeypatch, locatio
 
     tasks = [_task("read", "Read value", "debug", args={"msg": "{{ vars.payload%s }}" % suffix})]
     rt.run_play({"tasks": tasks, "gather_facts": False, "vars": play_vars})
-    assert frames[3]["result"]["msg"] == "used/tail"
+    if location == "play":
+        assert frames[3]["result"]["msg"] == source
+        assert calls == []
+        direct_read = _task("direct", "Read the play alias", "debug", args={"msg": "{{ payload }}"})
+        rt.run_play({"tasks": [direct_read], "gather_facts": False, "vars": play_vars})
+    assert frames[-1]["result"]["msg"] == "used/tail"
     assert calls == ["source"]
 
 
@@ -1493,6 +1547,7 @@ def test_deferred_vars_keep_standard_mapping_view_type_names(monkeypatch, versio
     '''"{{ lookup('source') }}/{{ suffix }}"''',
     '''"{{ lookup('source') }}" ~ "/{{ suffix }}"''',
     '''"{" ~ "{ lookup('source') }}" ~ tail''',
+    '''["{", "{ lookup('source') }}", tail] | join''',
 ])
 def test_task_defers_mixed_lookup_in_a_lookup_argument(argument):
     frames, calls = [], []
@@ -1957,7 +2012,8 @@ def test_loop_task_magic_vars_keep_original_values_when_facts_change():
 
 
 @pytest.mark.parametrize("play_alias", [False, True])
-def test_loop_task_magic_vars_cache_captured_alias_during_render(play_alias):
+def test_loop_task_magic_vars_cache_captured_alias_during_render(monkeypatch, play_alias):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
     rt = Runtime({}, "", {})
     readings = iter([1, 2])
     rt.templater.env.globals["next_reading"] = lambda: next(readings)
@@ -1971,7 +2027,8 @@ def test_loop_task_magic_vars_cache_captured_alias_during_render(play_alias):
     assert rt.template("{{ vars.alias }}", ctx) == 2
 
 
-def test_loop_snapshot_shares_live_play_alias_cache_for_same_binding():
+def test_loop_snapshot_shares_live_play_alias_cache_for_same_binding(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
     rt = Runtime({}, "", {})
     readings = iter([1, 2])
     rt.templater.env.globals["next_reading"] = lambda: next(readings)
@@ -2413,7 +2470,8 @@ def test_loop_assertion_observes_cached_play_alias_marker_on_each_read():
         rt.when([{"__ansiroll_trusted_condition__": "{{ checks }}"}], ctx, keyword=None)
 
 
-def test_loop_snapshot_preserves_provenance_when_a_play_alias_is_shadowed():
+def test_loop_snapshot_preserves_provenance_when_a_play_alias_is_shadowed(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
     rt = Runtime({}, "", {})
     rt._store_register({"register": "result"}, {"stdout": "1"})
     rt.vars.update(rt.template_vars({"entry": "entry == {{ result.stdout }}"}, {}, dynamic=True))
@@ -4744,3 +4802,162 @@ def test_legacy_bare_name_rendering_reads_regex_groups_without_subscripts(monkey
     runtime = Runtime({}, "", {}, extra_vars={"override_timeout": None})
     template = {"source": "{{ override_timeout }}", "vars": {}, "names": ["override_timeout"]}
     assert runtime._gather_timeout_for_run(23, template, legacy) is None
+
+
+@pytest.mark.parametrize("method", ["pop('used')", "setdefault('used')", "popitem()[1]"])
+def test_play_mapping_mutation_renders_only_the_returned_member(monkeypatch, method):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    runtime = Runtime({}, "", {})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    ctx = runtime.template_vars({"settings": {
+        "unused": "{{ lookup('unused') }}/tail", "used": "{{ lookup('ready') }}/tail",
+    }}, {}, dynamic=True)
+
+    assert runtime.template("{{ settings." + method + " }}", ctx) == "ready/tail"
+    assert calls == ["ready"]
+
+
+@pytest.mark.parametrize("method, first, full", [
+    ("items", ("one", "alpha"), [("one", "alpha"), ("two", "beta")]),
+    ("values", "alpha", ["alpha", "beta"]),
+])
+def test_lazy_mapping_iteration_resolves_only_consumed_entries(method, first, full):
+    runtime = Runtime({}, "", {})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    ctx = {"settings": {"one": "{{ lookup('alpha') }}", "two": "{{ lookup('beta') }}"}}
+
+    expr = "settings." + method + "()"
+    assert runtime.template("{{ " + expr + " | length }}", ctx) == 2
+    assert calls == []
+    assert runtime.template("{{ " + expr + " | first }}", ctx) == first
+    assert calls == ["alpha"]
+    calls.clear()
+    assert runtime.template("{{ " + expr + " }}", ctx) == full
+    assert calls == ["alpha", "beta"]
+
+
+@pytest.mark.parametrize("arguments, expected, seen", [
+    ("'a', 0, 1", 0, ["a"]),
+    ("'b', -2, -1", 1, ["b"]),
+    ("'missing', -2, -1", "missing", ["b"]),
+    ("'missing', 2, 1", "missing", []),
+])
+def test_lazy_list_index_resolves_only_the_window(arguments, expected, seen):
+    from ansiroll.runtime import _CapturedTemplateError, _fail_on_undef
+
+    runtime = Runtime({}, "", {})
+    calls = []
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or name
+    ctx = {"rows": ["{{ lookup('a') }}", "{{ lookup('b') }}", "{{ lookup('c') }}"]}
+
+    expression = "{{ rows.index(" + arguments + ") }}"
+    if expected == "missing":
+        with pytest.raises(_CapturedTemplateError, match="is not in list"):
+            _fail_on_undef(runtime.template(expression, ctx))
+    else:
+        assert runtime.template(expression, ctx) == expected
+    assert calls == seen
+
+
+@pytest.mark.parametrize("settings, member, whole", [
+    ({"used": "ready", "unused": "{{ lookup('probe') }}"}, ".used", {"used": "ready", "unused": "unused"}),
+    (["ready", "{{ lookup('probe') }}"], "[0]", ["ready", "unused"]),
+])
+def test_vars_lookup_keeps_nested_hostvars_collections_lazy(settings, member, whole):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "settings": settings})
+    runtime.templater._lookup_loaded["probe"] = lambda *args, **kwargs: calls.append("probe") or ["unused"]
+    task = _task("nested", "Read nested hostvars", "debug", vars={
+        "unused": "{{ lookup('irrelevant') }}/tail",
+    })
+    ctx = runtime._task_ctx(task, {})
+    expr = "lookup('vars', 'hostvars')[inventory_hostname].settings"
+
+    assert runtime.template("{{ " + expr + member + " }}", ctx) == "ready"
+    assert calls == []
+    assert runtime.template("{{ " + expr + " }}", ctx) == whole
+    assert calls == ["probe"]
+
+
+@pytest.mark.parametrize("settings, key", [({"used": 1, "unused": "{{ lookup('probe') }}"}, "'used'"),
+                                          ([1, "{{ lookup('probe') }}"], "0")])
+def test_custom_filter_receives_consumed_hostvars_lookup_members_as_builtins(settings, key):
+    calls = []
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "settings": settings})
+    runtime.templater._lookup_loaded["probe"] = lambda *args, **kwargs: calls.append("probe") or ["unused"]
+    runtime.templater.register_plugins([{"kind": "filter", "name": "update_lookup", "source": """
+def update_lookup(value, key):
+    assert type(value) is (list if key == 0 else dict)
+    value[key] += 1
+    return value
+
+class FilterModule:
+    def filters(self):
+        return {'update_lookup': update_lookup}
+"""}])
+    task = _task("consume", "Pass nested hostvars to a filter", "debug", vars={
+        "unused": "{{ lookup('irrelevant') }}/tail",
+    })
+    template = ("{% set host = lookup('vars', 'hostvars')[inventory_hostname] %}"
+                "{% set settings = host.settings %}"
+                "{% set result = settings | update_lookup(" + key + ") %}"
+                "{{ [settings[" + key + "], settings is sameas result] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == [2, True]
+    assert calls == ["probe"]
+
+
+@pytest.mark.parametrize("settings, writes, reads", [
+    ({}, "settings.update({'new': literal, 'nested': {'value': literal}, 'drop': literal})",
+     "settings.new, settings.nested.value, settings.pop('drop')"),
+    ([], "settings.extend([literal, {'value': literal}, literal])",
+     "settings[0], settings[1].value, settings.pop()"),
+])
+def test_vars_lookup_nested_hostvars_treats_collection_writes_as_data(settings, writes, reads):
+    runtime = Runtime({}, "", {"inventory_hostname": "h", "settings": settings})
+    task = _task("nested", "Mutate hostvars lookup data", "debug", vars={
+        "unused": "{{ lookup('irrelevant') }}/tail",
+    })
+    template = ("{% set settings = lookup('vars', 'hostvars')[inventory_hostname].settings %}"
+                "{% set literal = '{{ 42 }}' %}{% set ignored = " + writes + " %}"
+                "{{ [" + reads + "] | to_json }}")
+    assert json.loads(runtime.template(template, runtime._task_ctx(task, {}))) == ["{{ 42 }}"] * 3
+
+
+@pytest.mark.parametrize("member", [".timestamp", ".inner[0]"])
+def test_block_members_cache_per_render(monkeypatch, member):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.20.1")
+    runtime = Runtime({}, "", {})
+    calls = []
+
+    def now():
+        calls.append(None)
+        return len(calls)
+
+    runtime.templater.env.globals["now"] = now
+    block = runtime.template_vars({"settings": {
+        "timestamp": "{{ now() }}", "inner": ["{{ now() }}"],
+    }}, {}, defer=True, block_vars=True)
+    template = "{% set first = settings" + member + " %}{{ first == settings" + member + " }}"
+
+    for task_id in ("first", "second"):
+        task = _task(task_id, "Read block members", "assert")
+        ctx = runtime._task_ctx(task, block)
+        assert runtime.when([{"__ansiroll_trusted_condition__": template}], ctx, keyword=None)
+    assert len(calls) == 2
+
+
+def test_trusted_condition_leaves_unused_play_mapping_members_unread(monkeypatch):
+    monkeypatch.setattr("ansiroll.runtime._ANSIROLL_CORE_VERSION", "2.21.1")
+    calls, frames = [], []
+    runtime = Runtime({}, "", {}, on_result=frames.append)
+    runtime.templater.env.globals["lookup"] = lambda name: calls.append(name) or False
+    task = _task("first", "Check play vars", "debug", when=[
+        {"__ansiroll_trusted_condition__": "{{ settings.enabled }}"},
+    ])
+    runtime.run_play({"tasks": [task], "vars": {"settings": {
+        "enabled": True, "unused": "{{ lookup('unused') }}",
+    }}})
+    assert frames[0]["status"] == "ok"
+    assert calls == []
