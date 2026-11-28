@@ -103,6 +103,678 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+@pytest.mark.parametrize("subdirectory", [False, True], ids=["positional", "keywords"])
+def test_standalone_vars_file_first_found_uses_launch_value_and_bundled_first_match(tmp_path, subdirectory):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    core = _core_version()
+    if subdirectory and core < (2, 16):
+        pytest.skip("this Core requires positional first_found terms")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ LOOKUP }}"
+  tasks:
+    - assert:
+        that: selected == expected
+""".replace("LOOKUP", "lookup('first_found', files=[profile ~ '.yml', 'fallback.yml'], paths=['nested'])"
+            if subdirectory else "lookup('first_found', [profile ~ '.yml', 'fallback.yml'])"))
+    files = tmp_path if (2, 19) <= core < (2, 21) else tmp_path / "files"
+    if subdirectory:
+        files /= "nested"
+    files.mkdir(parents=True, exist_ok=True)
+    (files / "prod.yml").write_text("selected: production\n")
+    (files / "fallback.yml").write_text("selected: fallback\n")
+    (files / "dangling.yml").symlink_to("nonexistent.yml")
+    choices = (("prod", "production"), ("missing", "fallback"), ("dangling", "fallback"))
+    for profile, expected in choices:
+        native = subprocess.run(
+            ansible_playbook_command() + ["-i", "localhost,", "-c", "local",
+                                         "-e", json.dumps({"profile": profile, "expected": expected}), str(playbook)],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        )
+        assert native.returncode == 0, native.stdout + native.stderr
+
+    source, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    (files / "prod.yml").unlink()
+    (files / "fallback.yml").unlink()
+    for profile, expected in choices:
+        result = subprocess.run(
+            [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=20,
+            env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile, "expected": expected})},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("keyword_files", [False, True], ids=["positional", "keyword"])
+def test_first_found_vars_files_checks_filename_order_across_paths(tmp_path, keyword_files):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    core = _core_version()
+    if core < (2, 16):
+        pytest.skip("this Core uses legacy first_found argument handling")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', FILES[profile ~ '.yml', 'fallback.yml'], paths=search_dirs) }}"
+  tasks:
+    - assert: {that: selected == expected}
+""".replace("FILES", "files=" if keyword_files else ""))
+    (tmp_path / "A").mkdir()
+    (tmp_path / "B").mkdir()
+    (tmp_path / "A" / "fallback.yml").write_text("selected: fallback\n")
+    (tmp_path / "B" / "prod.yml").write_text("selected: found\n")
+    (tmp_path / "prod.yml").write_text("selected: default-root\n")
+    source, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    selected = "default-root" if core == (2, 16) and not keyword_files else "found"
+    for directories, expected in [(["A", "B"], selected), ([], "default-root")]:
+        extra = json.dumps({"profile": "prod", "expected": expected, "search_dirs": directories})
+        native = subprocess.run(
+            ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", extra, str(playbook)],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        )
+        assert native.returncode == 0, native.stdout + native.stderr
+        result = subprocess.run(
+            [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+            env={**os.environ, "ANSIROLL_EXTRA_VARS": extra},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("nested_role", [False, True], ids=["ordinary", "role-under-tasks"])
+def test_first_found_vars_files_uses_authored_search_path_order(tmp_path, nested_role):
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    roots = [tmp_path / name for name in ("preferred", "later")]
+    if nested_role:
+        roots[0] = tmp_path / "outer" / "tasks" / "preferred"
+        (roots[0] / "tasks").mkdir(parents=True)
+        (roots[0] / "tasks" / "main.yml").write_text("[]\n")
+    expected = "later" if nested_role and _core_version() < (2, 16) else "preferred"
+    for directory, value in zip([*roots, tmp_path], ["preferred", "later", "fallback"]):
+        directory.mkdir(exist_ok=True)
+        (directory / "prod.yml").write_text(f"selected: {value}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_search_path: ROOTS
+  vars_files:
+    - "{{ lookup('first_found', [profile ~ '.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'EXPECTED'}
+""".replace("ROOTS", json.dumps([str(root) for root in roots])).replace("EXPECTED", expected))
+    args = ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)]
+    native = subprocess.run(ansible_playbook_command() + args, cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30)
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    for directory in [*roots, tmp_path]:
+        (directory / "prod.yml").unlink()
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={
+        "profile": "prod", "ansible_search_path": [str(tmp_path / "unbundled")],
+    })
+    with pytest.raises(VarsFilesError, match="differs from the bundled search paths"):
+        runtime.run_play(plan)
+
+
+def test_first_found_vars_files_uses_absolute_candidate_before_search_path(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    unbundled = tmp_path / "unbundled"
+    unbundled.mkdir()
+    (tmp_path / "prod.yml").write_text("selected: absolute\n")
+    (unbundled / "fallback.yml").write_text("selected: unbundled\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_search_path: '{{ lookup_roots }}'
+  vars_files:
+    - "{{ lookup('first_found', [playbook_dir ~ '/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'absolute'}
+""")
+    inputs = {"profile": "prod", "lookup_roots": [str(unbundled)]}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(inputs), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    (tmp_path / "prod.yml").unlink()
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=inputs)
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={**inputs, "profile": "missing"})
+    with pytest.raises(VarsFilesError, match="differs from the bundled search paths"):
+        runtime.run_play(plan)
+
+
+def test_first_found_vars_files_rejects_unverified_earlier_root(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    earlier = tmp_path / "preferred"
+    (earlier / "nested").mkdir(parents=True)
+    (earlier / "nested" / "prod.yml").write_text("selected: earlier\n")
+    (tmp_path / "nested").mkdir()
+    later = tmp_path / "nested" / "prod.yml"
+    later.write_text("selected: later\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_search_path: ROOTS
+  vars_files:
+    - >-
+      {{ lookup('first_found', [profile ~ '.yml', ABSOLUTE]) }}
+  tasks:
+    - assert: {that: selected == expected}
+""".replace("ROOTS", json.dumps([str(earlier)])).replace("ABSOLUTE", json.dumps(str(later))))
+    extra = {"profile": "nested/prod", "expected": "earlier"}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(extra), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    with pytest.raises(VarsFilesError, match="outside the vars_files bundle"):
+        runtime.run_play(plan)
+
+    extra = {"profile": "missing", "expected": "later"}
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    runtime.run_play(plan)
+    assert not runtime.failed
+
+
+def test_first_found_vars_files_normalizes_string_options(tmp_path):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    if _core_version() < (2, 16):
+        pytest.skip("Core requires a positional first_found term")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - >-
+      {{ lookup('first_found', files='"prod.yml", fallback.yml', paths='A, "B"') }}
+  tasks:
+    - assert: {that: selected == 'production'}
+""")
+    (tmp_path / "A").mkdir()
+    (tmp_path / "B").mkdir()
+    (tmp_path / "A" / "fallback.yml").write_text("selected: fallback\n")
+    (tmp_path / "B" / "prod.yml").write_text("selected: production\n")
+    native = subprocess.run(ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(playbook)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert native.returncode == 0, native.stdout + native.stderr
+    source, _ = compile_playbook(str(playbook))
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(_compiled_plays(source, tmp_path)[0])
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+@pytest.mark.parametrize(("arguments", "minimum", "matches"), [
+    ("['files/' ~ profile ~ '.yml']", (2, 21), True),
+    ("['{{ profile | default(other, true) }}.yml']", (2, 10), True),
+    ("""["{{ profile | default('}}fallback', true) }}.yml"]""", (2, 10), True),
+    ("files=['{{ profile | default(other, true) }}.yml']", (2, 19), False),
+], ids=["files-prefix", "embedded-positional", "quoted-delimiter", "embedded-keyword"])
+def test_first_found_vars_files_preserves_rendered_candidate_bounds(tmp_path, arguments, minimum, matches):
+    from ansiroll.loader import _core_version
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    core = _core_version()
+    if core < minimum:
+        pytest.skip("the lookup needs the compiling Core's search or option behavior")
+    root = tmp_path if (2, 19) <= core < (2, 21) else tmp_path / "files"
+    root.mkdir(exist_ok=True)
+    (root / "prod.yml").write_text("selected: direct\n")
+    if minimum == (2, 21):
+        duplicate = root / "files"
+        duplicate.mkdir()
+        (duplicate / "prod.yml").write_text("selected: duplicate\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - >-
+      {{ lookup('first_found', ARGUMENTS) }}
+  tasks:
+    - assert: {that: selected == 'direct'}
+""".replace("ARGUMENTS", arguments))
+    extra = {"profile": "prod", "other": "fallback"}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(extra), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert (native.returncode == 0) == matches, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    if not matches:
+        with pytest.raises(VarsFilesError, match="No file was found"):
+            runtime.run_play(plan)
+        assert "No file was found" in native.stdout + native.stderr
+        return
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "direct"
+
+
+def test_legacy_first_found_paths_without_files_have_no_candidates(monkeypatch):
+    import ansiroll.runtime as runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.12")
+    with pytest.raises(ValueError, match="No file was found"):
+        runtime._first_found_vars_file(
+            ("prod.yml",), {"paths": ["profiles"]},
+            {"roots": ["/test"], "files": ["/test/profiles/prod.yml"], "home": "/test", "patterns": ["profiles/*"]},
+        )
+
+
+@pytest.mark.parametrize("case", ["out-of-bounds", "launch-parent", "directory", "missing", "skip"])
+def test_first_found_vars_files_never_falls_back_after_unverified_candidate(tmp_path, case):
+    from ansiroll.loader import _core_version
+
+    if case == "skip" and _core_version() < (2, 19):
+        pytest.skip("this Core stringifies the empty lookup result")
+    chosen = tmp_path / "prod.yml"
+    if case == "directory":
+        chosen.mkdir()
+    if case == "out-of-bounds":
+        (tmp_path / "nested").mkdir()
+        (tmp_path / "nested" / "prod.yml").write_text("selected: nested\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    terms = ("[profile ~ '.yml', 'fallback.yml']" if case in ("out-of-bounds", "launch-parent", "directory")
+             else "[profile ~ '.yml']")
+    skip = ", skip=True" if case == "skip" else ""
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', TERMS OPTIONS) }}"
+  tasks:
+    - fail: {msg: test-task-should-not-run}
+""".replace("TERMS OPTIONS", terms + skip))
+    source, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    profile = {"out-of-bounds": "nested/prod", "launch-parent": "nested/../fallback"}.get(case, "prod")
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": profile})},
+    )
+    assert result.returncode != 0
+    expected = {"out-of-bounds": "outside the vars_files bundle", "launch-parent": "outside the vars_files bundle",
+                "directory": "expected a regular file",
+                "missing": "No file was found", "skip": "must resolve to a string"}
+    assert expected[case] in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("term", ["profile ~ '.yml'", "'{{ profile }}.yml'"])
+def test_first_found_vars_files_replays_selected_timeout_before_setup(tmp_path, monkeypatch, term):
+    from ansiroll.loader import _core_version
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: true
+  gather_timeout: "{{ timeout_seconds }}"
+  vars:
+    timeout_seconds: 10
+  vars_files:
+    - "{{ lookup('first_found', [FILENAME, 'fallback/default.yml']) }}"
+  tasks: []
+""".replace("FILENAME", term))
+    root = tmp_path if (2, 19) <= _core_version() < (2, 21) else tmp_path / "files"
+    (root / "fallback").mkdir(parents=True)
+    (root / "fallback" / "default.yml").write_text("timeout_seconds: 19\n")
+    (root / "prod.yml").write_text("timeout_seconds: 23\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module", lambda action, args, **kwargs:
+                        called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
+
+
+def test_first_found_vars_files_does_not_use_blocked_search_path_before_setup(tmp_path, monkeypatch):
+    from ansiroll.loader import _core_version
+
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  vars:
+    stage: "{{ lookup('choice') }}"
+  vars_files:
+    - 'settings-{{ stage }}.yml'
+    - "{{ lookup('first_found', [profile ~ '.yml']) }}"
+  gather_timeout: '{{ timeout_seconds }}'
+  tasks: []
+""")
+    (tmp_path / "settings-production.yml").write_text("ansible_search_path: [/unbundled]\n")
+    directory = tmp_path if (2, 19) <= _core_version() < (2, 21) else tmp_path / "files"
+    directory.mkdir(exist_ok=True)
+    (directory / "timeout.yml").write_text("timeout_seconds: 23\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "timeout"})
+    runtime.templater._lookup_loaded["choice"] = lambda terms, variables: ["production"]
+    called = []
+    monkeypatch.setattr(runtime, "run_module", lambda *args, **kwargs: called.append(args) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert runtime.failed
+    assert not called
+    assert "cannot be rendered before setup" in frames[0]["result"]["msg"]
+
+
+@pytest.mark.parametrize("keyword_files", [False, True], ids=["positional", "keyword"])
+def test_legacy_first_found_vars_files_evaluates_embedded_filename(tmp_path, keyword_files):
+    from ansiroll.loader import _core_version
+    from tests import ansible_playbook_command
+
+    if _core_version() >= (2, 19):
+        pytest.skip("legacy Core templates each candidate in the lookup plugin")
+    if keyword_files and _core_version() < (2, 12):
+        pytest.skip("Core before 2.12 ignores the files keyword")
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    candidates = "['{{ missing }}.yml', profile ~ '.yml']"
+    if keyword_files:
+        positional = "profile, " if _core_version() < (2, 16) else ""
+        candidates = positional + "files=" + candidates
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', CANDIDATES) }}"
+  tasks:
+    - assert: {that: selected == 'fallback'}
+""".replace("CANDIDATES", candidates))
+    extra = {"profile": "fallback"}
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", json.dumps(extra), str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert (native.returncode == 0) == keyword_files, native.stdout + native.stderr
+    if not keyword_files:
+        assert "undefined" in native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars=extra)
+    runtime.run_play(plan)
+    assert runtime.failed == (not keyword_files)
+    assert runtime.vars.get("selected") == ("fallback" if keyword_files else None)
+
+
+def test_first_found_vars_files_replays_embedded_filename_after_earlier_file(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {profile: dev, variant: compile}
+  vars_files:
+    - selectors-{{ variant }}.yml
+    - "{{ lookup('first_found', ['{{ profile }}.yml']) }}"
+  tasks: []
+""")
+    (tmp_path / "selectors-compile.yml").write_text("profile: dev\n")
+    (tmp_path / "selectors-launch.yml").write_text("profile: prod\n")
+    (tmp_path / "dev.yml").write_text("selected: development\n")
+    (tmp_path / "prod.yml").write_text("selected: production\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"variant": "launch"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+@pytest.mark.parametrize("location", ["named-home", "playbook-dir", "joined-home", "empty-concatenation",
+                                      "parent-relative", "absolute-parent"])
+def test_first_found_vars_files_resolves_known_directories(tmp_path, monkeypatch, location):
+    from ansiroll.loader import _core_version
+
+    core = _core_version()
+    if core < (2, 12) and location not in ("parent-relative", "absolute-parent"):
+        pytest.skip("Core before 2.12 ignores keyword search paths")
+    profiles = tmp_path / "profiles"
+    play_dir = tmp_path
+    filename = "profile ~ '.yml'"
+    if location in ("named-home", "joined-home"):
+        expanduser = os.path.expanduser
+
+        def fake_expanduser(path):
+            if isinstance(path, str) and path.partition("/")[0] == "~ansiroll_test":
+                _, _, rest = path.partition("/")
+                return str(profiles / rest)
+            return expanduser(path)
+
+        monkeypatch.setattr(os.path, "expanduser", fake_expanduser)
+        if location == "named-home":
+            paths = "['~ansiroll_test']"
+        else:
+            filename = "'~ansiroll_test/' ~ profile ~ '.yml'"
+            paths = "['profiles']"
+            profiles /= "~ansiroll_test"
+    elif location == "empty-concatenation":
+        profiles = tmp_path
+        paths = "[prefix ~ '']"
+    elif location == "parent-relative":
+        play_dir = tmp_path / "project"
+        play_dir.mkdir()
+        filename = "'../profiles/' ~ profile ~ '.yml'"
+        paths = "[]"
+    elif location == "absolute-parent":
+        filename = "playbook_dir ~ '/missing/../profiles/' ~ profile ~ '.yml'"
+        paths = "[]"
+    else:
+        paths = "[playbook_dir ~ '/profiles']"
+    profiles.mkdir(parents=True, exist_ok=True)
+    (profiles / "prod.yml").write_text("selected: production\n")
+    playbook = play_dir / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', TERMSfiles=[FILENAME], paths=PATHS) }}"
+  tasks:
+    - assert: {that: selected == 'production'}
+""".replace("TERMS", "" if core == (2, 16) else "[FILENAME], ")
+                         .replace("PATHS", paths).replace("FILENAME", filename))
+    if location in ("parent-relative", "absolute-parent"):
+        from tests import ansible_playbook_command
+
+        native = subprocess.run(
+            ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+            cwd=play_dir, capture_output=True, text=True, timeout=30,
+        )
+        assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod", "prefix": ""})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+@pytest.mark.parametrize(("candidate", "expected"), [
+    ("'prod.yml/'", "fallback"),
+    ("'./prod.yml'", "production"),
+    ("'nested//../prod.yml'", "production"),
+    ("'nested//' ~ profile ~ '.yml'", "nested-production"),
+    ("'nested//../' ~ profile ~ '.yml'", "production"),
+    ("'missing//../' ~ profile ~ '.yml'", "fallback"),
+])
+def test_first_found_vars_files_preserves_relative_candidate_spelling(tmp_path, candidate, expected):
+    from tests import ansible_playbook_command
+
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "prod.yml").write_text("selected: nested-production\n")
+    (tmp_path / "prod.yml").write_text("selected: production\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', [CANDIDATE, 'fallback.yml', profile ~ '.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'EXPECTED'}
+""".replace("CANDIDATE", candidate).replace("EXPECTED", expected))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == expected
+
+
+def test_first_found_vars_files_rejects_unresolved_named_home(tmp_path):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    home = "~ansiroll_unresolved_fixture_user"
+    assert os.path.expanduser(home) == home
+    wrong_root = tmp_path / "files" / home
+    wrong_root.mkdir(parents=True)
+    (wrong_root / "prod.yml").write_text("selected: wrong-root-fixture-marker\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', ['HOME_DIR/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'fallback'}
+""".replace("HOME_DIR", home))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "wrong-root-fixture-marker" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    with pytest.raises(VarsFilesError, match="unresolved home"):
+        runtime.run_play(plan)
+
+
+@pytest.mark.parametrize("spelling", ["absolute", "matched-relative", "tilde"])
+def test_first_found_vars_files_rejects_unverified_environment_path(tmp_path, monkeypatch, spelling):
+    from ansiroll.runtime import VarsFilesError
+    from tests import ansible_playbook_command
+
+    directory = tmp_path / "controller-selected"
+    directory.mkdir()
+    (directory / "prod.yml").write_text("selected: requested\nprivate_value: expanded-file-fixture-marker\n")
+    if spelling == "matched-relative":
+        literal = tmp_path / "$ANSIROLL_TEST_FIRST_FOUND_DIR"
+        literal.mkdir()
+        (literal / "prod.yml").write_text("selected: literal\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    monkeypatch.setenv("ANSIROLL_TEST_FIRST_FOUND_DIR", directory.name)
+    if spelling == "tilde":
+        monkeypatch.setenv("ANSIROLL_TEST_FIRST_FOUND_DIR", "")
+        monkeypatch.setenv("HOME", str(directory))
+    playbook = tmp_path / "play.yml"
+    prefix = {"absolute": "playbook_dir ~ '/", "matched-relative": "'", "tilde": "'~"}[spelling]
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', [PREFIX$ANSIROLL_TEST_FIRST_FOUND_DIR/' ~ profile ~ '.yml', 'fallback.yml']) }}"
+  tasks:
+    - assert: {that: selected == 'requested'}
+""".replace("PREFIX", prefix))
+    native = subprocess.run(
+        ansible_playbook_command() + ["-i", "localhost,", "-c", "local", "-e", "profile=prod", str(playbook)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert native.returncode == 0, native.stdout + native.stderr
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert "expanded-file-fixture-marker" not in json.dumps(plan)
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod"})
+    with pytest.raises(VarsFilesError, match="environment references require selecting"):
+        runtime.run_play(plan)
+
+
+def test_legacy_first_found_vars_files_bundles_positional_fallback(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() >= (2, 16):
+        pytest.skip("this Core does not try the files override before positional terms")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "{{ lookup('first_found', ['nested/' ~ profile ~ '.yml'], files=overrides) }}"
+  tasks: []
+""")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "prod.yml").write_text("selected: production\n")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"profile": "prod", "overrides": []})
+    runtime.run_play(plan)
+    assert not runtime.failed
+    assert runtime.vars["selected"] == "production"
+
+
+def test_first_found_vars_files_preserves_bundled_custom_lookup(tmp_path):
+    lookup_dir = tmp_path / "lookup_plugins"
+    lookup_dir.mkdir()
+    (lookup_dir / "first_found.py").write_text("""class LookupModule:
+    def __init__(self, **kwargs):
+        pass
+
+    def run(self, terms, variables=None, **kwargs):
+        return ["custom.yml"]
+""")
+    (tmp_path / "custom.yml").write_text("selected: custom\n")
+    (tmp_path / "prod.yml").write_text("selected: builtin\n")
+    (tmp_path / "fallback.yml").write_text("selected: fallback\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - ["{{ lookup('first_found', profile ~ '.yml') }}", fallback.yml]
+  tasks:
+    - assert: {that: "selected == 'custom'"}
+""")
+    artifact = tmp_path / "artifact.py"
+    compiled = subprocess.run(
+        [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(artifact)],
+        cwd=tmp_path, env={**os.environ, "ANSIBLE_LOOKUP_PLUGINS": str(lookup_dir), "PYTHONPATH": ROOT},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path,
+        env={**os.environ, "ANSIROLL_EXTRA_VARS": json.dumps({"profile": "prod"})},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_path, monkeypatch):
     import builtins
 

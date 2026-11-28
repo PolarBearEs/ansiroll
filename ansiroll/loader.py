@@ -367,6 +367,8 @@ def _gather_timeout_file_scope(play, entries, runtime, *, scoped_options=None, s
     file_values = {}
     merge_hashes = C.DEFAULT_HASH_BEHAVIOUR == "merge"
     for entry in entries:
+        if entry.get("first_found"):
+            selector_names.add("ansible_search_path")
         for candidate in entry.get("controller_candidates", {}).values():
             selector_names.update(name for name, _ in candidate["paths"])
         for source in entry.get("names", ()):
@@ -495,8 +497,8 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
     from ansible import constants as C
     from jinja2 import Environment, TemplateSyntaxError, nodes
 
-    from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
-                          _selector_template_sources, _setup_builtin_lookup)
+    from .runtime import (_first_found_embedded_templates, _is_literal_vars_lookup, _selector_input_paths,
+                          _selector_projection_cycle, _selector_scope, _selector_template_sources, _setup_builtin_lookup)
 
     env = Environment()
     resolve_aliases = computed is not None or unknown_lookup is not None
@@ -530,6 +532,11 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                 and (vars_lookup_allowed is None or vars_lookup_allowed(call.args[0].value))
             ):
                 return None
+            if (selector and isinstance(method, nodes.Name) and method.name == "lookup" and call.args
+                    and isinstance(call.args[0], nodes.Const)
+                    and call.args[0].value in ("first_found", "ansible.builtin.first_found")):
+                pending.extend((template, (), (None, template), ancestors)
+                               for template in _first_found_embedded_templates(call))
             if (lookups is not None and isinstance(method, nodes.Name) and method.name in ("lookup", "query", "q")
                     and call.args and isinstance(call.args[0], nodes.Const) and isinstance(call.args[0].value, str)):
                 alias = call.args[0].value
@@ -1237,6 +1244,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             filename, inputs, _GATHER_STRING_METHODS, selector=True, allow_controller=True,
                             paths=paths, unknown_lookup=unknown_lookup)
                         if dependencies is not None and not unknown_lookup:
+                            if "first_found" in filename and _vars_first_found_patterns(filename, basedir, True) is not None:
+                                defer_for_order |= bool(dependencies[1] - extra_replacements - selector_magic.keys())
                             controller_inputs = {"inputs": dependencies[0], "paths": sorted(paths, key=repr)}
                             if requires_controller:
                                 controller_inputs["controller_only"] = True
@@ -1380,6 +1389,116 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _vars_first_found_patterns(source, basedir, allow_short_name):
+    """Model built-in first_found filenames using bounded glob patterns."""
+    import glob
+
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from .runtime import _first_found_list_option
+
+    environment = Environment(keep_trailing_newline=True)
+    named_homes = {}
+
+    def expand_home(pattern):
+        if not pattern.startswith("~"):
+            return pattern
+        home, separator, tail = pattern.partition("/")
+        expanded_home = os.path.expanduser(home)
+        if expanded_home == home:
+            return pattern
+        if home != "~":
+            named_homes[home] = expanded_home
+        return glob.escape(expanded_home) + separator + tail
+
+    def option_can_be_empty(term):
+        if isinstance(term, (nodes.List, nodes.Tuple)):
+            return all(option_can_be_empty(item) for item in term.items)
+        if isinstance(term, nodes.Concat):
+            return all(option_can_be_empty(item) for item in term.nodes)
+        return not isinstance(term, nodes.Const) or term.value == ""
+
+    def term_patterns(term, separators="[;,]", *, keyword=False):
+        if isinstance(term, nodes.Const) and isinstance(term.value, str):
+            value = term.value
+            if keyword or not _is_templated(value):
+                names = re.split(separators, value) if separators else [value]
+                pattern = _vars_file_glob_pattern if keyword and core < (2, 19) else glob.escape
+                return [pattern(name) for name in names]
+            # Core renders positional terms before lookup delimiter handling.
+            # The lexer distinguishes delimiters in quoted Jinja expressions
+            # from separators in the surrounding filename.
+            patterns = [""]
+            for _, token, text in environment.lex(value):
+                if token == "data":
+                    first, *others = re.split(separators, text) if separators else [text]
+                    patterns[-1] += glob.escape(first)
+                    patterns.extend(map(glob.escape, others))
+                elif token in ("variable_begin", "block_begin"):
+                    patterns[-1] += "*"
+            return patterns
+        if isinstance(term, nodes.Name):
+            return [glob.escape(basedir) if term.name == "playbook_dir" else "*"]
+        if isinstance(term, (nodes.List, nodes.Tuple)):
+            return [pattern for item in term.items for pattern in term_patterns(item, separators, keyword=keyword)]
+        if isinstance(term, (nodes.Add, nodes.Concat)):
+            terms = (term.left, term.right) if isinstance(term, nodes.Add) else term.nodes
+            segments = [term_patterns(segment, separators, keyword=keyword) for segment in terms]
+            if all(len(part) == 1 for part in segments):
+                return ["".join(part[0] for part in segments)]
+        raise ValueError("unmodeled first_found filename")
+
+    def option_patterns(term, separators):
+        if isinstance(term, nodes.Const) and isinstance(term.value, str):
+            return [pattern for value in _first_found_list_option(term.value)
+                    for pattern in term_patterns(nodes.Const(value), separators, keyword=True)]
+        return term_patterns(term, separators, keyword=True)
+
+    try:
+        parsed = environment.parse(source).body
+        if len(parsed) != 1 or not isinstance(parsed[0], nodes.Output):
+            return None
+        expressions = [node for node in parsed[0].nodes
+                       if not isinstance(node, nodes.TemplateData) or node.data.strip()]
+        if len(expressions) != 1 or not isinstance(expressions[0], nodes.Call):
+            return None
+        call = expressions[0]
+        if not (isinstance(call.node, nodes.Name) and call.node.name == "lookup" and call.args
+                and isinstance(call.args[0], nodes.Const)
+                and (call.args[0].value == "ansible.builtin.first_found"
+                     or allow_short_name and call.args[0].value == "first_found")
+                and not (call.dyn_args or call.dyn_kwargs)
+                and all(keyword.key in ("files", "paths", "skip") for keyword in call.kwargs)):
+            return None
+        terms = call.args[1:]
+        core = _core_version()
+        modern = core >= (2, 16)
+        # Before 2.12, keyword options are ignored. 2.16 reads them only without positional terms.
+        options = ({keyword.key: keyword.value for keyword in call.kwargs}
+                   if core >= (2, 12) and (core != (2, 16) or not terms) else {})
+        files = options.get("files")
+        has_files = files is not None and not (isinstance(files, (nodes.List, nodes.Tuple)) and not files.items)
+        use_file_option = has_files and ((modern and not terms) or (not modern and terms))
+        if use_file_option:
+            filenames = option_patterns(files, "[;,]")
+        else:
+            separator = "[;,]" if modern else None
+            filenames = [pattern for term in terms for pattern in term_patterns(term, separator)]
+        paths = options.get("paths")
+        directories = option_patterns(paths, "[,:;]") if paths is not None else []
+        plugin = call.args[0].value
+        if not modern and not use_file_option:
+            return plugin, [expand_home(filename) for filename in filenames], named_homes
+        if option_can_be_empty(paths):
+            directories.insert(0, "")
+        patterns = [os.path.join(directory, filename) for directory in directories for filename in filenames]
+        if not modern and option_can_be_empty(files) and option_can_be_empty(paths):
+            # With neither option set, legacy Core falls back to its positional terms.
+            patterns.extend(pattern for term in terms for pattern in term_patterns(term, None))
+        return plugin, [expand_home(pattern) for pattern in patterns], named_homes
+    except (TemplateSyntaxError, ValueError):
+        return None
+
+
 def _vars_file_has_dynamic_directory(name):
     return name.startswith(("{{", "{%")) and any(
         os.path.sep in literal for literal in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
@@ -1428,20 +1547,73 @@ def _deferred_vars_files(play, basedir, entries):
     """
     import glob
     from ansible.errors import AnsibleFileNotFound
-    from .runtime import _vars_file_glob_covers
+    from .runtime import _FIRST_FOUND_ENV_REFERENCE, _vars_file_glob_covers
 
     if tuple(map(int, _fact_schema().split("."))) >= (2, 12):
         dirs, subdir = list(play.get_search_path()) + [basedir], "vars"
     else:
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
+    first_found_search = None
     deferred = []
     for entry in entries:
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
+        first_found = {}
         checked_paths = {}
         unmodeled = []
         for position, name in enumerate(names):
+            if _is_templated(name) and "first_found" in name:
+                from ansible.plugins.loader import lookup_loader
+                from ansible.plugins.lookup import first_found as builtin_first_found
+
+                resolved = lookup_loader.find_plugin_with_context("first_found").plugin_resolved_path
+                has_local_override = any(os.path.isfile(os.path.join(root, "lookup_plugins", "first_found.py"))
+                                         for root in dirs)
+                modeled = _vars_first_found_patterns(
+                    name, basedir, bool(resolved and not has_local_override
+                               and os.path.realpath(resolved) == os.path.realpath(builtin_first_found.__file__)))
+                if modeled is not None:
+                    if first_found_search is None:
+                        first_found_search = _vars_first_found_search(play, basedir)
+                    first_found_roots, search_path, known_search_path = first_found_search
+                    plugin, patterns, named_homes = modeled
+                    candidates = set()
+                    matched_spellings = set()
+                    for pattern in patterns:
+                        absolute = os.path.isabs(pattern)
+                        if pattern.startswith("~") or absolute and _FIRST_FOUND_ENV_REFERENCE.search(pattern):
+                            continue
+                        absolute_parent = absolute and os.pardir in pattern.split(os.path.sep)
+                        # Core normalizes absolute candidates. For relative ones,
+                        # collapse repeated separators but preserve dot components.
+                        discovery = os.path.normpath(pattern) if absolute else re.sub(r"/{2,}", "/", pattern)
+                        for root, implicit_files in first_found_roots:
+                            for path in glob.glob(os.path.join(glob.escape(root), discovery)):
+                                if implicit_files and not absolute:
+                                    relative = path[len(os.path.join(root, "")):]
+                                    if relative.split(os.path.sep, 1)[0] == "files":
+                                        continue
+                                if not os.path.exists(path):
+                                    continue
+                                normalized = os.path.normpath(path)
+                                if absolute_parent or path != normalized:
+                                    # Relative candidates must match with their original spelling.
+                                    matched_spellings.add(path)
+                                candidates.add(normalized)
+                                # Match the literal candidate for diagnostics without letting
+                                # path_dwim load data from an environment-expanded path.
+                                if normalized not in files and not _FIRST_FOUND_ENV_REFERENCE.search(path):
+                                    files[normalized] = _bundled_vars_file(play, normalized)
+                    first_found[name] = {"plugin": plugin, "patterns": patterns,
+                                         "roots": [path for path, _ in first_found_roots],
+                                         "implicit_files": [index for index, (_, implicit) in enumerate(first_found_roots)
+                                                            if implicit],
+                                         "files": sorted(candidates),
+                                         "matched_spellings": sorted(matched_spellings),
+                                         "home": os.path.expanduser("~"), "named_homes": named_homes,
+                                         "search_path": search_path, "search_path_known": known_search_path}
+                    continue
             if _vars_file_has_dynamic_directory(name):
                 unmodeled.append(name)
                 continue
@@ -1482,6 +1654,8 @@ def _deferred_vars_files(play, basedir, entries):
                     if found not in files and (os.path.isfile(found) or os.path.isdir(found)):
                         files[found] = _bundled_vars_file(play, found)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
+        if first_found:
+            entry["first_found"] = first_found
         if checked_paths:
             entry["checked_paths"] = checked_paths
         if any(name.startswith("~/") for name in names):
@@ -1490,6 +1664,40 @@ def _deferred_vars_files(play, basedir, entries):
             entry["unmodeled"] = unmodeled
         deferred.append(entry)
     return deferred
+
+
+def _vars_first_found_search(play, basedir):
+    """Capture literal lookup search paths that can be inspected at compile time."""
+    from ansible.utils.path import unfrackpath
+
+    manager = play.get_variable_manager()
+    supplied = {**_gather_role_defaults(_gather_public_roles(play)), **(play.vars or {}),
+                **(manager.extra_vars if manager else {})}
+    search_path = supplied.get("ansible_search_path", [])
+    paths = []
+    known = isinstance(search_path, (list, tuple)) and all(isinstance(path, str) for path in search_path)
+    if known:
+        paths = [_PLAYBOOK_DIR_RE.sub(lambda _: basedir, path) for path in search_path]
+        known = not any(_is_templated(path) for path in paths)
+    core = _core_version()
+    with_files = not (2, 19) <= core < (2, 21)
+    roots = []
+    for path in paths if known else ():
+        resolved = unfrackpath(path, follow=False)
+        parent = os.path.dirname(resolved)
+        if parent.endswith("/tasks") and play._loader._is_role(path):
+            if with_files:
+                roots.append((os.path.join(os.path.dirname(parent), "files"), False))
+            roots.append((parent, False))
+            if core < (2, 16):
+                continue
+        if with_files:
+            roots.append((os.path.join(resolved, "files"), core >= (2, 21)))
+        roots.append((resolved, False))
+    if with_files:
+        roots.append((os.path.join(basedir, "files"), core >= (2, 21)))
+    roots.append((basedir, False))
+    return list(dict.fromkeys(roots)), _tag_untrusted(search_path) if known else None, known
 
 
 def _bundled_vars_file(play, path):

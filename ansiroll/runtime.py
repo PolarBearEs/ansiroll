@@ -902,6 +902,7 @@ def _vars_file_glob_covers(pattern, name):
     patterns = pattern.split(os.path.sep)
     return len(parts) == len(patterns) and all(
         (part or not segment) and (not part.startswith(".") or segment.startswith("."))
+        and (part != os.pardir or segment == os.pardir)
         and fnmatchcase(part, segment)
         for part, segment in zip(parts, patterns)
     )
@@ -1703,6 +1704,112 @@ _ANSIBLE_TESTS = {
 }
 
 
+def _first_found_embedded_templates(call):
+    nodes = jinja2.nodes
+    for arg in [*call.args[1:], *(keyword.value for keyword in call.kwargs)]:
+        literals = (arg,) if isinstance(arg, nodes.Const) else arg.find_all(nodes.Const)
+        for literal in literals:
+            if _looks_templated(literal.value):
+                yield literal.value
+
+
+def _first_found_list_option(value):
+    if not isinstance(value, str):
+        return value
+    members = [part.strip() for part in value.split(",")]
+    members = [part[1:-1] if len(part) > 1 and part[0] in ("'", '"') and part[-1] == part[0] else part
+               for part in members]
+    return [type(value)(part) for part in members] if isinstance(value, _NO_TEMPLATE) else members
+
+
+_FIRST_FOUND_ENV_REFERENCE = re.compile(r"\$(?:[a-zA-Z0-9_]+|\{[^}]*\})")
+
+
+def _first_found_vars_file(args, kwargs, selector):
+    def split_terms(values, separators=None):
+        for value in values:
+            if isinstance(value, (list, tuple)):
+                yield from split_terms(value, separators)
+            elif isinstance(value, str):
+                parts = re.split(separators, value) if separators else (value,)
+                yield from (type(value)(part) for part in parts) if isinstance(value, _NO_TEMPLATE) else parts
+            else:
+                raise ValueError("first_found filenames and paths must be strings")
+
+    modern = _core_at_least(2, 16)
+    if not _core_at_least(2, 12) or (modern and not _core_at_least(2, 17) and args):
+        kwargs = {}
+    _fail_on_undef((args, dict(kwargs)))
+    skip = _boolean(kwargs.get("skip", False), strict=True)
+    paths = tuple(split_terms((_first_found_list_option(kwargs.get("paths", ())),), "[,:;]"))
+    files = _first_found_list_option(kwargs.get("files", ()))
+    if not modern and args and (paths or files):
+        filenames = [tuple(split_terms((files,), "[,;]"))]
+    else:
+        terms = args
+        if modern and not terms:
+            terms = (files,)
+        filenames = [tuple(split_terms((term,), "[,;]")) if modern else (term,) for term in split_terms(terms)]
+    bundled = selector["files"]
+    implicit_files = frozenset(selector.get("implicit_files", ()))
+    matched_spellings = selector.get("matched_spellings", selector.get("parent_paths"))
+    render_candidate = selector.get("render_candidate")
+    environment_path_error = ("first_found paths with environment references require selecting "
+                              "the vars_files name at compile time")
+    for group in filenames:
+        for folder in paths or ("",):
+            for filename in group:
+                candidate = os.path.join(folder, filename) if folder else filename
+                if render_candidate is not None and not any(isinstance(part, _NO_TEMPLATE) for part in (folder, filename)):
+                    try:
+                        candidate = _fail_on_undef(render_candidate(candidate))
+                    except jinja2.UndefinedError as ex:
+                        if isinstance(ex, _CapturedTemplateError):
+                            raise
+                        continue
+                if (candidate.startswith("~") or os.path.isabs(candidate)) and _FIRST_FOUND_ENV_REFERENCE.search(candidate):
+                    raise ValueError(environment_path_error)
+                if candidate.startswith("~"):
+                    home, _, relative = candidate.partition("/")
+                    directory = selector.get("named_homes", {}).get(home)
+                    if home == "~":
+                        directory = selector["home"]
+                    if directory is None:
+                        raise ValueError("first_found cannot replay unresolved home %r; select the vars_files name "
+                                         "at compile time" % home)
+                    candidate = os.path.join(directory, relative) if relative else directory
+                covered = any(_vars_file_glob_covers(pattern, candidate) for pattern in selector["patterns"])
+                parent_relative = os.pardir in candidate.split(os.path.sep)
+                if parent_relative and (not covered or matched_spellings is None):
+                    raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
+                absolute = os.path.isabs(candidate)
+                if not absolute and not selector.get("search_path_matches", True):
+                    raise ValueError("first_found ansible_search_path differs from the bundled search paths; "
+                                     "recompile with the current search paths")
+                roots = ("",) if absolute else selector["roots"]
+                relative_spelling = re.sub(r"/{2,}", "/", candidate) if not absolute else None
+                for index, root in enumerate(roots):
+                    if (not absolute and index in implicit_files
+                            and candidate.split(os.path.sep, 1)[0] == "files"):
+                        continue
+                    candidate_path = os.path.join(root, candidate)
+                    path = os.path.normpath(candidate_path)
+                    checked_path = path if absolute else os.path.join(root, relative_spelling)
+                    exact_match = checked_path == path and not parent_relative
+                    verified_spelling = checked_path in (matched_spellings or ()) or (
+                        not absolute and candidate_path in (matched_spellings or ()))
+                    if path in bundled and (exact_match or verified_spelling):
+                        if _FIRST_FOUND_ENV_REFERENCE.search(candidate_path):
+                            raise ValueError(environment_path_error)
+                        return [path]
+                    if not covered:
+                        # We cannot rule this root out before trying a later one.
+                        raise ValueError("first_found selected a path outside the vars_files bundle: %r" % candidate)
+    if skip and (modern or args):
+        return []
+    raise ValueError("No file was found when using first_found.")
+
+
 def _setup_builtin_lookup(name):
     namespace, _, short = name.rpartition(".")
     if namespace in ("", "ansible.builtin", "ansible.legacy") and short in ("env", "config", "file"):
@@ -1711,6 +1818,9 @@ def _setup_builtin_lookup(name):
 
 
 def _lookup_values(name, args, kwargs, ctx=None):
+    selector = (ctx or {}).get("__ansiroll_first_found")
+    if selector and name == selector["plugin"]:
+        return _first_found_vars_file(args, kwargs, selector)
     qualified_name = str(name)
     name = qualified_name.rsplit(".", 1)[-1]
     if name in ("file", "pipe") and (ctx or {}).get("__ansiroll_vars_file_selector"):
@@ -1850,7 +1960,8 @@ def _lookup(name, *args, **kwargs):
     ctx = kwargs.pop("_ansiroll_ctx", None)
     wantlist = kwargs.pop("wantlist", False)
     vals = _lookup_values(name, args, kwargs, ctx)
-    if wantlist:
+    selector = (ctx or {}).get("__ansiroll_first_found")
+    if wantlist or (not vals and selector and name == selector["plugin"] and _core_at_least(2, 19)):
         return vals
     if len(vals) == 1:
         return vals[0]
@@ -3713,11 +3824,23 @@ class _Templater:
 
     def _g_lookup(self, name, *a, **k):
         try:
+            ctx = self._current_ctx
+            selector = (ctx or {}).get("__ansiroll_first_found")
+            modeled_first_found = selector and name == selector["plugin"]
+            legacy_first_found = modeled_first_found and not _core_at_least(2, 19)
             a = tuple(self._template_lookup_term(v) for v in a)
-            k = {key: self._template_lookup_arg(value) for key, value in k.items()}
+            k = {key: value if modeled_first_found and key in ("files", "paths") else self._template_lookup_arg(value)
+                 for key, value in k.items()}
+            if legacy_first_found:
+                # Core renders positional terms before entering the plugin.
+                # The plugin renders each joined candidate from the options.
+                lookup_ctx = dict(ctx, __ansiroll_first_found=dict(
+                    selector, render_candidate=lambda candidate: self.render_string(candidate, ctx)))
+            else:
+                lookup_ctx = self._lookup_ctx(name, a)
             # Lookup output is data and is never templated again.
             return _mark_unsafe(
-                _lookup(name, *a, _ansiroll_ctx=self._lookup_ctx(name, a), **k), preserve_lookup_hostvars=True)
+                _lookup(name, *a, _ansiroll_ctx=lookup_ctx, **k), preserve_lookup_hostvars=True)
         except _UnsupportedLookup:
             vals = self._plugin_lookup(name, a, k)
             if _is_undef(vals):
@@ -5514,9 +5637,21 @@ class Runtime:
             else:
                 selector_blocks = {}
             for raw in entry["names"]:
+                first_found = entry.get("first_found", {}).get(raw)
+                search_path_matches = True
+                if first_found:
+                    if "search_path_known" in first_found:
+                        search_path_matches = (
+                            first_found["search_path_known"]
+                            and not _vars_file_reads_blocked(selector_blocks, {("ansible_search_path", ())})
+                            and _same_vars_input(ctx.get("ansible_search_path", []), first_found["search_path"])
+                        )
+                    ctx["__ansiroll_first_found"] = dict(first_found, search_path_matches=search_path_matches)
+                else:
+                    ctx.pop("__ansiroll_first_found", None)
                 checked = entry.get("controller_candidates", {}).get(raw)
                 paths = {(key, tuple(path)) for key, path in checked["paths"]} if checked else set()
-                reuse_checked = checked and not _vars_file_reads_blocked(selector_blocks, paths) and all(
+                reuse_checked = checked and search_path_matches and not _vars_file_reads_blocked(selector_blocks, paths) and all(
                     _same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
                     for key, path in paths
                 )
@@ -5541,22 +5676,29 @@ class Runtime:
                                     blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
                         break
                     inputs.update(dependencies)
+                    if first_found and "search_path_known" in first_found:
+                        inputs["ansible_search_path"] = ctx.get("ansible_search_path", _MISSING_VARS_FILE_INPUT)
                 try:
                     name = checked["name"] if reuse_checked else _fail_on_undef(self.template(raw, ctx))
-                except jinja2.UndefinedError as ex:
-                    if before_setup:
-                        break
-                    if self.vars.get("module_setup") or self._facts_gathered:
-                        raise VarsFilesError("an undefined variable was found when attempting to template the "
-                                             "vars_files item %r: %s" % (item, ex))
-                    sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
-                                     % (item,))
-                    break
                 except Exception as ex:
                     if before_setup:
+                        if not search_path_matches:
+                            for mappings in entry["files"].values():
+                                if isinstance(mappings, list):
+                                    for mapping in mappings:
+                                        blocked_inputs.update(dict.fromkeys(mapping, frozenset()))
+                        break
+                    if isinstance(ex, jinja2.UndefinedError) and not (first_found and isinstance(ex, _CapturedTemplateError)):
+                        if self.vars.get("module_setup") or self._facts_gathered:
+                            raise VarsFilesError("an undefined variable was found when attempting to template the "
+                                                 "vars_files item %r: %s" % (item, ex))
+                        sys.stderr.write("[WARNING]: skipping vars_files item %r due to an undefined variable\n"
+                                         % (item,))
                         break
                     raise VarsFilesError("error templating the vars_files item %r: %s" % (item, ex))
                 if not isinstance(name, str):
+                    if first_found and not before_setup:
+                        raise VarsFilesError("vars_files item %r must resolve to a string" % (item,))
                     continue
                 if name.startswith(os.path.sep):
                     candidates = [name]
@@ -5639,6 +5781,14 @@ class Runtime:
             for call in analysis[2]:
                 method = call.node
                 if isinstance(method, jinja2.nodes.Getattr) and method.attr in _GATHER_STRING_METHODS:
+                    continue
+                nodes = jinja2.nodes
+                modeled = ctx.get("__ansiroll_first_found")
+                if (selector and modeled and isinstance(method, nodes.Name) and method.name == "lookup"
+                        and call.args and isinstance(call.args[0], nodes.Const)
+                        and call.args[0].value == modeled["plugin"]):
+                    pending.extend((template, (), (None, template), ancestors)
+                                   for template in _first_found_embedded_templates(call))
                     continue
                 if selector and _is_literal_vars_lookup(call):
                     continue
