@@ -2065,6 +2065,48 @@ def test_template_file_distinguishes_omit_override_from_magic_variable(tmp_path,
     assert output.read_bytes() == expected
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy Core uses a string omit token")
+@pytest.mark.parametrize("source", ["fact", "prior-play-fact", "loop"])
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_preserves_pre_resolved_omit_mapping_keys(tmp_path, source, delegated):
+    mapping = ("{'__omit_place_holder__ansiroll': 'literal', omit: 'kept'}" if source == "fact" else
+               "{omit: 'kept', '__omit_place_holder__ansiroll': 'literal'}")
+    play = "- hosts: localhost\n  gather_facts: false\n  tasks:\n"
+    if source == "fact":
+        play += '''    - set_fact:
+        alias: "{{ task_alias }}"
+      vars:
+        task_alias: "{{ ''' + mapping + ' }}"\n'
+    elif source == "prior-play-fact":
+        play += '    - set_fact:\n        alias: "{{ ' + mapping + ' }}"\n'
+        play += '''- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: "{{ alias[omit] }}"}
+'''
+    play += """    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+"""
+    if source == "loop":
+        play += '      loop: "{{ [' + mapping + '] }}"\n      loop_control: {loop_var: alias}\n'
+        play += "      when: alias[omit] == 'kept'\n"
+    if delegated:
+        play += "      delegate_to: localhost\n"
+    path = _write(tmp_path, play, {
+        "sample.j2": "prefix {{ alias }} / {{ alias[omit] }} / {{ alias['__omit_place_holder__ansiroll'] }}\n",
+    })
+    output = tmp_path / "rendered.txt"
+    mapping_text = mapping.replace("omit:", "<<Omit>>:")
+    expected = ("prefix " + mapping_text + " / kept / literal\n").encode()
+    native = _ansible(path, tmp_path)
+    assert output.read_bytes() == expected
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == native
+    assert output.read_bytes() == expected
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 
