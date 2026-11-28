@@ -4875,7 +4875,7 @@ class Runtime:
             if send_register:
                 include_register = packed
         elif (getattr(self, "_controller_result_transport", False)
-              and _has_omit_mapping_key(result)):
+              and _needs_omit_transport(result)):
             private_result = _pack_include_value(result, preserve_unsafe=True)
         if name is None:
             started_node, started_name = self._started_task_name
@@ -8890,9 +8890,10 @@ _SYNCHRONIZE_VARS = frozenset((
 ))
 
 
-def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, scalars, unsafe_paths):
+def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path, scalars, unsafe_paths, omit_paths):
     try:
-        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path, scalars, unsafe_paths)
+        return _delegate_fallback_value(value[key], undefined, errors, mapping_keys, path,
+                                        scalars, unsafe_paths, omit_paths)
     except _CapturedTemplateError as error:
         errors.append((path, str(error)))
     except jinja2.UndefinedError as error:
@@ -8906,7 +8907,8 @@ def _delegate_fallback_member(value, key, undefined, errors, mapping_keys, path,
     return None
 
 
-def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), scalars=None, unsafe_paths=None):
+def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(),
+                             scalars=None, unsafe_paths=None, omit_paths=None):
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
@@ -8919,13 +8921,16 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), sc
                                         else {"omit": True} if isinstance(key, _NativeOmit)
                                         else key for key in keys]))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys,
-                                                    (*path, wire_key), scalars, unsafe_paths)
+                                                    (*path, wire_key), scalars, unsafe_paths, omit_paths)
                 for wire_key, key in zip(wire_keys, keys)}
     if isinstance(value, (list, tuple, _HostVarEntries, _RawSnapshotList)):
         return [_delegate_fallback_member(value, index, undefined, errors, mapping_keys,
-                                          (*path, index), scalars, unsafe_paths)
+                                          (*path, index), scalars, unsafe_paths, omit_paths)
                 for index in range(len(value))]
     value = _fail_on_undef(value)
+    if omit_paths is not None and (isinstance(value, _Omit) or value is _KEYWORD_OMIT):
+        omit_paths.append(path)
+        return None
     if scalars is not None and isinstance(value, (_dt.date, bytes, range)):
         scalars.append((path, _encode_delegated_key(value)))
         return None
@@ -8971,11 +8976,13 @@ def _encode_delegated_key(key):
     raise TypeError("Unsupported delegated mapping key type %s" % type(key).__name__)
 
 
-def _pack_delegated_value(value, *, preserve_scalars=False, preserve_unsafe=False):
+def _pack_delegated_value(value, *, preserve_scalars=False, preserve_unsafe=False, preserve_omit=False):
     undefined, errors, mapping_keys = [], [], []
     scalars = [] if preserve_scalars else None
     unsafe_paths = [] if preserve_unsafe else None
-    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, scalars=scalars, unsafe_paths=unsafe_paths)
+    omit_paths = [] if preserve_omit else None
+    value = _delegate_fallback_value(value, undefined, errors, mapping_keys, scalars=scalars,
+                                     unsafe_paths=unsafe_paths, omit_paths=omit_paths)
     result = {"value": json.loads(json.dumps(value, default=str)), "undefined": undefined}
     if errors:
         result["errors"] = errors
@@ -8985,11 +8992,13 @@ def _pack_delegated_value(value, *, preserve_scalars=False, preserve_unsafe=Fals
         result["scalars"] = scalars
     if unsafe_paths:
         result["unsafe_paths"] = unsafe_paths
+    if omit_paths:
+        result["omit_paths"] = omit_paths
     return result
 
 
-def _has_omit_mapping_key(value):
-    # Already resolved aliases keep their keys in raw storage. Do not
+def _needs_omit_transport(value, *, include_values=False):
+    # Already resolved aliases keep their members in raw storage. Do not
     # evaluate unrelated lazy members just to decide how to serialize them.
     pending = [value]
     seen = set()
@@ -8998,6 +9007,10 @@ def _has_omit_mapping_key(value):
         if id(member) in seen:
             continue
         seen.add(id(member))
+        # JSON would read lazy containers during serialization, so capture any
+        # omit values they produce during that same pass.
+        if include_values and (isinstance(member, (_Omit, _LazyTplDict, _LazyTplList)) or member is _KEYWORD_OMIT):
+            return True
         if isinstance(member, dict):
             if any(isinstance(key, _NativeOmit) for key in dict.keys(member)):
                 return True
@@ -9122,6 +9135,10 @@ def _restore_rescue_scalars(packed):
                           for path, scalar in packed.get("scalars", ())))
 
 
+def _restore_delegated_omit(value, paths):
+    return _replace_delegated_values(value, ((path, _NATIVE_OMIT) for path in paths))
+
+
 def _restore_delegated_mapping_keys(value, mapping_keys):
     # Decode inner mappings before changing the keys used to reach them.
     for path, keys in reversed(mapping_keys):
@@ -9156,7 +9173,8 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
                      else [reserve(index) for index in range(len(rendered))])
         else:
             slots = None
-        result = _pack_delegated_value(rendered if slots is None else slots)
+        result = _pack_delegated_value(rendered if slots is None else slots,
+                                       preserve_omit=members is not None and _core_at_least(2, 19))
         if slots is not None:
             result["lazy_members"] = True
             if isinstance(rendered, _HostVarView):
@@ -9172,7 +9190,7 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
 
 
 def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None,
-                   mapping_keys=None):
+                   mapping_keys=None, omit_paths=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
@@ -9208,12 +9226,14 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
                         value = _delegate_template_value(value)
             # Materialize lazy values once so sending the frame cannot
             # resolve the same context a second time.
-            if mapping_keys is not None and _has_omit_mapping_key(value):
-                packed = _pack_delegated_value(value)
+            if mapping_keys is not None and _needs_omit_transport(value, include_values=omit_paths is not None):
+                packed = _pack_delegated_value(value, preserve_omit=omit_paths is not None)
                 if packed["undefined"] or packed.get("errors"):
                     continue
                 safe[key] = packed["value"]
-                mapping_keys.extend(([key, *path], keys) for path, keys in packed["mapping_keys"])
+                mapping_keys.extend(([key, *path], keys) for path, keys in packed.get("mapping_keys", ()))
+                if omit_paths is not None:
+                    omit_paths.extend([key, *path] for path in packed.get("omit_paths", ()))
             else:
                 safe[key] = json.loads(json.dumps(value, default=str))
         except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
@@ -9338,13 +9358,14 @@ def agent_main():
             lazy_play = set() if action == "synchronize" else None
             scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
             mapping_keys = [] if action == "template" else None
+            omit_paths = [] if action == "template" and _core_at_least(2, 19) else None
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
                 "runtime_id": task.get("runtime_id"),
                 "action": task.get("action"), "args": args,
                 "vars": _delegate_vars(scope, templater, resolve_keys, deferred,
                                        controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play,
-                                       mapping_keys=mapping_keys),
+                                       mapping_keys=mapping_keys, omit_paths=omit_paths),
                 "become": become, "to": task.get("delegate_to"),
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
@@ -9357,10 +9378,8 @@ def agent_main():
             if action == "template":
                 if mapping_keys:
                     frame["var_mapping_keys"] = mapping_keys
-                if _core_at_least(2, 19) and isinstance(dict.get(scope, "omit"), _Omit):
-                    # Let the file action supply its default instead of serializing
-                    # the sentinel as a string indistinguishable from user data.
-                    frame["vars"].pop("omit", None)
+                if omit_paths:
+                    frame["var_omit_paths"] = omit_paths
                 if rt._copy_transfer_check_mode is not None:
                     frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
             if lazy_play is not None and deferred:

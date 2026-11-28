@@ -1092,6 +1092,8 @@ class StrategyModule(StrategyBase):
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
+        from ansiroll.runtime import _restore_delegated_omit
+
         args = dict(frame.get("args") or {})
         src = args.get("src")
         if not isinstance(src, str) or not src:
@@ -1129,6 +1131,7 @@ class StrategyModule(StrategyBase):
                 }},
             }
             job_vars = dict(frame.get("vars") or {})
+            _restore_delegated_omit(job_vars, frame.get("var_omit_paths", ()))
             if mapping_keys := frame.get("var_mapping_keys"):
                 from ansiroll.runtime import _restore_delegated_mapping_keys
 
@@ -1160,8 +1163,9 @@ class StrategyModule(StrategyBase):
                         return _captured("unable to resolve delegated template value")
                     if "error" in resolved:
                         return _captured(resolved["error"])
+                    value = _restore_delegated_omit(_mark_unsafe(resolved["value"]), resolved.get("omit_paths", ()))
                     value = self._restore_play_fallback(
-                        _mark_unsafe(resolved["value"]), resolved["undefined"], resolved.get("errors", ()),
+                        value, resolved["undefined"], resolved.get("errors", ()),
                         resolved.get("mapping_keys", ()), runtime_marker=runtime_marker,
                     )
                     if not resolved.get("lazy_members"):

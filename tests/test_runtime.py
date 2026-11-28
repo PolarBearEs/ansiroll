@@ -1810,7 +1810,8 @@ def test_delegated_template_alias_uses_agent_filters():
     assert sent["sequence"] == ["TASK"]
 
 
-def test_delegated_template_mapping_key_scan_does_not_resolve_lazy_values():
+@pytest.mark.parametrize("omit_member", [False, True], ids=["plain", "omit-value"])
+def test_delegated_template_marker_scan_does_not_resolve_lazy_values(omit_member):
     from ansiroll import runtime as runtime_mod
 
     runtime = Runtime({}, "", {})
@@ -1821,12 +1822,19 @@ def test_delegated_template_mapping_key_scan_does_not_resolve_lazy_values():
         return "call-%d" % len(calls)
 
     runtime.templater.env.globals["lookup"] = lookup
-    data = runtime_mod._LazyTplDict({"stamp": "{{ lookup('counting') }}"}, runtime, {})
-    mapping_keys = []
-    sent = runtime_mod._delegate_vars({"data": data}, runtime.templater, mapping_keys=mapping_keys)
-    assert sent == {"data": {"stamp": "call-1"}}
+    raw = {"stamp": "{{ lookup('counting') }}"}
+    expected = {"stamp": "call-1"}
+    if omit_member:
+        raw["optional"] = runtime_mod._NATIVE_OMIT
+        expected["optional"] = None
+    data = runtime_mod._LazyTplDict(raw, runtime, {})
+    mapping_keys, omit_paths = [], []
+    sent = runtime_mod._delegate_vars({"data": data}, runtime.templater,
+                                      mapping_keys=mapping_keys, omit_paths=omit_paths)
+    assert sent == {"data": expected}
     assert calls == ["counting"]
     assert mapping_keys == []
+    assert omit_paths == ([["data", "optional"]] if omit_member else [])
 
 
 def test_delegation_resolves_selected_action_variables():
