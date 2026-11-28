@@ -5455,6 +5455,31 @@ def test_extra_vars_support_key_value_json_and_file(tmp_path):
     }
 
 
+@pytest.mark.parametrize("action", ["debug", "ansible.builtin.debug", "ansible.legacy.debug"])
+def test_standalone_debug_displays_messages_and_censors_no_log(tmp_path, monkeypatch, action):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text(f"""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Display a sample message
+      {action}: {{msg: visible sample payload}}
+    - name: Censor a sample message
+      {action}: {{msg: hidden sample payload}}
+      no_log: true
+""")
+    source, _ = compile_playbook(str(playbook))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    monkeypatch.delenv("ANSIROLL_RAW", raising=False)
+    proc = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=30)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '"msg": "visible sample payload"' in proc.stdout
+    assert '"censored":' in proc.stdout
+    assert "hidden sample payload" not in proc.stdout + proc.stderr
+
+
 def test_compiled_simple_runs_and_matches(tmp_path):
     src, _ = compile_playbook(os.path.join(FIXTURES, "simple.yml"))
     path = os.path.join(tmp_path, "compiled.py")

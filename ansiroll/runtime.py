@@ -4883,7 +4883,7 @@ class Runtime:
         else:
             verb = "changed" if status == "changed" or res.get("changed") else "ok"
             line = "%s: [%s]%s" % (verb, host, suffix)
-            if frame.get("action") == "debug":
+            if frame.get("action") in ("debug", "ansible.builtin.debug", "ansible.legacy.debug"):
                 shown = {k: v for k, v in res.items()
                          if not k.startswith("_") and k not in ("changed", "failed")}
                 line += " => %s" % json.dumps(shown, default=str, indent=4)
