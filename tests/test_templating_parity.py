@@ -45,13 +45,13 @@ def _env():
     return env
 
 
-def _summary(text, stderr=""):
+def _summary(text, stderr="", *, messages=MSG_RE):
     recap = RECAP_RE.search(text)
     assert recap, text + stderr
-    return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
+    return [json.loads(m) for m in messages.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable, summary=_summary):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
@@ -60,10 +60,10 @@ def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.execut
          "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
-    return _summary(proc.stdout, proc.stderr)
+    return summary(proc.stdout, proc.stderr)
 
 
-def _ansiroll(playbook, cwd):
+def _ansiroll(playbook, cwd, *, summary=_summary):
     src, _ = compile_playbook(str(playbook))
     script = cwd / "compiled.py"
     script.write_text(src)
@@ -71,7 +71,7 @@ def _ansiroll(playbook, cwd):
         [sys.executable, str(script)],
         cwd=str(cwd), env=_env(), capture_output=True, text=True,
     )
-    return _summary(proc.stdout + "\n" + proc.stderr)
+    return summary(proc.stdout + "\n" + proc.stderr)
 
 
 def _write(tmp_path, playbook, files=None):
@@ -84,13 +84,13 @@ def _write(tmp_path, playbook, files=None):
     return path
 
 
-def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
+def _assert_parity(tmp_path, playbook, files=None, use_strategy=False, *, summary=_summary):
     path = _write(tmp_path, playbook, files)
-    expected = _ansible(path, tmp_path)
+    expected = _ansible(path, tmp_path, summary=summary)
     if use_strategy:
-        actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+        actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", summary=summary)
     else:
-        actual = _ansiroll(path, tmp_path)
+        actual = _ansiroll(path, tmp_path, summary=summary)
     assert actual == expected
     return expected
 
@@ -2826,6 +2826,66 @@ def test_legacy_boolean_strings_in_inline_conditions(tmp_path, use_strategy):
 """, use_strategy=use_strategy)
     assert messages == ["accepted"]
     assert recap == ("1", "0", "0", "0", "1", "0", "0")
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core inline mapping view finalization")
+@pytest.mark.parametrize("native", ["true", "false"])
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_legacy_inline_assignment_preserves_key_view_output(tmp_path, monkeypatch, native, use_strategy):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", native)
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    source: {alpha: 1, beta: 2}
+    keys: "{% set mapping = source %}{% set view = mapping.keys() %}{{ view }}"
+    keys_text: "{% set mapping = {'alpha': 1, 'beta': 2} %}{{ mapping.keys() | string }}"
+  tasks:
+    - debug:
+        msg: "keys={{ keys | to_json }}"
+    - debug:
+        msg: "{{ keys_text }}"
+""", use_strategy=use_strategy)
+    assert messages == ['keys=["alpha", "beta"]', "dict_keys(['alpha', 'beta'])"]
+    assert recap == ("2", "0", "0", "0", "0", "0", "0")
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core inline mapping view finalization")
+@pytest.mark.parametrize("native", ["true", "false"])
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_legacy_inline_assignment_with_date_keys(tmp_path, monkeypatch, native, use_strategy):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", native)
+    scalar_or_list = re.compile(r'^\s*"msg": (".*"|\[[^\]]*\]),?\s*$', re.M)
+
+    def summary(text, stderr=""):
+        return _summary(text, stderr, messages=scalar_or_list)
+
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    keys: >-
+      {% set stamp = now().replace(year=2025, month=1, day=1, hour=12, minute=30, second=0, microsecond=0)
+      %}{% set mapping = {stamp.date(): 1, stamp: 2} %}{{ mapping.keys() }}
+  tasks:
+    - debug:
+        msg: "{{ keys | type_debug }}: {{ keys | to_json }}"
+    - debug:
+        msg: "{{ keys }}"
+    - debug:
+        msg: >-
+          {{ now().replace(year=2025, month=1, day=1, hour=12, minute=30, second=0, microsecond=0) }}
+    - debug:
+        msg: >-
+          stamp={{ now().replace(year=2025, month=1, day=1, hour=12, minute=30, second=0, microsecond=0) }}
+""", use_strategy=use_strategy, summary=summary)
+    if native == "true":
+        assert messages == ['list: ["2025-01-01", "2025-01-01T12:30:00"]', ["2025-01-01", "2025-01-01T12:30:00"],
+                            "2025-01-01T12:30:00", "stamp=2025-01-01 12:30:00"]
+    else:
+        rendered = "[datetime.date(2025, 1, 1), datetime.datetime(2025, 1, 1, 12, 30)]"
+        assert messages == [f"str: {json.dumps(rendered)}", rendered, "2025-01-01 12:30:00", "stamp=2025-01-01 12:30:00"]
+    assert recap == ("4", "0", "0", "0", "0", "0", "0")
 
 
 def test_lazy_container_operations_resolve_nested_values_once(tmp_path):

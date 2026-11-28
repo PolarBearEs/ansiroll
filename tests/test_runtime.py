@@ -225,6 +225,39 @@ def test_null_interpolation_respects_legacy_native_mode(monkeypatch):
         assert templater.render_string(text, ctx) == "prefix/"
 
 
+def test_legacy_inline_output_keeps_template_local_context(monkeypatch):
+    import jinja2
+
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.16.11")
+    templater = Runtime({}, "", {}).templater
+
+    pass_context = getattr(jinja2, "pass_context", None) or jinja2.contextfilter
+
+    @pass_context
+    def read_result(context, _value):
+        yield context["result"]
+
+    templater.env.filters["read_result"] = read_result
+    source = "{% set result = 'local' %}{{ 1 | read_result }}"
+    assert templater.render_string(source, {}) == "['local']"
+
+
+def test_legacy_inline_native_date_keys_can_be_sent_as_module_args(monkeypatch):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.16.11")
+    rt = Runtime({}, "", {})
+    context = {"mapping": {datetime.date(2025, 1, 1): 1, datetime.datetime(2025, 1, 1, 12, 30): 2},
+               "__ansiroll_controller_config": {"DEFAULT_JINJA2_NATIVE": True}}
+    keys = rt.templater.render_string("{% set data = mapping %}{{ data.keys() }}", context)
+    assert keys == list(context["mapping"])
+    assert json.loads(rt._module_params({"keys": keys}))["ANSIBLE_MODULE_ARGS"]["keys"] == [
+        "2025-01-01", "2025-01-01T12:30:00",
+    ]
+
+
 def test_template_file_interpolates_null_as_empty_in_legacy_native_mode(monkeypatch):
     import ansiroll.runtime as runtime_mod
 
