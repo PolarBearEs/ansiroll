@@ -3081,6 +3081,14 @@ def _keyword_omit_value(value, ctx):
     return _KEYWORD_OMIT if isinstance(value, _Omit) and ctx.get(_CHECK_MODE_TEMPLATE) is True else value
 
 
+def _string_filter(value):
+    if isinstance(value, _Omit) and _core_at_least(2, 19):
+        # Jinja's string filter preserves str subclasses, but Core's modern
+        # omit sentinel becomes ordinary text when explicitly converted.
+        return "<<Omit>>"
+    return jinja2.filters.FILTERS["string"](value)
+
+
 def _concat_keyword_segments(nodes):
     preserve_none = not _core_at_least(2, 19, 1)
     parts = [_KEYWORD_OMIT if isinstance(part, _Omit) else part
@@ -3637,6 +3645,7 @@ class _Templater:
         self.env.filters = filters
         eval_context_filter = getattr(jinja2, "pass_eval_context", None) or jinja2.evalcontextfilter
         self.env.filters["tojson"] = eval_context_filter(_jinja_tojson)
+        self.env.filters["string"] = _string_filter
         tests = _PluginDict("test", self._plugin_errors["test"])
         tests.update(self.env.tests)
         self.env.tests = tests
