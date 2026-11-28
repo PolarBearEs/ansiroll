@@ -52,13 +52,12 @@ _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ROLE_PATH_RE = re.compile(r"{{\s*role_path\s*}}")
 _USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
-_ENV_LOOKUP_RE = re.compile(
-    r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
-    r"""([A-Za-z_][A-Za-z0-9_]*)["']"""
-)
-_CONFIG_LOOKUP_RE = re.compile(
-    r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?config["']\s*,\s*["']"""
-    r"""([A-Z][A-Z0-9_]*)["']"""
+_CONTROLLER_LOOKUP_TERMS = {
+    "env": re.compile(r"[A-Za-z_][A-Za-z0-9_]*"),
+    "config": re.compile(r"[A-Z][A-Z0-9_]*"),
+}
+_LEGACY_FIRST_LOOKUP = re.compile(
+    r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?(env|config)["']\s*,\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"""
 )
 
 
@@ -936,10 +935,12 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
             result["_gather_setup_compile_vars"] = play_vars
     # Retain authored selectors and compile-selected definitions, including
     # definitions needed during ordered replay before later files shadow them.
+    template_files = []
     lookup_sources = {
         **result,
-        "tasks": _selected_include_lookup_nodes(result["tasks"]),
-        "handlers": _selected_include_lookup_nodes(result["handlers"]),
+        "gather_when": [_lookup_expression_source(cond) for cond in result["gather_when"]],
+        "tasks": _selected_include_lookup_nodes(result["tasks"], template_files),
+        "handlers": _selected_include_lookup_nodes(result["handlers"], template_files),
         "deferred_vars_files": [entry["names"] for entry in deferred],
         "ordered_vars_file_inputs": ordered_lookup_sources,
     }
@@ -948,7 +949,9 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     lookup_sources.pop("gather_setup_defaults", None)
     lookup_sources.pop("gather_action_defaults", None)
     lookup_sources.pop("_gather_setup_compile_vars", None)
-    names = _controller_env_names(lookup_sources)
+    lookup_sources.pop("jinja_plugins", None)
+    lookups = _controller_lookup_names(lookup_sources, template_files=template_files)
+    names = lookups["env"]
     if "_gather_setup_scoped" in result:
         result["_gather_compile_env_names"] = sorted(names)
     if names:
@@ -957,7 +960,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         }
     from ansible import constants as C
 
-    config_names = _controller_config_names(lookup_sources)
+    config_names = lookups["config"]
     config_names.update(("ALLOW_BROKEN_CONDITIONALS", "DEFAULT_JINJA2_NATIVE",
                          "INJECT_FACTS_AS_VARS", "DEFAULT_HASH_BEHAVIOUR"))
     if setup_defaults or gather_defaults:
@@ -1056,7 +1059,7 @@ def _ordered_vars_file_inputs(ordered, deferred, compile_selections):
     return mutable, sources
 
 
-def _selected_include_lookup_nodes(nodes):
+def _selected_include_lookup_nodes(nodes, template_files):
     """Controller values are captured for tasks selected at build time."""
     selected = []
     for node in nodes:
@@ -1066,9 +1069,28 @@ def _selected_include_lookup_nodes(nodes):
                              if branch["include_build_selected"]]
         for key in ("block", "rescue", "always", "tasks", "handlers"):
             if node.get(key):
-                node[key] = _selected_include_lookup_nodes(node[key])
+                node[key] = _selected_include_lookup_nodes(node[key], template_files)
+        for key in ("when", "changed_when", "failed_when", "until", "loop_break_when"):
+            if node.get(key):
+                node[key] = [_lookup_expression_source(cond) for cond in node[key]]
+        args = node.get("args") or {}
+        baked = node.pop("_baked", None)
+        if baked and node.get("special") == "template":
+            unresolved = bool(node.get("_baked_tree") or node.get("_baked_absolute_tree"))
+            template_files.extend((source, args, unresolved) for source in baked.values() if isinstance(source, str))
+        if node.get("special") == "assert" and "that" in args:
+            node["args"] = {**args, "that": [_lookup_expression_source(cond) for cond in args["that"]]}
+        if node.get("special") == "debug" and "var" in args:
+            node["args"] = {**args, "var": _lookup_expression_source(args["var"])}
         selected.append(node)
     return selected
+
+
+def _lookup_expression_source(value):
+    # Conditions and debug.var also evaluate Jinja without template delimiters.
+    if isinstance(value, str) and not _is_templated(value):
+        return "{{ " + value + " }}"
+    return value
 
 
 def _apply_force_handlers_default(play):
@@ -1121,15 +1143,20 @@ def _setup_module_defaults(play, action):
 
 def _controller_env_names(value, *, trusted_only=False):
     """Find literal controller-side env lookups that the target must reproduce."""
-    return _controller_lookup_names(value, _ENV_LOOKUP_RE, trusted_only=trusted_only)
+    return _controller_lookup_names(value, trusted_only=trusted_only)["env"]
 
 
 def _controller_config_names(value, *, trusted_only=False):
     """Find literal config lookups whose controller values must be preserved."""
-    return _controller_lookup_names(value, _CONFIG_LOOKUP_RE, trusted_only=trusted_only)
+    return _controller_lookup_names(value, trusted_only=trusted_only)["config"]
 
 
-def _controller_lookup_names(value, pattern, *, trusted_only=False):
+def _controller_lookup_names(value, *, trusted_only=False, template_files=()):
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+
+    from .runtime import (_FactKeyTemplate, _selector_scope, _setup_builtin_lookup, _Templater,
+                          _template_file_options, _template_task_only_args)
+
     if trusted_only:
         try:
             from ansible.template import is_trusted_as_template
@@ -1137,20 +1164,104 @@ def _controller_lookup_names(value, pattern, *, trusted_only=False):
             def is_trusted_as_template(value):
                 return not getattr(value, "__UNSAFE__", False)
 
-    names = set()
+    env = Environment()
+    names = {plugin: set() for plugin in _CONTROLLER_LOOKUP_TERMS}
+    sources = set()
+
+    def collect_first_terms(text):
+        for plugin, term in _LEGACY_FIRST_LOOKUP.findall(text):
+            if _CONTROLLER_LOOKUP_TERMS[plugin].fullmatch(term):
+                names[plugin].add(term)
+
+    def collect(text, environment):
+        templates = [(text, environment)]
+        while templates:
+            source, parser = templates.pop()
+            if (source, parser) in sources or not _Templater._LOOKUP_CALL.search(source):
+                continue
+            sources.add((source, parser))
+            try:
+                bindings, _, calls, _, _ = _selector_scope(parser.parse(source), {}, retain_mutable=True)
+            except (TemplateSyntaxError, RecursionError):
+                continue
+            for call in calls:
+                target = call.node
+                if (not isinstance(target, nodes.Name) or target.name not in ("lookup", "query", "q")
+                        or None not in bindings.get(id(target), {}).get(target.name, (None,))):
+                    continue
+                # The runtime templates string terms and option values before dispatch.
+                inputs = [*call.args[1:], *(keyword.value for keyword in call.kwargs)]
+                seen_inputs = set()
+                while inputs:
+                    arg = inputs.pop()
+                    if id(arg) in seen_inputs:
+                        continue
+                    seen_inputs.add(id(arg))
+                    if isinstance(arg, nodes.Const) and _is_templated(arg.value):
+                        templates.append((arg.value, env))
+                    elif isinstance(arg, (nodes.List, nodes.Tuple)):
+                        inputs.extend(arg.items)
+                    elif isinstance(arg, nodes.Dict):
+                        for pair in arg.items:
+                            inputs.extend((pair.key, pair.value))
+                    elif isinstance(arg, nodes.Name):
+                        inputs.extend(bindings.get(id(arg), {}).get(arg.name, ()))
+                if (not call.args or not isinstance(call.args[0], nodes.Const)
+                        or not isinstance(call.args[0].value, str)):
+                    continue
+                plugin = _setup_builtin_lookup(call.args[0].value)
+                if plugin in names:
+                    pattern = _CONTROLLER_LOOKUP_TERMS[plugin]
+                    names[plugin].update(arg.value for arg in call.args[1:] if isinstance(arg, nodes.Const)
+                                         and isinstance(arg.value, str) and pattern.fullmatch(arg.value))
+
     seen = set()
     pending = [value]
     while pending:
         item = pending.pop()
-        if isinstance(item, str) and (not trusted_only or is_trusted_as_template(item)):
-            names.update(pattern.findall(item))
+        if isinstance(item, str):
+            if not trusted_only or is_trusted_as_template(item):
+                if _is_templated(item):
+                    collect(item, env)
+                else:
+                    # Some plain strings become expressions only at runtime,
+                    # such as conditions supplied through an assert args mapping.
+                    collect_first_terms(item)
         elif isinstance(item, (dict, list, tuple)) and id(item) not in seen:
             seen.add(id(item))
             if isinstance(item, dict):
-                pending.extend(item)
-                pending.extend(item.values())
+                if item.keys() not in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"},
+                                       {"__ansiroll_untrusted_condition__"}):
+                    pending.extend(item.values())
+                    # Explicitly templated fact keys also appear as sources in
+                    # set_fact_key_templates. Other keys are normally data.
+                    for key in item:
+                        if (isinstance(key, _FactKeyTemplate)
+                                or trusted_only and _is_templated(key) and is_trusted_as_template(key)):
+                            collect_first_terms(key)
             else:
                 pending.extend(item)
+
+    template_options = set(_template_task_only_args()) - {"newline_sequence", "output_encoding"}
+    for source, args, unresolved in template_files:
+        if not _Templater._LOOKUP_CALL.search(source):
+            continue
+        options = {key: args[key] for key in template_options & args.keys()}
+        for key, value in options.items():
+            if isinstance(value, dict) and value.keys() == {"__ansiroll_unsafe__"}:
+                options[key] = value["__ansiroll_unsafe__"]
+        if unresolved or _contains_dynamic_value(options) or {"_raw_params", "_variable_params"} & args.keys():
+            # Preserve the previous single-term behavior where the source or
+            # its delimiters are only resolved at launch.
+            collect_first_terms(source)
+            continue
+        try:
+            body, settings, _ = _template_file_options(source, options, lambda _: None)
+            parser = env.overlay(**dict(settings))
+        except (AssertionError, SyntaxError, TypeError, ValueError):
+            # Invalid options are reported by the template task if it runs.
+            continue
+        collect(body, parser)
     return names
 
 
