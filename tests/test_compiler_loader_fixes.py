@@ -2543,6 +2543,99 @@ def test_baked_role_file_preserves_binary_content(tmp_path, action, source_layou
     assert extracted.read_bytes() == payload
 
 
+def test_compiled_legacy_file_actions_embed_builtin_sources(tmp_path):
+    payload = b"controller payload\x00\xff"
+    (tmp_path / "source.bin").write_bytes(payload)
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("inside.bin", payload)
+    (tmp_path / "out").mkdir()
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.legacy.copy:
+        src: source.bin
+        dest: "{{ playbook_dir }}/copied.bin"
+    - ansible.legacy.unarchive:
+        src: source.zip
+        dest: "{{ playbook_dir }}/out"
+""")
+    source, manifest = compile_playbook(str(playbook))
+    assert manifest["fallback_tasks"] == []
+    archive.unlink()
+    (tmp_path / "source.bin").unlink()
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "copied.bin").read_bytes() == payload
+    assert (tmp_path / "out/inside.bin").read_bytes() == payload
+
+
+def test_compiled_legacy_unarchive_preserves_remote_module_override(tmp_path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "unarchive.py").write_text("""#!/usr/bin/python
+from ansible.module_utils.basic import AnsibleModule
+
+module = AnsibleModule(argument_spec={"src": {}, "dest": {}, "remote_src": {"type": "bool"}})
+module.exit_json(changed=False, msg="local module selected")
+""")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.legacy.unarchive: {src: absent-archive, dest: /tmp, remote_src: true}
+      register: unpacked
+    - assert:
+        that: unpacked.msg == 'local module selected'
+""")
+    artifact = tmp_path / "compiled.py"
+    compile_result = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook),
+                                     "-o", str(artifact)], cwd=tmp_path, env=_env(),
+                                    capture_output=True, text=True, timeout=60)
+    assert compile_result.returncode == 0, compile_result.stdout + compile_result.stderr
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=45)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_legacy_file_actions_preserve_local_plugins(tmp_path):
+    from tests import ansible_playbook_command
+
+    plugins = tmp_path / "action_plugins"
+    plugins.mkdir()
+    for action in ("copy", "unarchive"):
+        (plugins / (action + ".py")).write_text("""from ansible.plugins.action import ActionBase
+
+class ActionModule(ActionBase):
+    def run(self, tmp=None, task_vars=None):
+        return {"changed": False, "msg": "local %s handled " + self._task.args["src"]}
+""" % action)
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  tasks:
+    - ansible.legacy.copy: {src: absent-copy}
+      register: copied
+    - ansible.legacy.unarchive: {src: absent-unarchive}
+      register: unpacked
+    - assert:
+        that:
+          - copied.msg == 'local copy handled absent-copy'
+          - unpacked.msg == 'local unarchive handled absent-unarchive'
+""")
+    cmd = ansible_playbook_command() + ["-i", "localhost,", "-c", "local", str(playbook)]
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = subprocess.run(cmd, cwd=tmp_path,
+                                env={**_env(), "ANSIBLE_COLLECTIONS_PATH": os.path.join(ROOT, "collections"),
+                                     "ANSIBLE_STRATEGY": strategy},
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_dynamic_role_template_limits_dot_prefix_to_action_directories(tmp_path):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost

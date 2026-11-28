@@ -3243,8 +3243,11 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
     role_defaults, role_vars = _role_vars(task)
 
     args = _clean_args(task.args)
-    unarchive = action.rsplit(".", 1)[-1] == "unarchive"
-    builtin_unarchive = unarchive and _is_builtin_unarchive(action)
+    action_name = action.rsplit(".", 1)[-1]
+    legacy_file_action = action in ("ansible.legacy.copy", "ansible.legacy.unarchive")
+    custom_file_action = legacy_file_action and not _is_builtin_legacy_file_action(task, action_name)
+    unarchive = action_name == "unarchive"
+    builtin_unarchive = unarchive and not custom_file_action and _is_builtin_unarchive(action)
     if builtin_unarchive and "copy" in args:
         literal_copy = _source_flag(args["copy"])
         if literal_copy is not None:
@@ -3332,8 +3335,13 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
         node["delegate_to"] = _tag_untrusted(delegate, template_syntax_only=True)
         node["delegate_facts"] = _boolean_or_template(node["delegate_facts"])
 
-    if builtin_unarchive or (action in BAKED_ACTIONS and not unarchive):
-        source_action = action.rsplit(".", 1)[-1]
+    if custom_file_action:
+        node["special"] = None
+        node["_custom_file_source_action"] = True
+        node["fallback"] = True
+        node["fallback_reason"] = "custom %s requires its Ansible action plugin" % action
+    elif builtin_unarchive or ((legacy_file_action or action in BAKED_ACTIONS) and not unarchive):
+        source_action = action_name
         unknown_defaults = False
         argument_layers = []
         if source_action in ("copy", "unarchive"):
@@ -3768,6 +3776,20 @@ def _bake_sources(node, task, basedir, *, controller_execution=False, unknown_de
     node["_baked"] = baked
     if meta:
         node["_baked_meta"] = meta
+
+
+def _is_builtin_legacy_file_action(task, name):
+    """Resolve the handler selected for an explicit ansible.legacy file action."""
+    from ansible.plugins.loader import action_loader, module_loader
+
+    builtin = "ansible.builtin." + name
+    collections = getattr(task, "collections", None)
+    module = module_loader.find_plugin_with_context(task.action, collection_list=collections)
+    handler = getattr(module, "action_plugin", None) if module.resolved else None
+    actual = action_loader.find_plugin_with_context(handler or task.action, collection_list=collections)
+    expected = action_loader.find_plugin_with_context(builtin)
+    return (actual.resolved and expected.resolved
+            and os.path.realpath(actual.plugin_resolved_path) == os.path.realpath(expected.plugin_resolved_path))
 
 
 def _is_builtin_unarchive(action):
