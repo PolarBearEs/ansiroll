@@ -96,6 +96,20 @@ def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_to_datetime_filter_supports_formats_and_arithmetic(tmp_path, use_strategy):
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: "seconds={{ ('2024-02-29 01:02:03' | to_datetime - '2024-02-29 01:00:00' | to_datetime).total_seconds() }}"
+    - debug:
+        msg: "year={{ ('29/02/2024' | ansible.builtin.to_datetime(format='%d/%m/%Y')).year }}"
+""", use_strategy=use_strategy)
+    assert messages == ["seconds=123.0", "year=2024"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
 @pytest.mark.parametrize("custom_path", [True, False], ids=["custom", "omit"])
 def test_implicit_setup_respects_gather_subset_and_fact_path(tmp_path, monkeypatch, use_strategy, custom_path):
     monkeypatch.setenv("ANSIROLL_FAST_FACTS", "1")

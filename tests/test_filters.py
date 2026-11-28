@@ -1,5 +1,7 @@
 """Unit tests for the runtime's vendored Jinja2 filters and tests. No Ansible needed."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from ansiroll.runtime import _Templater, _UnsafeTemplate, _f_to_yaml, _yaml_module, _yaml_plain
@@ -80,6 +82,14 @@ def test_to_uuid_stable(t):
     a = render(t, "{{ 'x' | to_uuid }}")
     b = render(t, "{{ 'x' | to_uuid }}")
     assert a == b and len(a) == 36
+
+
+def test_to_datetime_returns_native_values(t):
+    assert t.evaluate("'2024-02-29 01:02:03' | to_datetime", {}) == datetime(2024, 2, 29, 1, 2, 3)
+    assert t.evaluate(
+        "'29/02/2024 01:02:03.456 +0200' | ansible.builtin.to_datetime(format='%d/%m/%Y %H:%M:%S.%f %z')",
+        {},
+    ) == datetime(2024, 2, 29, 1, 2, 3, 456000, timezone(timedelta(hours=2)))
 
 
 @pytest.mark.parametrize("expr,ctx,expected", [
