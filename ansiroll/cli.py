@@ -796,6 +796,9 @@ def _reserve_closed_standard_fds(stack):
 
 
 def _shares_open_file_description(first, second):
+    from ctypes import CDLL, c_long, c_ulong
+
+    pid = os.getpid()
     if sys.platform.startswith("linux"):
         import fcntl
 
@@ -803,8 +806,54 @@ def _shares_open_file_description(first, second):
             # Linux supports F_DUPFD_QUERY before some Python versions name it.
             return fcntl.fcntl(first, getattr(fcntl, "F_DUPFD_QUERY", 1027), second) == 1
         except OSError:
-            pass  # Older kernels cannot query descriptor identity this way.
-    return False
+            pass
+        # Linux libc has no kcmp wrapper. Use SYS_kcmp on these Linux ABIs.
+        machine = os.uname().machine
+        if sys.maxsize > 2**32:
+            syscall = {"x86_64": 312, "aarch64": 272, "riscv64": 272}.get(machine)
+        else:
+            syscall = {"i386": 349, "i686": 349, "armv7l": 378}.get(machine)
+        if syscall is not None:
+            # Linux KCMP_FILE is 0.
+            result = CDLL(None).syscall(c_long(syscall), pid, pid, 0, c_ulong(first), c_ulong(second))
+            if result >= 0:
+                return result == 0
+    elif sys.platform.startswith("freebsd"):
+        kcmp = getattr(CDLL(None), "kcmp", None)
+        if kcmp is not None:
+            result = kcmp(pid, pid, 100, c_ulong(first), c_ulong(second))  # FreeBSD KCMP_FILE
+            if result >= 0:
+                return result == 0
+    return None
+
+
+def _copy_log_range(spool, saved, start, end):
+    spool.seek(start)
+    with open(saved, "wb", closefd=False) as output:
+        while start < end:
+            chunk = spool.read(min(shutil.COPY_BUFSIZE, end - start))
+            if not chunk:
+                break
+            output.write(chunk)
+            start += len(chunk)
+
+
+def _replay_diagnostic_file_pair(spool, outputs, initial_size):
+    # Read both cursors before seeking the spool, which was also stdout.
+    outputs = [(writer.tell(), saved, start) for writer, saved, start in outputs]
+    # Append writes share an EOF. Replay in order up to the last byte written
+    # by each handle, so each original open description ends at its own offset.
+    position = initial_size
+    appends = sorted((end, saved) for end, saved, start in outputs if start is None)
+    for end, saved in appends:
+        if end > position:
+            _copy_log_range(spool, saved, position, end)
+            position = end
+    # Independent positioned writers share the staged bytes in overlapping
+    # ranges. Replay those final bytes through each handle to advance its cursor.
+    for end, saved, start in outputs:
+        if start is not None and end > start:
+            _copy_log_range(spool, saved, start, end)
 
 
 @contextmanager
@@ -823,15 +872,63 @@ def _hold_compile_diagnostics(input_alias, *, shared_stdout=False):
         info = _writable_stream_stat(fd)
         if info is not None and (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
             destinations[fd] = info
-    if 1 in destinations and 2 in destinations:
-        shared_stdout = shared_stdout or _shares_open_file_description(1, 2)
+    independent_log = None
+    if not shared_stdout and 1 in destinations and 2 in destinations and os.path.samestat(
+        destinations[1], destinations[2],
+    ):
+        shared_stdout = _shares_open_file_description(1, 2)
+        if shared_stdout is False and stat.S_ISREG(destinations[1].st_mode):
+            independent_log = destinations[1]
     with ExitStack() as buffers, ExitStack() as redirects:
         if destinations:
             _reserve_closed_standard_fds(buffers)
+        log_spool = None
+        log_initial_size = 0
+        log_starts = {}
+        log_outputs = []
+        if independent_log is not None:
+            from fcntl import F_GETFL, F_SETFL, fcntl
+
+            for fd in (1, 2):
+                append = fcntl(fd, F_GETFL) & os.O_APPEND
+                log_starts[fd] = None if append else os.lseek(fd, 0, os.SEEK_CUR)
+            starts = [start for start in log_starts.values() if start is not None]
+            mixed = len(starts) == 1
+            # A positioned write past EOF can leave a gap in the append range.
+            # Keep separate spools there so replay cannot materialize that hole.
+            if not mixed or starts[0] <= independent_log.st_size:
+                log_spool = buffers.enter_context(tempfile.NamedTemporaryFile(buffering=0))
+            if log_spool is not None and log_starts[1] is None:
+                # The named temporary file wraps an already opened descriptor.
+                spool_fd = log_spool.fileno()
+                fcntl(spool_fd, F_SETFL, fcntl(spool_fd, F_GETFL) | os.O_APPEND)
+            if log_spool is not None and mixed:
+                # Only a mixed pair needs the original EOF in the spool.
+                try:
+                    log_spool.truncate(independent_log.st_size)
+                except OSError as ex:
+                    if ex.errno != errno.EFBIG:
+                        raise
+                    log_spool.close()
+                    log_spool = None
+                else:
+                    log_initial_size = independent_log.st_size
+            if log_spool is not None:
+                spool_info = os.fstat(log_spool.fileno())
+                original_streams[(spool_info.st_dev, spool_info.st_ino)] = independent_log
         for fd, info in destinations.items():
             saved = os.dup(fd)
             buffers.callback(os.close, saved)
-            if shared_stdout and fd == 2 and stdout_spool is not None:
+            if log_spool is not None and fd in log_starts:
+                start = log_starts[fd]
+                if fd == 1:
+                    spool = log_spool
+                else:
+                    mode = "a+b" if start is None else "r+b"
+                    spool = buffers.enter_context(open(log_spool.name, mode, buffering=0))
+                spool.seek(0 if start is None else start)
+                log_outputs.append((spool, saved, start))
+            elif shared_stdout and fd == 2 and stdout_spool is not None:
                 spool = stdout_spool
             else:
                 spool = buffers.enter_context(tempfile.TemporaryFile())
@@ -859,6 +956,8 @@ def _hold_compile_diagnostics(input_alias, *, shared_stdout=False):
                         ctypes.CDLL(None).fflush(None)
             finally:
                 redirects.close()
+            if log_spool is not None and not input_alias(independent_log):
+                _replay_diagnostic_file_pair(log_spool, log_outputs, log_initial_size)
             for info, spool, saved in pending:
                 if spool.seek(0, os.SEEK_END) and not input_alias(info):
                     spool.seek(0)

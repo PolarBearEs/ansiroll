@@ -493,14 +493,28 @@ with cli._hold_compile_diagnostics(lambda info: False):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux descriptor identity query")
-def test_file_compile_preserves_shell_merged_diagnostic_order(tmp_path):
+@pytest.mark.parametrize("fallback", [False, True])
+def test_file_compile_preserves_shell_merged_diagnostic_order(monkeypatch, tmp_path, fallback):
     import fcntl
 
+    query = getattr(fcntl, "F_DUPFD_QUERY", 1027)
     log = tmp_path / "diagnostics"
     driver = """
+import errno
+import fcntl
 import os
 import sys
 from ansiroll import cli
+
+if sys.argv[2] == "True":
+    original_fcntl = fcntl.fcntl
+
+    def fcntl_without_dupfd_query(fd, command, *args):
+        if command == getattr(fcntl, "F_DUPFD_QUERY", 1027):
+            raise OSError(errno.EINVAL, "F_DUPFD_QUERY unavailable")
+        return original_fcntl(fd, command, *args)
+
+    fcntl.fcntl = fcntl_without_dupfd_query
 
 def compile_playbook(*args, **kwargs):
     os.write(2, b"first\\n")
@@ -513,14 +527,100 @@ raise SystemExit(cli.main(["compile", "play.yml", "-o", sys.argv[1]]))
 """
     output = tmp_path / "compiled.py"
     with log.open("wb") as stdout:
-        try:
-            fcntl.fcntl(stdout.fileno(), getattr(fcntl, "F_DUPFD_QUERY", 1027), stdout.fileno())
-        except OSError:
-            pytest.skip("the kernel does not support F_DUPFD_QUERY")
-        subprocess.run([sys.executable, "-c", driver, str(output)], stdout=stdout,
+        if fallback:
+            original_fcntl = fcntl.fcntl
+
+            def fcntl_without_dupfd_query(fd, command, *args):
+                if command == query:
+                    raise OSError(errno.EINVAL, "F_DUPFD_QUERY unavailable")
+                return original_fcntl(fd, command, *args)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(fcntl, "fcntl", fcntl_without_dupfd_query)
+                if cli._shares_open_file_description(stdout.fileno(), stdout.fileno()) is None:
+                    pytest.skip("the kernel blocks kcmp or does not implement it")
+        else:
+            try:
+                fcntl.fcntl(stdout.fileno(), query, stdout.fileno())
+            except OSError:
+                pytest.skip("the kernel does not support F_DUPFD_QUERY")
+        subprocess.run([sys.executable, "-c", driver, str(output), str(fallback)], stdout=stdout,
                        stderr=subprocess.STDOUT, check=True, timeout=10)
     assert output.read_bytes() == b"pass\n"
     assert log.read_bytes().splitlines()[:3] == [b"first", b"second", b"third"]
+
+
+@pytest.mark.parametrize("mode", ["positioned", "append", "positioned_large", "low_fds"])
+def test_compile_diagnostic_capture_preserves_independent_file_write_order(tmp_path, mode):
+    if mode == "low_fds" and not sys.platform.startswith("linux"):
+        pytest.skip("requires Linux procfs")
+    log = tmp_path / "diagnostics"
+    log.write_bytes(b"original")
+    if mode == "positioned_large":
+        with log.open("r+b") as output:
+            output.truncate(1024 * 1024)
+    driver = """
+import os
+import sys
+from ansiroll import cli
+
+if sys.argv[1] == "positioned_large":
+    import resource
+    _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (128 * 1024, hard))
+elif sys.argv[1] == "low_fds":
+    import resource
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    free_fd = max(map(int, os.listdir("/proc/self/fd")))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (free_fd + 4, hard))
+
+with cli._hold_compile_diagnostics(lambda info: False):
+    os.write(2, b"err")
+    os.write(1, b"out")
+    os.write(2, b"end")
+"""
+    open_mode = "ab" if mode == "append" else "r+b"
+    with log.open(open_mode) as stdout, log.open(open_mode) as stderr:
+        if cli._shares_open_file_description(stdout.fileno(), stderr.fileno()) is None:
+            pytest.skip("the OS cannot verify independent open file descriptions")
+        subprocess.run([sys.executable, "-c", driver, mode], stdout=stdout, stderr=stderr,
+                       check=True, timeout=10)
+        if mode == "append":
+            assert log.read_bytes() == b"originalerroutend"
+            assert stdout.tell() == 14
+            assert stderr.tell() == 17
+        else:
+            with log.open("rb") as output:
+                assert output.read(8) == b"outendal"
+            assert log.stat().st_size == (1024 * 1024 if mode == "positioned_large" else 8)
+            assert stdout.tell() == 3
+            assert stderr.tell() == 6
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires sparse file block counts")
+def test_compile_diagnostic_capture_preserves_sparse_diagnostic_file(tmp_path):
+    log = tmp_path / "diagnostics"
+    offset = 1024 * 1024
+    control = tmp_path / "sparse"
+    with control.open("wb") as output:
+        output.seek(offset)
+        output.write(b"outerr")
+    if control.stat().st_blocks * 512 >= offset:
+        pytest.skip("the filesystem cannot create a sparse file")
+    driver = """
+import os
+from ansiroll import cli
+
+with cli._hold_compile_diagnostics(lambda info: False):
+    os.write(1, b"out")
+    os.write(2, b"err")
+"""
+    with log.open("wb") as stdout, log.open("ab") as stderr:
+        stdout.seek(offset)
+        subprocess.run([sys.executable, "-c", driver], stdout=stdout, stderr=stderr,
+                       check=True, timeout=10)
+    assert log.read_bytes() == control.read_bytes()
+    assert log.stat().st_blocks == control.stat().st_blocks
 
 
 def test_compile_diagnostic_capture_keeps_saved_stream_off_closed_stdout():
