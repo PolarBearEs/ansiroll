@@ -23,6 +23,7 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+from tests import ansible_playbook_command
 
 pytest.importorskip("ansible")
 
@@ -5821,7 +5822,8 @@ def test_strategy_controller_only_play_uses_controller_python(tmp_path):
     assert "controller only" in proc.stdout
 
 
-def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None):
+def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="localhost,", timeout=None,
+                       command=("ansible-playbook",)):
     path = tmp_path / "play.yml"
     path.write_text(playbook)
     env = os.environ.copy()
@@ -5831,7 +5833,7 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
     env["ANSIBLE_NOCOLOR"] = "1"
     env.update(environment or {})
     return subprocess.run(
-        ["ansible-playbook", "-i", inventory, str(path), *args],
+        [*command, "-i", inventory, str(path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -7190,6 +7192,64 @@ def test_expanded_include_honors_explicit_and_templated_false_become(tmp_path, m
     runtime.run_play(_compiled_plays(source, tmp_path)[0])
     assert not runtime.failed
     assert recorded == [("first", False), ("second", False)]
+
+
+@pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
+@pytest.mark.parametrize("all_skipped", [True, False], ids=["all-skipped", "last-skipped"])
+def test_skipped_include_loop_register_and_recap(tmp_path, runner, all_skipped):
+    from ansiroll.loader import _core_version
+
+    (tmp_path / "child.yml").write_text("- debug: {msg: executed-child}\n")
+    play = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+"""
+    playbook = play + """\
+    - include_tasks: child.yml
+      loop: [1, 2]
+      when: CONDITION
+      register: selected
+""".replace("CONDITION", "false" if all_skipped else "item == 1")
+    if runner != "standalone":
+        # The second play reads the register from the controller's fact cache.
+        playbook += play
+    legacy = _core_version() < (2, 11)
+    aggregate_skipped = all_skipped and not legacy
+    playbook += """\
+    - assert:
+        that:
+          - (selected is skipped) == EXPECTED
+          - selected.msg == 'MESSAGE'
+          - selected.results | length == 2
+          - (selected.results[0] is skipped) == FIRST_SKIPPED
+          - selected.results[1] is skipped
+""".replace("FIRST_SKIPPED", "true" if all_skipped else "false").replace(
+        "EXPECTED", "true" if aggregate_skipped else "false").replace(
+        "MESSAGE", "All items skipped" if aggregate_skipped else "All items completed")
+    if all_skipped and legacy:
+        playbook += """\
+          - selected.skipped is undefined
+          - selected.failed is undefined
+"""
+    if runner == "standalone":
+        path = tmp_path / "play.yml"
+        path.write_text(playbook)
+        script = tmp_path / "compiled.py"
+        script.write_text(compile_playbook(str(path))[0])
+        proc = subprocess.run(
+            [sys.executable, str(script)], cwd=tmp_path, text=True, capture_output=True, timeout=30,
+        )
+    else:
+        strategy = "linear" if runner == "linear" else "ansiroll.core.ansiroll"
+        proc = _run_strategy_play(
+            tmp_path, playbook, environment={"ANSIBLE_STRATEGY": strategy}, timeout=60,
+            command=ansible_playbook_command(),
+        )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert ("executed-child" in proc.stdout) is not all_skipped
+    assert re.search(r"localhost\s+:.*\bskipped=%d\b" % int(all_skipped), proc.stdout)
 
 
 @pytest.mark.parametrize("runner", ["linear", "standalone", "strategy"])
