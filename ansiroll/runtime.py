@@ -1516,12 +1516,14 @@ def _f_quote(v):
         return _to_text_str(v)
 
 
+def _date_json_default(value, fallback=str):
+    # datetime is a subclass of date and supplies its own ISO format.
+    return value.isoformat() if isinstance(value, _dt.date) else fallback(value)
+
+
 class _DateJSONEncoder(json.JSONEncoder):
     def default(self, value):
-        # datetime is a subclass of date and supplies its own ISO format.
-        if isinstance(value, _dt.date):
-            return value.isoformat()
-        return super().default(value)
+        return _date_json_default(value, super().default)
 
 
 def _f_to_json(v, **kwargs):
@@ -4899,7 +4901,7 @@ class Runtime:
         elif self.pretty:
             self._emit_pretty(frame)
         else:
-            sys.stdout.write(RESULT_MARKER + " " + json.dumps(frame, default=str) + "\n")
+            sys.stdout.write(RESULT_MARKER + " " + json.dumps(frame, default=_date_json_default) + "\n")
             sys.stdout.flush()
 
     def _emit_pretty(self, frame):
@@ -4921,12 +4923,12 @@ class Runtime:
         if frame.get("is_item"):
             label = res.get("_ansible_item_label", frame.get("item"))
             if not isinstance(label, str):
-                label = json.dumps(label, default=str)
+                label = json.dumps(label, default=_date_json_default)
             suffix = " => (item=%s)" % label
         if status in ("failed", "unreachable"):
             line = "fatal: [%s]:%s %s! => %s" % (
                 host, suffix, status.upper() if status == "unreachable" else "FAILED",
-                json.dumps(res, default=str))
+                json.dumps(res, default=_date_json_default))
             if frame.get("ignored"):
                 line += "\n...ignoring"
         elif status == "skipped":
@@ -4939,7 +4941,7 @@ class Runtime:
             if frame.get("action") == "debug":
                 shown = {k: v for k, v in res.items()
                          if not k.startswith("_") and k not in ("changed", "failed")}
-                line += " => %s" % json.dumps(shown, default=str, indent=4)
+                line += " => %s" % json.dumps(shown, default=_date_json_default, indent=4)
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
@@ -8819,8 +8821,8 @@ def _chan_recv():
     return json.loads(body.decode("utf-8", "surrogateescape"))
 
 
-def _chan_send(out_fd, obj):
-    b = json.dumps(obj, default=str).encode("utf-8", "surrogateescape")
+def _chan_send(out_fd, obj, *, json_default=str):
+    b = json.dumps(obj, default=json_default).encode("utf-8", "surrogateescape")
     view = memoryview(struct.pack(">I", len(b)) + b)
     while view:
         written = os.write(out_fd, view)
@@ -9224,7 +9226,7 @@ def agent_main():
                  module_bundle=g.get("_ansiroll_import_bytes"),
                  resource_reader=g.get("_ansiroll_resource_read"))
     rt._invocation_check_mode = bool(g.get("_INJECTED_INVOCATION_CHECK_MODE", check_mode))
-    rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame})
+    rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame}, json_default=_date_json_default)
     rt._controller_result_transport = True
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_rescue = lambda task, result, args: _chan_send(resp_fd, {
