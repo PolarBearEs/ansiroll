@@ -1620,7 +1620,7 @@ def _tag_untrusted(value, template_syntax_only=False):
 
     def walk(v):
         if isinstance(v, str) and untrusted(v):
-            if not template_syntax_only or "{{" in v or "{%" in v:
+            if not template_syntax_only or "{{" in v or "{%" in v or "{#" in v:
                 return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
             return {_FactKeyTemplate(k) if isinstance(k, str) and ("{{" in k or "{%" in k)
@@ -1991,6 +1991,10 @@ class _AppliedExecutionFlag(str):
     """An inherited flag whose value is resolved by the include invocation."""
 
 
+def _is_execution_flag_template(value, keyword):
+    return _is_templated(value) or (keyword == "check_mode" and isinstance(value, str) and "{#" in value)
+
+
 def _include_apply_flags(task, keywords, *, role=False):
     # Looped include_tasks keeps the original apply mapping; include_role
     # finalizes it separately for each item before expanding the role.
@@ -1999,14 +2003,16 @@ def _include_apply_flags(task, keywords, *, role=False):
     applied = (task.args or {}).get("apply")
     if not isinstance(applied, dict):
         return {}
-    flags = {key: _tag_untrusted(applied[key]) for key in keywords if _is_templated(applied.get(key))}
+    flags = {key: _tag_untrusted(applied[key]) for key in keywords
+             if _is_execution_flag_template(applied.get(key), key)}
     if not flags:
         return {}
     fallbacks = {}
     for key in flags:
         inherited = task._get_parent_attribute(key, omit=True)
         fallback = _execution_omit_fallback(inherited, keyword=key)
-        if key == "check_mode" and _is_templated(inherited) and not isinstance(inherited, _AppliedExecutionFlag):
+        if (key == "check_mode" and _is_execution_flag_template(inherited, key)
+                and not isinstance(inherited, _AppliedExecutionFlag)):
             fallback = {"__ansiroll_raw_apply_check_mode__": fallback}
         fallbacks[key] = fallback
     return {"apply_flags": flags, "apply_omit_fallback": fallbacks}
@@ -4954,6 +4960,11 @@ def _execution_keyword(task, keyword, *, node_key=None):
     value = getattr(task, keyword, None)
     if isinstance(value, _AppliedExecutionFlag):
         return {key: {"__ansiroll_apply_flag__": value.keyword}}
+    if keyword == "check_mode" and value is None and _core_version() >= (2, 14):
+        # The public value is None for both an unset keyword and an explicit
+        # null. Core 2.14+ dispatches modules using the task's flag directly.
+        if task._get_parent_attribute(keyword) is None:
+            return {key: None, "check_mode_null": True}
     value = _tag_untrusted(value)
     result = {key: value}
     if keyword == "check_mode" and isinstance(value, str):
@@ -4977,8 +4988,8 @@ def _execution_keyword(task, keyword, *, node_key=None):
                 result[key + "_on_omit"] = "invalid"
     elif _is_templated(value) and _core_version() >= (2, 19):
         inherited = task._get_parent_attribute(keyword, omit=True)
-        if inherited is not Sentinel:
-            result[key + "_on_omit"] = _execution_omit_fallback(inherited)
+        if inherited is not Sentinel or keyword == "become":
+            result[key + "_on_omit"] = _execution_omit_fallback(inherited, keyword=keyword)
     return result
 
 
@@ -4989,8 +5000,14 @@ def _execution_omit_fallback(value, *, keyword=None):
     if isinstance(value, _AppliedExecutionFlag):
         return {"__ansiroll_apply_flag__": value.keyword}
     if value is Sentinel:
-        return {"__ansiroll_invocation_check_mode__": True} if keyword == "check_mode" else None
-    if _is_templated(value):
+        if keyword == "check_mode":
+            return {"__ansiroll_invocation_check_mode__": True}
+        if keyword == "become":
+            from ansible import constants as C, context
+
+            return bool(context.CLIARGS.get("become", C.DEFAULT_BECOME))
+        return None
+    if _is_execution_flag_template(value, keyword):
         return _tag_untrusted(value)
     try:
         return boolean(value) if value is not None else False

@@ -28,6 +28,21 @@ def test_check_mode_buffer_null_semantics_follow_core_patch(monkeypatch, version
     assert templater.render_string(expression, {runtime._CHECK_MODE_TEMPLATE: True}) is expected
 
 
+@pytest.mark.parametrize("source", ["module", "rendered"])
+def test_omitted_become_does_not_render_comment_only_data(monkeypatch, source):
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.21.1")
+    rt = Runtime({}, "", {"inventory_hostname": "localhost"})
+    if source == "module":
+        rt._absorb_facts({"action": "example"}, {"ansible_facts": {"ansible_become": "{# data #}true"}})
+    else:
+        rt.vars["ansible_become"] = rt.template("{{ prefix ~ 'true' }}", {"prefix": "{# data #}"})
+    task = {"become_override": "{{ omit }}", "become_override_on_omit": False}
+    with pytest.raises(TypeError, match="Invalid boolean value"):
+        rt._execution_flag(task, "become_override", rt.ctx(), False)
+
+
 @pytest.mark.parametrize("survivor", ["ordinary", {"{{ name }}": "untrusted"}])
 def test_bundled_fact_keys_keep_types_and_trust_across_json_collisions(survivor):
     from ansiroll.runtime import _FactKeyTemplate, _encode_bundle_mapping_keys, _restore_bundle_mapping_keys
