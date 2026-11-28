@@ -18,7 +18,7 @@ from copy import copy
 from contextlib import contextmanager
 from functools import lru_cache
 
-from .compat import find_module, init_loader
+from .compat import LEGACY_COPY_MODULE, find_module, init_loader
 from .accelerated_modules import NAMES as ACCELERATED_ACTIONS
 from .accelerated_modules import can_accelerate
 
@@ -3377,10 +3377,14 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
             # official copy and file modules.
             actions.update(COPY_ACTION_MODULES)
             node.update(_copy_action_settings())
-            if node["special"] == "copy" and (argument_layers or _remote_src(node["args"]) is not False):
-                # remote_src copies run the copy module on the target, like the
-                # copy action plugin's remote_src path.
-                actions.add(action)
+            if node["special"] == "copy":
+                # The stock action requests the legacy module even when the
+                # action itself was selected with ansible.builtin.copy.
+                path, _ = find_module(LEGACY_COPY_MODULE)
+                builtin, _ = find_module("ansible.builtin.copy")
+                if path and builtin and os.path.realpath(path) != os.path.realpath(builtin):
+                    node["_copy_module"] = LEGACY_COPY_MODULE
+                    actions.add(LEGACY_COPY_MODULE)
     elif action in CONTROLLER_COUPLED:
         node["fallback"] = True
         node["fallback_reason"] = "controller-coupled action %s" % action

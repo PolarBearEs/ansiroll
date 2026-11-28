@@ -15,7 +15,7 @@ from __future__ import annotations
 import ast
 import os
 
-from .compat import build_module, find_module, make_templar
+from .compat import LEGACY_COPY_MODULE, build_module, find_module, make_templar
 
 # Actions the runtime handles itself; never embedded as modules.
 SPECIAL_ACTIONS = {
@@ -50,10 +50,12 @@ class ModuleEmbedder:
                 "supported in v1)" % action
             )
 
+        isolated_cache = action == LEGACY_COPY_MODULE
         cache_key = (
             self.python_interpreter,
             os.path.realpath(path),
             fqcn,
+            isolated_cache,
         )
         meta = self._canonical_cache.get(cache_key)
         if meta is None:
@@ -62,6 +64,7 @@ class ModuleEmbedder:
                 module_path=path,
                 templar=self.templar,
                 task_vars={"ansible_python_interpreter": self.python_interpreter},
+                isolated_cache=isolated_cache,
             )
             wrapper_text = wrapper_bytes.decode("utf-8", errors="surrogateescape")
             zip_b64, module_fqn = _extract(wrapper_text)

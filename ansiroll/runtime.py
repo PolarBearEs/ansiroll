@@ -7243,6 +7243,8 @@ class Runtime:
             if failure:
                 return {"failed": True, "changed": False, "msg": failure}
             if content is None and _ansible_boolean(args.get("remote_src", False)):
+                if task.get("_copy_module"):
+                    return self.run_module(task["_copy_module"], _fail_on_undef(args), become=become)
                 action = task.get("action")
                 if action not in self.modules:
                     action = _COPY_MODULE
@@ -7476,7 +7478,7 @@ class Runtime:
             if lmode:
                 module_args["mode"] = lmode
             try:
-                module_return = self.run_module(_COPY_MODULE, module_args, become=become)
+                module_return = self.run_module(task.get("_copy_module", _COPY_MODULE), module_args, become=become)
             finally:
                 self._run_worker_operation(
                     "copy_cleanup", {"tmpdir": staged.get("tmpdir")}, become=become)
