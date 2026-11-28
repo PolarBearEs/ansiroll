@@ -6563,6 +6563,126 @@ def test_strategy_keeps_loop_bindings_separate_from_result_state(tmp_path):
         assert "rescued=1" in result.stdout
 
 
+def test_strategy_replays_explicit_loop_bindings_and_omits_null_items(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("uses Core's structured loop metadata")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: "{{ ansible_index_var.value }}"}
+      loop: [{value: sample}]
+      loop_control: {loop_var: ansible_index_var}
+      register: named_item
+    - debug: {msg: "{{ ansible_index_var }}"}
+      loop: [sample]
+      loop_control: {index_var: ansible_index_var}
+      register: named_index
+    - block:
+        - fail: {msg: expected failure}
+          loop: [null]
+          loop_control: {loop_var: failed}
+      rescue:
+        - assert: {that: "ansible_failed_result.results[0].failed is true"}
+    - assert:
+        that:
+          - "named_item.results[0].ansible_index_var == {'value': 'sample'}"
+          - named_item.results[0].msg == 'sample'
+          - named_index.results[0].ansible_index_var == 0
+          - named_index.results[0].msg == 0
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_strategy_restores_shared_typed_loop_state():
+    from datetime import date
+
+    from ansiroll import runtime
+
+    strategy = _load_strategy_module()
+    plugin = strategy.StrategyModule.__new__(strategy.StrategyModule)
+    value = {date(2026, 1, 1): "fixture"}
+    shared = ["first", value]
+    entries = [
+        runtime._loop_item_result({}, runtime._LoopItem(
+            "item", item, None, i, {"allitems": shared, "index": i + 1}))
+        for i, item in enumerate(shared)
+    ]
+    packed = json.dumps(runtime._pack_loop_result({"results": entries}, preserve_scalars=True))
+    for restore in (plugin._restore_private_result, plugin._restore_rescue_value):
+        first, second = restore(json.loads(packed))["results"]
+        assert second["item"] == value
+        assert first["ansible_loop"]["allitems"] == shared
+        assert first["ansible_loop"]["allitems"] is second["ansible_loop"]["allitems"]
+
+
+def test_strategy_keeps_module_attempts_when_executor_retries(tmp_path):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 21):
+        pytest.skip("uses Core's structured result provenance")
+    playbook = """- hosts: localhost
+  gather_facts: false
+  vars: {attempts: 42}
+  tasks:
+    - debug: {var: attempts}
+      loop: [sample]
+      retries: 2
+      until: true
+      register: recorded
+    - assert:
+        that: recorded.results[0].attempts == 42
+"""
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-c", "local",
+                                    environment={"ANSIBLE_STRATEGY": strategy})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert '"attempts": 42' in result.stdout
+
+
+def test_linear_fallback_injects_private_rescue_facts_only_for_direct_tasks():
+    strategy = _load_strategy_module()
+    plugin = strategy.StrategyModule.__new__(strategy.StrategyModule)
+
+    class VariableManager:
+        def __init__(self):
+            self._nonpersistent_fact_cache = {}
+
+        def set_nonpersistent_facts(self, host, values):
+            self._nonpersistent_fact_cache.setdefault(host, {}).update(values)
+
+        def get_vars(self, play=None, host=None, task=None, include_hostvars=True):
+            return {**self._nonpersistent_fact_cache.get(host.name, {}), **(task or {})}
+
+    manager = plugin._variable_manager = VariableManager()
+    host = SimpleNamespace(name="origin")
+    other = SimpleNamespace(name="recipient")
+    key = "ansible_failed_result"
+    private = {key: {"msg": "fixture"}}
+    public = {key: {"msg": "public replacement"}}
+    plugin._save_rescue_facts(host.name, private, private.keys())
+    assert not manager._nonpersistent_fact_cache
+
+    def run(iterator, play_context):
+        assert manager.get_vars(host=host, task={}) == private
+        assert manager.get_vars(host=host, task=public) == public
+        assert manager.get_vars(host=host, include_hostvars=False) == {}
+        assert manager.get_vars(host=other, task={}) == {}
+        manager.set_nonpersistent_facts(host.name, public)
+        assert manager.get_vars(host=host, task={}) == public
+        return 0
+
+    plugin.run = run
+    assert plugin._run_linear_with_rescue_facts(None, None) == 0
+    assert "get_vars" not in vars(manager)
+    assert "set_nonpersistent_facts" not in vars(manager)
+    assert not strategy._private_rescue_facts(manager, host.name)
+
+
 def test_standalone_set_fact_fails_when_no_assignments_remain(tmp_path):
     from ansiroll.loader import _core_version
 
