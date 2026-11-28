@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import collections
 import base64
+import errno
 import json
 import inspect
 import os
@@ -34,6 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, MappingView, Set
+from itertools import count
 
 DOCUMENTATION = """
     name: ansiroll
@@ -65,6 +67,7 @@ except Exception:  # 2.21+ uses UnifiedTaskResult; older cores use TaskResult
         pass
 
 display = Display()
+_fallback_warning_numbers = count(1)
 
 
 class _DelegatedPlayVariables:
@@ -362,6 +365,19 @@ class StrategyModule(StrategyBase):
             )
             return self._tqm.RUN_ERROR
         if linear_reason:
+            if self._delegate_on_target:
+                if hasattr(play, "get_path"):
+                    source = play.get_path()
+                else:
+                    path, line, _ = getattr(play.get_ds(), "ansible_pos", ("", 0, 0))
+                    source = "%s:%s" % (path, line) if path else ""
+                display.warning(
+                    "ansiroll_delegate_on_target has no effect during core linear fallback for play %r "
+                    "on batch hosts %s (%s). Ansible handles delegation for this batch "
+                    "(play source %s, fallback batch %d)."
+                    % (play.name or play.get_name(), ", ".join(host.name for host in hosts),
+                       linear_reason, source, next(_fallback_warning_numbers))
+                )
             # There is no target work to accelerate, while run_once, rescue,
             # hostvars and batch membership still require task-lockstep
             # scheduling. Reuse core linear for this compatibility-only case.
@@ -766,7 +782,7 @@ class StrategyModule(StrategyBase):
     @staticmethod
     def _read_controller_source(path, *, role_task=None, archive_decrypt=None, archive_patterns=()):
         """Read a runtime-created controller file for in-memory target transfer."""
-        if not path or (role_task is None and not os.path.isfile(path)):
+        if not path:
             return {"error": "controller source %r is not a regular file" % path}
         if archive_decrypt is not None:
             from ansiroll.loader import _linked_role_source_matches
@@ -774,11 +790,25 @@ class StrategyModule(StrategyBase):
             if role_task is None or not isinstance(path, str) or ".." in path.split(os.sep) or not any(
                     _linked_role_source_matches(pattern, os.path.normpath(path)) for pattern in archive_patterns):
                 return {"error": "controller archive %r does not match the task's src" % path}
-        fd = None
         try:
             if role_task is None:
-                source = open(path, "rb")
-                fullpath = os.path.abspath(path)
+                try:
+                    source_path = os.fspath(path)
+                    fullpath = os.path.abspath(source_path)
+                except (TypeError, ValueError):
+                    return {"error": "controller source %r is not a regular file" % path}
+                flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY
+                # Give a transient write lease time to clear, with at most four short waits.
+                for attempt in range(5):
+                    if not os.path.isfile(source_path):
+                        return {"error": "controller source %r is not a regular file" % path}
+                    try:
+                        fd = os.open(source_path, flags)
+                        break
+                    except OSError as ex:
+                        if ex.errno not in (errno.EAGAIN, errno.EWOULDBLOCK) or attempt == 4:
+                            raise
+                        time.sleep(0.05)
             else:
                 from ansiroll.loader import _open_linked_role_source, _role_source_roots, _visible_below
 
@@ -805,12 +835,14 @@ class StrategyModule(StrategyBase):
                                          or not any(_visible_below(realpath, root) for root in roots.values())):
                         return {"error": "controller role source %r is excluded" % path}
                 fd = _open_linked_role_source(realpath)
-                source = os.fdopen(fd, "rb", closefd=False)
-            with source as fh:
-                st = os.fstat(fh.fileno())
+            try:
+                st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode):
                     return {"error": "controller source %r is not a regular file" % path}
-                data = fh.read()
+                with os.fdopen(fd, "rb", closefd=False) as fh:
+                    data = fh.read()
+            finally:
+                os.close(fd)
             if archive_decrypt:
                 data, _ = _decrypt_controller_file(loader, fullpath, data)
             return {
@@ -824,9 +856,6 @@ class StrategyModule(StrategyBase):
             }
         except (OSError, AnsibleError) as ex:
             return {"error": "could not read controller source %r: %s" % (path, ex)}
-        finally:
-            if fd is not None:
-                os.close(fd)
 
     def _profile(self, msg):
         if getattr(self, "_profile_enabled", False):
