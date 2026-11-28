@@ -275,9 +275,8 @@ def _open_manifest_fd(path, flags, validate, before_fifo):
             if info is None or not stat.S_ISFIFO(info.st_mode):
                 raise
             validate(info, None)
-            if before_fifo is not None:
-                before_fifo()
-            time.sleep(0.01)
+            if before_fifo is None or not before_fifo():
+                time.sleep(0.01)
 
 
 @contextmanager
@@ -405,30 +404,70 @@ def _open_compile_destination(path, validate, *, release_output=None, prepare=No
             yield writer
 
 
-def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None, write_stdout=None):
+def _write_available(fd, pending):
+    try:
+        return pending[os.write(fd, pending):]
+    except BlockingIOError:
+        return pending
+
+
+def _write_stdout_manifest(path, manifest, stdout_fd, *, validate_input=None, streamed_source=None):
     path = _manifest_for_stdout(path, stdout_fd)
-    closed_stdout = None
-    wrote_stdout = False
+    stdout, source, playbook = streamed_source if streamed_source is not None else (None, b"", None)
+    source = memoryview(source)
+    stdout_info = None
 
     def validate(info, fd):
+        closed_stdout = stdout_info if stdout is not None and stdout.closed else None
         _validate_stdout_manifest(path, info, stdout_fd, fd, closed_stdout=closed_stdout)
         if validate_input is not None:
             validate_input(info, "manifest path", path)
 
-    def before_fifo():
-        nonlocal closed_stdout, wrote_stdout
-        if not wrote_stdout:
-            info = os.fstat(stdout_fd)
-            # Keep a character device open for terminal alias validation.
-            close_stdout = not stat.S_ISCHR(info.st_mode)
-            write_stdout(close_stdout)
-            if close_stdout:
-                closed_stdout = info
-            wrote_stdout = True
+    with ExitStack() as restore_stdout_flags:
+        def advance_stdout():
+            nonlocal stdout_info, source
+            if stdout_info is None:
+                info = os.fstat(stdout_fd)
+                if validate_input is not None:
+                    validate_input(info, "stdout", playbook)
+                previous_blocking = os.get_blocking(stdout_fd)
+                os.set_blocking(stdout_fd, False)
+                restore_stdout_flags.callback(os.set_blocking, stdout_fd, previous_blocking)
+                stdout_info = info
+            elif not source:
+                return False
+            remaining = len(source)
+            source = _write_available(stdout_fd, source)
+            if not source and not stat.S_ISCHR(stdout_info.st_mode):
+                restore_stdout_flags.close()
+                stdout.close()
+            return len(source) < remaining
 
-    with _open_compile_destination(path, validate, manifest=True,
-                                   before_fifo=before_fifo if write_stdout is not None else None) as fh:
-        json.dump(manifest, fh, indent=2)
+        with _open_compile_destination(path, validate, manifest=True,
+                                       before_fifo=advance_stdout if stdout is not None else None) as fh:
+            manifest_fd = fh.fileno()
+            if stdout_info is not None and stat.S_ISFIFO(os.fstat(manifest_fd).st_mode):
+                # Either reader may wait for the other output to reach EOF.
+                os.set_blocking(manifest_fd, False)
+                pending = memoryview(json.dumps(manifest, indent=2).encode("ascii"))
+                while pending or source:
+                    remaining = len(pending) + len(source)
+                    if pending:
+                        pending = _write_available(manifest_fd, pending)
+                        if not pending:
+                            fh.close()
+                    advance_stdout()
+                    if len(pending) + len(source) == remaining:
+                        time.sleep(0.01)
+            else:
+                json.dump(manifest, fh, indent=2)
+
+        # A FIFO pathname can become a regular file while waiting for a reader.
+        if stdout_info is not None:
+            while source:
+                if not advance_stdout():
+                    time.sleep(0.01)
+    return stdout_info is not None
 
 
 def _stat_if_present(path):
@@ -736,7 +775,7 @@ def _reserve_closed_standard_fds(stack):
 
 
 @contextmanager
-def _hold_compile_diagnostics(input_alias):
+def _hold_compile_diagnostics(input_alias, *, shared_stdout=False):
     # Ansible may emit warnings before it opens even the first playbook.
     # Delay file and pipe diagnostics until their destination can be compared
     # with every input opened during compilation.
@@ -746,6 +785,7 @@ def _hold_compile_diagnostics(input_alias):
     pending = []
     original_streams = {}
     destinations = {}
+    stdout_spool = None
     for fd in sorted(descriptors - {None}):
         info = _writable_stream_stat(fd)
         if info is not None and (stat.S_ISREG(info.st_mode) or stat.S_ISFIFO(info.st_mode)):
@@ -756,10 +796,15 @@ def _hold_compile_diagnostics(input_alias):
         for fd, info in destinations.items():
             saved = os.dup(fd)
             buffers.callback(os.close, saved)
-            spool = buffers.enter_context(tempfile.TemporaryFile())
-            pending.append((info, spool, saved))
-            spool_info = os.fstat(spool.fileno())
-            original_streams[(spool_info.st_dev, spool_info.st_ino)] = info
+            if shared_stdout and fd == 2 and stdout_spool is not None:
+                spool = stdout_spool
+            else:
+                spool = buffers.enter_context(tempfile.TemporaryFile())
+                pending.append((info, spool, saved))
+                spool_info = os.fstat(spool.fileno())
+                original_streams[(spool_info.st_dev, spool_info.st_ino)] = info
+                if fd == 1:
+                    stdout_spool = spool
             inheritable = os.get_inheritable(fd)
             os.dup2(spool.fileno(), fd, inheritable=inheritable)
             redirects.callback(os.dup2, saved, fd, inheritable=inheritable)
@@ -801,6 +846,7 @@ def _cmd_compile_stdout(args):
         with os.fdopen(os.dup(1), "wb") as stdout:
             # Keep inherited stdout and native buffers on stderr through CLI exit.
             os.dup2(2, 1)
+            args.stdout_redirected_to_stderr = True
             sys.stdout.flush()
             with redirect_stdout(sys.stderr):
                 return _cmd_compile(args, stdout)
@@ -913,7 +959,9 @@ def _cmd_compile(args, stdout=None):
         report("ansiroll: %s\n" % ex)
         return 2
     try:
-        with _hold_compile_diagnostics(suppress_diagnostics) as original_streams:
+        with _hold_compile_diagnostics(
+            suppress_diagnostics, shared_stdout=getattr(args, "stdout_redirected_to_stderr", False),
+        ) as original_streams:
             try:
                 extra_vars = _load_extra_vars(args.extra_vars, args.vault_password_file)
             except Exception as ex:
@@ -949,22 +997,13 @@ def _cmd_compile(args, stdout=None):
             _write_compile_files(args.output, args.manifest, source, manifest, validate_input)
         else:
             encoded = source.encode("utf-8")
-            wrote_stdout = False
-
-            def write_stdout(close=False):
-                nonlocal wrote_stdout
+            if not args.manifest or not _write_stdout_manifest(
+                args.manifest, manifest, stdout.fileno(), validate_input=validate_input,
+                streamed_source=(stdout, encoded, args.playbook),
+            ):
                 validate_input(os.fstat(stdout.fileno()), "stdout", args.playbook)
                 stdout.write(encoded)
                 stdout.flush()
-                if close:
-                    stdout.close()
-                wrote_stdout = True
-
-            if args.manifest:
-                _write_stdout_manifest(args.manifest, manifest, stdout.fileno(),
-                                       validate_input=validate_input, write_stdout=write_stdout)
-            if not wrote_stdout:
-                write_stdout()
     except (Exception, KeyboardInterrupt) as ex:
         if isinstance(ex, (ValueError, _TruncatingReopenError)):
             report("ansiroll: %s\n" % ex)

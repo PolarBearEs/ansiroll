@@ -42,6 +42,7 @@ def test_compile_streams_executable_python_and_writes_manifest(tmp_path):
 def test_stdout_compile_keeps_compiler_subprocess_diagnostics_on_stderr():
     script = """
 import ctypes
+import os
 import subprocess
 import sys
 from ansiroll import cli
@@ -50,6 +51,8 @@ def compile_playbook(*args, **kwargs):
     print("compiler diagnostic")
     ctypes.CDLL(None).puts(b"native diagnostic")
     subprocess.run([sys.executable, "-c", "print('helper diagnostic')"], check=True)
+    os.write(2, b"first descriptor diagnostic\\n")
+    os.write(1, b"second descriptor diagnostic\\n")
     return "pass\\n", {"modules": [], "fallback_tasks": []}
 
 cli.compile_playbook = compile_playbook
@@ -61,6 +64,7 @@ raise SystemExit(cli.entrypoint())
     assert b"compiler diagnostic\n" in result.stderr
     assert b"native diagnostic\n" in result.stderr
     assert b"helper diagnostic\n" in result.stderr
+    assert b"first descriptor diagnostic\nsecond descriptor diagnostic\n" in result.stderr
 
 
 def test_stdout_compile_rejects_manifest_alias():
@@ -2206,21 +2210,35 @@ raise SystemExit(cli.main(['compile', 'play.yml', '-o', sys.argv[1], '-m', sys.a
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
-def test_stdout_compile_finishes_before_sequential_manifest_fifo(tmp_path):
+@pytest.mark.parametrize("manifest_first", [False, True])
+def test_stdout_compile_streams_with_either_sequential_fifo_order(tmp_path, manifest_first):
     manifest = tmp_path / "manifest.fifo"
     os.mkfifo(manifest)
     reader_script = """
 import sys
 from pathlib import Path
 
-sys.stdout.write(sys.stdin.read())
-sys.stdout.write(Path(sys.argv[1]).read_text())
+def read_stdout():
+    sys.stdout.write(sys.stdin.read())
+
+def read_manifest():
+    sys.stdout.write(Path(sys.argv[1]).read_text())
+
+if sys.argv[2] == "True":
+    read_manifest()
+    read_stdout()
+else:
+    read_stdout()
+    read_manifest()
 """
     compile_script = """
 import sys
 from ansiroll import cli
 
-cli.compile_playbook = lambda *a, **k: ('pass\\n', {'modules': [], 'fallback_tasks': []})
+cli.compile_playbook = lambda *a, **k: (
+    'pass\\n' * (512 * 1024),
+    {'modules': [], 'fallback_tasks': [], 'padding': 'x' * (2 * 1024 * 1024)},
+)
 raise SystemExit(cli.main(['compile', 'play.yml', '-o', '-', '-m', sys.argv[1]], _standalone=True))
 """
     producer = subprocess.Popen(
@@ -2228,13 +2246,13 @@ raise SystemExit(cli.main(['compile', 'play.yml', '-o', '-', '-m', sys.argv[1]],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     reader = subprocess.Popen(
-        [sys.executable, "-c", reader_script, str(manifest)],
+        [sys.executable, "-c", reader_script, str(manifest), str(manifest_first)],
         stdin=producer.stdout, stdout=subprocess.PIPE, text=True,
     )
     producer.stdout.close()
     try:
-        received, _ = reader.communicate(timeout=10)
-        _, diagnostics = producer.communicate(timeout=10)
+        received, _ = reader.communicate(timeout=30)
+        _, diagnostics = producer.communicate(timeout=30)
     finally:
         for process in (producer, reader):
             if process.poll() is None:
@@ -2242,7 +2260,9 @@ raise SystemExit(cli.main(['compile', 'play.yml', '-o', '-', '-m', sys.argv[1]],
                 process.communicate()
 
     assert producer.returncode == reader.returncode == 0, diagnostics
-    assert received == "pass\n" + json.dumps({"modules": [], "fallback_tasks": []}, indent=2)
+    source = "pass\n" * (512 * 1024)
+    metadata = json.dumps({"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)}, indent=2)
+    assert received == (metadata + source if manifest_first else source + metadata)
 
 
 def test_run_streams_compiled_source_without_creating_a_file(monkeypatch):
