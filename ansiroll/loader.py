@@ -1374,15 +1374,45 @@ def _load_vars_file(play, path):
         return play._loader.load_from_file(path)
 
 
+def _inline_path_literals(source, *, block_tags=False):
+    """Return the literal text between dynamic tags, with Jinja whitespace controls applied."""
+    from jinja2 import TemplateSyntaxError
+
+    env = _vars_filename_template_environment()
+    if not env.keep_trailing_newline:
+        env = env.overlay(keep_trailing_newline=True)
+    parts = [""]
+    kind = "data"
+    try:
+        for _, kind, value in env.lex(source):
+            if kind == "data":
+                parts[-1] += value
+            elif kind == "variable_end" or (block_tags and kind == "block_end"):
+                parts.append("")
+            elif kind in ("comment_begin", "raw_begin") or (not block_tags and kind == "block_begin"):
+                return None
+    except TemplateSyntaxError:
+        return None
+    # An unfinished tag can leave the lexer at EOF without raising.
+    return parts if kind in ("data", "variable_end", "block_end") else None
+
+
+def _vars_file_literals(name):
+    # Keep the existing scan for comments, raw blocks and lexically invalid sources.
+    return _inline_path_literals(name, block_tags=True) or re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S)
+
+
 def _vars_file_glob_pattern(name):
     import glob
 
-    return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+    return "*".join(glob.escape(part) for part in _vars_file_literals(name))
 
 
 def _vars_file_has_dynamic_directory(name):
-    return name.startswith(("{{", "{%")) and any(
-        os.path.sep in literal for literal in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
+    if not _is_templated(name):
+        return False
+    parts = _vars_file_literals(name)
+    return (not parts[0] or name.startswith(("{{", "{%"))) and any(os.path.sep in part for part in parts)
 
 
 def _finite_vars_file_names(source):
@@ -3856,12 +3886,13 @@ def _bake_absolute_tree(node, src, basedir, with_meta, *, newline=None):
     src = re.sub(r"/+", "/", src)
     if not os.path.isabs(src):
         return False
-    tree_dir = os.path.dirname(_JINJA_RE.split(src, 1)[0])
+    parts = _inline_path_literals(src) or _JINJA_RE.split(src)
+    tree_dir = os.path.dirname(parts[0])
     root = os.path.realpath(basedir)
     if not os.path.isdir(tree_dir) or not _visible_below(tree_dir, basedir) or not _visible_below(
             os.path.realpath(tree_dir), root):
         return False
-    pattern = re.compile(".*".join(re.escape(part) for part in _JINJA_RE.split(src)) + r"\Z", re.S)
+    pattern = re.compile(".*".join(re.escape(part) for part in parts) + r"\Z", re.S)
     baked = {}
     meta = {}
     size = 0

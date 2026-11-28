@@ -3468,13 +3468,14 @@ def test_deferred_vars_files_bundle_valid_vars_but_keep_vault_data_out(tmp_path)
     assert "hunter2" not in json.dumps(files) and "hunter3" not in json.dumps(files)
 
 
-def test_deferred_vars_files_name_with_leading_template_fails_to_compile(tmp_path):
+@pytest.mark.parametrize("selector", ["{{ project_vars_dir }}/vars.yml", "  {{- project_vars_dir }}/vars.yml"])
+def test_deferred_vars_files_name_with_leading_template_fails_to_compile(tmp_path, selector):
     _write(tmp_path, {"pb.yml": """
 - hosts: localhost
   vars_files:
-    - "{{ ansible_env.HOME }}/vars.yml"
+    - %s
   tasks:
     - debug: msg=reached
-"""})
+""" % json.dumps(selector)})
     with pytest.raises(ValueError, match="starts with a template"):
         compile_playbook(str(tmp_path / "pb.yml"))
