@@ -1523,6 +1523,144 @@ def test_unarchive_source_options_are_mutually_exclusive_before_lookup(tmp_path,
     assert "parameters are mutually exclusive" in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("kind", [
+    "default", "inline", "absolute", "nested", "vars-file", "explicit", "remote", "remote-override", "remote-omit",
+    "role-params", "include-params",
+])
+def test_unarchive_resolves_src_from_templated_module_defaults(tmp_path, monkeypatch, kind):
+    role = tmp_path / "roles" / "extract"
+    role_task = kind in ("role-params", "include-params")
+    files = (role if role_task else tmp_path) / "files"
+    files.mkdir(parents=True)
+    default = (tmp_path if kind == "remote" else files) / "default.zip"
+    explicit = files / "explicit.zip"
+    for path in (default, explicit):
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("selected.txt", path.stem)
+    destination = tmp_path / "extracted"
+    destination.mkdir()
+    play = tmp_path / "play.yml"
+    default_src = {
+        "absolute": "'{{ playbook_dir }}/files/default.zip'",
+        "remote": str(default),
+    }.get(kind, default.name)
+    source_flag = ", remote_src: true" if kind in ("remote", "remote-override") else ""
+    task_options = {
+        "explicit": ", src: explicit.zip",
+        "remote-override": ", remote_src: '{{ archive_remote }}'",
+        "remote-omit": ", remote_src: '{{ omit }}'",
+    }.get(kind, "")
+    options = f"{{src: {default_src}{source_flag}}}"
+    entry = {
+        "inline": "{{ {'src': archive_name} }}",
+        "nested": "{{ settings.archive }}",
+    }.get(kind, "{{ archive_options }}")
+    vars_file = ""
+    if kind == "vars-file":
+        vars_file = "  vars_files: [archive-vars.yml]\n"
+        (tmp_path / "archive-vars.yml").write_text(f"archive_options: {options}\n")
+        options = "{}"
+    action = f"- ansible.builtin.unarchive: {{dest: {destination}{task_options}}}\n"
+    if role_task:
+        if kind == "include-params":
+            _write(role, {
+                "tasks/main.yml": f"- include_tasks: child.yml\n  vars: {{archive_options: {options}}}\n",
+                "tasks/child.yml": action,
+            })
+            options = "{src: explicit.zip}"
+        else:
+            _write(role, {"tasks/main.yml": action})
+        body = f"  roles: [{{role: extract, archive_options: {options}}}]\n"
+        options = "{}"
+    else:
+        body = "  tasks:\n    " + action
+    play.write_text(f"""- hosts: localhost
+  gather_facts: false
+  vars:
+    archive_name: default.zip
+    archive_remote: false
+    archive_options: {options}
+    settings: {{archive: {options}}}
+{vars_file}  module_defaults:
+    ansible.builtin.unarchive: "{entry}"
+{body}""")
+    installed = destination / "selected.txt"
+    expected = explicit.stem if kind == "explicit" else default.stem
+    _ansible(play, returncode=0)
+    assert installed.read_text() == expected
+    installed.unlink()
+    with monkeypatch.context() as native:
+        native.setenv("ANSIROLL_NATIVE_ONLY", "1")
+        _ansible(play, strategy="ansiroll.core.ansiroll", returncode=0)
+    assert installed.read_text() == expected
+    installed.unlink()
+    compiled, _ = compile_playbook(str(play))
+    task, = (node for node in _task_nodes(_bundle_json(compiled)[0]["tasks"])
+             if node["action"] == "ansible.builtin.unarchive")
+    key = str(default) if kind == "absolute" else expected + ".zip"
+    assert set(task.get("_baked", {})) == (set() if kind == "remote" else {key})
+    if kind != "remote":
+        default.unlink()
+    explicit.unlink()
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compiled)
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert installed.read_text() == expected
+
+
+def test_unarchive_default_source_skips_unavailable_candidates(tmp_path, monkeypatch):
+    from ansiroll import loader
+
+    play_dir = tmp_path / "play"
+    play_dir.mkdir()
+    archive = tmp_path / "outside.zip"
+    with zipfile.ZipFile(archive, "w") as fixture:
+        fixture.writestr("selected.txt", "outside fixture")
+    (play_dir / "linked.zip").symlink_to(archive)
+    unreadable = play_dir / "unreadable.zip"
+    unreadable.write_bytes(archive.read_bytes())
+    (play_dir / "extra.zip").write_bytes(archive.read_bytes())
+
+    open_linked_source = loader._open_linked_role_source
+
+    def open_source(path):
+        if os.fspath(path) == str(unreadable):
+            raise PermissionError(path)
+        return open_linked_source(path)
+
+    monkeypatch.setattr(loader, "_open_linked_role_source", open_source)
+    play = play_dir / "play.yml"
+    play.write_text(f"""- hosts: localhost
+  gather_facts: false
+  vars:
+    external_archive: {{src: {archive}}}
+    linked_archive: {{src: linked.zip}}
+    unreadable_archive: {{src: unreadable.zip}}
+    cyclic: {{archive: "{{{{ cyclic.archive }}}}"}}
+  tasks:
+    - ansible.builtin.unarchive: {{dest: {play_dir}}}
+      module_defaults:
+        ansible.builtin.unarchive: "{{{{ external_archive }}}}"
+    - ansible.builtin.unarchive: {{dest: {play_dir}}}
+      module_defaults:
+        ansible.builtin.unarchive: "{{{{ linked_archive }}}}"
+    - ansible.builtin.unarchive: {{dest: {play_dir}}}
+      module_defaults:
+        ansible.builtin.unarchive: "{{{{ unreadable_archive }}}}"
+      when: false
+    - ansible.builtin.unarchive: {{dest: {play_dir}}}
+      module_defaults:
+        ansible.builtin.unarchive: "{{{{ cyclic.archive }}}}"
+      when: false
+""")
+    compiled, _ = compile_playbook(str(play), extra_vars={"external_archive": {"src": "extra.zip"}})
+    tasks = [node for node in _task_nodes(_bundle_json(compiled)[0]["tasks"])
+             if node["action"] == "ansible.builtin.unarchive"]
+    assert len(tasks) == 4
+    assert all(not task.get("_baked") for task in tasks)
+
+
 @pytest.mark.parametrize("action,decrypt,inherited", [
     ("copy", True, False), ("copy", False, False), ("copy", False, True), ("copy", True, True),
     ("unarchive", True, False),
