@@ -3373,7 +3373,7 @@ def test_unresolved_vars_files_name_keeps_includes_named_by_extra_vars_or_litera
 _CORE = tuple(int(part) for part in ANSIBLE_VERSION.split(".")[:2])
 
 
-def _run_both(playbook, tmp_path, *compile_args):
+def _run_both(playbook, tmp_path, *compile_args, before_standalone=None):
     """Return (returncode, output) of ansible-playbook and of the compiled script, for runs that may abort."""
     ansible = subprocess.run(
         [os.path.join(os.path.dirname(sys.executable), "ansible-playbook"), "-i", "localhost,", "-c", "local",
@@ -3383,6 +3383,8 @@ def _run_both(playbook, tmp_path, *compile_args):
     proc = subprocess.run([sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(out)]
                           + list(compile_args), cwd=ROOT, env=_env(), capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+    if before_standalone is not None:
+        before_standalone()
     run = subprocess.run([sys.executable, str(out)], cwd=str(playbook.parent), env=_env(),
                          capture_output=True, text=True)
     return ((ansible.returncode, ansible.stdout + ansible.stderr), (run.returncode, run.stdout + run.stderr))
@@ -3408,6 +3410,112 @@ def test_deferred_vars_files_abort_like_ansible(tmp_path, name, gather, aborts):
     assert (ansible_rc != 0, "reached" not in ansible_out) == (aborts, aborts), ansible_out
     assert (rc != 0, "reached" not in out) == (aborts, aborts), out
     assert "Traceback" not in out
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+@pytest.mark.parametrize("selector", [
+    "vars/{{ profile }}-missing.yml",
+    "{{ folder }}/missing.yml",
+    'vars/{{ deployment | default("offline") }}.yml',
+])
+def test_compile_resolved_missing_vars_file_matches_core(tmp_path, ordered, selector):
+    later_file = "    - vars/default.yml\n" if ordered else ""
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: false
+  vars: {profile: local, folder: vars}
+  vars_files:
+    - 'SELECTOR'
+LATER  tasks:
+    - debug: {msg: reached}
+""".replace("LATER", later_file).replace("SELECTOR", selector), "vars/default.yml": "unused: true\n"})
+    native, standalone = _run_both(tmp_path / "pb.yml", tmp_path)
+    expected = 1 if _CORE < (2, 15) else 0
+    for returncode, output in (native, standalone):
+        assert returncode == expected, output
+        if expected:
+            assert "vars file" in output and "was not found" in output
+            assert "reached" not in output
+        else:
+            assert "reached" in output
+
+
+@pytest.mark.skipif(_CORE >= (2, 15), reason="only older Core requires vars files")
+@pytest.mark.parametrize(("selector", "gather"), [
+    ("vars/missing.yml", "true"),
+    ("vars/{{ lookup('file', 'profile.txt') }}-missing.yml", "false"),
+])
+def test_compile_resolved_vars_file_miss_fails_without_controller_source_or_setup(tmp_path, selector, gather):
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: GATHER
+  vars_files:
+    - "SELECTOR"
+  tasks:
+    - debug: {msg: reached}
+""".replace("GATHER", gather).replace("SELECTOR", selector), "profile.txt": "profile\n"})
+    native, standalone = _run_both(
+        tmp_path / "pb.yml", tmp_path, before_standalone=(tmp_path / "profile.txt").unlink)
+    for returncode, output in (native, standalone):
+        assert returncode == 1, output
+        assert "vars file" in output and "was not found" in output
+        assert "Gathering Facts" not in output
+        assert "reached" not in output
+
+
+@pytest.mark.skipif(_CORE >= (2, 15), reason="newer Core tolerates missing vars files")
+@pytest.mark.parametrize("name", ["inventory_hostname", "deployment"])
+def test_legacy_compile_does_not_treat_hostless_vars_file_miss_as_final(tmp_path, name):
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "vars/{{ INVENTORY_NAME | default('offline') }}.yml"
+  tasks:
+    - assert: {that: selected}
+""".replace("INVENTORY_NAME", name), "vars/localhost.yml": "selected: true\n"})
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(tmp_path / "pb.yml"))[0])
+    env = dict(_env(), ANSIROLL_EXTRA_VARS=json.dumps({name: "localhost"}))
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(_CORE >= (2, 15), reason="newer Core tolerates missing vars files")
+def test_legacy_compile_allows_launch_override_of_a_missing_vars_file(tmp_path):
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: false
+  vars: {profile: offline}
+  vars_files:
+    - 'vars/{{ profile }}.yml'
+  tasks:
+    - assert: {that: selected == 'actual'}
+""", "vars/actual.yml": "selected: actual\n"})
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(tmp_path / "pb.yml"))[0])
+    env = dict(_env(), ANSIROLL_EXTRA_VARS=json.dumps({"profile": "actual"}))
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(_CORE >= (2, 15), reason="newer Core tolerates missing vars files")
+@pytest.mark.parametrize("missing_first", [False, True])
+def test_legacy_compile_preserves_error_from_deferred_vars_file(tmp_path, missing_first):
+    files = ["always-missing.yml", "vars/{{ profile }}.yml"]
+    if not missing_first:
+        files.reverse()
+    _write(tmp_path, {"pb.yml": """- hosts: localhost
+  gather_facts: true
+  vars_files: FILES
+  tasks:
+    - debug: {msg: reached}
+""".replace("FILES", json.dumps(files)), "vars/chosen.yml": "broken: [1\n"})
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(tmp_path / "pb.yml"))[0])
+    env = dict(_env(), ANSIROLL_EXTRA_VARS=json.dumps({"profile": "chosen"}))
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert "Invalid vars_files file" in result.stderr
+    assert "vars/chosen.yml" in result.stderr
+    assert "always-missing.yml" not in result.stderr
 
 
 def test_selected_deferred_vars_file_that_fails_to_parse_aborts(tmp_path):
