@@ -128,7 +128,12 @@ def test_inline_template_whitespace_matches_linear(tmp_path, monkeypatch, use_st
         cases.extend([
             (" {{ missing | default(omit) }}\n", " \n"),
             (" {{ none }} ", " None " if Version(__version__) < Version("2.19.1") else "  "),
+            ("{{ [1, omit, {'gone': omit, 'keep': (2, omit)}] }} ", "[1, {'keep': [2]}] "),
+            ("{{ {omit: 4} }} ", "{<<Omit>>: 4} "),
         ])
+    elif legacy_native:
+        expected = '"hello"' if Version(__version__) >= Version("2.14.1") else "hello"
+        cases.append(("{{ '\"hello\"' }} ", expected))
     tasks = []
     for source, _ in cases:
         tasks.extend([
@@ -138,6 +143,56 @@ def test_inline_template_whitespace_matches_linear(tmp_path, monkeypatch, use_st
     playbook = json.dumps([{"hosts": "localhost", "gather_facts": False, "tasks": tasks}])
     messages, _ = _assert_parity(tmp_path, playbook, use_strategy=use_strategy)
     assert [json.loads(message) for message in messages] == [expected for _, expected in cases]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_padded_inline_collections_reject_undefined_members(tmp_path, monkeypatch, use_strategy):
+    if Version(__version__) < Version("2.13"):
+        # Legacy non-native concatenation through 2.12 stringifies Undefined
+        # inside a collection. Exercise the native mode's recursive check.
+        monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "True")
+        monkeypatch.setattr(C, "DEFAULT_JINJA2_NATIVE", True)
+    _, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - set_fact:
+        rendered: "{{ [{'key': missing}] }} "
+""", use_strategy=use_strategy)
+    assert recap[3] == "1"
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_padded_boolean_conditions_match_linear(tmp_path, use_strategy):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars: {enabled: true, disabled: false}
+  tasks:
+    - debug: {msg: enabled}
+      when: ' {{ enabled }} '
+    - debug: {msg: disabled}
+      when: ' {{ disabled }} '
+""", use_strategy=use_strategy)
+    assert messages == ["enabled"]
+    assert recap[4] == "1"
+
+
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy native conditions can use non-booleans")
+def test_padded_legacy_native_conditions_keep_typed_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", "True")
+    monkeypatch.setattr(C, "DEFAULT_JINJA2_NATIVE", True)
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: integer}
+      when: ' {{ 1 }} '
+    - debug: {msg: "null"}
+      when: ' {{ none }} '
+""")
+    assert messages == ["integer"]
+    assert recap[4] == "1"
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])

@@ -3411,18 +3411,48 @@ def test_vars_file_replay_does_not_cache_templated_vars_lookup_terms():
 
 @pytest.mark.parametrize(("alias", "path", "expected"), [
     ("{{ 'fast' }}", ("fast",), 1),
+    (" {{- 'fast' -}} ", ("fast",), 1),
     (" {{ 'fast' }} ", (), 2),
-    ("{{ 'fast' }}\n", (), 3),
+    ("{{ 'fast' }}\n", ("fast\n",), 3),
+    (" {{- 'fast' -}}\n", ("fast\n",), 3),
+    ("{{ 0 }}\n", (0,), 4),
 ])
 def test_selector_input_paths_respect_inline_alias_whitespace(alias, path, expected):
     runtime = Runtime({}, "", {})
-    context = {"key": alias, "choices": {"fast": 1, " fast ": 2, "fast\n": 3}}
+    context = {"key": alias, "choices": {"fast": 1, " fast ": 2, "fast\n": 3, 0: 4}}
     source = "{{ choices[key] }}"
     paths = set()
 
     assert runtime._pre_setup_template_inputs(source, context, paths=paths, selector=True) == context
     assert paths == {("key", ()), ("choices", path)}
     assert runtime.templater.render_string(source, context) == expected
+
+
+@pytest.mark.parametrize("profile", [" {{- 'fast' -}} ", "{{ 'fast' }}\n"])
+def test_standalone_gather_timeout_ignores_unused_member_with_whitespace_alias(tmp_path, monkeypatch, profile):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""
+- hosts: localhost
+  vars_files: ['settings-{{ mode }}.yml']
+  gather_timeout: '{{ settings[profile] }}'
+  tasks: []
+""")
+    (tmp_path / "settings-local.yml").write_text(json.dumps({
+        "profile": profile,
+        "settings": {
+            "fast": 23,
+            "fast\n": 23,
+            "unused": "{{ lookup('env', 'ANSIROLL_UNUSED_GATHER_TIMEOUT') }}",
+        },
+    }))
+    source, _ = compile_playbook(str(playbook))
+    plan = _compiled_plays(source, tmp_path)[0]
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, extra_vars={"mode": "local"})
+    called = []
+    monkeypatch.setattr(runtime, "run_module",
+                        lambda action, args, **kwargs: called.append((action, args)) or {"ansible_facts": {}})
+    runtime.run_play(plan)
+    assert called == [("ansible.builtin.setup", {"gather_timeout": 23})]
 
 
 def test_standalone_replays_later_vars_file_after_launch_selected_earlier_file(tmp_path):

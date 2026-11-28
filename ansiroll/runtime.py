@@ -74,6 +74,13 @@ _DEFER_LOOKUP_NAMES = "__ansiroll_defer_lookup_names"
 _TEMPLATE_FILE_TEXT = "__ansiroll_template_file_text"
 _CHECK_MODE_TEMPLATE = "__ansiroll_check_mode_template"
 _INCLUDE_APPLY_FLAGS = "__ansiroll_apply_flags"
+_INLINE_TEMPLATE_OPTIONS = {"trim_blocks": True}
+
+
+def _with_inline_newlines(source, result):
+    source_newlines = len(source) - len(source.rstrip("\n"))
+    result_newlines = len(result) - len(result.rstrip("\n"))
+    return result + "\n" * (source_newlines - result_newlines)
 
 
 def _rendered_number(value, source, ctx):
@@ -677,11 +684,7 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
         if isinstance(value, (int, float, dict, list, tuple)):
             return value
         if aliases is not None and len(aliases) < 64 and node.name not in aliases and isinstance(value, str):
-            # The expression alone cannot model literal padding or a source
-            # newline restored after rendering. Keep the member path dynamic.
-            if value != value.strip():
-                return unknown
-            source = _bare_template_expression(value)
+            source = _bare_template_expression(value, preserve_outer=True)
             if source is not None:
                 try:
                     body = jinja2.Environment().parse("{{ " + source + " }}").body
@@ -689,7 +692,10 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
                     return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
                     rendered = _selector_vars_key(body[0].nodes[0], template_variables, (*aliases, node.name))
-                    return _rendered_number(rendered, value, template_variables)
+                    rendered = _rendered_number(rendered, value, template_variables)
+                    if value.endswith("\n") and isinstance(rendered, str) and not isinstance(rendered, _Omit):
+                        return _with_inline_newlines(value, rendered)
+                    return rendered
     if isinstance(node, jinja2.nodes.Compare):
         # Delegate each comparison of known scalars to Jinja's own operator
         # semantics. Evaluate chained operands only when needed.
@@ -3106,10 +3112,26 @@ def _finalize_text_segment(context, value):
     return _concretize(value)
 
 
+def _finalize_padded_legacy_segment(context, value):
+    return _fail_on_undef(_finalize_text_segment(context, value))
+
+
+def _modern_inline_collection(value):
+    if isinstance(value, dict):
+        return {_modern_inline_collection(key): _modern_inline_collection(member)
+                for key, member in value.items() if not isinstance(member, _Omit)}
+    if isinstance(value, (list, tuple)):
+        return [_modern_inline_collection(member) for member in value if not isinstance(member, _Omit)]
+    if isinstance(value, _Omit):
+        # Omit mapping keys survive, using Core's representation in text.
+        return _KEYWORD_OMIT
+    return _fail_on_undef(value)
+
+
 def _finalize_padded_inline_segment(value):
     if isinstance(value, _Omit) or (value is None and _core_at_least(2, 19, 1)):
         return ""
-    return _concretize(value)
+    return _modern_inline_collection(_concretize(value))
 
 
 def _legacy_padded_expression_value(result, ctx):
@@ -3122,7 +3144,10 @@ def _legacy_padded_expression_value(result, ctx):
         value = ast.literal_eval(ast.parse(result, mode="eval"))
     except (ValueError, SyntaxError):
         return result
-    return result if isinstance(value, str) else value
+    if isinstance(value, str) and _core_at_least(2, 14, 1):
+        quote = result[0]
+        return quote + value + quote
+    return value
 
 
 class _CapturedTemplateError(jinja2.UndefinedError):
@@ -3649,8 +3674,8 @@ class _Templater:
         self._lookup_errors = {}    # name -> load error text
         self.env = jinja2.Environment(
             undefined=_AnsirollUndefined,
-            trim_blocks=True,
             finalize=(getattr(jinja2, "pass_context", None) or jinja2.contextfunction)(_finalize_text_segment),
+            **_INLINE_TEMPLATE_OPTIONS,
         )
         self.env.context_class = _AnsirollContext
         self.env.code_generator_class = _AnsirollCodeGenerator
@@ -4221,9 +4246,13 @@ class _Templater:
                                              preserve_outer=inline)
         padded_inline = (inline and expr is None and text != stripped
                          and _bare_template_expression(stripped, lex=env.lex) is not None)
-        if padded_inline and _core_at_least(2, 19):
+        if padded_inline:
             if env not in self._padded_inline_environments:
-                self._padded_inline_environments[env] = env.overlay(finalize=_finalize_padded_inline_segment)
+                finalize = _finalize_padded_inline_segment
+                if _legacy_templating():
+                    pass_context = getattr(jinja2, "pass_context", None) or jinja2.contextfunction
+                    finalize = pass_context(_finalize_padded_legacy_segment)
+                self._padded_inline_environments[env] = env.overlay(finalize=finalize)
             env = self._padded_inline_environments[env]
         template_options = (strict, lazy_names, file_newline, file_options, native_file, check_mode_template)
         template_key = (text, *template_options)
@@ -4293,9 +4322,8 @@ class _Templater:
                     # converting numbers in legacy non-native mode.
                     result = _rendered_number(result, text, ctx)
                     if isinstance(result, str) and not isinstance(result, _Omit):
-                        missing = (len(text) - len(text.rstrip("\n"))) - (len(result) - len(result.rstrip("\n")))
-                        if missing > 0:
-                            padded = result + "\n" * missing
+                        padded = _with_inline_newlines(text, result)
+                        if padded != result:
                             result = type(result)(padded) if isinstance(result, _NO_TEMPLATE) else padded
             if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
@@ -4700,7 +4728,7 @@ class Runtime:
                     "cannot be evaluated." % cond)
             if self._direct_previous_register(cond, ctx):
                 raise UntrustedConditional("Encountered untrusted template or expression.")
-            result = self.templater.render_conditional_template(cond, ctx, strict=strict_vars)
+            result = self.templater.render_conditional_template(cond.strip(), ctx, strict=strict_vars)
             # Assert accepts an indirected list of expressions (for
             # example `that: "{{ expression_list }}"`). Evaluate the
             # resolved members as conditions rather than treating the
