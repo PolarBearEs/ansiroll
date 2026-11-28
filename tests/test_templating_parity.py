@@ -1347,6 +1347,25 @@ def test_pinning_reference_ansible_preserves_dependency_lookup_order(tmp_path, m
     assert result.stdout.strip() == "inherited"
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_standalone_file_lookup_preserves_line_endings(tmp_path, newline):
+    contents = newline.join(["first", "second", "", ""])
+    (tmp_path / "line-endings.txt").write_bytes(contents.encode("utf-8"))
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/line-endings.txt') }}"
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/line-endings.txt', rstrip=true) }}"
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/line-endings.txt', rstrip=false) }}"
+""")
+    stripped = "first" + newline + "second"
+    assert messages == [stripped, stripped, contents]
+
+
 def test_untrusted_data_is_not_templated_again(tmp_path):
     msgs, _ = _assert_parity(tmp_path, r"""
 - hosts: localhost
