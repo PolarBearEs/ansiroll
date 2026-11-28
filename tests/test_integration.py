@@ -6505,7 +6505,8 @@ def test_strategy_vars_file_handler_names_use_controller_scope(tmp_path):
   connection: local
   vars_files: ['profile-{{ profile | default("default") }}.yml']
   tasks:
-    - command: /bin/true
+    - debug: {msg: notify-handler}
+      changed_when: true
       notify: native-handler
   handlers:
     - name: "{{ handler_name }}"
