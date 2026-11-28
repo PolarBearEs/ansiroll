@@ -3499,6 +3499,22 @@ class _AnsirollContext(jinja2.runtime.Context):
     marked as never-templated (results, facts, rendered output) is returned
     verbatim.  Names bound inside the template itself are never touched."""
 
+    def call(__self, __obj, *args, **kwargs):
+        file_context = __self.parent.get(_TEMPLATE_FILE_TEXT)
+        if file_context and (__obj is _jinja_dict or _is_undef(__obj)) and _core_at_least(2, 19):
+            if __obj is not _jinja_dict:
+                return __obj
+            # Core propagates an undefined argument before calling dict().
+            for arg in (*args, *kwargs.values()):
+                if _is_undef(arg):
+                    return _AnsirollUndefined(hint=arg._undefined_message, exc=arg._undefined_exception)
+        result = super().call(__obj, *args, **kwargs)
+        if file_context and isinstance(result, (KeysView, ItemsView, ValuesView)) and _core_at_least(2, 19):
+            # Snapshot the view before an alias or Jinja expression can index it.
+            # Leave nested members for the consuming expression to resolve.
+            return list(result)
+        return result
+
     def _defer_name(self, key):
         scope = self.parent.get("vars")
         if key in self or (isinstance(scope, _HandlerNameVars) and key in scope):
