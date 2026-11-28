@@ -3101,12 +3101,18 @@ def _native_output_value(value, plain_strings=False, seen=None):
     if isinstance(value, (KeysView, type({}.keys()))):
         value = list(value)
     if isinstance(value, (dict, _RawSnapshotMapping)):
-        result = {
-            (str(key) if plain_strings and isinstance(key, str) else _fail_on_undef(key)):
-            _native_output_value(member, plain_strings, seen)
-            for key, member in value.items()
-            if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT
-        }
+        result = {}
+        for key, member in value.items():
+            if isinstance(member, _Omit) or member is _KEYWORD_OMIT:
+                continue
+            # Native rendering keeps omit keys distinct from ordinary strings.
+            if isinstance(key, _Omit):
+                key = _KEYWORD_OMIT
+            elif plain_strings and isinstance(key, str):
+                key = str(key)
+            else:
+                key = _fail_on_undef(key)
+            result[key] = _native_output_value(member, plain_strings, seen)
     elif isinstance(value, (list, tuple, _RawSnapshotList)):
         result = [_native_output_value(member, plain_strings, seen) for member in value
                   if not isinstance(member, _Omit) and member is not _KEYWORD_OMIT]
@@ -7345,7 +7351,12 @@ class Runtime:
             if name == "template":
                 tctx = dict(ctx)
                 tctx[_TEMPLATE_FILE_TEXT] = True
-                if isinstance(tctx.get("omit"), str) and tctx["omit"] == _OMIT:
+                modern = _core_at_least(2, 19)
+                if modern:
+                    if isinstance(tctx.setdefault("omit", _OMIT), _Omit):
+                        # The native marker must be distinct from plain string keys.
+                        tctx["omit"] = _KEYWORD_OMIT
+                elif isinstance(tctx.get("omit"), str) and tctx["omit"] == _OMIT:
                     tctx["omit"] = _OMIT
                 try:
                     import platform
@@ -7376,10 +7387,10 @@ class Runtime:
                     raw, options, header = _template_file_options(raw, args, self.on_warning)
                     rendered = self.templater.render_string(
                         raw, tctx, file_newline=newline_sequence, file_options=options, file_header=header)
-                    if _core_at_least(2, 19) and isinstance(rendered, _Omit):
+                    if modern and (isinstance(rendered, _Omit) or rendered is _KEYWORD_OMIT):
                         return {"failed": True, "changed": False,
                                 "msg": "Task failed: A template was resolved to an Omit scalar."}
-                    rendered = _native_file_text(rendered) if _core_at_least(2, 19) else _as_text(rendered)
+                    rendered = _native_file_text(rendered) if modern else _as_text(rendered)
                 except Exception as ex:
                     return {"failed": True, "changed": False,
                             "msg": "template: failed to render %s: %s" % (src, ex)}
@@ -9263,8 +9274,13 @@ def agent_main():
                 "search_dirs": task.get("search_dirs"),
                 "name": task.get("name"),
             }
-            if action == "template" and rt._copy_transfer_check_mode is not None:
-                frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
+            if action == "template":
+                if _core_at_least(2, 19) and isinstance(dict.get(scope, "omit"), _Omit):
+                    # Let the file action supply its default instead of serializing
+                    # the sentinel as a string indistinguishable from user data.
+                    frame["vars"].pop("omit", None)
+                if rt._copy_transfer_check_mode is not None:
+                    frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
             if lazy_play is not None and deferred:
                 frame["deferred_vars"] = deferred
             if lazy_play:
