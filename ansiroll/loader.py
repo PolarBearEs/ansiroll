@@ -1838,6 +1838,8 @@ def _is_templated(value):
 
 def _loop_binding_names(loop_var, index_var, extended):
     names = {loop_var or "item", "ansible_loop_var"}
+    if isinstance(index_var, dict):
+        index_var = index_var.get("__ansiroll_unsafe__")
     if index_var:
         names.update((index_var, "ansible_index_var"))
     if extended:
@@ -2634,7 +2636,8 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "when": _conditions(task.when),
         "loop": _tag_loop_values(task, _loop_of(task, basedir)),
         "loop_var": _loop_var(task),
-        "index_var": _index_var(task),
+        "index_var": _tag_untrusted(_index_var(task), template_syntax_only=True),
+        "loop_label": _tag_untrusted(_loop_label(task), template_syntax_only=True),
         **_loop_control(task),
         "vars": _tag_untrusted(dict(task.vars or {})),
         "role_defaults": _tag_untrusted(role_defaults),
@@ -2643,6 +2646,11 @@ def _include_node(task, action, fname, basedir, role_defaults, role_vars,
         "become": bool(task.become),
         "tasks": tasks,
     }
+    if node["register"] and node["loop"] is not None and (2, 16) <= _core_version() < (2, 21):
+        args = dict(task.args or {})
+        if action == "include_tasks":
+            args.pop("_raw_params", None)
+        node["include_register_args"] = _tag_untrusted(args)
     if action == "include_role":
         node["handlers"] = handlers or []
         # The runtime overlay already has the enclosing invocations' evaluated

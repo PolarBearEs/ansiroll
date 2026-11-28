@@ -5162,14 +5162,27 @@ class Runtime:
             body, body_handlers = targets.get(variant.get("tasks_ref"), (body, handlers))
             return filename, body, body_handlers
 
-        include_no_log = bool(node.get("no_log"))
+        include_no_log = None
         apply_flags = {}
         apply_vars = {}
         items, result, ignore = self._resolve_task_loop(node, base_ctx)
         metadata_flags = None
+        loop_node = node
         if items:
             try:
                 metadata_flags = self._loop_metadata_flags(node, base_ctx)
+                index_var = node.get("index_var")
+                if isinstance(index_var, dict) or _looks_templated(index_var):
+                    index_var = _fail_on_undef(self.template(index_var, base_ctx, strict=True))
+                    if isinstance(index_var, _Omit):
+                        index_var = None
+                    elif index_var is not None and not isinstance(index_var, str):
+                        index_var = str(index_var)
+                    loop_node = {**node, "index_var": index_var}
+                if _core_at_least(2, 21) and index_var is not None:
+                    if (index_var in {"true", "false", "none", "True", "False", "None", "not"}
+                            or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", index_var)):
+                        raise TypeError("Invalid 'index_var': Invalid variable name %r" % index_var)
             except (jinja2.UndefinedError, TypeError) as ex:
                 result = {"failed": True, "changed": False, "msg": str(ex)}
                 ignore = self._ignore_before_validation(node)
@@ -5186,6 +5199,8 @@ class Runtime:
                     except Exception as error:
                         result = {"changed": False, "failed": True, "msg": str(error)}
         if result is not None:
+            if include_no_log is None:
+                include_no_log, _ = self._resolve_task_no_log(node, base_ctx)
             self._store_register(node, result)
             self.emit(node, _status_of(result), result, ignored=ignore, no_log=include_no_log)
             if result.get("skipped"):
@@ -5198,9 +5213,20 @@ class Runtime:
             return
         tally_ok = node.get("tally_include_ok", True)
         looped = items is not None
+        register = node.get("register")
+        # Explicit per-item updates were backported after the initial 2.16
+        # and 2.17 releases. An earlier include action returns before writing
+        # its register, so later iterations only see the prior task's value.
+        carries_register = register and (
+            _core_at_least(2, 17, 4) or (_core_at_least(2, 16, 11) and not _core_at_least(2, 17))
+        )
+        register_include_args = carries_register and not _core_at_least(2, 21)
+        label_source = node.get("loop_label")
         invocation_params = node.get("include_params", node.get("vars")) or {}
         selected = []
         results = []
+        registered_items = []
+        label_warnings = []
         ignore_loop = False
         failed_items_ignored = True
         legacy_failure = None
@@ -5210,43 +5236,68 @@ class Runtime:
                 selected.append((base_ctx, {}, result, item, include_no_log, body, body_handlers, apply_flags, apply_vars))
                 break
             try:
-                loop_vars = self._loop_item_vars(node, items, i, base_ctx, metadata_flags=metadata_flags)
+                loop_vars = self._loop_item_vars(loop_node, items, i, base_ctx, metadata_flags=metadata_flags)
             except (jinja2.UndefinedError, TypeError) as ex:
+                failed_no_log, _ = self._resolve_task_no_log(node, base_ctx)
                 legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)},
-                                  self._ignore_before_validation(node))
+                                  self._ignore_before_validation(node), failed_no_log)
                 break
             ctx = {**base_ctx, **loop_vars}
             blocked, ignored = self._task_gate(node, ctx)
-            item_no_log = include_no_log
             item_flags, item_vars = {}, {}
+            register_flags = {} if register_include_args else None
             if blocked is None:
-                item_no_log, item_flags, item_vars, blocked = self._prepare_include(node, ctx)
+                item_no_log, item_flags, item_vars, blocked = self._prepare_include(node, ctx, register_flags)
+            else:
+                item_no_log, _ = self._resolve_task_no_log(node, ctx)
+            include_args = None
             if blocked is None:
                 try:
                     filename, body, body_handlers = select_body(ctx)
+                    if register_include_args:
+                        include_args = self._include_register_args(node, ctx, register_flags, item_vars)
                     result = {"changed": False, "include": filename}
                 except Exception as error:
                     result = {"changed": False, "failed": True, "msg": str(error)}
             else:
                 result = blocked
             if _result_failed(result) and not _core_at_least(2, 19):
-                legacy_failure = (result, ignored)
+                legacy_failure = (result, ignored, item_no_log)
                 break
             # Older executors added loop metadata directly to the result before
             # aggregating item status. Newer executors keep status separately.
             if not _core_at_least(2, 21):
                 result.update(loop_vars)
             result.setdefault("failed", False)
+            label = item
+            valid_label = True
+            if label_source:
+                label_ctx = ctx
+                if carries_register:
+                    label_ctx = {**ctx, register: self._include_item_register(node, result, loop_vars, include_args)}
+                try:
+                    label = _fail_on_undef(self.template(label_source, label_ctx, strict=True))
+                except Exception as ex:
+                    valid_label = False
+                    if _core_at_least(2, 21):
+                        message = "Failed to template loop_control label: %s" % ex
+                        result.setdefault("warnings", []).append(message)
+                        label_warnings.append(message)
+                        if not item_no_log:
+                            self.on_warning(message)
+                    else:
+                        result.update(failed=True, msg="Failed to template loop_control.label: %s" % ex)
+            label_fields = {"_ansible_item_label": label} if valid_label and register_include_args else {}
             stop = False
             if node.get("loop_break_when"):
                 break_ctx = dict(ctx)
-                if node.get("register"):
-                    break_ctx[node["register"]] = _registered_result(node, {**result, **loop_vars})
+                if register:
+                    break_ctx[register] = self._include_item_register(node, result, loop_vars, include_args, label_fields)
                 try:
                     stop = self.when(node["loop_break_when"], break_ctx, keyword="break_when")
                 except ConditionalError as ex:
                     if not _core_at_least(2, 21):
-                        legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)}, ignored)
+                        legacy_failure = ({"failed": True, "changed": False, "msg": str(ex)}, ignored, item_no_log)
                         break
                     result.update(failed=True, break_when_result=str(ex))
                     stop = True
@@ -5257,10 +5308,14 @@ class Runtime:
             if _result_failed(result):
                 failed_items_ignored = failed_items_ignored and ignored
             reported = {**result, **loop_vars}
+            registered_items.append(reported)
+            if carries_register:
+                base_ctx[register] = self._include_item_register(node, result, loop_vars, include_args, label_fields)
+            presentation = {**reported, "_ansible_item_label": label} if label_source else reported
             if not _result_failed(result) and not result.get("skipped"):
-                selected.append((ctx, loop_vars, reported, item, item_no_log, body, body_handlers,
+                selected.append((ctx, loop_vars, presentation, item, item_no_log, body, body_handlers,
                                  item_flags, item_vars))
-            results.append((item, result, reported, item_no_log))
+            results.append((item, result, presentation, item_no_log))
             if stop:
                 break
 
@@ -5268,14 +5323,15 @@ class Runtime:
         if looped:
             aggregate_no_log = any(hidden for _, _, _, hidden in results)
             if legacy_failure is not None:
-                aggregate, ignored = legacy_failure
-                aggregate_no_log = aggregate_no_log or include_no_log
+                aggregate, ignored, failed_no_log = legacy_failure
+                aggregate_no_log = aggregate_no_log or failed_no_log
                 selected.clear()
             else:
                 failed = any(_result_failed(outcome) for _, outcome, _, _ in results)
                 skipped = all(outcome.get("skipped") for _, outcome, _, _ in results)
-                aggregate = {"changed": False, "failed": failed,
-                             "results": [reported for _, _, reported, _ in results]}
+                aggregate = {"changed": False, "failed": failed, "results": registered_items}
+                if label_warnings:
+                    aggregate["warnings"] = label_warnings
                 if failed:
                     aggregate["msg"] = "One or more items failed"
                 elif skipped:
@@ -5303,6 +5359,14 @@ class Runtime:
 
         scopes = []
         for ctx, loop_vars, result, item, item_no_log, body, body_handlers, apply_flags, apply_vars in selected:
+            if looped and label_source:
+                label = result["_ansible_item_label"]
+                loop_vars["_ansible_item_label"] = ctx["_ansible_item_label"] = label
+            if looped and register:
+                # The complete result is available when building each include block.
+                ctx[register] = self.vars[register]
+            if looped and (label_source or register):
+                ctx["vars"] = _vars_snapshot(ctx)
             body_overlay = {**overlay, **apply_vars} if apply_vars else overlay
             params = self.template_vars(invocation_params, ctx, higher_vars=self.extra_vars,
                                         defer=_core_at_least(2, 19))
@@ -5331,7 +5395,37 @@ class Runtime:
             raise failure
         yield from self._included_body_steps(scopes, b)
 
-    def _prepare_include(self, node, ctx):
+    def _include_register_args(self, node, ctx, apply_flags, apply_vars):
+        args = node.get("include_register_args") or {}
+        if not _core_at_least(2, 19):
+            return _decode_included_var(args)
+        # Include-role apply flags and vars were already evaluated for this
+        # invocation. Reuse them so this result doesn't rerun a lookup.
+        resolved = dict(apply_flags)
+        if node.get("apply_vars"):
+            resolved["vars"] = apply_vars
+        if not resolved:
+            return _setup_omit(self.template(args, self._check_mode_template_context(ctx)))
+        apply = {key: value for key, value in (args.get("apply") or {}).items() if key not in resolved}
+        rendered = self.template({**args, "apply": apply}, self._check_mode_template_context(ctx))
+        rendered["apply"] = {**rendered.get("apply", {}), **resolved}
+        return _setup_omit(rendered)
+
+    def _include_item_register(self, node, result, loop_vars, include_args, label_fields=None):
+        item_result = dict(result)
+        modern_result = _core_at_least(2, 21)
+        if modern_result or node.get("action") == "include_role":
+            # The filename belongs to Core's include dispatch, outside the
+            # result projected into the task's live register.
+            item_result.pop("include", None)
+        if not modern_result and item_result.get("failed") is False:
+            item_result.pop("failed")
+        if include_args is not None:
+            item_result["include_args"] = include_args
+            item_result.pop("changed", None)
+        return _registered_result(node, {**item_result, **loop_vars, **(label_fields or {})})
+
+    def _prepare_include(self, node, ctx, register_flags=None):
         no_log, failure = self._resolve_task_no_log(node, ctx)
         authored_flags = node.get("apply_flags") or {}
         authored_vars = node.get("apply_vars") or {}
@@ -5342,6 +5436,8 @@ class Runtime:
                 key: self._execution_flag_value(value, ctx, check_mode=key == "check_mode")
                 for key, value in authored_flags.items()
             }
+            if register_flags is not None:
+                register_flags.update(flags)
             for key, value in flags.items():
                 if isinstance(value, _Omit) or value is _KEYWORD_OMIT:
                     inherited = (node.get("apply_omit_fallback") or {}).get(key)
