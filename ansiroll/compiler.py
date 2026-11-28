@@ -404,7 +404,7 @@ def _condition_value(condition, variables, templater):
     try:
         from jinja2 import meta as jinja_meta
         source = str(condition) if trusted else "{{ (%s) }}" % condition
-        parsed = templater.env.parse(source)
+        parsed = templater.env.parse_inline(source) if trusted else templater.env.parse(source)
         # Jinja's undeclared-variable scan compiles and can fold constant
         # filter operands in this AST. Check for runtime filters first.
         if _uses_nondeterministic_filter(parsed):
@@ -494,7 +494,7 @@ def _runtime_dependent(value, variables, env, _seen=None):
         return False
     from jinja2 import nodes
     try:
-        parsed = env.parse(value)
+        parsed = env.parse_inline(value)
     except Exception:
         return False
     def depends(name):
@@ -585,7 +585,8 @@ def _simplify_when(conditions, variables, templater, stats, cache, shadowed=froz
     remaining = []
     for condition in conditions or []:
         # Masking a loop binding is not enough when another variable reads it, e.g. alias: "{{ env }}".
-        if shadowed and _depends_on_vars(_condition_source(condition), unmasked, shadowed.__contains__):
+        if shadowed and _depends_on_vars(_condition_source(condition), unmasked, shadowed.__contains__,
+                                         bare_condition=isinstance(condition, str)):
             remaining.append(condition)
             continue
         key = _condition_cache_key(condition)

@@ -493,12 +493,13 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
                                  unknown_lookup=None, retain_mutable=False, lookups=None, alternate_values=None,
                                  vars_lookup_allowed=None):
     from ansible import constants as C
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import TemplateSyntaxError, nodes
 
-    from .runtime import (_is_literal_vars_lookup, _selector_input_paths, _selector_projection_cycle, _selector_scope,
-                          _selector_template_sources, _setup_builtin_lookup)
+    from .runtime import (_AnsirollEnvironment, _is_literal_vars_lookup, _selector_input_paths,
+                          _selector_projection_cycle, _selector_scope, _selector_template_sources,
+                          _setup_builtin_lookup)
 
-    env = Environment()
+    env = _AnsirollEnvironment()
     resolve_aliases = computed is not None or unknown_lookup is not None
     key_scope = {key: _tag_untrusted(value, template_syntax_only=True) if isinstance(value, str) else value
                  for key, value in variables.items()}
@@ -516,7 +517,7 @@ def _gather_timeout_dependencies(source, variables, scalar_methods=(), *,
             return None
         ancestors = (*ancestors, (origin, remaining))
         try:
-            expression = env.parse(source)
+            expression = env.parse_inline(source)
         except TemplateSyntaxError:
             if retain_mutable:
                 continue
@@ -1347,7 +1348,7 @@ def _vars_filename_controller_requirements(source, portable, *, paths=None, jinj
     missing_tests = set()
     for candidate in sources:
         try:
-            parsed = env.parse(candidate)
+            parsed = env.parse_inline(candidate)
         except TemplateSyntaxError:
             return True, {}
         for kind, node_type, supported, missing in (
@@ -1387,7 +1388,8 @@ def _vars_file_has_dynamic_directory(name):
 
 def _finite_vars_file_names(source):
     """Return closed literal alternatives of inline conditional file names."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import TemplateSyntaxError, nodes
+    from .runtime import _AnsirollEnvironment
 
     def choices(node):
         if isinstance(node, nodes.TemplateData):
@@ -1413,7 +1415,7 @@ def _finite_vars_file_names(source):
         raise ValueError("nonliteral vars file selector")
 
     try:
-        return dict.fromkeys(choices(Environment(keep_trailing_newline=True).parse(source)))
+        return dict.fromkeys(choices(_AnsirollEnvironment(keep_trailing_newline=True).parse_inline(source)))
     except (TemplateSyntaxError, ValueError):
         return None
 
@@ -1892,14 +1894,15 @@ def _has_dynamic_include(nodes):
     return False
 
 
-def _depends_on_vars(value, variables, matches):
+def _depends_on_vars(value, variables, matches, *, bare_condition=False):
     """Follow Jinja variable references through known values."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import TemplateSyntaxError, nodes
+    from .runtime import _AnsirollEnvironment
 
-    env = Environment()
+    env = _AnsirollEnvironment()
     seen = set()
 
-    def walk(value):
+    def walk(value, bare=False):
         if isinstance(value, dict):
             if set(value) in ({"__ansiroll_unsafe__"}, {"__ansiroll_vault__"}):
                 return False
@@ -1909,7 +1912,7 @@ def _depends_on_vars(value, variables, matches):
         if not _is_templated(value):
             return False
         try:
-            parsed = env.parse(value)
+            parsed = env.parse(value) if bare else env.parse_inline(value)
         except TemplateSyntaxError:
             return False
         for call in parsed.find_all(nodes.Call):
@@ -1936,7 +1939,7 @@ def _depends_on_vars(value, variables, matches):
         seen.add(name)
         return matches(name) or (name in variables and walk(variables[name]))
 
-    return walk(value)
+    return walk(value, bare_condition)
 
 
 class _IncludeVariables:
@@ -2022,10 +2025,11 @@ def _bind_include_apply_flags(parent, options):
 
 def _vars_file_simple_field(source):
     """Recognize a filename with one interpolated name and an optional default."""
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import TemplateSyntaxError, nodes
+    from .runtime import _AnsirollEnvironment
 
     try:
-        body = Environment().parse(os.path.expanduser(source)).body
+        body = _AnsirollEnvironment().parse_inline(os.path.expanduser(source)).body
     except TemplateSyntaxError:
         return None
     if len(body) != 1 or not isinstance(body[0], nodes.Output):
@@ -4396,10 +4400,11 @@ def _search_dirs(task, basedir, subdir, tagged=False, explicit_subdir=False):
 
 
 def _linked_role_source_patterns(src):
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import TemplateSyntaxError, nodes
+    from .runtime import _AnsirollEnvironment
 
     try:
-        parsed = Environment(keep_trailing_newline=True).parse(src)
+        parsed = _AnsirollEnvironment(keep_trailing_newline=True).parse_inline(src)
     except TemplateSyntaxError:
         return None
     body = parsed.body

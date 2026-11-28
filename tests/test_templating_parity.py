@@ -51,25 +51,28 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable, extra_vars=None):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
     proc = subprocess.run(
         ansible_playbook_command() + (["--diff"] if diff else []) + ["-i", "localhost,", "-c", "local",
-         "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
+         "-e", json.dumps({"ansible_python_interpreter": interpreter, **(extra_vars or {})}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
     return _summary(proc.stdout, proc.stderr)
 
 
-def _ansiroll(playbook, cwd):
+def _ansiroll(playbook, cwd, *, extra_vars=None):
     src, _ = compile_playbook(str(playbook))
     script = cwd / "compiled.py"
     script.write_text(src)
+    env = _env()
+    if extra_vars is not None:
+        env["ANSIROLL_EXTRA_VARS"] = json.dumps(extra_vars)
     proc = subprocess.run(
         [sys.executable, str(script)],
-        cwd=str(cwd), env=_env(), capture_output=True, text=True,
+        cwd=str(cwd), env=env, capture_output=True, text=True,
     )
     return _summary(proc.stdout + "\n" + proc.stderr)
 
@@ -84,15 +87,169 @@ def _write(tmp_path, playbook, files=None):
     return path
 
 
-def _assert_parity(tmp_path, playbook, files=None, use_strategy=False):
+def _assert_parity(tmp_path, playbook, files=None, use_strategy=False, *, extra_vars=None):
     path = _write(tmp_path, playbook, files)
-    expected = _ansible(path, tmp_path)
+    expected = _ansible(path, tmp_path, extra_vars=extra_vars)
     if use_strategy:
-        actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll")
+        actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", extra_vars=extra_vars)
     else:
-        actual = _ansiroll(path, tmp_path)
+        actual = _ansiroll(path, tmp_path, extra_vars=extra_vars)
     assert actual == expected
     return expected
+
+
+def test_inline_template_backslashes_follow_ansible(tmp_path):
+    messages, recap = _assert_parity(tmp_path, r'''
+- hosts: localhost
+  gather_facts: false
+  vars:
+    tab_value: "before\tafter"
+    marker: rendered
+  tasks:
+    - debug:
+        msg: '{{ "before\tafter" }}'
+    - debug:
+        msg: '{{ "before\\tafter" }}'
+    - debug:
+        msg: "{{ 'before\tafter' }}"
+    - debug:
+        msg: '{{ tab_value }}'
+    - debug:
+        msg: 'outside\t{{ "inside\t" }}{% set value = "block\tvalue" %}{{ value }}'
+    - debug:
+        msg: '{{ "demo_suffix" | regex_replace("^(.*)_suffix$", "\1") }}'
+    - debug:
+        msg: condition matched
+      when: '"before\tafter" == tab_value'
+    - debug:
+        msg: '{{ "before\"after" }}'
+      ignore_errors: true
+    - debug:
+        msg: '{{ item }}'
+      loop:
+        - '{{ "{{ marker }} C:\xyz" }}'
+''')
+    expected = [r"before\tafter", r"before\\tafter", "before\tafter", "before\tafter",
+                "outside\\tinside\\tblock\tvalue", "demo", "condition matched"]
+    if MODERN_TEMPLATING:
+        expected.append(r'before\"after')
+    expected.append(r"{{ marker }} C:\xyz" if MODERN_TEMPLATING else r"rendered C:\xyz")
+    assert messages == expected
+    assert recap == ("9", "0", "0", "0", "0", "0", "0" if MODERN_TEMPLATING else "1")
+
+
+@pytest.mark.parametrize("prefix", ["", "prefix="], ids=["expression", "mixed"])
+def test_template_file_backslashes_follow_jinja(tmp_path, prefix):
+    source = prefix + r'{{ "before\tafter" }}'
+    playbook = _write(tmp_path, '''
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug:
+        msg: 'SOURCE'
+    - template:
+        src: input.j2
+        dest: '{{ playbook_dir }}/output'
+    - debug:
+        msg: 'SOURCE'
+'''.replace("SOURCE", source), {"input.j2": source})
+    output = tmp_path / "output"
+    expected = _ansible(playbook, tmp_path)
+    assert output.read_bytes() == (prefix + "before\tafter").encode()
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert output.read_bytes() == (prefix + "before\tafter").encode()
+
+
+def test_implicit_setup_captures_selected_inline_backslash_lookup(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_BACKSLASH_SETUP_DECOY", "all")
+    monkeypatch.setenv("ANSIROLL_BACKSLASH_SETUP_SUBSET", "min")
+    messages, recap = _assert_parity(tmp_path, r'''
+- hosts: localhost
+  gather_facts: true
+  gather_subset: >-
+    {{ lookup("env", "ANSIROLL_BACKSLASH_SETUP_DECOY") if "\t" == "\u0009"
+       else lookup("env", "ANSIROLL_BACKSLASH_SETUP_SUBSET") }}
+  tasks:
+    - debug: {msg: gathered}
+''')
+    assert messages == ["gathered"]
+    assert recap == ("2", "0", "0", "0", "0", "0", "0")
+
+
+def test_implicit_setup_replays_timeout_with_inline_backslash_alias(tmp_path):
+    messages, recap = _assert_parity(tmp_path, r'''
+- hosts: localhost
+  gather_facts: true
+  gather_subset: [min]
+  vars:
+    timeout_seconds: 20
+    tab_alias: '{{ "\t" }}'
+  gather_timeout: >-
+    {{ timeout_seconds if tab_alias == "\t" else lookup("ansiroll_unused_timeout") }}
+  tasks:
+    - debug: {msg: gathered}
+''', extra_vars={"timeout_seconds": 30})
+    assert messages == ["gathered"]
+    assert recap == ("2", "0", "0", "0", "0", "0", "0")
+
+
+def test_deferred_vars_file_inline_backslash_in_literal_name(tmp_path):
+    messages, _ = _assert_parity(tmp_path, r'''
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - '{{ "demo\test.yml" if use_demo else "other.yml" }}'
+  tasks:
+    - debug: {msg: '{{ file_value }}'}
+''', {r"demo\test.yml": "file_value: literal-backslash\n", "other.yml": "file_value: other\n"},
+        extra_vars={"use_demo": True})
+    assert messages == ["literal-backslash"]
+
+
+def test_vars_file_default_with_inline_backslash_bundles_task_variants(tmp_path):
+    messages, _ = _assert_parity(tmp_path, r'''
+- hosts: localhost
+  gather_facts: false
+  vars: {lane: dev}
+  vars_files:
+    - 'first-{{ selector | default("demo\test") }}.vars'
+    - 'second-{{ lane }}.vars'
+  tasks:
+    - include_tasks: '{{ selector }}-{{ flavor }}.yml'
+''', {
+        r"first-demo\test.vars": "selector: selected\n",
+        "second-dev.vars": "flavor: dev\n",
+        "second-prod.vars": "flavor: prod\n",
+        "selected-dev.yml": "- debug: {msg: development}\n",
+        "selected-prod.yml": "- debug: {msg: production}\n",
+    }, extra_vars={"lane": "prod"})
+    assert messages == ["production"]
+
+
+def test_linked_role_template_source_with_inline_backslash(tmp_path):
+    playbook = _write(tmp_path, '''
+- hosts: localhost
+  gather_facts: false
+  vars: {asset_name: app}
+  roles: [demo]
+''', {
+        "roles/demo/tasks/main.yml": r'''
+- template:
+    src: '{{ "templates/sites/alias\t/" ~ asset_name ~ ".j2" }}'
+    dest: '{{ playbook_dir }}/output'
+''',
+        "roles/demo/templates/shared/app.j2": "linked source\n",
+    })
+    sites = tmp_path / "roles/demo/templates/sites"
+    sites.mkdir()
+    (sites / r"alias\t").symlink_to("../shared", target_is_directory=True)
+    output = tmp_path / "output"
+    expected = _ansible(playbook, tmp_path)
+    assert output.read_text() == "linked source\n"
+    output.unlink()
+    assert _ansiroll(playbook, tmp_path) == expected
+    assert output.read_text() == "linked source\n"
 
 
 @pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
