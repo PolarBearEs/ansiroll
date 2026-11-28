@@ -1623,7 +1623,7 @@ def _tag_untrusted(value, template_syntax_only=False):
             if not template_syntax_only or "{{" in v or "{%" in v:
                 return {"__ansiroll_unsafe__": str(v)}
         if isinstance(v, dict):
-            return {_FactKeyTemplate(k) if isinstance(k, str) and ("{{" in k or "{%" in k)
+            return {_FactKeyTemplate(k) if _is_templated_fact_key(k)
                     and not untrusted(k) else k: walk(x) for k, x in v.items()}
         if isinstance(v, list):
             return [walk(x) for x in v]
@@ -1836,6 +1836,10 @@ def _is_templated(value):
     return isinstance(value, str) and ("{{" in value or "{%" in value)
 
 
+def _is_templated_fact_key(key):
+    return _is_templated(key) or (isinstance(key, str) and "{#" in key)
+
+
 def _loop_binding_names(loop_var, index_var, extended):
     names = {loop_var or "item", "ansible_loop_var"}
     if index_var:
@@ -1865,7 +1869,7 @@ def _runtime_write_names(action, args, register, *, raw_params_is_fact=False):
     names = set(register if isinstance(register, dict) else [register]) if register else set()
     action = str(action or "").rsplit(".", 1)[-1]
     if action == "set_fact":
-        names.update(None if _is_templated(key) else key
+        names.update(None if _is_templated_fact_key(key) else key
                      for key in args if key not in ("cacheable", "_variable_params"))
         if "_variable_params" in args or (
                 not raw_params_is_fact and set(args) == {"_raw_params"} and _is_templated(args["_raw_params"])):
@@ -3387,10 +3391,9 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
     elif node["special"] is None:
         actions.add(action)
     if node["special"] == "set_fact":
-        # Only top-level fact names from the authored argument mapping may
-        # be templates. Preserve their trust before serialization strips tags.
-        keys = [k for k in node["args"] if isinstance(k, str)
-                and ("{{" in k or "{%" in k)]
+        # Record trusted fact names from the explicit argument mapping
+        # before serialization strips tags.
+        keys = [k for k in node["args"] if _is_templated_fact_key(k)]
         trusted_keys = [k for k in _tag_untrusted(keys) if isinstance(k, str)]
         if trusted_keys:
             node["set_fact_key_templates"] = trusted_keys

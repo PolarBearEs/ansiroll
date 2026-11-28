@@ -3611,7 +3611,7 @@ class _Templater:
         self._expr_cache = {}
         self._condition_list_cache = {}
         self._template_cache = {}
-        self._file_environments = {}
+        self._template_environments = {}
         self._keyword_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
@@ -3899,7 +3899,8 @@ class _Templater:
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if file_newline is None:
-            templated = _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text)
+            comments = isinstance(text, _FactKeyTemplate) or ctx.get(_CHECK_MODE_TEMPLATE) is not None
+            templated = _looks_templated(text) or (comments and "{#" in text)
         else:
             settings = dict(file_options)
             starts = [
@@ -4147,6 +4148,7 @@ class _Templater:
         stripped = text.strip()
         check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
         native_keyword = check_mode_template is True
+        fact_key_comment = file_newline is None and isinstance(text, _FactKeyTemplate) and "{#" in text
         tracking = self._untrusted_task_interpolation is not None
         lazy_names = tracking or bool(ctx.get(_DEFER_LOOKUP_NAMES))
         if lazy_names:
@@ -4154,6 +4156,7 @@ class _Templater:
         else:
             env = self._strict_env if strict else self.env
         native_file = file_newline is not None and not _legacy_templating()
+        native_output = native_file or (fact_key_comment and _core_at_least(2, 19))
         if native_keyword:
             if env not in self._keyword_environments:
                 keyword_env = env.overlay()
@@ -4168,25 +4171,29 @@ class _Templater:
                     _ConditionalKeywordCodeGenerator if lazy_names else _KeywordCodeGenerator)
                 self._keyword_environments[env] = keyword_env
             env = self._keyword_environments[env]
-        if file_newline is not None:
-            key = (env, file_newline, file_options, native_file)
-            if key not in self._file_environments:
-                settings = {"newline_sequence": file_newline, "keep_trailing_newline": False, **dict(file_options)}
-                file_env = env.overlay()
+        if file_newline is not None or fact_key_comment:
+            key = (env, file_newline, file_options, native_output)
+            if key not in self._template_environments:
+                settings = {"keep_trailing_newline": False}
+                if fact_key_comment:
+                    settings["trim_blocks"] = True
+                else:
+                    settings.update({"newline_sequence": file_newline, **dict(file_options)})
+                template_env = env.overlay()
                 for option, value in settings.items():
-                    setattr(file_env, option, value)
-                if native_file:
-                    file_env.code_generator_class = _ConditionalFileCodeGenerator if lazy_names else _FileCodeGenerator
-                    file_env.concat = _concat_file_output
-                    file_env.finalize = _concretize
-                self._file_environments[key] = file_env
-            env = self._file_environments[key]
+                    setattr(template_env, option, value)
+                if native_output:
+                    template_env.code_generator_class = _ConditionalFileCodeGenerator if lazy_names else _FileCodeGenerator
+                    template_env.concat = _concat_file_output
+                    template_env.finalize = _concretize
+                self._template_environments[key] = template_env
+            env = self._template_environments[key]
         expr = None
         legacy_header = file_header and not native_file
         if (not legacy_header and (check_mode_template is None or text == stripped)
                 and env.variable_start_string == "{{" and env.variable_end_string == "}}"):
-            expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None)
-        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword)
+            expr = _bare_template_expression(stripped, lex=env.lex, verify=file_newline is not None or fact_key_comment)
+        template_options = (strict, lazy_names, file_newline, file_options, native_file, native_keyword, fact_key_comment)
         template_key = (text, *template_options)
         # A bare "{{ expr }}" returns the native object (list/dict/int/...).
         has_lookup = self._has_lookup_call(stripped)
@@ -4211,9 +4218,9 @@ class _Templater:
                 if tmpl is None:
                     tmpl = env.from_string(text)
                     self._template_cache[template_key] = tmpl
-                if native_file:
-                    # Bundled Jinja uses the global text concatenator in
-                    # Template.render, even when the overlay has a native one.
+                if native_output:
+                    # Template.render uses Jinja's text concatenator even
+                    # when the overlay has a native one.
                     result = _concat_file_output(tmpl.root_render_func(tmpl.new_context(ctx)))
                 elif native_keyword:
                     result = _concat_keyword_segments(tmpl.generate(**ctx))
@@ -4246,14 +4253,16 @@ class _Templater:
                 elif legacy and (isinstance(result, _Omit) or text.endswith("\n")):
                     result = (str(_finalize_text_segment(ctx, result)) if result is None
                               else str(_as_text(result)))
-            if file_newline is not None and isinstance(result, str) and not isinstance(result, _Omit):
+            if (file_newline is not None or fact_key_comment) and isinstance(result, str) and not isinstance(result, _Omit):
                 source_newlines = len(text) - len(text.rstrip("\n"))
                 if file_header and source_newlines == len(text):
                     # Removing the header also consumed a trailing LF.
                     source_newlines += 1
                 result_newlines = len(result) - len(result.rstrip("\n"))
                 # Core 2.14–2.18 restore using the overlay's newline sequence.
-                restored_newline = env.newline_sequence if not native_file and _core_at_least(2, 14) else file_newline
+                restored_newline = file_newline
+                if fact_key_comment or (not native_file and _core_at_least(2, 14)):
+                    restored_newline = env.newline_sequence
                 result += restored_newline * (source_newlines - result_newlines)
             if self._untrusted_task_interpolation and type(result) in (dict, list, tuple):
                 # Filter-produced containers can outlive this member's tracking
@@ -6890,7 +6899,7 @@ class Runtime:
                 continue
             value = args[key]
             if isinstance(key, _FactKeyTemplate):
-                key = _fail_on_undef(self.template(str(key), ctx))
+                key = _fail_on_undef(self.template(key, ctx))
                 if modern and isinstance(key, _Omit):
                     return {"failed": True, "changed": False,
                             "msg": "Invalid variable name: fact key resolved to omit"}

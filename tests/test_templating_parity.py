@@ -3867,6 +3867,47 @@ def test_set_fact_templates_authored_fact_names(tmp_path, use_strategy):
     assert recap == ("4", "0", "0", "0", "0", "0", "1")
 
 
+def test_set_fact_renders_comments_in_trusted_names_before_validation(tmp_path):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    saved:
+      '{# name #}from_mapping': pear
+  tasks:
+    - set_fact:
+        '{# name #}greeting': hello
+        '{# name #}with_{{ suffix }}': apple
+        ? |-
+          {# name #}
+          multiline
+        : plum
+      vars:
+        suffix: expression
+    - set_fact: {}
+      args: '{{ saved }}'
+    - set_fact:
+        '{# name #}invalid-name': rejected
+      ignore_errors: true
+    - set_fact:
+        'invalid-name': rejected
+      ignore_errors: true
+    - set_fact:
+        !unsafe '{# name #}literal': rejected
+      ignore_errors: true
+    - set_fact:
+        ? |
+          trailing_newline{# name #}
+        : rejected
+      ignore_errors: true
+    - debug:
+        msg: >-
+          {{ greeting }}/{{ with_expression }}/{{ multiline }}/{{ from_mapping }}/{{ literal is defined }}/{{ trailing_newline is defined }}
+""")
+    assert messages == ["hello/apple/plum/pear/False/False"]
+    assert recap == ("7", "0", "0", "0", "0", "0", "4")
+
+
 @pytest.mark.parametrize("use_strategy", [False, True])
 def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
     unsafe_task = """
@@ -3898,20 +3939,21 @@ def test_set_fact_templates_trusted_names_from_args(tmp_path, use_strategy):
 
 @pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy Core uses a string omit token")
 @pytest.mark.parametrize("use_strategy", [False, True])
-def test_set_fact_rejects_trusted_name_that_resolves_to_omit(tmp_path, use_strategy):
+@pytest.mark.parametrize("key", ["{{ omit }}", "{# name #}{{ omit }}"], ids=["expression", "with-comment"])
+def test_set_fact_rejects_trusted_name_that_resolves_to_omit(tmp_path, use_strategy, key):
     messages, _ = _assert_parity(tmp_path, """
 - hosts: localhost
   gather_facts: false
   vars:
     fact_args:
-      '{{ omit }}': invalid
+      'FACT_KEY': invalid
   tasks:
     - block:
         - set_fact: {}
           args: '{{ fact_args }}'
       rescue:
         - debug: {msg: rejected-omitted-key}
-""", use_strategy=use_strategy)
+""".replace("FACT_KEY", key), use_strategy=use_strategy)
     assert messages == ["rejected-omitted-key"]
 
 

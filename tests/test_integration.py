@@ -7593,6 +7593,20 @@ def test_expanded_set_fact_args_prevent_conflicting_freeze(tmp_path):
         compile_playbook(str(playbook), freeze_vars=["status"])
 
 
+def test_comment_in_set_fact_key_prevents_conflicting_freeze(tmp_path):
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    status: before
+  tasks:
+    - set_fact:
+        '{# name #}status': after
+""")
+    with pytest.raises(ValueError, match="cannot freeze 'status'"):
+        compile_playbook(str(playbook), freeze_vars=["status"])
+
+
 def test_explicit_raw_params_fact_allows_unrelated_freeze(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
