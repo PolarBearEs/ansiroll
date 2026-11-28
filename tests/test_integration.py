@@ -5840,6 +5840,63 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
     )
 
 
+@pytest.mark.parametrize("guard", ["matches", "unmatched", "absent"])
+def test_strategy_missing_literal_unarchive_source_honors_creates(tmp_path, guard):
+    destination = tmp_path / "dest"
+    destination.mkdir()
+    if guard == "matches":
+        (destination / "marker").touch()
+    playbook = """- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - ansible.builtin.unarchive:
+        src: missing.tar.gz
+        dest: "{{ playbook_dir }}/dest"
+"""
+    if guard != "absent":
+        playbook += '        creates: "{{ playbook_dir }}/dest/marker"\n'
+
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, "-v", environment={"ANSIBLE_STRATEGY": strategy})
+        output = result.stdout + result.stderr
+        if guard == "matches":
+            assert result.returncode == 0, output
+            assert "skipped, since %s exists" % (destination / "marker") in output, output
+        else:
+            assert result.returncode != 0, output
+            assert "Could not find or access 'missing.tar.gz'" in output, output
+
+
+def test_strategy_missing_literal_unarchive_source_keeps_delegation_on_target(tmp_path):
+    (tmp_path / "marker").touch()
+    inventory = tmp_path / "inventory"
+    inventory.write_text(
+        "target ansible_connection=local\n"
+        "delegate ansible_connection=local ansible_shell_type=ansiroll_missing_shell\n"
+    )
+    playbook = """- hosts: target
+  gather_facts: false
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - ansible.builtin.unarchive:
+        src: missing.tar.gz
+        dest: "{{ playbook_dir }}"
+        creates: "{{ playbook_dir }}/marker"
+      delegate_to: delegate
+    - ansible.builtin.file:
+        path: "{{ playbook_dir }}/result"
+        state: touch
+      delegate_to: delegate
+"""
+    result = _run_strategy_play(tmp_path, playbook, "-v", inventory=str(inventory))
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "skipped, since %s exists" % (tmp_path / "marker") in output, output
+    assert (tmp_path / "result").is_file()
+
+
 def test_standalone_task_omit_preserves_invocation_check_mode(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost

@@ -4452,6 +4452,7 @@ class Runtime:
         self._module_source_bytes = None  # baked unarchive input for the next worker call
         self._errors_cleared = False  # set by `meta: clear_host_errors`
         self.delegate_fn = None      # agent mode: run delegated/controller tasks via the channel
+        self.unarchive_fallback_fn = None  # resolve a missing controller archive through the native action
         self.gather_setup_fn = None  # resolve implicit setup options using controller task scope
         self.delegate_on_target = False
         self.controller_source_fn = None  # fetch runtime-created controller files in agent mode
@@ -6444,8 +6445,10 @@ class Runtime:
                 if isinstance(become_user, str):
                     become_user = self.template(become_user, ctx)
                 self.become_user = _as_text(become_user)
-            delegated = self.delegate_fn and (task.get("delegate_to") or task.get("fallback"))
-            if delegated and task["action"].rsplit(".", 1)[-1] == "synchronize":
+            missing_archive = task.get("_missing_literal_unarchive_source")
+            delegate_fn = self.unarchive_fallback_fn if missing_archive else self.delegate_fn
+            delegated = delegate_fn and (task.get("delegate_to") or task.get("fallback"))
+            if delegated and (missing_archive or task["action"].rsplit(".", 1)[-1] == "synchronize"):
                 self._module_env = None  # TaskExecutor has the delegated inventory context.
             else:
                 self._module_env = self._task_environment(task, ctx)
@@ -6478,10 +6481,10 @@ class Runtime:
                     args = _fail_on_undef(_strip_omit(
                         self._render_action_args(task.get("args") or {}, ctx, args_cache)
                     ))
-                    if self._is_builtin_unarchive(task):
+                    if self._is_builtin_unarchive(task) and not missing_archive:
                         self._normalize_unarchive_options(args)
                     self._executed_task_args = args
-                    res = self.delegate_fn(task, args, become, ctx)
+                    res = delegate_fn(task, args, become, ctx)
                     action = task["action"].rsplit(".", 1)[-1]
                     if action == "group_by":
                         # Preserve trust only for controller inventory metadata.
@@ -9199,81 +9202,88 @@ def agent_main():
 
     rt.gather_setup_fn = _gather_setup
     rt.delegate_on_target = delegate_on_target
-    if not delegate_on_target:
-        def _delegate(task, args, become, ctx):
-            # Only the agent has the play's bundled filters and lookup plugins.
-            # Synchronize also reads connection and executable vars directly.
-            action = (task.get("action") or "").rsplit(".", 1)[-1]
-            if action == "template":
-                ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
-            templater = rt.templater if action in ("template", "synchronize") else None
-            resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else None
-            defer_template = action == "template" and (
-                ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
-            )
-            if defer_template:
-                resolve_keys = {"omit"}
-            deferred = {} if resolve_keys is not None else None
-            lazy_play = set() if action == "synchronize" else None
-            scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
-            frame = {
-                "t": "delegate", "uuid": task.get("uuid"),
-                "runtime_id": task.get("runtime_id"),
-                "action": task.get("action"), "args": args,
-                "vars": _delegate_vars(scope, templater, resolve_keys, deferred,
-                                       controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play),
-                "become": become, "to": task.get("delegate_to"),
-                "become_user": rt.become_user,
-                "check_mode": bool(rt.check_mode),
-                "diff_mode": bool(rt.diff_mode),
-                "no_log": bool(task.get("no_log")),
-                "fallback": bool(task.get("fallback")),
-                "search_dirs": task.get("search_dirs"),
-                "name": task.get("name"),
-            }
-            if action == "template" and rt._copy_transfer_check_mode is not None:
-                frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
-            if lazy_play is not None and deferred:
-                frame["deferred_vars"] = deferred
-            if lazy_play:
-                frame["lazy_play_vars"] = sorted(lazy_play)
-            requested_names = lazy_play or set()
-            members = [] if defer_template else None
-            if defer_template:
-                requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
-                if _legacy_non_native(ctx) and not ctx.get(_DEFER_LOOKUP_NAMES):
-                    # Legacy scalar block aliases were sent as template source.
-                    # Let the controller evaluate that source when the file uses it.
-                    requested_names.difference_update(
-                        name for name, value in ctx.items() if isinstance(value, _BlockVarTemplate)
-                    )
-                if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
-                    requested_names.add("hostvars")
-                frame["lazy_template_vars"] = sorted(requested_names)
-                # Transport can be lazy while Jinja resolves each referenced name.
-                frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES))
-            _chan_send(resp_fd, frame)
+
+    def _delegate(task, args, become, ctx):
+        # Only the agent has the play's bundled filters and lookup plugins.
+        # Synchronize also reads connection and executable vars directly.
+        action = (task.get("action") or "").rsplit(".", 1)[-1]
+        missing_archive = bool(task.get("_missing_literal_unarchive_source"))
+        native_action = action == "synchronize" or missing_archive
+        if action == "template":
+            ctx = {**ctx, _TEMPLATE_FILE_TEXT: True}
+        templater = rt.templater if action == "template" or native_action else None
+        resolve_keys = None
+        if native_action:
+            resolve_keys = _SYNCHRONIZE_VARS if action == "synchronize" else set()
+        defer_template = action == "template" and (
+            ctx.get(_DEFER_LOOKUP_NAMES) or any(_is_deferred_block_var(value) for value in ctx.values())
+        )
+        if defer_template:
+            resolve_keys = {"omit"}
+        deferred = {} if resolve_keys is not None else None
+        lazy_play = set() if native_action else None
+        scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
+        frame = {
+            "t": "delegate", "uuid": task.get("uuid"),
+            "runtime_id": task.get("runtime_id"),
+            "action": task.get("action"), "args": args,
+            "vars": _delegate_vars(scope, templater, resolve_keys, deferred,
+                                   controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play),
+            "become": become, "to": task.get("delegate_to"),
+            "become_user": rt.become_user,
+            "check_mode": bool(rt.check_mode),
+            "diff_mode": bool(rt.diff_mode),
+            "no_log": bool(task.get("no_log")),
+            "fallback": bool(task.get("fallback")),
+            "search_dirs": task.get("search_dirs"),
+            "name": task.get("name"),
+        }
+        if action == "template" and rt._copy_transfer_check_mode is not None:
+            frame["copy_transfer_check_mode"] = rt._copy_transfer_check_mode
+        if lazy_play is not None and deferred:
+            frame["deferred_vars"] = deferred
+        if lazy_play:
+            frame["lazy_play_vars"] = sorted(lazy_play)
+        requested_names = lazy_play or set()
+        members = [] if defer_template else None
+        if defer_template:
+            requested_names = {name for name, kind in deferred.items() if kind in ("task", "play")}
+            if _legacy_non_native(ctx) and not ctx.get(_DEFER_LOOKUP_NAMES):
+                # Legacy scalar block aliases were sent as template source.
+                # Let the controller evaluate that source when the file uses it.
+                requested_names.difference_update(
+                    name for name, value in ctx.items() if isinstance(value, _BlockVarTemplate)
+                )
+            if isinstance(ctx.get("hostvars", {}).get(rt.host), _TaskHostVars):
+                requested_names.add("hostvars")
+            frame["lazy_template_vars"] = sorted(requested_names)
+            # Transport can be lazy while Jinja resolves each referenced name.
+            frame["defer_template_names"] = bool(ctx.get(_DEFER_LOOKUP_NAMES))
+        _chan_send(resp_fd, frame)
+        reply = _chan_recv()
+        while reply and reply.get("t") == "delegate_play_var":
+            name = reply.get("name")
+            member = reply.get("member")
+            fallback = None
+            if member is None and isinstance(name, str) and name in requested_names:
+                template_vars = reply.get("template_vars") if defer_template else None
+                if template_vars:
+                    for key in ("template_mtime", "template_run_date"):
+                        if template_vars.get(key) is not None:
+                            template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
+                    scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
+                fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
+            elif members is not None and type(member) is int and 0 <= member < len(members):
+                fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)
+            _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
             reply = _chan_recv()
-            while reply and reply.get("t") == "delegate_play_var":
-                name = reply.get("name")
-                member = reply.get("member")
-                fallback = None
-                if member is None and isinstance(name, str) and name in requested_names:
-                    template_vars = reply.get("template_vars") if defer_template else None
-                    if template_vars:
-                        for key in ("template_mtime", "template_run_date"):
-                            if template_vars.get(key) is not None:
-                                template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
-                        scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
-                    fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
-                elif members is not None and type(member) is int and 0 <= member < len(members):
-                    fallback = _resolve_delegated_play_var(None, scope, templater, members=members, member=member)
-                _chan_send(resp_fd, {"t": "delegate_play_var_result", "fallback": fallback})
-                reply = _chan_recv()
-            if not reply or reply.get("t") != "delegate_result":
-                return {"failed": True, "changed": False,
-                        "msg": "ansiroll: controller did not return a delegate result"}
-            return reply.get("result", {})
+        if not reply or reply.get("t") != "delegate_result":
+            return {"failed": True, "changed": False,
+                    "msg": "ansiroll: controller did not return a delegate result"}
+        return reply.get("result", {})
+
+    rt.unarchive_fallback_fn = _delegate
+    if not delegate_on_target:
         rt.delegate_fn = _delegate
 
         def _controller_source(path, lookup_task_id=None):

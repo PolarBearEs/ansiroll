@@ -438,7 +438,7 @@ class StrategyModule(StrategyBase):
     def _compile(self, play, play_vars, gather_task):
         from ansiroll.loader import _conditions, _convert_play
         from ansiroll.embed import ModuleEmbedder, SPECIAL_ACTIONS
-        from ansiroll.compiler import _render_source
+        from ansiroll.compiler import _render_source, _walk_play_nodes
 
         actions = set()
         only_tags = set(context.CLIARGS.get("tags") or [])
@@ -471,6 +471,10 @@ class StrategyModule(StrategyBase):
             from ansiroll.compiler import _mark_unsupported
             _mark_unsupported([play_node], unsupported)
         self._compiled_controller_fallbacks = _controller_fallbacks(play_node)
+        self._missing_literal_unarchive_tasks = {
+            node["runtime_id"] for node in _walk_play_nodes([play_node])
+            if node.get("_missing_literal_unarchive_source")
+        }
         self._deferred_vars_file_keys = (
             set(play_node.get("vars") or {}) if play_node.get("deferred_vars_files") else None
         )
@@ -890,9 +894,12 @@ class StrategyModule(StrategyBase):
                     for key, value in facts.items():
                         self._variable_manager.set_host_variable(target.name, key, value)
             return result
-        if action == "synchronize":
+        missing_archive = (action == "unarchive"
+                           and frame.get("runtime_id") in self._missing_literal_unarchive_tasks)
+        if action == "synchronize" or missing_archive:
             return self._run_native_controller_task(
-                frame, host, hv, task_map or {}, play_context, resolve_play_var)
+                frame, host, hv, task_map or {}, play_context, resolve_play_var,
+                ignore_delegation=missing_archive and self._delegate_on_target)
         to = frame.get("to")
         to = self._t(templar, to) if isinstance(to, str) else to
         local = to and str(to).lower() in ("localhost", "127.0.0.1", "::1")
@@ -920,7 +927,8 @@ class StrategyModule(StrategyBase):
             rt.diff_mode = previous_diff
             rt.become_user = previous_become_user
 
-    def _run_native_controller_task(self, frame, host, hv, task_map, play_context, resolve_play_var=None):
+    def _run_native_controller_task(self, frame, host, hv, task_map, play_context, resolve_play_var=None,
+                                    *, ignore_delegation=False):
         """Run an action-plugin task with Ansible's official TaskExecutor."""
         task = task_map.get(frame.get("runtime_id"))
         if task is None:
@@ -936,6 +944,8 @@ class StrategyModule(StrategyBase):
             from ansiroll.loader import _core_version
 
             concrete = task.copy()
+            if ignore_delegation:
+                concrete.delegate_to = None
             omit_tokens = {"__omit_place_holder__ansiroll", (hv or {}).get("omit")}
             concrete.args = _drop_omit_values(dict(frame.get("args") or {}), omit_tokens)
             if _core_version() < (2, 19):
