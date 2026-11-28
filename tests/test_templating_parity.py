@@ -1911,6 +1911,78 @@ def test_legacy_template_header_preserves_expression_formatting(tmp_path, expres
     assert output.read_bytes() == expected
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern mapping views become indexable lists")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+def test_template_file_indexes_mapping_view_aliases(tmp_path, delegated):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    values_alias: "{{ dict(mode='ready').values() }}"
+    values_hop: "{{ values_alias }}"
+    items_alias: "{{ dict(mode='ready').items() }}"
+    keys_alias: "{{ dict(mode='ready').keys() }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""" + ("      delegate_to: localhost\n" if delegated else ""), {
+        "sample.j2": "{% set key = keys_alias[0] %}{{ key }}={{ values_hop[-1] }} {{ items_alias[0][1] }}\n",
+    })
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert output.read_bytes() == b"mode=ready ready\n"
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == expected
+    assert output.read_bytes() == b"mode=ready ready\n"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern mapping views become indexable lists")
+def test_template_file_indexes_view_alias_without_finalizing_its_members(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    alias: "{{ [{'keep': 'ready', 'unused': missing}.values()] }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""", {"sample.j2": "{{ alias[0][0] }}\n"})
+    output = tmp_path / "rendered.txt"
+    expected = _ansible(path, tmp_path)
+    assert output.read_bytes() == b"ready\n"
+    output.unlink()
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_bytes() == b"ready\n"
+
+
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="modern calls propagate undefined arguments")
+@pytest.mark.parametrize("default", [False, True], ids=["failure", "default"])
+def test_template_file_view_alias_propagates_undefined_dict_argument(tmp_path, default):
+    output = tmp_path / "rendered.txt"
+    original = "existing content\n"
+    output.write_text(original)
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    alias: "{{ dict(keep='ready', unused=missing).values()[0] ALIAS_FILTER }}"
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+""".replace("ALIAS_FILTER", "| default('fallback')" if default else ""), {"sample.j2": "{{ alias }}\n"})
+    expected = _ansible(path, tmp_path)
+    content = "fallback\n" if default else original
+    assert expected[1][3] == ("0" if default else "1")
+    assert output.read_text() == content
+    output.write_text(original)
+    assert _ansiroll(path, tmp_path) == expected
+    assert output.read_text() == content
+
+
 def test_template_file_newline_mode_does_not_affect_later_expressions():
     from ansiroll.runtime import Runtime
 
