@@ -680,7 +680,7 @@ def _selector_vars_key(node, variables, aliases=None, *, template_variables=None
             source = _bare_template_expression(value)
             if source is not None:
                 try:
-                    body = jinja2.Environment().parse("{{ " + source + " }}").body
+                    body = _AnsirollEnvironment().parse_inline("{{ " + source + " }}").body
                 except jinja2.TemplateSyntaxError:
                     return unknown
                 if len(body) == 1 and isinstance(body[0], jinja2.nodes.Output) and len(body[0].nodes) == 1:
@@ -3632,15 +3632,26 @@ class _InlineTemplateLexer(jinja2.lexer.Lexer):
 
 class _AnsirollEnvironment(jinja2.Environment):
     _inline_lexer = None
+    _inline_variant = None
 
     @property
     def lexer(self):
         return self._inline_lexer or super().lexer
 
-    def inline_overlay(self):
-        env = self.overlay()
-        env._inline_lexer = _InlineTemplateLexer(env)
+    def for_inline(self, text):
+        if "\\" not in text or "{{" not in text or self._inline_lexer is not None:
+            return self
+        env = self._inline_variant
+        # Jinja copies instance attributes into overlays. Each lexer must use
+        # the settings of its own environment (for example, trim_blocks).
+        if env is None or env.linked_to is not self:
+            env = self.overlay()
+            env._inline_lexer = _InlineTemplateLexer(env)
+            self._inline_variant = env
         return env
+
+    def parse_inline(self, text):
+        return self.for_inline(text).parse(text)
 
 
 class _Templater:
@@ -3654,7 +3665,6 @@ class _Templater:
         self._condition_list_cache = {}
         self._template_cache = {}
         self._file_environments = {}
-        self._inline_environments = {}
         self._keyword_environments = {}
         self._lookup_templates = {}
         self._inherited_lookup_scans = {}
@@ -4099,16 +4109,6 @@ class _Templater:
             return _lazy_wrap(_mark_unsafe(value, preserve_views=True), self._runtime, ctx)
         return value
 
-    def _inline_environment(self, env, text):
-        if "\\" not in text or "{{" not in text:
-            return env
-        if env not in self._inline_environments:
-            self._inline_environments[env] = env.inline_overlay()
-        return self._inline_environments[env]
-
-    def parse_inline(self, text):
-        return self._inline_environment(self.env, text).parse(text)
-
     def _has_lookup_call(self, text, env=None):
         if not _looks_templated(text) or not self._LOOKUP_CALL.search(text):
             return False
@@ -4117,7 +4117,7 @@ class _Templater:
             nodes = jinja2.nodes
             has_lookup = defer_lookup = False
             try:
-                parsed = self.parse_inline(text) if env is None else env.parse(text)
+                parsed = self.env.parse_inline(text) if env is None else env.parse(text)
                 pending = [(parsed, False, False)]
                 while pending:
                     node, in_lookup, composed = pending.pop()
@@ -4237,7 +4237,7 @@ class _Templater:
                 self._file_environments[key] = file_env
             env = self._file_environments[key]
         else:
-            env = self._inline_environment(env, text)
+            env = env.for_inline(text)
         expr = None
         legacy_header = file_header and not native_file
         if (not legacy_header and (check_mode_template is None or text == stripped)
@@ -4762,7 +4762,7 @@ class Runtime:
             return False
         nodes = jinja2.nodes
         try:
-            parsed = self.templater.parse_inline(condition.strip())
+            parsed = self.templater.env.parse_inline(condition.strip())
         except jinja2.TemplateError:
             return False
         if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.Output):
@@ -5682,7 +5682,7 @@ class Runtime:
                 return None
             ancestors = (*ancestors, (origin, remaining))
             try:
-                expression = self.templater.parse_inline(source)
+                expression = self.templater.env.parse_inline(source)
             except jinja2.TemplateSyntaxError:
                 return None
             analysis = _selector_scope(expression, ctx)
@@ -6199,7 +6199,7 @@ class Runtime:
         for i, source in enumerate(loop):
             if type(source) is not str or type(items[i]) is not _UnsafeText:
                 continue
-            parsed = self.templater.parse_inline(source)
+            parsed = self.templater.env.parse_inline(source)
             if all(isinstance(node, jinja2.nodes.Output) and
                    all(isinstance(part, (jinja2.nodes.Const, jinja2.nodes.TemplateData))
                        for part in node.nodes)
