@@ -70,6 +70,16 @@ display = Display()
 _fallback_warning_numbers = count(1)
 
 
+def _decrypt_controller_source(loader, path, data):
+    from ansiroll.loader import _core_version
+
+    if _core_version() < (2, 19):
+        return loader._decrypt_if_vault_data(data, os.fsencode(path))
+    from ansible._internal._datatag._tags import Origin
+
+    return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
+
+
 class _DelegatedPlayVariables:
     """Cache the agent's values for one controller task invocation."""
 
@@ -1121,6 +1131,8 @@ class StrategyModule(StrategyBase):
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
+        from ansiroll.loader import _open_role_source, _RoleSourceLeaseError
+
         args = dict(frame.get("args") or {})
         src = args.get("src")
         if not isinstance(src, str) or not src:
@@ -1133,12 +1145,17 @@ class StrategyModule(StrategyBase):
         search_path = source_task.get_search_path() if source_task is not None else []
         try:
             fullpath = loader.path_dwim_relative_stack(search_path, "templates", src)
-            if not os.path.isfile(loader.path_dwim(fullpath)):
+            path = loader.path_dwim(fullpath)
+            if not os.path.isfile(path):
                 return {"failed": True, "changed": False, "msg": "template: source is not a regular file"}
-            data, _ = loader._get_file_contents(fullpath)
+            with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as handle:
+                st = os.fstat(handle.fileno())
+                if not stat.S_ISREG(st.st_mode):
+                    return {"failed": True, "changed": False, "msg": "template: source is not a regular file"}
+                data = handle.read()
+            data, _ = _decrypt_controller_source(loader, path, data)
             raw = data.decode("utf-8", "surrogateescape")
-            st = os.stat(fullpath)
-        except (OSError, AnsibleError) as ex:
+        except (OSError, AnsibleError, _RoleSourceLeaseError) as ex:
             return {"failed": True, "changed": False, "msg": "template: %s" % ex}
         rt = self._local_runtime(become_pass)
         previous = rt.check_mode, rt.diff_mode, rt.become_user, rt._copy_transfer_check_mode
@@ -1149,6 +1166,7 @@ class StrategyModule(StrategyBase):
             rt._copy_transfer_check_mode = frame.get("copy_transfer_check_mode")
             task = {
                 "no_log": bool(frame.get("no_log")),
+                "_max_diff_size": C.MAX_FILE_SIZE_FOR_DIFF,
                 "_baked": {src: raw},
                 "_baked_meta": {src: {
                     "fullpath": fullpath,
@@ -1407,7 +1425,6 @@ class StrategyModule(StrategyBase):
 
         def read_selected(path):
             from ansible.errors import AnsibleFileNotFound, AnsibleParserError
-            from ansiroll.loader import _core_version
 
             path = loader.path_dwim(path)
             try:
@@ -1423,11 +1440,7 @@ class StrategyModule(StrategyBase):
                 raise AnsibleFileNotFound("Unable to retrieve file contents.", file_name=path) from ex
             except OSError as ex:
                 raise AnsibleParserError("could not read selected vars file %r" % path) from ex
-            if _core_version() < (2, 19):
-                return loader._decrypt_if_vault_data(data, os.fsencode(path))
-            from ansible._internal._datatag._tags import Origin
-
-            return loader._decrypt_if_vault_data(Origin(path=path).tag(data))
+            return _decrypt_controller_source(loader, path, data)
 
         loader.load_from_file = capture
         try:

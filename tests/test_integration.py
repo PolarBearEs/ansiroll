@@ -5840,6 +5840,153 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
     )
 
 
+@pytest.mark.parametrize("leased", [False, True], ids=["available", "transient-lease"])
+def test_strategy_delegated_template_reads_one_inode(tmp_path, monkeypatch, leased):
+    import errno
+    from ansible.parsing.dataloader import DataLoader
+
+    plugin_type = _load_strategy_module().StrategyModule
+    strategy = plugin_type.__new__(plugin_type)
+    loader = DataLoader()
+    loader.set_basedir(str(tmp_path))
+    strategy._loader = loader
+    src = tmp_path / "source.j2"
+    src.write_text("original source")
+    src.chmod(0o641)
+    replacement = tmp_path / "replacement"
+    replacement.write_text("replacement source")
+    replacement.chmod(0o644)
+    open_source = io.open
+    open_fd = os.open
+    source_open_flags = []
+
+    def open_with_lease(path, flags, *args, **kwargs):
+        if os.fsdecode(path) == str(src):
+            source_open_flags.append(flags)
+            if leased and len(source_open_flags) == 1:
+                raise BlockingIOError(errno.EAGAIN, "synthetic active write lease")
+        return open_fd(path, flags, *args, **kwargs)
+
+    def replace_after_open(path, *args, **kwargs):
+        handle = open_source(path, *args, **kwargs)
+        if not isinstance(path, int) and os.fsdecode(path) == str(src) and replacement.exists():
+            replacement.replace(src)
+        return handle
+
+    monkeypatch.setattr("builtins.open", replace_after_open)
+    monkeypatch.setattr(io, "open", replace_after_open)
+    monkeypatch.setattr(os, "open", open_with_lease)
+
+    def record_result(name, task, args, ctx, **kwargs):
+        assert name == "template"
+        assert args["mode"] == "preserve"
+        return {"source": task["_baked"][src.name], "mode": task["_baked_meta"][src.name]["mode"]}
+
+    rt = SimpleNamespace(check_mode=False, diff_mode=False, become_user="root",
+                         _copy_transfer_check_mode=None, _run_file_action=record_result)
+    strategy._local_runtime = lambda _: rt
+    frame = {"args": {"src": src.name, "dest": str(tmp_path / "result"), "mode": "preserve"}}
+    assert strategy._run_local_template(frame, None) == {"source": "original source", "mode": 0o641}
+    assert src.read_text() == "replacement source"
+    assert len(source_open_flags) == (2 if leased else 1)
+    assert all(flags & os.O_NONBLOCK for flags in source_open_flags)
+
+
+@pytest.mark.parametrize(("task_diff", "block_diff", "apply_diff", "cli_diff", "hide", "limit", "expected_diff", "legacy_native"), [
+    pytest.param(None, None, None, True, False, 104448, "visible", False, id="cli-default"),
+    pytest.param("false", "true", None, True, False, 104448, "absent", False, id="false-override"),
+    pytest.param("null", "true", None, True, False, 104448, "absent", False, id="null-override"),
+    pytest.param('"{{ none }}"', "true", None, True, False, 104448, "absent", False, id="rendered-null"),
+    pytest.param('"{{ unset_diff }}"', "true", None, True, False, 104448, "absent", False, id="null-variable"),
+    pytest.param("|\n    {{ unset_diff }}", "true", None, True, False, 104448, "absent", False,
+                 id="null-variable-newline"),
+    pytest.param('"{{ none }}"', "true", None, True, False, 104448, "absent", True, id="legacy-native-null"),
+    pytest.param(None, "true", None, False, False, 104448, "visible", False, id="inherit-block"),
+    pytest.param('"{{ omit }}"', "false", None, True, False, 104448, "absent", False, id="omit-inherit-block"),
+    pytest.param('"{{ omit }}"', '"{{ true }}"', None, True, False, 104448, "failed", False, id="omit-invalid-inherited"),
+    pytest.param(None, "true", None, True, True, 104448, "redacted", False, id="include-apply-no-log"),
+    pytest.param(None, None, '"{{ omit }}"', True, False, 104448, "visible", False, id="include-apply-omit"),
+    pytest.param(None, None, '"{{ none }}"', True, False, 104448, "absent", False, id="include-apply-null"),
+    pytest.param(None, None, None, True, False, 8, "limited", False, id="size-limit"),
+])
+def test_strategy_delegated_template_diff_in_check_mode(
+        tmp_path, task_diff, block_diff, apply_diff, cli_diff, hide, limit, expected_diff, legacy_native):
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansiroll.loader import _core_version
+
+    version = _core_version()
+    if (task_diff == '"{{ omit }}"' or apply_diff is not None) and version < (2, 19):
+        pytest.skip("requires native keyword omission and include apply rendering")
+    if task_diff == "null" and version < (2, 17):
+        expected_diff = "visible"
+    if legacy_native and version >= (2, 19):
+        pytest.skip("requires legacy native Jinja configuration")
+    if task_diff == '"{{ none }}"' and version < (2, 19) and not legacy_native:
+        expected_diff = "failed"
+    secret = VaultSecret(b"test-vault-password")
+    password_file = tmp_path / "vault-password"
+    password_file.write_bytes(secret.bytes + b"\n")
+    before = "old synthetic template data"
+    after = "new synthetic template data"
+    destination = tmp_path / "rendered.txt"
+    destination.write_text(before + "\n")
+    (tmp_path / "source.j2").write_bytes(
+        VaultLib([("default", secret)]).encrypt((after + "\n").encode(), secret=secret))
+    (tmp_path / "child.yml").write_text("""- template:
+    src: source.j2
+    dest: "{{ playbook_dir }}/rendered.txt"
+  delegate_to: localhost
+  check_mode: true
+  register: saved
+""" + (f"  diff: {task_diff}\n" if task_diff is not None else ""))
+    block = ("      diff: " + block_diff + "\n") if block_diff is not None else ""
+    apply = ("              diff: " + apply_diff + "\n") if apply_diff is not None else ""
+    playbook = """- hosts: localhost
+  gather_facts: false
+  vars:
+    hide_template_output: HIDE
+    unset_diff: null
+  tasks:
+    - block:
+        - include_tasks:
+            file: child.yml
+            apply:
+              no_log: "{{ hide_template_output }}"
+APPLYBLOCK    - assert:
+        quiet: true
+        that:
+          - saved is changed
+          - EXPECTED
+""".replace("HIDE", json.dumps(hide)).replace("APPLY", apply).replace("BLOCK", block)
+    assertion = {
+        "visible": f"saved.diff[0].before | trim == '{before}' and saved.diff[0].after | trim == '{after}'",
+        "absent": "saved.diff | default([]) | length == 0",
+        "redacted": '''saved.diff[0].before == '' and "no_log: true" in saved.diff[0].after''',
+        "limited": f"saved.diff[0] == {{'src_larger': {limit}, 'dst_larger': {limit}}}",
+        "failed": "false",
+    }[expected_diff]
+    playbook = playbook.replace("EXPECTED", json.dumps(assertion))
+    args = ["-c", "local", "-e", json.dumps({"ansible_python_interpreter": sys.executable})]
+    if cli_diff:
+        args.append("--diff")
+    environment = {
+        "ANSIBLE_VAULT_PASSWORD_FILE": str(password_file),
+        "ANSIBLE_MAX_DIFF_SIZE": str(limit),
+    }
+    if version < (2, 19):
+        environment["ANSIBLE_JINJA2_NATIVE"] = str(legacy_native)
+    for strategy in ("linear", "ansiroll.core.ansiroll"):
+        result = _run_strategy_play(tmp_path, playbook, *args, environment={**environment, "ANSIBLE_STRATEGY": strategy})
+        output = result.stdout + result.stderr
+        if expected_diff == "failed":
+            assert result.returncode == 2 and "diff" in output and "TASK [assert]" not in output, (strategy, output)
+        else:
+            assert result.returncode == 0, (strategy, output)
+        assert (before in output) == (expected_diff == "visible"), (strategy, output)
+        assert (after in output) == (expected_diff == "visible"), (strategy, output)
+        assert destination.read_text() == before + "\n"
+
+
 def test_standalone_task_omit_preserves_invocation_check_mode(tmp_path):
     playbook = tmp_path / "play.yml"
     playbook.write_text("""- hosts: localhost
