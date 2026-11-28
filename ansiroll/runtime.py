@@ -175,6 +175,32 @@ class _Omit(str):
 _OMIT = _Omit("__omit_place_holder__ansiroll")
 
 
+class _NativeOmit(_Omit):
+    """An omit key that can coexist with strings using the legacy spelling."""
+
+    def __eq__(self, other):
+        return self is other or other is _KEYWORD_OMIT
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(_KEYWORD_OMIT)
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+_NATIVE_OMIT = _NativeOmit(_OMIT)
+
+
+def _default_omit():
+    return _NATIVE_OMIT if _core_at_least(2, 19) else _OMIT
+
+
 class _FactKeyTemplate(str):
     """An authored mapping key that set_fact may evaluate."""
 
@@ -922,6 +948,8 @@ def _mark_unsafe(value, _seen=None, preserve_included_vars=False, condition_text
         return value
     if reject_vault and isinstance(value, dict) and dict.keys(value) == {"__ansiroll_vault__"}:
         raise ValueError("The variable contains an undecryptable variable")
+    if value is _NATIVE_OMIT:
+        return value
     if isinstance(value, str):
         if condition_text and not isinstance(value, _TrustedAsTemplateValue):
             return _UntrustedConditionValue(value)
@@ -997,7 +1025,7 @@ def _decode_frozen_value(value):
 
 
 def _trust_set_fact_value(value):
-    if isinstance(value, (_FactKeyTemplate,) + _NO_TEMPLATE):
+    if isinstance(value, (_FactKeyTemplate, _Omit) + _NO_TEMPLATE):
         return value
     if isinstance(value, str):
         return _TrustedAsTemplateValue(value)
@@ -1087,9 +1115,13 @@ def _normalized_facts(facts, preserve_local=False):
             for key, value in facts.items()}
 
 
+def _is_omit_arg(value):
+    return value is _NATIVE_OMIT or value == _OMIT
+
+
 def _strip_omit(args):
     if isinstance(args, dict):
-        return {k: v for k, v in args.items() if v != _OMIT}
+        return {k: v for k, v in args.items() if not _is_omit_arg(v)}
     return args
 
 
@@ -1097,9 +1129,9 @@ def _setup_omit(args):
     if not _core_at_least(2, 19):
         return _fail_on_undef(_strip_omit(args))
     if isinstance(args, dict):
-        return {key: _setup_omit(value) for key, value in args.items() if value != _OMIT and value is not _KEYWORD_OMIT}
+        return {key: _setup_omit(value) for key, value in args.items() if not _is_omit_arg(value) and value is not _KEYWORD_OMIT}
     if isinstance(args, (list, tuple)):
-        return [_setup_omit(value) for value in args if value != _OMIT and value is not _KEYWORD_OMIT]
+        return [_setup_omit(value) for value in args if not _is_omit_arg(value) and value is not _KEYWORD_OMIT]
     return _fail_on_undef(args)
 
 
@@ -3073,6 +3105,11 @@ class _KeywordOmit:
     def __repr__(self):
         return "<<Omit>>"
 
+    def __eq__(self, other):
+        return self is other or other is _NATIVE_OMIT
+
+    __hash__ = object.__hash__
+
 
 _KEYWORD_OMIT = _KeywordOmit()
 
@@ -4543,7 +4580,7 @@ class Runtime:
             if o:
                 d.update(o)
         self._pin_magic_vars(d)
-        d.setdefault("omit", _OMIT)
+        d.setdefault("omit", _default_omit())
         if "hostvars" not in d:
             d["hostvars"] = {self.host: dict(d)}
         if "vars" not in d:
@@ -4605,6 +4642,8 @@ class Runtime:
         base = dict(ctx)
         base.update(d)
         base.update(higher_vars or {})
+        if _core_at_least(2, 19):
+            base.setdefault("omit", _NATIVE_OMIT)
         self._pin_magic_vars(base)
         out = {}
         legacy = _legacy_non_native(base)
@@ -4835,6 +4874,9 @@ class Runtime:
             item = _pack_include_value(item)["value"] if item is not None else None
             if send_register:
                 include_register = packed
+        elif (getattr(self, "_controller_result_transport", False)
+              and _has_omit_mapping_key(result)):
+            private_result = _pack_include_value(result, preserve_unsafe=True)
         if name is None:
             started_node, started_name = self._started_task_name
             name = started_name if started_node is node else self._node_name(node)
@@ -5765,7 +5807,7 @@ class Runtime:
                     for key in inputs & mapping.keys()} for mapping in layers]
             merged = _f_combine(*raw, recursive=True)
             ctx.update(self.template_vars(merged, ctx, dynamic=True))
-        ctx.setdefault("omit", _OMIT)
+        ctx.setdefault("omit", _default_omit())
         if task.get("search_dirs"):
             ctx["__ansiroll_search_dirs"] = task["search_dirs"]
         if task.get("search_path"):
@@ -6258,11 +6300,11 @@ class Runtime:
         if task.get("delegate_to") and task["action"].rsplit(".", 1)[-1] == "set_fact":
             try:
                 flag = _fail_on_undef(self.template(task.get("delegate_facts", False), ctx))
-                delegate_facts = flag != _OMIT and _boolean(flag, strict=True)
+                delegate_facts = not _is_omit_arg(flag) and _boolean(flag, strict=True)
                 target = None
                 if delegate_facts or not self.delegate_on_target:
                     target = _fail_on_undef(self.template(task["delegate_to"], ctx))
-                    if target == _OMIT:
+                    if _is_omit_arg(target):
                         target = None
                     elif not isinstance(target, str) or not target:
                         raise ValueError("delegate_to must resolve to a nonempty host name")
@@ -6354,7 +6396,7 @@ class Runtime:
                     source = self.templater.render_string(raw_args.pop(layer), ctx)
                     if not isinstance(source, dict):
                         _fail_on_undef(source)
-                        if source == _OMIT or layer == "_variable_params" and _legacy_templating():
+                        if _is_omit_arg(source) or layer == "_variable_params" and _legacy_templating():
                             continue
                         raise ValueError("file source arguments must resolve to a dictionary")
                     sources.append(source)
@@ -6410,7 +6452,7 @@ class Runtime:
     def _check_mode_template_context(ctx):
         native_keyword = _core_at_least(2, 19)
         ctx = {**ctx, _CHECK_MODE_TEMPLATE: native_keyword}
-        if native_keyword and ctx.get("omit") is _OMIT:
+        if native_keyword and isinstance(ctx.get("omit"), _Omit):
             ctx["omit"] = _KEYWORD_OMIT
         return ctx
 
@@ -6743,7 +6785,7 @@ class Runtime:
         for entry in entries:
             if isinstance(entry, str):
                 entry = self.template(entry, ctx)
-            if _is_undef(entry) or entry is None or entry == _OMIT:
+            if _is_undef(entry) or entry is None or _is_omit_arg(entry):
                 continue
             if not isinstance(entry, dict):
                 raise RuntimeError(
@@ -6756,7 +6798,7 @@ class Runtime:
                     # gathering: Ansible skips that entry.
                     continue
                 # Test Undefined first: comparing it to the omit sentinel can raise.
-                if _is_undef(v) or v == _OMIT:
+                if _is_undef(v) or _is_omit_arg(v):
                     continue
                 env[str(k)] = _as_text(v)
         return env or None
@@ -6847,7 +6889,7 @@ class Runtime:
         if name == "assert" and "_variable_params" in args:
             # Legacy Core parses a templated argument mapping into this field.
             params = args["_variable_params"]
-            if params == _OMIT or params == ctx.get("omit", _OMIT):
+            if _is_omit_arg(params) or params == ctx.get("omit", _OMIT):
                 params = {}
             if not isinstance(params, dict):
                 _fail_on_undef(params)
@@ -7353,7 +7395,7 @@ class Runtime:
                 tctx[_TEMPLATE_FILE_TEXT] = True
                 modern = _core_at_least(2, 19)
                 if modern:
-                    if isinstance(tctx.setdefault("omit", _OMIT), _Omit):
+                    if isinstance(tctx.setdefault("omit", _default_omit()), _Omit):
                         # The native marker must be distinct from plain string keys.
                         tctx["omit"] = _KEYWORD_OMIT
                 elif isinstance(tctx.get("omit"), str) and tctx["omit"] == _OMIT:
@@ -7684,7 +7726,7 @@ class Runtime:
         names = []
         for value in values:
             names.extend(value if isinstance(value, list) else [value])
-        return [name for name in names if name is not None and name != _OMIT]
+        return [name for name in names if name is not None and not _is_omit_arg(name)]
 
     def _queue_notify(self, names):
         for name in names:
@@ -7728,7 +7770,7 @@ class Runtime:
             ctx.update(scoped)
         ctx.update(handler.get("vars") or {})
         ctx.update(higher)
-        ctx.setdefault("omit", _OMIT)
+        ctx.setdefault("omit", _default_omit())
         ctx.setdefault("hostvars", {self.host: ctx})
         ctx.setdefault("vars", ctx)
         if not params:
@@ -7754,7 +7796,7 @@ class Runtime:
                 ctx = dict(handler.get("handler_name_vars") or {})
                 ctx.update(scope.get(_INCLUDE_PARAMS_KEY) or {})
                 ctx.update(self.extra_vars)
-                ctx.setdefault("omit", _OMIT)
+                ctx.setdefault("omit", _default_omit())
                 for key in ("__ansiroll_controller_env", "__ansiroll_controller_config"):
                     ctx[key] = self.vars.get(key) or {}
                 hostvars = dict(self.vars.get("hostvars") or {})
@@ -7882,7 +7924,7 @@ class Runtime:
         if inputs is None or _vars_file_reads_blocked(blocked, paths):
             raise ValueError(error)
         value = _fail_on_undef(self.template(template["source"], scope, strict=True))
-        if value == _OMIT:
+        if _is_omit_arg(value):
             return template["omit_default"]
         if value is None:
             if not _legacy_non_native(scope):
@@ -8868,12 +8910,13 @@ def _delegate_fallback_value(value, undefined, errors, mapping_keys, path=(), sc
     """Keep each member's position and classify failures at its own path."""
     if isinstance(value, (dict, _RawSnapshotMapping)):
         keys = list(value)
-        if all(isinstance(key, str) and not isinstance(key, _FactKeyTemplate) for key in keys):
+        if all(isinstance(key, str) and not isinstance(key, (_FactKeyTemplate, _NativeOmit)) for key in keys):
             wire_keys = keys
         else:
             # Index this mapping on the wire so 8080 and '8080' never collide.
             wire_keys = [str(index) for index in range(len(keys))]
             mapping_keys.append((path, [{"fact_template": str(key)} if isinstance(key, _FactKeyTemplate)
+                                        else {"omit": True} if isinstance(key, _NativeOmit)
                                         else key for key in keys]))
         return {wire_key: _delegate_fallback_member(value, key, undefined, errors, mapping_keys,
                                                     (*path, wire_key), scalars, unsafe_paths)
@@ -8945,6 +8988,31 @@ def _pack_delegated_value(value, *, preserve_scalars=False, preserve_unsafe=Fals
     return result
 
 
+def _has_omit_mapping_key(value):
+    # Already resolved aliases keep their keys in raw storage. Do not
+    # evaluate unrelated lazy members just to decide how to serialize them.
+    pending = [value]
+    seen = set()
+    while pending:
+        member = pending.pop()
+        if id(member) in seen:
+            continue
+        seen.add(id(member))
+        if isinstance(member, dict):
+            if any(isinstance(key, _NativeOmit) for key in dict.keys(member)):
+                return True
+            pending.extend(dict.values(member))
+        elif isinstance(member, list):
+            pending.extend(list.__iter__(member))
+        elif isinstance(member, tuple):
+            pending.extend(tuple.__iter__(member))
+        elif isinstance(member, (_RawSnapshotMapping, _RawSnapshotList)):
+            pending.append(member._owner)
+        elif isinstance(member, _SnapshotBinding):
+            pending.append(member._value if member._resolved else member.source)
+    return False
+
+
 def _contains_typed_mapping_keys(value):
     pending = [value]
     seen = set()
@@ -8953,7 +9021,7 @@ def _contains_typed_mapping_keys(value):
         if isinstance(member, (dict, list, tuple)) and id(member) not in seen:
             seen.add(id(member))
             if isinstance(member, dict):
-                if any(not isinstance(key, str) or isinstance(key, _FactKeyTemplate) for key in member):
+                if any(not isinstance(key, str) or isinstance(key, (_FactKeyTemplate, _NativeOmit)) for key in member):
                     return True
                 pending.extend(member.values())
             else:
@@ -8976,6 +9044,8 @@ def _decode_delegated_key(key, *, mapping_key=True):
     if isinstance(key, dict):
         if "fact_template" in key:
             return _FactKeyTemplate(key["fact_template"])
+        if "omit" in key:
+            return _NATIVE_OMIT
         if "bytes" in key:
             return base64.b64decode(key["bytes"], validate=True)
         if "date" in key:
@@ -9101,7 +9171,8 @@ def _resolve_delegated_play_var(name, scope, templater, *, members=None, member=
         return {"error": "%s: %s" % (type(error).__name__, error)}
 
 
-def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None):
+def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, lazy_play=None, controller_vars=None,
+                   mapping_keys=None):
     """Return the serializable part of a task context for controller actions."""
     safe = {}
     scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
@@ -9137,7 +9208,14 @@ def _delegate_vars(ctx, templater=None, resolve_keys=None, deferred=None, *, laz
                         value = _delegate_template_value(value)
             # Materialize lazy values once so sending the frame cannot
             # resolve the same context a second time.
-            safe[key] = json.loads(json.dumps(value, default=str))
+            if mapping_keys is not None and _has_omit_mapping_key(value):
+                packed = _pack_delegated_value(value)
+                if packed["undefined"] or packed.get("errors"):
+                    continue
+                safe[key] = packed["value"]
+                mapping_keys.extend(([key, *path], keys) for path, keys in packed["mapping_keys"])
+            else:
+                safe[key] = json.loads(json.dumps(value, default=str))
         except (TypeError, ValueError, RecursionError, jinja2.UndefinedError):
             continue
     return safe
@@ -9259,12 +9337,14 @@ def agent_main():
             deferred = {} if resolve_keys is not None else None
             lazy_play = set() if action == "synchronize" else None
             scope = templater._play_var_scope(ctx, strict=False) if templater is not None else ctx
+            mapping_keys = [] if action == "template" else None
             frame = {
                 "t": "delegate", "uuid": task.get("uuid"),
                 "runtime_id": task.get("runtime_id"),
                 "action": task.get("action"), "args": args,
                 "vars": _delegate_vars(scope, templater, resolve_keys, deferred,
-                                       controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play),
+                                       controller_vars=g.get("_INJECTED_VARS"), lazy_play=lazy_play,
+                                       mapping_keys=mapping_keys),
                 "become": become, "to": task.get("delegate_to"),
                 "become_user": rt.become_user,
                 "check_mode": bool(rt.check_mode),
@@ -9275,6 +9355,8 @@ def agent_main():
                 "name": task.get("name"),
             }
             if action == "template":
+                if mapping_keys:
+                    frame["var_mapping_keys"] = mapping_keys
                 if _core_at_least(2, 19) and isinstance(dict.get(scope, "omit"), _Omit):
                     # Let the file action supply its default instead of serializing
                     # the sentinel as a string indistinguishable from user data.

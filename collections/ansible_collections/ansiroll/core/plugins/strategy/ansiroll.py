@@ -1129,6 +1129,10 @@ class StrategyModule(StrategyBase):
                 }},
             }
             job_vars = dict(frame.get("vars") or {})
+            if mapping_keys := frame.get("var_mapping_keys"):
+                from ansiroll.runtime import _restore_delegated_mapping_keys
+
+                _restore_delegated_mapping_keys(job_vars, mapping_keys)
             template_vars = {}
             if names := frame.get("lazy_template_vars"):
                 from ansiroll.runtime import (

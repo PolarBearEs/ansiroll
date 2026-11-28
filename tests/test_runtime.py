@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from ansiroll.runtime import (
-    _OMIT, ConditionalError, Runtime, UntrustedConditional, _parse_output,
+    ConditionalError, Runtime, UntrustedConditional, _default_omit, _parse_output,
 )
 
 
@@ -1146,10 +1146,10 @@ def test_lazy_hostvars_entries_support_list_operations(expression, expected):
 
 
 @pytest.mark.parametrize(("plugin", "expected"), [
-    ("items", ["h", 17, "17/tail", _OMIT]),
-    ("flattened", ["h", 17, "17/tail", _OMIT]),
-    ("indexed_items", [[0, "h"], [1, 17], [2, "17/tail"], [3, _OMIT]]),
-    ("nested", [["h"], [17], ["17/tail"], [_OMIT]]),
+    ("items", ["h", 17, "17/tail", _default_omit()]),
+    ("flattened", ["h", 17, "17/tail", _default_omit()]),
+    ("indexed_items", [[0, "h"], [1, 17], [2, "17/tail"], [3, _default_omit()]]),
+    ("nested", [["h"], [17], ["17/tail"], [_default_omit()]]),
 ])
 def test_loop_lookups_consume_lazy_hostvars_values(plugin, expected):
     runtime = Runtime({}, "", {"inventory_hostname": "h"})
@@ -1808,6 +1808,25 @@ def test_delegated_template_alias_uses_agent_filters():
     assert sent["alias"] == "TASK"
     assert sent["nested"] == {"value": "TASK", "literal": {"__ansiroll_unsafe__": "{{ untouched }}"}}
     assert sent["sequence"] == ["TASK"]
+
+
+def test_delegated_template_mapping_key_scan_does_not_resolve_lazy_values():
+    from ansiroll import runtime as runtime_mod
+
+    runtime = Runtime({}, "", {})
+    calls = []
+
+    def lookup(name):
+        calls.append(name)
+        return "call-%d" % len(calls)
+
+    runtime.templater.env.globals["lookup"] = lookup
+    data = runtime_mod._LazyTplDict({"stamp": "{{ lookup('counting') }}"}, runtime, {})
+    mapping_keys = []
+    sent = runtime_mod._delegate_vars({"data": data}, runtime.templater, mapping_keys=mapping_keys)
+    assert sent == {"data": {"stamp": "call-1"}}
+    assert calls == ["counting"]
+    assert mapping_keys == []
 
 
 def test_delegation_resolves_selected_action_variables():
