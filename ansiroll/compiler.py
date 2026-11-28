@@ -558,6 +558,12 @@ def _loop_shadowed_names(node):
     ))
 
 
+def _has_dynamic_loop_index(node):
+    source = node.get("index_var")
+    return (node.get("type") == "task" and node.get("loop") is not None
+            and isinstance(source, str) and any(start in source for start in ("{{", "{%", "{#")))
+
+
 def _condition_cache_key(condition):
     if isinstance(condition, (str, bool, int, float, type(None))):
         return type(condition).__name__, condition
@@ -644,10 +650,14 @@ def _tree_shake_nodes(nodes, variables, templater, stats, cache, recursive_loops
     kept = []
     for node in nodes or []:
         loop_names = enclosing_loops | _loop_shadowed_names(node)
-        possible, remaining = _simplify_when(
-            node.get("when"), variables, templater, stats, cache,
-            loop_names, preserve_errors=handlers,
-        )
+        if _has_dynamic_loop_index(node):
+            # The resolved index can shadow any compile-time variable.
+            possible, remaining = True, node.get("when") or []
+        else:
+            possible, remaining = _simplify_when(
+                node.get("when"), variables, templater, stats, cache,
+                loop_names, preserve_errors=handlers,
+            )
         if not possible:
             stats["removed_nodes"] += 1
             if handlers:
@@ -724,7 +734,7 @@ def _specialize_accelerators(plays, variables):
         return name not in variables
 
     for node in _walk_play_nodes(plays):
-        if node.get("accelerator") != "dynamic":
+        if node.get("accelerator") != "dynamic" or _has_dynamic_loop_index(node):
             continue
         args = node.get("args") or {}
         # An unresolved alias can render to a valid default at build time
