@@ -333,6 +333,26 @@ def test_implicit_setup_default_uses_controller_file_lookup(tmp_path, use_strate
     assert messages == ["filtered"]
 
 
+def test_implicit_setup_file_lookup_with_null_rstrip(tmp_path):
+    contents = "payload \t\n\n"
+    lookup = 'lookup("file", "strip-null.txt", rstrip=none)'
+    selected = f'"ansible_distribution" if {lookup} | length == {len(contents.rstrip())} else "ansible_hostname"'
+    expression = "{{ " + (selected if LEGACY_SETUP else f"[{selected}]") + " }}"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: true
+  module_defaults:
+    SETUP_ACTION:
+      filter: 'FILTER_EXPRESSION'
+  tasks:
+    - debug:
+        msg: "{{ 'distribution' if ansible_facts.distribution is defined else 'hostname' }}"
+""".replace("SETUP_ACTION", "setup" if LEGACY_SETUP else "ansible.builtin.setup")
+                  .replace("FILTER_EXPRESSION", expression),
+        {"files/strip-null.txt": contents})
+    assert messages == ["distribution" if Version(__version__) >= Version("2.14") else "hostname"]
+
+
 @pytest.mark.parametrize("plugin", ["example.custom.file", "file"])
 def test_implicit_setup_does_not_capture_files_requested_by_custom_lookups(tmp_path, plugin):
     files = {"files/private.txt": "synthetic private contents\n"}
@@ -1394,6 +1414,23 @@ def test_file_lookup_followed_by_another_template_segment(tmp_path, use_strategy
 """, {"data.txt": "first"}, use_strategy=use_strategy)
     null_suffix = "None" if not MODERN_TEMPLATING and C.DEFAULT_JINJA2_NATIVE else ""
     assert messages == ["first/second", "first/" + null_suffix]
+
+
+def test_file_lookup_with_null_strip_options(tmp_path):
+    contents = " \tpayload \t\n\n"
+    messages, _ = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    null_strip: null
+  tasks:
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt', lstrip=null_strip, rstrip=null_strip) }}"
+    - debug:
+        msg: "{{ lookup('file', playbook_dir ~ '/data.txt', rstrip=false) }}"
+""", {"data.txt": contents})
+    expected_null = contents.rstrip() if Version(__version__) >= Version("2.14") else contents
+    assert messages == [expected_null, contents]
 
 
 def test_delegated_template_does_not_run_unused_block_lookups(tmp_path):
