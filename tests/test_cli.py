@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import select
 import stat
 import subprocess
 import sys
@@ -42,6 +43,7 @@ def test_compile_streams_executable_python_and_writes_manifest(tmp_path):
 def test_stdout_compile_keeps_compiler_subprocess_diagnostics_on_stderr():
     script = """
 import ctypes
+import os
 import subprocess
 import sys
 from ansiroll import cli
@@ -50,6 +52,8 @@ def compile_playbook(*args, **kwargs):
     print("compiler diagnostic")
     ctypes.CDLL(None).puts(b"native diagnostic")
     subprocess.run([sys.executable, "-c", "print('helper diagnostic')"], check=True)
+    os.write(2, b"first descriptor diagnostic\\n")
+    os.write(1, b"second descriptor diagnostic\\n")
     return "pass\\n", {"modules": [], "fallback_tasks": []}
 
 cli.compile_playbook = compile_playbook
@@ -61,6 +65,7 @@ raise SystemExit(cli.entrypoint())
     assert b"compiler diagnostic\n" in result.stderr
     assert b"native diagnostic\n" in result.stderr
     assert b"helper diagnostic\n" in result.stderr
+    assert b"first descriptor diagnostic\nsecond descriptor diagnostic\n" in result.stderr
 
 
 def test_stdout_compile_rejects_manifest_alias():
@@ -380,6 +385,289 @@ raise SystemExit(cli.main(['compile', playbook, '-o', output]))
     assert result.returncode == (0 if read_only else 2), result.stderr
     assert output.exists() == read_only
     assert playbook.read_text() == original
+
+
+@pytest.mark.parametrize("before_operand", [False, True])
+@pytest.mark.parametrize("protected", [False, True])
+def test_compile_argument_error_checks_diagnostic_destination(monkeypatch, capsys, before_operand, protected):
+    monkeypatch.setattr(cli, "_stderr_may_be_playbook", lambda path: protected and path == "play.yml")
+    args = ["-o", "--tree-shake", "play.yml"] if before_operand else ["play.yml"]
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(["compile", *args])
+
+    assert error.value.code == 2
+    diagnostics = capsys.readouterr().err
+    if protected:
+        assert not diagnostics
+    else:
+        assert "usage: ansiroll compile" in diagnostics
+
+
+def test_file_compile_checks_stdout_before_compilation(monkeypatch, capsys):
+    def alias(path, fd, stream):
+        assert path == "play.yml"
+        return fd == 1
+
+    monkeypatch.setattr(cli, "_diagnostics_may_be_playbook", alias)
+    monkeypatch.setattr(cli, "compile_playbook", lambda *a, **kw: pytest.fail("started compilation"))
+    assert cli.main(["compile", "play.yml", "-o", "compiled.py"]) == 2
+    assert "stdout points to input playbook" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("match", ["none", "destination", "buffer", "interrupt", "exit"])
+@pytest.mark.parametrize("stream", [1, 2])
+def test_file_compile_defers_diagnostics_until_input_identities_are_known(tmp_path, match, stream):
+    log = tmp_path / "diagnostics"
+    output = tmp_path / "compiled.py"
+    driver = """
+import os
+import sys
+from ansiroll import cli
+
+stream, match, log, output = sys.argv[1:]
+def compile_playbook(path, *, on_playbook_open, **kwargs):
+    print("early Python diagnostic", file=sys.stdout if stream == "1" else sys.stderr, flush=True)
+    os.write(int(stream), b"early descriptor diagnostic\\n")
+    if match in ("destination", "interrupt", "exit"):
+        on_playbook_open("observed-input.yml", os.stat(log))
+    elif match == "buffer":
+        on_playbook_open("observed-input.yml", os.fstat(int(stream)))
+    if match == "interrupt":
+        raise KeyboardInterrupt
+    if match == "exit":
+        raise SystemExit("extension stopped compilation")
+    return "pass\\n", {"modules": [], "fallback_tasks": []}
+
+cli.compile_playbook = compile_playbook
+raise SystemExit(cli.main(["compile", "entry.yml", "-o", output]))
+"""
+    with log.open("wb") as destination:
+        result = subprocess.run(
+            [sys.executable, "-c", driver, str(stream), match, str(log), str(output)],
+            stdout=destination if stream == 1 else subprocess.PIPE,
+            stderr=destination if stream == 2 else subprocess.PIPE,
+            timeout=30,
+        )
+
+    if match in ("buffer", "interrupt", "exit"):
+        if match == "buffer":
+            assert result.returncode == 2
+        elif match == "exit":
+            assert result.returncode == 1
+        elif stream == 2:
+            assert result.returncode == 130
+        else:
+            assert result.returncode != 0
+        assert not output.exists()
+    else:
+        assert result.returncode == 0
+        assert output.read_text() == "pass\n"
+    if match != "none":
+        assert log.read_bytes() == b""
+    else:
+        diagnostics = log.read_text()
+        assert diagnostics.startswith("early Python diagnostic\nearly descriptor diagnostic\n")
+        if stream == 2:
+            assert "compiled entry.yml" in diagnostics
+    if stream == 1 and match in ("none", "destination"):
+        assert b"compiled entry.yml" in result.stderr
+
+
+def test_compile_diagnostic_capture_preserves_independent_file_offsets(tmp_path):
+    log = tmp_path / "diagnostics"
+    log.write_bytes(b"........")
+    driver = """
+import os
+from ansiroll import cli
+
+with cli._hold_compile_diagnostics(lambda info: False):
+    os.write(1, b"stdout")
+    os.write(2, b"stderr")
+"""
+    with log.open("r+b") as stdout, log.open("ab") as stderr:
+        stdout.seek(2)
+        subprocess.run([sys.executable, "-c", driver], stdout=stdout, stderr=stderr,
+                       check=True, timeout=10)
+    assert log.read_bytes() == b"..stdoutstderr"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux descriptor identity query")
+@pytest.mark.parametrize("fallback", [False, True])
+def test_file_compile_preserves_shell_merged_diagnostic_order(monkeypatch, tmp_path, fallback):
+    import fcntl
+
+    query = getattr(fcntl, "F_DUPFD_QUERY", 1027)
+    log = tmp_path / "diagnostics"
+    driver = """
+import errno
+import fcntl
+import os
+import sys
+from ansiroll import cli
+
+if sys.argv[2] == "True":
+    original_fcntl = fcntl.fcntl
+
+    def fcntl_without_dupfd_query(fd, command, *args):
+        if command == getattr(fcntl, "F_DUPFD_QUERY", 1027):
+            raise OSError(errno.EINVAL, "F_DUPFD_QUERY unavailable")
+        return original_fcntl(fd, command, *args)
+
+    fcntl.fcntl = fcntl_without_dupfd_query
+
+def compile_playbook(*args, **kwargs):
+    os.write(2, b"first\\n")
+    os.write(1, b"second\\n")
+    os.write(2, b"third\\n")
+    return "pass\\n", {"modules": [], "fallback_tasks": []}
+
+cli.compile_playbook = compile_playbook
+raise SystemExit(cli.main(["compile", "play.yml", "-o", sys.argv[1]]))
+"""
+    output = tmp_path / "compiled.py"
+    with log.open("wb") as stdout:
+        if fallback:
+            original_fcntl = fcntl.fcntl
+
+            def fcntl_without_dupfd_query(fd, command, *args):
+                if command == query:
+                    raise OSError(errno.EINVAL, "F_DUPFD_QUERY unavailable")
+                return original_fcntl(fd, command, *args)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(fcntl, "fcntl", fcntl_without_dupfd_query)
+                if cli._shares_open_file_description(stdout.fileno(), stdout.fileno()) is None:
+                    pytest.skip("the kernel blocks kcmp or does not implement it")
+        else:
+            try:
+                fcntl.fcntl(stdout.fileno(), query, stdout.fileno())
+            except OSError:
+                pytest.skip("the kernel does not support F_DUPFD_QUERY")
+        subprocess.run([sys.executable, "-c", driver, str(output), str(fallback)], stdout=stdout,
+                       stderr=subprocess.STDOUT, check=True, timeout=10)
+    assert output.read_bytes() == b"pass\n"
+    assert log.read_bytes().splitlines()[:3] == [b"first", b"second", b"third"]
+
+
+@pytest.mark.parametrize("mode", ["positioned", "append", "positioned_large", "low_fds"])
+def test_compile_diagnostic_capture_preserves_independent_file_write_order(tmp_path, mode):
+    if mode == "low_fds" and not sys.platform.startswith("linux"):
+        pytest.skip("requires Linux procfs")
+    log = tmp_path / "diagnostics"
+    log.write_bytes(b"original")
+    if mode == "positioned_large":
+        with log.open("r+b") as output:
+            output.truncate(1024 * 1024)
+    driver = """
+import os
+import sys
+from ansiroll import cli
+
+if sys.argv[1] == "positioned_large":
+    import resource
+    _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (128 * 1024, hard))
+elif sys.argv[1] == "low_fds":
+    import resource
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    free_fd = max(map(int, os.listdir("/proc/self/fd")))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (free_fd + 4, hard))
+
+with cli._hold_compile_diagnostics(lambda info: False):
+    os.write(2, b"err")
+    os.write(1, b"out")
+    os.write(2, b"end")
+"""
+    open_mode = "ab" if mode == "append" else "r+b"
+    with log.open(open_mode) as stdout, log.open(open_mode) as stderr:
+        if cli._shares_open_file_description(stdout.fileno(), stderr.fileno()) is None:
+            pytest.skip("the OS cannot verify independent open file descriptions")
+        subprocess.run([sys.executable, "-c", driver, mode], stdout=stdout, stderr=stderr,
+                       check=True, timeout=10)
+        if mode == "append":
+            assert log.read_bytes() == b"originalerroutend"
+            assert stdout.tell() == 14
+            assert stderr.tell() == 17
+        else:
+            with log.open("rb") as output:
+                assert output.read(8) == b"outendal"
+            assert log.stat().st_size == (1024 * 1024 if mode == "positioned_large" else 8)
+            assert stdout.tell() == 3
+            assert stderr.tell() == 6
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires sparse file block counts")
+def test_compile_diagnostic_capture_preserves_sparse_diagnostic_file(tmp_path):
+    log = tmp_path / "diagnostics"
+    offset = 1024 * 1024
+    control = tmp_path / "sparse"
+    with control.open("wb") as output:
+        output.seek(offset)
+        output.write(b"outerr")
+    if control.stat().st_blocks * 512 >= offset:
+        pytest.skip("the filesystem cannot create a sparse file")
+    driver = """
+import os
+from ansiroll import cli
+
+with cli._hold_compile_diagnostics(lambda info: False):
+    os.write(1, b"out")
+    os.write(2, b"err")
+"""
+    with log.open("wb") as stdout, log.open("ab") as stderr:
+        stdout.seek(offset)
+        subprocess.run([sys.executable, "-c", driver], stdout=stdout, stderr=stderr,
+                       check=True, timeout=10)
+    assert log.read_bytes() == control.read_bytes()
+    assert log.stat().st_blocks == control.stat().st_blocks
+
+
+def test_compile_diagnostic_capture_keeps_saved_stream_off_closed_stdout():
+    driver = """
+import errno
+import os
+from ansiroll import cli
+
+os.close(1)
+with cli._hold_compile_diagnostics(lambda info: False):
+    os.write(1, b"discarded stdout")
+    os.write(2, b"kept stderr")
+try:
+    os.fstat(1)
+except OSError as error:
+    assert error.errno == errno.EBADF
+else:
+    raise AssertionError("stdout was left open")
+"""
+    result = subprocess.run([sys.executable, "-c", driver], capture_output=True, check=True, timeout=10)
+    assert result.stdout == b""
+    assert result.stderr == b"kept stderr"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX pipes")
+def test_compile_does_not_read_a_fifo_while_holding_its_diagnostic_writer(tmp_path):
+    output = tmp_path / "compiled.py"
+    driver = """
+import os
+import sys
+from ansiroll import cli
+
+original_stderr = os.fstat(2)
+def compile_playbook(path, *, on_playbook_open, **kwargs):
+    sys.stderr.write("early diagnostic\\n")
+    on_playbook_open("observed-input.yml", original_stderr)
+    raise AssertionError("would have started reading from the pipe")
+
+cli.compile_playbook = compile_playbook
+raise SystemExit(cli.main(["compile", "entry.yml", "-o", sys.argv[1]]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", driver, str(output)], capture_output=True, timeout=10,
+    )
+    assert result.returncode == 2
+    assert result.stderr == b""
+    assert not output.exists()
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
@@ -773,6 +1061,113 @@ def test_stdout_compile_rejects_output_descriptor_aliasing_the_playbook(tmp_path
     assert playbook.read_bytes() == original
 
 
+@pytest.mark.parametrize(("destination", "alias"), [
+    ("output", "direct"), ("output", "hardlink"), ("output", "symlink"),
+    ("manifest", "hardlink"), ("stdout", "direct"),
+])
+def test_compile_rejects_destinations_aliasing_a_transitive_import(tmp_path, destination, alias):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    (tmp_path / "nested").mkdir()
+    imported = tmp_path / "nested" / "child.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    imported.write_bytes(original)
+    (tmp_path / "parent.yml").write_text("- import_playbook: nested/child.yml\n")
+    playbook.write_text("- import_playbook: parent.yml\n")
+    target = imported if alias == "direct" else tmp_path / "alias"
+    if alias == "hardlink":
+        os.link(imported, target)
+    elif alias == "symlink":
+        target.symlink_to(imported)
+    command = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook)]
+    if destination == "stdout":
+        with target.open("ab") as stdout:
+            result = subprocess.run(command + ["-o", "-"], stdout=stdout, stderr=subprocess.PIPE, timeout=10)
+    else:
+        args = (["-o", str(target)] if destination == "output"
+                else ["-o", str(tmp_path / "compiled.py"), "-m", str(target)])
+        result = subprocess.run(command + args, capture_output=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert b"points to input playbook" in result.stderr
+    assert imported.read_bytes() == original
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_compile_protects_import_previously_read_through_vars_files(tmp_path, encrypted):
+    pytest.importorskip("ansible")
+    playbook = tmp_path / "play.yml"
+    imported = tmp_path / "child.yml"
+    original = b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n"
+    vault_args = []
+    if encrypted:
+        from ansible.parsing.vault import VaultLib, VaultSecret
+
+        password = tmp_path / "vault-password"
+        password.write_text("fixture-password\n")
+        secret = VaultSecret(b"fixture-password")
+        original = VaultLib([("default", secret)]).encrypt(original, secret=secret)
+        vault_args = ["--vault-password-file", str(password)]
+    imported.write_bytes(original)
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files: [child.yml]
+  tasks: []
+- import_playbook: child.yml
+""")
+    command = [sys.executable, "-m", "ansiroll.cli", "compile", str(playbook), "-o", str(imported)]
+    result = subprocess.run(command + vault_args, capture_output=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert b"points to input playbook" in result.stderr
+    assert imported.read_bytes() == original
+
+
+def test_playbook_open_observer_bypasses_a_populated_vault_cache(tmp_path):
+    pytest.importorskip("ansible")
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.parsing.vault import VaultLib, VaultSecret
+    from ansible.playbook import Playbook
+    from ansiroll.loader import _core_version, _make_rewriting_loader
+
+    playbook = tmp_path / "child.yml"
+    secret = VaultSecret(b"fixture-password")
+    secrets = [("default", secret)]
+    playbook.write_bytes(VaultLib(secrets).encrypt(
+        b"- hosts: localhost\n  gather_facts: false\n  tasks: []\n", secret=secret))
+    loader = _make_rewriting_loader(DataLoader)
+    loader.set_vault_secrets(secrets)
+    loader.load_from_file(str(playbook), cache="vaulted" if _core_version() >= (2, 17) else True)
+    assert str(playbook) in loader._FILE_CACHE
+
+    opened = []
+    loader.on_playbook_open = lambda path, st: opened.append((Path(os.fsdecode(path)), st.st_ino))
+    Playbook.load(str(playbook), loader=loader)
+    identity = (playbook, playbook.stat().st_ino)
+    assert opened == [identity]
+    playbook.unlink()
+    assert len(Playbook.load(str(playbook), loader=loader).get_plays()) == 1
+    assert opened == [identity]
+
+
+def test_playbook_open_observer_bypasses_a_cached_empty_document(tmp_path):
+    pytest.importorskip("ansible")
+    from ansible.errors import AnsibleParserError
+    from ansible.parsing.dataloader import DataLoader
+    from ansible.playbook import Playbook
+    from ansiroll.loader import _make_rewriting_loader
+
+    playbook = tmp_path / "empty.yml"
+    playbook.write_text("# empty\n")
+    loader = _make_rewriting_loader(DataLoader)
+    assert loader.load_from_file(str(playbook)) is None
+    assert str(playbook) in loader._FILE_CACHE
+
+    opened = []
+    loader.on_playbook_open = lambda path, info: opened.append((Path(os.fsdecode(path)), info.st_ino))
+    with pytest.raises(AnsibleParserError, match="Empty playbook"):
+        Playbook.load(str(playbook), loader=loader)
+    assert opened == [(playbook, playbook.stat().st_ino)]
+
+
 def test_stdout_compile_rechecks_playbook_after_writing_manifest(monkeypatch, tmp_path, capsys):
     playbook = tmp_path / "play.yml"
     destination = tmp_path / "stdout"
@@ -1112,7 +1507,8 @@ def test_manifest_overwrite_can_truncate_only_the_validated_inode(monkeypatch, t
     ("truncate", errno.EINVAL),
     ("truncate", errno.ENOSYS),
 ])
-def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_path, destination, failure, error):
+def test_compile_reopens_validated_destination_with_truncation(
+        monkeypatch, cli_os, tmp_path, destination, failure, error):
     output = tmp_path / "compiled.py"
     manifest = tmp_path / "manifest.json"
     files = {"output": output, "manifest": manifest}
@@ -1168,12 +1564,56 @@ def test_compile_reopens_validated_destination_with_truncation(monkeypatch, tmp_
         file = fdopen(fd, mode)
         return AppendOnly(file) if fd == append_fd and not reopened else file
 
-    monkeypatch.setattr(os, "open", open_append_only)
-    monkeypatch.setattr(os, "fdopen", wrap_append_handle)
+    cli_os.open = open_append_only
+    cli_os.fdopen = wrap_append_handle
     assert cli.main(["compile", "play.yml", "-o", str(output), "-m", str(manifest)]) == 0
     assert len(reopened) == 1
     assert output.read_text() == source
     assert json.loads(manifest.read_text()) == data
+
+
+@pytest.mark.parametrize("manifest", [False, True])
+@pytest.mark.parametrize("reopen", [False, True])
+def test_destination_revalidates_after_truncation(monkeypatch, tmp_path, manifest, reopen):
+    path = tmp_path / "existing"
+    path.write_text("previous artifact\n")
+    truncated = False
+    fdopen = os.fdopen
+
+    def track_truncation(fd, mode, *args, **kwargs):
+        writer = fdopen(fd, mode, *args, **kwargs)
+        truncate = writer.truncate
+
+        def truncate_artifact(size):
+            nonlocal truncated
+            if reopen:
+                raise OSError(errno.EOPNOTSUPP, "requires truncating reopen")
+            truncate(size)
+            truncated = True
+
+        writer.truncate = truncate_artifact
+        return writer
+
+    def reopen_artifact(*args):
+        nonlocal truncated
+        fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+        truncated = True
+        return fd
+
+    def validate(info, fd):
+        if truncated:
+            raise ValueError("destination no longer safe")
+
+    if reopen and not os.path.isdir("/proc/self/fd"):
+        pytest.skip("requires procfs descriptor links")
+    monkeypatch.setattr(cli.os, "fdopen", track_truncation)
+    monkeypatch.setattr(cli, "_open_truncated_destination", reopen_artifact)
+    with pytest.raises(ValueError, match="destination no longer safe"):
+        with cli._open_compile_destination(str(path), validate, manifest=manifest):
+            pytest.fail("received writer after destination validation failed")
+    assert truncated
+    assert path.read_bytes() == b""
+
 
 
 @pytest.mark.skipif(not hasattr(os, "O_PATH") or not os.path.isdir("/proc/self/fd"),
@@ -1689,6 +2129,25 @@ def test_file_compile_never_writes_manifest_through_replaced_deferred_fifo(monke
     assert output.read_text() == "pass\n"
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NONBLOCK"), reason="requires nonblocking descriptor opens")
+def test_manifest_wait_checks_destination_before_retrying(monkeypatch, cli_os):
+    fifo = Namespace(st_mode=stat.S_IFIFO)
+
+    def open_without_reader(path, flags, mode):
+        assert flags & os.O_NONBLOCK
+        raise OSError(errno.ENXIO, "no FIFO reader")
+
+    def reject_destination(info, fd):
+        assert info is fifo and fd is None
+        raise ValueError("manifest path points to compiled output")
+
+    cli_os.open = open_without_reader
+    cli_os.stat = lambda path: fifo
+    monkeypatch.setattr(cli.time, "sleep", lambda delay: pytest.fail("waited for unvalidated destination"))
+    with pytest.raises(ValueError, match="manifest path points to compiled output"):
+        cli._open_manifest_fd("manifest", os.O_WRONLY, reject_destination, None)
+
+
 def test_file_compile_writes_to_current_manifest_after_replacement(monkeypatch, tmp_path):
     output = tmp_path / "compiled.py"
     manifest_path = tmp_path / "manifest.json"
@@ -1880,6 +2339,165 @@ raise SystemExit(cli.main(['compile', 'play.yml', '-o', sys.argv[1], '-m', sys.a
             reader.communicate()
     assert reader.returncode == 0
     assert received == "pass\n" + json.dumps({"modules": [], "fallback_tasks": []}, indent=2)
+
+
+_FIFO_COMPILE_SCRIPT = """
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **kw: (
+    "pass\\n" * (512 * 1024),
+    {"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)},
+)
+raise SystemExit(cli.main(["compile", "play.yml", "-o", "-", "-m", sys.argv[1]], _standalone=True))
+"""
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+@pytest.mark.parametrize("manifest_first", [False, True])
+def test_stdout_compile_streams_with_either_sequential_fifo_order(tmp_path, manifest_first):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    reader_script = """
+import sys
+from pathlib import Path
+
+def read_stdout():
+    sys.stdout.write(sys.stdin.read())
+
+def read_manifest():
+    sys.stdout.write(Path(sys.argv[1]).read_text())
+
+if sys.argv[2] == "True":
+    read_manifest()
+    read_stdout()
+else:
+    read_stdout()
+    read_manifest()
+"""
+    producer = subprocess.Popen(
+        [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    reader = subprocess.Popen(
+        [sys.executable, "-c", reader_script, str(manifest), str(manifest_first)],
+        stdin=producer.stdout, stdout=subprocess.PIPE, text=True,
+    )
+    producer.stdout.close()
+    try:
+        received, _ = reader.communicate(timeout=30)
+        _, diagnostics = producer.communicate(timeout=30)
+    finally:
+        for process in (producer, reader):
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    assert producer.returncode == reader.returncode == 0, diagnostics
+    source = "pass\n" * (512 * 1024)
+    metadata = json.dumps({"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)}, indent=2)
+    assert received == (metadata + source if manifest_first else source + metadata)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_stdout_compile_keeps_inherited_pipe_blocking_while_waiting_for_manifest(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb") as inherited:
+        with subprocess.Popen(
+            [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+            stdout=inherited, stderr=subprocess.PIPE,
+        ) as producer:
+            try:
+                # Seeing Python bytes proves the producer started writing
+                # while the manifest FIFO still has no reader.
+                assert select.select([reader], [], [], 10)[0]
+                assert os.get_blocking(inherited.fileno())
+            finally:
+                producer.kill()
+                producer.communicate()
+        assert os.get_blocking(inherited.fileno())
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_stdout_compile_reports_broken_stdout_without_manifest_reader(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    with os.fdopen(write_fd, "wb") as stdout:
+        result = subprocess.run(
+            [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+            stdout=stdout, stderr=subprocess.PIPE, timeout=10,
+        )
+    assert result.returncode != 0
+    assert b"BrokenPipeError" in result.stderr
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires named pipes")
+def test_stdout_compile_finishes_connected_manifest_after_broken_stdout(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    stdout_reader, stdout_writer = os.pipe()
+    os.close(stdout_reader)
+    with os.fdopen(stdout_writer, "wb") as stdout, \
+            os.fdopen(os.open(manifest, os.O_RDONLY | os.O_NONBLOCK), "rb") as manifest_reader, \
+            os.fdopen(os.open(manifest, os.O_WRONLY | os.O_NONBLOCK), "wb") as keepalive:
+        # Keep the FIFO connected while a separate reader drains the JSON.
+        os.set_blocking(manifest_reader.fileno(), True)
+        with subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
+            stdin=manifest_reader, stdout=subprocess.PIPE,
+        ) as reader:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", _FIFO_COMPILE_SCRIPT, str(manifest)],
+                    stdout=stdout, stderr=subprocess.PIPE, timeout=10,
+                )
+                keepalive.close()
+                received, _ = reader.communicate(timeout=10)
+            finally:
+                if reader.poll() is None:
+                    reader.kill()
+                    reader.communicate()
+    assert result.returncode != 0
+    assert b"BrokenPipeError" in result.stderr
+    assert reader.returncode == 0
+    assert json.loads(received) == {"modules": [], "fallback_tasks": [], "padding": "x" * (2 * 1024 * 1024)}
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires Linux descriptor pins")
+def test_stdout_compile_can_stream_manifest_fifo_with_one_fd_available(tmp_path):
+    manifest = tmp_path / "manifest.fifo"
+    os.mkfifo(manifest)
+    driver = """
+import os
+import resource
+import sys
+from ansiroll import cli
+
+cli.compile_playbook = lambda *a, **kw: ("pass\\n", {"modules": [], "fallback_tasks": []})
+write_manifest = cli._write_stdout_manifest
+
+def write_with_one_free_fd(*args, **kwargs):
+    # Listing the fd directory uses the descriptor we leave available.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    free_fd = max(map(int, os.listdir("/proc/self/fd")))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (free_fd + 1, hard))
+    try:
+        return write_manifest(*args, **kwargs)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+cli._write_stdout_manifest = write_with_one_free_fd
+raise SystemExit(cli.main(["compile", "play.yml", "-o", "-", "-m", sys.argv[1]], _standalone=True))
+"""
+    with os.fdopen(os.open(manifest, os.O_RDONLY | os.O_NONBLOCK), "rb") as reader:
+        result = subprocess.run([sys.executable, "-c", driver, str(manifest)],
+                                capture_output=True, check=True, timeout=10)
+        assert json.load(reader) == {"modules": [], "fallback_tasks": []}
+    assert result.stdout == b"pass\n"
 
 
 def test_run_streams_compiled_source_without_creating_a_file(monkeypatch):
