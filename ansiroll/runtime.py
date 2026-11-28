@@ -15,6 +15,7 @@ Python standard library. Importing this module directly uses the controller's
 installed Jinja2.
 """
 
+import ast
 import datetime as _dt
 import base64
 from decimal import Decimal
@@ -1515,7 +1516,16 @@ def _f_quote(v):
         return _to_text_str(v)
 
 
+class _DateJSONEncoder(json.JSONEncoder):
+    def default(self, value):
+        # datetime is a subclass of date and supplies its own ISO format.
+        if isinstance(value, _dt.date):
+            return value.isoformat()
+        return super().default(value)
+
+
 def _f_to_json(v, **kwargs):
+    kwargs.setdefault("cls", _DateJSONEncoder)
     return json.dumps(_mark_unsafe(v, reject_vault=True), **kwargs)
 
 
@@ -3411,9 +3421,19 @@ class _ConditionalName:
 
 @_jinja_pass_context
 def _finalize_legacy_inline_segment(context, value):
-    # Legacy Core unrolls views in both Jinja modes. Iterating only the keys
-    # keeps unused mapping values lazy.
-    return list(value) if isinstance(value, KeysView) else str(_finalize_text_segment(context, value))
+    if not isinstance(value, KeysView):
+        return str(_finalize_text_segment(context, value))
+    # Iterating only the keys keeps unused mapping values lazy.
+    keys = list(value)
+    if not _legacy_non_native(context):
+        return keys
+    # Non-native Core converts the rendered list back to data only when
+    # its representation is a literal. Date and datetime reprs are calls.
+    rendered = str(keys)
+    try:
+        return ast.literal_eval(rendered)
+    except (SyntaxError, ValueError):
+        return rendered
 
 
 class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
@@ -8102,7 +8122,7 @@ class Runtime:
         module_args = dict(args)
         module_args["_ansible_check_mode"] = bool(self.check_mode)
         module_args["_ansible_diff"] = bool(self.diff_mode)
-        return json.dumps({"ANSIBLE_MODULE_ARGS": module_args})
+        return json.dumps({"ANSIBLE_MODULE_ARGS": module_args}, cls=_DateJSONEncoder)
 
     def run_module(self, action, args, become=False):
         meta = self.modules.get(action)
@@ -8398,8 +8418,6 @@ def _template_task_only_args():
 
 
 def _template_file_options(source, args, warn):
-    import ast
-
     options = {"trim_blocks": _boolean(args.get("trim_blocks", True)),
                "lstrip_blocks": _boolean(args.get("lstrip_blocks", False))}
     for key in _template_task_only_args():

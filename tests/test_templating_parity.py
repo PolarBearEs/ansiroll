@@ -2850,6 +2850,27 @@ def test_legacy_inline_assignment_preserves_key_view_output(tmp_path, monkeypatc
     assert recap == ("2", "0", "0", "0", "0", "0", "0")
 
 
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core inline mapping view finalization")
+@pytest.mark.parametrize("native", ["true", "false"])
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_legacy_inline_assignment_with_date_keys(tmp_path, monkeypatch, native, use_strategy):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", native)
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    keys: >-
+      {% set stamp = now().replace(year=2025, month=1, day=1, hour=12, minute=30, second=0, microsecond=0)
+      %}{% set mapping = {stamp.date(): 1, stamp: 2} %}{{ mapping.keys() }}
+  tasks:
+    - debug:
+        msg: "{{ keys | type_debug }}: {{ keys | to_json }}"
+""", use_strategy=use_strategy)
+    assert messages == (['list: ["2025-01-01", "2025-01-01T12:30:00"]'] if native == "true" else
+                        ['str: "[datetime.date(2025, 1, 1), datetime.datetime(2025, 1, 1, 12, 30)]"'])
+    assert recap == ("1", "0", "0", "0", "0", "0", "0")
+
+
 def test_lazy_container_operations_resolve_nested_values_once(tmp_path):
     msgs, _ = _assert_parity(tmp_path, """
 - hosts: localhost
