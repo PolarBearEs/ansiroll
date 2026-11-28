@@ -2872,13 +2872,20 @@ def test_legacy_inline_assignment_with_date_keys(tmp_path, monkeypatch, native, 
         msg: "{{ keys | type_debug }}: {{ keys | to_json }}"
     - debug:
         msg: "{{ keys }}"
+    - debug:
+        msg: >-
+          {{ now().replace(year=2025, month=1, day=1, hour=12, minute=30, second=0, microsecond=0) }}
+    - debug:
+        msg: >-
+          stamp={{ now().replace(year=2025, month=1, day=1, hour=12, minute=30, second=0, microsecond=0) }}
 """, use_strategy=use_strategy, summary=summary)
     if native == "true":
-        assert messages == ['list: ["2025-01-01", "2025-01-01T12:30:00"]', ["2025-01-01", "2025-01-01T12:30:00"]]
+        assert messages == ['list: ["2025-01-01", "2025-01-01T12:30:00"]', ["2025-01-01", "2025-01-01T12:30:00"],
+                            "2025-01-01T12:30:00", "stamp=2025-01-01 12:30:00"]
     else:
         rendered = "[datetime.date(2025, 1, 1), datetime.datetime(2025, 1, 1, 12, 30)]"
-        assert messages == [f"str: {json.dumps(rendered)}", rendered]
-    assert recap == ("2", "0", "0", "0", "0", "0", "0")
+        assert messages == [f"str: {json.dumps(rendered)}", rendered, "2025-01-01 12:30:00", "stamp=2025-01-01 12:30:00"]
+    assert recap == ("4", "0", "0", "0", "0", "0", "0")
 
 
 def test_lazy_container_operations_resolve_nested_values_once(tmp_path):

@@ -4901,8 +4901,15 @@ class Runtime:
         elif self.pretty:
             self._emit_pretty(frame)
         else:
-            sys.stdout.write(RESULT_MARKER + " " + json.dumps(frame, default=_date_json_default) + "\n")
+            sys.stdout.write(RESULT_MARKER + " " + json.dumps(frame, default=self._result_json_default) + "\n")
             sys.stdout.flush()
+
+    def _result_json_default(self, value):
+        config = self.vars.get("__ansiroll_controller_config") or {}
+        # Legacy non-native debug renders a scalar datetime as text with a space.
+        if config.get("DEFAULT_JINJA2_NATIVE") is True and _legacy_templating():
+            return _date_json_default(value)
+        return str(value)
 
     def _emit_pretty(self, frame):
         # Ansible-callback-style lines for humans running the compiled file
@@ -4923,12 +4930,12 @@ class Runtime:
         if frame.get("is_item"):
             label = res.get("_ansible_item_label", frame.get("item"))
             if not isinstance(label, str):
-                label = json.dumps(label, default=_date_json_default)
+                label = json.dumps(label, default=self._result_json_default)
             suffix = " => (item=%s)" % label
         if status in ("failed", "unreachable"):
             line = "fatal: [%s]:%s %s! => %s" % (
                 host, suffix, status.upper() if status == "unreachable" else "FAILED",
-                json.dumps(res, default=_date_json_default))
+                json.dumps(res, default=self._result_json_default))
             if frame.get("ignored"):
                 line += "\n...ignoring"
         elif status == "skipped":
@@ -4941,7 +4948,7 @@ class Runtime:
             if frame.get("action") == "debug":
                 shown = {k: v for k, v in res.items()
                          if not k.startswith("_") and k not in ("changed", "failed")}
-                line += " => %s" % json.dumps(shown, default=_date_json_default, indent=4)
+                line += " => %s" % json.dumps(shown, default=self._result_json_default, indent=4)
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
@@ -9229,7 +9236,8 @@ def agent_main():
                  module_bundle=g.get("_ansiroll_import_bytes"),
                  resource_reader=g.get("_ansiroll_resource_read"))
     rt._invocation_check_mode = bool(g.get("_INJECTED_INVOCATION_CHECK_MODE", check_mode))
-    rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame}, json_default=_date_json_default)
+    rt.on_result = lambda frame: _chan_send(resp_fd, {"t": "result", "frame": frame},
+                                            json_default=rt._result_json_default)
     rt._controller_result_transport = True
     rt.on_task_start = lambda frame: _chan_send(resp_fd, {"t": "task_start", "frame": frame})
     rt.on_rescue = lambda task, result, args: _chan_send(resp_fd, {
