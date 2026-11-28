@@ -9,6 +9,8 @@ import io
 import json
 import os
 import shlex
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -114,6 +116,58 @@ def test_rescued_dates_and_datetimes_roundtrip_without_fromisoformat(monkeypatch
     restored_keys = runtime._restore_delegated_mapping_keys(packed_keys["value"], packed_keys["mapping_keys"])
     assert list(restored_keys.values()) == ["first", "second", "text"]
     assert runtime._pack_include_value(restored_keys)["mapping_keys"] == packed_keys["mapping_keys"]
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["modern", "legacy"])
+def test_agent_restores_delegated_template_timestamps(legacy):
+    agent = """
+import datetime
+import sys
+from types import SimpleNamespace
+from ansiroll import runtime
+
+if sys.argv[1] == 'legacy':
+    def legacy_strptime(timestamp, format_string):
+        if format_string.endswith('%z') and timestamp[-3] == ':':
+            raise ValueError('Python 3.5 requires a colon-free UTC offset')
+        return datetime.datetime.strptime(timestamp, format_string)
+
+    runtime._dt = SimpleNamespace(datetime=SimpleNamespace(strptime=legacy_strptime),
+                                  timedelta=datetime.timedelta, timezone=datetime.timezone)
+runtime.PLAYS = [{'gather_facts': False, 'tasks': [{
+    'type': 'block',
+    'vars': {'timestamps': '{{ template_run_date.isoformat() ~ "|" ~ template_mtime.isoformat() }}'},
+    'block': [{
+        'type': 'task', 'name': 'Render', 'action': 'ansible.builtin.template',
+        'special': 'template', 'delegate_to': 'localhost',
+        'args': {'src': 'sample.j2', 'dest': 'sample.txt'},
+    }],
+}]}]
+runtime.MODULES = {}
+runtime.ANSIBALLZ_CODE = ''
+runtime._INJECTED_HOST = 'target'
+runtime.agent_main()
+"""
+    run_date = "2025-03-01T08:30:12.345678"
+    mtime = "2025-02-28T10:20:30.654321-03:30"
+    replies = [
+        {"t": "delegate_play_var", "name": "timestamps",
+         "template_vars": {"template_run_date": run_date, "template_mtime": mtime}},
+        {"t": "delegate_result", "result": {"changed": False}},
+    ]
+    encoded = [json.dumps(reply).encode() for reply in replies]
+    result = subprocess.run([sys.executable, "-c", agent, "legacy" if legacy else "modern"],
+                            input=b"".join(len(reply).to_bytes(4, "big") + reply for reply in encoded),
+                            capture_output=True, timeout=15)
+    assert result.returncode == 0, result.stderr.decode()
+    frames = {}
+    stream = io.BytesIO(result.stdout)
+    while header := stream.read(4):
+        frame = json.loads(stream.read(int.from_bytes(header, "big")))
+        frames[frame["t"]] = frame
+    assert frames["done"]["failed"] is False, frames["result"]
+    assert "timestamps" in frames["delegate"]["lazy_template_vars"]
+    assert frames["delegate_play_var_result"]["fallback"]["value"] == run_date + "|" + mtime
 
 
 def test_lookup_followed_by_another_template_segment_renders_as_text():
