@@ -51,6 +51,7 @@ _JINJA_RE = re.compile(r"{{.*?}}")
 _ABSOLUTE_TREE_LIMIT = 4 * 1024 * 1024
 _PLAYBOOK_DIR_RE = re.compile(r"{{\s*playbook_dir\s*}}")
 _ROLE_PATH_RE = re.compile(r"{{\s*role_path\s*}}")
+_STANDALONE_INVENTORY_SELECTORS = frozenset(("inventory_hostname", "inventory_hostname_short", "group_names"))
 _USES_PLAYBOOK_DIR_RE = re.compile(r"({{|{%)((?!}}|%}).)*(?<![.\w])playbook_dir\b", re.S)
 _ENV_LOOKUP_RE = re.compile(
     r"""lookup\s*\(\s*["'](?:ansible\.builtin\.)?env["']\s*,\s*["']"""
@@ -801,6 +802,7 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     replay_order = any(_is_templated(filename)
                        for entry in vars_file_entries[:-1]
                        for filename in _as_list(entry))
+    inventory_models = {} if gather_facts is None else None
     scoped_options = {
         key: value for key in ("fact_path", "gather_subset")
         if any(_selector_template_sources(value := _tag_untrusted(getattr(play, key, None))))
@@ -815,8 +817,19 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     order_deferred = {}
     hash_scope = {} if ordered_vars_files is not None and C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
     play_vars = _resolved_play_vars(
-        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope)
-    deferred = _deferred_vars_files(play, basedir, unresolved_vars_files)
+        play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope,
+        inventory_models=inventory_models)
+    if inventory_models and ordered_vars_files is None:
+        # The first pass sees replacements made by earlier literal vars files.
+        unresolved_vars_files.clear()
+        order_deferred.clear()
+        inventory_models.clear()
+        ordered_vars_files = []
+        hash_scope = {} if C.DEFAULT_HASH_BEHAVIOUR == "merge" else None
+        play_vars = _resolved_play_vars(
+            play, all_vars, basedir, unresolved_vars_files, ordered_vars_files, order_deferred, hash_scope,
+            inventory_models=inventory_models)
+    deferred = _deferred_vars_files(play, basedir, unresolved_vars_files, inventory_models=inventory_models)
     for index, (selected, checked_paths, controller_candidates) in order_deferred.items():
         deferred[index]["files"].update(selected)
         deferred[index].setdefault("checked_paths", {}).update(checked_paths)
@@ -910,6 +923,8 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
     }
     if deferred:
         result["deferred_vars_files"] = deferred
+    if inventory_models:
+        result["inventory_vars_file_selectors"] = True
     if gather:
         setup_options = {
             name: value
@@ -982,9 +997,10 @@ def _convert_play(play, actions, basedir=None, only_tags=None, skip_tags=None,
         result["_gather_compile_vars"] = play_vars
         result["_gather_hash_scope"] = hash_scope
     if ordered_vars_files and unresolved_vars_files:
-        for entry in deferred:
+        for index, entry in enumerate(deferred):
             entry["glob_patterns"] = {
-                name: _vars_file_glob_pattern(name) for name in entry["names"]
+                name: (inventory_models or {}).get(index, {}).get(name, _vars_file_glob_pattern(name))
+                for name in entry["names"]
                 if _is_templated(name) and name not in entry.get("unmodeled", ())
             }
         result["ordered_vars_files"] = [
@@ -1179,7 +1195,8 @@ def _fact_schema():
     return "2.10"
 
 
-def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None):
+def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, order_deferred=None, hash_scope=None,
+                        *, inventory_models=None):
     """Merge static vars_files at their play-var precedence.
 
     Templated names are rendered like Ansible does, with play vars and extra vars. Names that stay unknown are
@@ -1194,6 +1211,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
     compile_extra_vars = {}
     selector_magic = {}
     role_defaults = {}
+    if inventory_models is not None:
+        compile_extra_vars = play.get_variable_manager().extra_vars
     if ordered is not None:
         manager = play.get_variable_manager()
         compile_extra_vars = manager.extra_vars
@@ -1203,13 +1222,35 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
         selector_magic = _gather_selector_magic(play)
     if hash_scope is not None:
         hash_scope.update(combine_vars(role_defaults, out))
+    entries = _as_list(getattr(play, "vars_files", None))
+    inventory_role_defaults = role_defaults
+    if entries and inventory_models is not None and ordered is None:
+        inventory_role_defaults = _gather_role_defaults(_gather_public_roles(play))
+    fixed_inventory = set(out) & _STANDALONE_INVENTORY_SELECTORS
     bundled_inputs = set()
     scanned = 0
-    for entry in _as_list(getattr(play, "vars_files", None)):
+    for entry in entries:
         defer_for_order = False
         selected = {}
         checked_paths = {}
         controller_candidates = {}
+        inventory_patterns = {}
+        inventory_names = set()
+        if inventory_models is not None:
+            scope = {**inventory_role_defaults, **out, **compile_extra_vars, **selector_magic}
+            fixed = fixed_inventory | compile_extra_vars.keys()
+            templates = [
+                source
+                for item in _as_list(entry) if isinstance(item, str)
+                if _is_templated(source := _PLAYBOOK_DIR_RE.sub(lambda _: basedir, item))
+            ]
+            inventory_names = {source for source in templates if _inventory_selector_names(source, scope, fixed)}
+            if inventory_names:
+                inventory_patterns = {
+                    source: _inventory_selector_patterns(
+                        source, scope if source in inventory_names else {}, fixed | selector_magic.keys())
+                    for source in templates
+                }
         for filename in _as_list(entry):
             if not isinstance(filename, str):
                 continue
@@ -1218,6 +1259,14 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             candidate_source = filename
             controller_inputs = None
             if _is_templated(filename):
+                if ordered is None and inventory_patterns:
+                    # Restart with ordered replay before rendering this entry.
+                    inventory_models[len(unresolved)] = inventory_patterns
+                    return out
+                if filename in inventory_names:
+                    # A hostless default must not become the fixed file.
+                    defer_for_order = True
+                    break
                 # A deferred file may change a later selector's inputs.
                 if ordered is not None:
                     from .runtime import _GATHER_STRING_METHODS
@@ -1228,7 +1277,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                     requires_controller, required_plugins = _vars_filename_controller_requirements(filename, portable)
                     # A templated leading directory cannot be bundled by the
                     # filename glob. Keep its known choice unless order requires replay.
-                    if portable is not None and not _vars_file_has_dynamic_directory(filename):
+                    if portable is not None and (
+                            filename in inventory_patterns or not _vars_file_has_dynamic_directory(filename)):
                         defer_for_order |= bool(portable[1] - extra_replacements - selector_magic.keys())
                     dependencies = portable
                     paths, unknown_lookup = set(), set()
@@ -1243,7 +1293,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                             if required_plugins:
                                 controller_inputs["jinja_plugins"] = required_plugins
                     if unresolved and dependencies is not None:
-                        earlier = _deferred_vars_files(play, basedir, unresolved[scanned:])
+                        earlier = _deferred_vars_files(
+                            play, basedir, unresolved[scanned:], inventory_models=inventory_models, offset=scanned)
                         for index, previous in enumerate(earlier, start=scanned):
                             if order_deferred and index in order_deferred:
                                 previous["files"].update(order_deferred[index][0])
@@ -1271,9 +1322,12 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                 filename = _template_vars_file_name(play, raw, selector_vars, all_vars, selector_magic)
                 if filename is None:
                     if unresolved is not None and not defer_for_order:
+                        if inventory_patterns:
+                            inventory_models[len(unresolved)] = inventory_patterns
                         if ordered is not None:
                             ordered.append(len(unresolved))
                         unresolved.append(entry)
+                        fixed_inventory.clear()
                     break
             if ordered is not None:
                 checked_paths[filename] = None
@@ -1292,6 +1346,8 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
             mappings = [item for item in _as_list(loaded) if isinstance(item, dict)]
             for item in mappings:
                 out = combine_vars(out, item)
+                if not defer_for_order:
+                    fixed_inventory.update(item.keys() & _STANDALONE_INVENTORY_SELECTORS)
                 if hash_scope is not None:
                     hash_scope.update(combine_vars(hash_scope, item))
             if defer_for_order:
@@ -1302,9 +1358,13 @@ def _resolved_play_vars(play, all_vars, basedir, unresolved=None, ordered=None, 
                 ordered.append(_tag_untrusted(mappings))
             break
         if defer_for_order:
+            fixed_inventory.clear()
+            if inventory_patterns:
+                inventory_models[len(unresolved)] = inventory_patterns
             if order_deferred is not None:
                 order_deferred[len(unresolved)] = (selected, checked_paths, controller_candidates)
-            ordered.append(len(unresolved))
+            if ordered is not None:
+                ordered.append(len(unresolved))
             unresolved.append(entry)
     # The variable manager has already applied extra vars and any parser-level
     # transformations. Restrict it to actual play/vars-file keys so magic vars
@@ -1380,6 +1440,98 @@ def _vars_file_glob_pattern(name):
     return "*".join(glob.escape(part) for part in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
 
 
+def _inventory_selector_names(source, scope, fixed=()):
+    from .runtime import _GATHER_STRING_METHODS
+
+    dependencies = _gather_timeout_dependencies(
+        source, scope, _GATHER_STRING_METHODS, selector=True, allow_controller=True, retain_mutable=True)
+    return dependencies[1] & (_STANDALONE_INVENTORY_SELECTORS - set(fixed)) if dependencies else set()
+
+
+def _inventory_selector_globs(source, scope, fixed):
+    """Keep authored path components without rendering controller expressions."""
+    import glob
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from .runtime import _selector_default_arguments
+
+    environment = Environment(keep_trailing_newline=True)
+
+    def binding(node):
+        if isinstance(node, nodes.Name):
+            return (node.name,), scope.get(node.name)
+        if isinstance(node, nodes.Getattr):
+            member = node.attr
+        elif isinstance(node, nodes.Getitem) and isinstance(node.arg, nodes.Const):
+            member = node.arg.value
+        else:
+            return (), None
+        path, container = binding(node.node)
+        if isinstance(container, dict) and isinstance(member, (str, int, float, type(None))):
+            return (*path, member), container.get(member)
+        if isinstance(container, (list, tuple)) and isinstance(member, int) and -len(container) <= member < len(container):
+            return (*path, member), container[member]
+        return (), None
+
+    def project(node, seen=frozenset()):
+        if isinstance(node, nodes.TemplateData):
+            return (glob.escape(node.data),)
+        if isinstance(node, nodes.Const) and isinstance(node.value, str):
+            return (glob.escape(node.value),)
+        if isinstance(node, nodes.CondExpr) and node.expr2 is not None:
+            return tuple(dict.fromkeys((*project(node.expr1, seen), *project(node.expr2, seen))))
+        if isinstance(node, nodes.Filter) and node.name in ("default", "d"):
+            arguments = _selector_default_arguments(node)
+            if arguments is not None:
+                fallback = project(arguments["default_value"], seen) if "default_value" in arguments else ("",)
+                return tuple(dict.fromkeys((*project(node.node, seen), *fallback)))
+        if isinstance(node, (nodes.Template, nodes.Output, nodes.Concat, nodes.Add)):
+            parts = (node.body if isinstance(node, nodes.Template) else (node.left, node.right)
+                     if isinstance(node, nodes.Add) else node.nodes)
+            patterns = ("",)
+            for part in parts:
+                alternatives = project(part, seen)
+                if len(patterns) * len(alternatives) > 256:
+                    return ("*",)
+                patterns = tuple(prefix + suffix for prefix in patterns for suffix in alternatives)
+            return patterns
+        path, value = binding(node)
+        if path and path not in seen and len(seen) < 32 and isinstance(value, str):
+            name = path[0]
+            if name in _STANDALONE_INVENTORY_SELECTORS and name not in fixed:
+                return ("*",)
+            tagged = _tag_untrusted(value, template_syntax_only=True)
+            if isinstance(tagged, str) and _is_templated(tagged):
+                return project(environment.parse(tagged), seen | {path})
+            if name not in fixed and os.path.sep not in value:
+                return tuple(dict.fromkeys((glob.escape(value), "*")))
+            return (glob.escape(value),)
+        return ("*",)
+
+    try:
+        return project(environment.parse(source))
+    except TemplateSyntaxError:
+        return (_vars_file_glob_pattern(source),)
+
+
+def _bounded_inventory_source(play, candidate, roots):
+    # DataLoader expands environment references and symlinks in source paths.
+    resolved = os.path.realpath(play._loader.path_dwim(candidate))
+    if resolved == os.path.realpath(candidate) and any(
+            os.path.commonpath((root, resolved)) == root for root in roots):
+        return resolved
+    return None
+
+
+def _inventory_selector_patterns(source, scope, fixed=()):
+    import glob
+
+    finite = _finite_vars_file_names(source)
+    if finite:
+        return tuple(glob.escape(name) for name in finite if os.pardir not in name.split(os.path.sep))
+    return tuple(pattern for pattern in _inventory_selector_globs(source, scope, fixed)
+                 if os.pardir not in pattern.split(os.path.sep))
+
+
 def _vars_file_has_dynamic_directory(name):
     return name.startswith(("{{", "{%")) and any(
         os.path.sep in literal for literal in re.split(r"{{.*?}}|{%.*?%}", name, flags=re.S))
@@ -1418,7 +1570,7 @@ def _finite_vars_file_names(source):
         return None
 
 
-def _deferred_vars_files(play, basedir, entries):
+def _deferred_vars_files(play, basedir, entries, *, inventory_models=None, offset=0):
     """Bundle every file a vars_files entry left to the runtime could select, keyed by path.
 
     A templated name matches files by turning each template into a glob ``*``, so it cannot select a file
@@ -1435,14 +1587,18 @@ def _deferred_vars_files(play, basedir, entries):
     else:
         dirs, subdir = [basedir], None
     dirs = [os.path.normpath(d) for d in dirs]
+    roots = tuple(dict.fromkeys(map(os.path.realpath, dirs))) if inventory_models else ()
     deferred = []
-    for entry in entries:
+    for index, entry in enumerate(entries, start=offset):
         names = [re.sub(r"{{\s*playbook_dir\s*}}", basedir, name) for name in _as_list(entry) if isinstance(name, str)]
         files = {}
         checked_paths = {}
+        blocked_paths = {}
         unmodeled = []
+        inventory_patterns = (inventory_models or {}).get(index, {})
         for position, name in enumerate(names):
-            if _vars_file_has_dynamic_directory(name):
+            bounded = name in inventory_patterns
+            if not bounded and _vars_file_has_dynamic_directory(name):
                 unmodeled.append(name)
                 continue
             if not _is_templated(name):
@@ -1461,12 +1617,15 @@ def _deferred_vars_files(play, basedir, entries):
                 # Ansible can consider any remaining first-found candidates.
                 names = names[:position + 1]
                 break
-            pattern = _vars_file_glob_pattern(os.path.expanduser(name))
-            finite_names = _finite_vars_file_names(name) if _is_templated(name) else None
-            variants = ([(expanded, glob.escape(expanded)) for candidate in finite_names
-                         if os.pardir not in candidate.split(os.path.sep)
-                         and _vars_file_glob_covers(pattern, expanded := os.path.expanduser(candidate))]
-                        if finite_names else [(name, pattern)])
+            if bounded:
+                variants = [(pattern, pattern) for pattern in inventory_patterns[name]]
+            else:
+                pattern = _vars_file_glob_pattern(os.path.expanduser(name))
+                finite_names = _finite_vars_file_names(name)
+                variants = ([(expanded, glob.escape(expanded)) for candidate in finite_names
+                             if os.pardir not in candidate.split(os.path.sep)
+                             and _vars_file_glob_covers(pattern, expanded := os.path.expanduser(candidate))]
+                            if finite_names else [(name, pattern)])
             patterns = []
             for candidate, variant in variants:
                 if os.path.isabs(os.path.expanduser(candidate)):
@@ -1479,11 +1638,20 @@ def _deferred_vars_files(play, basedir, entries):
             for path in patterns:
                 for found in glob.glob(path):
                     found = os.path.normpath(found)
+                    physical = _bounded_inventory_source(play, found, roots) if bounded else None
+                    if bounded and physical is None:
+                        blocked_paths.setdefault(name, {})[found] = {
+                            "__ansiroll_vars_file_error__":
+                                "vars_files item %r selected a path outside its approved sources" % name,
+                        }
+                        continue
                     if found not in files and (os.path.isfile(found) or os.path.isdir(found)):
-                        files[found] = _bundled_vars_file(play, found)
+                        files[found] = _bundled_vars_file(play, found, physical=physical)
         entry = {"names": names, "dirs": dirs, "subdir": subdir, "files": files}
         if checked_paths:
             entry["checked_paths"] = checked_paths
+        if blocked_paths:
+            entry["blocked_paths"] = blocked_paths
         if any(name.startswith("~/") for name in names):
             entry["controller_home"] = os.path.expanduser("~")
         if unmodeled:
@@ -1492,14 +1660,15 @@ def _deferred_vars_files(play, basedir, entries):
     return deferred
 
 
-def _bundled_vars_file(play, path):
+def _bundled_vars_file(play, path, *, physical=None):
     """A candidate's vars, or an error marker: the glob also matches playbooks, task files and secrets."""
     from ansible.errors import AnsibleParserError
 
     if not os.path.isfile(path):
         return {"__ansiroll_vars_file_error__": "Invalid vars_files file %r: expected a regular file" % path, "rc": 1}
     try:
-        loaded = _load_plain_ansible_source(play._loader.path_dwim(path))
+        load_path = physical if physical is not None else play._loader.path_dwim(path)
+        loaded = _load_plain_ansible_source(load_path, opener=_open_linked_role_source if physical else None)
         if isinstance(loaded, dict) or loaded is None:
             return _tag_untrusted([loaded] if loaded else [])
         from ansible.vars.manager import preprocess_vars
@@ -2230,6 +2399,28 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     raw_fname = args.get("_raw_params") or args.get("file")
     if not isinstance(raw_fname, str):
         return None
+    if not includes.controller_execution and _is_templated(raw_fname):
+        variables, higher_layers = _include_template_variables(task, includes)
+        fixed = set(includes.play_vars) - includes.vars_file_writes
+        if includes.incomplete:
+            fixed.difference_update(_STANDALONE_INVENTORY_SELECTORS)
+        fixed.update(*higher_layers)
+        inventory = _inventory_selector_names(raw_fname, variables, fixed)
+        if inventory:
+            pinned = (fixed & _STANDALONE_INVENTORY_SELECTORS) | higher_layers[-1].keys() | {"playbook_dir", "role_path"}
+            variants = _inventory_include_variants(task, raw_fname, basedir, includes, variables, pinned)
+            replay = copy(includes)
+            replay.compile_selected_vars = None
+            if variants:
+                node = _expand_include_variants(
+                    task, (raw_fname,), variants, inventory, actions, basedir, only_tags, skip_tags, replay,
+                    bind_parent_filename=True)
+                if node is not None:
+                    includes.resolved_template = True
+                    return node
+            node = _convert_task(task, actions, basedir)
+            node["fallback_reason"] = "inventory-dependent include_tasks has no bundled candidates"
+            return node
     fname = _template_include_filename(task, raw_fname, includes) if _is_templated(raw_fname) else raw_fname
     if fname is not None and (not isinstance(fname, str) or _is_templated(fname)):
         return None
@@ -2259,7 +2450,57 @@ def _convert_include_tasks(task, actions, basedir, only_tags, skip_tags, include
     return _expand_include_tasks(task, raw_fname, fname, path, actions, basedir, only_tags, skip_tags, includes)
 
 
-def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes):
+def _inventory_include_variants(task, source, basedir, includes, scope, fixed):
+    import glob
+
+    role = getattr(task, "_role", None)
+    roots = [basedir]
+    search = [basedir]
+    if role is not None:
+        roots.append(role._role_path)
+        search.extend((role._role_path, os.path.join(role._role_path, "handlers" if _is_handler(task) else "tasks")))
+        scope = dict(scope, role_path=role._role_path)
+    roots = tuple(map(os.path.realpath, roots))
+    base_search = tuple(search)
+    cumulative = None
+    for parent, dynamic in _parent_include_paths(_include_parent(task)):
+        if dynamic:
+            parent_file = _template_include_filename(task, parent, includes)
+            if parent_file is None:
+                return {}
+            parent = os.path.dirname(parent_file)
+        cumulative = _next_include_dir(parent, cumulative)
+        search.extend(os.path.join(root, cumulative) for root in base_search)
+    source = _PLAYBOOK_DIR_RE.sub(lambda _: basedir, source)
+    variants = {}
+    for pattern in _inventory_selector_patterns(source, scope, fixed):
+        if pattern == "*" or os.pardir in pattern.split(os.path.sep):
+            continue
+        for directory in ("",) if os.path.isabs(pattern) else dict.fromkeys(search):
+            prefix = os.path.join(directory, "") if directory else ""
+            for path in glob.iglob(glob.escape(prefix) + pattern):
+                filename = path[len(prefix):]
+                if filename in variants or not _bounded_inventory_source(_play_of(task), path, roots):
+                    continue
+                resolved = _include_tasks_path(task, filename, includes)
+                if (not resolved or not os.path.isfile(resolved)
+                        or not _bounded_inventory_source(_play_of(task), resolved, roots)):
+                    continue
+                branch = _IncludeVariables(includes.play_vars, includes.all_vars,
+                                           includes.runtime_writes | includes.variant_writes)
+                branch.vars_file_plan = includes.vars_file_plan
+                branch.vars_file_scopes = includes.vars_file_scopes
+                branch.vars_file_writes = includes.vars_file_writes
+                branch.incomplete = includes.incomplete
+                branch.unresolved_vars_file = includes.unresolved_vars_file
+                variants[filename] = branch
+                if len(variants) > 256:
+                    raise ValueError("too many inventory-dependent include_tasks candidates")
+    return variants
+
+
+def _expand_include_variants(task, sources, variants, inputs, actions, basedir, only_tags, skip_tags, includes, *,
+                             bind_parent_filename=False):
     if not variants and (includes.incomplete or includes.unresolved_vars_file):
         node = _convert_task(task, actions, basedir)
         node["vars_file_include_fallback"] = True
@@ -2311,7 +2552,7 @@ def _expand_include_variants(task, sources, variants, inputs, actions, basedir, 
                 continue
             variant_task = task.copy(exclude_parent=True)
             variant_task._parent = task._parent
-            if _core_version() >= (2, 19):
+            if bind_parent_filename or _core_version() >= (2, 19):
                 # Modern Core keeps the selected directory in the parent include.
                 variant_task._ansiroll_include_variant_filename = fname
             expanded = _expand_include_tasks(variant_task, raw_fname, fname, path,

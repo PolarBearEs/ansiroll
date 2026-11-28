@@ -4952,7 +4952,8 @@ class Runtime:
                     {**vars_file_defaults, **(timeout_template.get("timeout_defaults") or {}),
                      **((option_scope or {}).get("defaults") or {})},
                     blocked_inputs=blocked_timeout_inputs, merge_hashes=merge_vars_files, magic=vars_file_magic,
-                    ordered=ordered_files is not None, deferred_entries=deferred_files)
+                    ordered=ordered_files is not None, deferred_entries=deferred_files,
+                    pre_setup_host_vars=self._vars_file_host_vars if play.get("inventory_vars_file_selectors") else None)
             setup_ctx = self._layered_ctx(self.ctx(play_vars if timeout_template or timeout_vars is None else {},
                                                    timeout_vars))
             option_contexts = {}
@@ -5570,18 +5571,24 @@ class Runtime:
                             candidates.append(os.path.join(d, entry["subdir"], name))
                         candidates.append(os.path.join(d, name))
                 checked_paths = entry.get("checked_paths", {})
+                blocked_paths = entry.get("blocked_paths", {}).get(raw, {})
                 if name in checked_paths:
                     path = checked_paths[name]
                     if path is None:
                         continue
-                    data = entry["files"][path]
+                    data = blocked_paths.get(path) or entry["files"][path]
                 else:
-                    pattern = entry.get("glob_patterns", {}).get(raw)
+                    patterns = entry.get("glob_patterns", {}).get(raw)
+                    if isinstance(patterns, str):
+                        patterns = (patterns,)
                     covered = raw not in entry.get("unmodeled", ()) and (
-                        pattern is None or _vars_file_glob_covers(pattern, name))
+                        patterns is None or any(_vars_file_glob_covers(pattern, name) for pattern in patterns))
                     data = None
                     if ".." not in name.split(os.path.sep) or not entry.get("glob_patterns"):
                         for candidate in map(os.path.normpath, candidates):
+                            if candidate in blocked_paths:
+                                data = blocked_paths[candidate]
+                                break
                             if candidate in entry["files"]:
                                 data = entry["files"][candidate]
                                 break

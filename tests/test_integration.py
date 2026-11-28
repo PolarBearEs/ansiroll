@@ -102,6 +102,351 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+@pytest.mark.parametrize("include", [False, True])
+def test_standalone_replays_inventory_filenames(tmp_path, include):
+    playbook = tmp_path / "play.yml"
+    (tmp_path / "profiles").mkdir()
+    (tmp_path / "tasks").mkdir()
+    for name in ("local", "worker"):
+        (tmp_path / "profiles" / (name + ".yml")).write_text(f"selected: {name}\n")
+        (tmp_path / "tasks" / (name + ".yml")).write_text(f"- debug: {{msg: task-{name}}}\n")
+    extra_task = "    - include_tasks: \"tasks/{{ inventory_hostname_short | default('local') }}.yml\"\n"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - "profiles/{{ inventory_hostname_short | default('local') }}.yml"
+  tasks:
+    - assert: {that: selected == 'worker'}
+""" + (extra_task if include else ""))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    shutil.rmtree(tmp_path / "profiles")
+    shutil.rmtree(tmp_path / "tasks")
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30, env=dict(os.environ, ANSIROLL_HOST="worker.example"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    if include:
+        assert "task-worker" in result.stdout
+        assert "task-local" not in result.stdout
+
+
+def test_standalone_replays_inventory_include_inside_known_parent(tmp_path):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "wrapper.yml").write_text(
+        '- include_tasks: "{{ inventory_hostname_short | default(\'local\') }}.yml"\n')
+    (profiles / "worker.yml").write_text("- debug: {msg: selected-worker}\n")
+    (profiles / "local.yml").write_text("- fail: {msg: selected-hostless-default}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars: {task_dir: profiles}
+  tasks:
+    - include_tasks: '{{ task_dir }}/wrapper.yml'
+""")
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30, env=dict(os.environ, ANSIROLL_HOST="worker.example"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "selected-worker" in result.stdout
+
+
+def test_standalone_replays_inventory_selector_from_role_defaults(tmp_path):
+    defaults = tmp_path / "roles" / "fixture" / "defaults"
+    defaults.mkdir(parents=True)
+    (defaults / "main.yml").write_text("profile_file: 'profiles/{{ inventory_hostname_short }}.yml'\n")
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "worker.yml").write_text("selected: worker\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  roles: [fixture]
+  vars_files: ['{{ profile_file }}']
+  tasks:
+    - assert: {that: selected == 'worker'}
+""")
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30, env=dict(os.environ, ANSIROLL_HOST="worker.example"))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("has_later_file", [False, True])
+@pytest.mark.parametrize("leading", [False, True])
+def test_standalone_replays_inventory_vars_file_as_fallback(tmp_path, has_later_file, leading):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "warm.yml").write_text("selected: compile-choice\n")
+    (tmp_path / "warm").mkdir()
+    (tmp_path / "warm" / "settings.yml").write_text("selected: compile-choice\n")
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    (worker / "settings.yml").write_text("selected: inventory\n")
+    (tmp_path / "suffix.yml").write_text("unused: true\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars: {stage: warm}
+  vars_files:
+    - ['EARLIER', '{{ inventory_hostname_short }}/settings.yml']
+LATER  tasks:
+    - assert: {that: selected == 'inventory'}
+""".replace("LATER", "    - suffix.yml\n" if has_later_file else "").replace(
+        "EARLIER", "{{ stage }}/settings.yml" if leading else "profiles/{{ stage }}.yml"))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, ANSIROLL_HOST="worker.example", ANSIROLL_EXTRA_VARS='{"stage": "cold"}'),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_standalone_inventory_selector_replays_after_deferred_override_is_removed(tmp_path):
+    (tmp_path / "first-warm.yml").write_text("inventory_hostname_short: alias\n")
+    (tmp_path / "first-cold.yml").write_text("unused: true\n")
+    for host in ("alias", "worker"):
+        directory = tmp_path / host
+        directory.mkdir()
+        (directory / "settings.yml").write_text(f"selected: {host}\n")
+        (directory / "tasks.yml").write_text(f"- debug: {{msg: include-{host}}}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars: {stage: warm}
+  vars_files:
+    - 'first-{{ stage }}.yml'
+    - '{{ inventory_hostname_short }}/settings.yml'
+  tasks:
+    - assert: {that: selected == 'worker'}
+    - include_tasks: '{{ inventory_hostname_short }}/tasks.yml'
+""")
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, ANSIROLL_HOST="worker.example", ANSIROLL_EXTRA_VARS='{"stage": "cold"}'),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "include-worker" in result.stdout
+
+
+@pytest.mark.parametrize("member", ["profile.settings", "profile['settings']"])
+def test_standalone_inventory_selector_projects_mapping_aliases_and_mutable_components(tmp_path, member):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "worker-cold.yml").write_text("selected: cold\n")
+    (profiles / "tasks-worker-cold.yml").write_text("- debug: {msg: include-cold}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    suffix: warm
+    profile:
+      settings: "profiles/{{ inventory_hostname_short }}-{{ suffix }}.yml"
+      tasks: "profiles/tasks-{{ inventory_hostname_short }}-{{ suffix }}.yml"
+  vars_files:
+    - "{{ MEMBER }}"
+  tasks:
+    - assert: {that: selected == 'cold'}
+    - include_tasks: "{{ profile['tasks'] }}"
+""".replace("MEMBER", member))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, ANSIROLL_HOST="worker.example", ANSIROLL_EXTRA_VARS='{"suffix": "cold"}'),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "include-cold" in result.stdout
+
+
+def test_standalone_inventory_selector_projects_default_filter_operands(tmp_path):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    (profiles / "dev.yml").write_text("selected: dev\n")
+    (profiles / "worker.yml").write_text("selected: worker\n")
+    (profiles / "tasks-dev.yml").write_text("- debug: {msg: include-dev}\n")
+    (profiles / "tasks-worker.yml").write_text("- debug: {msg: include-worker}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars:
+    profile_file: "profiles/{{ inventory_hostname_short | default('dev') }}.yml"
+    tasks_file: "profiles/tasks-{{ inventory_hostname_short | default('dev') }}.yml"
+  vars_files:
+    - "{{ profile_file | default('profiles/dev.yml') }}"
+  tasks:
+    - assert: {that: selected == 'worker'}
+    - include_tasks:
+        file: "{{ tasks_file | d(default_value='profiles/tasks-dev.yml') }}"
+""")
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    shutil.rmtree(profiles)
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, ANSIROLL_HOST="worker.example"),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "include-worker" in result.stdout
+
+
+def test_standalone_inventory_selector_projects_nested_conditional_paths(tmp_path):
+    for group in ("worker", "default"):
+        directory = tmp_path / "profiles" / group
+        directory.mkdir(parents=True)
+        (directory / "settings.yml").write_text(f"selected: {group}\n")
+        (directory / "tasks.yml").write_text(f"- debug: {{msg: include-{group}}}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars: {use_group: true}
+  vars_files:
+    - "{{ ('profiles/' ~ group_names[0] ~ '/settings.yml') if use_group else 'profiles/default/settings.yml' }}"
+  tasks:
+    - assert: {that: selected == 'worker'}
+    - include_tasks: "{{ ('profiles/' ~ group_names[0] ~ '/tasks.yml') if use_group else 'profiles/default/tasks.yml' }}"
+""")
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, ANSIROLL_EXTRA_VARS='{"group_names": ["worker"]}'),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "include-worker" in result.stdout
+
+
+def test_standalone_inventory_include_preserves_parent_and_vars_file_selection(tmp_path):
+    wrapper = tmp_path / "worker"
+    phases = wrapper / "phases"
+    phases.mkdir(parents=True)
+    (phases / "cleanup.yml").write_text("- debug: {msg: selected-cleanup}\n")
+    (wrapper / "wrapper.yml").write_text("""- include_tasks: '{{ inventory_hostname_short }}.yml'
+- include_tasks: 'phases/{{ phase }}.yml'
+""")
+    (wrapper / "worker.yml").write_text("- debug: {msg: selected-worker}\n")
+    (tmp_path / "profile-worker.yml").write_text("phase: cleanup\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - 'profile-{{ inventory_hostname_short }}.yml'
+  tasks:
+    - include_tasks: '{{ inventory_hostname_short }}/wrapper.yml'
+""")
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run([sys.executable, str(artifact)], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30, env=dict(os.environ, ANSIROLL_HOST="worker.example"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "selected-worker" in result.stdout
+    assert "selected-cleanup" in result.stdout
+
+
+@pytest.mark.parametrize(("expression", "selected"), [
+    ("group_names[0] | regex_search('[a-z]+$')", "prod"),
+    ("group_names[0] | regex_replace('^stage-', '')", "prod"),
+    ("group_names[0] | profile_filter", "custom"),
+])
+def test_standalone_inventory_vars_file_is_available_before_setup(tmp_path, expression, selected):
+    plugin_dir = tmp_path / "filter_plugins"
+    plugin_dir.mkdir()
+    (plugin_dir / "profile.py").write_text("""class FilterModule:
+    def filters(self):
+        return {"profile_filter": lambda value: "custom"}
+""")
+    for name in ("prod", "custom"):
+        profile = tmp_path / "profiles" / name
+        profile.mkdir(parents=True)
+        (profile / "settings.yml").write_text(f"setup_profile: {name}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: true
+  environment:
+    ANSIROLL_TEST_SETUP_PROFILE: '{{ setup_profile }}'
+  vars_files:
+    - "{{ 'profiles/' ~ (EXPRESSION) ~ '/settings.yml' }}"
+  tasks:
+    - assert:
+        that:
+          - setup_profile == 'SELECTED'
+          - ansible_facts.env.ANSIROLL_TEST_SETUP_PROFILE == 'SELECTED'
+""".replace("EXPRESSION", expression).replace("SELECTED", selected))
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook))[0])
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=45,
+        env=dict(os.environ, ANSIROLL_EXTRA_VARS=json.dumps({"group_names": ["stage-prod"]})),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_standalone_inventory_candidate_bundle_uses_approved_roots(tmp_path, monkeypatch):
+    playdir = tmp_path / "play"
+    playdir.mkdir()
+    playbook = playdir / "play.yml"
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+    - ["profiles/{{ inventory_hostname_short }}.yml", fallback.yml]
+  tasks: []
+""")
+    (playdir / "fallback.yml").write_text("fallback: true\n")
+    profiles = playdir / "profiles"
+    profiles.mkdir()
+    outside = tmp_path / "outside.yml"
+    outside.write_text("outside: synthetic-fixture\n")
+    (profiles / "linked.yml").symlink_to(outside)
+    (profiles / "local.yml").write_text(
+        'unused: "{{ lookup(\'env\', \'ANSIROLL_TEST_INVENTORY_CANDIDATE\') }}"\n')
+    monkeypatch.setenv("ANSIROLL_TEST_INVENTORY_CANDIDATE", "synthetic-controller-value")
+    source = compile_playbook(str(playbook))[0]
+    play, = _compiled_plays(source, playdir)
+    files = play["deferred_vars_files"][0]["files"]
+    assert set(files) == {str(profiles / "local.yml"), str(playdir / "fallback.yml")}
+    assert "ANSIROLL_TEST_INVENTORY_CANDIDATE" not in play.get("controller_env", {})
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(source)
+    result = subprocess.run(
+        [sys.executable, str(artifact)], cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        env=dict(os.environ, ANSIROLL_HOST="linked.example"),
+    )
+    assert result.returncode != 0
+    assert "selected a path outside its approved sources" in result.stderr
+
+
+@pytest.mark.parametrize("source", ["compile-extra", "static-file"])
+def test_standalone_inventory_file_respects_fixed_group(tmp_path, source):
+    playbook = tmp_path / "play.yml"
+    initial = "    - groups.yml\n" if source == "static-file" else ""
+    if initial:
+        (tmp_path / "groups.yml").write_text("group_names: [fixed]\n")
+    playbook.write_text("""- hosts: all
+  gather_facts: false
+  vars_files:
+FIRST    - "profiles/{{ group_names[0] }}/settings.yml"
+  tasks:
+    - assert: {that: chosen == 'fixed'}
+""".replace("FIRST", initial))
+    for name in ("fixed", "launch"):
+        profile = tmp_path / "profiles" / name
+        profile.mkdir(parents=True)
+        (profile / "settings.yml").write_text(f"chosen: {name}\n")
+    extra = {"group_names": ["fixed"]} if source == "compile-extra" else {}
+    artifact = tmp_path / "compiled.py"
+    artifact.write_text(compile_playbook(str(playbook), extra_vars=extra)[0])
+    launcher = ("import runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__', "
+                "init_globals={'_INJECTED_VARS': {'group_names': ['launch']}})")
+    result = subprocess.run([sys.executable, "-c", launcher, str(artifact)], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_path, monkeypatch):
     import builtins
 

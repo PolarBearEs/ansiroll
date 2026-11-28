@@ -86,7 +86,7 @@ def test_standalone_tasks_receive_inventory_magic(tmp_path, hostname, injected):
     ("node.example.test", "inventory_hostname_short | default(profile)", "override"),
     ("", "inventory_hostname | default(profile, true)", None),
 ])
-def test_standalone_vars_file_uses_only_explicit_inventory_inputs(tmp_path, host, selector, short_override):
+def test_standalone_vars_file_uses_inventory_and_explicit_overrides(tmp_path, host, selector, short_override):
     import socket
 
     from ansible.inventory.host import Host
@@ -105,6 +105,7 @@ def test_standalone_vars_file_uses_only_explicit_inventory_inputs(tmp_path, host
     profiles = tmp_path / "profiles"
     profiles.mkdir()
     (profiles / "deployment.yml").write_text("selected: deployment\n")
+    (profiles / "node.yml").write_text("selected: node\n")
     (profiles / "override.yml").write_text("selected: override\n")
     compiled = tmp_path / "compiled.py"
     compiled.write_text(compile_playbook(str(playbook))[0])
@@ -119,7 +120,8 @@ def test_standalone_vars_file_uses_only_explicit_inventory_inputs(tmp_path, host
                 if line.startswith("__ANSIROLL_RESULT__ ")]
     name = host or socket.gethostname()
     short = short_override or Host(name).get_magic_vars()["inventory_hostname_short"]
-    assert messages == [f"{name}:{short}:{short_override or 'deployment'}"] * 2
+    selected = short if host else "deployment"
+    assert messages == [f"{name}:{short}:{selected}"] * 2
 
 
 def test_freezing_keeps_inventory_dependent_play_vars_dynamic(tmp_path):
