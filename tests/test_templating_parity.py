@@ -2318,7 +2318,12 @@ def test_playbook_dir_template_src_from_another_role_is_baked(tmp_path):
     assert dest.read_text() == "value=2"
 
 
-def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_path):
+@pytest.mark.parametrize("source", [
+    "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2",
+    "{{ playbook_dir }}/roles/b/templates/  {{- item -}} .j2",
+    """{{ playbook_dir }}/roles/b/templates/{{ item | replace('}}', 'unused') -}} .j2""",
+], ids=["plain", "trim-both", "delimiter-in-expression"])
+def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_path, source):
     playbook = _write(tmp_path, """
 - hosts: localhost
   gather_facts: false
@@ -2327,10 +2332,10 @@ def test_looped_playbook_dir_template_src_is_baked_under_its_absolute_path(tmp_p
 """, {
         "roles/a/tasks/main.yml": """
 - template:
-    src: "{{ playbook_dir }}/roles/b/templates/{{ item }}.j2"
+    src: %s
     dest: %s/out-{{ item }}
   loop: "{{ names }}"
-""" % str(tmp_path),
+""" % (json.dumps(source), tmp_path),
         "roles/a/templates/own.j2": "unrelated",
         "roles/b/templates/conf.j2": "value={{ 1 + 1 }}",
     })
@@ -4239,6 +4244,33 @@ def test_vars_files_named_from_facts_load_at_runtime(tmp_path):
 """, {"vars/linux.yml": 'os_name: linux\nderived: "{{ from_play }}-{{ ansible_facts.system }}"\n',
       "vars/darwin.yml": "os_name: darwin\nderived: darwin\n", "fallback.yml": "fb: fallback\n"})
     assert msgs == ["linux play-Linux fallback"]
+
+
+@pytest.mark.parametrize("gather_facts", ["  gather_facts: false\n", ""], ids=["deferred", "ordered"])
+def test_deferred_vars_files_apply_path_whitespace_control(tmp_path, gather_facts):
+    selector = "vars-  {{- profile -}} .yml"
+    playbook = _write(tmp_path, """
+- hosts: localhost
+%s  vars:
+    profile: "{{ inventory_hostname | replace('localhost', 'fast') }}"
+  vars_files:
+    - %s
+    - defaults.yml
+  tasks:
+    - debug: msg="{{ selected_profile }}"
+""" % (gather_facts, json.dumps(selector)), {
+        "vars-fast.yml": "selected_profile: fast\n",
+        "other-fast.yml": "selected_profile: other\n",
+        "defaults.yml": "default_value: default\n",
+    })
+    plays, _ = parse_playbook(str(playbook))
+    entry = plays[0]["deferred_vars_files"][0]
+    assert set(entry["files"]) == {str(tmp_path / "vars-fast.yml")}
+    if not gather_facts:
+        assert entry["glob_patterns"][selector] == "vars-*.yml"
+    expected = _ansible(playbook, tmp_path)
+    assert expected[0] == ["fast"]
+    assert _ansiroll(playbook, tmp_path) == expected
 
 
 def test_rebound_play_vars_render_in_order_through_raw_task_vars(tmp_path):
