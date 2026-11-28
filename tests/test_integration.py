@@ -103,6 +103,133 @@ def test_deferred_vars_file_does_not_embed_controller_environment(tmp_path, monk
         }]
 
 
+@pytest.mark.parametrize("function,plugin_prefix,wantlist", [
+    ("lookup", "", False),
+    ("lookup", "ansible.builtin.", True),
+    ("query", "ansible.builtin.", False),
+    ("q", "ansible.legacy.", False),
+])
+def test_compiled_controller_lookups_capture_selected_literal_terms(tmp_path, monkeypatch,
+                                                              function, plugin_prefix, wantlist):
+    controller_env = {
+        "ANSIROLL_LOOKUP_FIRST": "first",
+        "ANSIROLL_LOOKUP_SECOND": "second",
+        "ANSIROLL_LOOKUP_WHEN_FIRST": "left",
+        "ANSIROLL_LOOKUP_WHEN_SECOND": "right",
+    }
+    for key, value in controller_env.items():
+        monkeypatch.setenv(key, value)
+    for suffix in ("DEFAULT", "UNSELECTED", "LITERAL", "UNREACHABLE", "UNSAFE", "MAPPING_KEY"):
+        monkeypatch.setenv("ANSIROLL_LOOKUP_" + suffix, "synthetic-unused")
+    monkeypatch.setenv("ANSIBLE_REMOTE_USER", "fixture-user")
+    monkeypatch.setenv("ANSIBLE_TRANSPORT", "fixture-transport")
+    monkeypatch.setenv("ANSIBLE_TIMEOUT", "42")
+    monkeypatch.setenv("ANSIBLE_FORKS", "17")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars_files: [selected.yml, 'profile-{{ profile }}.yml']
+  tasks:
+    - debug: {msg: {env: '{{ selected_env }}', config: '{{ selected_config }}'}}
+      when: q('env', 'ANSIROLL_LOOKUP_WHEN_FIRST', 'ANSIROLL_LOOKUP_WHEN_SECOND') == ['left', 'right']
+""")
+    terms = ", wantlist=true" if wantlist else ""
+    (tmp_path / "selected.yml").write_text(f"""\
+selected_env: >-
+  {{{{ {function}('{plugin_prefix}env', 'ANSIROLL_LOOKUP_FIRST', 'ANSIROLL_LOOKUP_MISSING',
+     'ANSIROLL_LOOKUP_SECOND', default='ANSIROLL_LOOKUP_DEFAULT'{terms}) }}}}
+selected_config: >-
+  {{{{ {function}('{plugin_prefix}config', 'DEFAULT_REMOTE_USER', 'DEFAULT_TRANSPORT'{terms}) }}}}
+literal: "q('env', 'ANSIROLL_LOOKUP_LITERAL')"
+unsafe: !unsafe "{{{{ {function}('env', 'ANSIROLL_LOOKUP_UNSAFE') }}}}"
+unreachable: "{{{{ 'plain' if true else {function}('env', 'ANSIROLL_LOOKUP_UNREACHABLE') }}}}"
+examples:
+  "{{{{ q('env', 'ANSIROLL_LOOKUP_MAPPING_KEY') }}}}": literal-key
+""")
+    (tmp_path / "profile-unused.yml").write_text(f"""\
+unselected_env: "{{{{ {function}('env', 'ANSIROLL_LOOKUP_UNSELECTED') }}}}"
+unselected_config: "{{{{ {function}('config', 'DEFAULT_TIMEOUT', 'DEFAULT_FORKS') }}}}"
+""")
+    monkeypatch.delenv("ANSIROLL_LOOKUP_MISSING", raising=False)
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    assert plan["controller_env"] == controller_env
+    assert plan["controller_config"]["DEFAULT_REMOTE_USER"] == "fixture-user"
+    assert plan["controller_config"]["DEFAULT_TRANSPORT"] == "fixture-transport"
+    assert {"DEFAULT_TIMEOUT", "DEFAULT_FORKS"}.isdisjoint(plan["controller_config"])
+    for key in controller_env:
+        monkeypatch.setenv(key, "launch-only-value")
+    frames = []
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"}, on_result=frames.append,
+                      extra_vars={"profile": "unused"})
+    runtime.run_play(plan)
+    expected_env = ["first", "ANSIROLL_LOOKUP_DEFAULT", "second"]
+    expected_config = ["fixture-user", "fixture-transport"]
+    if function == "lookup" and not wantlist:
+        expected_env = ",".join(expected_env)
+        expected_config = ",".join(expected_config)
+    assert [frame["result"]["msg"] for frame in frames] == [{"env": expected_env, "config": expected_config}]
+
+
+def test_compiled_controller_lookups_use_selected_template_delimiters(tmp_path, monkeypatch):
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    (templates / "selected.j2").write_text("""\
+{% set fallback = "{{ lookup('env', 'ANSIROLL_LOOKUP_NESTED') }}" %}
+[[ lookup('env', 'ANSIROLL_LOOKUP_FIXED') ]]
+[[ query('env', 'ANSIROLL_LOOKUP_FIRST', 'ANSIROLL_LOOKUP_SECOND') ]]
+[[ lookup('env', 'ANSIROLL_LOOKUP_MISSING', default=fallback) ]]
+{{ q('env', 'ANSIROLL_LOOKUP_LITERAL') }}
+""")
+    (templates / "part-main.j2").write_text("main\n")
+    (templates / "part-alt.j2").write_text("{{ q('env', 'ANSIROLL_LOOKUP_ALTERNATE') }}\n")
+    (tmp_path / "raw.txt").write_text("{{ q('env', 'ANSIROLL_LOOKUP_COPY') }}\n")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars: {part: main}
+  tasks:
+    - template:
+        src: selected.j2
+        dest: /unused/selected
+        variable_start_string: '[['
+        variable_end_string: ']]'
+    - template: {src: '{{ playbook_dir }}/templates/part-{{ part }}.j2', dest: /unused/part}
+    - copy: {src: raw.txt, dest: /unused/copy}
+""")
+    for term in ("FIXED", "FIRST", "SECOND", "NESTED", "LITERAL", "ALTERNATE", "COPY"):
+        monkeypatch.setenv("ANSIROLL_LOOKUP_" + term, term.lower())
+    monkeypatch.delenv("ANSIROLL_LOOKUP_MISSING", raising=False)
+
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    baked_paths = {path for node in _walk_play_nodes([plan]) for path in node.get("_baked", {})}
+    assert str(templates / "part-alt.j2") in baked_paths
+    assert "raw.txt" in baked_paths
+    assert plan["controller_env"] == {"ANSIROLL_LOOKUP_" + term: term.lower()
+                                      for term in ("FIXED", "FIRST", "SECOND", "NESTED")}
+
+
+def test_compiled_preserves_single_lookup_in_dynamic_assert_args(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANSIROLL_LOOKUP_ASSERT", "controller-value")
+    playbook = tmp_path / "play.yml"
+    playbook.write_text("""- hosts: localhost
+  gather_facts: false
+  vars:
+    checks:
+      that:
+        - "lookup('env', 'ANSIROLL_LOOKUP_ASSERT') == 'controller-value'"
+  tasks:
+    - assert: {}
+      args: '{{ checks }}'
+""")
+    plan = _compiled_plays(compile_playbook(str(playbook))[0], tmp_path)[0]
+    monkeypatch.setenv("ANSIROLL_LOOKUP_ASSERT", "launch-value")
+    runtime = Runtime({}, "", {"inventory_hostname": "localhost"})
+    runtime.run_play(plan)
+    assert runtime.stats["ok"] == 1
+    assert not runtime.failed
+
+
 def test_unreadable_deferred_vars_file_reports_an_error_only_when_selected(tmp_path, monkeypatch):
     import builtins
 
@@ -6502,11 +6629,17 @@ sys.exit(compiled['main'](
 
 
 def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):
-    (tmp_path / "settings-localhost.yml").write_text(
-        'value: "{{ lookup(\'env\', \'ANSIROLL_TEST_HOST_SELECTED_ENV\') }}"\n'
-        'prefix: "{{ lookup(\'env\', \'ANSIROLL_TEST_HOST_SELECTED_PREFIX\', default=\'wrong\') }}"\n')
+    (tmp_path / "settings-localhost.yml").write_text("""\
+value: >-
+  {{ query('env', 'ANSIROLL_TEST_HOST_SELECTED_ENV', 'ANSIROLL_TEST_HOST_SELECTED_SECOND',
+           'ANSIROLL_TEST_HOST_SELECTED_MISSING',
+           default={'value': "{{ lookup('env', 'ANSIROLL_TEST_HOST_SELECTED_DEFAULT') }}"}) }}
+prefix: "{{ lookup('env', 'ANSIROLL_TEST_HOST_SELECTED_PREFIX', default='wrong') }}"
+fact_args:
+  "{{ lookup('env', 'ANSIROLL_TEST_HOST_SELECTED_FACT') }}": hello
+""")
     (tmp_path / "settings-other.yml").write_text(
-        'value: "{{ lookup(\'env\', \'ANSIROLL_TEST_OTHER_HOST_ENV\') }}"\n')
+        'value: "{{ q(\'env\', \'ANSIROLL_TEST_OTHER_HOST_ENV\') }}"\n')
     (tmp_path / "chosen-right.yml").write_text("prefix: overridden\nchoice: right\n")
     (tmp_path / "chosen-wrong.yml").write_text("prefix: overridden\nchoice: wrong\n")
     proc = _run_strategy_play(
@@ -6516,14 +6649,21 @@ def test_strategy_captures_env_from_host_selected_vars_file(tmp_path):
   connection: local
   vars_files: ['settings-{{ inventory_hostname }}.yml', 'chosen-{{ prefix }}.yml']
   tasks:
+    - set_fact: {}
+      args: '{{ fact_args }}'
     - assert:
         that:
-          - value == 'host-selected'
+          - "value == ['host-selected', 'second', {'value': 'fallback'}]"
           - choice == 'right'
           - prefix == 'overridden'
+          - greeting == 'hello'
+          - "'ANSIROLL_TEST_OTHER_HOST_ENV' not in __ansiroll_controller_env"
 """,
         environment={
             "ANSIROLL_TEST_HOST_SELECTED_ENV": "host-selected",
+            "ANSIROLL_TEST_HOST_SELECTED_SECOND": "second",
+            "ANSIROLL_TEST_HOST_SELECTED_DEFAULT": "fallback",
+            "ANSIROLL_TEST_HOST_SELECTED_FACT": "greeting",
             "ANSIROLL_TEST_HOST_SELECTED_PREFIX": "right",
             "ANSIROLL_TEST_OTHER_HOST_ENV": "other",
         },
