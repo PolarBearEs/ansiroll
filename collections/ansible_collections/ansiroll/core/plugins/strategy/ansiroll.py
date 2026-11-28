@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import collections
 import base64
+import errno
 import json
 import inspect
 import os
@@ -770,13 +771,27 @@ class StrategyModule(StrategyBase):
     @staticmethod
     def _read_controller_source(path, *, role_task=None):
         """Read a runtime-created controller file for in-memory target transfer."""
-        if not path or (role_task is None and not os.path.isfile(path)):
+        if not path:
             return {"error": "controller source %r is not a regular file" % path}
-        fd = None
         try:
             if role_task is None:
-                source = open(path, "rb")
-                fullpath = os.path.abspath(path)
+                try:
+                    source_path = os.fspath(path)
+                    fullpath = os.path.abspath(source_path)
+                except (TypeError, ValueError):
+                    return {"error": "controller source %r is not a regular file" % path}
+                flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY
+                # Give a transient write lease time to clear, with at most four short waits.
+                for attempt in range(5):
+                    if not os.path.isfile(source_path):
+                        return {"error": "controller source %r is not a regular file" % path}
+                    try:
+                        fd = os.open(source_path, flags)
+                        break
+                    except OSError as ex:
+                        if ex.errno not in (errno.EAGAIN, errno.EWOULDBLOCK) or attempt == 4:
+                            raise
+                        time.sleep(0.05)
             else:
                 from ansiroll.loader import _open_linked_role_source, _role_source_roots, _visible_below
 
@@ -798,12 +813,14 @@ class StrategyModule(StrategyBase):
                                          or not any(_visible_below(realpath, root) for root in roots.values())):
                         return {"error": "controller role source %r is excluded" % path}
                 fd = _open_linked_role_source(realpath)
-                source = os.fdopen(fd, "rb", closefd=False)
-            with source as fh:
-                st = os.fstat(fh.fileno())
+            try:
+                st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode):
                     return {"error": "controller source %r is not a regular file" % path}
-                data = fh.read()
+                with os.fdopen(fd, "rb", closefd=False) as fh:
+                    data = fh.read()
+            finally:
+                os.close(fd)
             return {
                 "data": base64.b64encode(data).decode("ascii"),
                 "meta": {
@@ -815,9 +832,6 @@ class StrategyModule(StrategyBase):
             }
         except (OSError, AnsibleError) as ex:
             return {"error": "could not read controller source %r: %s" % (path, ex)}
-        finally:
-            if fd is not None:
-                os.close(fd)
 
     def _profile(self, msg):
         if getattr(self, "_profile_enabled", False):
