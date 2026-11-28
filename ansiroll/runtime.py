@@ -1386,6 +1386,10 @@ def _f_to_uuid(v, namespace="361E6D51-FAEC-444A-9079-341386DA8E2E"):
     return str(uuid.uuid5(uuid.UUID(namespace), _to_text_str(v)))
 
 
+def _f_to_datetime(string, format="%Y-%m-%d %H:%M:%S"):
+    return _dt.datetime.strptime(string, format)
+
+
 def _f_unique(seq):
     out = []
     for x in seq or []:
@@ -1616,6 +1620,8 @@ _ANSIBLE_FILTERS = {
     "hash": _f_hash,
     "checksum": lambda v: _f_hash(v, "sha1"),
     "to_uuid": _f_to_uuid,
+    "to_datetime": _f_to_datetime,
+    "ansible.builtin.to_datetime": _f_to_datetime,
     "unique": _f_unique,
     "union": _f_union,
     "intersect": _f_intersect,
