@@ -2828,6 +2828,28 @@ def test_legacy_boolean_strings_in_inline_conditions(tmp_path, use_strategy):
     assert recap == ("1", "0", "0", "0", "1", "0", "0")
 
 
+@pytest.mark.skipif(MODERN_TEMPLATING, reason="legacy Core inline mapping view finalization")
+@pytest.mark.parametrize("native", ["true", "false"])
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_legacy_inline_assignment_preserves_key_view_output(tmp_path, monkeypatch, native, use_strategy):
+    monkeypatch.setenv("ANSIBLE_JINJA2_NATIVE", native)
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    source: {alpha: 1, beta: 2}
+    keys: "{% set mapping = source %}{% set view = mapping.keys() %}{{ view }}"
+    keys_text: "{% set mapping = {'alpha': 1, 'beta': 2} %}{{ mapping.keys() | string }}"
+  tasks:
+    - debug:
+        msg: "keys={{ keys | to_json }}"
+    - debug:
+        msg: "{{ keys_text }}"
+""", use_strategy=use_strategy)
+    assert messages == ['keys=["alpha", "beta"]', "dict_keys(['alpha', 'beta'])"]
+    assert recap == ("2", "0", "0", "0", "0", "0", "0")
+
+
 def test_lazy_container_operations_resolve_nested_values_once(tmp_path):
     msgs, _ = _assert_parity(tmp_path, """
 - hosts: localhost

@@ -171,6 +171,25 @@ def test_null_interpolation_respects_legacy_native_mode(monkeypatch):
         assert templater.render_string(text, ctx) == "prefix/"
 
 
+def test_legacy_inline_output_keeps_template_local_context(monkeypatch):
+    import jinja2
+
+    from ansiroll import runtime
+
+    monkeypatch.setattr(runtime, "_ANSIROLL_CORE_VERSION", "2.16.11")
+    templater = Runtime({}, "", {}).templater
+
+    pass_context = getattr(jinja2, "pass_context", None) or jinja2.contextfunction
+
+    @pass_context
+    def read_result(context, _value):
+        yield context["result"]
+
+    templater.env.filters["read_result"] = read_result
+    source = "{% set result = 'local' %}{{ 1 | read_result }}"
+    assert templater.render_string(source, {}) == "['local']"
+
+
 def test_template_file_interpolates_null_as_empty_in_legacy_native_mode(monkeypatch):
     import ansiroll.runtime as runtime_mod
 

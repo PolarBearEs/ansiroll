@@ -165,6 +165,8 @@ class _WorkerStderr:
 import jinja2  # type: ignore
 from jinja2.nativetypes import NativeCodeGenerator
 
+_jinja_pass_context = getattr(jinja2, "pass_context", None) or jinja2.contextfunction
+
 
 # Sentinel for the `omit` magic variable; args/env entries equal to it are
 # dropped before the module runs (mirrors Ansible's omit placeholder).
@@ -3407,6 +3409,13 @@ class _ConditionalName:
         self.key = key
 
 
+@_jinja_pass_context
+def _finalize_legacy_inline_segment(context, value):
+    # Legacy Core unrolls views in both Jinja modes. Iterating only the keys
+    # keeps unused mapping values lazy.
+    return list(value) if isinstance(value, KeysView) else str(_finalize_text_segment(context, value))
+
+
 class _AnsirollCodeGenerator(jinja2.compiler.CodeGenerator):
     def write_commons(self):
         super().write_commons()
@@ -3661,6 +3670,7 @@ class _Templater:
         self._conditional_env = self.env.overlay()
         self._conditional_env.code_generator_class = _ConditionalCodeGenerator
         self._strict_conditional_env = self._conditional_env.overlay(undefined=_StrictAnsirollUndefined)
+        self._legacy_inline_environments = {}
 
     @contextmanager
     def _plugin_arg_scope(self, converted):
@@ -4143,6 +4153,23 @@ class _Templater:
                     pending.extend(value)
         return False
 
+    def _compile_legacy_inline_template(self, env, text, lazy_names):
+        parsed = env.parse(text)
+        nodes = jinja2.nodes
+        if (len(parsed.body) > 1 and isinstance(parsed.body[-1], nodes.Output)
+                and all(isinstance(statement, nodes.Assign) for statement in parsed.body[:-1])):
+            output = parsed.body[-1].nodes
+            if len(output) == 1 and not isinstance(output[0], nodes.TemplateData):
+                if env not in self._legacy_inline_environments:
+                    inline_env = env.overlay(finalize=_finalize_legacy_inline_segment)
+                    # Keep the finalized object at the output boundary.
+                    inline_env.concat = "".join
+                    inline_env.code_generator_class = (
+                        _ConditionalFileCodeGenerator if lazy_names else _FileCodeGenerator)
+                    self._legacy_inline_environments[env] = inline_env
+                env = self._legacy_inline_environments[env]
+        return env.from_string(parsed)
+
     def _render_string(self, text, ctx, strict=False, *, file_newline=None, file_options=(), file_header=False):
         stripped = text.strip()
         check_mode_template = ctx.get(_CHECK_MODE_TEMPLATE) if file_newline is None else None
@@ -4207,16 +4234,22 @@ class _Templater:
                 return _captured_jinja_error(e, syntax=isinstance(e, jinja2.TemplateSyntaxError))
         else:
             try:
-                tmpl = self._template_cache.get(template_key)
+                preserve_key_view = (file_newline is None and check_mode_template is None
+                                     and "{%" in text and "{{" in text and _legacy_templating())
+                output_key = (*template_key, preserve_key_view)
+                tmpl = self._template_cache.get(output_key)
                 if tmpl is None:
-                    tmpl = env.from_string(text)
-                    self._template_cache[template_key] = tmpl
+                    tmpl = (self._compile_legacy_inline_template(env, text, lazy_names)
+                            if preserve_key_view else env.from_string(text))
+                    self._template_cache[output_key] = tmpl
                 if native_file:
                     # Bundled Jinja uses the global text concatenator in
                     # Template.render, even when the overlay has a native one.
                     result = _concat_file_output(tmpl.root_render_func(tmpl.new_context(ctx)))
                 elif native_keyword:
                     result = _concat_keyword_segments(tmpl.generate(**ctx))
+                elif tmpl.environment.finalize is _finalize_legacy_inline_segment:
+                    result, = tmpl.generate(**ctx)
                 else:
                     result = tmpl.render(**ctx)
             except jinja2.TemplateError as e:
