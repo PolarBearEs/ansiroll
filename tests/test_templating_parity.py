@@ -2202,6 +2202,47 @@ def test_delegated_template_reads_current_host_task_alias(tmp_path, monkeypatch)
     assert (tmp_path / "rendered.txt").read_text() == "prefix=controller/tail\ntype=list\n"
 
 
+@pytest.mark.skipif(not MODERN_TEMPLATING, reason="legacy templates use a string omit placeholder")
+@pytest.mark.parametrize("delegated", [False, True], ids=["standalone", "delegated"])
+@pytest.mark.parametrize("definitions", [
+    """        payload:
+          nested: {drop: '{{ omit }}', literal: __omit_place_holder__ansiroll}
+          keep: ready/tail
+""",
+    """        prefix: ready/tail
+        payload: >-
+          {{ {'nested': {'drop': omit, 'literal': '__omit_place_holder__ansiroll'},
+              'keep': prefix} }}
+""",
+    """        prefix: "{{ lookup('env', 'ANSIROLL_TEST_PREFIX') }}/tail"
+        payload: >-
+          {{ {'nested': {'drop': omit, 'literal': '__omit_place_holder__ansiroll'},
+              'keep': prefix} }}
+""",
+], ids=["mapping", "eager-alias", "lazy-alias"])
+def test_template_mapping_omit_values_preserve_equal_spelling_text(tmp_path, monkeypatch, delegated, definitions):
+    monkeypatch.setenv("ANSIROLL_TEST_PREFIX", "ready")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - template:
+        src: sample.j2
+        dest: "{{ playbook_dir }}/rendered.txt"
+      vars:
+""" + definitions + ("      delegate_to: localhost\n" if delegated else ""),
+                  {"sample.j2": "payload {{ payload }}\n"})
+    output = tmp_path / "rendered.txt"
+    expected = b"payload {'nested': {'literal': '__omit_place_holder__ansiroll'}, 'keep': 'ready/tail'}\n"
+    summary = _ansible(path, tmp_path)
+    assert summary[1][3] == "0"
+    assert output.read_bytes() == expected
+    output.unlink()
+    actual = _ansible(path, tmp_path, strategy="ansiroll.core.ansiroll") if delegated else _ansiroll(path, tmp_path)
+    assert actual == summary
+    assert output.read_bytes() == expected
+
+
 def test_role_defaults_and_group_vars_still_resolve_nested_templates(tmp_path):
     _assert_parity(tmp_path, """
 - hosts: localhost
