@@ -9142,35 +9142,38 @@ def _decode_delegated_key(key, *, mapping_key=True):
             return _dt.date(*map(int, key["date"].split("-")))
         if "range" in key:
             return range(*key["range"])
-        timestamp = key["datetime"]
-        sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
-        fromisoformat = getattr(_dt.datetime, "fromisoformat", None)
-        if fromisoformat is not None and not sub_minute:
-            return fromisoformat(timestamp)
-        # Python 3.5 and 3.6 accept %z offsets without a colon.
-        format_string = "%Y-%m-%dT%H:%M:%S"
-        if sub_minute:
-            timestamp = timestamp[:sub_minute.start()]
-        elif re.search(r"[+-]\d\d:\d\d$", timestamp):
-            timestamp = timestamp[:-3] + timestamp[-2:]
-            format_string += "%z"
-        if "." in timestamp:
-            format_string = format_string.replace("%S", "%S.%f")
-        value = fromisoformat(timestamp) if fromisoformat is not None else _dt.datetime.strptime(timestamp, format_string)
-        if sub_minute:
-            sign, hours, minutes, seconds, micros = sub_minute.groups()
-            offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
-                                   microseconds=int(micros or 0))
-            if sign == "-":
-                offset = -offset
-            if fromisoformat is not None:
-                # fromisoformat can discard offsets smaller than one second.
-                return value.replace(tzinfo=_dt.timezone(offset))
-            # Older interpreters require offsets aligned to a whole minute.
-            key_text = key["datetime"] if mapping_key else None
-            return _legacy_offset_datetime(value, offset, key_text)
-        return value
+        return _decode_iso_datetime(key["datetime"], mapping_key=mapping_key)
     return key
+
+
+def _decode_iso_datetime(timestamp, *, mapping_key=False):
+    key_text = timestamp if mapping_key else None
+    sub_minute = re.search(r"([+-])(\d\d):(\d\d):(\d\d)(?:\.(\d{6}))?$", timestamp)
+    fromisoformat = getattr(_dt.datetime, "fromisoformat", None)
+    if fromisoformat is not None and not sub_minute:
+        return fromisoformat(timestamp)
+    # Python 3.5 and 3.6 accept %z offsets without a colon.
+    format_string = "%Y-%m-%dT%H:%M:%S"
+    if sub_minute:
+        timestamp = timestamp[:sub_minute.start()]
+    elif re.search(r"[+-]\d\d:\d\d$", timestamp):
+        timestamp = timestamp[:-3] + timestamp[-2:]
+        format_string += "%z"
+    if "." in timestamp:
+        format_string = format_string.replace("%S", "%S.%f")
+    value = fromisoformat(timestamp) if fromisoformat is not None else _dt.datetime.strptime(timestamp, format_string)
+    if sub_minute:
+        sign, hours, minutes, seconds, micros = sub_minute.groups()
+        offset = _dt.timedelta(hours=int(hours), minutes=int(minutes), seconds=int(seconds),
+                               microseconds=int(micros or 0))
+        if sign == "-":
+            offset = -offset
+        if fromisoformat is not None:
+            # fromisoformat can discard offsets smaller than one second.
+            return value.replace(tzinfo=_dt.timezone(offset))
+        # Older interpreters require offsets aligned to a whole minute.
+        return _legacy_offset_datetime(value, offset, key_text)
+    return value
 
 
 def _legacy_offset_datetime(value, offset, key_text):
@@ -9466,7 +9469,7 @@ def agent_main():
                     if template_vars:
                         for key in ("template_mtime", "template_run_date"):
                             if template_vars.get(key) is not None:
-                                template_vars[key] = _dt.datetime.fromisoformat(template_vars[key])
+                                template_vars[key] = _decode_iso_datetime(template_vars[key])
                         scope = templater._play_var_scope({**ctx, **template_vars}, strict=False)
                     fallback = _resolve_delegated_play_var(name, scope, templater, members=members)
                 elif members is not None and type(member) is int and 0 <= member < len(members):
