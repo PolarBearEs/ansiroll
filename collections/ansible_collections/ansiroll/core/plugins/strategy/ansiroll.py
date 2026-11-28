@@ -1102,6 +1102,8 @@ class StrategyModule(StrategyBase):
 
     def _run_local_template(self, frame, become_pass, resolve_play_var=None, *, source_task=None):
         """Resolve and render the controller's template through the in-memory runtime."""
+        from ansiroll.loader import _open_role_source, _RoleSourceLeaseError
+
         args = dict(frame.get("args") or {})
         src = args.get("src")
         if not isinstance(src, str) or not src:
@@ -1117,14 +1119,14 @@ class StrategyModule(StrategyBase):
             path = loader.path_dwim(fullpath)
             if not os.path.isfile(path):
                 return {"failed": True, "changed": False, "msg": "template: source is not a regular file"}
-            with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as handle:
+            with open(path, "rb", opener=lambda name, _: _open_role_source(name)) as handle:
                 st = os.fstat(handle.fileno())
                 if not stat.S_ISREG(st.st_mode):
                     return {"failed": True, "changed": False, "msg": "template: source is not a regular file"}
                 data = handle.read()
             data, _ = _decrypt_controller_source(loader, path, data)
             raw = data.decode("utf-8", "surrogateescape")
-        except (OSError, AnsibleError) as ex:
+        except (OSError, AnsibleError, _RoleSourceLeaseError) as ex:
             return {"failed": True, "changed": False, "msg": "template: %s" % ex}
         rt = self._local_runtime(become_pass)
         previous = rt.check_mode, rt.diff_mode, rt.become_user, rt._copy_transfer_check_mode

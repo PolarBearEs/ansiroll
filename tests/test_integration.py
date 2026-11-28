@@ -5719,7 +5719,9 @@ def _run_strategy_play(tmp_path, playbook, *args, environment=None, inventory="l
     )
 
 
-def test_strategy_delegated_template_reads_one_inode(tmp_path, monkeypatch):
+@pytest.mark.parametrize("leased", [False, True], ids=["available", "transient-lease"])
+def test_strategy_delegated_template_reads_one_inode(tmp_path, monkeypatch, leased):
+    import errno
     from ansible.parsing.dataloader import DataLoader
 
     plugin_type = _load_strategy_module().StrategyModule
@@ -5734,6 +5736,15 @@ def test_strategy_delegated_template_reads_one_inode(tmp_path, monkeypatch):
     replacement.write_text("replacement source")
     replacement.chmod(0o644)
     open_source = io.open
+    open_fd = os.open
+    source_open_flags = []
+
+    def open_with_lease(path, flags, *args, **kwargs):
+        if os.fsdecode(path) == str(src):
+            source_open_flags.append(flags)
+            if leased and len(source_open_flags) == 1:
+                raise BlockingIOError(errno.EAGAIN, "synthetic active write lease")
+        return open_fd(path, flags, *args, **kwargs)
 
     def replace_after_open(path, *args, **kwargs):
         handle = open_source(path, *args, **kwargs)
@@ -5743,6 +5754,7 @@ def test_strategy_delegated_template_reads_one_inode(tmp_path, monkeypatch):
 
     monkeypatch.setattr("builtins.open", replace_after_open)
     monkeypatch.setattr(io, "open", replace_after_open)
+    monkeypatch.setattr(os, "open", open_with_lease)
 
     def record_result(name, task, args, ctx, **kwargs):
         assert name == "template"
@@ -5755,6 +5767,8 @@ def test_strategy_delegated_template_reads_one_inode(tmp_path, monkeypatch):
     frame = {"args": {"src": src.name, "dest": str(tmp_path / "result"), "mode": "preserve"}}
     assert strategy._run_local_template(frame, None) == {"source": "original source", "mode": 0o641}
     assert src.read_text() == "replacement source"
+    assert len(source_open_flags) == (2 if leased else 1)
+    assert all(flags & os.O_NONBLOCK for flags in source_open_flags)
 
 
 @pytest.mark.parametrize(("task_diff", "block_diff", "apply_diff", "cli_diff", "hide", "limit", "expected_diff", "legacy_native"), [
