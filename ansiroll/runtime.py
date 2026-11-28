@@ -5651,9 +5651,14 @@ class Runtime:
                     ctx.pop("__ansiroll_first_found", None)
                 checked = entry.get("controller_candidates", {}).get(raw)
                 paths = {(key, tuple(path)) for key, path in checked["paths"]} if checked else set()
-                reuse_checked = checked and search_path_matches and not _vars_file_reads_blocked(selector_blocks, paths) and all(
-                    _same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
-                    for key, path in paths
+                # A compile-checked selection can use a path supplied by an
+                # earlier vars file. Its saved input verifies the selection
+                # separately from the search roots of the glob model.
+                reuse_checked = (
+                    checked and (search_path_matches or checked.get("first_found_search_path_checked"))
+                    and not _vars_file_reads_blocked(selector_blocks, paths)
+                    and all(_same_vars_input(_vars_input_at(ctx, key, path), _vars_input_at(checked["inputs"], key, path))
+                            for key, path in paths)
                 )
                 if checked and checked.get("controller_only") and not reuse_checked:
                     plugins = checked.get("jinja_plugins")
