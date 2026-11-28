@@ -3895,11 +3895,14 @@ class _Templater:
             return _PlayVarScope(ctx, self, strict)
         return ctx
 
-    def render_string(self, text, ctx, _depth=0, strict=False, *, file_newline=None, file_options=(), file_header=False):
+    def render_string(self, text, ctx, _depth=0, strict=False, *, comment_only=False,
+                      file_newline=None, file_options=(), file_header=False):
         if not isinstance(text, str) or isinstance(text, _NO_TEMPLATE):
             return text
         if file_newline is None:
-            templated = _looks_templated(text) or (ctx.get(_CHECK_MODE_TEMPLATE) is not None and "{#" in text)
+            templated = _looks_templated(text) or (
+                (comment_only or ctx.get(_CHECK_MODE_TEMPLATE) is not None) and "{#" in text
+            )
         else:
             settings = dict(file_options)
             starts = [
@@ -4529,7 +4532,7 @@ class Runtime:
             # set_fact: they outrank play/role/block/task vars.
             self._set_fact_overrides[name] = self.vars[name]
 
-    def template(self, value, ctx, _seen=None, strict=False):
+    def template(self, value, ctx, _seen=None, strict=False, *, comment_only=False):
         if isinstance(value, (dict, list, tuple)):
             if _seen is None:
                 _seen = set()
@@ -4551,7 +4554,7 @@ class Runtime:
         if isinstance(value, tuple):
             return tuple(self.template(v, ctx, _seen, strict) for v in value)
         if isinstance(value, str):
-            out = self.templater.render_string(value, ctx, strict=strict)
+            out = self.templater.render_string(value, ctx, strict=strict, comment_only=comment_only)
             if isinstance(out, (dict, list, tuple, _RawSnapshotMapping, _RawSnapshotList)) and out is not value:
                 # A bare expression returned a container that may hold lazy
                 # variable views -- resolve them now that it is used.  The
@@ -5837,14 +5840,16 @@ class Runtime:
 
         notifications = []
         no_log = bool(task.get("no_log"))
+        loop_failed = None
         rescue_overrides = ([] if self.on_rescue_overrides is not None
                             and task["action"].rsplit(".", 1)[-1] == "set_fact" else None)
         if task.get("loop") is not None:
             items, res, ignore = self._resolve_task_loop(task, base_ctx)
             if res is None:
                 try:
-                    res, ignore = self._run_loop(task, items, base_ctx, effective_become, notifications,
-                                                 rescue_overrides=rescue_overrides)
+                    res, ignore, loop_failed = self._run_loop(
+                        task, items, base_ctx, effective_become, notifications, rescue_overrides=rescue_overrides
+                    )
                 except TaskFailed:
                     raise
                 except Exception as ex:
@@ -5866,9 +5871,9 @@ class Runtime:
             self._store_register(task, res)
 
         tally_changed = res.pop("_ansiroll_tally_changed", res.get("changed", False))
-        if res.get("changed") and not (_result_failed(res) or res.get("unreachable")):
+        status = _status_of(res, failed=loop_failed)
+        if res.get("changed") and status not in ("failed", "unreachable"):
             self._queue_notify(notifications)
-        status = _status_of(res)
         if rescue_overrides:
             if status not in ("ok", "changed"):
                 # Public item facts are visible even when a later item fails.
@@ -5890,7 +5895,7 @@ class Runtime:
             else:
                 self._tally("skipped")
                 self._tally("unreachable")
-        elif _result_failed(res):
+        elif status == "failed":
             if ignore:
                 self._tally("changed" if tally_changed else "ok")
                 self._tally("ignored")
@@ -5957,15 +5962,20 @@ class Runtime:
         result = {"failed": True, "changed": False, "msg": message}
         return result, self._ignore_before_validation(task)
 
-    def _loop_item_vars(self, task, items, i, ctx=None, *, metadata_flags=None):
-        """Per-item loop variables: loop_var, index_var and ansible_loop."""
+    def _loop_var_name(self, task, ctx):
         loop_var = task.get("loop_var") or "item"
         if "{{" in loop_var and ctx is not None:
             loop_var = _as_text(self.template(loop_var, ctx))
-        out = {loop_var: items[i], "ansible_loop_var": loop_var}
+        return loop_var
+
+    def _loop_item_vars(self, task, items, i, ctx=None, *, metadata_flags=None, loop_var=None):
+        """Per-item loop variables: loop_var, index_var and ansible_loop."""
+        if loop_var is None:
+            loop_var = self._loop_var_name(task, ctx)
+        out = {"ansible_loop_var": loop_var, loop_var: items[i]}
         if task.get("index_var"):
-            out[task["index_var"]] = i
             out["ansible_index_var"] = task["index_var"]
+            out[task["index_var"]] = i
         extended, allitems = metadata_flags or self._loop_metadata_flags(task, ctx)
         if extended:
             n = len(items)
@@ -5992,22 +6002,52 @@ class Runtime:
         return (self._loop_control_bool(task, "loop_extended", False, ctx),
                 self._loop_control_bool(task, "loop_extended_allitems", True, ctx))
 
+    def _resolve_loop_index_var(self, source, ctx):
+        try:
+            name = _fail_on_undef(self.template(source, ctx, strict=True, comment_only=True))
+        except jinja2.UndefinedError as ex:
+            if _core_at_least(2, 19):
+                raise ValueError("Error processing keyword 'index_var': %s" % ex)
+            raise
+        if name is None or not _core_at_least(2, 14):
+            return name
+        if isinstance(name, _Omit) or (not _core_at_least(2, 19) and name == self._legacy_omit_token):
+            return None
+        if not isinstance(name, str):
+            name = str(name)
+        if _core_at_least(2, 21) and (
+            name in {"true", "false", "none", "True", "False", "None", "not"}
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name)
+        ):
+            raise ValueError("Invalid 'index_var': Invalid variable name %r." % name)
+        return name
+
     def _run_loop(self, task, items, base_ctx, become=False, notifications=None, *, rescue_overrides=None):
         agg = {"results": [], "changed": False, "failed": False, "msg": "All items completed"}
         ignore_loop = False
         failed_items_ignored = True
+        loop_task = task
+        if items and task.get("index_var") is not None:
+            loop_task = dict(task, index_var=self._resolve_loop_index_var(task["index_var"], base_ctx))
+        loop_var = self._loop_var_name(task, base_ctx) if items else None
         metadata_flags = self._loop_metadata_flags(task, base_ctx) if items else None
+        label_source = task.get("loop_label")
+        modern_labels = _core_at_least(2, 21)
         commits_delegated_facts = task.get("delegate_to") and (
             task.get("action", "").rsplit(".", 1)[-1] == "set_fact"
         )
         pending_facts = []
         loop_succeeded = False
+        legacy_label_failed = False
         aggregate_no_log = False
         try:
             for i, it in enumerate(items):
                 fact_host = None
                 ctx = dict(base_ctx)
-                ctx.update(self._loop_item_vars(task, items, i, base_ctx, metadata_flags=metadata_flags))
+                loop_vars = self._loop_item_vars(
+                    loop_task, items, i, base_ctx, metadata_flags=metadata_flags, loop_var=loop_var
+                )
+                ctx.update(loop_vars)
                 if i > 0 and task.get("loop_pause"):
                     time.sleep(float(self.template(task["loop_pause"], ctx) or 0))
                 res, ignore = self._task_gate(task, ctx)
@@ -6035,18 +6075,33 @@ class Runtime:
                                 }
                 aggregate_no_log = aggregate_no_log or no_log
                 res["item"] = it
-                if task.get("loop_label") is not None:
+                label = it
+                if label_source is not None:
                     label_ctx = dict(ctx)
                     if task.get("register"):
                         label_ctx[task["register"]] = res
                     try:
-                        label = self.template(task["loop_label"], label_ctx)
-                        if _is_undef(label):
-                            label._fail_with_undefined_error()
-                        res["_ansible_item_label"] = label
+                        label = _fail_on_undef(self.template(
+                            label_source, label_ctx, strict=modern_labels, comment_only=True
+                        ))
+                        if modern_labels and isinstance(label, _Omit):
+                            raise ValueError("A template was resolved to an Omit scalar.")
+                        if not modern_labels:
+                            res["_ansible_item_label"] = label
                     except Exception as ex:
-                        res = {"failed": True, "changed": False, "item": it,
-                               "msg": "Failed to template loop_control.label: %s" % ex}
+                        if modern_labels:
+                            label = loop_vars[loop_var]
+                            message = "Failed to template loop_control label: %s" % ex
+                            warnings = res.get("warnings")
+                            res["warnings"] = (warnings if isinstance(warnings, list) else []) + [message]
+                            agg.setdefault("warnings", []).append(message)
+                            if not no_log:
+                                self.on_warning(message)
+                        else:
+                            res.update(failed=True, msg="Failed to template loop_control.label: %s" % ex)
+                            legacy_label_failed = True
+                            agg["failed"] = True
+                            failed_items_ignored = failed_items_ignored and ignore
                 stop = False
                 bw = task.get("loop_break_when")
                 if bw:
@@ -6062,7 +6117,7 @@ class Runtime:
                             self.emit(task, _status_of(res), res, item=it,
                                       ignored=ignore, is_item=True, no_log=no_log)
                             return {"failed": True, "changed": False, "msg": str(ex),
-                                    "_ansiroll_no_log": aggregate_no_log}, ignore
+                                    "_ansiroll_no_log": aggregate_no_log}, ignore, True
                         res["failed"] = True
                         res["break_when_result"] = str(ex)
                         stop = True
@@ -6086,10 +6141,21 @@ class Runtime:
                 ignore_loop = ignore_loop or ignore
                 if fact_host is not None:
                     pending_facts.append((fact_host, res, no_log))
-                self.emit(task, _status_of(res), res, item=it, ignored=ignore, is_item=True, no_log=no_log)
+                # Core 2.21 exports the item label only to callbacks.
+                reported = (dict(res, _ansible_item_label=label)
+                            if modern_labels and label_source is not None else res)
+                self.emit(task, _status_of(res), reported, item=it, ignored=ignore, is_item=True, no_log=no_log)
                 if stop:
                     break
-            loop_succeeded = not (agg["failed"] or agg.get("unreachable"))
+            loop_failed = agg["failed"]
+            if legacy_label_failed:
+                # Core exposes the raw failure fields but uses a nested
+                # failed_when_result, when present, for the task outcome.
+                decisions = [result["failed_when_result"] for result in agg["results"]
+                             if "failed_when_result" in result]
+                if decisions:
+                    loop_failed = any(decisions)
+            loop_succeeded = not (loop_failed or agg.get("unreachable"))
         finally:
             for fact_host, result, no_log in pending_facts:
                 if fact_host is None or loop_succeeded:
@@ -6106,7 +6172,7 @@ class Runtime:
             agg["msg"] = "One or more items were unreachable"
         if items:
             agg["_ansiroll_no_log"] = aggregate_no_log
-        return agg, ignore_loop if _core_at_least(2, 21) else failed_items_ignored
+        return agg, ignore_loop if modern_labels else failed_items_ignored, loop_failed
 
     def _resolve_task_loop(self, task, ctx):
         loop = task.get("loop")
@@ -8479,8 +8545,10 @@ def _result_failed(res):
     return bool(res.get("failed"))
 
 
-def _status_of(res):
-    if _result_failed(res):
+def _status_of(res, *, failed=None):
+    if failed is None:
+        failed = _result_failed(res)
+    if failed:
         return "failed"
     if res.get("unreachable"):
         return "unreachable"

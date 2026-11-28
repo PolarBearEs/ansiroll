@@ -51,7 +51,7 @@ def _summary(text, stderr=""):
     return [json.loads(m) for m in MSG_RE.findall(text)], recap.groups()
 
 
-def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable):
+def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.executable, raw=False):
     env = _env()
     if strategy is not None:
         env["ANSIBLE_STRATEGY"] = strategy
@@ -60,10 +60,10 @@ def _ansible(playbook, cwd, strategy=None, *, diff=False, interpreter=sys.execut
          "-e", json.dumps({"ansible_python_interpreter": interpreter}), str(playbook)],
         cwd=str(cwd), env=env, capture_output=True, text=True, timeout=120,
     )
-    return _summary(proc.stdout, proc.stderr)
+    return proc if raw else _summary(proc.stdout, proc.stderr)
 
 
-def _ansiroll(playbook, cwd):
+def _ansiroll(playbook, cwd, *, raw=False):
     src, _ = compile_playbook(str(playbook))
     script = cwd / "compiled.py"
     script.write_text(src)
@@ -71,7 +71,7 @@ def _ansiroll(playbook, cwd):
         [sys.executable, str(script)],
         cwd=str(cwd), env=_env(), capture_output=True, text=True,
     )
-    return _summary(proc.stdout + "\n" + proc.stderr)
+    return proc if raw else _summary(proc.stdout + "\n" + proc.stderr)
 
 
 def _write(tmp_path, playbook, files=None):
@@ -2241,6 +2241,160 @@ def test_when_errors_fail_instead_of_skipping(tmp_path):
       when: undefined_var
     - debug: msg=NOT_REACHED
 """)
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_ordinary_loop_resolves_index_name_once(tmp_path, use_strategy):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    index_name: position
+    position: shadowed
+    observed: []
+  tasks:
+    - set_fact:
+        index_name: changed_name
+        observed: "{{ observed + [ansible_index_var ~ ':' ~ position ~ ':' ~ item] }}"
+      loop: [one, two]
+      loop_control:
+        index_var: "{{ index_name }}"
+    - debug: {msg: "{{ observed | join(', ') }}"}
+    - debug: {msg: empty loop should skip}
+      loop: []
+      loop_control:
+        index_var: "{{ undefined_index_name }}"
+""", use_strategy=use_strategy)
+    assert messages == ["position:0:one, position:1:two"]
+    assert recap == ("2", "0", "0", "0", "1", "0", "0")
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+@pytest.mark.parametrize(("index_source", "legacy_name"), [
+    ('"{{ name }}"', "bad-name"),
+    ('!unsafe "unchanged{# comment #}"', "unchanged{# comment #}"),
+    ('""', "absent"),
+])
+def test_ordinary_loop_validates_resolved_index_name(tmp_path, use_strategy, index_source, legacy_name):
+    modern_loop_controls = Version(__version__) >= Version("2.21")
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  vars:
+    name: bad-name
+  tasks:
+    - debug: {msg: "index={{ ansible_index_var | default('absent') }}"}
+      loop: [one]
+      loop_control:
+        index_var: INDEX_SOURCE
+      register: outcome
+      ignore_errors: true
+    - debug:
+        msg: >-
+          {{ 'invalid-name' if outcome is failed and outcome.msg is search("Invalid 'index_var'") else 'accepted' }}
+""".replace("INDEX_SOURCE", index_source), use_strategy=use_strategy)
+    if modern_loop_controls:
+        assert messages[-1:] == ["invalid-name"]
+        assert recap[-1] == "1"
+    else:
+        assert messages == ["index=" + legacy_name, "accepted"]
+
+
+def test_tree_shake_preserves_ordinary_comment_only_loop_controls(tmp_path):
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: "index={{ position }}"}
+      loop: [one, two]
+      when: position == 0
+      loop_control:
+        index_var: "position{# comment #}"
+        label: "chosen{# comment #}"
+""")
+    src, _ = compile_playbook(str(path), extra_vars={"position": -1}, tree_shake=True)
+    script = tmp_path / "compiled.py"
+    script.write_text(src)
+    proc = subprocess.run([sys.executable, str(script)], cwd=tmp_path, env=_env(),
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ok: [localhost] => (item=chosen)" in proc.stdout
+    assert _summary(proc.stdout)[0] == ["index=0"]
+
+
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_undefined_loop_label_uses_version_specific_outcome(tmp_path, use_strategy):
+    modern_labels = Version(__version__) >= Version("2.21")
+    path = _write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: "value-{{ item }}"}
+      changed_when: true
+      loop: [first, second]
+      loop_control:
+        label: "{{ outcome.msg if item == 'first' else missing_label }}"
+      register: outcome
+      ignore_errors: true
+    - debug:
+        msg: >-
+          {{ outcome is failed }}/{{ outcome.results[1].changed }}/{{ outcome.results[1].warnings | default([]) | length }}
+""")
+    native = _ansible(path, tmp_path, raw=True)
+    actual = (_ansible(path, tmp_path, strategy="ansiroll.core.ansiroll", raw=True)
+              if use_strategy else _ansiroll(path, tmp_path, raw=True))
+    for proc in (native, actual):
+        output = proc.stdout + proc.stderr
+        assert proc.returncode == 0, output
+        assert "changed: [localhost] => (item=value-first)" in output
+        if modern_labels:
+            assert "changed: [localhost] => (item=second)" in output
+            assert "[WARNING]: Failed to template loop_control label" in output
+            assert '"False/True/1"' in output
+        else:
+            assert "Failed to template loop_control.label" in output
+            assert '"True/True/0"' in output
+    assert _summary(actual.stdout, actual.stderr)[1] == _summary(native.stdout, native.stderr)[1]
+
+
+@pytest.mark.skipif(Version(__version__) < Version("2.21"), reason="uses modern item label fallback")
+@pytest.mark.parametrize("binding", ["position", "ansible_loop_var", "ansible_index_var"])
+def test_undefined_loop_label_uses_live_loop_binding(tmp_path, binding):
+    proc = _ansiroll(_write(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: unreachable}
+      when: false
+      loop: [one]
+      loop_control:
+        loop_var: BINDING
+        index_var: "{{ 'BINDING' }}"
+        label: "{{ missing_label }}"
+""".replace("BINDING", binding)), tmp_path, raw=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "skipping: [localhost] => (item=0)" in proc.stdout
+    assert "[WARNING]: Failed to template loop_control label" in proc.stderr
+
+
+@pytest.mark.skipif(Version(__version__) >= Version("2.21"), reason="checks legacy label failure flags")
+@pytest.mark.parametrize("use_strategy", [False, True], ids=["standalone", "strategy"])
+def test_legacy_loop_label_failure_retains_raw_failed_flags(tmp_path, use_strategy):
+    messages, recap = _assert_parity(tmp_path, """
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - debug: {msg: example}
+      failed_when: false
+      loop: [one]
+      register: result
+      loop_control:
+        label: "{{ missing_label }}"
+    - debug:
+        msg: "{{ result.failed }}/{{ result.results[0].failed }}/{{ result.results[0].failed_when_result }}"
+""", use_strategy=use_strategy)
+    assert messages[-1:] == ["True/True/False"]
+    assert recap == ("2", "0", "0", "0", "0", "0", "0")
 
 
 def test_nested_render_restores_loop_context(tmp_path):

@@ -1838,6 +1838,8 @@ def _is_templated(value):
 
 def _loop_binding_names(loop_var, index_var, extended):
     names = {loop_var or "item", "ansible_loop_var"}
+    if isinstance(index_var, dict):
+        index_var = index_var.get("__ansiroll_unsafe__")
     if index_var:
         names.update((index_var, "ansible_index_var"))
     if extended:
@@ -3261,9 +3263,9 @@ def _convert_task(task, actions, basedir, *, controller_execution=False):
         "when": _conditions(task.when),
         "loop": _loop_of(task, basedir),
         "loop_var": _loop_var(task),
-        "index_var": _index_var(task),
+        "index_var": _tag_untrusted(_index_var(task, preserve_empty=True)),
         **_loop_control(task),
-        "loop_label": _loop_label(task),
+        "loop_label": _tag_untrusted(_loop_label(task)),
         "register": _register_of(task),
         "changed_when": _conditions(task.changed_when) or None,
         "failed_when": _conditions(task.failed_when) or None,
@@ -4902,11 +4904,10 @@ def _loop_control(task):
     return out
 
 
-def _index_var(task):
+def _index_var(task, *, preserve_empty=False):
     lc = getattr(task, "loop_control", None)
-    if lc is not None and getattr(lc, "index_var", None):
-        return lc.index_var
-    return None
+    name = getattr(lc, "index_var", None)
+    return name if preserve_empty else name or None
 
 
 def _loop_var(task):
