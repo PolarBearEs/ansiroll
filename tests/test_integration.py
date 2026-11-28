@@ -7955,6 +7955,75 @@ def test_strategy_rejects_delegated_facts_with_on_target_delegation(tmp_path):
     assert "with ansiroll_delegate_on_target" in " ".join((proc.stdout + proc.stderr).split())
 
 
+@pytest.mark.parametrize("on_target", [False, True])
+def test_strategy_reports_unavailable_on_target_delegation_in_linear_fallback(tmp_path, on_target):
+    proc = _run_strategy_play(
+        tmp_path, """- name: Delegation by batch
+  hosts: all
+  serial: 2
+  gather_facts: false
+  connection: local
+  tasks:
+    - set_fact: {marker: skipped}
+      when: false
+      delegate_to: recipient
+      delegate_facts: true
+    - set_fact: {expected_marker: reached}
+      when: inventory_hostname == 'origin'
+      delegate_to: recipient
+      delegate_facts: true
+    - assert:
+        that:
+          - hostvars.recipient.marker is undefined
+          - hostvars.recipient.expected_marker == 'reached'
+""", "-e", json.dumps({"ansiroll_delegate_on_target": on_target}),
+        inventory="origin,recipient,last,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    warning = "ansiroll_delegate_on_target has no effect during core linear fallback"
+    warnings = " ".join(proc.stderr.split())
+    assert warnings.count(warning) == int(on_target)
+    if on_target:
+        assert "for play 'Delegation by batch' on batch hosts origin, recipient" in warnings
+        assert "batch hosts last" not in warnings
+
+
+def test_strategy_warns_for_each_unnamed_play_in_linear_fallback(tmp_path):
+    play = """- hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - debug: {msg: controller only}
+"""
+    proc = _run_strategy_play(tmp_path, play * 2, inventory="origin,recipient,")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    warnings = " ".join(proc.stderr.split())
+    assert warnings.count("ansiroll_delegate_on_target has no effect during core linear fallback") == 2
+    locations = set(re.findall(r"play\.yml:(\d+),", "".join(proc.stderr.split())))
+    assert {"1", str(len(play.splitlines()) + 1)} <= locations
+
+
+def test_strategy_warns_for_each_import_of_a_play_in_linear_fallback(tmp_path):
+    (tmp_path / "imported.yml").write_text("""- hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    ansiroll_delegate_on_target: true
+  tasks:
+    - debug: {msg: controller only}
+""")
+    proc = _run_strategy_play(
+        tmp_path, "- import_playbook: imported.yml\n" * 2, inventory="origin,recipient,",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    warnings = " ".join(proc.stderr.split())
+    assert warnings.count("ansiroll_delegate_on_target has no effect during core linear fallback") == 2
+    assert "".join(proc.stderr.split()).count("imported.yml:1,") == 2
+
+
 def test_strategy_skips_on_target_fact_delegation_when_condition_is_false(tmp_path):
     proc = _run_strategy_play(
         tmp_path, """- hosts: origin
