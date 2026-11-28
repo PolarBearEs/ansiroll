@@ -1774,7 +1774,7 @@ def _lookup_values(name, args, kwargs, ctx=None):
                     if os.path.exists(cand):
                         path = cand
                         break
-            with open(path) as f:
+            with open(path, newline="") as f:
                 text = f.read()
             if lstrip:
                 text = text.lstrip()
